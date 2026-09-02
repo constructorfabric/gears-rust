@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-security"
-version = "0.8.0"
+version = "0.8.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,14 +18,22 @@ name = "toolkit_security"
 [lints]
 workspace = true
 
+[features]
+# Enables `internal_auth_cache::CachingInternalAuthenticator`.
+internal-auth-cache = ["dep:tokio", "dep:base64", "dep:serde_json", "dep:parking_lot"]
+
 [dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true }
 postcard = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
+parking_lot = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 trybuild = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -30,7 +30,9 @@ impl EventBrokerBackend for MockBroker {
     async fn persist(
         &self,
         _ctx: &SecurityContext,
-        topic: &str,
+        // Ingest resolves the destination stream from each event's type, so the
+        // caller's routing hint is not consulted.
+        _topic: &str,
         _partition: u32,
         events: &[Event],
     ) -> Result<(), StorageBackendError> {
@@ -46,11 +48,7 @@ impl EventBrokerBackend for MockBroker {
         }
         let mut core = self.core.lock().await;
         for event in events {
-            let mut e = event.clone();
-            if e.topic.is_empty() {
-                e.topic = topic.to_owned();
-            }
-            ingest_one(&mut core, &e).map_err(|err| StorageBackendError::PersistFailed {
+            ingest_one(&mut core, event).map_err(|err| StorageBackendError::PersistFailed {
                 reason: err.to_string(),
                 detail: String::new(),
                 instance: String::new(),
@@ -129,7 +127,11 @@ impl EventBrokerBackend for MockBroker {
         topic: &str,
     ) -> Result<Vec<PartitionLeader>, StorageBackendError> {
         let core = self.core.lock().await;
-        let partitions = core.topics.get(topic).map(|t| t.partitions).unwrap_or(0);
+        let partitions = core
+            .topics
+            .get(topic)
+            .map(|state| state.partitions)
+            .unwrap_or(0);
         Ok((0..partitions)
             .map(|p| PartitionLeader {
                 partition: p,

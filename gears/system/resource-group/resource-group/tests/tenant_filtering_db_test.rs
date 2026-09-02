@@ -18,16 +18,16 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, PolicyEnforcer,
+    AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    PolicyEnforcer,
     constraints::{Constraint, InGroupPredicate, InPredicate, Predicate},
 };
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_odata::ODataQuery;
-use toolkit_security::pep_properties;
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::type_repo::TypeRepository;
@@ -39,11 +39,12 @@ use common::{make_ctx, test_db};
 struct TenantScopingAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for TenantScopingAuthZ {
+impl AuthZResolverApi for TenantScopingAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -77,7 +78,7 @@ impl AuthZResolverClient for TenantScopingAuthZ {
 fn make_group_service(
     db: Arc<DBProvider<DbError>>,
 ) -> GroupService<GroupRepository, TypeRepository> {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     GroupService::new(
         db,
@@ -86,6 +87,25 @@ fn make_group_service(
         Arc::new(GroupRepository),
         Arc::new(TypeRepository),
         common::make_types_registry(),
+    )
+}
+
+/// Same wiring, but every metadata validation fails: the registry answers
+/// `Internal` rather than `NotFound`, so `validate_metadata_via_gts` returns
+/// an error instead of skipping. Used to check what a cross-tenant caller can
+/// learn from *which* error comes back.
+fn make_group_service_with_unavailable_registry(
+    db: Arc<DBProvider<DbError>>,
+) -> GroupService<GroupRepository, TypeRepository> {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
+    let enforcer = PolicyEnforcer::new(authz);
+    GroupService::new(
+        db,
+        QueryProfile::default(),
+        enforcer,
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        common::make_unavailable_types_registry(),
     )
 }
 
@@ -103,7 +123,7 @@ fn make_group_service(
 #[tokio::test]
 async fn tenant_isolation_list_groups() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -182,7 +202,7 @@ async fn tenant_isolation_list_groups() {
 #[tokio::test]
 async fn tenant_isolation_get_group_cross_tenant_invisible() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -211,7 +231,7 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
 #[tokio::test]
 async fn tenant_isolation_hierarchy_scoped() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -294,7 +314,7 @@ async fn tenant_isolation_hierarchy_scoped() {
 #[tokio::test]
 async fn tenant_isolation_update_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -338,12 +358,70 @@ async fn tenant_isolation_update_cross_tenant_blocked() {
     );
 }
 
+/// A cross-tenant `update_group` must not become an existence oracle.
+///
+/// `update_group` reads the row before it opens its transaction, and that
+/// read builds `system_scope()` -- it answers for a group in any tenant. If
+/// metadata validation ran on the strength of that read alone, a caller in
+/// tenant B would get a *validation* error for a group that exists in
+/// tenant A and a *not-found* for an id that exists nowhere: two different
+/// answers, which is exactly how one learns that the foreign group is real.
+/// The scoped read has to come first, so both cases answer the same way.
+#[tokio::test]
+async fn tenant_isolation_update_cross_tenant_is_not_an_existence_oracle() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    // Every metadata validation on this one fails, so the only thing that can
+    // keep the two cases indistinguishable is the order of the two reads.
+    let oracle_svc = make_group_service_with_unavailable_registry(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let type_code = common::create_root_type(&type_svc, "xoracle").await.code;
+    let ga = common::create_root_group(&group_svc, &ctx_a, &type_code, "A's group", tenant_a).await;
+
+    let req = || resource_group_sdk::UpdateGroupRequest {
+        name: "Probe".to_owned(),
+        parent_id: None,
+        metadata: Some(serde_json::json!({"probe": true})),
+    };
+
+    let existing = oracle_svc
+        .update_group(&ctx_b, ga.id, req())
+        .await
+        .expect_err("tenant B must not update tenant A's group");
+    let unknown = oracle_svc
+        .update_group(&ctx_b, Uuid::now_v7(), req())
+        .await
+        .expect_err("an unknown id must not update anything either");
+
+    assert!(
+        matches!(
+            existing,
+            resource_group::domain::error::DomainError::GroupNotFound { .. }
+        ),
+        "a group in another tenant must answer not-found, not a metadata \
+         validation error that proves it exists: {existing}"
+    );
+    assert!(
+        matches!(
+            unknown,
+            resource_group::domain::error::DomainError::GroupNotFound { .. }
+        ),
+        "an unknown id must answer not-found: {unknown}"
+    );
+}
+
 /// Full chain: `delete_group` with wrong tenant returns not-found.
 // Scenario: L2-Tenant-05 - Cross-tenant delete blocked
 #[tokio::test]
 async fn tenant_isolation_delete_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -393,11 +471,12 @@ struct GroupScopingAuthZ {
 }
 
 #[async_trait]
-impl AuthZResolverClient for GroupScopingAuthZ {
+impl AuthZResolverApi for GroupScopingAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -438,7 +517,7 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
     let group_b = Uuid::now_v7();
     let tenant_id = Uuid::now_v7();
 
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(GroupScopingAuthZ {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(GroupScopingAuthZ {
         allowed_group_ids: vec![group_a, group_b],
     });
     let enforcer = PolicyEnforcer::new(authz);
@@ -483,7 +562,7 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
 #[tokio::test]
 async fn group_based_membership_data_correctly_stored() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -501,7 +580,7 @@ async fn group_based_membership_data_correctly_stored() {
 
     // Create task type first (project references it in allowed_membership_types)
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: task_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -512,7 +591,7 @@ async fn group_based_membership_data_correctly_stored() {
         .expect("create task type");
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: project_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -526,13 +605,10 @@ async fn group_based_membership_data_correctly_stored() {
     let project_a = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: project_type.clone(),
-                name: "ProjectA".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(
+                project_type.clone(),
+                "ProjectA".to_owned(),
+            ),
             tenant,
         )
         .await
@@ -541,20 +617,14 @@ async fn group_based_membership_data_correctly_stored() {
     let project_b = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: project_type,
-                name: "ProjectB".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(project_type, "ProjectB".to_owned()),
             tenant,
         )
         .await
         .expect("create ProjectB");
 
     // Add memberships via MembershipService (with PolicyEnforcer)
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     let membership_svc = resource_group::domain::membership_service::MembershipService::new(
         db.clone(),

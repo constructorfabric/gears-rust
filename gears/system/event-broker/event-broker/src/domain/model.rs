@@ -5,43 +5,23 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use gts::{GtsInstanceId, GtsTypeId};
 use serde_json::Value as JsonValue;
 use toolkit::domain_model;
 use uuid::Uuid;
 
-/// `gts.cf.core.events.topic.v1~` - a named, partitioned event log.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub struct Topic {
-    pub id: String,
-    pub description: Option<String>,
-    pub partitions: i32,
-    pub streaming: JsonValue,
-    pub retention: JsonValue,
-    pub created_at: DateTime<Utc>,
-}
-
-/// `gts.cf.core.events.event_type.v1~` - schema and constraints for one
-/// category of events within a topic.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub struct EventType {
-    pub id: String,
-    pub topic_id: String,
-    pub description: Option<String>,
-    pub allowed_subject_types: Vec<String>,
-    pub data_schema: JsonValue,
-    pub created_at: DateTime<Utc>,
-}
-
-/// `gts.cf.core.events.event.v1~` - an immutable record in a
-/// `(topic, partition)` log.
+/// An immutable record in a `(topic, partition)` log, and an instance of the
+/// derived GTS type its `type` field names - hence a [`GtsTypeId`] there, since
+/// an event type is a type schema and never an instance.
+///
+/// An event names no topic: the owning stream is the `topic` trait on its event
+/// type, so a single event can never disagree with its type about where it
+/// belongs. Resolve it with [`event_type::topic`](crate::domain::event_type::topic).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: Uuid,
-    pub r#type: String,
-    pub topic: String,
+    pub r#type: GtsTypeId,
     pub partition_key: Option<String>,
     pub tenant_id: Uuid,
     pub source: String,
@@ -77,7 +57,7 @@ pub struct Subscription {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub consumer_group: String,
-    pub topics: Vec<String>,
+    pub topics: Vec<GtsInstanceId>,
     pub assigned: Vec<Assignment>,
     pub session_timeout: Duration,
     pub last_seen_at: DateTime<Utc>,
@@ -87,7 +67,7 @@ pub struct Subscription {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct Assignment {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: i32,
     pub offset: i64,
     pub last_examined: i64,
@@ -98,7 +78,7 @@ pub struct Assignment {
 #[derive(Debug, Clone)]
 pub struct GroupState {
     pub consumer_group: String,
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub per_member_filters: HashMap<Uuid, JsonValue>,
     pub active_members: HashMap<Uuid, Subscription>,
     pub topology_version: i64,
@@ -109,7 +89,7 @@ pub struct GroupState {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct Cursor {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub consumer_group: String,
     pub partition: i32,
     pub offset: i64,

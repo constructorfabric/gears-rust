@@ -91,6 +91,32 @@ pub struct DbConnConfig {
     )]
     pub password: Option<SecretString>, // literal password or ${VAR} for env expansion
     pub dbname: Option<String>, // MUST be present in final for server-based DBs
+    /// Backend-specific connection parameters.
+    ///
+    /// Recognized keys are mapped to typed `sqlx` options (`sslmode`,
+    /// `application_name`, `statement_cache_capacity`, ...). **Anything else
+    /// is passed to `PostgreSQL` as a server runtime parameter**, i.e. applied
+    /// as if by `SET` on every connection in the pool.
+    ///
+    /// That catch-all is how session GUCs are configured, and it is easy to
+    /// miss because nothing names them:
+    ///
+    /// ```yaml
+    /// params:
+    ///   statement_timeout: "5s"   # abort a single statement that runs longer
+    ///   lock_timeout: "2s"        # give up waiting for a row lock
+    /// ```
+    ///
+    /// Neither has a default here, so a deployment that sets nothing has
+    /// neither bound. Note that `statement_timeout` bounds one statement, not
+    /// a transaction. For the transaction as a whole there is
+    /// `transaction_timeout`, added in `PostgreSQL` 17; before that version
+    /// there is no equivalent, and `idle_in_transaction_session_timeout`
+    /// bounds only the idle part. All three are runtime parameters, so all
+    /// three are set the same way.
+    ///
+    /// `MySQL` has no runtime-parameter equivalent; unrecognized keys there are
+    /// rejected rather than forwarded.
     #[serde(default)]
     pub params: Option<HashMap<String, String>>,
 

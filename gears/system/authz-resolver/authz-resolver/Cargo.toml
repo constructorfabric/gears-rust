@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authz-resolver"
-version = "0.1.37"
+version = "0.1.39"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,13 +21,18 @@ workspace = true
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.21", path = "../authz-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.23", path = "../authz-resolver-sdk", features = [
+    "rest-client",
+    "rest-server",
+] }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
+toolkit-security = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -38,8 +43,18 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# `register_rest` hands an `axum::Router` to the SDK's generated route
+# registration; the SDK owns the http/futures/stream deps for that codegen.
+axum = { workspace = true }
+
 # Required by toolkit::gear macro
 inventory = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Async test harness + supporting types for the gear/local-client unit tests.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true }

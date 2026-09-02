@@ -15,9 +15,9 @@ use uuid::Uuid;
 use super::common::{TENANT, publish_json, wait_until};
 
 const SLOW_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.slow.v1";
-const SLOW_EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.slow.v1";
+const SLOW_EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.slow.v1~";
 const FAST_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.fast.v1";
-const FAST_EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.fast.v1";
+const FAST_EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.fast.v1~";
 
 #[derive(Clone, Default)]
 struct RecordingRuntimeListener {
@@ -170,7 +170,6 @@ async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() 
     publish_json(
         &broker,
         &ctx,
-        SLOW_TOPIC,
         SLOW_EVENT_TYPE,
         "slow-0",
         Some(0),
@@ -282,7 +281,6 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
     publish_json(
         &broker,
         &ctx,
-        SLOW_TOPIC,
         SLOW_EVENT_TYPE,
         "slow-noisy",
         Some(0),
@@ -292,7 +290,6 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
     publish_json(
         &broker,
         &ctx,
-        FAST_TOPIC,
         FAST_EVENT_TYPE,
         "fast-independent",
         Some(0),

@@ -109,6 +109,10 @@ Check that public APIs follow idiomatic Rust conventions.
 - Prefer domain types over primitive obsession
 - Prefer explicit enums/newtypes where they encode invariants
 - Avoid exposing implementation details in public signatures
+- Accept `impl Into<String>` for owned string parameters instead of forcing callers to pre-convert
+- Flag more than 2-3 boolean parameters on one function — use an options struct, enum, or builder instead
+- Validating constructors should return `Result`, not panic or silently clamp invalid input
+- Flag `Deref`/`DerefMut` impls used to simulate inheritance on a wrapper type — this leaks the inner type's full API and blurs ownership; prefer explicit delegation methods or a trait
 
 ---
 
@@ -125,6 +129,9 @@ Check that public APIs follow idiomatic Rust conventions.
 **Review guidance**:
 - Prefer compile-time guarantees over comments
 - Flag APIs that rely on caller discipline when the type system could help
+- Prefer exhaustive `match` over a wildcard `_ =>` catch-all on crate-owned enums, so a new variant forces a compile error at call sites instead of silently falling through
+- Use `#[non_exhaustive]` on public enums/structs expected to grow variants or fields later
+- Use `#[must_use]` on results that are easy to drop by accident (builders, "must be applied" configs, guards)
 
 ---
 
@@ -142,6 +149,7 @@ Check that public APIs follow idiomatic Rust conventions.
 - Flag `map_err(|_| ...)` if it destroys useful context
 - Flag generic error wrapping that hides root cause without reason
 - Prefer propagation with context over ad hoc stringification
+- Use `TryFrom`, not `From`, for conversions that can fail — a `From` impl that panics or silently coerces on bad input is a correctness bug
 
 ---
 
@@ -173,6 +181,11 @@ Check that public APIs follow idiomatic Rust conventions.
 - Flag defensive cloning without evidence
 - Flag ownership patterns that make APIs awkward or expensive
 - Flag unnecessary heap allocation or conversion churn
+- Prefer borrowed parameter types over owned (`&str` not `&String`, `&[T]` not `&Vec<T>`, `&T` not `&Box<T>`)
+- Use `mem::take`/`mem::replace` to move a field out of `&mut self` or an enum variant instead of cloning it
+- Fallible functions that take ownership of an argument should return that value inside the error so the caller can retry without re-cloning
+- Flag a single lifetime parameter used to bound both an input argument and a stored/returned reference — it over-constrains callers; use separate lifetimes
+- Prefer RAII guard types (custom `Drop`) over manual acquire/release call pairs
 
 ---
 
@@ -191,6 +204,9 @@ Check that public APIs follow idiomatic Rust conventions.
 - Flag `.await` inside critical sections
 - Flag detached tasks with no supervision or shutdown behavior
 - Flag loops that can retry forever without jitter, cap, or logging
+- Functions holding partial or shared state across `.await` points should be auditable for cancel-safety — consider what happens if the future is dropped mid-await via `select!` or a timeout
+- `Drop` cannot `.await` — audit `Drop` impls on async-held resources (transactions, connections, guards) for cleanup that actually needs an async call; it must be handled explicitly, not assumed to run via `Drop`
+- CPU-bound async loops should yield periodically (`tokio::task::yield_now()`) so they do not starve other tasks on the same executor thread
 
 ---
 
@@ -224,6 +240,11 @@ Check that public APIs follow idiomatic Rust conventions.
 - Flag missing validation on request or config boundaries
 - Flag security checks implemented too deep or too late
 - Flag implicit trust in upstream data without validation
+- Never leak internal details (stack traces, file paths, SQL text, dependency versions) in error responses returned to external callers
+- Security-sensitive randomness (tokens, session IDs, nonces) must use a CSPRNG, never a general-purpose or seeded PRNG
+- Outbound requests built from user-supplied URLs or hosts must guard against SSRF (validate/allowlist the destination, block internal/link-local ranges) before the request is issued
+- Flag hardcoded secrets, API keys, passwords, or tokens committed literally in the diff
+- Flag disabled or weakened TLS certificate validation
 
 ---
 
@@ -256,6 +277,8 @@ Check that public APIs follow idiomatic Rust conventions.
 - Do not micro-optimize blindly
 - Report only clear, likely-relevant footguns
 - Prefer evidence-based performance comments
+- Flag `.collect::<Vec<_>>()` immediately consumed by another loop or iteration — chain iterators instead of materializing an intermediate collection
+- Flag `Box::new([0; N])` for large buffers — allocate via `vec![0; n]` to avoid building an oversized value on the stack before the move
 
 ---
 
@@ -305,6 +328,7 @@ Check that public APIs follow idiomatic Rust conventions.
 - Flag "god gears"
 - Flag handlers/controllers doing domain work directly
 - Flag infrastructure details leaking into domain logic without need
+- Flag `#![deny(warnings)]` (or equivalent) added directly in source — it silently escalates any future lint, including new compiler lints, into a hard build break for downstream consumers; deny specific lints by name, or gate via CI/`RUSTFLAGS`, not a blanket source-level deny
 
 ---
 
@@ -373,6 +397,7 @@ Check that public APIs follow idiomatic Rust conventions.
 - No accidental serde/wire/schema changes
 - No accidental visibility expansion
 - No accidental behavior changes hidden inside refactoring
+- No new blanket trait impls (`impl<T: Bound> Trait for T`) in a public API without deliberate justification — they are a semver/coherence hazard for downstream crates
 
 ---
 

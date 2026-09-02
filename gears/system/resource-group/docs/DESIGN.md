@@ -64,7 +64,7 @@ RG is intentionally policy-agnostic:
 
 The architecture consists of:
 
-- **RG Resolver SDK** — read and write trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`)
+- **RG Resolver SDK** — read and write trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`, `ResourceGroupTypeBootstrap` — the last one un-gated, for in-process type registration at gear init, see the AuthZ matrix below)
 - **RG Gear (Gateway)** — routes requests to built-in or vendor-specific provider
 - **RG Plugin** — full service with database, REST API, seeding, and domain logic
 
@@ -659,7 +659,7 @@ Client initialization: AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` fr
 | Dependency                            | Interface                       | Purpose                                                       |
 | ------------------------------------- | ------------------------------- | ------------------------------------------------------------- |
 | SQL database                          | SeaORM repositories             | durable canonical + closure storage                           |
-| AuthZ Resolver SDK                    | `PolicyEnforcer` / `AuthZResolverClient` | AuthZ evaluation for JWT-authenticated RG API requests (write + read) |
+| AuthZ Resolver SDK                    | `PolicyEnforcer` / `AuthZResolverApi` | AuthZ evaluation for JWT-authenticated RG API requests (write + read) |
 | Vendor-specific RG backend (optional) | `ResourceGroupReadHierarchy`    | alternative hierarchy/membership source for integration reads (vendor impl replaces the registered `ResourceGroupReadHierarchy` at gear init) |
 | AuthZ plugin consumer (optional)      | `ResourceGroupReadHierarchy`    | read group context in PDP logic (narrow reads: hierarchy + listing + single-group + memberships, resolved unscoped; in-process via `ClientHub` — `p1`; MTLS transport — `p2`, deferred / not implemented yet) |
 | General consumers (optional)          | `ResourceGroupClient`           | full read+write access to types/entities/memberships/hierarchy |
@@ -731,7 +731,7 @@ sequenceDiagram
 Write-concurrency rule for hierarchy mutations (`create/move/delete`):
 
 - authoritative invariant checks MUST run inside the same write transaction that applies closure/entity mutations
-- write transactions MUST use `SERIALIZABLE` isolation to prevent phantom reads between cycle-check and closure/entity insert under concurrent hierarchy mutations; `SERIALIZABLE` is the recommended default
+- a write transaction whose invariant check reads a predicate over rows the write itself does not lock MUST use `SERIALIZABLE` isolation, to prevent a phantom read between that check and the mutation under concurrent hierarchy mutations — rewriting closure rows across a subtree (`move`, a parent-changing `update`, a **force** delete) is one case of this, and so is `create`'s depth/width check, which reads the parent's depth and sibling count without locking either. A write that instead locks whatever its decision was read from — one row by primary key, or a row lock such as `SELECT ... FOR UPDATE` — does not need it — see the retry-policy section for which operation is which
 - serialization conflicts are handled by bounded retry with deterministic error mapping when retries are exhausted
 
 #### AuthZ + RG + SQL Responsibility Split
@@ -776,12 +776,12 @@ Phase 1 (SystemCapability):
      → REST/gRPC endpoints NOT yet accepting traffic
 
   2. AuthZ Resolver init (deps: [types-registry])
-     → registers AuthZResolverClient in ClientHub
+     → registers AuthZResolverApi in ClientHub
      → plugin discovery is lazy (first evaluate() call)
 
 Phase 2 (ready):
   3. RG Gear starts accepting REST/gRPC traffic
-     → write operations call PolicyEnforcer → AuthZResolverClient (available since step 2)
+     → write operations call PolicyEnforcer → AuthZResolverApi (available since step 2)
      → seed operations run as pre-deployment step with system SecurityContext (bypass AuthZ)
 
   4. AuthZ plugin on first evaluate() call
@@ -821,7 +821,7 @@ sequenceDiagram
     GW->>CS: handler(ctx: SecurityContext)
 
     CS->>PE: access_scope(ctx, COURSE, "list", None)
-    PE->>AZ: evaluate(EvaluationRequest)
+    PE->>AZ: evaluate(SecurityContext, EvaluationRequest)
     Note right of AZ: subject.properties.tenant_id = T1<br/>action.name = "list"<br/>resource.type = "gts.cf.lms.course.v1~"<br/>context.require_constraints = true<br/>context.supported_properties = ["owner_tenant_id"]
 
     AZ->>RG: list_group_depth(system_ctx, T1, filter: "hierarchy/depth ge 0 and type eq 'tenant'")
@@ -843,7 +843,7 @@ Step-by-step:
 
 2. **Domain service** — Courses handler receives the request with `SecurityContext`. Before querying the database, it calls `PolicyEnforcer.access_scope(&ctx, &COURSE_RESOURCE, "list", None)` to obtain row-level access constraints.
 
-3. **AuthZ evaluation** — `PolicyEnforcer` builds an `EvaluationRequest` (subject with `tenant_id = T1`, action `"list"`, resource type `"gts.cf.lms.course.v1~"`, `require_constraints = true`, `supported_properties = ["owner_tenant_id"]`) and calls `AuthZResolverClient.evaluate()`.
+3. **AuthZ evaluation** — `PolicyEnforcer` builds an `EvaluationRequest` (subject with `tenant_id = T1`, action `"list"`, resource type `"gts.cf.lms.course.v1~"`, `require_constraints = true`, `supported_properties = ["owner_tenant_id"]`) and calls `AuthZResolverApi.evaluate(ctx, request)`, passing the caller's `SecurityContext` ahead of the `EvaluationRequest` and receiving `Result<EvaluationResponse, CanonicalError>`.
 
 4. **Hierarchy resolution** — The AuthZ plugin calls `ResourceGroupReadHierarchy.list_group_depth()` with `tenant_id = T1` and a depth filter to resolve the tenant hierarchy. RG returns `[T1 (depth 0), T7 (depth 1)]` — the accessible tenant subtree. The plugin does NOT see `T9` because it is outside `T1`'s hierarchy.
 
@@ -1151,7 +1151,7 @@ Indexes:
 | `resource_id`   | TEXT        | caller-defined resource identifier         |
 | `created_at`       | TIMESTAMPTZ | creation time                              |
 
-Tenant scope is not stored on membership rows. It is derived from `resource_group.tenant_id` via JOIN on `group_id`.
+Tenant scope is not stored on membership rows. It is derived from `resource_group.tenant_id` via JOIN on `group_id` — including the "one tenant per resource" check, which asks whether any membership of the pair belongs to another tenant and is answered by that JOIN with `LIMIT 1`, inside the same `SERIALIZABLE` transaction as the insert it gates.
 
 Constraints/indexes:
 
@@ -1245,7 +1245,7 @@ RG relies on database-level performance rather than application-level caching:
 - **Connection pooling**: handled by platform database infrastructure (connection pool configuration is deployment-specific).
 - **Scalability approach**: vertical scaling of the database instance is the primary strategy. Horizontal read replicas can be added for read-heavy AuthZ query paths. `resource_group_membership` partitioning is a candidate optimization for production scale (see PRD Open Questions).
 - **Application-tier horizontal scaling**: RG is a stateless service with no in-process caches, sessions, or local state. Multiple RG instances can run behind the platform load balancer without session affinity. Scaling the application tier is a simple matter of increasing replica count — the platform orchestration layer handles load distribution. All coordination is delegated to PostgreSQL (SERIALIZABLE transactions for write consistency, connection pool for concurrency control).
-- **Query cost protection**: all list endpoints enforce `limit` (max 200 per page). Unbounded hierarchy traversals are bounded by `max_depth` query profile. Database-level query timeout (statement_timeout) is configured at the connection pool level per platform defaults. API-layer rate limiting is handled by the API gateway — RG does not implement its own throttling.
+- **Query cost protection**: all list endpoints enforce `limit` (max 200 per page). Unbounded hierarchy traversals are bounded by the `max_depth` query profile, but only where one is configured: `null`/absent disables the depth limit (§3.8), so unless a deployment sets it, traversal depth is unbounded. Database-level query timeout (`statement_timeout`) and lock wait (`lock_timeout`) are PostgreSQL runtime parameters, set per connection through the database config's `params` map — any key `toolkit-db` does not recognize is passed to the server as a runtime option. No platform default is set in this repository, so unless a deployment supplies one, neither is bounded. API-layer rate limiting is handled by the API gateway — RG does not implement its own throttling.
 - **Closure write amplification bounds**: subtree move operations update `O(N × D)` closure rows where N = subtree size and D = depth. With `max_depth = 10` and typical organizational hierarchies (width >> depth), expected subtree sizes for move operations are under 10K nodes. For larger subtrees, SERIALIZABLE isolation + bounded retry (max 3) prevents runaway transactions. No hard cap on subtree size is enforced — `max_depth` and `max_width` provide indirect bounds.
 - **Optimistic concurrency**: v1 uses last-write-wins semantics for `PUT /groups/{id}`. ETag-based optimistic concurrency control is a candidate for future versions if concurrent update conflicts become a production concern.
 - **Latency budget** (target p95 < 250 ms for hierarchy queries, default profile `max_depth = 10`):
@@ -1288,6 +1288,7 @@ RG relies on database-level performance rather than application-level caching:
 | `gts.cf.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `read` | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | JWT |
 | _(AuthZ bypassed)_ | — | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | MTLS |
+| _(AuthZ bypassed)_ | — | `ResourceGroupTypeBootstrap` (no REST surface) | — | — | in-process |
 | `gts.cf.core.rg.group_membership.v1~` | `list` | `listMemberships` | GET | `/memberships` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `create` | `addMembership` | POST | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `delete` | `deleteMembership` | DELETE | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
@@ -1297,6 +1298,7 @@ Notes:
   - Standard action vocabulary: `list` (collection), `read` (single resource), `create`, `update`, `delete` — aligned with [AuthZ usage scenarios](../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md).
   - The AuthZ plugin reads hierarchy in-process via `ResourceGroupReadHierarchy` registered in `ClientHub` and **bypasses `PolicyEnforcer` invocation** on those reads (`AccessScope::allow_all()`); the plugin still produces AuthZ tenant/subtree constraints from the returned hierarchy — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - MTLS-authenticated requests (AuthZ plugin only) **also** bypass `PolicyEnforcer` entirely — `p2`, **deferred / not implemented yet**, planned for the future microservice split — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
+  - `ResourceGroupTypeBootstrap` is a narrow, deliberately un-gated SDK trait registered in `ClientHub`, backed by `TypeService`'s unscoped methods. Its one permitted caller is account-management's `register_user_group_types`, which registers the RG type schemas it owns from its own `Gear::init` — a phase at which no gated call can both find a plugin (types-registry keeps registrations in a staging buffer until `post_init`) and be admitted by it (the only actor a gear-init path has is platform-scoped, which the static AuthZ plugin rejects). Guardrail: it must never be exposed through REST, pinned by `bootstrap_bypasses_policy_enforcer_while_gated_path_denies`. Sunset: the carve-out exists only because the GTS type registry lives inside this gear, and should not survive a split of the registry.
   - `listGroupHierarchy` shares `resource_group` + `read` permission with `getGroup` — both are group read operations; the AuthZ policy may differentiate them if needed.
 
 ### Reliability Architecture
@@ -1421,7 +1423,7 @@ Index-to-data ratio: **2.03×** (reasonable for btree-only indexes with UUID key
 |---|---|---|---|---|
 | **Unit** | No DB — in-memory trait mocks | No network | Domain services, invariant logic, error mapping | All repositories (trait-based `InMemory*` impls) |
 | **Integration** | SQLite in-memory (`:memory:`, per-test schema) | No network — direct repo calls | Repositories, closure table SQL, SecureORM tenant scoping, constraints | PostgreSQL-dialect SQL, SERIALIZABLE semantics, `gts_type_path` DOMAIN (covered by E2E) |
-| **API** | SQLite in-memory | No real network — `Router::oneshot()` (in-process HTTP simulation) | REST handlers, OData parsing, domain services, DB | `PolicyEnforcer` / `AuthZResolverClient` (mock Allow/Deny) |
+| **API** | SQLite in-memory | No real network — `Router::oneshot()` (in-process HTTP simulation) | REST handlers, OData parsing, domain services, DB | `PolicyEnforcer` / `AuthZResolverApi` (mock Allow/Deny) |
 | **E2E** | Real PostgreSQL (Docker or hosted) | Real HTTP via `httpx` to running `cf-gears-server` | Everything: AuthZ, DB, network, auth modes | Nothing — full production-like stack |
 
 #### Level 1: Unit Tests (Domain Layer)
@@ -1515,7 +1517,7 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 
 | Dependency | Mock | Why |
 |---|---|---|
-| `PolicyEnforcer` / `AuthZResolverClient` | `MockAuthZResolverClient` (always Allow) or `DenyingAuthZResolverClient` | Isolate from AuthZ; test RG's own auth mode logic |
+| `PolicyEnforcer` / `AuthZResolverApi` | `MockAuthZResolverClient` (always Allow) or `DenyingAuthZResolverClient` | Isolate from AuthZ; test RG's own auth mode logic |
 | Database | SQLite in-memory | REST tests need real query execution for OData/pagination; PostgreSQL-dialect behavior covered by E2E |
 | Domain services | Real (not mocked) | REST layer delegates to real services |
 
@@ -1589,7 +1591,14 @@ Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env 
 
 #### Concurrency Testing
 
-Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bounded retry. Concurrency tests verify correctness under parallel access.
+Hierarchy mutations run with bounded retry, at an isolation level chosen per operation rather than fixed:
+
+- `SERIALIZABLE` where a write depends on a predicate over rows it does not itself lock:
+  - `create` — the depth/width limit check reads the parent's depth and its sibling count, and the insert that follows locks neither, so two concurrent creates under the same parent can each read a count that passes the check and both commit past the limit.
+  - `move`, a parent-changing `update`, and a **force** delete — these rewrite closure rows across a subtree, exposed to the same phantom-read window between the cycle check and the closure/entity mutation.
+- The backend default where there is no such predicate: a name/metadata-only `update`, which changes one row by primary key, and a **non-force** delete, which takes a row lock (`SELECT ... FOR UPDATE`) on its target so the children and membership checks it decides from stay true until it commits.
+
+The second group does not *require* `SERIALIZABLE` — it does not stop being correct under it. What changes is where contention shows up: on PostgreSQL's default (`READ COMMITTED`) those operations wait on a row lock rather than aborting with `40001`, so retries there are for deadlocks, not for serialization failures. A deployment that raises the default to `SERIALIZABLE`, and SQLite, which is serializable regardless, keep the abort-and-retry behaviour; retry is in place either way. Concurrency tests verify correctness under parallel access.
 
 **Serialization retry policy**:
 
@@ -1604,9 +1613,14 @@ Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bou
   surfaces whatever the database said, which today reaches HTTP as a 500.
   Whether an exhausted retry deserves its own status is an open contract
   question, tracked in `db-behavior-audit.md` under Deferred.
-- transaction timeout: none. `TxConfig` carries `isolation` and `access_mode`
-  and nothing else — there is no timeout mechanism to configure. The "5s
-  (configurable)" this list used to claim never existed.
+- transaction timeout: none is set. `TxConfig` carries `isolation` and
+  `access_mode` and nothing else, so there is no per-call knob. On the server
+  side `statement_timeout` bounds a single statement, not a transaction;
+  `transaction_timeout` (PostgreSQL 17+) bounds the transaction, and on
+  earlier versions there is no equivalent. The benchmark environment above is
+  PostgreSQL 17, so the 5s bound this section used to claim is reachable — it
+  is simply not configured. Nothing in this repository sets any of the three;
+  see the query-cost note above for how a deployment can.
 
 **Concurrency test pattern** (E2E test level — requires real PostgreSQL for SERIALIZABLE isolation):
 

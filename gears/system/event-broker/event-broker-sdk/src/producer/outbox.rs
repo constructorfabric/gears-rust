@@ -29,8 +29,6 @@ pub struct ProducerOutboxEnvelope {
     source: String,
     subject: String,
     subject_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    partition_key: Option<String>,
     occurred_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_parent: Option<String>,
@@ -53,6 +51,7 @@ pub struct ProducerOutboxDiagnostics {
 impl ProducerOutboxEnvelope {
     pub(crate) fn from_event(
         event: Event,
+        topic: String,
         broker_partition: u32,
         producer_mode: ProducerMode,
         producer_id: Option<ProducerId>,
@@ -63,12 +62,11 @@ impl ProducerOutboxEnvelope {
             version: PRODUCER_OUTBOX_ENVELOPE_VERSION,
             event_id: event.id,
             event_type_id: event.type_id,
-            topic: event.topic,
+            topic,
             tenant_id: event.tenant_id,
             source: event.source,
             subject: event.subject,
             subject_type: event.subject_type,
-            partition_key: event.partition_key,
             occurred_at: event.occurred_at,
             trace_parent: event.trace_parent,
             data: event.data,
@@ -126,12 +124,10 @@ impl ProducerOutboxEnvelope {
         Ok(Event {
             id: self.event_id,
             type_id: self.event_type_id.clone(),
-            topic: self.topic.clone(),
             tenant_id: self.tenant_id,
             source: self.source.clone(),
             subject: self.subject.clone(),
             subject_type: self.subject_type.clone(),
-            partition_key: self.partition_key.clone(),
             occurred_at: self.occurred_at,
             trace_parent: self.trace_parent.clone(),
             data: self.data.clone(),
@@ -403,10 +399,10 @@ impl ProducerOutboxProcessor {
             Ok(event) => event,
             Err(err) => return MessageResult::Reject(err.to_string()),
         };
-        self.publish_event(event).await
+        self.publish_event(&envelope.topic, event).await
     }
 
-    async fn publish_event(&self, event: Event) -> MessageResult {
+    async fn publish_event(&self, topic: &str, event: Event) -> MessageResult {
         match self
             .producer
             .broker
@@ -421,7 +417,10 @@ impl ProducerOutboxProcessor {
                     self.cursor_state
                         .lock()
                         .expect("producer outbox cursor state lock poisoned")
-                        .insert((ProducerId(producer_id), event.topic, partition), sequence);
+                        .insert(
+                            (ProducerId(producer_id), topic.to_owned(), partition),
+                            sequence,
+                        );
                 }
                 MessageResult::Ok
             }
@@ -484,7 +483,10 @@ impl LeasedMessageHandler for ProducerOutboxProcessor {
                     self.cursor_state
                         .lock()
                         .expect("producer outbox cursor state lock poisoned")
-                        .insert((ProducerId(producer_id), event.topic, partition), sequence);
+                        .insert(
+                            (ProducerId(producer_id), envelope.topic.clone(), partition),
+                            sequence,
+                        );
                 }
                 MessageResult::Ok
             }

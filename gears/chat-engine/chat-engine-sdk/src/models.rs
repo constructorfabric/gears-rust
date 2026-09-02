@@ -914,7 +914,7 @@ pub struct StreamingToolEvent {
 #[cfg(test)]
 mod streaming_event_wire_format_tests {
     //! Pins the on-wire JSON shape of `StreamingEvent` and its payload structs
-    //! to the snake_case contract documented in `api/README.md`, `api/http-protocol.json`,
+    //! to the snake_case contract documented in `docs/openapi.json`,
     //! and ADR-0006 §Streaming Event Types. If you find yourself updating these
     //! tests to change `message_id` → `messageId` (or similar), update the
     //! OpenAPI spec and announce a breaking wire-protocol change first.

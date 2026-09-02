@@ -29,6 +29,15 @@ impl ScopeError {
             _ => false,
         }
     }
+
+    /// Returns `true` if this error wraps a foreign-key violation.
+    #[must_use]
+    pub fn is_foreign_key_violation(&self) -> bool {
+        match self {
+            Self::Db(db_err) => is_foreign_key_violation(db_err),
+            _ => false,
+        }
+    }
 }
 
 /// Check whether a `sea_orm::DbErr` represents a unique-constraint violation.
@@ -59,4 +68,105 @@ pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
         || msg.contains("unique_violation")
         || msg.contains("duplicate entry")
         || msg.contains("unique constraint failed")
+}
+
+/// Check whether a `sea_orm::DbErr` represents a foreign-key violation.
+///
+/// The counterpart of [`is_unique_violation`], and detected the same way: the
+/// SQLSTATE fast path first, then a message match for errors that were
+/// re-wrapped on the way here and lost their typed shape.
+///
+/// Useful where a referencing row is the invariant and the `RESTRICT` on the
+/// foreign key is what actually enforces it -- a preceding count is a nicer
+/// message, not the guard, and under concurrency the constraint is what
+/// answers.
+///
+/// Recognized patterns across backends:
+/// - **Postgres** SQLSTATE `23503` — "`foreign_key_violation`" / "violates
+///   foreign key constraint"
+/// - **`SQLite`** extended code `787` (`SQLITE_CONSTRAINT_FOREIGNKEY`) —
+///   "FOREIGN KEY constraint failed"
+/// - **`MySQL`** errors `1451`/`1452` — "a foreign key constraint fails"
+#[must_use]
+pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
+    if matches!(
+        err.sql_err(),
+        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+    ) {
+        return true;
+    }
+
+    let msg = err.to_string().to_lowercase();
+    msg.contains("foreign key constraint")
+        || msg.contains("foreign_key_violation")
+        || msg.contains("violates foreign key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_foreign_key_violation, is_unique_violation};
+    use sea_orm::DbErr;
+
+    // The classifiers are reached through two shapes: the typed `SqlErr` the
+    // driver produces, and the `DbErr::Custom` left by a caller that
+    // re-wrapped the error through `to_string()`.
+    //
+    // In this workspace the *typed* shape is the production one for these two
+    // functions: every call site classifies the raw `ScopeError::Db` straight
+    // out of `secure_insert`/`secure_delete`, and only stringifies what the
+    // classifier already rejected. (`is_retryable_contention` is the opposite
+    // case, and the one RG-15 was about -- do not carry that conclusion
+    // across.)
+    //
+    // The typed path cannot be exercised from here: it needs a `DbErr` whose
+    // `sql_err()` resolves, and that requires a real `PgDatabaseError` or
+    // `SqliteError`, both of which have crate-private constructors. It is
+    // covered end-to-end instead, by tests that provoke a genuine violation
+    // against live SQLite. What is left for a unit test is the message
+    // matching below, per backend.
+
+    #[test]
+    fn foreign_key_violation_detected_per_backend_message() {
+        for msg in [
+            "error returned from database: update or delete on table \"gts_type\" violates \
+             foreign key constraint \"resource_group_gts_type_id_fkey\" on table \
+             \"resource_group\"",
+            "error returned from database: (code: 787) FOREIGN KEY constraint failed",
+            "Cannot delete or update a parent row: a foreign key constraint fails",
+        ] {
+            assert!(
+                is_foreign_key_violation(&DbErr::Custom(msg.to_owned())),
+                "should classify as a foreign-key violation: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_key_and_unique_are_not_confused() {
+        // They map to different domain answers -- "still referenced" versus
+        // "already exists" -- so a classifier that matched both would report
+        // the wrong conflict.
+        let unique = DbErr::Custom("UNIQUE constraint failed: gts_type.schema_id".to_owned());
+        let unique_pg = DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \
+             \"gts_type_schema_id_key\""
+                .to_owned(),
+        );
+        assert!(is_unique_violation(&unique_pg));
+        assert!(!is_foreign_key_violation(&unique_pg));
+        let fk = DbErr::Custom("FOREIGN KEY constraint failed".to_owned());
+
+        assert!(is_unique_violation(&unique));
+        assert!(!is_foreign_key_violation(&unique));
+
+        assert!(is_foreign_key_violation(&fk));
+        assert!(!is_unique_violation(&fk));
+    }
+
+    #[test]
+    fn an_unrelated_error_is_neither() {
+        let err = DbErr::Custom("connection reset by peer".to_owned());
+        assert!(!is_unique_violation(&err));
+        assert!(!is_foreign_key_violation(&err));
+    }
 }

@@ -8,7 +8,7 @@ use crate::ids::{ConsumerGroupId, TopicId};
 use super::DeadLetterRecord;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1~");
 
 fn raw_event() -> RawEvent {
     RawEvent {
@@ -18,7 +18,6 @@ fn raw_event() -> RawEvent {
         tenant_id: Uuid::new_v4(),
         subject: "order-1".to_owned(),
         subject_type: "order".to_owned(),
-        partition_key: Some("tenant-a/order-1".to_owned()),
         partition: 3,
         sequence: 42,
         offset: 42,
@@ -48,7 +47,6 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.event_type, EVENT_TYPE);
     assert_eq!(record.subject, "order-1");
     assert_eq!(record.subject_type, "order");
-    assert_eq!(record.partition_key.as_deref(), Some("tenant-a/order-1"));
     assert_eq!(record.partition, 3);
     assert_eq!(record.offset, 42);
     assert_eq!(record.payload, payload);

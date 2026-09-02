@@ -1,7 +1,10 @@
 //! Operator-facing configuration for the Event Broker module
-//! (`DESIGN.md` §4.1 Deployment Modes, example YAML at `DESIGN.md:2363-2391`).
+//! (`DESIGN.md` §4.1 "Deployment Modes", which carries the example YAML).
+
+use std::time::Duration;
 
 use serde::Deserialize;
+use toolkit_utils::iso8601_duration::Iso8601Duration;
 
 /// Which of the four deployment-mode wiring variants this instance runs as.
 /// Drives [`crate::module::EventBrokerModule`]'s per-mode service/route
@@ -28,6 +31,10 @@ pub struct EventBrokerConfig {
     pub default_storage_backend: String,
 
     #[serde(default)]
+    pub topic: TopicConfig,
+    #[serde(default)]
+    pub producer: ProducerConfig,
+    #[serde(default)]
     pub batch: BatchConfig,
     #[serde(default)]
     pub polling: PollingConfig,
@@ -35,6 +42,59 @@ pub struct EventBrokerConfig {
     pub subscription: SubscriptionConfig,
     #[serde(default)]
     pub workers: WorkersConfig,
+}
+
+/// Defaults the broker applies to a topic that declares none. A topic carries
+/// what the stream is; how many partitions back it and how long they are kept
+/// when unstated are the broker's to decide, so an operator tunes them here
+/// rather than every topic author restating them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicConfig {
+    /// Partitions a topic is divided into. Each is an independent ordered log,
+    /// so events sharing a partition see total order and events across
+    /// partitions see none.
+    pub partitions: u32,
+    /// How long events are retained when a topic states no retention of its own.
+    pub retention: Iso8601Duration,
+}
+
+impl Default for TopicConfig {
+    fn default() -> Self {
+        Self {
+            // Enough headroom to parallelise a consumer group without making
+            // fan-out a decision every topic author has to take up front.
+            // Partition count cannot be changed on a live topic, so the default
+            // errs high rather than low.
+            partitions: 8,
+            // 30 days, in the largest unit `Duration` offers on stable.
+            retention: Iso8601Duration::new(Duration::from_hours(720)),
+        }
+    }
+}
+
+/// Deduplication state the broker keeps on behalf of chained and monotonic
+/// producers. This is publish-side bookkeeping, unrelated to how long a topic's
+/// events are kept.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerConfig {
+    /// How long a `(producer_id, topic, partition)` chain row survives without
+    /// activity before the reaper deletes it, which is also the window a replayed
+    /// publish can still be deduplicated within. Capped at `P14D`: a chain row is
+    /// only useful for as long as a producer might retry, and holding one per
+    /// producer per partition indefinitely is unbounded state.
+    pub state_retention: Iso8601Duration,
+}
+
+impl Default for ProducerConfig {
+    fn default() -> Self {
+        Self {
+            // The cap itself: 14 days, in the largest unit `Duration` offers on
+            // stable.
+            state_retention: Iso8601Duration::new(Duration::from_hours(336)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

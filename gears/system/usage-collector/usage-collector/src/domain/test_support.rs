@@ -4,7 +4,7 @@
 //! `types_registry_sdk::testing` directly (gated on the `test-util`
 //! dev-dependency feature).
 //!
-//! PDP: this module exposes `AuthZResolverClient` fakes plus `PolicyEnforcer`
+//! PDP: this module exposes `AuthZResolverApi` fakes plus `PolicyEnforcer`
 //! constructors that let tests pin every outcome (permit + constraints, deny,
 //! empty-constraints fail-closed, transport unreachable, and no-cache via the
 //! per-call counting resolvers).
@@ -25,9 +25,10 @@ use authz_resolver_sdk::constraints::Constraint;
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
-use toolkit_security::pep_properties;
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
     AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
     UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
@@ -231,11 +232,12 @@ impl CountingTenantPermitResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CountingTenantPermitResolver {
+impl AuthZResolverApi for CountingTenantPermitResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(permit_scoped_to_request_tenant(&request))
     }
@@ -271,11 +273,12 @@ impl CountingPermitResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CountingPermitResolver {
+impl AuthZResolverApi for CountingPermitResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(permit_with_string_constraint(
             self.property,
@@ -310,11 +313,12 @@ impl CountingAllowAllResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CountingAllowAllResolver {
+impl AuthZResolverApi for CountingAllowAllResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(EvaluationResponse {
             decision: true,
@@ -355,11 +359,12 @@ impl CapturingTenantPermitResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CapturingTenantPermitResolver {
+impl AuthZResolverApi for CapturingTenantPermitResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let response = permit_scoped_to_request_tenant(&request);
         *self.last_request.lock().expect("mutex") = Some(request);
         Ok(response)
@@ -373,11 +378,12 @@ impl AuthZResolverClient for CapturingTenantPermitResolver {
 pub struct PermitEmptyConstraintsResolver;
 
 #[async_trait]
-impl AuthZResolverClient for PermitEmptyConstraintsResolver {
+impl AuthZResolverApi for PermitEmptyConstraintsResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -394,11 +400,12 @@ impl AuthZResolverClient for PermitEmptyConstraintsResolver {
 pub struct DenyAllResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllResolver {
+impl AuthZResolverApi for DenyAllResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -416,14 +423,17 @@ impl AuthZResolverClient for DenyAllResolver {
 pub struct UnreachableResolver;
 
 #[async_trait]
-impl AuthZResolverClient for UnreachableResolver {
+impl AuthZResolverApi for UnreachableResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::ServiceUnavailable(
-            "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
-        ))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::service_unavailable()
+            .with_detail(
+                "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
+            )
+            .create())
     }
 }
 
@@ -450,19 +460,22 @@ impl CountingUnreachableResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CountingUnreachableResolver {
+impl AuthZResolverApi for CountingUnreachableResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(AuthZResolverError::ServiceUnavailable(
-            "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
-        ))
+        Err(CanonicalError::service_unavailable()
+            .with_detail(
+                "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
+            )
+            .create())
     }
 }
 
-/// Wrap a `dyn AuthZResolverClient` in a `PolicyEnforcer` for tests, mirroring
+/// Wrap a `dyn AuthZResolverApi` in a `PolicyEnforcer` for tests, mirroring
 /// the production `module.rs` wiring (`PolicyEnforcer::new(authz)`). No
 /// capabilities are advertised, matching production (`module.rs:74`):
 /// `usage_record` is a flat resource that does not advertise
@@ -473,7 +486,7 @@ impl AuthZResolverClient for CountingUnreachableResolver {
 /// hierarchy-aware enforcer must build one explicitly and assert the
 /// `InTenantSubtree` fail-closed behavior at that call site.
 #[must_use]
-pub fn enforcer_for(authz: Arc<dyn AuthZResolverClient>) -> PolicyEnforcer {
+pub fn enforcer_for(authz: Arc<dyn AuthZResolverApi>) -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
@@ -548,7 +561,7 @@ pub fn service_with_counting_permit(
 ) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
     let resolver = CountingTenantPermitResolver::new();
-    let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverClient>);
+    let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
     let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
     (service, resolver)
 }
@@ -592,7 +605,7 @@ pub fn local_metrics() -> (
 pub fn service_with_metrics(
     plugin: Arc<dyn UsageCollectorPluginV1>,
     suffix: &str,
-    resolver: Arc<dyn AuthZResolverClient>,
+    resolver: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
     let (metrics, provider, exporter) = local_metrics();
@@ -625,7 +638,7 @@ pub fn hub_registry_only(suffix: &str, vendor: &str) -> Arc<ClientHub> {
 #[must_use]
 pub fn service_with_metrics_unready_plugin(
     suffix: &str,
-    resolver: Arc<dyn AuthZResolverClient>,
+    resolver: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
     let hub = hub_registry_only(suffix, "cyberfabric");
     let (metrics, provider, exporter) = local_metrics();

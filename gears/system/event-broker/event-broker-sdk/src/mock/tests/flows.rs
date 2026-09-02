@@ -28,7 +28,7 @@ async fn s1_01_flow_publish_subscribe_consume() {
     // -- Exchanges 1-3: publish three events (persist-confirming path). ----------
     for _ in 0..3 {
         let outcome = broker
-            .publish_sync(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish_sync(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
         assert!(

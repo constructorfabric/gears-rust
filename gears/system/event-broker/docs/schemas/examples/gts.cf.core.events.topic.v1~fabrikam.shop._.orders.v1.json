@@ -1,0 +1,5 @@
+{
+  "id": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+  "description": "Worked producer example: a third-party application's own order-lifecycle stream, registered by that application at its init rather than by the broker.",
+  "retention": "P7D"
+}

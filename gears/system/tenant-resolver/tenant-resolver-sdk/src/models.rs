@@ -109,7 +109,19 @@ impl From<&TenantInfo> for TenantRef {
 ///
 /// [`as_smallint`]: TenantStatus::as_smallint
 /// [`from_smallint`]: TenantStatus::from_smallint
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantStatus {
     /// Tenant is active and operational.

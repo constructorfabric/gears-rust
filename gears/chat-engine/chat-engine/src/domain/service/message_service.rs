@@ -61,8 +61,8 @@ use crate::domain::context::{
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::memory_strategy::MemoryStrategy;
 use crate::domain::message::{
-    Message, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
-    StreamingStartEvent,
+    MAX_MESSAGE_METADATA_BYTES, Message, RESERVED_MESSAGE_METADATA_KEYS, StreamingChunkEvent,
+    StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent, StreamingStartEvent,
 };
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
@@ -164,6 +164,12 @@ pub struct SendMessageRequest {
     pub file_ids: Vec<Uuid>,
     pub parent_message_id: Option<Uuid>,
     pub capabilities: Option<Vec<CapabilityValue>>,
+    /// Opaque per-turn client context persisted on the user message row
+    /// (device, locale, active error state, …). Unlike `capabilities` it
+    /// survives into reads, export, replay, recreate, and branching, so the
+    /// conditioning of a past turn stays reconstructable. Validated by
+    /// [`validate_message_metadata`].
+    pub metadata: Option<JsonValue>,
 }
 
 /// Outgoing event stream returned by [`MessageService::send_message`]. The
@@ -1202,6 +1208,8 @@ impl MessageService {
             ));
         }
 
+        validate_message_metadata(req.metadata.as_ref())?;
+
         // Ownership is already enforced by the caller's parent-session PDP
         // decision (`authorize_session`); `session` is the authorized row.
 
@@ -1299,7 +1307,7 @@ impl MessageService {
             } else {
                 Some(req.file_ids.clone())
             },
-            metadata: None,
+            metadata: req.metadata.clone(),
         };
         self.messages.insert_user_and_assistant_stub(payload).await
     }
@@ -1799,6 +1807,38 @@ enum DriverOutcome {
 struct ValidatedRequest {
     session_type_id: Uuid,
     plugin_instance_id: String,
+}
+
+/// Reject client-supplied `Message.metadata` that writes an engine-reserved
+/// key or exceeds [`MAX_MESSAGE_METADATA_BYTES`] once serialized. The
+/// message-side counterpart of
+/// [`crate::domain::service::session_service::reject_reserved_metadata`]
+/// (ADR-0017), with the size cap added because the blob is persisted for the
+/// session's whole retention window.
+//
+// @cpt-cf-chat-engine-algo-message-processing-validate-request
+pub fn validate_message_metadata(metadata: Option<&JsonValue>) -> Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    if let JsonValue::Object(map) = metadata {
+        for key in RESERVED_MESSAGE_METADATA_KEYS {
+            if map.contains_key(*key) {
+                return Err(ChatEngineError::bad_request(format!(
+                    "metadata key '{key}' is reserved and cannot be set by clients"
+                )));
+            }
+        }
+    }
+    let size = serde_json::to_vec(metadata)
+        .map_err(|e| ChatEngineError::bad_request(format!("metadata is not serializable: {e}")))?
+        .len();
+    if size > MAX_MESSAGE_METADATA_BYTES {
+        return Err(ChatEngineError::bad_request(format!(
+            "metadata is {size} bytes serialized, exceeding the {MAX_MESSAGE_METADATA_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Names of capabilities currently enabled on a session, decoded from the

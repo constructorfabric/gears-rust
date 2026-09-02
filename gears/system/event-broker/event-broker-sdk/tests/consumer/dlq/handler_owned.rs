@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::consumer::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.dlq.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.dlq.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.dlq.v1~";
 
 #[derive(Clone, Default)]
 struct RecordingDeadLetterSink {
@@ -28,7 +28,6 @@ fn rejected_event() -> RawEvent {
         tenant_id: Uuid::nil(),
         subject: "dlq-1".to_owned(),
         subject_type: "test".to_owned(),
-        partition_key: Some("dlq-1".to_owned()),
         partition: 0,
         sequence: 1,
         offset: 1,
@@ -103,7 +102,6 @@ async fn if_i_want_permanent_failures_parked_i_do_it_in_the_handler() {
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         EVENT_TYPE,
         "dlq-1",
         None,

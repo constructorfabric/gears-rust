@@ -21,7 +21,6 @@ use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
 use chrono::{NaiveDate, Utc};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -442,7 +441,7 @@ async fn setup_with_one_balanced_post(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_clean_tenant_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -483,7 +482,7 @@ async fn run_over_clean_tenant_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_drifted_tenant_emits_alarm() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1089,7 +1088,7 @@ fn cache_baseline_rows_roundtrip() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn incremental_tie_out_equals_full_across_periods() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, service, provider, f) = setup(&url).await;

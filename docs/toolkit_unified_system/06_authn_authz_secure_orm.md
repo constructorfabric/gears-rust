@@ -114,10 +114,10 @@ pub struct MyGear { /* ... */ }
 2. **Resolve the AuthZ client** from `ClientHub` during `init()`:
 
 ```rust
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 
 async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-    let authz = ctx.client_hub().get::<dyn AuthZResolverClient>()?;
+    let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
     // Pass authz to your domain service...
 }
 ```
@@ -693,7 +693,7 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 
 ### AuthZ wiring
 - [ ] Add `deps = ["authz-resolver"]` to your gear declaration.
-- [ ] Resolve `AuthZResolverClient` from `ClientHub` in `init()`.
+- [ ] Resolve `AuthZResolverApi` from `ClientHub` in `init()`.
 - [ ] Create `PolicyEnforcer::new(authz)` once, clone into sub-services.
 - [ ] Define `ResourceType` constants with `supported_properties` for each resource.
 - [ ] Define action constants (`get`, `list`, `create`, `update`, `delete`).

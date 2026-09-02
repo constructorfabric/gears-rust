@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use cluster_sdk::cache::{PutRequest, Ttl};
@@ -16,7 +17,7 @@ use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use cluster_sdk::profile::ClusterProfile;
 use cluster_sdk::{ClusterCacheV1, DistributedLockV1, LeaderElectionV1};
-use common::{MemCacheBackend, register_cache_and_siblings};
+use common::{MemCacheBackend, cache_profile, wire};
 use toolkit::client_hub::ClientHub;
 
 /// The single profile all three primitives resolve under.
@@ -29,13 +30,23 @@ impl ClusterProfile for AppProfile {
 
 #[tokio::main]
 async fn main() -> Result<(), ClusterError> {
-    // Bind one cache plus its two derived default backends under the profile.
-    let hub = ClientHub::new();
-    register_cache_and_siblings(&hub, AppProfile::NAME, MemCacheBackend::linearizable())?;
+    // Wire one cache; the omit-default auto-wrap supplies leader election and the
+    // lock over it, and the wiring registers the cluster client consumers resolve
+    // through.
+    let hub = Arc::new(ClientHub::new());
+    let handle = wire(
+        &hub,
+        vec![(
+            AppProfile::NAME,
+            cache_profile(MemCacheBackend::linearizable()),
+        )],
+    )?;
 
     cache_demo(&hub).await?;
     leader_demo(&hub).await?;
     lock_demo(&hub).await?;
+
+    handle.stop().await;
     Ok(())
 }
 
@@ -43,7 +54,8 @@ async fn main() -> Result<(), ClusterError> {
 async fn cache_demo(hub: &ClientHub) -> Result<(), ClusterError> {
     let cache = ClusterCacheV1::resolver(hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     cache
         .put(PutRequest {
             key: "epoch",
@@ -59,7 +71,8 @@ async fn cache_demo(hub: &ClientHub) -> Result<(), ClusterError> {
 async fn leader_demo(hub: &ClientHub) -> Result<(), ClusterError> {
     let leader = LeaderElectionV1::resolver(hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     let mut watch = leader.elect("scheduler").await?;
     match first_status(&mut watch).await? {
         LeaderStatus::Leader => println!("[leader] this node is the scheduler leader"),
@@ -98,7 +111,8 @@ async fn first_status(watch: &mut LeaderWatch) -> Result<LeaderStatus, ClusterEr
 async fn lock_demo(hub: &ClientHub) -> Result<(), ClusterError> {
     let lock = DistributedLockV1::resolver(hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     let guard = lock
         .try_lock("rebuild-index", Duration::from_secs(30))
         .await?;

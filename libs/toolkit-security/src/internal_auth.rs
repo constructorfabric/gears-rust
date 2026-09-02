@@ -152,6 +152,28 @@ impl PlatformSecurityContext {
         Self { identity }
     }
 
+    /// Construct a credential-free **outbound plane marker**.
+    ///
+    /// This is **not** a validated identity. It exists so gear-layer code (e.g.
+    /// a `PolicyEnforcer`) can call a platform-plane contract method whose
+    /// signature takes a [`PlatformSecurityContext`] *argument* for compile-time
+    /// plane selection, without possessing — or being able to forge — a real
+    /// one. The marker carries no secret and is **discarded** by the generated
+    /// client: the actual platform credential is attached below the contract
+    /// layer from the process `InternalTokenProvider`, and the receiver
+    /// re-derives the real identity by validating that wire token
+    /// (`cpt-cf-adr-two-plane-auth`).
+    ///
+    /// It MUST never be consulted for an authorization decision — its
+    /// [`PlatformIdentity`] is [`PlatformIdentity::Unknown`] precisely so a
+    /// consumer that mistakenly reads it cannot derive a meaningful caller name.
+    #[must_use]
+    pub fn outbound_marker() -> Self {
+        Self {
+            identity: PlatformIdentity::Unknown,
+        }
+    }
+
     /// The validated platform identity backing this context.
     #[must_use]
     pub fn identity(&self) -> &PlatformIdentity {
@@ -256,6 +278,16 @@ mod tests {
         let ctx = PlatformSecurityContext::new(identity.clone());
         assert_eq!(ctx.identity(), &identity);
         assert_eq!(ctx.into_identity(), identity);
+    }
+
+    #[test]
+    fn outbound_marker_carries_no_identity() {
+        // The marker is a credential-free plane selector; its identity is
+        // deliberately `Unknown` so a consumer that mistakenly reads it cannot
+        // derive a meaningful caller name.
+        let marker = PlatformSecurityContext::outbound_marker();
+        assert_eq!(marker.identity(), &PlatformIdentity::Unknown);
+        assert_eq!(marker.identity().peer_name(), "<unknown>");
     }
 
     #[test]

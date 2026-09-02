@@ -1,11 +1,14 @@
 [package]
 name = "cf-gears-file-storage"
-version = "0.1.0"
-publish = false
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "File Storage gear (control plane): metadata, authorization, versioning, signed URLs"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "file-storage"]
+categories = ["web-programming"]
 # `src/bin/` also holds `sidecar_tests.rs`, the sidecar's out-of-line unit-test
 # module (required by the `de1101_tests_in_separate_files` repo lint — see
 # `#[path = "sidecar_tests.rs"] mod tests;` at the bottom of `sidecar.rs`).
@@ -28,10 +31,10 @@ default = []
 
 [dependencies]
 # SDK - public API, models, and errors
-cf-gears-file-storage-sdk = { path = "../file-storage-sdk" }
+cf-gears-file-storage-sdk = { version = "0.1.0", path = "../file-storage-sdk" }
 
 # Authorization Service (PEP) — per-type access decisions
-cf-gears-authz-resolver-sdk = { path = "../../system/authz-resolver/authz-resolver-sdk" }
+cf-gears-authz-resolver-sdk = { version = "0.3.23", path = "../../system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 # Core dependencies

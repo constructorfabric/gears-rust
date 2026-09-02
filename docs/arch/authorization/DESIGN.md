@@ -259,18 +259,18 @@ Both AuthN Resolver and AuthZ Resolver can run in two deployment configurations:
 
 **Out-of-Process (Separate Service):**
 - Resolvers run as separate processes (same machine or remote)
-- Communication via gRPC
+- Communication via REST/HTTP — the gear's `#[toolkit::rest_contract]` projection, discovered via the directory and routed through the api-gateway
 - Trust model: explicit authentication required
-- **mTLS required** — Resolver authenticates that the caller is legitimate
+- **Platform-plane authentication** — the caller's service identity is asserted with an `X-ToolKit-Internal-Token`; network-level hardening such as mTLS is an optional, orthogonal transport concern
 
 **Trust Boundaries:**
 
-In both modes, AuthZ Resolver (PDP) trusts subject identity data from PEP. The mTLS in out-of-process mode authenticates *which service* is calling, not the validity of subject claims. Subject identity originates from AuthN Resolver (Gear) and flows through PEP to AuthZ Resolver.
+In both modes, AuthZ Resolver (PDP) trusts subject identity data from PEP. In out-of-process mode the platform-plane token authenticates *which workload* is calling, not the validity of subject claims. Subject identity originates from AuthN Resolver (Gear) and flows through PEP to AuthZ Resolver.
 
 | Aspect | In-Process | Out-of-Process |
 |--------|------------|----------------|
-| Gear → Plugin | implicit | mTLS |
-| Subject identity trust | Same process | Authenticated caller |
+| Gear → Plugin | implicit (same process) | separate-process plugin; platform-plane token (`X-ToolKit-Internal-Token`) authenticates the calling workload |
+| Subject identity trust | Same process | Subject identity supplied by PEP; the platform-plane token authenticates only the workload, not subject claims |
 | Network exposure | none | internal network only |
 
 ## Token Scopes

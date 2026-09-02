@@ -49,6 +49,15 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(id.to_string())
                     .create()
             }
+            // A target tenant outside the caller's `create` AccessScope maps
+            // to `not_found`, not `permission_denied` -- an anti-oracle
+            // rationale: this gear owns no tenant data and cannot
+            // legitimately claim to know which foreign tenants exist.
+            DomainError::TenantNotFound { tenant_id } => {
+                RgError::not_found(format!("Tenant '{tenant_id}' was not found"))
+                    .with_resource(tenant_id.to_string())
+                    .create()
+            }
             DomainError::MembershipNotFound { key } => {
                 RgError::not_found(format!("Membership '{key}' was not found"))
                     .with_resource(key)

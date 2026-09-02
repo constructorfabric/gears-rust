@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::MembershipRepositoryTrait;
+use crate::infra::storage::FK_RGM_GROUP_ID;
 use crate::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
@@ -125,6 +126,24 @@ impl MembershipRepositoryTrait for MembershipRepository {
                             "Membership already exists: ({group_id}, type_id={gts_type_id}, {resource_id})"
                         ),
                     )
+                } else if e.is_foreign_key_violation() {
+                    // The group can be deleted between the caller's read of
+                    // it and this insert, and then the answer comes from
+                    // `fk_rgm_group_id` -- a missing group, not an internal
+                    // failure. Matched by constraint name, the same way
+                    // `GroupRepository::insert` does: this table's other
+                    // foreign key, `fk_rgm_gts_type`, fails on a concurrent
+                    // `delete_type` and must not be reported as a missing
+                    // group. PostgreSQL names the constraint; SQLite says
+                    // only "FOREIGN KEY constraint failed", so there the
+                    // answer stays a database error rather than a confident
+                    // lie about which resource was missing.
+                    let msg = e.to_string();
+                    if msg.contains(FK_RGM_GROUP_ID) {
+                        DomainError::group_not_found(group_id)
+                    } else {
+                        DomainError::database(msg)
+                    }
                 } else {
                     DomainError::database(e.to_string())
                 }
@@ -184,25 +203,27 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
-    /// Check existing membership tenants for a resource (for tenant compatibility).
-    /// Returns the set of distinct `tenant_ids` for groups that have this resource as a member.
-    async fn get_existing_membership_tenant_ids<C: DBRunner>(
+    /// Whether the resource already belongs to a tenant other than
+    /// `tenant_id`. See the trait doc for the isolation contract this read
+    /// depends on (RG-01).
+    async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
         gts_type_id: i16,
         resource_id: &str,
-    ) -> Result<Vec<Uuid>, DomainError> {
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
         use crate::infra::storage::entity::resource_group::{
             self as rg_entity, Entity as ResourceGroupEntity,
         };
+        use sea_orm::QuerySelect;
 
         let scope = system_scope();
 
-        // The group ids feeding the second query were exactly the first
-        // query's result, so the database can derive them: one statement with
-        // two bind parameters, not two statements the second of which bound
-        // one parameter per membership of the resource -- unbounded, and
-        // unchunked.
+        // One statement, two bind parameters: the member group ids are
+        // derived by the database rather than round-tripped through the
+        // process, so nothing here grows with the number of memberships the
+        // resource has.
         //
         // The inner subquery over `resource_group_membership` is
         // deliberately hand-built and unscoped, not an oversight: this is an
@@ -218,8 +239,9 @@ impl MembershipRepositoryTrait for MembershipRepository {
         // resource tenant-compatible with everything. This method builds
         // `system_scope()` itself, precisely so no constrained scope can
         // reach here; if it ever takes a caller-supplied scope instead,
-        // do not scope this subquery -- rethink what "existing membership
-        // tenants" is even supposed to mean under a partial view first.
+        // do not scope this subquery -- rethink what "already owned by
+        // another tenant" is even supposed to mean under a partial view
+        // first.
         let member_group_ids = Query::select()
             .column(membership_entity::Column::GroupId)
             .from(MembershipEntity)
@@ -227,17 +249,19 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .and_where(Expr::col(membership_entity::Column::ResourceId).eq(resource_id))
             .to_owned();
 
-        let groups = ResourceGroupEntity::find()
+        // `LIMIT 1` and the tenant predicate pushed into the same statement:
+        // the first foreign-tenant row settles the question, so this neither
+        // counts nor materializes the rest.
+        let conflicting = ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.in_subquery(member_group_ids))
+            .filter(rg_entity::Column::TenantId.ne(tenant_id))
+            .limit(1)
             .secure()
             .scope_with(&scope)
-            .all(db)
+            .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        let mut tenant_ids: Vec<Uuid> = groups.into_iter().map(|g| g.tenant_id).collect();
-        tenant_ids.sort();
-        tenant_ids.dedup();
-        Ok(tenant_ids)
+        Ok(conflicting.is_some())
     }
 }

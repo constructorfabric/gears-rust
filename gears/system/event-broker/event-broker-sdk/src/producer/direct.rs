@@ -39,6 +39,7 @@ pub struct ProducerBuilder<
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
     validation_timing: ValidationTiming,
+    broker_partitions: u32,
     _state: ProducerBuilderState<Broker, Ctx, Identity, Dedup, Topics, Patterns>,
 }
 
@@ -52,6 +53,7 @@ impl ProducerBuilder {
             topics: Vec::new(),
             event_type_patterns: Vec::new(),
             validation_timing: ValidationTiming::Eager,
+            broker_partitions: super::schema_cache::DEFAULT_BROKER_PARTITIONS,
             _state: PhantomData,
         }
     }
@@ -68,6 +70,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -82,6 +85,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -96,6 +100,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -113,6 +118,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -131,6 +137,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: topics.into_iter().map(Into::into).collect(),
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -149,6 +156,7 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: patterns.into_iter().map(Into::into).collect(),
             validation_timing: self.validation_timing,
+            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -156,6 +164,17 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
     #[must_use]
     pub fn lazy_validation(mut self) -> Self {
         self.validation_timing = ValidationTiming::Lazy;
+        self
+    }
+
+    /// Partition count the producer assumes the broker gives every topic it
+    /// publishes to. It feeds the partition a producer-state chain is keyed by and
+    /// the partition hint an outbox envelope carries. A topic does not report a
+    /// count, so a producer whose broker is configured away from the default must
+    /// declare it here.
+    #[must_use]
+    pub fn broker_partitions(mut self, partitions: u32) -> Self {
+        self.broker_partitions = partitions;
         self
     }
 }
@@ -182,7 +201,7 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
         identity.validate()?;
         deduplication.validate()?;
 
-        let cache = Arc::new(ProducerSchemaCache::default());
+        let cache = Arc::new(ProducerSchemaCache::new(self.broker_partitions));
         if prepare_all {
             cache
                 .prepare_all(&broker, &ctx, &self.topics, &self.event_type_patterns)
@@ -297,7 +316,7 @@ impl Producer {
                 .await?;
             advance_cursor(
                 &mut batch_sequence_state,
-                &event.event.topic,
+                &event.topic,
                 event.broker_partition,
                 event.event.meta.as_ref(),
             );
@@ -413,7 +432,7 @@ impl Producer {
             .insert(
                 (
                     ProducerId(producer_id),
-                    prepared.event.topic.clone(),
+                    prepared.topic.clone(),
                     prepared.broker_partition,
                 ),
                 sequence,

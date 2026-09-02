@@ -27,7 +27,7 @@ supplies the concrete directory path. In the filename escaping, `/` becomes `__`
 
 Apply **only** these specific check IDs:
 
-1. **RUST-ERR-001** — Errors must preserve context and original cause. Check for `map_err(|_| ...)` patterns that discard the source error. Errors should be useful to callers, not opaque.
+1. **RUST-ERR-001** — Errors must preserve context and original cause. Check for `map_err(|_| ...)` patterns that discard the source error. Errors should be useful to callers, not opaque. Also flag `From` impls used for conversions that can fail (panic or silently coerce on bad input) — use `TryFrom` instead.
 
 2. **RUST-PANIC-001** — Code should not panic at runtime except in truly exceptional conditions (e.g., internal invariant violations). Check for panic-prone patterns: unwrap/expect on fallible operations, indexing without bounds checks, panic-driven control flow.
 

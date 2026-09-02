@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-v2-tests
-description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 8 test anti-patterns. Returns JSON array only."
+description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 9 test anti-patterns. Returns JSON array only."
 tools: Read, Bash
 model: inherit
 ---

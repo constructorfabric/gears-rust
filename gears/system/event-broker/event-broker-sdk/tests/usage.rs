@@ -45,16 +45,21 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const ORDERS_TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.usage.orders.v1";
 #[cfg(all(feature = "db", feature = "outbox"))]
 const BILLING_TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.usage.billing.v1";
-const ORDER_CREATED: &str = "gts.cf.core.events.event_type.v1~example.sdk.usage.created.v1";
-const ORDER_UPDATED: &str = "gts.cf.core.events.event_type.v1~example.sdk.usage.updated.v1";
+const ORDER_CREATED: &str = "gts.cf.core.events.event.v1~example.sdk.usage.created.v1~";
+const ORDER_UPDATED: &str = "gts.cf.core.events.event.v1~example.sdk.usage.updated.v1~";
 const TENANT_PARTITION: u32 = 2;
 #[cfg(all(feature = "db", feature = "outbox"))]
-const BILLING_CHARGED: &str = "gts.cf.core.events.event_type.v1~example.sdk.usage.charged.v1";
+const BILLING_CHARGED: &str = "gts.cf.core.events.event.v1~example.sdk.usage.charged.v1~";
 const ORDER_SUBJECT: &str = "gts.cf.core.events.subject.v1~example.sdk.usage.order.v1";
 #[cfg(all(feature = "db", feature = "outbox"))]
 const BILLING_SUBJECT: &str = "gts.cf.core.events.subject.v1~example.sdk.usage.charge.v1";
 #[cfg(all(feature = "db", feature = "outbox"))]
 const PRODUCER_QUEUE: &str = "event-broker-producer";
+/// `description` of the base event's `data` member, which every event type's
+/// composed payload contract carries as its first branch. Spelled out rather
+/// than read back from the declaration so that changing the base surfaces as a
+/// failure here.
+const BASE_DATA_DESCRIPTION: &str = "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).";
 
 #[cfg(all(feature = "db", feature = "outbox"))]
 static USAGE_DB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -67,7 +72,6 @@ struct OrderCreated {
 
 impl TypedEvent for OrderCreated {
     const TYPE_ID: &'static str = ORDER_CREATED;
-    const TOPIC: &'static str = ORDERS_TOPIC;
     const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
     const SOURCE: &'static str = "order-service";
 
@@ -90,7 +94,6 @@ struct InvalidOrderCreated {
 #[cfg(all(feature = "db", feature = "outbox"))]
 impl TypedEvent for InvalidOrderCreated {
     const TYPE_ID: &'static str = ORDER_CREATED;
-    const TOPIC: &'static str = ORDERS_TOPIC;
     const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
     const SOURCE: &'static str = "order-service";
 
@@ -111,7 +114,6 @@ struct OrderUpdated {
 
 impl TypedEvent for OrderUpdated {
     const TYPE_ID: &'static str = ORDER_UPDATED;
-    const TOPIC: &'static str = ORDERS_TOPIC;
     const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
     const SOURCE: &'static str = "order-service";
 
@@ -134,7 +136,6 @@ struct BillingCharged {
 #[cfg(all(feature = "db", feature = "outbox"))]
 impl TypedEvent for BillingCharged {
     const TYPE_ID: &'static str = BILLING_CHARGED;
-    const TOPIC: &'static str = BILLING_TOPIC;
     const SUBJECT_TYPE: &'static str = BILLING_SUBJECT;
     const SOURCE: &'static str = "billing-service";
 
@@ -204,9 +205,40 @@ async fn mock_registers_order_topic_and_event_type() -> TestResult {
     let topics = broker.list_topics(&ctx).await?;
     let event_type = broker.get_event_type(&ctx, ORDER_CREATED).await?;
 
-    assert!(topics.iter().any(|topic| topic.id == ORDERS_TOPIC));
-    assert_eq!(event_type.id, ORDER_CREATED);
-    assert_eq!(event_type.topic, ORDERS_TOPIC);
+    // A topic reports the instance document's own values; an event type's topic
+    // binding is a resolved trait, and `data_schema` is the payload contract
+    // composed out of the base event's `data` member and this type's narrowing.
+    assert_eq!(
+        serde_json::to_value(&topics)?,
+        serde_json::json!([
+            {
+                "id": ORDERS_TOPIC,
+                "description": format!("Mock topic {ORDERS_TOPIC}"),
+                "retention": null,
+            },
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(&event_type)?,
+        serde_json::json!({
+            "id": ORDER_CREATED,
+            "topic": ORDERS_TOPIC,
+            "partition_key": "/tenant_id",
+            "description": null,
+            "allowed_subject_types": [ORDER_SUBJECT],
+            "data_schema": {
+                "allOf": [
+                    {
+                        "additionalProperties": true,
+                        "default": null,
+                        "description": BASE_DATA_DESCRIPTION,
+                        "type": ["object", "null"],
+                    },
+                    order_created_schema(),
+                ],
+            },
+        })
+    );
 
     Ok(())
 }
@@ -241,7 +273,7 @@ async fn producer_stateless_publish_sends_typed_event() -> TestResult {
         )
         .deduplication(DirectDeduplication::stateless())
         .topics([ORDERS_TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.usage.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
         .prepare_all()
         .await?;
 
@@ -499,7 +531,7 @@ async fn consumer_routes_events_by_topic_and_type() -> TestResult {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DirectDeduplication::stateless())
         .topics([ORDERS_TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.usage.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
         .prepare_all()
         .await?;
 
@@ -734,7 +766,7 @@ async fn single_outbox_queue_can_carry_multiple_topics() -> TestResult {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DbDeduplication::stateless())
         .topics([ORDERS_TOPIC, BILLING_TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.usage.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
         .prepare_all()
         .await?;
 

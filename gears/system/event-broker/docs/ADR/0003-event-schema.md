@@ -35,12 +35,12 @@ decision-makers: Event Broker Team
 
 ## Context and Problem Statement
 
-The event broker's `schemas/event.v1.schema.json` today mixes four categories of fields onto one event:
+The event broker's `schemas/gts.cf.core.events.event.v1~.schema.json` today mixes four categories of fields onto one event:
 
 | Category | Fields |
 |---|---|
-| Event-semantic | `id`, `type`, `topic`, `source`, `subject`, `subject_type`, `occurred_at`, `trace_parent`, `data` |
-| Partition-routing | `partition_key`, `partition` |
+| Event-semantic | `id`, `type`, `source`, `subject`, `subject_type`, `occurred_at`, `trace_parent`, `data` |
+| Partition-routing | `partition` |
 | Producer-protocol | `producer_id`, `previous`, `sequence` |
 | Server-stamped | `offset`, `offset_time`, `tenant_id`, `created_at` |
 
@@ -80,13 +80,13 @@ The decision is about *what fields exist on the broker's event* and *how the sch
 
 ## Decision Outcome
 
-Adopt **a single canonical event JSON Schema (`schemas/event.v1.schema.json`) with field-level `readOnly` / `writeOnly` markers for per-direction semantics, an optional versioned `meta` block for publish-time transport mechanics, broker-native field names, and an *optional, external* CloudEvents converter for cross-broker interop if and when needed.**
+Adopt **a single canonical event JSON Schema (`schemas/gts.cf.core.events.event.v1~.schema.json`) with field-level `readOnly` / `writeOnly` markers for per-direction semantics, an optional versioned `meta` block for publish-time transport mechanics, broker-native field names, and an *optional, external* CloudEvents converter for cross-broker interop if and when needed.**
 
 ### One Schema With Read/Write Field Markers
 
 One JSON Schema replaces the publish-input / read-projection pair:
 
-- **`event.v1.schema.json`** is the single source of truth for the event resource shape.
+- **`gts.cf.core.events.event.v1~.schema.json`** is the single source of truth for the event resource shape.
 - Field-level markers encode per-direction semantics:
   - `meta`: `"writeOnly": true` — accepted on publish, stripped on read.
   - `partition`, `sequence`, `sequence_time`: `"readOnly": true` — server-stamped on read, rejected with `400 BadRequest` if supplied on publish.
@@ -118,19 +118,18 @@ A top-level publish-input field `meta` (marked `writeOnly`) carries producer-pro
 
 ### Field-Level Changes
 
-Concrete edits to the event shape vs. today's `event.v1.schema.json`:
+Concrete edits to the event shape vs. today's `gts.cf.core.events.event.v1~.schema.json`:
 
 | Field | Today | After this ADR | Rationale |
 |---|---|---|---|
-| `id`, `type`, `topic`, `source`, `subject`, `occurred_at`, `data` | body | body (unchanged) | Event-semantic, consumer-visible, names stay broker-native |
+| `id`, `type`, `source`, `subject`, `occurred_at`, `data` | body | body (unchanged) | Event-semantic, consumer-visible, names stay broker-native |
 | `subject_type` | body | body (kept) | Carries entity-kind not derivable from `type` (e.g., generic `rule_applied` may apply to many subject kinds; body-less events have no `data` to introspect) |
 | `trace_parent` | body | body (kept) | Distributed-tracing context is event-correlated, not publish-correlated; useful to consumers for post-hoc trace correlation |
-| `partition_key` | body, optional | body, optional | Content-derived (producer-chosen grouping key); semantically close to `subject`; visible to consumers on read |
 | `tenant_id` | body, `readOnly: true` | body, **producer-supplied** | A system service legitimately publishes events on behalf of arbitrary tenants (billing aggregator, audit emitter); authz delegated to platform resolver |
 | `producer_id` | body | **moved to `meta`** | Producer-protocol mechanic; should not appear on the consumer-visible body |
 | `previous` | body | **moved to `meta`** | Producer-protocol mechanic; per-event in batches |
 | `sequence` (producer-side) | body | **moved to `meta`** | Producer-protocol mechanic; renamed under `meta` (the body-level `sequence` after this ADR is the server-assigned consumer-visible field, see "Terminology Cleanup") |
-| `partition` | body, producer-set | body, `readOnly` | Broker derives from `partition_key` or `tenant_id` per [ADR-0002](0002-partition-selection.md); rejected on publish; surfaced on read |
+| `partition` | body, producer-set | body, `readOnly` | Broker derives from the member the event type's partition-key pointer names, per [ADR-0002](0002-partition-selection.md); rejected on publish; surfaced on read |
 | `offset` | body, `readOnly: true` | **renamed `sequence`**, `readOnly` | Wire / cursor terminology alignment |
 | `offset_time` | body, `readOnly: true` | **renamed `sequence_time`**, `readOnly` | Same |
 | `created_at` | body, `readOnly: true` | **dropped entirely** | Redundant between `occurred_at` (producer-stamped) and `sequence_time` (server-stamped); the ingest-accept moment is observability data, not event-record data |
@@ -154,7 +153,7 @@ No collision between `meta.sequence` and body-level `sequence`: the `meta.` qual
 
 ### Event Field Encoding: ASCII Only
 
-All event string fields (`id`, `type`, `topic`, `source`, `subject`, `subject_type`, `partition_key`, `trace_parent`, and all `meta.*` string fields) MUST be ASCII on the publish wire. UTF-8 is permitted only inside the `data` payload. The broker rejects publishes containing non-ASCII bytes in any event field with `400 InvalidEventFieldEncoding`. Per-field byte caps apply (e.g., `partition_key` ≤ 1024 bytes; `400 EventFieldTooLong` on overflow).
+All event string fields (`id`, `type`, `source`, `subject`, `subject_type`, `trace_parent`, and all `meta.*` string fields) MUST be ASCII on the publish wire. UTF-8 is permitted only inside the `data` payload. The broker rejects publishes containing non-ASCII bytes in any event field with `400 InvalidEventFieldEncoding`. Per-field byte caps apply (e.g., `subject` ≤ 1024 bytes; `400 EventFieldTooLong` on overflow).
 
 This is a platform-wide convention, not a broker-specific choice. It keeps first-party partition-hint derivation deterministic without normalization concerns, and it keeps event-field parsing in any language cheap.
 
@@ -227,7 +226,7 @@ The decision is verified by:
 
 ### Two Schemas (publish + read)
 
-**Description**: Maintain `event.v1.schema.json` for publish input and a separate read-side schema file. SDK authors get type-safe schemas; codegen produces two structs.
+**Description**: Maintain `gts.cf.core.events.event.v1~.schema.json` for publish input and a separate read-side schema file. SDK authors get type-safe schemas; codegen produces two structs.
 
 * Good, because per-direction semantics are type-system-enforceable via separate files
 * Bad, because two files must be kept in sync — duplicate field declarations (mitigated via `$ref`, but still maintenance)
@@ -249,7 +248,7 @@ The decision is verified by:
 
 - **Converter realization (post-MVP)**: when / if real interop demand emerges, the converter ships as either an SDK-side adapter (in `cf-gears-event-broker-sdk`) mapping broker-native ↔ CloudEvents at publish/consume boundaries, or a broker-side projection endpoint (`GET /v1/events:cloudevents`) returning CloudEvents 1.0 wire shape. Both are additive and require no change to the canonical storage shape.
 - **AsyncAPI documentation export**: similarly post-MVP; an AsyncAPI 2.x document describing the broker's event schema + topic conventions can be generated from the JSON Schema file, with no schema-shape impact.
-- **Per-type `data_schema`**: the per-event-type payload schema (the contents of the `data` field) is described by the event type's `data_schema` in the types registry. See [`DESIGN.md §3.1`](../DESIGN.md) for the concept relationship and the Validation Pipeline walkthrough.
+- **Per-type payload schema**: the contents of the `data` field are described by the narrowing the event type's derived schema applies to this base's `data` member in the types registry. `GET /v1/event-types` projects that contract as `data_schema`. See [`DESIGN.md §3.1`](../DESIGN.md) for the concept relationship and the Validation Pipeline walkthrough.
 - **Field-name stability commitment**: changes to the broker-native field names after this ADR is accepted require a major event schema version (`event.v2.schema.json`). Field additions and `meta.*` changes do not.
 
 External references:
@@ -278,4 +277,4 @@ External references:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation contract
   - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — producer modes / `meta`-block-shape enforcement / registration TTL / reset endpoint
 - **Schemas**:
-  - [`schemas/event.v1.schema.json`](../schemas/event.v1.schema.json) — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)
+  - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)

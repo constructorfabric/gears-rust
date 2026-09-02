@@ -11,7 +11,7 @@ use event_broker_sdk::{
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.customoffset.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.customoffset.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.customoffset.v1~";
 
 type LoadCall = (ConsumerGroupId, TopicId, u32);
 type CommitCall = (ConsumerGroupId, TopicId, u32, i64);
@@ -89,7 +89,6 @@ async fn if_i_want_my_own_offset_store_i_implement_the_minimal_traits() {
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         EVENT_TYPE,
         "custom-offset-1",
         None,

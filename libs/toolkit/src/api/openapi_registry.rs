@@ -12,13 +12,14 @@ use std::sync::Arc;
 use utoipa::openapi::{
     OpenApi, OpenApiBuilder, Ref, RefOr, Required,
     content::ContentBuilder,
+    header::HeaderBuilder,
     info::InfoBuilder,
     path::{
         HttpMethod, OperationBuilder as UOperationBuilder, ParameterBuilder, ParameterIn,
         PathItemBuilder, PathsBuilder,
     },
     request_body::RequestBodyBuilder,
-    response::{ResponseBuilder, ResponsesBuilder},
+    response::{Response, ResponsesBuilder},
     schema::{ArrayBuilder, ComponentsBuilder, ObjectBuilder, Schema, SchemaFormat, SchemaType},
     security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
     server::Server,
@@ -256,43 +257,65 @@ impl OpenApiRegistryImpl {
             }
 
             // Responses
-            let mut responses = ResponsesBuilder::new();
+            let mut responses_by_status = BTreeMap::<u16, Response>::new();
             for r in &spec.responses {
+                let response = responses_by_status
+                    .entry(r.status)
+                    .or_insert_with(|| Response::new(&r.description));
+                // Preserve the historical last-declaration-wins behavior for
+                // the status-level description while merging media types.
+                response.description.clone_from(&r.description);
+
                 // Body-less response (e.g. 204 No Content) is signalled by an
                 // empty `content_type`. Emit just `description` — attaching a
                 // `content` block would make code-generators expect a body.
-                if r.content_type.is_empty() {
-                    let resp = ResponseBuilder::new().description(&r.description).build();
-                    responses = responses.response(r.status.to_string(), resp);
-                    continue;
+                if !r.content_type.is_empty() {
+                    let is_json_like = r.content_type == "application/json"
+                        || r.content_type == problem::APPLICATION_PROBLEM_JSON
+                        || r.content_type == "text/event-stream";
+                    let content = if is_json_like {
+                        // Manually build content to preserve the correct content type.
+                        ContentBuilder::new()
+                            .schema(Some(build_response_schema(r.schema.as_ref())))
+                            .build()
+                    } else {
+                        let schema = Schema::Object(
+                            ObjectBuilder::new()
+                                .schema_type(SchemaType::Type(
+                                    utoipa::openapi::schema::Type::String,
+                                ))
+                                .format(Some(SchemaFormat::Custom(r.content_type.into())))
+                                .build(),
+                        );
+                        ContentBuilder::new().schema(Some(schema)).build()
+                    };
+                    response.content.insert(r.content_type.to_owned(), content);
                 }
-                let is_json_like = r.content_type == "application/json"
-                    || r.content_type == problem::APPLICATION_PROBLEM_JSON
-                    || r.content_type == "text/event-stream";
-                let resp = if is_json_like {
-                    // Manually build content to preserve the correct content type
-                    let content = ContentBuilder::new()
-                        .schema(Some(build_response_schema(r.schema.as_ref())))
+
+                for header in &r.headers {
+                    let schema_type = match header.header_type {
+                        operation_builder::ResponseHeaderType::String => {
+                            SchemaType::Type(utoipa::openapi::schema::Type::String)
+                        }
+                        operation_builder::ResponseHeaderType::Integer => {
+                            SchemaType::Type(utoipa::openapi::schema::Type::Integer)
+                        }
+                        operation_builder::ResponseHeaderType::Boolean => {
+                            SchemaType::Type(utoipa::openapi::schema::Type::Boolean)
+                        }
+                    };
+                    let declared = HeaderBuilder::new()
+                        .description(header.description.clone())
+                        .schema(ObjectBuilder::new().schema_type(schema_type).build())
                         .build();
-                    ResponseBuilder::new()
-                        .description(&r.description)
-                        .content(r.content_type, content)
-                        .build()
-                } else {
-                    let schema = Schema::Object(
-                        ObjectBuilder::new()
-                            .schema_type(SchemaType::Type(utoipa::openapi::schema::Type::String))
-                            .format(Some(SchemaFormat::Custom(r.content_type.into())))
-                            .build(),
-                    );
-                    let content = ContentBuilder::new().schema(Some(schema)).build();
-                    ResponseBuilder::new()
-                        .description(&r.description)
-                        .content(r.content_type, content)
-                        .build()
-                };
-                responses = responses.response(r.status.to_string(), resp);
+                    response.headers.insert(header.name.clone(), declared);
+                }
             }
+            let responses = ResponsesBuilder::new().responses_from_iter(
+                responses_by_status
+                    .into_iter()
+                    .map(|(status, response)| (status.to_string(), response)),
+            );
             op = op.responses(responses.build());
 
             // Add security requirement if operation requires authentication
@@ -611,7 +634,8 @@ fn collect_refs_from_json(value: &serde_json::Value, refs: &mut HashSet<String>)
 mod tests {
     use super::*;
     use crate::api::operation_builder::{
-        OperationSpec, ParamLocation, ParamSpec, ResponseSchema, ResponseSpec, VendorExtensions,
+        OperationSpec, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
+        ResponseSchema, ResponseSpec, VendorExtensions,
     };
     use http::Method;
 
@@ -635,6 +659,7 @@ mod tests {
                 content_type: "application/json",
                 description: "OK".to_owned(),
                 schema,
+                headers: vec![],
             }],
             handler_id: handler.to_owned(),
             authenticated: false,
@@ -685,6 +710,7 @@ mod tests {
                 content_type: "application/json",
                 description: "Success".to_owned(),
                 schema: None,
+                headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
             authenticated: false,
@@ -697,6 +723,113 @@ mod tests {
 
         registry.register_operation(&spec);
         assert_eq!(registry.operation_specs.len(), 1);
+    }
+
+    #[test]
+    fn response_headers_are_emitted_with_their_declared_types() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response("/submit", "submit", None);
+        spec.responses[0].headers = vec![
+            ResponseHeaderSpec::new(
+                "Location",
+                "Operation resource URI",
+                ResponseHeaderType::String,
+            ),
+            ResponseHeaderSpec::new(
+                "Retry-After",
+                "Retry delay in seconds",
+                ResponseHeaderType::Integer,
+            ),
+            ResponseHeaderSpec::new(
+                "Idempotency-Replayed",
+                "Whether this is a replay",
+                ResponseHeaderType::Boolean,
+            ),
+        ];
+        registry.register_operation(&spec);
+
+        let doc = registry.build_openapi(&test_info()).unwrap();
+        let json = serde_json::to_value(doc).unwrap();
+        let headers = &json["paths"]["/submit"]["get"]["responses"]["200"]["headers"];
+        assert_eq!(headers["Location"]["schema"]["type"], "string");
+        assert_eq!(headers["Location"]["description"], "Operation resource URI");
+        assert_eq!(headers["Retry-After"]["schema"]["type"], "integer");
+        assert_eq!(headers["Idempotency-Replayed"]["schema"]["type"], "boolean");
+    }
+
+    #[test]
+    fn response_content_types_with_the_same_status_are_combined() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response("/document", "document", None);
+        spec.responses[0].content_type = "text/plain";
+        spec.responses[0].description = "Plain document".to_owned();
+        spec.responses[0].headers = vec![ResponseHeaderSpec::new(
+            "X-Plain-Document",
+            "Whether plain text is available",
+            ResponseHeaderType::Boolean,
+        )];
+        spec.responses.push(
+            ResponseSpec::new(
+                http::StatusCode::OK.as_u16(),
+                "text/html",
+                "HTML document",
+                None,
+            )
+            .with_headers([ResponseHeaderSpec::new(
+                "X-HTML-Document",
+                "Whether HTML is available",
+                ResponseHeaderType::Boolean,
+            )]),
+        );
+        registry.register_operation(&spec);
+
+        let doc = registry.build_openapi(&test_info()).unwrap();
+        let json = serde_json::to_value(doc).unwrap();
+        let response = &json["paths"]["/document"]["get"]["responses"]["200"];
+        assert_eq!(response["description"], "HTML document");
+        assert_eq!(
+            response["content"]["text/plain"]["schema"]["format"],
+            "text/plain"
+        );
+        assert_eq!(
+            response["content"]["text/html"]["schema"]["format"],
+            "text/html"
+        );
+        assert_eq!(
+            response["headers"]["X-Plain-Document"]["schema"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            response["headers"]["X-HTML-Document"]["schema"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn bodyless_response_can_declare_headers_without_content() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response("/jobs", "jobs", None);
+        spec.responses[0].content_type = "";
+        spec.responses[0].schema = None;
+        spec.responses[0].headers = vec![ResponseHeaderSpec::without_description(
+            "Retry-After",
+            ResponseHeaderType::Integer,
+        )];
+        registry.register_operation(&spec);
+
+        let doc = registry.build_openapi(&test_info()).unwrap();
+        let json = serde_json::to_value(doc).unwrap();
+        let response = &json["paths"]["/jobs"]["get"]["responses"]["200"];
+        assert!(response.get("content").is_none());
+        assert_eq!(
+            response["headers"]["Retry-After"]["schema"]["type"],
+            "integer"
+        );
+        assert!(
+            response["headers"]["Retry-After"]
+                .get("description")
+                .is_none()
+        );
     }
 
     #[test]
@@ -750,6 +883,7 @@ mod tests {
                 content_type: "application/json",
                 description: "User found".to_owned(),
                 schema: None,
+                headers: vec![],
             }],
             handler_id: "get_users_id".to_owned(),
             authenticated: false,
@@ -810,6 +944,7 @@ mod tests {
                 content_type: "application/json",
                 description: "Upload successful".to_owned(),
                 schema: None,
+                headers: vec![],
             }],
             handler_id: "post_upload".to_owned(),
             authenticated: false,
@@ -889,6 +1024,7 @@ mod tests {
                 content_type: "application/json",
                 description: "OK".to_owned(),
                 schema: None,
+                headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
             authenticated: false,
@@ -943,6 +1079,7 @@ mod tests {
                 content_type: "application/json",
                 description: "OK".to_owned(),
                 schema: None,
+                headers: vec![],
             }],
             handler_id: "get_ping".to_owned(),
             authenticated: false,

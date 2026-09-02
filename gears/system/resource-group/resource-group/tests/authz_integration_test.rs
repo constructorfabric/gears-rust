@@ -16,12 +16,13 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, PolicyEnforcer, ResourceType,
+    AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    PolicyEnforcer, ResourceType,
     constraints::{Constraint, InPredicate, Predicate},
     models::DenyReason,
 };
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 
 // ── Resource type descriptor (mirrors what RG handlers will declare) ────
 
@@ -36,11 +37,12 @@ const RG_GROUP: ResourceType = ResourceType::from_static(
 struct TenantScopingAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for TenantScopingAuthZ {
+impl AuthZResolverApi for TenantScopingAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -79,11 +81,12 @@ impl AuthZResolverClient for TenantScopingAuthZ {
 struct DenyAllAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllAuthZ {
+impl AuthZResolverApi for DenyAllAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -101,11 +104,12 @@ impl AuthZResolverClient for DenyAllAuthZ {
 struct AllowAllAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAllAuthZ {
+impl AuthZResolverApi for AllowAllAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -133,7 +137,7 @@ fn make_ctx(tenant_id: Uuid) -> SecurityContext {
 // Scenario: L2-AuthZ-01 - Tenant scoping produces correct AccessScope
 #[tokio::test]
 async fn enforcer_tenant_scoping_produces_correct_access_scope() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let tenant_id = Uuid::now_v7();
@@ -155,7 +159,7 @@ async fn enforcer_tenant_scoping_produces_correct_access_scope() {
 // Scenario: L2-AuthZ-02 - Different tenants get different scopes
 #[tokio::test]
 async fn enforcer_different_tenants_get_different_scopes() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let tenant_a = Uuid::now_v7();
@@ -183,7 +187,7 @@ async fn enforcer_different_tenants_get_different_scopes() {
 // Scenario: L2-AuthZ-03 - Deny-all returns denied error
 #[tokio::test]
 async fn enforcer_deny_all_returns_denied_error() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(DenyAllAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let result = enforcer
@@ -202,7 +206,7 @@ async fn enforcer_deny_all_returns_denied_error() {
 // Scenario: L2-AuthZ-04 - Allow-all with no constraints returns AllowAll scope
 #[tokio::test]
 async fn enforcer_allow_all_no_constraints_returns_allow_all() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(AllowAllAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let ctx = make_ctx(Uuid::now_v7());
@@ -225,7 +229,7 @@ async fn enforcer_allow_all_no_constraints_returns_allow_all() {
 // Scenario: L2-AuthZ-05 - Allow-all with required constraints fails
 #[tokio::test]
 async fn enforcer_allow_all_with_required_constraints_fails() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(AllowAllAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let ctx = make_ctx(Uuid::now_v7());
@@ -255,11 +259,12 @@ async fn enforcer_passes_resource_id_to_pdp() {
     }
 
     #[async_trait]
-    impl AuthZResolverClient for CapturingAuthZ {
+    impl AuthZResolverApi for CapturingAuthZ {
         async fn evaluate(
             &self,
+            _ctx: PlatformSecurityContext,
             request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, AuthZResolverError> {
+        ) -> Result<EvaluationResponse, CanonicalError> {
             self.captured.lock().unwrap().push(request.clone());
             // Return tenant-scoped allow
             let tid = request
@@ -287,7 +292,7 @@ async fn enforcer_passes_resource_id_to_pdp() {
     let mock = Arc::new(CapturingAuthZ {
         captured: Mutex::new(Vec::new()),
     });
-    let authz: Arc<dyn AuthZResolverClient> = mock.clone();
+    let authz: Arc<dyn AuthZResolverApi> = mock.clone();
     let enforcer = PolicyEnforcer::new(authz);
 
     let resource_id = Uuid::now_v7();
@@ -309,7 +314,7 @@ async fn enforcer_passes_resource_id_to_pdp() {
 // Scenario: L2-AuthZ-07 - Enforcer works for all CRUD actions
 #[tokio::test]
 async fn enforcer_works_for_all_crud_actions() {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let tenant_id = Uuid::now_v7();
@@ -351,11 +356,12 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
     }
 
     #[async_trait]
-    impl AuthZResolverClient for CapturingTenantAuthZ {
+    impl AuthZResolverApi for CapturingTenantAuthZ {
         async fn evaluate(
             &self,
+            _ctx: PlatformSecurityContext,
             request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, AuthZResolverError> {
+        ) -> Result<EvaluationResponse, CanonicalError> {
             let tid = request
                 .subject
                 .properties
@@ -382,7 +388,7 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
     let mock = Arc::new(CapturingTenantAuthZ {
         requests: Mutex::new(Vec::new()),
     });
-    let authz: Arc<dyn AuthZResolverClient> = mock.clone();
+    let authz: Arc<dyn AuthZResolverApi> = mock.clone();
     let enforcer = PolicyEnforcer::new(authz);
 
     let tenant_id = Uuid::now_v7();
@@ -434,7 +440,7 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
 async fn full_chain_deny_all_blocks_list_groups() {
     use resource_group::domain::group_service::RG_GROUP_RESOURCE;
 
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(DenyAllAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
 
     let ctx = make_ctx(Uuid::now_v7());

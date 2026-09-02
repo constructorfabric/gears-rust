@@ -6,6 +6,7 @@ use super::super::helpers::*;
 use super::super::helpers::{broker_with_topic, ctx, wire_event};
 use crate::api::{EventBrokerApi, IngestOutcome, ProducerMode};
 use crate::error::EventBrokerError;
+use crate::mock::PartitionKeyFixture;
 use crate::models::{Event, ProducerMeta};
 use uuid::Uuid;
 
@@ -14,12 +15,11 @@ use uuid::Uuid;
 
 fn chained_event(
     ctx: &toolkit_security::SecurityContext,
-    topic: &str,
     producer_id: Uuid,
     sequence: i64,
     previous: i64,
 ) -> Event {
-    let mut ev = wire_event(topic, EVT, ctx.subject_tenant_id());
+    let mut ev = wire_event(EVT, ctx.subject_tenant_id());
     ev.meta = Some(ProducerMeta {
         version: 1,
         producer_id: Some(producer_id),
@@ -32,11 +32,10 @@ fn chained_event(
 
 fn monotonic_event(
     ctx: &toolkit_security::SecurityContext,
-    topic: &str,
     producer_id: Uuid,
     sequence: i64,
 ) -> Event {
-    let mut ev = wire_event(topic, EVT, ctx.subject_tenant_id());
+    let mut ev = wire_event(EVT, ctx.subject_tenant_id());
     ev.meta = Some(ProducerMeta {
         version: 1,
         producer_id: Some(producer_id),
@@ -95,14 +94,14 @@ async fn s1_02_register_monotonic_producer() {
         .0;
     assert_eq!(
         broker
-            .publish(&c, &monotonic_event(&c, TOPIC, mpid, 1))
+            .publish(&c, &monotonic_event(&c, mpid, 1))
             .await
             .unwrap(),
         IngestOutcome::Accepted
     );
     assert_eq!(
         broker
-            .publish(&c, &monotonic_event(&c, TOPIC, mpid, 1))
+            .publish(&c, &monotonic_event(&c, mpid, 1))
             .await
             .unwrap(),
         IngestOutcome::Duplicate
@@ -120,7 +119,7 @@ async fn registered_producer_mode_must_match_event_metadata() {
         .0;
 
     let err = broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 1, -1))
+        .publish(&c, &chained_event(&c, pid, 1, -1))
         .await
         .unwrap_err();
     assert!(
@@ -145,7 +144,7 @@ async fn s1_03_chained_mode_sequence() {
     let mut prev = -1;
     for seq in 1..=7 {
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, seq, prev))
+            .publish(&c, &chained_event(&c, pid, seq, prev))
             .await
             .unwrap();
         prev = seq;
@@ -153,7 +152,7 @@ async fn s1_03_chained_mode_sequence() {
     // Next publish previous=7, sequence=8 matches → Accepted.
     assert_eq!(
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, 8, 7))
+            .publish(&c, &chained_event(&c, pid, 8, 7))
             .await
             .unwrap(),
         IngestOutcome::Accepted
@@ -182,7 +181,7 @@ async fn s1_04_idempotency_key_dedup() {
     let mut prev = -1;
     for seq in 1..=8 {
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, seq, prev))
+            .publish(&c, &chained_event(&c, pid, seq, prev))
             .await
             .unwrap();
         prev = seq;
@@ -191,7 +190,7 @@ async fn s1_04_idempotency_key_dedup() {
 
     // Re-send the same (previous=7, sequence=8) event.
     let dup = broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 8, 7))
+        .publish(&c, &chained_event(&c, pid, 8, 7))
         .await
         .unwrap();
     assert_eq!(dup, IngestOutcome::Duplicate, "retry must be Duplicate");
@@ -208,7 +207,7 @@ async fn s1_04_idempotency_key_dedup() {
     // Chain not poisoned: next sequence still admits.
     assert_eq!(
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, 9, 8))
+            .publish(&c, &chained_event(&c, pid, 9, 8))
             .await
             .unwrap(),
         IngestOutcome::Accepted
@@ -231,7 +230,7 @@ async fn s1_05_chained_sequence_violation() {
     let mut prev = -1;
     for seq in 1..=7 {
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, seq, prev))
+            .publish(&c, &chained_event(&c, pid, seq, prev))
             .await
             .unwrap();
         prev = seq;
@@ -242,7 +241,7 @@ async fn s1_05_chained_sequence_violation() {
     // treats it as a chain-link check (not a backward duplicate): seq>last but
     // previous mismatches → SequenceViolation.
     let err = broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 8, 3))
+        .publish(&c, &chained_event(&c, pid, 8, 3))
         .await
         .unwrap_err();
     let msg = format!("{err:?}");
@@ -269,20 +268,28 @@ async fn s1_05_chained_sequence_violation() {
 async fn s1_06_cursor_recovery() {
     // After publishing on two partitions, GET cursors reports last_sequence per
     // (topic, partition) so a desynced producer can re-seed meta.previous.
-    let (broker, _h) = broker_with_topic(TOPIC, 8).await;
+    let (broker, h) = broker_with_topic(TOPIC, 8).await;
     let c = ctx();
+    // A chain is per `(producer_id, topic, partition)`, so driving two chains needs
+    // two partitions. The type points at `/subject`, a member this test varies;
+    // under the default tenant pointer every event would share one partition.
+    h.set_partition_key(PartitionKeyFixture {
+        event_type: EVT,
+        pointer: "/subject",
+    })
+    .await;
     let pid = broker
         .register_producer(&c, ProducerMode::Chained, "svc/1.0")
         .await
         .unwrap()
         .0;
 
-    // Drive partition 0 to last_sequence=7 using an explicit partition key.
+    // Drive partition 0 to last_sequence=7.
     let key_p0 = partition_key_for(0, 8);
     let mut prev = -1;
     for seq in 1..=7 {
-        let mut ev = chained_event(&c, TOPIC, pid, seq, prev);
-        ev.partition_key = Some(key_p0.clone());
+        let mut ev = chained_event(&c, pid, seq, prev);
+        ev.subject = key_p0.clone();
         broker.publish(&c, &ev).await.unwrap();
         prev = seq;
     }
@@ -290,8 +297,8 @@ async fn s1_06_cursor_recovery() {
     let key_p1 = partition_key_for(1, 8);
     let mut prev = -1;
     for seq in 1..=3 {
-        let mut ev = chained_event(&c, TOPIC, pid, seq, prev);
-        ev.partition_key = Some(key_p1.clone());
+        let mut ev = chained_event(&c, pid, seq, prev);
+        ev.subject = key_p1.clone();
         broker.publish(&c, &ev).await.unwrap();
         prev = seq;
     }
@@ -319,7 +326,7 @@ async fn s1_07_chain_reset() {
     let mut prev = -1;
     for seq in 1..=5 {
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, seq, prev))
+            .publish(&c, &chained_event(&c, pid, seq, prev))
             .await
             .unwrap();
         prev = seq;
@@ -353,7 +360,7 @@ async fn s1_07_chain_reset() {
     // Fresh chain from sequence 1 is accepted again.
     assert_eq!(
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, 1, -1))
+            .publish(&c, &chained_event(&c, pid, 1, -1))
             .await
             .unwrap(),
         IngestOutcome::Accepted
@@ -369,7 +376,7 @@ async fn s1_08_unknown_producer() {
     let c = ctx();
     let unknown = Uuid::parse_str("deadbeef-0000-0000-0000-000000000000").unwrap();
     let err = broker
-        .publish(&c, &chained_event(&c, TOPIC, unknown, 1, -1))
+        .publish(&c, &chained_event(&c, unknown, 1, -1))
         .await
         .expect_err("publishing with an unregistered producer_id must be rejected");
     assert!(
@@ -396,7 +403,7 @@ async fn s1_09_chained_producer_desync_recovery() {
     let mut prev = -1;
     for seq in 1..=7 {
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, seq, prev))
+            .publish(&c, &chained_event(&c, pid, seq, prev))
             .await
             .unwrap();
         prev = seq;
@@ -406,7 +413,7 @@ async fn s1_09_chained_producer_desync_recovery() {
     // the next forward sequence with previous=3 → broker expected previous=7, so
     // SequenceViolation (412).
     let err = broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 8, 3))
+        .publish(&c, &chained_event(&c, pid, 8, 3))
         .await
         .unwrap_err();
     assert!(
@@ -425,7 +432,7 @@ async fn s1_09_chained_producer_desync_recovery() {
     // Exchange 3: republish with corrected previous=7, sequence=8 → Accepted.
     assert_eq!(
         broker
-            .publish(&c, &chained_event(&c, TOPIC, pid, 8, c0_last))
+            .publish(&c, &chained_event(&c, pid, 8, c0_last))
             .await
             .unwrap(),
         IngestOutcome::Accepted
@@ -438,9 +445,9 @@ async fn s1_09_chained_producer_desync_recovery() {
 }
 
 // -- Test-local helper ---------------------------------------------------------
-// Find a partition_key string that the mock routes to `target`
-// partition under `parts` partitions, so chained-flow tests can pin events to a
-// chosen partition.
+// Find a value that the mock routes to `target` partition under `parts`
+// partitions, so chained-flow tests can pin events to a chosen partition through
+// whichever member their event type points at.
 fn partition_key_for(target: u32, parts: u32) -> String {
     use crate::mock::partitioning::partition_for;
     for i in 0..100_000u32 {

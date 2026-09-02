@@ -7,31 +7,41 @@ use super::helpers::{broker_with_topic, ctx, wire_event};
 use crate::api::EventBrokerApi;
 use crate::models::PartitionRange;
 
+/// `description` of the base event's `data` member, which every event type's
+/// composed payload contract carries as its first branch. Spelled out rather
+/// than read back from the declaration so that changing the base surfaces as a
+/// failure here.
+const BASE_DATA_DESCRIPTION: &str = "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).";
+
 /// Scenario: topics/1.01-positive-list-topics.md
 #[tokio::test]
 async fn s1_01_positive_list_topics() {
-    // GET /v1/topics → array of topic records (id + partitions).
+    // GET /v1/topics → one DTO per registered topic. Each is projected from the
+    // stored topic instance document, so the reported values are the topic's own
+    // and an undeclared `retention` surfaces as absent.
     let (broker, h) = broker_with_topic(TOPIC, 4).await;
     h.register_topic(TOPIC2, 2).await;
     let c = ctx();
 
-    let topics = broker.list_topics(&c).await.unwrap();
-    assert_eq!(topics.len(), 2, "both registered topics are visible");
+    let mut topics = broker.list_topics(&c).await.unwrap();
+    // Registration order is not listing order - the mock holds topics in a map.
+    topics.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
 
-    let audit = topics
-        .iter()
-        .find(|t| t.id == TOPIC)
-        .expect("audit topic must be listed");
     assert_eq!(
-        audit.partitions, 4,
-        "partition count echoed per topic record"
+        serde_json::to_value(&topics).unwrap(),
+        serde_json::json!([
+            {
+                "id": TOPIC,
+                "description": format!("Mock topic {TOPIC}"),
+                "retention": null,
+            },
+            {
+                "id": TOPIC2,
+                "description": format!("Mock topic {TOPIC2}"),
+                "retention": null,
+            },
+        ])
     );
-
-    let notify = topics
-        .iter()
-        .find(|t| t.id == TOPIC2)
-        .expect("notify topic must be listed");
-    assert_eq!(notify.partitions, 2);
 }
 
 /// Scenario: topics/1.02-positive-list-topic-segments.md
@@ -44,7 +54,7 @@ async fn s1_02_positive_list_topic_segments() {
     // Publish a few events so partition 0 has a non-empty log.
     for _ in 0..3 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -104,29 +114,79 @@ async fn s1_03_negative_segments_unknown_topic() {
 /// Scenario: topics/1.04-positive-list-event-types.md
 #[tokio::test]
 async fn s1_04_positive_list_event_types() {
-    // GET /v1/event-types → registered types, each anchored to its parent topic.
+    // GET /v1/event-types → one DTO per registered type, projected from its
+    // derived type schema. The topic each one is anchored to is a resolved
+    // `topic` trait, and `data_schema` is the payload contract composed out of
+    // the base event's `data` member and the type's narrowing of it - so the
+    // first branch below is proof the chain resolved through the base.
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     let c = ctx();
 
-    let schema = serde_json::json!({ "type": "object" });
-    h.register_event_type(TOPIC, EVT, schema.clone(), &[]).await;
-    h.register_event_type(TOPIC, EVT2, schema, &[]).await;
+    h.register_event_type(TOPIC, EVT, serde_json::json!({ "type": "object" }), &[])
+        .await;
+    h.register_event_type(
+        TOPIC,
+        EVT2,
+        serde_json::json!({ "type": "object", "required": ["kind"] }),
+        &["test-type"],
+    )
+    .await;
 
-    let types = broker.list_event_types(&c).await.unwrap();
-    assert_eq!(types.len(), 2, "both registered event types are listed");
-    assert!(
-        types.iter().all(|et| et.topic == TOPIC),
-        "each event type is anchored to its parent topic"
+    let mut types = broker.list_event_types(&c).await.unwrap();
+    // Registration order is not listing order - the mock holds types in a map.
+    types.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
+
+    assert_eq!(
+        serde_json::to_value(&types).unwrap(),
+        serde_json::json!([
+            {
+                "id": EVT,
+                "partition_key": "/tenant_id",
+                "topic": TOPIC,
+                "description": null,
+                "allowed_subject_types": [],
+                "data_schema": {
+                    "allOf": [
+                        {
+                            "additionalProperties": true,
+                            "default": null,
+                            "description": BASE_DATA_DESCRIPTION,
+                            "type": ["object", "null"],
+                        },
+                        { "type": "object" },
+                    ],
+                },
+            },
+            {
+                "id": EVT2,
+                "partition_key": "/tenant_id",
+                "topic": TOPIC,
+                "description": null,
+                "allowed_subject_types": ["test-type"],
+                "data_schema": {
+                    "allOf": [
+                        {
+                            "additionalProperties": true,
+                            "default": null,
+                            "description": BASE_DATA_DESCRIPTION,
+                            "type": ["object", "null"],
+                        },
+                        { "type": "object", "required": ["kind"] },
+                    ],
+                },
+            },
+        ])
     );
-    assert!(types.iter().any(|et| et.id == EVT));
-    assert!(types.iter().any(|et| et.id == EVT2));
 
-    // get_event_type round-trips a known id and rejects an unknown one.
+    // get_event_type serves the same DTO for a known id, and rejects an unknown
+    // one.
     let one = broker.get_event_type(&c, EVT).await.unwrap();
-    assert_eq!(one.id, EVT);
-    assert_eq!(one.topic, TOPIC);
+    assert_eq!(
+        serde_json::to_value(&one).unwrap(),
+        serde_json::to_value(&types[0]).unwrap()
+    );
 
-    let ghost = gts_id!("cf.core.events.event_type.v1~example.mock.broker.ghost.v1");
+    let ghost = gts_id!("cf.core.events.event.v1~example.mock.broker.ghost.v1~");
     let err = broker.get_event_type(&c, ghost).await.unwrap_err();
     match err {
         crate::error::EventBrokerError::EventTypeUnknown { ref type_id, .. } => {

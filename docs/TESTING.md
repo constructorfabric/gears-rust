@@ -50,6 +50,9 @@ make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)
 
+# CI gate: no database container built outside libs/test-containers (4.4)
+cargo xtask check-test-container-pins
+
 make build GEAR=file-parser      # one gear package plus SDK package
 make test GEAR=file-parser       # one gear package plus SDK package
 make run GEAR=file-parser        # server with only this gear feature set
@@ -154,6 +157,71 @@ make test-users-info-pg    # users-info Postgres integration
 
 The `integration` job in `ci.yml` runs SQLite, Postgres, and MySQL integration tests
 plus macro UI tests on every PR (Ubuntu only).
+
+### 4.4 Database container images
+
+Every fixture that starts a database container goes through
+[`libs/test-containers`](../libs/test-containers/src/lib.rs) (crate
+`cf-gears-test-containers`, imported as `test_containers`). It is the single place image
+versions are pinned, so a version change is one reviewed diff instead of a grep across the
+workspace.
+
+**Do not call `Postgres::default()` or `Mysql::default()` in a test**, and do not call
+`GenericImage::new()` outside that crate. Those constructors take their tag from
+`testcontainers-modules`, which pins it transitively through `Cargo.lock` — a dependency bump
+then changes the database under every test with nothing in the diff to show it.
+
+`cargo xtask check-test-container-pins` enforces this in CI (the `clippy` job). It parses every
+tracked `.rs` file with `syn`, so an import rename (`Postgres as Pg`), a type alias, a
+non-literal image name or an oddly wrapped call is caught the same as the plain spelling.
+
+```rust
+// Add to [dev-dependencies]:  test-containers = { workspace = true }
+use testcontainers::runners::AsyncRunner;
+
+let container = test_containers::postgres().start().await?;
+
+// Non-default database name (POSTGRES_DB is applied at image level):
+let container = test_containers::postgres_named("cluster_test").start().await?;
+
+// A suite pinned to a floor of its own, above or below the workspace pin —
+// "16-alpine" is just an illustration value here. GEARS_TEST_PG_TAG still
+// wins over it, so the suite stays in the CI version matrix; chaining
+// `.with_tag(...)` onto `postgres()` would silently opt out of the override.
+let container = test_containers::postgres_tagged("16-alpine").start().await?;
+```
+
+Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
+`timescaledb()`, `mariadb()`.
+
+#### Version-matrix overrides
+
+Each tag can be overridden from the environment, so CI can run a matrix without touching code.
+An unset *or empty* variable means "use the pinned constant".
+
+| Variable | Overrides |
+|---|---|
+| `GEARS_TEST_PG_TAG` | `POSTGRES_TAG` |
+| `GEARS_TEST_PG_GRAPH_TAG` | `POSTGRES_GRAPH_TAG` |
+| `GEARS_TEST_MYSQL_TAG` | `MYSQL_TAG` |
+| `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
+| `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
+
+```bash
+GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
+```
+
+`GEARS_TEST_TIMESCALEDB_TAG` is read by both lanes: the Rust plugin fixtures via
+`test_containers::timescaledb()`, and the Python E2E sidecar via `timescaledb_tag()` in
+[`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
+migrations and E2E on the same image instead of silently testing two different ones.
+
+`GEARS_TEST_PG_GRAPH_REQUIRED=1` turns an unavailable PostgreSQL 19 image into a failure rather
+than a graceful skip; it is off by default while that tag is pre-GA. Unset, empty, `0`, `false`,
+`off` and `no` all mean off.
+
+Only concrete tags belong in the constants — a floating alias such as `lts` or `latest`
+re-points under CI with nothing in the diff, which is the drift this crate exists to prevent.
 
 ---
 

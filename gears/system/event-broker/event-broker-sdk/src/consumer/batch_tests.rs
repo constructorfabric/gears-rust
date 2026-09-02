@@ -14,12 +14,11 @@ use crate::error::ConsumerError;
 fn raw_event(offset: i64) -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: gts_id!("cf.core.events.event.v1~example.orders.order_created.x.v1").to_owned(),
+        type_id: gts_id!("cf.core.events.event.v1~example.orders.order_created.x.v1~").to_owned(),
         topic: gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1").to_owned(),
         tenant_id: Uuid::nil(),
         subject: format!("order-{offset}"),
         subject_type: "order".to_owned(),
-        partition_key: None,
         partition: 7,
         sequence: offset,
         offset,

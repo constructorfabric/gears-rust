@@ -191,7 +191,7 @@ Use case: long-quiet producers (monthly batch job that hasn't run in 6 months) s
 ### Producer Registration TTL
 
 - Default TTL: platform-wide setting (initial proposed value `P30D` — 30 days). Configurable per-deployment.
-- TTL is **per producer registration row**, not per `evbk_producer_state` row. The state rows have their own retention governed by topic-level `retention` (capped at `P14D`, per ADR-revised — see DESIGN.md).
+- TTL is **per producer registration row**, not per `evbk_producer_state` row. The state rows have their own retention, governed by the broker's `producer.state_retention` (capped at `P14D` — see DESIGN.md §4.1).
 - A producer's `evbk_producer.last_seen_at` is updated atomically with every accepted chained / monotonic publish.
 - Reaper sweep cadence: bounded (default `PT5M`); exact cadence is implementation detail, not spec.
 - Purge cascade: when an `evbk_producer` row is deleted, any orphaned `evbk_producer_state` rows for the same `producer_id` are also deleted in the same sweep.
@@ -273,7 +273,7 @@ This atomicity is the central invariant of the "exactly-once via idempotent prod
 | 400 | `UnknownMetaVersion` | `meta.version` exceeds broker's supported version | SDK rolls back to a supported version |
 | 400 | `InvalidEventFieldEncoding` | Non-ASCII bytes in event field | Sanitize input |
 | 400 | `EventFieldTooLong` | Event string field exceeds length cap | Sanitize input |
-| 400 | `RetentionExceedsMaxSpan` | Topic created/updated with `retention > P14D` | Lower the value |
+| 400 | `RetentionExceedsMaxSpan` | Broker configured with `producer.state_retention > P14D` | Lower the value |
 | 403 | `ProducerPrincipalMismatch` | Cross-principal publish / cursor read / reset | Use the owning principal |
 | 403 | `TenantIdNotAuthorized` | Platform authz resolver denied the `tenant_id` | Acquire grant (platform-side) |
 | 412 | `SequenceViolation` | Chained mode: `meta.previous != last_sequence` | `GET /v1/producers/{id}/cursors` → reconcile → resume |

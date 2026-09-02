@@ -1253,6 +1253,16 @@ components:
           format: uuid
           description: "Parent group ID."
           example: 11111111-1111-1111-1111-111111111111
+        tenant_id:
+          type: [string, 'null']
+          format: uuid
+          description: >-
+            Optional target tenant for the created group. Omitted, the group is
+            created in the caller's own tenant. Present and different, the
+            create succeeds only when the caller's `create` AccessScope covers
+            that tenant; otherwise the request is rejected with 404, which does
+            not reveal whether the tenant exists. Rejected for tenant-typed
+            groups, whose tenant is always their own id.
         metadata:
           type: object
           description: "Type-specific fields defined by the chained RG type schema."

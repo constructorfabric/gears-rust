@@ -21,9 +21,13 @@ workspace = true
 [features]
 serde = ["dep:serde"]
 humantime-serde = ["serde", "dep:humantime"]
+# JSON Schema reflection, so a duration field can appear in a generated GTS type
+# schema or a REST DTO while keeping its ISO 8601 string form on the wire.
+schemars = ["dep:schemars"]
 
 [dependencies]
 serde = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 humantime = { workspace = true, optional = true }
 secrecy = { workspace = true }
 regex = { workspace = true }

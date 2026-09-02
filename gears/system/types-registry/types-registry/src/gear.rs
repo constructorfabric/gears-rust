@@ -4,16 +4,23 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use toolkit::api::OpenApiRegistry;
-use toolkit::contracts::SystemCapability;
+use toolkit::contracts::{DatabaseCapability, SystemCapability};
 use toolkit::{Gear, GearCtx, RestApiCapability};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::config::TypesRegistryConfig;
+use crate::domain::admission::{NullDispatch, OperationDispatch};
 use crate::domain::local_client::TypesRegistryLocalClient;
+use crate::domain::ports::Stores;
+use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 use crate::infra::InMemoryGtsRepository;
+use crate::infra::storage::Repos;
+
+/// Table prefix for the gear's `toolkit-db` outbox (SPEC §5).
+const OUTBOX_TABLE_PREFIX: &str = "types_registry_outbox";
 
 /// Types Registry gear.
 ///
@@ -22,6 +29,7 @@ use crate::infra::InMemoryGtsRepository;
 /// ## Capabilities
 ///
 /// - `system` — Core infrastructure gear, initialized early in startup
+/// - `db` — Owns the managed-state schema (`docs/database.sql`, P0 subset)
 /// - `rest` — Exposes REST API endpoints
 ///
 /// ## Link-time inventory seeding
@@ -41,10 +49,12 @@ use crate::infra::InMemoryGtsRepository;
 /// the dependency graph.
 #[toolkit::gear(
     name = "types-registry",
-    capabilities = [system, rest]
+    capabilities = [system, db, rest]
 )]
 pub struct TypesRegistryGear {
     service: OnceLock<Arc<TypesRegistryService>>,
+    /// The database-backed path. Absent when no database is bound to this gear.
+    registry: OnceLock<Arc<RegistryService>>,
     local_client: OnceLock<Arc<TypesRegistryLocalClient>>,
 }
 
@@ -52,6 +62,7 @@ impl Default for TypesRegistryGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            registry: OnceLock::new(),
             local_client: OnceLock::new(),
         }
     }
@@ -61,6 +72,34 @@ impl Default for TypesRegistryGear {
 impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TypesRegistryConfig = ctx.config_or_default()?;
+
+        // Startup validation. An unparsable registration-policy region reads
+        // exactly like a closed one at admission time, so the boot fails here
+        // rather than leaving an operator with refusals that name no cause
+        // (SPEC §10.3). The compiled policy is returned rather than recomputed
+        // so the boot path and the acceptance path cannot disagree; T7 is its
+        // first consumer and takes ownership of it there.
+        let registration_policy = cfg.validate()?;
+        debug!(
+            regions = registration_policy.len(),
+            allow_compatibility_force = cfg.allow_compatibility_force,
+            batch_candidates = cfg.limits.batch_candidates,
+            "Validated types_registry registration policy and limits"
+        );
+
+        // A key P0 parses but does not act on is said out loud once, at the only
+        // moment an operator is watching. Silence is what turns
+        // `activation_write_set: 1024` into "the operator believes the bound is 1024"
+        // — the enforcement is scheduled, the false impression is the defect.
+        let inert = cfg.inert_limit_keys();
+        if !inert.is_empty() {
+            warn!(
+                keys = ?inert,
+                "types_registry accepted configuration keys that P0 does not enforce; \
+                 each key's documentation names the task that binds it"
+            );
+        }
+
         debug!(
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}, \
              local_client.cache.type_schemas={{capacity={}, ttl={:?}}}, \
@@ -75,6 +114,7 @@ impl Gear for TypesRegistryGear {
 
         let gts_config = cfg.to_gts_config();
         let static_entities = cfg.entities.clone();
+        let cfg_for_registry = cfg.clone();
         let type_schemas_cache_cfg = cfg.local_client.cache.type_schemas.to_cache_config();
         let instances_cache_cfg = cfg.local_client.cache.instances.to_cache_config();
 
@@ -134,6 +174,41 @@ impl Gear for TypesRegistryGear {
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // The database-backed platform-plane path (T7–T9). Optional rather than
+        // required: `no-db.yaml` and `--mock` deployments bind no database to this
+        // gear, and failing their boot for a path they do not use would be a
+        // regression. Where no database is bound the new routes answer
+        // `503 Service Unavailable` through the ordinary canonical-error ladder,
+        // and this warning names the cause.
+        if let Some(db) = ctx.db() {
+            // Admission runs inline until T21 starts the outbox worker in
+            // `init()`. `NullDispatch` therefore enqueues nothing — the
+            // dispatch is still written inside the acceptance transaction, so
+            // the shape T21 needs is already in place.
+            let dispatch: Arc<dyn OperationDispatch> = Arc::new(NullDispatch);
+            // The domain names its persistence ports and never the repositories;
+            // this is the one place the database-backed adapter is chosen.
+            let stores: Arc<dyn Stores> = Arc::new(Repos);
+            let registry = Arc::new(RegistryService::new(
+                db.db(),
+                stores,
+                registration_policy,
+                cfg_for_registry,
+                dispatch,
+                crate::domain::registry_service::AdmissionMode::Inline,
+            ));
+            self.registry
+                .set(registry)
+                .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+            info!("types_registry database-backed admission path wired");
+        } else {
+            tracing::warn!(
+                "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \
+                 GET /entities/{{key}} will report service unavailable. Bind one under \
+                 gears.types-registry.database to enable admission."
+            );
+        }
 
         let local_client = Arc::new(TypesRegistryLocalClient::with_cache_configs(
             service,
@@ -201,6 +276,35 @@ impl SystemCapability for TypesRegistryGear {
     }
 }
 
+impl DatabaseCapability for TypesRegistryGear {
+    /// The managed-state schema plus the outbox tables the admission worker
+    /// dispatches through.
+    ///
+    /// The outbox tables are `ToolKit`-owned and are deliberately *not* part of
+    /// the initial migration: they come from
+    /// `outbox_migrations_with_prefix("types_registry_outbox")`, so a `ToolKit`
+    /// change to the outbox schema arrives as a `ToolKit` migration rather than
+    /// as a hand-copied DDL drift in this gear.
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        use sea_orm_migration::MigratorTrait;
+        info!("Providing types-registry database migrations");
+        let mut migrations = crate::infra::storage::Migrator::migrations();
+        let outbox = match toolkit_db::outbox::outbox_migrations_with_prefix(OUTBOX_TABLE_PREFIX) {
+            Ok(outbox) => outbox,
+            // `migrations()` cannot fail in its signature. The prefix is a
+            // compile-time constant that the helper only rejects for an invalid
+            // shape (e.g. a schema-qualified name), so this arm is unreachable
+            // in practice; fail the process rather than booting a gear whose
+            // outbox tables are missing.
+            Err(e) => panic!(
+                "types-registry outbox migration prefix '{OUTBOX_TABLE_PREFIX}' is invalid: {e}"
+            ),
+        };
+        migrations.extend(outbox);
+        migrations
+    }
+}
+
 impl RestApiCapability for TypesRegistryGear {
     fn register_rest(
         &self,
@@ -216,7 +320,11 @@ impl RestApiCapability for TypesRegistryGear {
             .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
             .clone();
 
-        let router = crate::api::rest::routes::register_routes(router, openapi, service);
+        // Where no database is bound there is no `RegistryService`, and the
+        // database-backed routes must still exist so a caller gets a problem
+        // document naming the cause rather than a 404 suggesting the API changed.
+        let registry = self.registry.get().cloned();
+        let router = crate::api::rest::routes::register_routes(router, openapi, service, registry);
 
         info!("Types registry REST routes registered successfully");
         Ok(router)

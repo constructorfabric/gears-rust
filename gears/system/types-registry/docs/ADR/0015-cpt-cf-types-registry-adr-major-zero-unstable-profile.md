@@ -112,11 +112,7 @@ GTS §9.6 also permits an `x-gts-ref` that names no entity. `gts.*` constrains a
 
 The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct edge to v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
 
-The induction's base case is a **precondition, not a theorem**. GTS has always admitted major 0, while the managed profile previously assigned it no special meaning. An existing registry could therefore already contain a stable entity referencing v0. Refusing only new edges would assert quarantine without establishing it.
-
-Enabling the rule requires a **preflight scan**: join `dependency` to `entity.gts_id` and find any subject whose last-segment major is at least 1 with a target whose is 0. This is the admission comparison run once.
-
-An empty scan establishes the base case; that is expected for a first release where only stable majors were admitted. A non-empty scan requires remediation before enablement. There is no grandfathering because every retained edge is the leak the rule exists to prevent.
+The induction's base case holds because **no registry predates the rule**. The release that introduces the quarantine check is the release that first persists a managed entity at all, so at enablement there is no stored edge to inherit and nothing to grandfather — the property the rule maintains starts out true rather than being asserted over existing state. Two consequences worth naming: an implementation MUST NOT enable the rule against a registry populated by a build that had the storage but not the check, since those edges were admitted under no rule at all; and a later release that re-establishes the rule over an existing registry has to demonstrate the base case rather than assume it, for which the check run once over stored edges is the obvious instrument.
 
 Without quarantine, the profile leaks. A `$ref` floats, so reshaping unstable `address.v0~` can redefine the accepted-instance set of stable `customer.v1~` that references it — **without any authored revision of `customer.v1~`**. DESIGN §1.1 recomputes its current-state projection when the dependency advances.
 
@@ -190,14 +186,13 @@ Three limits are stated here so that they are not discovered later.
 * No storage change, no migration, and no new operation.
 * The contract gains no value in any enumeration. ADR-0003 confines compatibility reporting to refusal, and a v0 entity has nothing to refuse on this axis, so admitting one simply says nothing about compatibility — which serves the concern below better than a special value would: there is no bare verdict to be mistaken for a guarantee if there is no verdict.
 * A control-plane type and its registered Instances cannot be co-developed under the profile.
-* Introducing the profile is **schema-additive but conditionally enablable**: it changes no stored row, while the quarantine rule's base case has to be established by the preflight scan rather than assumed. Existing v0 entities are possible, since the grammar always admitted major 0, so only a clean scan establishes that no existing closure needs remediation.
+* Introducing the profile is **schema-additive**: it changes no stored row, and it needs no deployment step of its own. The quarantine rule's base case comes from the release boundary — the storage and the check arrive together — so there is no existing closure to remediate and no condition on enablement.
 
 ### Confirmation
 
 This decision is confirmed when:
 
 * a content revision of a **major-only `v0~`** entity is admitted **when the non-exempt checks pass** whether it narrows, widens, or is incomparable to the current revision, including a pair that a comparison would have reported undecidable — which is never invoked, so no verdict is computed or reported; the same candidate against a `v1~` entity is admitted only in the widening case and rejected in the other three; and a content revision of a **minor-bearing `v0.n~`** entity is refused, immutability being unwaived;
-* the preflight scan for a stable subject holding a direct edge to a v0 target reports empty before the quarantine rule is enabled, and reports the offending edges where one exists;
 * a v0 derived Type Schema that violates its base chain is rejected, proving derivation compatibility is not waived;
 * a v0 Type Schema candidate declaring a dialect other than Draft-07 is rejected, proving ADR-0014 is not waived;
 * a `v0.2~` candidate is admitted without any compatibility check against `v0.1~`, while opening major 0 at `v0.1~`, admitting `v0.2~` over a missing `v0.1~`, and revising `v0.1~` at all are each rejected — proving the exemption reaches the check and not the contiguity or immutability rules;
@@ -251,7 +246,7 @@ A boolean or enumeration column on `entity`, set at initial admission and immuta
 * Good, because the risk is legible in the value every consumer already holds, so accepting it is an informed act rather than an assumption.
 * Good, because it needs no storage, no migration, no new operation, and no new state, and graduation falls out of the existing version-family model.
 * Good, because the quarantine rule makes responsibility genuinely local: an unstable type can harm only entities whose owners also opted in.
-* Good, because it is schema-additive: it stores nothing and migrates nothing. Its one deployment cost is the preflight scan that establishes the quarantine base case, which is a single query and is expected to come back empty.
+* Good, because it is schema-additive: it stores nothing, migrates nothing, and has no deployment step — the quarantine base case comes from the release boundary rather than from a scan of existing state.
 * Good, because it follows the convention every developer already knows from SemVer, Go modules, Cargo, and Kubernetes alpha versions, so it needs no explaining to the actors who will use it.
 * Bad, because it consumes a major number for a meaning, so a genuine `v0` in the ordinary sense is no longer available. In practice the two coincide.
 * Bad, because it cannot be applied to a settled type that later needs one breaking change: that case still needs a new major.

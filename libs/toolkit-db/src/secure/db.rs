@@ -41,11 +41,20 @@
 //! let user_id = result?;
 //! ```
 
-use std::{cell::Cell, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
 
-use super::tx_config::TxConfig;
+use super::tx_config::{TxConfig, TxIsolationLevel};
 use super::tx_error::TxError;
 use crate::{DbError, DbHandle};
 
@@ -195,7 +204,15 @@ impl std::fmt::Display for TxPhase {
 // non-transactional runners while inside a transaction closure.
 tokio::task_local! {
     static IN_TX: Cell<bool>;
+    static TX_ID: Cell<u64>;
+    static TX_ISOLATION: Cell<Option<TxIsolationLevel>>;
 }
+
+/// Source of the ids `with_tx_guard` hands each transaction. Process-wide and
+/// monotonic, not persisted or reset -- it only has to be unique for the
+/// process's lifetime, to tell two transactions apart within one recorded
+/// trace.
+static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Check if we're currently inside a transaction context.
 ///
@@ -215,6 +232,48 @@ fn is_in_transaction() -> bool {
 #[must_use]
 pub fn in_transaction_for_testing() -> bool {
     is_in_transaction()
+}
+
+/// The identity of the transaction the caller is currently inside, or `None`
+/// outside any transaction.
+///
+/// [`in_transaction_for_testing`] alone cannot tell "these two queries ran in
+/// the same transaction" from "each ran in a transaction, but not the same
+/// one" -- a regression that split one transactional operation into two
+/// sequential transactions would still answer `true` for every query either
+/// way. This id is fresh every time [`with_tx_guard`] wraps a new attempt, so
+/// query recorders can tell those two cases apart.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn transaction_id_for_testing() -> Option<u64> {
+    TX_ID.try_with(Cell::get).ok()
+}
+
+/// The isolation level the caller *asked for* when opening the transaction the
+/// caller is currently inside.
+///
+/// Two nested `Option`s, and both carry meaning:
+///
+/// - the outer `None` means "not inside a transaction at all";
+/// - `Some(None)` means "inside a transaction opened at the backend default",
+///   which is what `TxConfig::default()` asks for;
+/// - `Some(Some(level))` means the transaction was opened at `level`.
+///
+/// This records the *request*, not what the backend did with it. That is the
+/// point: `SQLite` is serializable whatever it is told, so a test that asked
+/// the engine would pass on `SQLite` no matter which level the service picked,
+/// and the thing worth pinning is the service's own choice. An invariant that
+/// several code paths must all open `SERIALIZABLE` -- so `PostgreSQL`'s SSI can
+/// see them as conflicting -- is otherwise guarded by review alone: downgrading
+/// one of them changes no statement, no count, and no result on `SQLite`.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn transaction_isolation_for_testing() -> Option<Option<TxIsolationLevel>> {
+    TX_ISOLATION.try_with(Cell::get).ok()
 }
 
 /// Name the class of a `SqlErr` without echoing its payload.
@@ -238,11 +297,22 @@ fn sql_err_kind(err: Option<&sea_orm::SqlErr>) -> &'static str {
 /// Sets `IN_TX = true` for the duration of the closure, so that any call to
 /// `Db::conn()` within it fails rather than silently opening a second
 /// connection outside the transaction.
-async fn with_tx_guard<F, T>(f: F) -> T
+///
+/// It also assigns the transaction a process-unique id and records the
+/// isolation level it was asked to open at, both scoped to the same closure.
+/// Those two are read only by the query recorder under `test-support`, though
+/// the counter and the task-locals are compiled into every transaction.
+async fn with_tx_guard<F, T>(isolation: Option<TxIsolationLevel>, f: F) -> T
 where
     F: Future<Output = T>,
 {
-    IN_TX.scope(Cell::new(true), f).await
+    let id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+    IN_TX
+        .scope(
+            Cell::new(true),
+            TX_ID.scope(Cell::new(id), TX_ISOLATION.scope(Cell::new(isolation), f)),
+        )
+        .await
 }
 
 /// Database handle for secure operations.
@@ -408,7 +478,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(None, f(&tx)).await;
 
         match res {
             Ok(v) => {
@@ -457,7 +527,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(None, f(&tx)).await;
 
         match res {
             Ok(v) => {
@@ -540,7 +610,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(tx_config.isolation, f(&tx)).await;
 
         match res {
             Ok(v) => match txn.commit().await {
@@ -846,7 +916,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(None, f(&tx)).await;
 
         match res {
             Ok(v) => match txn.commit().await {
@@ -897,7 +967,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(None, f(&tx)).await;
 
         match res {
             Ok(v) => match txn.commit().await {
@@ -960,7 +1030,7 @@ impl Db {
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
-        let res = with_tx_guard(f(&tx)).await;
+        let res = with_tx_guard(config.isolation, f(&tx)).await;
 
         match res {
             Ok(v) => match txn.commit().await {

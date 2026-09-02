@@ -3,6 +3,7 @@
 //! `ADR/0004-idempotent-producer-protocol.md`). Signatures only.
 
 use async_trait::async_trait;
+use gts::GtsInstanceId;
 use toolkit::domain_model;
 use uuid::Uuid;
 
@@ -36,7 +37,7 @@ pub trait IdempotencyGuard: Send + Sync {
     async fn check_and_record(
         &self,
         producer_id: Uuid,
-        topic: &str,
+        topic: &GtsInstanceId,
         partition: i32,
         previous: i64,
         sequence: i64,

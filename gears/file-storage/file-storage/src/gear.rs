@@ -147,7 +147,7 @@ impl Gear for FileStorageGear {
         // listing applies the tenant scope).
         let authz = ctx
             .client_hub()
-            .get::<dyn authz_resolver_sdk::AuthZResolverClient>()
+            .get::<dyn authz_resolver_sdk::AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to resolve AuthZ resolver: {e}"))?;
         let authorizer: Arc<dyn Authorizer> = Arc::new(PolicyEnforcerAuthorizer::new(authz));
 
@@ -187,7 +187,7 @@ impl Gear for FileStorageGear {
         //
         // TODO(P2 1.12 remediation): wire the usage reporter off `None`.
         // `usage-collector-sdk`'s `UsageCollectorClientV1` (resolved the same
-        // way `authz_resolver_sdk::AuthZResolverClient` is resolved just
+        // way `authz_resolver_sdk::AuthZResolverApi` is resolved just
         // above) is mechanically reachable via `ctx.client_hub().get::<...>()`,
         // but an adapter from this gear's simple `UsageDelta{bytes_delta,
         // file_count_delta}` shape to the collector's actual wire model is a

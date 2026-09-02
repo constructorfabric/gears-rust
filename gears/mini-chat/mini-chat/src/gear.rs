@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverClient, ClientCredentialsRequest};
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 use std::time::Duration;
 use toolkit::api::OpenApiRegistry;
 use toolkit::contracts::RunnableCapability;
@@ -197,7 +197,7 @@ impl Gear for MiniChatGear {
 
         let authz = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
+            .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
 
         let authn_client = ctx

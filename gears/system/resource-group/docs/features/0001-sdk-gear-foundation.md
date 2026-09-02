@@ -216,7 +216,7 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 
 **Required behavior**:
 - Phase 1 (SystemCapability): register `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub. REST/gRPC endpoints NOT yet accepting traffic.
-- Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverClient` (available since AuthZ init in Phase 1).
+- Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverApi` (available since AuthZ init in Phase 1).
 - ClientHub registration: single `RgService` implementation registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`.
 - Query profile configuration loaded from gear config (`max_depth`, `max_width`).
 

@@ -222,6 +222,64 @@ async fn s1_09_positive_list_subscriptions() {
     assert_eq!(item.topology_version, 1);
 }
 
+/// A read subscription reports the topic each of its partitions belongs to.
+///
+/// The JOIN response has always carried the topic per partition, so a multi-topic
+/// assignment was only ever asserted there. This covers the read projection, whose
+/// entries a consumer commits offsets against.
+#[tokio::test]
+async fn a_multi_topic_assignment_names_each_partitions_own_topic() {
+    let (broker, h) = broker_with_topic(TOPIC, 2).await;
+    h.register_topic(TOPIC2, 2).await;
+    let c = ctx();
+    let gid = make_group(&c, &broker).await;
+
+    let mk_interest = |topic: &str| SubscriptionInterest {
+        topic: topic.to_owned(),
+        tenant_id: Uuid::nil(),
+        tenant_depth: crate::api::TenantTraversalDepth::CurrentTenant,
+        barrier_mode: BarrierMode::Respect,
+        types: vec!["*".to_owned()],
+        filter: None,
+    };
+    let assignment = broker
+        .join(
+            &c,
+            JoinRequest {
+                group: gid,
+                client_agent: "fulfilment-worker/2.0.0".to_owned(),
+                interests: vec![mk_interest(TOPIC), mk_interest(TOPIC2)],
+                session_timeout: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let record = broker
+        .get_subscription(&c, assignment.subscription_id)
+        .await
+        .unwrap();
+
+    let mut reported = record
+        .assigned
+        .iter()
+        .map(|a| (a.topic.as_ref().to_owned(), a.partition))
+        .collect::<Vec<_>>();
+    reported.sort();
+
+    // Partition 0 of each topic is a distinct entry: committing an offset for one
+    // must not address the other.
+    assert_eq!(
+        reported,
+        vec![
+            (TOPIC.to_owned(), 0),
+            (TOPIC.to_owned(), 1),
+            (TOPIC2.to_owned(), 0),
+            (TOPIC2.to_owned(), 1),
+        ]
+    );
+}
+
 /// Scenario: consumer/subscriptions/1.10-positive-read-subscription.md
 #[tokio::test]
 async fn s1_10_positive_read_subscription() {

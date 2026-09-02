@@ -16,7 +16,6 @@ pub struct DeadLetterEnvelope {
     pub event_type: String,
     pub subject: String,
     pub subject_type: String,
-    pub partition_key: Option<String>,
     pub partition: u32,
     pub offset: i64,
     pub attempts: Option<u16>,
@@ -35,13 +34,16 @@ pub struct DeadLetterSourceCoordinates {
     pub event_type: String,
     pub subject: String,
     pub subject_type: String,
-    pub partition_key: Option<String>,
     pub partition: u32,
     pub offset: i64,
     pub event_id: Uuid,
 }
 
 impl DeadLetterEnvelope {
+    /// Bumped only when a stored envelope's shape changes in a way a reader must
+    /// detect. The version is a compatibility marker for envelopes already in a
+    /// DLQ, so a change made before anything ships leaves it alone: there are no
+    /// stored envelopes of an older shape for a reader to distinguish.
     pub const VERSION: u16 = 1;
     pub const PAYLOAD_TYPE: &'static str = "application/vnd.cyberfabric.event-broker.dlq+json";
 
@@ -54,7 +56,6 @@ impl DeadLetterEnvelope {
             event_type: record.event_type,
             subject: record.subject,
             subject_type: record.subject_type,
-            partition_key: record.partition_key,
             partition: record.partition,
             offset: record.offset,
             attempts: record.attempts,
@@ -90,7 +91,6 @@ impl DeadLetterEnvelope {
             event_type: self.event_type.clone(),
             subject: self.subject.clone(),
             subject_type: self.subject_type.clone(),
-            partition_key: self.partition_key.clone(),
             partition: self.partition,
             offset: self.offset,
             event_id: self.event_id,

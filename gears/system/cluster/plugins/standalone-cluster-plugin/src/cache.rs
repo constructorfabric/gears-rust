@@ -427,6 +427,60 @@ impl ClusterCacheBackend for StandaloneCache {
         outcome
     }
 
+    async fn compare_and_swap_value(
+        &self,
+        key: &str,
+        expected_value: &[u8],
+        new_value: &[u8],
+        ttl: Ttl,
+    ) -> Result<CacheEntry, ClusterError> {
+        // Overridden (not the default get-then-swap) for atomicity, per the
+        // trait doc's guidance for a backend with an atomic store. Guards on the
+        // exact bytes rather than the version so a delete-then-recreate (which
+        // resets the version to 1) cannot alias a successor's fresh claim — the
+        // lease steal relies on this.
+        let now = Instant::now();
+        let outcome = {
+            let mut guard = self.lock();
+            if guard.shutting_down {
+                return Err(ClusterError::Shutdown);
+            }
+            match guard.map.get(key) {
+                Some(stored) if !stored.is_expired(now) => {
+                    if stored.value.as_slice() == expected_value {
+                        let version = stored.version + 1;
+                        let stored = Stored {
+                            value: new_value.to_vec(),
+                            version,
+                            expires_at: ttl.as_duration().map(|d| now + d),
+                        };
+                        let entry = stored.entry();
+                        guard.map.insert(key.to_owned(), stored);
+                        Ok(entry)
+                    } else {
+                        Err(ClusterError::CasConflict {
+                            key: key.to_owned(),
+                            current: Some(stored.entry()),
+                        })
+                    }
+                }
+                _ => Err(ClusterError::CasConflict {
+                    key: key.to_owned(),
+                    current: None,
+                }),
+            }
+        };
+        if outcome.is_ok() {
+            self.broadcast(
+                key,
+                &CacheEvent::Changed {
+                    key: key.to_owned(),
+                },
+            );
+        }
+        outcome
+    }
+
     async fn compare_and_delete(
         &self,
         key: &str,

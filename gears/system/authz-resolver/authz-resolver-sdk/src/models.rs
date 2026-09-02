@@ -11,7 +11,17 @@ use uuid::Uuid;
 use crate::constraints::Constraint;
 
 /// Tenant hierarchy mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantMode {
     /// Only the specified root tenant (no subtree expansion).
@@ -24,7 +34,19 @@ pub enum TenantMode {
 /// Controls how barriers (self-managed tenants) are handled during `AuthZ` evaluation.
 ///
 /// Consistent with `tenant_resolver_sdk::BarrierMode`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
+#[schema(as = AuthzBarrierMode)]
 #[serde(rename_all = "snake_case")]
 pub enum BarrierMode {
     /// Respect all barriers - stop at barrier boundaries (default).
@@ -45,7 +67,9 @@ pub enum BarrierMode {
 /// the PDP will then return `InGroup`/`InGroupSubtree` predicates directly.
 /// Services without access should omit these capabilities — the PDP will
 /// degrade group predicates to explicit `In` with pre-resolved resource IDs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// PEP understands tenant hierarchy constraints.
@@ -57,7 +81,7 @@ pub enum Capability {
 }
 
 /// Reason for an explicit deny from the PDP.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct DenyReason {
     /// Machine-readable error code.
     pub error_code: String,
@@ -69,7 +93,7 @@ pub struct DenyReason {
 /// Authorization evaluation request.
 ///
 /// Follows the `AuthZEN` 1.0 model: Subject + Action + Resource + Context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct EvaluationRequest {
     /// The subject (who is making the request).
     pub subject: Subject,
@@ -82,7 +106,7 @@ pub struct EvaluationRequest {
 }
 
 /// The authenticated subject making the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 #[allow(clippy::struct_field_names)] // field names follow AuthZEN spec
 pub struct Subject {
     /// Subject identifier (user ID, service ID).
@@ -98,14 +122,14 @@ pub struct Subject {
 }
 
 /// The action being performed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct Action {
     /// Action name (e.g., "list", "get", "create", "update", "delete").
     pub name: String,
 }
 
 /// The resource being accessed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 #[allow(clippy::struct_field_names)] // field names follow AuthZEN spec
 pub struct Resource {
     /// Resource type identifier (e.g., "`gts.cf.core.users.user.v1~`").
@@ -120,7 +144,7 @@ pub struct Resource {
 }
 
 /// Tenant context for the evaluation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct TenantContext {
     /// Tenant hierarchy mode (default: `Subtree`).
     #[serde(default)]
@@ -128,7 +152,7 @@ pub struct TenantContext {
     /// The context tenant ID (tenant being operated on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_id: Option<Uuid>,
-    /// Barrier enforcement mode (default: `All`).
+    /// Barrier enforcement mode (default: `Respect`).
     #[serde(default)]
     pub barrier_mode: BarrierMode,
     /// Required tenant status filter (e.g., `["active"]`).
@@ -137,7 +161,7 @@ pub struct TenantContext {
 }
 
 /// Additional evaluation request context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 #[allow(clippy::struct_field_names)] // field names follow design doc
 pub struct EvaluationRequestContext {
     /// Tenant context for multi-tenant scoping.
@@ -168,7 +192,7 @@ pub struct EvaluationRequestContext {
 ///
 /// Contains constraints (when `decision` is `true`) or deny reason
 /// (when `decision` is `false`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct EvaluationResponseContext {
     /// Row-level constraints to apply when `decision` is `true`.
     /// Empty when `require_constraints` was `false` or when access is unrestricted.
@@ -184,11 +208,23 @@ pub struct EvaluationResponseContext {
 ///
 /// The PDP returns a decision (allow/deny) and optionally a context
 /// containing constraints or deny reason.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct EvaluationResponse {
     /// Whether access is granted.
     pub decision: bool,
     /// Response context with constraints or deny reason.
     #[serde(default)]
     pub context: EvaluationResponseContext,
+}
+
+// Marker impls so these DTOs are accepted by `toolkit::OperationBuilder` /
+// `#[toolkit::rest_contract]`. `RequestApiDto` / `ResponseApiDto` are tag
+// traits with no required methods; the `Serialize` / `Deserialize` /
+// `JsonSchema` / `ToSchema` derives above carry the real behavior.
+mod _api_dto_markers {
+    use super::{EvaluationRequest, EvaluationResponse};
+    use toolkit::api::api_dto::{RequestApiDto, ResponseApiDto};
+
+    impl RequestApiDto for EvaluationRequest {}
+    impl ResponseApiDto for EvaluationResponse {}
 }

@@ -14,13 +14,13 @@ use uuid::Uuid;
 #[test]
 fn display_interpolates_fields() {
     let e = EventBrokerError::EventTypeNotDeclared {
-        type_id: "gts.cf.core.events.event_type.v1~example.foo.v1".into(),
+        type_id: "gts.cf.core.events.event.v1~example.foo.v1~".into(),
         detail: "d".into(),
         instance: String::new(),
     };
     assert!(
         e.to_string()
-            .contains("gts.cf.core.events.event_type.v1~example.foo.v1")
+            .contains("gts.cf.core.events.event.v1~example.foo.v1~")
     );
 
     let e = EventBrokerError::SequenceViolation {
@@ -147,7 +147,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::EventTypeNotDeclared {
-                type_id: "gts.cf.core.events.event_type.v1~example.orders.created.v1".into(),
+                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "type is not declared".into(),
                 instance: "ignored".into(),
             },
@@ -164,14 +164,14 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                         "description": "type is not declared",
                         "reason": reasons::EVENT_TYPE_NOT_DECLARED
                     }],
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event_type.v1~example.orders.created.v1"
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
         ),
         (
             EventBrokerError::EventTypeUnknown {
-                type_id: "gts.cf.core.events.event_type.v1~example.orders.created.v1".into(),
+                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "event type not found".into(),
                 instance: "ignored".into(),
             },
@@ -183,14 +183,14 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event_type.v1~example.orders.created.v1"
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
         ),
         (
             EventBrokerError::TypeNotInDeclaredTopic {
-                type_id: "gts.cf.core.events.event_type.v1~example.orders.created.v1".into(),
+                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 expected_topic: "orders".into(),
                 detail: "type belongs to another topic".into(),
                 instance: "ignored".into(),
@@ -205,17 +205,17 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "context": {
                     "violations": [{
                         "type": reasons::TYPE_NOT_IN_DECLARED_TOPIC,
-                        "subject": "gts.cf.core.events.event_type.v1~example.orders.created.v1",
+                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
                         "description": "type belongs to another topic; expected topic orders"
                     }],
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event_type.v1~example.orders.created.v1"
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
         ),
         (
             EventBrokerError::SchemaNotPrepared {
-                type_id: "gts.cf.core.events.event_type.v1~example.orders.created.v1".into(),
+                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "schema cache missing".into(),
                 instance: "ignored".into(),
             },
@@ -229,11 +229,11 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "context": {
                     "violations": [{
                         "type": reasons::SCHEMA_NOT_PREPARED,
-                        "subject": "gts.cf.core.events.event_type.v1~example.orders.created.v1",
+                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
                         "description": "schema cache missing"
                     }],
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event_type.v1~example.orders.created.v1"
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
         ),
@@ -262,7 +262,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::EventDataInvalid {
-                type_id: "gts.cf.core.events.event_type.v1~example.orders.created.v1".into(),
+                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 errors: vec!["/amount must be >= 0".into()],
                 detail: "payload invalid".into(),
                 instance: "ignored".into(),
@@ -280,8 +280,8 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                         "description": "payload invalid: /amount must be >= 0",
                         "reason": reasons::EVENT_DATA_INVALID
                     }],
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event_type.v1~example.orders.created.v1"
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
         ),

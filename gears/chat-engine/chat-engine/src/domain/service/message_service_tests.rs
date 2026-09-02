@@ -411,6 +411,7 @@ fn make_request(session_id: Uuid) -> SendMessageRequest {
         file_ids: vec![],
         parent_message_id: None,
         capabilities: None,
+        metadata: None,
     }
 }
 
@@ -2142,4 +2143,56 @@ async fn list_active_messages_with_parent_filter_returns_direct_replies() {
             .iter()
             .all(|m| m.parent_message_id == Some(root.assistant_message_id))
     );
+}
+
+// ----------------- validate_message_metadata -----------------
+
+#[test]
+fn message_metadata_rejects_every_reserved_key() {
+    for key in RESERVED_MESSAGE_METADATA_KEYS {
+        let metadata = serde_json::json!({ *key: "spoofed" });
+        let err =
+            validate_message_metadata(Some(&metadata)).expect_err("reserved key must be rejected");
+        assert!(
+            matches!(err, ChatEngineError::BadRequest { .. }),
+            "reserved key '{key}' must map to 400, got {err:?}",
+        );
+    }
+}
+
+#[test]
+fn message_metadata_allows_client_keys_and_absent_metadata() {
+    validate_message_metadata(None).expect("absent metadata accepted");
+    let metadata = serde_json::json!({
+        "device": "ios",
+        "active_error": {"code": "E_OFFLINE"},
+        "time_remaining_s": 42,
+    });
+    validate_message_metadata(Some(&metadata)).expect("client metadata accepted");
+}
+
+#[test]
+fn message_metadata_enforces_the_serialized_size_cap() {
+    // `{"blob":"…"}` — the payload sits just under / just over the cap once
+    // the enclosing object and quotes are counted.
+    let overhead = r#"{"blob":""}"#.len();
+    let at_limit = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_METADATA_BYTES - overhead) });
+    validate_message_metadata(Some(&at_limit)).expect("payload at the cap is accepted");
+
+    let over_limit =
+        serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_METADATA_BYTES - overhead + 1) });
+    let err = validate_message_metadata(Some(&over_limit))
+        .expect_err("payload over the cap must be rejected");
+    assert!(
+        matches!(err, ChatEngineError::BadRequest { .. }),
+        "oversized metadata must map to 400, got {err:?}",
+    );
+}
+
+#[test]
+fn message_metadata_accepts_non_object_json() {
+    // Reserved-key filtering only applies to objects; a scalar or array is
+    // opaque client context and only the size cap governs it.
+    validate_message_metadata(Some(&serde_json::json!(["a", "b"]))).expect("array accepted");
+    validate_message_metadata(Some(&serde_json::json!("plain"))).expect("string accepted");
 }

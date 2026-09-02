@@ -395,7 +395,7 @@ The lock around `cluster.distributed_lock("evbk.group.<G>")` is the serializatio
 - **cursor CAS forward-only**: SEEK with offset older than current `cursor.offset` is a no-op (forward-only during streaming).
 - **topology_version monotonicity**: each mutation increments by exactly 1; concurrent mutations serialize through the lock.
 - **filter evaluation order**: per-member filter applies AFTER partition assignment; events for non-assigned partitions are never evaluated.
-- **interest prerequisites**: per-event delivery checks `event.topic == interest.topic`, then `event.tenant_id == interest.tenant_id`, then `event.type ∈ resolved_type_set` BEFORE invoking `engine.eval`. Non-matching prerequisite → skip interest without engine call.
+- **interest prerequisites**: per-event delivery checks the event's topic - resolved from the `topic` trait on its `type`, not carried on the event - against `interest.topic`, then `event.tenant_id == interest.tenant_id`, then `event.type ∈ resolved_type_set` BEFORE invoking `engine.eval`. Non-matching prerequisite → skip interest without engine call.
 - **filter-object shape**: parameterize over `filter` ∈ {absent, `{engine, expression}`, `{engine}` only, `{expression}` only} — absent and complete accepted; partial (missing `engine` or `expression`) rejected with `400 BadRequest`.
 - **GTS pattern syntax**: parameterize over valid (exact, trailing `.*`, trailing `~*`, `v*` at trailing) and invalid (mid-pattern `*`, `**`, substring `vendor*`, two `*` occurrences) patterns; valid → accept; invalid → `400 BadTypePattern`.
 - **Version resolution**: parameterize over (registered types, pattern) tuples and assert resolved set matches per-name-latest + minor-version-omitted rule from ADR-0005.

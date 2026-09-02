@@ -25,11 +25,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-use authz_resolver_sdk::error::AuthZResolverError;
 use authz_resolver_sdk::models::{
     DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -40,11 +39,12 @@ use bss_pricing_sdk::CatalogVersion;
 use chrono::{TimeZone, Utc};
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistryImpl;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -58,11 +58,12 @@ struct FlatInResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for FlatInResolver {
+impl AuthZResolverApi for FlatInResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -84,11 +85,12 @@ impl AuthZResolverClient for FlatInResolver {
 struct DenyingResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyingResolver {
+impl AuthZResolverApi for DenyingResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {

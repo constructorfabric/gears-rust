@@ -105,7 +105,7 @@ E2E_BASE_URL=http://localhost:8087 pytest testing/e2e/suites/resource_group/ -v
 
 The intended AuthZ → RG chain is:
 
-1. **Gear init** (`gear.rs`): resolves `dyn AuthZResolverClient` from ClientHub, creates `PolicyEnforcer`
+1. **Gear init** (`gear.rs`): resolves `dyn AuthZResolverApi` from ClientHub, creates `PolicyEnforcer`
 2. **GroupService** (`group_service.rs`): receives `PolicyEnforcer`; all CRUD methods (`list_groups`, `get_group`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`) call `enforcer.access_scope(&ctx, &RG_GROUP_RESOURCE, action, resource_id)`
 3. **GroupRepository** (`group_repo.rs`): `list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` and pass it to `SecureORM` via `.secure().scope_with(scope)`
 4. **Handlers** (`handlers/groups.rs`): pass `&ctx` to service methods (no longer `_ctx`)

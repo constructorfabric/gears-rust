@@ -50,7 +50,6 @@ fn raw_event_on(topic: &str, type_id: &str, partition: u32, offset: i64) -> RawE
         tenant_id: Uuid::nil(),
         subject: format!("event-{offset}"),
         subject_type: "test".to_owned(),
-        partition_key: None,
         partition,
         sequence: offset,
         offset,
@@ -463,15 +462,14 @@ async fn routed_dispatch_retry_does_not_advance_past_earlier_unprocessed_event()
 async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() {
     use crate::EventBrokerApi;
     use crate::mock::stubs::test_ctx_for_tenant;
-    use crate::mock::{MockBroker, MockBrokerHandle};
+    use crate::mock::{MockBroker, MockBrokerHandle, PartitionKeyFixture};
     use crate::models::Event;
     use std::collections::BTreeSet;
 
     const ORDERS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.orders.v1");
     const PAYMENTS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.payments.v1");
-    const ORDERS_EVENT: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.order.v1");
-    const PAYMENTS_EVENT: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.payment.v1");
+    const ORDERS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.order.v1~");
+    const PAYMENTS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.payment.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -493,6 +491,17 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
             &[],
         )
         .await;
+    // Both types route by `/subject`, a member this test varies. Under the default
+    // tenant pointer every event would land on one partition per topic, and the
+    // per-`(topic, partition)` batch scope would never be exercised across two.
+    for event_type in [ORDERS_EVENT, PAYMENTS_EVENT] {
+        control
+            .set_partition_key(PartitionKeyFixture {
+                event_type,
+                pointer: "/subject",
+            })
+            .await;
+    }
     control
         .set_heartbeat_interval(Duration::from_millis(10))
         .await;
@@ -519,7 +528,7 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    for (topic, event_type, partition) in [
+    for (_topic, event_type, partition) in [
         (ORDERS_TOPIC, ORDERS_EVENT, 0),
         (ORDERS_TOPIC, ORDERS_EVENT, 1),
         (PAYMENTS_TOPIC, PAYMENTS_EVENT, 0),
@@ -531,12 +540,10 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
                 &Event {
                     id: Uuid::new_v4(),
                     type_id: event_type.to_owned(),
-                    topic: topic.to_owned(),
                     tenant_id: ctx.subject_tenant_id(),
                     source: "consumer.dispatcher.test".to_owned(),
-                    subject: format!("{topic}-{partition}"),
+                    subject: partition_key_for_partition(partition, 2),
                     subject_type: "test".to_owned(),
-                    partition_key: Some(partition_key_for_partition(partition, 2)),
                     occurred_at: Utc::now(),
                     trace_parent: None,
                     data: Some(serde_json::json!({ "partition": partition })),
@@ -680,7 +687,7 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
     use crate::models::Event;
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.slow.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.slow.v1");
+    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.slow.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -733,12 +740,10 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "slow-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: Some(partition_key_for_partition(0, 2)),
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "slow": true })),
@@ -826,8 +831,7 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
     use std::collections::BTreeSet;
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.affected.v1");
-    const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.affected.v1");
+    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.affected.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -879,12 +883,10 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "affected-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "slow": true })),
@@ -952,7 +954,7 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.listener_all.v1");
     const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.listener_all.v1");
+        gts_id!("cf.core.events.event.v1~example.mock.broker.listener_all.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -1008,12 +1010,10 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "listener-all-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "representative": true })),
@@ -1090,7 +1090,7 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.listener_failure.v1");
     const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.listener_failure.v1");
+        gts_id!("cf.core.events.event.v1~example.mock.broker.listener_failure.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -1143,12 +1143,10 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
                 &Event {
                     id: Uuid::new_v4(),
                     type_id: EVENT_TYPE.to_owned(),
-                    topic: TOPIC.to_owned(),
                     tenant_id: ctx.subject_tenant_id(),
                     source: "consumer.dispatcher.test".to_owned(),
                     subject: format!("listener-failure-{offset}"),
                     subject_type: "test".to_owned(),
-                    partition_key: None,
                     occurred_at: Utc::now(),
                     trace_parent: None,
                     data: Some(serde_json::json!({ "offset": offset })),
@@ -1223,7 +1221,7 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.listener_timeout.v1");
     const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.listener_timeout.v1");
+        gts_id!("cf.core.events.event.v1~example.mock.broker.listener_timeout.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -1278,12 +1276,10 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "listener-timeout-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "timeout": true })),
@@ -1341,7 +1337,7 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
     use crate::models::Event;
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.latency.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.latency.v1");
+    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.latency.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -1399,12 +1395,10 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "latency-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "slow": "handler" })),
@@ -1493,7 +1487,7 @@ async fn slow_drop_drains_buffer_before_rejoin_load_position() {
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.drain_rejoin.v1");
     const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event_type.v1~example.mock.broker.drain_rejoin.v1");
+        gts_id!("cf.core.events.event.v1~example.mock.broker.drain_rejoin.v1~");
 
     let mock = MockBroker::new();
     let control = MockBrokerHandle::from_broker(&mock);
@@ -1546,12 +1540,10 @@ async fn slow_drop_drains_buffer_before_rejoin_load_position() {
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "drain-rejoin-subject".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "slow": "high-watermark" })),
@@ -1624,7 +1616,7 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
     use crate::models::Event;
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.audit.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.event.v1");
+    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.event.v1~");
 
     #[derive(Clone, Default)]
     struct RecordingOffsetManager {
@@ -1708,12 +1700,10 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
             &Event {
                 id: Uuid::new_v4(),
                 type_id: EVENT_TYPE.to_owned(),
-                topic: TOPIC.to_owned(),
                 tenant_id: ctx.subject_tenant_id(),
                 source: "consumer.dispatcher.test".to_owned(),
                 subject: "subject-1".to_owned(),
                 subject_type: "test".to_owned(),
-                partition_key: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({ "ok": true })),

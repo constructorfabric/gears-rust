@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError,
+    AuthZResolverApi,
     constraints::{Constraint, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, DatabaseCapability, Gear, GearCtx};
 use toolkit_db::migration_runner::run_migrations_for_gear;
 use toolkit_db::{ConnectOpts, DBProvider, Db, DbError, connect_db};
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use users_info::UsersInfo;
@@ -27,11 +28,12 @@ use users_info_sdk::{NewUser, UsersInfoClientV1};
 struct MockAuthZResolver;
 
 #[async_trait::async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         // Resolve tenant: explicit context > subject property (like a real PDP)
         let root_id = request
             .context
@@ -118,7 +120,7 @@ async fn users_info_registers_sdk_client_and_handles_basic_crud() {
     let hub = Arc::new(ClientHub::new());
 
     // Register mock AuthZ resolver before initializing the gear
-    hub.register::<dyn AuthZResolverClient>(Arc::new(MockAuthZResolver));
+    hub.register::<dyn AuthZResolverApi>(Arc::new(MockAuthZResolver));
 
     let ctx = GearCtx::new(
         "users_info",

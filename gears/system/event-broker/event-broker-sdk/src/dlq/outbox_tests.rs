@@ -13,7 +13,7 @@ use super::{ConsumerDlqOutbox, DeadLetterEnvelope, DeadLetterRecord};
 const DLQ_QUEUE: &str = "consumer-dlq";
 const DLQ_PARTITIONS: u32 = 4;
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1~");
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -37,7 +37,6 @@ fn raw_event(offset: i64) -> RawEvent {
         tenant_id: Uuid::new_v4(),
         subject: format!("order-{offset}"),
         subject_type: "order".to_owned(),
-        partition_key: Some(format!("tenant-a/order-{offset}")),
         partition: 6,
         sequence: offset,
         offset,

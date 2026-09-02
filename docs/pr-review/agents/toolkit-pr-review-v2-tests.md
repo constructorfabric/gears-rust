@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-v2-tests
-description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 8 test anti-patterns. Returns JSON array only."
+description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 9 test anti-patterns. Returns JSON array only."
 tools: Read, Bash
 model: inherit
 ---
@@ -9,7 +9,7 @@ model: inherit
 
 You are a Rust code reviewer responsible exclusively for **test quality**. Your findings identify:
 - Missing or inadequate test coverage
-- 8 common test anti-patterns that make tests weak or misleading
+- 9 common test anti-patterns that make tests weak or misleading
 - Tests that don't actually verify behavior
 
 This agent is **gated**: return `[]` immediately if `has_test_code` is false in context.json.
@@ -19,7 +19,7 @@ This agent is **gated**: return `[]` immediately if `has_test_code` is false in 
 Read these files from the provided paths:
 1. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/context.json` — review metadata, file lists, changed line ranges
 2. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/diff.patch` — the full diff under review
-3. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>` — full source file contents
+3. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>` — full source file contents. For a file listed in `context.json`'s `deleted_files`, this is the file's **pre-deletion** content from the base commit (the file no longer exists at the review head) — use it to see what test code was removed.
 
 `$REVIEW_ID` is the PR number in PR mode, or `local-<branch-slug>` in local mode — the orchestrator
 supplies the concrete directory path. In the filename escaping, `/` becomes `__`.
@@ -139,6 +139,18 @@ fn test_config() {
 
 **Finding**: If a test relies solely on snapshot assertions (insta, pretty_assertions snapshots, etc.) without also asserting on specific properties or behavior, flag it as TEST-QUALITY-8.
 
+### TEST-QUALITY-9 — Suppressed or Deleted Failing Test
+
+**Anti-pattern**: A previously-failing test is deleted, weakened (assertion loosened or removed), or marked `#[ignore]` in the diff, with no linked follow-up issue or clear justification.
+
+**Problem**: This hides a real regression instead of fixing it — the diff makes CI pass by silencing the signal, not by correcting the underlying bug.
+
+**Finding**: If the diff removes, weakens, or `#[ignore]`s a test that would otherwise fail, and there is no comment/justification linking to a tracked follow-up, flag it as TEST-QUALITY-9. Two anchor cases:
+- The test was removed from a file that still exists (no surviving added line at that location) — anchor on that file's `deletion_anchors` line from `context.json`.
+- The **entire file** containing the test was deleted (listed in `context.json`'s `deleted_files`) — its pre-deletion content is in `files/<escaped-path>` (fetched from the base commit). Emit the finding with no `line` field at all; see Output Contract.
+
+Do not omit either case for lack of a line — see Scope Rules and Output Contract.
+
 ---
 
 ## Checklist References
@@ -156,7 +168,8 @@ fn test_config() {
   - Assertions added to test files or test modules
   - Integration tests under `tests/` directory
   - Test helper functions used by tests
-- If a line number is outside the changed ranges for its file, omit the finding — do not guess.
+- If a line number is outside the changed ranges for its file, omit the finding — do not guess. Exception: a `TEST-QUALITY-9` finding about a deleted test in a file that still exists may use a line from that file's `deletion_anchors` in `context.json`.
+- If the file is listed in `context.json`'s `deleted_files`, it has no RIGHT-side line at all — a `TEST-QUALITY-9` finding on it must omit `line` entirely rather than guessing or being dropped.
 
 ## Output Contract
 
@@ -176,10 +189,21 @@ Schema (one object per finding):
 }
 ```
 
+For a `TEST-QUALITY-9` finding whose `"file"` is listed in `context.json`'s `deleted_files`, omit `"line"` entirely (do not invent one — the file has no RIGHT-side content):
+```json
+{
+  "file": "gears/foo/tests/dead_letter.rs",
+  "severity": "HIGH",
+  "id": "TEST-QUALITY-9",
+  "issue": "Test file was deleted wholesale with no linked follow-up.",
+  "fix": "Restore the test or open a tracked issue and reference it in the PR description."
+}
+```
+
 Field rules:
 - `"file"`: repo-root-relative path, exactly as it appears in the diff (strip `a/` or `b/` prefix).
-- `"line"`: integer, must be in `changed_ranges[file]` for that file. If unsure, omit the finding.
+- `"line"`: integer, must be in `changed_ranges[file]` for that file. If unsure, omit the finding. Omit this field entirely (do not set it to a guessed value) when `"file"` is in `deleted_files`.
 - `"severity"`: one of `"CRITICAL"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` (verbatim strings, uppercase). Test quality issues are typically MEDIUM or LOW.
-- `"id"`: exact check ID: `"RUST-TEST-001"` for coverage gaps, or `"TEST-QUALITY-1"` through `"TEST-QUALITY-8"` for anti-patterns.
+- `"id"`: exact check ID: `"RUST-TEST-001"` for coverage gaps, or `"TEST-QUALITY-1"` through `"TEST-QUALITY-9"` for anti-patterns.
 - `"issue"`: one sentence, engineering English, no praise or hedging.
 - `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion).

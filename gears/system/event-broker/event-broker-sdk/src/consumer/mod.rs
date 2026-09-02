@@ -4,6 +4,7 @@ mod dispatcher;
 mod offset_manager;
 mod progress;
 mod runtime;
+mod type_cache;
 mod types;
 
 #[cfg(test)]
@@ -22,6 +23,9 @@ mod dispatcher_tests;
 mod offset_manager_tests;
 #[cfg(test)]
 mod progress_tests;
+#[cfg(test)]
+#[cfg(feature = "test-util")]
+mod type_cache_tests;
 #[cfg(test)]
 mod types_tests;
 
@@ -46,8 +50,8 @@ pub use offset_manager::{
 pub use runtime::{Consumer, ConsumerHandle};
 
 pub use crate::api::{
-    BarrierMode, ControlCode, FrameStream, PartitionPosition, PartitionSlot, ResolvedPosition,
-    SeekPosition, SubscriptionAssignment, TenantTraversalDepth, WireEvent, WireFrame,
+    BarrierMode, ControlCode, FrameStream, PartitionPosition, ResolvedPosition, SeekPosition,
+    SubscriptionAssignment, TenantTraversalDepth, WireEvent, WireFrame,
 };
 pub use crate::error::OffsetManagerError;
 pub use types::{

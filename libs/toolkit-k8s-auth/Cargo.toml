@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-k8s-auth"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,8 +19,7 @@ name = "toolkit_k8s_auth"
 workspace = true
 
 [dependencies]
-# Platform-plane authentication trait + identity/error types.
-toolkit-security = { workspace = true }
+toolkit-security = { workspace = true, features = ["internal-auth-cache"] }
 
 kube = { workspace = true, features = ["client", "rustls-tls", "aws-lc-rs"] }
 k8s-openapi = { workspace = true, features = ["latest"] }
@@ -30,4 +29,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

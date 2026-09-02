@@ -3,11 +3,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use gts::GtsInstanceId;
 use tokio::time::sleep;
 
-use crate::api::{
-    ControlCode, FrameStream, PartitionPosition, PartitionSlot, WireEvent, WireFrame,
-};
+use crate::api::{ControlCode, FrameStream, PartitionPosition, WireEvent, WireFrame};
 use crate::error::EventBrokerError;
 use crate::ids::SubscriptionId;
 
@@ -102,7 +101,9 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                             .unwrap_or(0)
                             .saturating_sub(1);
                         PartitionPosition {
-                            slot: PartitionSlot { topic_ix: 0, partition: *partition },
+                            topic: GtsInstanceId::try_new(topic)
+                                .expect("registration asserts the topic id"),
+                            partition: *partition,
                             offset,
                             last_examined,
                         }
@@ -170,7 +171,9 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                             .unwrap_or(0)
                             .saturating_sub(1);
                         PartitionPosition {
-                            slot: PartitionSlot { topic_ix: 0, partition: *partition },
+                            topic: GtsInstanceId::try_new(topic)
+                                .expect("registration asserts the topic id"),
+                            partition: *partition,
                             offset,
                             last_examined,
                         }
@@ -262,11 +265,11 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                         pending.push(WireFrame::Event(WireEvent {
                             id: stamped.id,
                             type_id: stamped.type_id.clone(),
-                            topic: stamped.topic.clone(),
+                            // The stream knows the topic from the partition it is
+                            // reading; the stored event does not carry one.
                             tenant_id: stamped.tenant_id,
                             subject: stamped.subject.clone(),
                             subject_type: stamped.subject_type.clone(),
-                            partition_key: stamped.partition_key.clone(),
                             partition: stamped.partition.unwrap_or(*partition),
                             sequence: stamped.sequence.unwrap_or(0),
                             offset: stamped.offset.unwrap_or(0),
@@ -298,7 +301,9 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                     if round_delivered == 0 && frontier > last_delivered {
                         let delivered_pos = seek_offset.unwrap_or(0).max(last_delivered);
                         progress_positions.push(PartitionPosition {
-                            slot: PartitionSlot { topic_ix: 0, partition: *partition },
+                            topic: GtsInstanceId::try_new(topic)
+                                .expect("registration asserts the topic id"),
+                            partition: *partition,
                             offset: delivered_pos,
                             last_examined: frontier,
                         });

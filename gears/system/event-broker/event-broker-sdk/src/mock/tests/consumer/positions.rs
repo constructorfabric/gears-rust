@@ -3,7 +3,9 @@
 #[cfg(test)]
 use super::super::helpers::*;
 
-use super::super::helpers::{broker_with_topic, ctx, join_group, make_group, wire_event};
+use super::super::helpers::{
+    broker_with_topic, ctx, join_group, make_group, register_topic_with_event_type, wire_event,
+};
 use crate::ResolvedPosition;
 use crate::api::EventBrokerApi;
 use crate::api::SeekPosition;
@@ -12,8 +14,8 @@ use uuid::Uuid;
 
 /// Build a wire event with an explicit `occurred_at` so timestamp-seek scenarios
 /// can place events on the partition's time axis deterministically.
-fn wire_event_at(topic: &str, type_id: &str, tenant_id: Uuid, occurred_at: &str) -> Event {
-    let mut ev = wire_event(topic, type_id, tenant_id);
+fn wire_event_at(type_id: &str, tenant_id: Uuid, occurred_at: &str) -> Event {
+    let mut ev = wire_event(type_id, tenant_id);
     ev.occurred_at = chrono::DateTime::parse_from_rfc3339(occurred_at)
         .expect("wire_event_at: occurred_at must be RFC3339")
         .with_timezone(&chrono::Utc);
@@ -32,7 +34,7 @@ async fn s1_01_positive_seek_earliest() {
     let c = ctx();
     for _ in 0..3 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -81,7 +83,7 @@ async fn s1_02_positive_seek_latest() {
     // Five events → offsets 0..4, next_offset = 5, HWM = 4.
     for _ in 0..5 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -121,7 +123,7 @@ async fn s1_03_positive_seek_exact_offset() {
     let c = ctx();
     for _ in 0..100 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -159,18 +161,20 @@ async fn s1_03_positive_seek_exact_offset() {
 async fn s1_04_positive_mixed_sentinels() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     h.register_topic(TOPIC2, 1).await;
-    h.register_topic(TOPIC3, 1).await;
+    // TOPIC3 is published to, so it needs its own event type: the topic an event
+    // lands on is resolved from its type, and EVT already belongs to TOPIC.
+    register_topic_with_event_type(&h, TOPIC3, 1, EVT3).await;
     let c = ctx();
     // TOPIC: events so an exact offset is valid. TOPIC3: 5 events → HWM 4.
     for _ in 0..100 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
     for _ in 0..5 {
         broker
-            .publish(&c, &wire_event(TOPIC3, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT3, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -280,7 +284,7 @@ async fn s1_06_negative_offset_above_hwm() {
     let c = ctx();
     for _ in 0..3 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -423,7 +427,7 @@ async fn s1_10_positive_seek_any_value_in_range() {
     let c = ctx();
     for _ in 0..600 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -465,11 +469,11 @@ async fn s1_11_positive_seek_at_timestamp() {
     let t = c.subject_tenant_id();
     // offset 0 @ 09:59:50 (before), offset 1 @ 10:00:03 (at/after target 10:00:00).
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-06-14T09:59:50Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-06-14T09:59:50Z"))
         .await
         .unwrap();
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-06-14T10:00:03Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-06-14T10:00:03Z"))
         .await
         .unwrap();
 
@@ -506,11 +510,11 @@ async fn s1_12_positive_seek_at_timestamp_before_retention() {
     let t = c.subject_tenant_id();
     // Oldest stored event is at 2026-01-01; the requested ts (2025) predates it.
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-01-01T00:00:00Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-01-01T00:00:00Z"))
         .await
         .unwrap();
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-02-01T00:00:00Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-02-01T00:00:00Z"))
         .await
         .unwrap();
 
@@ -547,11 +551,11 @@ async fn s1_13_positive_seek_at_timestamp_beyond_hwm() {
     let t = c.subject_tenant_id();
     // Two events; newest at 2026-06; HWM = offset 1. Requested ts (2030) is beyond.
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-06-01T00:00:00Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-06-01T00:00:00Z"))
         .await
         .unwrap();
     broker
-        .publish(&c, &wire_event_at(TOPIC, EVT, t, "2026-06-02T00:00:00Z"))
+        .publish(&c, &wire_event_at(EVT, t, "2026-06-02T00:00:00Z"))
         .await
         .unwrap();
 

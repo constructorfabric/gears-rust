@@ -287,6 +287,11 @@ impl Consumer {
         let mut slots = Vec::with_capacity(parallelism as usize);
         let ctx_arc = Arc::new(builder.security_context);
 
+        // Resolved once, before any slot starts, so attributing a delivered event
+        // to its topic is a local read rather than a call on the delivery path.
+        let type_cache = Arc::new(super::type_cache::ConsumerTypeCache::default());
+        type_cache.prime(&broker, &ctx_arc, &builder.topics).await?;
+
         for idx in 0..parallelism {
             let sub_id = Arc::new(tokio::sync::Mutex::new(None));
             let cancel = shared_cancel.clone().unwrap_or_default();
@@ -294,6 +299,7 @@ impl Consumer {
             let dispatcher = SlotDispatcher {
                 slot_idx: idx,
                 broker: broker.clone(),
+                type_cache: type_cache.clone(),
                 offset_manager: offset_manager.clone(),
                 handler: handler.clone(),
                 group_ref: builder
@@ -391,6 +397,11 @@ impl Consumer {
         let mut slots = Vec::with_capacity(parallelism as usize);
         let ctx_arc = Arc::new(builder.security_context);
 
+        // Resolved once, before any slot starts, so attributing a delivered event
+        // to its topic is a local read rather than a call on the delivery path.
+        let type_cache = Arc::new(super::type_cache::ConsumerTypeCache::default());
+        type_cache.prime(&broker, &ctx_arc, &builder.topics).await?;
+
         for idx in 0..parallelism {
             let sub_id = Arc::new(tokio::sync::Mutex::new(None));
             let cancel = CancellationToken::new();
@@ -398,6 +409,7 @@ impl Consumer {
             let dispatcher = TxSlotDispatcher {
                 slot_idx: idx,
                 broker: broker.clone(),
+                type_cache: type_cache.clone(),
                 offset_manager: offset_manager.clone(),
                 handler: handler.clone(),
                 group_ref: builder

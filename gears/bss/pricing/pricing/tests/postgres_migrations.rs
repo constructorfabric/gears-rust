@@ -68,8 +68,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, connect_db};
 
@@ -91,11 +91,9 @@ fn chain_len() -> usize {
     Migrator::migrations().len()
 }
 
-/// `testcontainers-modules` defaults to `postgres:11-alpine`, which reached end
-/// of life in 2023. Nothing in this repository pins the production server
-/// version, so "the backend it targets" is an assumption either way; running on
-/// a current major is the closer of the two guesses, and pinning it here means a
-/// bump is a diff rather than a dependency's default quietly moving.
+/// Below the workspace floor (`test_containers::POSTGRES_TAG`) on purpose,
+/// matching `pg_support::PG_TAG`; see its note on why `postgres_tagged` and not
+/// the bare default. `GEARS_TEST_PG_TAG` still overrides it.
 const PG_TAG: &str = "16-alpine";
 
 /// A running Postgres, its port, and the container guard.
@@ -103,8 +101,7 @@ const PG_TAG: &str = "16-alpine";
 /// The guard is returned because dropping it stops the container: a caller that
 /// bound only the port would race its own database to the end of the test.
 async fn pg() -> (u16, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag(PG_TAG)
+    let container = test_containers::postgres_tagged(PG_TAG)
         .start()
         .await
         .expect("start postgres");

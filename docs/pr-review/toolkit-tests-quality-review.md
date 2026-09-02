@@ -45,6 +45,9 @@ Tests cover only successful execution but ignore invalid input, errors, boundary
 8. Snapshot Abuse
 A test that snapshots formatting or debug output instead of validating meaningful behavior. Formatting-only assertions should be treated with suspicion unless formatting itself is the contract.
 
+9. Suppressed or Deleted Failing Test
+A previously-failing test was deleted, weakened, or marked `#[ignore]` in the diff with no linked follow-up issue or clear justification. This hides a real regression instead of fixing it.
+
 What to do:
 - Flag meaningless or weak tests.
 - Explain why each flagged test is low-value.
@@ -58,6 +61,7 @@ What to do:
   - invariants
   - state transitions
   - interaction contracts
+- For parsing, validation, or serialization code, prefer at least one property-based test (proptest/quickcheck) over point examples alone.
 - Distinguish clearly between:
   - good tests
   - weak but salvageable tests

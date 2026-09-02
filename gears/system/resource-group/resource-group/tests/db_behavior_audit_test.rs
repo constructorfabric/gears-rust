@@ -16,16 +16,17 @@
 //!
 //! The `no-tx-write` class is asserted on the write paths: each of their
 //! trace tests ends on [`QueryRecorder::writes_outside_tx`]. Read paths and
-//! the scale tests do not — for a read path the assertion is trivially true,
-//! and a scale test is about a slope, not a boundary.
+//! the scale tests of Section 2 do not — for a read path the assertion is
+//! trivially true, and a scale test is about a slope, not a boundary.
 //!
-//! `no-retry-serializable` is not observable as a statement count and has a
-//! source-scan rule in Section 4 instead.
+//! Three classes are not observable as a statement count at all and have
+//! source-scan rules in Section 4 instead: `no-retry-serializable`,
+//! `external-call-in-tx`, and the row lock that lets a non-force delete run
+//! below `SERIALIZABLE` (invisible on SQLite, which has no row locks).
 //!
-//! Deliberately absent: the `external-call-in-tx` class and the write-set
-//! narrowing checks. Both belong to fixes this branch does not carry — a test
-//! asserting a fix that is not here would only be noise. They live on the
-//! branches that carry them.
+//! Deliberately absent: the write-set narrowing checks, which belong to a
+//! fix this branch does not carry — a test asserting a fix that is not here
+//! would only be noise. It lives on the branch that carries it.
 //!
 //! Healthy operations assert the invariant directly, doubling as negative
 //! controls.
@@ -86,7 +87,7 @@ async fn create_self_referencing_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -96,7 +97,7 @@ async fn create_self_referencing_type(
         .await
         .expect("create self-referencing type (initial)");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -123,7 +124,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -235,10 +236,10 @@ async fn trace_create_root_group() {
          re-read it; got {rg_selects} resource_group SELECTs:\n{}",
         rec.dump()
     );
-    // Exactly 1 gts_type SELECT: `find_by_code_with_model`'s combined
-    // model+type lookup (RG-11). The second one belonged to the response
-    // read-back, which resolved the very code this request supplied -- it
-    // went with the read-back itself (RG-08).
+    // Exactly 1 gts_type SELECT: `find_by_code_with_model`'s combined id+type
+    // lookup (RG-11). The second one belonged to the response read-back,
+    // which resolved the very code this request supplied -- it went with the
+    // read-back itself (RG-08).
     let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
     assert_eq!(
         type_selects,
@@ -320,6 +321,35 @@ async fn trace_update_group() {
         "update_group must not read a row back after writing it (RG-08):\n{}",
         rec.dump()
     );
+    // A plain rename never touches the parent, so `update_group_inner` no
+    // longer loads the full type (`find_by_code`) to feed
+    // `move_group_internal_impl`'s parent-compatibility check -- that read
+    // only matters on the `parent_changed` branch, which this request never
+    // takes. It used to run unconditionally and pull both junction tables
+    // for a type this call never needed the parent/membership lists of.
+    let parent_junction_selects =
+        count_in(&rec.stats(), QueryKind::Select, "gts_type_allowed_parent");
+    let membership_junction_selects = count_in(
+        &rec.stats(),
+        QueryKind::Select,
+        "gts_type_allowed_membership",
+    );
+    assert_eq!(
+        parent_junction_selects,
+        0,
+        "a rename must not read gts_type_allowed_parent -- that table is only \
+         relevant to the parent-changed branch's move-compatibility check, \
+         got {parent_junction_selects} SELECTs:\n{}",
+        rec.dump()
+    );
+    assert_eq!(
+        membership_junction_selects,
+        0,
+        "a rename must not read gts_type_allowed_membership -- same reasoning \
+         as gts_type_allowed_parent above, got {membership_junction_selects} \
+         SELECTs:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
@@ -375,6 +405,16 @@ async fn trace_force_delete_subtree() {
         "delete_group(force=true) must run its writes inside a transaction:\n{}",
         rec.dump()
     );
+    // A force delete rewrites a whole subtree -- closure rows, memberships,
+    // the group rows themselves -- and races a concurrent create or move
+    // anywhere inside it. That is write skew over rows it does not lock, so
+    // it keeps `SERIALIZABLE` where the non-force delete does not.
+    assert!(
+        rec.all_in_serializable_transaction(),
+        "the force-delete cascade rewrites a subtree it does not lock and \
+         must open SERIALIZABLE:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
@@ -416,7 +456,7 @@ async fn trace_update_type() {
 
     rec.clear();
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -510,7 +550,7 @@ async fn trace_list_memberships() {
 
 /// `add_membership`'s own trace, which the suite did not have.
 ///
-/// Two things are pinned here, and they point in opposite directions.
+/// Three things are pinned here.
 ///
 /// The membership table is read once and written once: the tenant-compatibility
 /// check is a single statement whose subquery derives the member groups
@@ -518,9 +558,24 @@ async fn trace_list_memberships() {
 /// that table is a key part or `created_at`, all four known to the caller
 /// (RG-08).
 ///
-/// And the writes run on a bare connection. That is RG-01, still present here:
-/// the transaction boundary belongs to the isolation branch, so this asserts
-/// the defect rather than its absence, and fails the day it is fixed.
+/// Fixed (RG-01): the tenant-compatibility check and the membership insert
+/// now share one `SERIALIZABLE` transaction inside `add_membership_inner`.
+/// Apart, two first memberships from different tenants each read an empty
+/// set and both commit; together at that level the read and the write into
+/// the same predicate are the write skew SSI cancels. This asserts the fix.
+///
+/// Fixed again: the `allowed_membership_types` check -- loading the group's
+/// full type and testing the requested resource type against it -- used to
+/// run on the pool, before `BEGIN`. PostgreSQL's SSI only tracks
+/// rw-antidependencies between reads and writes that both happen inside a
+/// serializable transaction, so a concurrent `update_type` removing this
+/// resource type from `allowed_membership_types` -- itself `SERIALIZABLE` --
+/// was invisible to a pre-transaction read of the same row: it could commit
+/// between that read and this insert with neither side raising `40001`. The
+/// check now runs inside the same transaction as the tenant check and the
+/// insert, so all three are covered by the one SSI cycle. Only `resolve_id`
+/// (the resource type's own surrogate-id lookup) and the initial group read
+/// stay on the pool -- out of scope for this fix, tracked separately.
 #[tokio::test]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
@@ -566,11 +621,147 @@ async fn trace_add_membership() {
     );
 
     assert!(
-        !rec.writes_outside_tx().is_empty(),
-        "RG-01 is pinned as present in this branch: add_membership writes on a \
-         bare connection. If this now fails, the transaction boundary landed -- \
-         flip this to `is_empty()` and update the RG-01 row in \
-         docs/db-behavior-audit.md in the same commit:\n{}",
+        rec.writes_outside_tx().is_empty(),
+        "RG-01 regression: add_membership's tenant check and membership insert \
+         should share one transaction; got a write outside it:\n{}",
+        rec.dump()
+    );
+    // `writes_outside_tx` only proves each write ran inside *some*
+    // transaction -- it would still pass if the tenant check and the
+    // membership insert ran in two separate, sequential transactions rather
+    // than one, which reopens RG-01 just as surely as running outside a
+    // transaction entirely.
+    assert!(
+        rec.all_in_one_transaction(),
+        "RG-01 regression: add_membership's tenant check and membership insert \
+         must share one transaction, not merely one each:\n{}",
+        rec.dump()
+    );
+    // One transaction is not enough on its own, and the missing half is
+    // something no statement count can see. The check reads a predicate and
+    // the insert writes into it; at the backend default both writers read
+    // from their own snapshot, neither sees the other's uncommitted row, and
+    // both commit. Only `SERIALIZABLE` makes that a cycle SSI can cancel --
+    // and lowering the level leaves this trace byte-identical (same
+    // statements, same order, same transaction), while on SQLite, which
+    // serializes writes regardless, the outcome does not change either. The
+    // requested level is the only signal.
+    assert!(
+        rec.all_in_serializable_transaction(),
+        "RG-01 regression: add_membership must open SERIALIZABLE -- the tenant \
+         check is a predicate read the insert writes into, and below that \
+         level two first memberships from different tenants both commit:\n{}",
+        rec.dump()
+    );
+
+    // The allowed_membership_types check reads the group's full type,
+    // including the `gts_type_allowed_parent` and `gts_type_allowed_membership`
+    // junction tables. `all_in_serializable_transaction()` above only asks
+    // whether every *in-tx* event is SERIALIZABLE -- it has nothing to say
+    // about a read that runs on the pool instead of in a transaction at all,
+    // which is exactly the shape the regression this pins would take: the
+    // check moving back out of the transaction rather than merely running
+    // at a weaker level. Assert directly that every read of those two
+    // junction tables happened inside a transaction.
+    let junction_read_outside_tx = rec.events().into_iter().any(|e| {
+        matches!(e.kind, QueryKind::Select)
+            && matches!(
+                e.table.as_deref(),
+                Some("gts_type_allowed_parent" | "gts_type_allowed_membership")
+            )
+            && !e.in_tx
+    });
+    assert!(
+        !junction_read_outside_tx,
+        "allowed_membership_types regression: the type's junction tables must \
+         be read inside the same SERIALIZABLE transaction as the insert, not \
+         on the pool -- an outside-tx read of either is invisible to SSI and \
+         cannot be cancelled against a concurrent update_type:\n{}",
+        rec.dump()
+    );
+}
+
+#[tokio::test]
+async fn trace_remove_membership() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let member_type = common::create_root_type(&type_svc, "rmmbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "rmgrp", &[&member_type.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+    membership_svc
+        .add_membership(&ctx, group.id, &member_type.code, "res-rm")
+        .await
+        .expect("seed membership");
+
+    rec.clear();
+    membership_svc
+        .remove_membership(&ctx, group.id, &member_type.code, "res-rm")
+        .await
+        .expect("remove_membership should succeed");
+
+    snapshot_trace("remove_membership", &rec);
+
+    // One DELETE by primary key, and nothing decided from a read: tenant
+    // ownership is derived from the membership rows themselves, so a removal
+    // has no second piece of state to keep in step and needs neither its own
+    // transaction nor a level above the backend default. The negative half of
+    // `trace_add_membership`'s assertion -- "raise everything to
+    // SERIALIZABLE" must not be how that one is satisfied.
+    let membership_deletes = count_in(&rec.stats(), QueryKind::Delete, "resource_group_membership");
+    assert_eq!(
+        membership_deletes,
+        1,
+        "expected exactly 1 resource_group_membership DELETE, got \
+         {membership_deletes}:\n{}",
+        rec.dump()
+    );
+    assert!(
+        !rec.all_in_serializable_transaction(),
+        "remove_membership decides nothing from a read and must stay at the \
+         backend default:\n{}",
+        rec.dump()
+    );
+}
+
+#[tokio::test]
+async fn trace_delete_group_non_force() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = create_self_referencing_type(&type_svc, "ndel").await;
+    let leaf = common::create_root_group(&group_svc, &ctx, &t.code, "leaf", tenant_id).await;
+
+    rec.clear();
+    group_svc
+        .delete_group(&ctx, leaf.id, false)
+        .await
+        .expect("non-force delete should succeed");
+
+    snapshot_trace("delete_group_non_force", &rec);
+
+    // The negative half of the pairing the other three traces assert. A
+    // non-force delete removes one row by primary key and takes a row lock on
+    // it, so it has no cross-row predicate for SSI to protect and deliberately
+    // stays at the backend default -- that is the saving the isolation work in
+    // this branch is about. Without this, "make everything SERIALIZABLE" would
+    // satisfy every other assertion here while quietly undoing it.
+    assert!(
+        rec.all_in_one_transaction(),
+        "non-force delete must still run in one transaction:\n{}",
+        rec.dump()
+    );
+    assert!(
+        !rec.all_in_serializable_transaction(),
+        "a non-force delete has no predicate SSI needs to protect and must \
+         stay at the backend default:\n{}",
         rec.dump()
     );
 }
@@ -737,8 +928,9 @@ async fn scale_move_closure_inserts_do_not_grow_with_subtree_size() {
 
 #[tokio::test]
 async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
-    // Move's depth validation calls get_descendant_ids_with_depth once and
-    // takes the max in memory (RG-05).
+    // Move's depth validation calls get_max_descendant_depth once -- a
+    // single MAX(depth) aggregate -- rather than pulling every descendant
+    // row into this process to fold down to that one number (RG-05).
     let small = count_in(
         &move_stats_for_subtree_size(3).await.0,
         QueryKind::Select,
@@ -767,7 +959,7 @@ async fn junction_inserts_for_parent_count(n: usize) -> usize {
 
     rec.clear();
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.child.i{}.v1~",
                 gts_id!("cf.core.rg.type.v1~"),
@@ -813,7 +1005,7 @@ async fn list_types_total_statements_for_page_size(n: usize) -> usize {
         ..Default::default()
     };
     let page = type_svc
-        .list_types(&query)
+        .list_types_unscoped(&query)
         .await
         .expect("list_types should succeed");
     assert_eq!(page.items.len(), n, "page must contain all N created types");
@@ -843,7 +1035,7 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
 
     rec.clear();
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: t.code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1143,7 +1335,7 @@ async fn total_statements_for_update_type_removing_n_parents(n: usize) -> usize 
 
     rec.clear();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &child_type.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -1196,7 +1388,7 @@ async fn negative_control_tenant_root_create_runs_in_tx() {
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1268,7 +1460,7 @@ async fn negative_control_read_paths_produce_no_write_statements() {
         .await
         .expect("list_groups should succeed");
     type_svc
-        .list_types(&toolkit_odata::ODataQuery::default())
+        .list_types_unscoped(&toolkit_odata::ODataQuery::default())
         .await
         .expect("list_types should succeed");
 
@@ -1292,75 +1484,311 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     );
 }
 
-// Section 4 -- static source-scan rules for the one defect class here that
-// leaves no trace in the SQL: RG-03, a SERIALIZABLE transaction opened
-// without retry. Matched on call shape.
+#[tokio::test]
+async fn trace_delete_type() {
+    // RG-02. `delete_type` resolved the id, counted referencing groups and
+    // deleted the row on a bare connection, so a concurrent `create_group` of
+    // that type could land between the count and the delete. All three are
+    // one transaction now.
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let t = common::create_root_type(&type_svc, "deltype").await;
+
+    rec.clear();
+    type_svc
+        .delete_type_unscoped(&t.code)
+        .await
+        .expect("delete_type should succeed for an unreferenced type");
+
+    snapshot_trace("delete_type", &rec);
+    assert!(
+        rec.writes_outside_tx().is_empty(),
+        "delete_type must run its writes inside a transaction (RG-02):\n{}",
+        rec.dump()
+    );
+    // `writes_outside_tx` only flags writes: a regression that moved the id
+    // resolution or the reference count ahead of `BEGIN` would still pass
+    // that check as long as the delete itself stayed transactional, and
+    // that ordering is exactly the check-then-delete race RG-02 was about.
+    // "Every event is in *a* transaction" isn't quite enough either -- that
+    // still passes if the resolution/count and the delete ran in two
+    // separate, sequential transactions, so this checks they share one.
+    assert!(
+        rec.all_in_one_transaction(),
+        "delete_type must run its reads and writes inside one transaction (RG-02):\n{}",
+        rec.dump()
+    );
+}
+
+// Section 4 -- static source-scan rules for the contracts that leave no
+// trace in the SQL: RG-03 (SERIALIZABLE without retry), RG-09 (an external
+// call inside a transaction closure), and the row lock a non-force delete
+// takes in place of SERIALIZABLE. Matched on call shape.
 //
-// Both service files are scanned, because scanning only the healthy one is
-// how a rule comes to pass by construction: `group_service.rs` has never had
-// this defect, so a rule that reads nothing else can never fail and never
-// notices `type_service.rs`, which has it today.
+// Both service files are scanned for RG-03. On the query-count branch this
+// file scanned only `group_service.rs`, which had never had the defect — so
+// the rule passed by construction and was blind to the two live violations in
+// `type_service.rs`. Those are fixed here, and both files are watched.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-const UNRETRIED_SERIALIZABLE: &str = ".transaction_ref_mapped_with_config(TxConfig::serializable()";
-const RETRIED_SERIALIZABLE: &str = ".transaction_with_retry(TxConfig::serializable()";
+/// The source of one `async fn`, from its name to the start of the next one.
+///
+/// These rules are text scans, so their reach is whatever slice they are
+/// handed, and handing them the whole file is how a rule comes to pass on
+/// someone else's code. Panics rather than returning empty: a rule that
+/// silently scans nothing is worse than one that fails.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name}(");
+    src.split("async fn ")
+        .find(|f| f.starts_with(&prefix))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `async fn {name}(` in the scanned source -- renamed? then rename it here too"
+            )
+        })
+}
+
+/// Split `if {marker} { <true arm> } else { <false arm> }` into its two arm
+/// bodies, by brace depth rather than by string search for the closing
+/// brace -- so a literal that happens to appear inside one arm's own nested
+/// braces cannot be mistaken for the end of that arm.
+///
+/// `marker` is the text right after `if ` and before the opening `{`, e.g.
+/// `"force"`. Panics with a clear message if the shape isn't there, rather
+/// than silently returning something that makes every caller's assertion
+/// vacuously true.
+fn split_if_else<'a>(body: &'a str, marker: &str) -> (&'a str, &'a str) {
+    let if_marker = format!("if {marker} {{");
+    let if_start = body.find(&if_marker).unwrap_or_else(|| {
+        panic!(
+            "no `{if_marker}` found -- the branch this rule checks may have moved or been renamed"
+        )
+    });
+    let true_start = if_start + if_marker.len();
+
+    let true_end = brace_close(body, true_start);
+    let true_arm = &body[true_start..true_end];
+
+    let after_true = &body[true_end + 1..];
+    let else_marker = "else {";
+    let trimmed = after_true.trim_start();
+    assert!(
+        trimmed.starts_with(else_marker),
+        "expected `}} else {{` right after the `if {marker}` arm, found: {:?}",
+        &trimmed[..trimmed.len().min(40)]
+    );
+    let false_start = (body.len() - trimmed.len()) + else_marker.len();
+    let false_end = brace_close(body, false_start);
+    let false_arm = &body[false_start..false_end];
+
+    (true_arm, false_arm)
+}
+
+/// Given the index right after an opening `{`, return the index of its
+/// matching `}` by counting nested braces.
+fn brace_close(body: &str, open_index: usize) -> usize {
+    let mut depth = 1i32;
+    for (offset, ch) in body[open_index..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open_index + offset;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces while scanning from index {open_index}");
+}
 
 #[test]
 fn static_rule_passes_group_service_uses_retry() {
     let src = include_str!("../src/domain/group_service.rs");
-    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
-    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
+    // Matched without the level, unlike an earlier revision that looked for
+    // `.transaction_with_retry(TxConfig::serializable()` as one literal.
+    // `update_group` and `delete_group` choose their level first and pass the
+    // binding, so the literal missed exactly the two call sites where the
+    // choice is dynamic -- the ones a regression is most likely to touch --
+    // while the message claimed all four were covered.
+    let unretried = count_occurrences(src, ".transaction_ref_mapped_with_config(");
+    let retried = count_occurrences(src, ".transaction_with_retry(");
     assert_eq!(
         unretried, 0,
         "negative control violated: group_service.rs should not bypass \
-         transaction_with_retry for its SERIALIZABLE writes"
+         transaction_with_retry for its writes"
     );
     // Exact count, not a floor: the five call sites are create_group,
-    // update_group, move_group, delete_group, and create_group_unscoped. A
-    // floor of >= 3 would pass just as well if a refactor quietly dropped the
-    // retry wrapper from one of these (as long as 3 remained) or if a sixth
-    // SERIALIZABLE transaction were added without it -- either regression
-    // should fail this test, and only exact equality catches both.
+    // update_group, move_group, delete_group, and create_group_unscoped --
+    // two of them pass a level chosen from the request, which is why the
+    // needle above matches the call and not the level. A floor of >= 5 would
+    // pass just as well if a sixth transaction were added without retry, and
+    // a floor of >= 3 if a refactor quietly dropped the wrapper from two;
+    // only exact equality catches both directions.
     assert_eq!(
         retried, 5,
-        "expected exactly 5 transaction_with_retry(TxConfig::serializable(...)) call \
-         sites in group_service.rs -- create_group, update_group, move_group, \
+        "expected exactly 5 transaction_with_retry call sites in \
+         group_service.rs -- create_group, update_group, move_group, \
          delete_group, create_group_unscoped -- found {retried}"
     );
 }
 
-/// RG-03, pinned where it actually is.
-///
-/// `create_type` and `update_type` open SERIALIZABLE transactions with no
-/// retry wrapper, so a serialization failure surfaces as a 500 instead of a
-/// second attempt. The fix belongs to the isolation branch, not this one, and
-/// the audit's rule is to pin a defect as an executable assertion rather than
-/// describe it -- so this asserts the count that is there, not the count that
-/// ought to be.
-///
-/// It fails in both directions on purpose: fixing one of the two, or adding a
-/// third unretried transaction, both break it. Whoever lands the fix updates
-/// the expectation to 0 and this becomes the negative control its neighbour
-/// already is.
 #[test]
-fn static_rule_pins_type_service_serializable_without_retry() {
+fn static_rule_passes_type_service_uses_retry() {
     let src = include_str!("../src/domain/type_service.rs");
-    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
-    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
+    // The rule is "every transaction here is retry-aware", not "every
+    // transaction here is SERIALIZABLE". `create_type` runs at the backend
+    // default now, and still has to retry: contention retries catch
+    // deadlocks, which no isolation level rules out.
+    let unretried = count_occurrences(src, ".transaction_ref_mapped_with_config(");
+    let retried = count_occurrences(src, ".transaction_with_retry(");
     assert_eq!(
-        unretried, 2,
-        "RG-03 is pinned at 2 unretried SERIALIZABLE transactions in \
-         type_service.rs (create_type, update_type); found {unretried}. \
-         If this dropped, the fix landed -- change the expectation to 0 and \
-         say so in the doc comment above."
+        unretried, 0,
+        "create_type/update_type must not open a transaction through the \
+         non-retrying helper: a 40001 then reaches the caller as an unhandled \
+         database error and is reported as 500, on a path account-management \
+         drives at gear init"
     );
+    // Exact count, not a floor, for the same reason as the group_service
+    // rule above: a floor of >= 2 stays green if a fourth transaction is
+    // added without retry, or if a refactor quietly drops the wrapper from
+    // one of the three while adding it to a new one. All three of this
+    // file's transactions -- create_type, update_type, and delete_type --
+    // are retry-aware; only exact equality catches a regression in either
+    // direction.
     assert_eq!(
-        retried, 0,
-        "type_service.rs is not expected to use transaction_with_retry yet; \
-         found {retried}. If it now does, RG-03 is being fixed and the \
-         assertion above needs updating in the same commit."
+        retried, 3,
+        "expected exactly 3 transaction_with_retry call sites in \
+         type_service.rs -- create_type, update_type, delete_type -- \
+         found {retried}"
+    );
+}
+
+#[test]
+fn static_rule_update_group_locks_the_row_it_may_rewrite() {
+    // `update_group` opens at the backend default for a rename or a
+    // metadata-only edit, and `GroupRepository::update` matches on `id`
+    // alone while always assigning `parent_id`. So the read that decides
+    // whether this request moves the group has to be the locked one: an
+    // unlocked read answers from a READ COMMITTED snapshot, and a reparent
+    // that commits in the gap gets written back out while the closure table
+    // keeps its ancestry. Invisible on SQLite -- it has no row locks and
+    // sea-query omits the clause -- and unreachable through the recorder,
+    // which is why it is pinned here as well as by
+    // `group_rename_does_not_revert_a_concurrent_reparent`.
+    let src = include_str!("../src/domain/group_service.rs");
+    let update_inner = fn_body(src, "update_group_inner");
+
+    assert!(
+        update_inner.contains("find_model_by_id_for_update"),
+        "update_group_inner must take the row lock on the group before it \
+         decides whether the parent changed: without it, a rename running \
+         below SERIALIZABLE reverts a concurrent move it never saw"
+    );
+    assert!(
+        !update_inner.contains(".find_model_by_id(tx, group_id)"),
+        "the authoritative read of the updated group must be the locked one; \
+         an unlocked read of the same row reintroduces the lost update"
+    );
+}
+
+#[test]
+fn static_rule_non_force_delete_locks_before_it_decides() {
+    // Scoped to the two functions this is about, not to the file. Scanning
+    // the whole file made the second assertion pass by accident: `if force {`,
+    // `TxConfig::serializable()` and `TxConfig::default()` all appear
+    // somewhere in `group_service.rs` regardless of what `delete_group` does
+    // -- `update_group` alone supplies both TxConfig literals -- so hard-coding
+    // the level back would not have failed it.
+    let src = include_str!("../src/domain/group_service.rs");
+    let delete_group = fn_body(src, "delete_group");
+    let delete_inner = fn_body(src, "delete_group_inner");
+
+    // Not observable as SQL here: SQLite has no row locks and sea-query omits
+    // the clause for it entirely, so the trace on this backend looks the same
+    // with and without the lock. On PostgreSQL it is what makes the ordering
+    // against a concurrent `create_group` decidable -- the blocking itself
+    // comes from the foreign key's `FOR KEY SHARE`, see the comment in
+    // `delete_group`.
+    assert!(
+        delete_inner.contains("find_model_by_id_for_update"),
+        "the non-force delete must lock the target row before checking its \
+         children: without it, lowering the isolation level below SERIALIZABLE \
+         opens the window it was closing"
+    );
+
+    // And the level must still be chosen, not hard-coded back -- checked
+    // per branch, not by whether both literals appear somewhere in the
+    // function. `contains("if force {") && contains(serializable) &&
+    // contains(default)` passes just as well if the two branches were
+    // swapped, since both literals are still present; splitting the `if` by
+    // brace depth and checking each arm on its own catches that swap.
+    let (force_true_arm, force_false_arm) = split_if_else(delete_group, "force");
+    assert!(
+        force_true_arm.contains("TxConfig::serializable()")
+            && !force_true_arm.contains("TxConfig::default()"),
+        "delete_group's `force` arm must select TxConfig::serializable() -- a \
+         force delete rewrites a subtree and keeps SERIALIZABLE:\n{force_true_arm}"
+    );
+    assert!(
+        force_false_arm.contains("TxConfig::default()")
+            && !force_false_arm.contains("TxConfig::serializable()"),
+        "delete_group's non-`force` arm must select TxConfig::default() -- a \
+         non-force delete has no cross-row predicate to protect and must stay \
+         at the backend default:\n{force_false_arm}"
+    );
+}
+
+#[test]
+fn static_rule_metadata_schema_is_resolved_before_begin() {
+    let src = include_str!("../src/domain/group_service.rs");
+
+    // RG-09. Resolving the chained GTS schema is a network round-trip and the
+    // schema is then compiled; under an open transaction that time is
+    // snapshot lifetime, and every retry pays it again. The fix is structural
+    // rather than positional: the transaction-inner functions do not take a
+    // `TypesRegistryClient`, so the call cannot drift back inside. This rule
+    // asserts the parameter stays gone -- a positional check ("the call comes
+    // before `transaction_with_retry`") would pass again the moment someone
+    // reintroduced the argument and moved the call.
+    let inner_fns: Vec<&str> = src
+        .split("async fn ")
+        .filter(|f| f.starts_with("create_group_inner") || f.starts_with("update_group_inner"))
+        .collect();
+    // Without this the rule below would pass on an empty set -- a rename or a
+    // reshuffle would silently turn it into an assertion about nothing.
+    assert_eq!(
+        inner_fns.len(),
+        2,
+        "the scan should find create_group_inner and update_group_inner; \
+         found {} definition(s). Rename? Then update this rule with it.",
+        inner_fns.len()
+    );
+
+    let inner_taking_registry: Vec<&str> = inner_fns
+        .iter()
+        .filter(|f| {
+            let signature_end = f.find(") -> Result").unwrap_or(f.len());
+            f[..signature_end].contains("types_registry")
+        })
+        .map(|f| f.split('(').next().unwrap_or(f))
+        .collect();
+    assert!(
+        inner_taking_registry.is_empty(),
+        "these transaction-inner functions take a TypesRegistryClient, which \
+         puts an external call inside the transaction (RG-09): {inner_taking_registry:?}"
+    );
+
+    // Negative control: the validation must still happen somewhere. Without
+    // this, deleting the call outright would satisfy the rule above.
+    let calls = count_occurrences(src, "validate_metadata_via_gts(");
+    assert!(
+        calls >= 3,
+        "expected create_group, create_group_unscoped and update_group to each \
+         validate metadata before opening their transaction, found {calls} call(s)"
     );
 }

@@ -4,9 +4,11 @@
 pub mod cluster;
 pub mod delivery;
 pub mod error;
+pub mod event_type;
 pub mod idempotency;
 pub mod ingest;
 pub mod model;
+pub mod projection;
 pub mod repo;
 pub mod specification;
 

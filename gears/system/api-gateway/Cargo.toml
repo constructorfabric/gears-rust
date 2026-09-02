@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-api-gateway"
-version = "0.4.9"
+version = "0.4.11"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,12 +21,14 @@ workspace = true
 [dependencies]
 toolkit = { workspace = true }
 toolkit-http = { workspace = true }
+toolkit-http-middleware = { workspace = true }
 toolkit-gateway = { workspace = true }
-toolkit-security = { workspace = true }
+toolkit-security = { workspace = true, features = ["internal-auth-cache"] }
+toolkit-k8s-auth = { workspace = true, optional = true }
 toolkit-transport-grpc = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.29", path = "../authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.31", path = "../authn-resolver/authn-resolver-sdk" }
 toolkit-gts = { workspace = true }
 grpc_hub = { workspace = true }
 authn-resolver = { workspace = true }
@@ -71,6 +73,7 @@ uuid = { workspace = true }
 grpc = []
 embed_elements = []
 otel = []
+k8s-auth = ["dep:toolkit-k8s-auth"]
 
 [build-dependencies]
 ureq = { workspace = true }

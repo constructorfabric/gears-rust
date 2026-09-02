@@ -1,0 +1,7 @@
+[gear]
+name = "Usage Collector"
+description = "Centralized usage metering with pluggable storage, aggregation, and replay-safe feeds."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

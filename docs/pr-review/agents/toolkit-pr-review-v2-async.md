@@ -33,6 +33,9 @@ Apply **only** these specific check IDs:
    - `.unwrap()` or `.expect()` on futures without `.await`
    - CPU-bound work without spawning a blocking task
    - Lock acquisitions that may hold across await points (use tokio::sync::Mutex instead of std::sync::Mutex in async code)
+   - Functions holding partial/shared state across `.await` points with no consideration of what happens if the future is dropped mid-await (`select!`, timeout)
+   - `Drop` impls on async-held resources (transactions, connections, guards) that assume cleanup runs, when the cleanup actually needs an async call (`Drop` cannot `.await`)
+   - CPU-bound async loops with no periodic `tokio::task::yield_now()`, starving other tasks on the executor
 
 2. **RUST-CONC-001** — Concurrent state access must be safe. Check for:
    - Unjustified `unsafe` blocks in concurrent code
@@ -47,6 +50,8 @@ Apply **only** these specific check IDs:
    - Unbounded collections that could grow without limit
    - Inefficient string handling (repeated concatenation)
    - Excessive logging or tracing in performance-critical paths
+   - `.collect::<Vec<_>>()` immediately consumed by another loop/iteration instead of chaining iterators
+   - `Box::new([0; N])` for large buffers instead of `vec![0; n]`
 
 4. **RUST-NO-004** — No async blocking footguns. Do not block the async runtime — equivalent to RUST-ASYNC-001 but phrased as a "must not."
 

@@ -181,6 +181,9 @@ pub struct CreateGroupDto {
     pub name: String,
     /// Parent group ID (null for root groups).
     pub parent_id: Option<Uuid>,
+    /// Optional target tenant for the created group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -246,13 +249,11 @@ impl From<ResourceGroupWithDepth> for GroupWithDepthDto {
 
 impl From<CreateGroupDto> for CreateGroupRequest {
     fn from(dto: CreateGroupDto) -> Self {
-        Self {
-            id: dto.id,
-            code: dto.type_path,
-            name: dto.name,
-            parent_id: dto.parent_id,
-            metadata: dto.metadata,
-        }
+        Self::new(dto.type_path, dto.name)
+            .with_id(dto.id)
+            .with_parent_id(dto.parent_id)
+            .with_tenant_id(dto.tenant_id)
+            .with_metadata(dto.metadata)
     }
 }
 

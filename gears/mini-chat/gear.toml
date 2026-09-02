@@ -1,0 +1,7 @@
+[gear]
+name = "MiniChat"
+description = "Lightweight chat module for simple Azure and OpenAI conversational scenarios."
+category = "gen-ai"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

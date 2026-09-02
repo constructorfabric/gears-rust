@@ -1,0 +1,7 @@
+[gear]
+name = "Noop Usage Collector Plugin"
+description = "No-op storage backend plugin for Usage Collector testing and development."
+category = "core-functionality"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

@@ -132,13 +132,13 @@ async fn s1_06_negative_412_sequence_violation() {
 
     // Seed a chain at sequence=1 (previous=-1), so broker last_sequence becomes 1.
     broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 1, -1))
+        .publish(&c, &chained_event(&c, pid, 1, -1))
         .await
         .unwrap();
 
     // Publish sequence=2 with a wrong previous (3 instead of 1) → violation.
     let err = broker
-        .publish(&c, &chained_event(&c, TOPIC, pid, 2, 3))
+        .publish(&c, &chained_event(&c, pid, 2, 3))
         .await
         .unwrap_err();
     match err {
@@ -171,12 +171,12 @@ async fn s1_07_negative_429_rate_limited() {
     // Allow exactly one publish, then throttle.
     h.set_publish_rate_limit(Some(1)).await;
     broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap();
 
     let err = broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap_err();
     match err {
@@ -209,7 +209,7 @@ async fn s1_08_negative_500_internal() {
 
     h.reject_persist(Some("simulated invariant failure")).await;
     let err = broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap_err();
     assert!(
@@ -222,12 +222,11 @@ async fn s1_08_negative_500_internal() {
 
 fn chained_event(
     ctx: &toolkit_security::SecurityContext,
-    topic: &str,
     producer_id: Uuid,
     sequence: i64,
     previous: i64,
 ) -> crate::models::Event {
-    let mut ev = wire_event(topic, EVT, ctx.subject_tenant_id());
+    let mut ev = wire_event(EVT, ctx.subject_tenant_id());
     ev.meta = Some(crate::models::ProducerMeta {
         version: 1,
         producer_id: Some(producer_id),

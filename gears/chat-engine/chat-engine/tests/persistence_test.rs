@@ -101,6 +101,7 @@ fn make_request(session_id: Uuid) -> SendMessageRequest {
         file_ids: vec![],
         parent_message_id: None,
         capabilities: None,
+        metadata: None,
     }
 }
 
@@ -259,6 +260,7 @@ async fn multi_part_user_message_round_trips_in_order_against_sqlite() {
         file_ids: vec![],
         parent_message_id: None,
         capabilities: None,
+        metadata: None,
     };
 
     let cancel = CancellationToken::new();
@@ -412,6 +414,136 @@ async fn send_message_stamps_tenant_and_author_against_sqlite() {
     assert_eq!(
         assistant.user_id, None,
         "assistant message has no human author",
+    );
+}
+
+// ===========================================================================
+// 1c. Per-turn client metadata — persisted on the user row, absent from the
+//     assistant stub, and rejected when reserved or oversized
+// ===========================================================================
+
+#[tokio::test]
+async fn send_message_persists_client_metadata_on_the_user_row_against_sqlite() {
+    use chat_engine::infra::db::entity::message;
+
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "message-metadata-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    // The plugin completes with metadata of its own, so the assistant row is
+    // finalised with a populated map — otherwise the "client keys absent"
+    // assertion below would hold trivially against a NULL column.
+    let plugin = FakePlugin::new(
+        plugin_id,
+        FakePluginScript::Events(vec![
+            StreamingEvent::Chunk(StreamingChunkEvent {
+                message_id: Uuid::nil(),
+                chunk: "ok".into(),
+            }),
+            StreamingEvent::Complete(StreamingCompleteEvent {
+                message_id: Uuid::nil(),
+                metadata: Some(serde_json::json!({ "finish_reason": "stop" })),
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }),
+        ]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let svc = build_service(&harness, plugin_id, plugin_dyn);
+
+    let client_metadata = serde_json::json!({
+        "device": "ios",
+        "skill_level": "beginner",
+        "time_remaining_s": 42,
+    });
+    let mut req = make_request(session_id);
+    req.metadata = Some(client_metadata.clone());
+
+    let mut stream = svc
+        .send_message(req, &make_ctx(), CancellationToken::new())
+        .await
+        .expect("send_message dispatch");
+    while stream.next().await.is_some() {}
+
+    let rows = db::list_messages(&harness.db, session_id).await;
+    let user = rows
+        .iter()
+        .find(|m| matches!(m.role, message::MessageRole::User))
+        .expect("user message persisted");
+    assert_eq!(
+        user.metadata.as_ref(),
+        Some(&client_metadata),
+        "per-turn client metadata must land verbatim on the user row",
+    );
+
+    // Read the assistant row only after the detached driver has finalised it,
+    // so its metadata column is populated rather than still NULL.
+    let assistant = db::wait_for_finalize(&harness.db, session_id, Duration::from_secs(2)).await;
+    let assistant_meta = assistant.metadata.expect("assistant metadata present");
+    assert_eq!(
+        assistant_meta["finish_reason"], "stop",
+        "the plugin's own metadata must survive finalize",
+    );
+    // Driven off the payload itself so the assertion cannot drift from what
+    // the request actually sent.
+    for key in client_metadata
+        .as_object()
+        .expect("client metadata is a JSON object")
+        .keys()
+    {
+        assert!(
+            assistant_meta.get(key).is_none(),
+            "client metadata key '{key}' must not leak onto the assistant row",
+        );
+    }
+}
+
+#[tokio::test]
+async fn send_message_rejects_reserved_and_oversized_metadata_against_sqlite() {
+    let harness = db::setup_sqlite().await;
+    let plugin_id = "message-metadata-reject-plugin";
+    let session_type_id = db::seed_session_type(&harness, plugin_id).await;
+    let session_id = db::seed_active_session(&harness, TENANT_ID, USER_ID, session_type_id).await;
+
+    let plugin = FakePlugin::new(plugin_id, FakePluginScript::Events(vec![]));
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let svc = build_service(&harness, plugin_id, plugin_dyn);
+
+    let mut reserved = make_request(session_id);
+    reserved.metadata = Some(serde_json::json!({"model_used": "spoofed"}));
+    let err = svc
+        .send_message(reserved, &make_ctx(), CancellationToken::new())
+        .await
+        .err()
+        .expect("reserved key must be rejected");
+    assert!(
+        matches!(
+            err,
+            chat_engine::domain::error::ChatEngineError::BadRequest { .. }
+        ),
+        "reserved metadata key must map to 400, got {err:?}",
+    );
+
+    let mut oversized = make_request(session_id);
+    oversized.metadata = Some(serde_json::json!({"blob": "x".repeat(9 * 1024)}));
+    let err = svc
+        .send_message(oversized, &make_ctx(), CancellationToken::new())
+        .await
+        .err()
+        .expect("oversized metadata must be rejected");
+    assert!(
+        matches!(
+            err,
+            chat_engine::domain::error::ChatEngineError::BadRequest { .. }
+        ),
+        "oversized metadata must map to 400, got {err:?}",
+    );
+
+    assert!(
+        db::list_messages(&harness.db, session_id).await.is_empty(),
+        "a rejected send must not persist any message row",
     );
 }
 

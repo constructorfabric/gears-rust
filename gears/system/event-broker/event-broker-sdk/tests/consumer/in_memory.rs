@@ -9,7 +9,7 @@ use event_broker_sdk::{
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.inmemory.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.inmemory.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.inmemory.v1~";
 
 struct RecordingHandler {
     subjects: Arc<Mutex<Vec<String>>>,
@@ -50,7 +50,6 @@ async fn if_i_want_at_least_once_consumption_with_in_memory_offsets() {
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         EVENT_TYPE,
         "order-1",
         None,

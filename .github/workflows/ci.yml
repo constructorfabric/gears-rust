@@ -80,6 +80,11 @@ jobs:
               # Input to `make check-release-config` in the test job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
+              # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
+              # libs/test-containers: a Python-only edit to the E2E sidecar must
+              # still get the cross-lane TimescaleDB pin checked, or the guard
+              # silently never runs on exactly the diff it exists to catch.
+              - 'testing/e2e/lib/sidecars.py'
             fips:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
@@ -166,6 +171,20 @@ jobs:
           else
             echo "sccache failed, falling back to plain rustc"
           fi
+
+      # Database image tags are pinned in libs/test-containers (docs/TESTING.md
+      # 4.4). A fixture that constructs a container any other way re-introduces
+      # the transitive pin through Cargo.lock that issue #4616 removed: a
+      # dependency bump then moves the database under every test with nothing in
+      # the diff to show it.
+      #
+      # This parses the workspace with `syn` rather than grepping it, so import
+      # renames, type aliases, non-literal image names and creative formatting
+      # cannot slip past. Placed here, after the cache and sccache setup, because
+      # it needs a toolchain -- but still ahead of clippy, which is the expensive
+      # step in this job.
+      - name: No unpinned database container images
+        run: cargo xtask check-test-container-pins
 
       - name: cargo clippy
         run: make clippy

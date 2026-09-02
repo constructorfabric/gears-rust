@@ -14,6 +14,7 @@ pub mod api;
 pub mod consumer;
 pub mod dlq;
 pub mod error;
+pub mod gts;
 pub mod ids;
 pub mod models;
 pub mod producer;
@@ -22,6 +23,9 @@ pub mod typed_event;
 
 #[cfg(test)]
 mod api_tests;
+
+#[cfg(test)]
+mod gts_tests;
 
 #[cfg(feature = "test-util")]
 pub mod mock;
@@ -38,9 +42,9 @@ pub use consumer::{
     ConsumerRuntimeListener, ConsumerSettings, ConsumerSettingsOverrides, ConsumerSlowDetection,
     ControlCode, EventBatch, EventTypeRef, Fallback, FilterEngineRef, FrameStream, HandlerOutcome,
     InMemoryOffsetManager, OffsetStore, PartitionBufferState, PartitionBufferStateSnapshot,
-    PartitionPosition, PartitionProgress, PartitionSlot, RawEvent, SeekPosition,
-    SingleEventHandler, SlowConsumerTrigger, SubscriptionFilterRef, SubscriptionInterest, TopicRef,
-    WireEvent, WireFrame,
+    PartitionPosition, PartitionProgress, RawEvent, SeekPosition, SingleEventHandler,
+    SlowConsumerTrigger, SubscriptionFilterRef, SubscriptionInterest, TopicRef, WireEvent,
+    WireFrame,
 };
 #[cfg(feature = "db")]
 pub use consumer::{
@@ -51,9 +55,9 @@ pub use consumer::{
 pub use error::{ConsumerError, EventBrokerError, OffsetManagerError, StorageBackendError};
 pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
 pub use models::{
-    ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event,
-    EventType, Page, PartitionAssignment, PartitionLeader, PartitionRange, ResetScope,
-    Subscription, Topic, TopicSegment,
+    ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, Page,
+    PartitionAssignment, PartitionLeader, PartitionRange, ResetScope, Subscription, Topic,
+    TopicSegment,
 };
 #[cfg(feature = "db")]
 pub use producer::{

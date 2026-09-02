@@ -104,19 +104,19 @@ Today a module needing these properties must either bring up an external broker 
 
 | Term | Definition |
 |------|------------|
-| Topic | A named, partitioned event stream identified by a GTS topic identifier (`gts.cf.core.events.topic.v1~vendor.foo.v1`). Topic is the unit of subscription and the scope of partition / offset semantics. Topics are platform-scoped (globally unique by GTS). See [DESIGN.md §3.1 Topic Schema](DESIGN.md). |
-| Partition | An independent ordered log within a topic. Partitioning serves two requirements — per-key event ordering and horizontal scale — rather than being a requirement itself. Per-partition order is total; cross-partition order is unspecified. The producer-facing partition input is `partition_key` when present and `tenant_id` otherwise; the broker derives the final topic partition and producers do not set a top-level partition. Partition count is fixed at topic creation. See [ADR-0002](ADR/0002-partition-selection.md). |
+| Topic | A named, partitioned event stream. A topic is an instance of `gts.cf.core.events.topic.v1~` (for example `gts.cf.core.events.topic.v1~vendor.foo.v1`) carrying the stream's own data - identifier, description, and how long its events are kept. Partition count and backend binding are broker configuration. Topic is the unit of subscription and the scope of partition / offset semantics. Topics are platform-scoped (globally unique by GTS). See [DESIGN.md §3.1 Topic Schema](DESIGN.md). |
+| Partition | An independent ordered log within a topic. Partitioning serves two requirements — per-key event ordering and horizontal scale — rather than being a requirement itself. Per-partition order is total; cross-partition order is unspecified. The producer-facing partition input is `partition_key` when present and `tenant_id` otherwise; the broker derives the final topic partition and producers do not set a top-level partition. Partition count is broker configuration and applies to every topic the broker serves. See [ADR-0002](ADR/0002-partition-selection.md). |
 | Event | An immutable record in a `(topic, partition)` log, GTS-typed via its `event_type`. Carries `subject` + `subject_type` to identify the entity it concerns; its broker topic partition follows the partition input contract. See [DESIGN.md §3.1 Event Schema](DESIGN.md) and [ADR-0003 Event Schema](ADR/0003-event-schema.md). |
-| Event Type | A GTS-typed registration record describing one kind of event: its parent topic, allowed subject types, and the per-type `data_schema` (a JSON Schema that validates `event.data` at ingest). See [DESIGN.md §3.1 Event Type Schema](DESIGN.md). |
+| Event Type | A derived GTS type schema describing one kind of event. It narrows the base event schema's `data` member into the payload contract that validates `event.data` at ingest, and declares the metadata governing the type - owning topic, allowed subject types - in its `x-gts-traits`. See [DESIGN.md §3.1 Event Type](DESIGN.md). |
 | Subject Type | The GTS-typed kind of entity an event concerns (e.g., user, account, invoice). Enforced on two dimensions: authorization (per-principal) and schema (`event_type.allowed_subject_types`). |
 | Producer | A client that publishes events. Three modes: chained (producer-id + previous + sequence chain), monotonic (producer-id + sequence), stateless (no producer-id). |
 | Consumer Group | A logical set of cooperating consumer instances sharing partition assignments and a single committed offset per partition. Persistent broker resource, GTS-typed, with two creation paths (anonymous via `POST /v1/consumer-groups`, named via `types_registry`). |
 | Subscription | An ephemeral session a consumer instance opens against a consumer group via `POST /v1/subscriptions`. Holds the partition assignment, declared `interests[]`, compiled filter handles, and streaming session state. Identified by `subscription_id`; lives in cache; expires on `session_timeout`. See [DESIGN.md §3.1 Subscription Schema](DESIGN.md). |
 | Interest | A topic-anchored, typed-filter selection declared at JOIN per [ADR-0005](ADR/0005-subscription-filter-typing.md). One subscription carries 1–64 interests. Each interest has required `topic`, `tenant_id`, `types[]` plus an optional `filter { engine, expression }` object. Multiple interests OR together. |
 | FilterEngine | Plugin trait (`compile()` + `eval()`) for evaluating filter expressions over events. GTS-typed; base type `gts.cf.core.events.filter.v1~`; v1 built-in CEL engine. Resolved at JOIN via `ClientHub`. |
-| FilterContext | Per-engine declaration of which event fields are visible to filter expressions. CEL engine v1 exposes the read-side event (`event.v1.schema.json` with `readOnly` fields populated; `writeOnly` `meta` stripped). |
+| FilterContext | Per-engine declaration of which event fields are visible to filter expressions. CEL engine v1 exposes the read-side event (`gts.cf.core.events.event.v1~.schema.json` with `readOnly` fields populated; `writeOnly` `meta` stripped). |
 | Offset | Backend-assigned, monotonic-per-`(topic, partition)` ordering key. Consumer-visible; the only sequence consumers paginate by. |
-| Storage Backend | Pluggable persistence layer for events. Discovered via GTS instance registration and resolved via ClientHub. Built-in implementations: memory, postgres. Backend owns retention, compaction, and offset assignment. |
+| Storage Backend | Pluggable persistence layer for events. Discovered via GTS instance registration and resolved via ClientHub. Built-in implementations: memory, postgres. Backend enforces retention, compaction, and offset assignment. |
 | Cluster Module | The platform-level `modules/system/cluster` system module providing KV-with-TTL, leader election, and distributed locks. Consumed by the broker for coordination. |
 | GTS | Global Type System — the platform's schema and instance registration system used for type identification, validation, and pattern matching in authorization. |
 
@@ -124,13 +124,13 @@ Today a module needing these properties must either bring up an external broker 
 
 Before the functional requirements, this section establishes the conceptual entities the broker deals in and how they relate. It is the requirements-level view; the schema-level model (fields, persistence, GTS base types) lives in [DESIGN.md §3.1 Domain Model](DESIGN.md).
 
-1. **Topic** — A named, platform-scoped event stream identified by a GTS topic identifier and the unit of subscription. A topic fixes its **partition count** at creation and defines the scope within which event ordering and offsets are meaningful. It carries a backend `streaming` configuration block — retention horizon, compaction/consolidation policy, segment sizing, and similar — that is **opaque to the broker and owned and enforced by the topic's bound storage backend**; the broker performs no retention or consolidation of its own.
+1. **Topic** — A named, platform-scoped event stream identified by a GTS topic identifier and the unit of subscription. It defines the scope within which event ordering and offsets are meaningful, and declares how long its events are kept. **Partition count** and the **backend binding** are broker configuration rather than topic data. Retention, compaction/consolidation, segment sizing and similar are **enforced by the topic's bound storage backend**; the broker performs none of them itself.
 
 2. **Event Type** — A versioned contract, identified by a GTS identifier and bound to exactly one parent **topic**, that constrains the events published under it. It declares the set of **allowed subject types** and a **payload schema** (`data_schema`) against which each event's payload is validated at ingest. Event types are **immutable** in v1: changing the contract requires a new GTS identifier.
 
 3. **Event** — An **immutable**, append-only record of something that occurred, classified by its **event type**. Each event carries a client-supplied identifier, the **subject** and **subject type** identifying the entity it concerns, its owning **tenant**, an occurrence **timestamp**, and a typed **payload** whose shape is governed by the event type's schema. An event's **partition is derived by the broker** (by default from the tenant) and is never set by the producer. Once accepted, an event is never modified, re-ordered, or re-numbered.
 
-4. **Partition** — An independent, totally-ordered log within a topic. Ordering is **total within** a single partition and **unspecified across** partitions. The partition count is fixed at topic creation. Partitioning determines the granularity of ordering, of parallel consumption, and of offset tracking.
+4. **Partition** — An independent, totally-ordered log within a topic. Ordering is **total within** a single partition and **unspecified across** partitions. The partition count is broker configuration. Partitioning determines the granularity of ordering, of parallel consumption, and of offset tracking.
 
 5. **Subscription** — An **ephemeral** session opened by a single consumer instance against a consumer group. It holds the **partition assignment** granted to that instance and the consumer's declared **interests** — the topics, event types, and optional filter expression it wishes to receive. A subscription exists only for the lifetime of the consuming session and expires on timeout; it never outlives the consumer process.
 
@@ -138,7 +138,7 @@ Before the functional requirements, this section establishes the conceptual enti
 
 7. **Offset / Cursor** — The **offset** is a backend-assigned, monotonic position within a `(topic, partition)` log; it is the only ordering coordinate consumers observe. The **cursor** is the group-scoped ephemeral session position set by SEEK. The cursor advances **forward-only** during streaming and may be repositioned explicitly for replay via SEEK (`POST /v1/subscriptions/{id}:seek`).
 
-8. **Storage Backend** — The pluggable persistence layer bound to a topic. It durably stores events, **assigns their offsets**, and **owns retention, compaction/consolidation, and deletion** as directed by the topic's `streaming` configuration. Built-in backends are provided (in-memory for dev/test, PostgreSQL for production); third-party backends register via GTS without modifying broker core.
+8. **Storage Backend** — The pluggable persistence layer bound to a topic. It durably stores events, **assigns their offsets**, and **enforces retention, compaction/consolidation, and deletion** - retention as the topic declares it, the rest as its own configuration directs. Built-in backends are provided (in-memory for dev/test, PostgreSQL for production); third-party backends register via GTS without modifying broker core.
 
 **Relationships**:
 
@@ -147,7 +147,7 @@ Topic 1 ──*  Event Type        (a topic defines its event types)
 Topic 1 ──*  Partition         (fixed count, set at creation)
 Event Type 1 ──*  Event        (an event is an instance of one type)
 Partition 1 ──*  Event         (each event lands in exactly one partition)
-Topic *  ──1  Storage Backend  (a topic is bound to one backend; the backend owns retention/consolidation)
+Topic *  ──1  Storage Backend  (a topic is bound to one backend; the backend enforces retention/consolidation)
 Consumer Group 1 ──*  Subscription   (members)
 Consumer Group 1 ──*  Cursor         (one committed cursor per assigned partition)
 Subscription *  ──*  Partition       (a subscription is assigned partitions to consume)
@@ -165,14 +165,14 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-platform-operator`
 
-- **Role**: Configures broker deployment topology (standalone vs cluster), bound storage backend instances per topic, and operational policies (stream connection caps, group caps, retention via backend config).
+- **Role**: Configures broker deployment topology (standalone vs cluster), partition count, bound storage backend instances per topic, and operational policies (stream connection caps, group caps, retention via backend config).
 - **Needs**: Operate broker as a managed platform service; observe per-topic / per-group lag; scale delivery shards horizontally; rebind topics to different backend instances on infrastructure changes.
 
 #### Module Developer (Producer Side)
 
 **ID**: `cpt-cf-evbk-actor-module-dev-producer`
 
-- **Role**: Authors a Gears module that publishes events. Registers topic + event-type instances in `types_registry` and/or uses the producer SDK to enqueue events transactionally with business writes. Registration (`define`) and publishing (`produce`) are independently grantable authorization actions (see §5.6) — the module that registers a type need not be the module that publishes it.
+- **Role**: Authors a Gears module that publishes events. Registers topic and event-type schemas in `types_registry` and/or uses the producer SDK to enqueue events transactionally with business writes. Registration (`define`) and publishing (`produce`) are independently grantable authorization actions (see §5.6) — the module that registers a type need not be the module that publishes it.
 - **Needs**: Transactional publish (events durable iff business commit succeeds); chain-of-custody dedup so retries don't double-publish; explicit error semantics on chain breaks; minimal coupling to broker internals.
 
 #### Module Developer (Consumer Side)
@@ -272,9 +272,9 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-topic-registration`
 
-The system MUST support topic registration through the Type Registry: topics are authored declaratively (e.g. in YAML) and owned by `types_registry` as GTS instances; the broker consumes the registered instances at startup (it does not parse declarative config itself). A registered topic MUST have a globally-unique GTS identifier (`gts.cf.core.events.topic.v1~<vendor>.<package>.<namespace>.<name>.v1`), a fixed partition count (no default — operator must declare), and a `streaming` configuration block validated against the chosen storage backend's `config_schema`.
+The system MUST support topic registration through the Type Registry: topics are authored declaratively (e.g. in YAML) and owned by `types_registry` as instances of `gts.cf.core.events.topic.v1~`; the broker consumes the registered instances at startup (it does not parse declarative config itself). A registered topic MUST have a globally-unique GTS instance identifier (`gts.cf.core.events.topic.v1~<vendor>.<package>.<namespace>.<name>.v1`) and MUST declare a description and MAY declare a retention. A topic carries only the stream's own data; the partition count and the backend binding are broker configuration, because they describe how a deployment serves the stream rather than what the stream is.
 
-- **Rationale**: Topics are platform-scoped resources; registration is identity-and-ownership state that must be unambiguous across deployments.
+- **Rationale**: Topics are platform-scoped contracts; registration is identity-and-ownership state that must be unambiguous across deployments.
 - **Actors**: `cpt-cf-evbk-actor-platform-operator`, `cpt-cf-evbk-actor-module-dev-producer`
 
 #### Event-Type Registration
@@ -290,7 +290,7 @@ The system MUST support event-type registration via `types_registry`. Each event
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-topic-introspection`
 
-The system MUST expose read-only REST endpoints for listing topics, listing event types, retrieving a single topic's metadata (including partition count and bound backend), and retrieving a single event type's schema. Read access is gated by the `topic:consume` PEP check.
+The system MUST expose read-only REST endpoints for listing topics, listing event types, retrieving a single topic's metadata, and retrieving a single event type's schema. Read access is gated by the `topic:consume` PEP check.
 
 - **Rationale**: Producers and SDKs may need topic metadata for local broker-partition hints or batching, consumers need event-type schemas to validate, and tooling needs discovery.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`, `cpt-cf-evbk-actor-module-dev-consumer`
@@ -301,7 +301,7 @@ The system MUST expose read-only REST endpoints for listing topics, listing even
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-single`
 
-The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `topic`, `subject`, `subject_type`, `tenant_id`, and `data`; the partition is broker-derived, not client-set. Publish MUST be **accepted asynchronously and durably** — the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode MUST be available for callers needing read-after-write, acknowledging only after backend persistence completes. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
+The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `subject`, `subject_type`, `tenant_id`, and `data`; the owning topic is resolved from the event type, and the partition is broker-derived, not client-set. Publish MUST be **accepted asynchronously and durably** — the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode MUST be available for callers needing read-after-write, acknowledging only after backend persistence completes. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
 
 - **Rationale**: Standard event-streaming publish primitive with explicit at-least-once semantics.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -453,7 +453,7 @@ The system MUST allow third-party storage backend plugins (e.g., Kafka, S3, cust
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-authorization`
 
-The system MUST delegate all authorization decisions to the `authz-resolver` framework via `PolicyEnforcer::access_scope_with(...)`. The broker MUST define four resource types — `gts.cf.core.events.topic.v1~`, `gts.cf.core.events.event_type.v1~`, `gts.cf.core.events.subject_type.v1~`, `gts.cf.core.events.consumer_group.v1~` — each with three actions (`produce`, `consume`, `define`). Permission grammar MUST be `<gts_pattern>:<action>` with full GTS wildcard support.
+The system MUST delegate all authorization decisions to the `authz-resolver` framework via `PolicyEnforcer::access_scope_with(...)`. The broker MUST define four resource types — `gts.cf.core.events.topic.v1~`, `gts.cf.core.events.event.v1~`, `gts.cf.core.events.subject_type.v1~`, `gts.cf.core.events.consumer_group.v1~` — each with three actions (`produce`, `consume`, `define`). Permission grammar MUST be `<gts_pattern>:<action>` with full GTS wildcard support.
 
 - **Rationale**: Standardized authorization via the platform PEP; per-resource granularity prevents the coarse-permission failure mode where any service with `produce` could write to any topic.
 - **Actors**: `cpt-cf-evbk-actor-authz-resolver`
@@ -565,7 +565,7 @@ GET    /v1/subscriptions                         # list active subscriptions for
 GET    /v1/subscriptions/{id}                    # read subscription state
 
 GET    /v1/topics                                # list registered topics
-GET    /v1/topics/{id}                           # read topic metadata (partition count, bound backend)
+GET    /v1/topics/{id}                           # read topic metadata
 GET    /v1/event-types                           # list registered event types
 GET    /v1/event-types/{id}                      # read event-type schema and allowed subject types
 ```
@@ -591,7 +591,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 - The audit-pipeline principal holds `:consume` PEP grants on the relevant audit topics, event types, subject types, and the consumer group.
 
 **Main Flow**:
-1. A platform module emits an audit event (e.g., `gts.cf.core.events.event_type.v1~vendor.audit.user_changed.v1`) on every privileged action.
+1. A platform module emits an audit event (e.g., `gts.cf.core.events.event.v1~vendor.audit.user_changed.v1~`) on every privileged action.
 2. The audit-pipeline module JOINs the named consumer group and streams.
 3. The broker delivers events at-least-once; audit-pipeline processes idempotently into long-term storage.
 4. Audit-pipeline seeks past processed events via SEEK (`POST /v1/subscriptions/{id}:seek`); broker advances `cursor.offset` for the group.
@@ -705,7 +705,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 | Storage backend selection lock-in | A topic's bound backend cannot be changed without data migration tooling (post-MVP). Selecting an inappropriate backend at topic registration may require a full topic rebuild for migration. | Document backend characteristics and capacity ceilings clearly at registration time; restrict ad-hoc backend choices; prefer postgres unless an explicit scale or compliance constraint forces an alternative. Backend instance migration tooling is on the post-MVP roadmap. |
 | Consumer-cursor durability under cache-only model | In standalone mode, broker runtime cursors die with the process; consumers may re-process from their chosen start position after restart unless they persist progress themselves. | Idempotent consumer processing is a normative SDK requirement (per the at-least-once contract). Consumers that need durable progress persist offsets in their own store; broker runtime cursor state is not the durable source of truth. |
 | Hot-topic scaling in sharded ingest mode | A single hot topic pinned to a single ingest instance via `serves_topic_patterns` becomes a bottleneck and a noisy neighbor for any topics co-located with it. | Hetero ingest mode (default) load-balances all topics across all ingest instances. Sharded mode is opt-in for explicit isolation; operators choosing sharded mode are responsible for capacity planning per shard. Partition-sharded ingest (sub-topic level) is on the post-MVP roadmap. |
-| Schema evolution gap | v1's "new GTS identifier per change" rule makes long-lived event logs operationally awkward without the post-MVP compatible-evolution feature. | Consumers use type-pattern wildcards (`gts.cf.core.events.event_type.v1~vendor.audit.*`) to subscribe to families of versions. Compatible schema evolution + inter-version casting is on the post-MVP roadmap. |
+| Schema evolution gap | v1's "new GTS identifier per change" rule makes long-lived event logs operationally awkward without the post-MVP compatible-evolution feature. | Consumers use type-pattern wildcards (`gts.cf.core.events.event.v1~vendor.audit.*`) to subscribe to families of versions. Compatible schema evolution + inter-version casting is on the post-MVP roadmap. |
 | Abuse / resource exhaustion without quotas | Without rate limits and storage quotas, a misbehaving or malicious tenant can flood ingest, exhaust backend storage, or starve consumers. The limits **must** be set before broad production exposure. | Interim per-tenant safety-floor caps on resource-creation endpoints (`cpt-cf-evbk-nfr-tenant-rate-caps`) bound the worst vector now. Full **Quotas & Rate Limiting** — scoped per topic / per producer / per consumer (produce rate, poll rate, active-subscription caps, storage quotas) — is the immediate post-MVP feature and needs dedicated design; tracked in BACKLOG.md. |
 
 ## 13. Open Questions

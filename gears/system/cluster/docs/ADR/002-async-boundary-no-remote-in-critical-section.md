@@ -100,6 +100,16 @@ The architecture lint rule that enforces "no remote I/O in critical sections" is
 - Cluster provider implementations are reviewed to confirm no fencing-token generation exists in production code paths.
 - Unbounded-pause coverage test (per-backend integration suite): simulate a holder pause longer than TTL by suspending the holder process or pausing its async runtime via `pause_runtime_for(ttl + epsilon)`. Assert: (a) backend releases the lock at TTL, (b) a successor acquires within `epsilon`, (c) on resume, the original holder's `release().await` is a benign no-op against the foreign holder, (d) the original holder's subsequent CAS write attempt against the guarded resource returns `CasConflict` when the successor has changed it, and `Ok` only when the resource state matches the holder's pre-pause expected_version.
 
+## Amendment (2026-08): bounded cluster round trips in the deployable profile
+
+This ADR was written on the premise that *cluster's own* operations are in-process, so "no remote I/O in the critical section" and "all remote effects before `try_lock` or after `release`" were one rule. The deployable profile — cluster as a separate process (DESIGN.md §3.16–§3.20) — breaks that premise: in Profile 3 a consumer's own `cache.get` / `compare_and_swap` against cluster *is* a remote call, so the rule as originally written forbids the design's own reference flow (UC-002's rate limiter).
+
+**Refinement.** Bounded **cluster-primitive** round trips are permitted inside a critical section; the ban on **non-cluster** remote I/O — database writes, HTTP to other services, anything whose latency depends on a third party — stands unchanged. Cluster round trips are bounded by `rpc_timeout` and fail closed, so a holder whose lease has lapsed learns quickly. This does not reopen the stale-writer scenario: a remote critical section has a *wider* window in which a lease can lapse unnoticed, so pattern C (treat the lock as advisory; make the protected write a conditional cache CAS — DESIGN.md §3.3) becomes more important, not less, and remains the answer for correctness-critical work.
+
+**Lint consequence.** The `no-remote-in-critical-section` rule is re-scoped to distinguish cluster coordination (permitted) from third-party remote I/O (forbidden). The original rule — scoped to flag the three cluster backend traits within `try_lock`/`release` — would, in Profile 3, either fire on every correct consumer or be suppressed wholesale, and a suppressed lint protects nothing. The re-scoped lint is a follow-up to this amendment; until it lands the constraint is design discipline plus review, as DESIGN.md §2.2 records.
+
+Everything else in this ADR — no-op `Drop`, explicit async `release()`, TTL as the safety net, no fencing tokens — is unchanged.
+
 ## Pros and Cons of the Options
 
 ### Option 1: Sync Drop with block_on

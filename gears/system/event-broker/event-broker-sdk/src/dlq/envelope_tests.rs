@@ -8,7 +8,7 @@ use crate::ids::{ConsumerGroupId, TopicId};
 use super::{DeadLetterEnvelope, DeadLetterRecord};
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1~");
 
 fn raw_event() -> RawEvent {
     RawEvent {
@@ -18,7 +18,6 @@ fn raw_event() -> RawEvent {
         tenant_id: Uuid::new_v4(),
         subject: "order-1".to_owned(),
         subject_type: "order".to_owned(),
-        partition_key: Some("tenant-a/order-1".to_owned()),
         partition: 7,
         sequence: 99,
         offset: 99,
@@ -54,7 +53,6 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
     assert_eq!(envelope.event_type, EVENT_TYPE);
     assert_eq!(envelope.subject, "order-1");
     assert_eq!(envelope.subject_type, "order");
-    assert_eq!(envelope.partition_key.as_deref(), Some("tenant-a/order-1"));
     assert_eq!(envelope.partition, 7);
     assert_eq!(envelope.offset, 99);
     assert_eq!(envelope.attempts, Some(6));
@@ -78,10 +76,6 @@ fn dead_letter_envelope_round_trips_from_outbox_payload() {
     assert_eq!(coordinates.event_type, EVENT_TYPE);
     assert_eq!(coordinates.subject, "order-1");
     assert_eq!(coordinates.subject_type, "order");
-    assert_eq!(
-        coordinates.partition_key.as_deref(),
-        Some("tenant-a/order-1")
-    );
     assert_eq!(coordinates.partition, 7);
     assert_eq!(coordinates.offset, 99);
     assert_eq!(coordinates.event_id, raw.id);

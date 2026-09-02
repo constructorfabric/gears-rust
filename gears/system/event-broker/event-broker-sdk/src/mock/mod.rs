@@ -19,5 +19,5 @@ mod control_tests;
 #[cfg(all(test, feature = "test-util"))]
 mod stream_tests;
 
-pub use control::{MockBrokerHandle, PartitionSlot};
+pub use control::{MockBrokerHandle, PartitionKeyFixture, PartitionSlot};
 pub use core::{CursorEntry, MockBroker, StoredEvent};

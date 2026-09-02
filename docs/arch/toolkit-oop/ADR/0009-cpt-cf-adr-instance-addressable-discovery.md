@@ -215,11 +215,11 @@ resolution is service-name-scoped"):
   service-name analogue of the role-qualified gear names in §1. A bare, shared service name is intentionally
   reachable across every advertising role.
 * **The edge exposes public routes of the resolved name.** The `api-gateway` reverse-proxy edge already keys its
-  route table on gear name; it exposes only the **public** routes (via the `.exposed()` / `x-toolkit-visibility`
-  visibility split the edge introduces - a prerequisite not yet in the tree, see Consequences) of the
-  names it syncs from the directory. An internal role never enters the edge's public route table because its
-  **name** is internal - a role-split gear simply does not register its internal role-names as edge-eligible, or
-  exposes no public routes on them. No `entrypoint` predicate is needed at the edge.
+  route table on gear name; it exposes only the **public** routes (via the `.exposed()` /
+  `x-toolkit-visibility` visibility split) of the names it syncs from the directory. An internal role never
+  enters the edge's public route table because its **name** is internal - a role-split gear simply does not
+  register its internal role-names as edge-eligible, or exposes no public routes on them. No `entrypoint`
+  predicate is needed at the edge.
 * **One public contract per directory name (constraint):** instances registered under **one** directory name
   MUST expose the **same logical public API** - a directory name *is* one logical service. This does **not**
   forbid **transient version skew** during a rolling deploy of the *same* contract: while v1 and v2 pods coexist
@@ -451,13 +451,13 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
   endpoint (i.e. not a shared VIP); the *mechanism* - `StatefulSet` + headless Service, a self-registering
   `Deployment` advertising its pod IP / per-pod DNS, etc. - is the **gear developer's choice** and is **not**
   mandated here. Front-door role-names may keep a Service VIP.
-* **Ordering dependency on the edge work (these prerequisites do not exist today).** Layer 1's edge story and
-  the enumeration decision below depend on directory/edge changes that are **not yet in the tree** and are **not
-  specified by the current edge ADRs** (ADR-0003 defines only the `GatewayProvider` trait; ADR-0007 defines the
-  edge auth *modes*) - they are a separate, not-yet-written directory/edge work item: `directory.proto` has
-  **no `ListAllInstances` RPC**, `openapi_spec` lives on `RegisterInstanceRequest` only (not on `InstanceInfo`),
-  and there is **no `.exposed()` / `x-toolkit-visibility`** visibility split. Layer 1 therefore **must merge after
-  (or reconcile with) that edge implementation**; it is **not** available today and must not be read as such.
+* **Edge / directory ordering dependency (discharged).** Layer 1's edge story and the enumeration decision
+  below depended on directory/edge machinery that has since landed: `directory.proto` has `ListAllInstances`,
+  `InstanceInfo` carries `openapi_spec` (field 6), and the `.exposed()` / `x-toolkit-visibility` visibility
+  split is emitted by `OperationBuilder` and consumed by `toolkit-gateway`. ADR-0003 still defines only the
+  `GatewayProvider` trait and ADR-0007 the edge auth *modes*; the concrete crates (`toolkit-gateway`,
+  `api-gateway` directory-sync) exist in-tree even though those two ADRs have not been amended to specify
+  them. Layer 1 merged on top of that edge (#4540); the ordering dependency is satisfied.
 * **Requires amendments to sibling ADRs / PRD / DESIGN** (not just cross-references), because it changes shapes
   they assert - **ADR-0001**, **PRD `cpt-cf-fr-k8s-native`**, **DESIGN.md (§3 Profile 3)**, and **ADR-0004**
   (Helm); enumerated under
@@ -602,19 +602,17 @@ defines the `GatewayProvider` trait and [`cpt-cf-adr-edge-architecture`](0007-cp
 this ADR's edge story depends on: the `libs/toolkit-gateway` crate (`GatewayProvider`, `ProxyRegistry`,
 `ToolKitGatewayProvider`), the `api-gateway` embedded reverse-proxy with its directory-sync loop (poll ->
 reconcile -> register/prune), the `ListAllInstances` RPC and `InstanceInfo.openapi_spec` field, and the
-`.exposed()` / `x-toolkit-visibility` edge-visibility split. Those pieces are a **separate directory/edge work
-item, an ordering dependency not in the tree today** (enumerated in Consequences); if they are ultimately
-specified by amending ADR-0003 / ADR-0007 rather than a new ADR, those two move from *references* to
-*amendments*. This ADR is **additive on top of that edge** (`labels` ride on the `InstanceInfo` the edge
-extends; role exclusion is structural), so Layer 1 must merge **after** / reconcile with that edge
-implementation. Labels ride on `InstanceInfo` for the per-name paths (`list_instances` /
+`.exposed()` / `x-toolkit-visibility` edge-visibility split. Those pieces have **landed in-tree** (see
+Consequences); if they are ultimately specified by amending ADR-0003 / ADR-0007 rather than a new ADR, those
+two move from *references* to *amendments*. This ADR is **additive on top of that edge** (`labels` ride on
+the `InstanceInfo` the edge extends; role exclusion is structural); Layer 1 merged after that edge
+implementation (#4540). Labels ride on `InstanceInfo` for the per-name paths (`list_instances` /
 `resolve_by_labels`); the `ListAllInstances` edge snapshot deliberately omits them (it routes by name - see
 Implementation notes), so its mapper is **not** extended to carry `labels`.
 
 ### Implementation notes
 
-For the implementing change (reconcile against the edge's directory rework - the separate edge/directory work
-item above, not the current ADR-0007):
+For the implementing change (reconcile against the landed edge directory rework - not the current ADR-0007):
 
 * **gRPC resolution is service-name-scoped, not gear-scoped.** `resolve_grpc_service` round-robins over every
   instance advertising a gRPC service *across all gears*, whereas `resolve_rest_service` is per-gear. Because

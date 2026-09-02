@@ -1,0 +1,262 @@
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use authz_resolver_sdk::{
+    AuthZResolverApi, PolicyEnforcer,
+    constraints::{Constraint, InPredicate, Predicate},
+    models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
+};
+use github_mirror::domain::error::DomainError;
+use github_mirror::domain::ports::github::{FetchedRepository, GithubPort};
+use github_mirror::domain::service::{Service, ServiceConfig};
+use github_mirror::infra::storage::migrations::Migrator;
+use github_mirror::infra::storage::sea_orm_repo::{
+    SeaOrmBranchRepository, SeaOrmCheckRunRepository, SeaOrmCommentRepository,
+    SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository, SeaOrmCommitRepository,
+    SeaOrmCommitStatusRepository, SeaOrmContributorRepository, SeaOrmDeploymentRepository,
+    SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository, SeaOrmIssueRepository,
+    SeaOrmIssueTimelineRepository, SeaOrmLabelRepository, SeaOrmMilestoneRepository,
+    SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
+    SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
+    SeaOrmReviewCommentRepository, SeaOrmReviewRepository, SeaOrmReviewThreadRepository,
+    SeaOrmTagRepository, SeaOrmWorkflowJobRepository, SeaOrmWorkflowRunRepository,
+};
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::{ClientHub, ConfigProvider, GearCtx};
+use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use uuid::Uuid;
+
+pub type ConcreteService = Service<
+    SeaOrmRepoRepository,
+    SeaOrmIssueRepository,
+    SeaOrmPullRequestRepository,
+    SeaOrmCommitRepository,
+    SeaOrmCommentRepository,
+    SeaOrmReviewCommentRepository,
+    SeaOrmReviewRepository,
+    SeaOrmLabelRepository,
+    SeaOrmMilestoneRepository,
+    SeaOrmReleaseRepository,
+    SeaOrmBranchRepository,
+    SeaOrmContributorRepository,
+    SeaOrmWorkflowRunRepository,
+    SeaOrmPullRequestFileRepository,
+    SeaOrmTagRepository,
+    SeaOrmCommitFileRepository,
+    SeaOrmReviewThreadRepository,
+    SeaOrmCommitCommentRepository,
+    SeaOrmIssueEventRepository,
+    SeaOrmDeploymentRepository,
+    SeaOrmPullRequestCommitRepository,
+    SeaOrmCommitStatusRepository,
+    SeaOrmWorkflowJobRepository,
+    SeaOrmIssueReactionRepository,
+    SeaOrmCheckRunRepository,
+    SeaOrmIssueTimelineRepository,
+>;
+
+/// PDP fake: allows everything, constrained to the caller's tenant.
+pub struct MockAuthZResolver;
+
+#[async_trait]
+impl AuthZResolverApi for MockAuthZResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let root_id = request
+            .context
+            .tenant_context
+            .as_ref()
+            .and_then(|tc| tc.root_id)
+            .or_else(|| {
+                request
+                    .subject
+                    .properties
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+            })
+            .ok_or_else(|| CanonicalError::internal("tenant context is required").create())?;
+
+        let predicates = vec![Predicate::In(InPredicate::new(
+            pep_properties::OWNER_TENANT_ID,
+            [root_id],
+        ))];
+
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint { predicates }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// PDP fake that denies everything: for exercising the deny path.
+pub struct DenyAllAuthZResolver;
+
+#[async_trait]
+impl AuthZResolverApi for DenyAllAuthZResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: false,
+            context: EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// GitHub fake: serves a pre-baked fetch result, or `NotFound` when empty.
+pub struct FakeGithub {
+    pub result: Option<FetchedRepository>,
+}
+
+#[async_trait]
+impl GithubPort for FakeGithub {
+    async fn fetch_repository(
+        &self,
+        _owner: &str,
+        _name: &str,
+    ) -> Result<FetchedRepository, DomainError> {
+        self.result.clone().ok_or(DomainError::NotFound)
+    }
+}
+
+pub async fn inmem_db() -> Db {
+    use sea_orm_migration::MigratorTrait;
+
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let db = connect_db("sqlite::memory:", opts)
+        .await
+        .unwrap_or_else(|e| panic!("in-memory database must connect: {e}"));
+
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .unwrap_or_else(|e| panic!("migrations must apply: {e}"));
+
+    db
+}
+
+pub fn enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
+    PolicyEnforcer::new(authz)
+}
+
+pub fn deny_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(DenyAllAuthZResolver);
+    PolicyEnforcer::new(authz)
+}
+
+pub fn service_with_github(
+    db: Db,
+    api_base_url: &str,
+    github: Arc<dyn GithubPort>,
+) -> Arc<ConcreteService> {
+    service_with_enforcer(db, api_base_url, github, enforcer())
+}
+
+pub fn service_with_enforcer(
+    db: Db,
+    api_base_url: &str,
+    github: Arc<dyn GithubPort>,
+    policy_enforcer: PolicyEnforcer,
+) -> Arc<ConcreteService> {
+    Arc::new(Service::new(
+        Arc::new(DBProvider::new(db)),
+        Arc::new(SeaOrmRepoRepository::new()),
+        Arc::new(SeaOrmIssueRepository::new()),
+        Arc::new(SeaOrmPullRequestRepository::new()),
+        Arc::new(SeaOrmCommitRepository::new()),
+        Arc::new(SeaOrmCommentRepository::new()),
+        Arc::new(SeaOrmReviewCommentRepository::new()),
+        Arc::new(SeaOrmReviewRepository::new()),
+        Arc::new(SeaOrmLabelRepository::new()),
+        Arc::new(SeaOrmMilestoneRepository::new()),
+        Arc::new(SeaOrmReleaseRepository::new()),
+        Arc::new(SeaOrmBranchRepository::new()),
+        Arc::new(SeaOrmContributorRepository::new()),
+        Arc::new(SeaOrmWorkflowRunRepository::new()),
+        Arc::new(SeaOrmPullRequestFileRepository::new()),
+        Arc::new(SeaOrmTagRepository::new()),
+        Arc::new(SeaOrmCommitFileRepository::new()),
+        Arc::new(SeaOrmReviewThreadRepository::new()),
+        Arc::new(SeaOrmCommitCommentRepository::new()),
+        Arc::new(SeaOrmIssueEventRepository::new()),
+        Arc::new(SeaOrmDeploymentRepository::new()),
+        Arc::new(SeaOrmPullRequestCommitRepository::new()),
+        Arc::new(SeaOrmCommitStatusRepository::new()),
+        Arc::new(SeaOrmWorkflowJobRepository::new()),
+        Arc::new(SeaOrmIssueReactionRepository::new()),
+        Arc::new(SeaOrmCheckRunRepository::new()),
+        Arc::new(SeaOrmIssueTimelineRepository::new()),
+        github,
+        policy_enforcer,
+        ServiceConfig {
+            api_base_url: api_base_url.to_owned(),
+        },
+    ))
+}
+
+pub fn service_over(db: Db, api_base_url: &str) -> Arc<ConcreteService> {
+    service_with_github(db, api_base_url, Arc::new(FakeGithub { result: None }))
+}
+
+pub async fn service(api_base_url: &str) -> Arc<ConcreteService> {
+    service_over(inmem_db().await, api_base_url)
+}
+
+pub struct StaticConfig {
+    pub section: Option<serde_json::Value>,
+}
+
+impl ConfigProvider for StaticConfig {
+    fn get_gear_config(&self, gear_name: &str) -> Option<&serde_json::Value> {
+        if gear_name == "github-mirror" {
+            self.section.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+/// A `GearCtx` good enough for `Gear::init`: config + hub with a fake PDP + an
+/// in-memory database with migrations applied.
+pub async fn gear_ctx(hub: Arc<ClientHub>, section: Option<serde_json::Value>) -> GearCtx {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
+    hub.register::<dyn AuthZResolverApi>(authz);
+
+    GearCtx::new(
+        "github-mirror",
+        Uuid::new_v4(),
+        Arc::new(StaticConfig { section }),
+        hub,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .with_db(DBProvider::new(inmem_db().await))
+}
+
+pub fn caller_in(tenant_id: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant_id)
+        .build()
+        .unwrap_or_else(|e| panic!("test caller context must build: {e}"))
+}
+
+pub fn caller() -> SecurityContext {
+    caller_in(Uuid::new_v4())
+}

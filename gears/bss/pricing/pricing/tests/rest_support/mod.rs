@@ -26,11 +26,10 @@ use toolkit_canonical_errors::CanonicalError;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-use authz_resolver_sdk::error::AuthZResolverError;
 use authz_resolver_sdk::models::{
     DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, Response};
@@ -87,7 +86,7 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureUpdateExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -176,11 +175,12 @@ pub struct FlatInResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for FlatInResolver {
+impl AuthZResolverApi for FlatInResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -201,11 +201,12 @@ impl AuthZResolverClient for FlatInResolver {
 pub struct DenyingResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyingResolver {
+impl AuthZResolverApi for DenyingResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -224,14 +225,15 @@ impl AuthZResolverClient for DenyingResolver {
 pub struct UnavailableResolver;
 
 #[async_trait]
-impl AuthZResolverClient for UnavailableResolver {
+impl AuthZResolverApi for UnavailableResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::Internal(
-            "the policy decision point is unreachable".to_owned(),
-        ))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::service_unavailable()
+            .with_detail("the policy decision point is unreachable")
+            .create())
     }
 }
 
@@ -241,11 +243,12 @@ impl AuthZResolverClient for UnavailableResolver {
 pub struct UnconstrainedResolver;
 
 #[async_trait]
-impl AuthZResolverClient for UnconstrainedResolver {
+impl AuthZResolverApi for UnconstrainedResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -266,11 +269,12 @@ pub struct RecordingResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for RecordingResolver {
+impl AuthZResolverApi for RecordingResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.seen.lock().expect("recorder").push(req);
         Ok(EvaluationResponse {
             decision: true,
@@ -310,11 +314,12 @@ pub struct SelectiveResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for SelectiveResolver {
+impl AuthZResolverApi for SelectiveResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let asked = (
             req.resource.resource_type.as_str(),
             req.action.name.as_str(),
@@ -728,7 +733,7 @@ impl Harness {
         AccessScope::for_tenant(self.other)
     }
 
-    fn client(&self, resolver: Arc<dyn AuthZResolverClient>, ctx: Option<Uuid>) -> Client {
+    fn client(&self, resolver: Arc<dyn AuthZResolverApi>, ctx: Option<Uuid>) -> Client {
         self.client_as(resolver, ctx.map(|tenant| (tenant, Uuid::now_v7())))
     }
 
@@ -739,11 +744,7 @@ impl Harness {
     /// which is right for the authoring suites and would make a submitter and
     /// an approver accidentally distinct here — a self-approval test that could
     /// never stage a self-approval.
-    fn client_as(
-        &self,
-        resolver: Arc<dyn AuthZResolverClient>,
-        ctx: Option<(Uuid, Uuid)>,
-    ) -> Client {
+    fn client_as(&self, resolver: Arc<dyn AuthZResolverApi>, ctx: Option<(Uuid, Uuid)>) -> Client {
         let openapi = OpenApiRegistryImpl::new();
         let router = bss_pricing::api::rest::frontier::router(Arc::clone(&self.frontier), &openapi)
             // Slice 12's bulk import and its history read. Both merged here

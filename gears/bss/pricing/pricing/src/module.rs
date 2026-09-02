@@ -1222,13 +1222,13 @@ impl Gear for BssPricingGear {
 
         // Platform PEP. Authz is security-critical — a catalog whose price book
         // is commercially sensitive must not run unauthorized — so a missing
-        // `AuthZResolverClient` fails init loudly rather than degrading. No
+        // `AuthZResolverApi` fails init loudly rather than degrading. No
         // `with_capabilities`: the PDP pre-expands the subtree to a flat `In`.
         let authz_client = ctx
             .client_hub()
-            .get::<dyn authz_resolver_sdk::AuthZResolverClient>()
+            .get::<dyn authz_resolver_sdk::AuthZResolverApi>()
             .context(
-                "bss-pricing: AuthZResolverClient absent from ClientHub; \
+                "bss-pricing: AuthZResolverApi absent from ClientHub; \
                  authz-resolver module must be registered",
             )?;
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(authz_client));

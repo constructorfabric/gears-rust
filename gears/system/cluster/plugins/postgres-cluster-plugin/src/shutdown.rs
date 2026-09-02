@@ -2,8 +2,9 @@
 //! (cache + lock) and [`PostgresLockHandle`] (lock only) — DESIGN.md §10.
 //!
 //! Both handles end the same way: cancel the shared `CancellationToken`, join
-//! the background tasks, hand back this instance's locks, close the beacon, then
-//! close the pool. The two steps that are *not* obvious live here rather than in
+//! the background tasks, then close the pool — leaving held lease rows in place,
+//! which is DESIGN.md's whole point (a restart is not a lease
+//! event). The two steps that are *not* obvious live here rather than in
 //! either handle, because each one is a property of the pair and the pair had
 //! already drifted on both:
 //!
@@ -115,10 +116,6 @@ pub enum DropDiagnosis {
 /// end-to-end observable — a cancelled token makes the next `try_lock` answer
 /// `ClusterError::Shutdown` — is asserted by an integration scenario gated on
 /// `not(debug_assertions)`.
-///
-/// The beacon is deliberately *not* on this token (`lock::beacon`): it has to
-/// outlive the shared cancel so the shutdown drain can still read its key.
-/// `BeaconHandle`'s own `Drop` ends that one.
 pub fn cancel_and_diagnose_drop(stopped: bool, shutdown: &CancellationToken) -> DropDiagnosis {
     if stopped {
         return DropDiagnosis::StoppedCleanly;

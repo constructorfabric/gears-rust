@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use authz_resolver_sdk::{AuthZResolverClient, EnforcerError, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, EnforcerError, PolicyEnforcer};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
@@ -41,7 +41,7 @@ pub struct PolicyEnforcerAuthorizer {
 impl PolicyEnforcerAuthorizer {
     /// Build from the `ClientHub`-resolved `AuthZ` resolver client.
     #[must_use]
-    pub fn new(authz: Arc<dyn AuthZResolverClient>) -> Self {
+    pub fn new(authz: Arc<dyn AuthZResolverApi>) -> Self {
         Self {
             enforcer: PolicyEnforcer::new(authz),
         }

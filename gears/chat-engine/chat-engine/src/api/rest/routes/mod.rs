@@ -1,6 +1,6 @@
 //! Route registration for the Chat Engine REST surface.
 //!
-//! Every endpoint listed in DESIGN §API and `api/http-protocol.json` is
+//! Every endpoint listed in DESIGN §API and `docs/openapi.json` is
 //! wired up here via [`OperationBuilder`]. The function
 //! [`register_routes`] is the single mounting point — `module.rs` calls
 //! it once, then the gateway owns the rest (request tracing, CORS,
@@ -26,6 +26,7 @@ use toolkit::api::operation_builder::{
 };
 
 use crate::api::rest::WebhookEmitter;
+use crate::api::rest::docs::TeeRegistry;
 use crate::api::rest::dto::{
     CreateSessionRequestDto, ExportAcceptedDto, MessageDto, MessageListDto, ReactionListDto,
     ReactionRequestDto, RecreateMessageRequestDto, RegisterSessionTypeRequestDto, SearchRequestDto,
@@ -42,7 +43,7 @@ use crate::domain::service::{
 
 /// API tag used by every Chat Engine endpoint in the generated OpenAPI
 /// document.
-const API_TAG: &str = "Chat Engine";
+pub(crate) const API_TAG: &str = "Chat Engine";
 
 /// License feature required by all `cf-chat-engine` endpoints.
 ///
@@ -77,8 +78,10 @@ pub struct ChatEngineServices {
 ///
 /// - `OperationBuilder::<verb>(path)` chain per endpoint.
 /// - `.authenticated()` + `.require_license_features([&ChatEngineLicense])`
-///   on every protected route (the only public route is
-///   `POST /chat-engine/v1/shared/{share_token}` which uses `.anonymous()`).
+///   on every protected route. The `.anonymous()` routes are
+///   `POST /chat-engine/v1/shared/{share_token}` (the share token is the
+///   grant) and the two documentation routes (`GET /chat-engine/v1/docs`,
+///   `GET /chat-engine/v1/openapi`).
 /// - `.json_response_with_schema::<…>(openapi, status, desc)` for typed
 ///   responses; `.json_request::<…>(openapi, desc)` for typed bodies.
 /// - `.standard_errors(openapi)` registers the RFC-9457 error variants.
@@ -92,6 +95,13 @@ pub fn register_routes(
     enable_search: bool,
 ) -> Router {
     let mut router = router;
+
+    // Every `OperationBuilder` below registers through this decorator, so the
+    // gear-scoped document served at `/chat-engine/v1/openapi` is assembled
+    // from exactly what this function registers. Shadowing `openapi` keeps the
+    // per-endpoint chains untouched — they still read as plain registry calls.
+    let tee = TeeRegistry::new(openapi);
+    let openapi = &tee;
 
     // -------------------------------------------------------------------
     // Session types (developer-scope registration)
@@ -333,10 +343,9 @@ pub fn register_routes(
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Session UUID")
         .handler(handlers::glue::summarize_session)
-        .json_response_with_schema::<StreamingEventDto>(
+        .sse_json::<StreamingEventDto>(
             openapi,
-            StatusCode::OK,
-            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events (text/event-stream)",
+            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -347,17 +356,16 @@ pub fn register_routes(
 
     router = OperationBuilder::post("/chat-engine/v1/sessions/{id}/messages")
         .operation_id("chat_engine.message.send")
-        .summary("Send a message and stream the assistant response as NDJSON")
+        .summary("Send a message and stream the assistant response as SSE")
         .tag(API_TAG)
         .authenticated()
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Session UUID")
         .json_request::<SendMessageRequestDto>(openapi, "Message payload")
         .handler(handlers::glue::send_message_in_session)
-        .json_response_with_schema::<StreamingEventDto>(
+        .sse_json::<StreamingEventDto>(
             openapi,
-            StatusCode::OK,
-            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events (text/event-stream)",
+            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -400,10 +408,9 @@ pub fn register_routes(
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Message UUID")
         .handler(handlers::glue::resume_message_stream)
-        .json_response_with_schema::<StreamingEventDto>(
+        .sse_json::<StreamingEventDto>(
             openapi,
-            StatusCode::OK,
-            "SSE delta stream replayed from Last-Event-ID then live-tailed (text/event-stream)",
+            "SSE delta stream replayed from Last-Event-ID then live-tailed",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -422,17 +429,16 @@ pub fn register_routes(
 
     router = OperationBuilder::post("/chat-engine/v1/messages/{id}/recreate")
         .operation_id("chat_engine.message.recreate")
-        .summary("Recreate an assistant variant (NDJSON stream)")
+        .summary("Recreate an assistant variant (SSE stream)")
         .tag(API_TAG)
         .authenticated()
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Message UUID")
         .json_request::<RecreateMessageRequestDto>(openapi, "Recreate options")
         .handler(handlers::glue::recreate_message)
-        .json_response_with_schema::<StreamingEventDto>(
+        .sse_json::<StreamingEventDto>(
             openapi,
-            StatusCode::OK,
-            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events (text/event-stream)",
+            "SSE typed delta stream of message.start/message.text.delta/message.complete/message.error events",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -466,6 +472,9 @@ pub fn register_routes(
         .standard_errors(openapi)
         .register(router, openapi);
 
+    // Mounted last: it snapshots everything registered above (itself included).
+    router = crate::api::rest::docs::mount(router, &tee);
+
     // -------------------------------------------------------------------
     // Service & webhook DI attached once at the end.
     // -------------------------------------------------------------------
@@ -481,3 +490,7 @@ pub fn register_routes(
         .layer(Extension(webhooks))
         .layer(Extension(stream_buffer))
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod mod_tests;

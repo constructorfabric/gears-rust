@@ -5,4 +5,4 @@
 pub mod cache;
 pub mod storage;
 
-pub use storage::InMemoryGtsRepository;
+pub use storage::{InMemoryGtsRepository, Migrator};

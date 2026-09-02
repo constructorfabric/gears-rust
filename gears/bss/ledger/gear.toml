@@ -1,0 +1,7 @@
+[gear]
+name = "Billing Ledger"
+description = "Append-only double-entry subledger for financially material movements and balances."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

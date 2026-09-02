@@ -1,6 +1,6 @@
 //! Shared test harness for the domain-service authorization suite (Phase 8).
 //!
-//! Provides mock `AuthZResolverClient` implementations (mirroring the
+//! Provides mock `AuthZResolverApi` implementations (mirroring the
 //! `users-info` reference gear), `PolicyEnforcer` builders, `SecurityContext`
 //! fixtures, an in-memory SQLite database with the real migrations applied,
 //! Sea-ORM repo builders, and row-seed helpers. Real repos + a mock PDP let the
@@ -19,15 +19,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError,
+    AuthZResolverApi,
     constraints::{Constraint, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
 use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
-use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use toolkit::ClientHub;
@@ -224,7 +225,7 @@ pub async fn seed_session(
 
 /// Build a [`PolicyEnforcer`] over the given resolver.
 #[must_use]
-pub fn enforcer(resolver: Arc<dyn AuthZResolverClient>) -> PolicyEnforcer {
+pub fn enforcer(resolver: Arc<dyn AuthZResolverApi>) -> PolicyEnforcer {
     PolicyEnforcer::new(resolver)
 }
 
@@ -299,11 +300,12 @@ fn resolve_subject_tenant(request: &EvaluationRequest) -> Option<Uuid> {
 pub struct MockAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let subject_id = request.subject.id;
         let constraints = match resolve_subject_tenant(&request) {
             Some(tenant) => vec![Constraint {
@@ -332,11 +334,12 @@ impl AuthZResolverClient for MockAuthZResolver {
 pub struct AllowUnconstrainedAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for AllowUnconstrainedAuthZResolver {
+impl AuthZResolverApi for AllowUnconstrainedAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext::default(),
@@ -351,11 +354,12 @@ impl AuthZResolverClient for AllowUnconstrainedAuthZResolver {
 pub struct DenyAllAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllAuthZResolver {
+impl AuthZResolverApi for DenyAllAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext::default(),
@@ -371,12 +375,13 @@ impl AuthZResolverClient for DenyAllAuthZResolver {
 pub struct FailingAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for FailingAuthZResolver {
+impl AuthZResolverApi for FailingAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::Internal("PDP unavailable".to_owned()))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::internal("PDP unavailable".to_owned()).create())
     }
 }
 
@@ -388,11 +393,12 @@ impl AuthZResolverClient for FailingAuthZResolver {
 pub struct CompileFailAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for CompileFailAuthZResolver {
+impl AuthZResolverApi for CompileFailAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext::default(),

@@ -50,7 +50,7 @@ pub async fn list_groups(
     // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-9
     // RG Gateway delegates to GroupService.list_groups, which (jwt-3..9):
     //   3) calls PolicyEnforcer.access_scope(ctx, RG_GROUP_RESOURCE, action)
-    //   4) PolicyEnforcer → AuthZResolverClient.evaluate(EvaluationRequest)
+    //   4) PolicyEnforcer → AuthZResolverApi.evaluate(ctx, EvaluationRequest) -> Result<_, CanonicalError>
     //   5) AuthZ plugin internally calls ResourceGroupReadHierarchy.list_group_depth
     //      via ClientHub for tenant hierarchy resolution (in-process bypass)
     //   6) AuthZ plugin produces constraints (e.g., owner_tenant_id IN (...))

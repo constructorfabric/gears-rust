@@ -15,8 +15,7 @@ use uuid::Uuid;
 /// }
 ///
 /// impl TypedEvent for OrderCreated {
-///     const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~example.orders.created.v1";
-///     const TOPIC:   &'static str = "gts.cf.core.events.topic.v1~example.orders.v1";
+///     const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~example.orders.created.v1~";
 ///     const SUBJECT_TYPE: &'static str = "gts.cf.core.events.subject.v1~example.order.v1";
 ///     const SOURCE:  &'static str = "order-service";
 ///
@@ -25,23 +24,15 @@ use uuid::Uuid;
 ///     }
 /// }
 /// ```
+/// The topic is deliberately absent, as is the partition key: both belong to the
+/// event type's traits, and the broker resolves them from `TYPE_ID`. A second
+/// declaration here could only disagree with them.
 pub trait TypedEvent: Serialize + DeserializeOwned + Send + Sync + 'static {
     const TYPE_ID: &'static str;
-    const TOPIC: &'static str;
     const SUBJECT_TYPE: &'static str;
     const SOURCE: &'static str;
 
     fn subject(&self) -> Cow<'_, str>;
-
-    /// Returns the stable grouping identifier used for partition selection.
-    ///
-    /// Prefer an authenticated, normalized identifier whose representation is
-    /// controlled by the producer. Do not pass raw attacker-controlled
-    /// free-form values: MurmurHash3 is non-cryptographic, so adversarial keys
-    /// can deliberately hot-spot a partition.
-    fn partition_key(&self) -> Option<Cow<'_, str>> {
-        None
-    }
 
     /// Overrides the authenticated security-context tenant for this event.
     ///

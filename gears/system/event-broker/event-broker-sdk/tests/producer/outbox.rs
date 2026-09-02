@@ -10,7 +10,7 @@ use uuid::Uuid;
 use event_broker_sdk::ProducerId;
 use event_broker_sdk::api::EventBrokerApi;
 use event_broker_sdk::error::EventBrokerError;
-use event_broker_sdk::mock::{MockBroker, MockBrokerHandle};
+use event_broker_sdk::mock::{MockBroker, MockBrokerHandle, PartitionKeyFixture};
 use event_broker_sdk::models::{Event, ProducerMeta, ResetScope};
 use event_broker_sdk::producer::IngestOutcome;
 use event_broker_sdk::producer::UnknownProducerAction;
@@ -20,10 +20,19 @@ use event_broker_sdk::{
 };
 
 const QUEUE: &str = "event-broker-producer";
+/// Partition count `fixture_with_handle` registers its topics with, and therefore
+/// the count its producers declare.
+const FIXTURE_BROKER_PARTITIONS: u32 = 4;
+
+/// The payload member `OrderCreated` carries for the tests that need to steer the
+/// partition. Pointing an event type here is the interesting case: a bare field
+/// name could not reach inside `data`.
+const PAYLOAD_POINTER: &str = "/data/partition_key";
+
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.outbox.orders.v1";
 const TOPIC2: &str = "gts.cf.core.events.topic.v1~example.sdk.outbox.billing.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.sdk.outbox.created.v1";
-const EVENT_TYPE2: &str = "gts.cf.core.events.event_type.v1~example.sdk.outbox.charged.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.created.v1~";
+const EVENT_TYPE2: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.charged.v1~";
 const SUBJECT_TYPE: &str = "gts.cf.core.events.subject.v1~example.sdk.outbox.order.v1";
 const TENANT_PARTITION: u32 = 2;
 
@@ -33,22 +42,18 @@ static DB_SEQ: AtomicU64 = AtomicU64::new(1);
 struct OrderCreated {
     order_id: Uuid,
     total_cents: i64,
-    #[serde(skip)]
+    /// A payload member an event type can point its partition key at.
+    #[serde(skip_serializing_if = "Option::is_none")]
     partition_key: Option<String>,
 }
 
 impl TypedEvent for OrderCreated {
     const TYPE_ID: &'static str = EVENT_TYPE;
-    const TOPIC: &'static str = TOPIC;
     const SUBJECT_TYPE: &'static str = SUBJECT_TYPE;
     const SOURCE: &'static str = "order-service";
 
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.order_id.to_string())
-    }
-
-    fn partition_key(&self) -> Option<Cow<'_, str>> {
-        self.partition_key.as_deref().map(Cow::Borrowed)
     }
 
     fn tenant_id(&self) -> Option<Uuid> {
@@ -64,7 +69,6 @@ struct BadOrderCreated {
 
 impl TypedEvent for BadOrderCreated {
     const TYPE_ID: &'static str = EVENT_TYPE;
-    const TOPIC: &'static str = TOPIC;
     const SUBJECT_TYPE: &'static str = SUBJECT_TYPE;
     const SOURCE: &'static str = "order-service";
 
@@ -85,7 +89,6 @@ struct BillingCharged {
 
 impl TypedEvent for BillingCharged {
     const TYPE_ID: &'static str = EVENT_TYPE2;
-    const TOPIC: &'static str = TOPIC2;
     const SUBJECT_TYPE: &'static str = SUBJECT_TYPE;
     const SOURCE: &'static str = "billing-service";
 
@@ -140,7 +143,7 @@ async fn lazy_validation_missing_schema_fails_without_broker_lookup() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DbDeduplication::stateless())
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.outbox.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.outbox.*"])
         .lazy_validation()
         .build()
         .await
@@ -288,24 +291,38 @@ async fn unknown_producer_register_new_replaces_registration() {
     assert_eq!(action, UnknownProducerAction::AlreadyRotated);
 }
 
+/// The event type decides which member is hashed, so the same publish call yields
+/// a different partition under a different pointer - and a producer cannot change
+/// it per message.
 #[tokio::test]
-async fn tenant_fallback_and_partition_key_input_drive_broker_partition() {
-    let (db, broker) = fixture().await;
-    let producer = stateless_producer(db, broker).await;
+async fn the_event_types_declared_pointer_drives_the_broker_partition() {
+    let (db, broker, handle) = fixture_with_handle().await;
+    let by_tenant = stateless_producer(db.clone(), broker.clone()).await;
 
-    let (_, tenant_envelope) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let (_, keyed_envelope) = producer
+    let (_, tenant_envelope) = by_tenant.outbox_envelope(order(None), 4).await.unwrap();
+    assert_eq!(
+        envelope_json(&tenant_envelope)["broker_partition"],
+        serde_json::json!(TENANT_PARTITION)
+    );
+
+    // Repointing must precede `prepare_all`, which caches the resolved type, so
+    // the payload-pointed case needs its own producer.
+    handle
+        .set_partition_key(PartitionKeyFixture {
+            event_type: EVENT_TYPE,
+            pointer: PAYLOAD_POINTER,
+        })
+        .await;
+    let by_payload = stateless_producer(db, broker).await;
+
+    let (_, keyed_envelope) = by_payload
         .outbox_envelope(order(Some("explicit-key")), 4)
         .await
         .unwrap();
-    let tenant = envelope_json(&tenant_envelope);
-    let keyed = envelope_json(&keyed_envelope);
-
     assert_eq!(
-        tenant["broker_partition"],
-        serde_json::json!(TENANT_PARTITION)
+        envelope_json(&keyed_envelope)["broker_partition"],
+        serde_json::json!(3)
     );
-    assert_eq!(keyed["broker_partition"], serde_json::json!(3));
 }
 
 #[tokio::test]
@@ -332,8 +349,14 @@ async fn producer_outbox_and_broker_topic_partition_counts_can_differ() {
     handle
         .register_event_type(TOPIC2, EVENT_TYPE2, billing_schema(), &[SUBJECT_TYPE])
         .await;
+    handle
+        .set_partition_key(PartitionKeyFixture {
+            event_type: EVENT_TYPE,
+            pointer: PAYLOAD_POINTER,
+        })
+        .await;
     let broker: Arc<dyn EventBrokerApi> = mock;
-    let producer = stateless_producer(db, broker).await;
+    let producer = stateless_producer_with_broker_partitions(db, broker, 16).await;
 
     let event = order(Some("explicit-key"));
     let expected_broker_partition = 15;
@@ -361,7 +384,7 @@ async fn one_queue_can_carry_multiple_topics() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DbDeduplication::stateless())
         .topics([TOPIC, TOPIC2])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.outbox.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.outbox.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -607,8 +630,12 @@ async fn fixture_with_handle() -> (toolkit_db::Db, Arc<dyn EventBrokerApi>, Mock
     let db = db().await;
     let mock = Arc::new(MockBroker::new());
     let handle = mock.handle();
-    handle.register_topic(TOPIC, 4).await;
-    handle.register_topic(TOPIC2, 4).await;
+    handle
+        .register_topic(TOPIC, FIXTURE_BROKER_PARTITIONS)
+        .await;
+    handle
+        .register_topic(TOPIC2, FIXTURE_BROKER_PARTITIONS)
+        .await;
     handle
         .register_event_type(TOPIC, EVENT_TYPE, order_schema(), &[SUBJECT_TYPE])
         .await;
@@ -660,6 +687,17 @@ async fn db_without_producer_migrations() -> toolkit_db::Db {
 }
 
 async fn stateless_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -> DbProducer {
+    stateless_producer_with_broker_partitions(db, broker, FIXTURE_BROKER_PARTITIONS).await
+}
+
+/// A topic reports no partition count, so a producer declares the count its
+/// broker is configured with. These fixtures register topics with a known count
+/// and hand the producer the same one.
+async fn stateless_producer_with_broker_partitions(
+    db: toolkit_db::Db,
+    broker: Arc<dyn EventBrokerApi>,
+    broker_partitions: u32,
+) -> DbProducer {
     DbProducer::builder()
         .broker(broker)
         .db(db)
@@ -668,6 +706,7 @@ async fn stateless_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>)
         .deduplication(DbDeduplication::stateless())
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
+        .broker_partitions(broker_partitions)
         .prepare_all()
         .await
         .unwrap()
@@ -710,7 +749,8 @@ fn order_schema() -> serde_json::Value {
         "required": ["order_id", "total_cents"],
         "properties": {
             "order_id": { "type": "string" },
-            "total_cents": { "type": "integer" }
+            "total_cents": { "type": "integer" },
+            "partition_key": { "type": "string" }
         }
     })
 }
@@ -812,12 +852,10 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
     Event {
         id: Uuid::new_v4(),
         type_id: EVENT_TYPE.to_owned(),
-        topic: TOPIC.to_owned(),
         tenant_id: test_tenant(),
         source: "order-service".to_owned(),
         subject: Uuid::new_v4().to_string(),
         subject_type: SUBJECT_TYPE.to_owned(),
-        partition_key: None,
         occurred_at: chrono::Utc::now(),
         trace_parent: None,
         data: Some(serde_json::json!({

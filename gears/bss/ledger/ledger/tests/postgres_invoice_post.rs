@@ -48,7 +48,6 @@ use bss_ledger_sdk::{AccountClass, EntryView, LineView, MappingStatus, Side, Sou
 use chrono::{DateTime, NaiveDate, Utc};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -243,7 +242,7 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn posts_balanced_invoice_and_emits_metrics() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -325,7 +324,7 @@ async fn posts_balanced_invoice_and_emits_metrics() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn closed_payer_is_rejected_but_a_reversal_still_posts() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -438,7 +437,7 @@ async fn closed_payer_is_rejected_but_a_reversal_still_posts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -481,7 +480,7 @@ async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn revenue_line_missing_revenue_stream_is_rejected_by_the_foundation() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -510,7 +509,7 @@ async fn revenue_line_missing_revenue_stream_is_rejected_by_the_foundation() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_pending_suspense_line_blocks_period_close() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -569,7 +568,7 @@ async fn a_pending_suspense_line_blocks_period_close() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn mapping_correction_retry_replays_idempotently() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -664,7 +663,7 @@ async fn mapping_correction_retry_replays_idempotently() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reverse_of_a_reversal_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -762,7 +761,7 @@ async fn reverse_of_a_reversal_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_same_invoice_posts_exactly_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -851,7 +850,7 @@ async fn concurrent_same_invoice_posts_exactly_once() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_reversals_of_one_entry_post_exactly_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

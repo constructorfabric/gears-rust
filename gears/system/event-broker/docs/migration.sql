@@ -101,7 +101,7 @@ CREATE TABLE evbk_producer (
 -- narrowed by tenant. `last_sequence` tracks the highest producer-set
 -- `meta.sequence` accepted from this producer for this (topic, partition). The
 -- Reaper worker cleans up records where `last_seen_at` is older than the
--- topic's `retention` (capped at P14D). Cascade-deleted when the parent
+-- broker's `producer.state_retention` (capped at P14D). Cascade-deleted when the parent
 -- evbk_producer registration row is aged out.
 --
 -- Chain check at ingest (chained mode): on incoming event with

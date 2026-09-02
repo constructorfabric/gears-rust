@@ -14,8 +14,8 @@ use crate::infra::proxy::DataPlaneServiceImpl;
 use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 use async_trait::async_trait;
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, PolicyEnforcer,
+    AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    PolicyEnforcer,
 };
 use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
@@ -24,8 +24,9 @@ use tenant_resolver_sdk::{
     GetTenantsOptions, IsAncestorOptions, TenantId, TenantInfo, TenantRef, TenantResolverClient,
     TenantResolverError, TenantStatus,
 };
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::client_hub::ClientHub;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
 /// Build an allow-all `PolicyEnforcer` for tests.
 pub fn allow_all_enforcer() -> PolicyEnforcer {
@@ -71,11 +72,12 @@ struct MockAuthZResolverClient;
 
 /// Always returns `Allow` so tests that do not care about authorization pass by default.
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolverClient {
+impl AuthZResolverApi for MockAuthZResolverClient {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -90,11 +92,12 @@ impl AuthZResolverClient for MockAuthZResolverClient {
 pub struct DenyingAuthZResolverClient;
 
 #[async_trait]
-impl AuthZResolverClient for DenyingAuthZResolverClient {
+impl AuthZResolverApi for DenyingAuthZResolverClient {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -142,11 +145,12 @@ impl Default for CapturingAuthZResolverClient {
 }
 
 #[async_trait]
-impl AuthZResolverClient for CapturingAuthZResolverClient {
+impl AuthZResolverApi for CapturingAuthZResolverClient {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.requests.lock().unwrap().push(request);
         Ok(EvaluationResponse {
             decision: self.decision,
@@ -505,7 +509,7 @@ impl Default for TestCpBuilder {
 /// `ClientHub` (e.g., via `TestCpBuilder`).
 pub struct TestDpBuilder {
     request_timeout: Option<Duration>,
-    authz_client: Option<Arc<dyn AuthZResolverClient>>,
+    authz_client: Option<Arc<dyn AuthZResolverApi>>,
     backend_selector: Option<Arc<dyn EndpointSelector>>,
     max_body_size: Option<usize>,
     skip_upstream_tls_verify: bool,
@@ -540,7 +544,7 @@ impl TestDpBuilder {
 
     /// Override the AuthZ client (useful for authorization tests).
     #[must_use]
-    pub fn with_authz_client(mut self, client: Arc<dyn AuthZResolverClient>) -> Self {
+    pub fn with_authz_client(mut self, client: Arc<dyn AuthZResolverApi>) -> Self {
         self.authz_client = Some(client);
         self
     }

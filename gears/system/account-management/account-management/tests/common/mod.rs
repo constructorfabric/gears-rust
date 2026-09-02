@@ -92,8 +92,9 @@ use authz_resolver_sdk::constraints::{Constraint, InTenantSubtreePredicate, Pred
 use authz_resolver_sdk::models::{
     Capability, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
-use toolkit_security::{SecurityContext, pep_properties};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 
 /// Permissive PDP fake that emits a single
 /// [`InTenantSubtree`](toolkit_security::ScopeFilter::in_tenant_subtree)
@@ -105,11 +106,12 @@ use toolkit_security::{SecurityContext, pep_properties};
 struct PermitWithSubtreeResolver;
 
 #[async_trait]
-impl AuthZResolverClient for PermitWithSubtreeResolver {
+impl AuthZResolverApi for PermitWithSubtreeResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let root_str = request
             .subject
             .properties
@@ -170,7 +172,7 @@ impl AuthZResolverClient for PermitWithSubtreeResolver {
 /// granted one.
 #[must_use]
 pub fn mock_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(PermitWithSubtreeResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitWithSubtreeResolver);
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }
 
@@ -189,11 +191,12 @@ struct ActionAwareResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for ActionAwareResolver {
+impl AuthZResolverApi for ActionAwareResolver {
     async fn evaluate(
         &self,
+        ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         if !self.allowed.contains(&request.action.name) {
             return Ok(EvaluationResponse {
                 decision: false,
@@ -209,7 +212,7 @@ impl AuthZResolverClient for ActionAwareResolver {
                 },
             });
         }
-        PermitWithSubtreeResolver.evaluate(request).await
+        PermitWithSubtreeResolver.evaluate(ctx, request).await
     }
 }
 
@@ -218,7 +221,7 @@ impl AuthZResolverClient for ActionAwareResolver {
 /// independently required.
 #[must_use]
 pub fn enforcer_allowing(actions: &[&str]) -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(ActionAwareResolver {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(ActionAwareResolver {
         allowed: actions.iter().map(|a| (*a).to_owned()).collect(),
     });
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
@@ -1669,7 +1672,7 @@ pub mod pg {
 
     use anyhow::Result;
     use sea_orm::ConnectionTrait;
-    use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
+    use testcontainers::{ImageExt, runners::AsyncRunner};
     use testcontainers_modules::postgres::Postgres;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, connect_db};
@@ -1702,8 +1705,7 @@ pub mod pg {
     /// — a missing Docker daemon shows up as a clear container-start
     /// failure rather than a silent skip.
     pub async fn bring_up_postgres() -> Result<PgHarness> {
-        let postgres_image = Postgres::default();
-        let request = ContainerRequest::from(postgres_image)
+        let request = test_containers::postgres()
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_USER", "user")
             .with_env_var("POSTGRES_DB", "app");

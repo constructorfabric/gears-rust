@@ -12,32 +12,37 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use toolkit_gts::GTS_ID_PREFIX;
 use toolkit_gts::gts_id;
 
+use async_trait::async_trait;
 use serde_json::json;
 use uuid::Uuid;
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::{GroupService, QueryProfile};
+use resource_group::domain::metrics::{Operation, Outcome, RgMetricsPort};
+use resource_group::domain::repo::GroupRepositoryTrait;
 use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::gts_type::{
     Column as GtsTypeColumn, Entity as GtsTypeEntity,
 };
 use resource_group::infra::storage::entity::resource_group::{
-    Column as RgColumn, Entity as RgEntity,
+    Column as RgColumn, Entity as RgEntity, Model as RgModel,
 };
 use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::type_repo::TypeRepository;
+use resource_group_sdk::models::{ResourceGroup as ResourceGroupSdkModel, ResourceGroupWithDepth};
 use resource_group_sdk::{
     CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
-use toolkit_db::secure::{SecureEntityExt, secure_insert};
-use toolkit_odata::ODataQuery;
+use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
 
 /// Build a `GroupService` with custom `QueryProfile`.
@@ -64,7 +69,7 @@ fn make_group_service_with_profile(
 #[tokio::test]
 async fn group_create_child_with_closure() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -106,7 +111,7 @@ async fn group_create_child_with_closure() {
 #[tokio::test]
 async fn group_three_level_hierarchy_closure() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -160,7 +165,7 @@ async fn group_three_level_hierarchy_closure() {
 #[tokio::test]
 async fn group_create_incompatible_parent_type() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -177,13 +182,8 @@ async fn group_create_incompatible_parent_type() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: unrelated_type.code.clone(),
-                name: "Bad".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(unrelated_type.code.clone(), "Bad".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -199,7 +199,7 @@ async fn group_create_incompatible_parent_type() {
 #[tokio::test]
 async fn group_create_root_when_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -210,13 +210,7 @@ async fn group_create_root_when_cannot_be_root() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "Rootless".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "Rootless".to_owned()),
             tenant_id,
         )
         .await
@@ -239,13 +233,10 @@ async fn group_create_nonexistent_type() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: gts_id!("cf.core.rg.type.v1~x.test.nonexistent.type.v1~").to_owned(),
-                name: "Ghost".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(
+                gts_id!("cf.core.rg.type.v1~x.test.nonexistent.type.v1~").to_owned(),
+                "Ghost".to_owned(),
+            ),
             tenant_id,
         )
         .await
@@ -261,7 +252,7 @@ async fn group_create_nonexistent_type() {
 #[tokio::test]
 async fn group_create_cross_tenant_parent() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -280,20 +271,15 @@ async fn group_create_cross_tenant_parent() {
     let err = group_svc
         .create_group(
             &ctx_b,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "CrossTenant".to_owned(),
-                parent_id: Some(root_a.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "CrossTenant".to_owned())
+                .with_parent_id(Some(root_a.id)),
             tenant_b,
         )
         .await
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { ref message } if message.contains("must match parent tenant_id")),
+        matches!(err, DomainError::Validation { ref message } if message.contains("must match parent tenant")),
         "Expected Validation with tenant mismatch, got: {err:?}"
     );
 }
@@ -302,7 +288,7 @@ async fn group_create_cross_tenant_parent() {
 #[tokio::test]
 async fn group_create_with_metadata() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -313,13 +299,8 @@ async fn group_create_with_metadata() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "WithMeta".to_owned(),
-                parent_id: None,
-                metadata: Some(meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "WithMeta".to_owned())
+                .with_metadata(Some(meta.clone())),
             tenant_id,
         )
         .await
@@ -345,7 +326,7 @@ async fn group_create_with_metadata() {
 #[tokio::test]
 async fn group_multiple_roots_same_type() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -375,7 +356,7 @@ async fn group_multiple_roots_same_type() {
 #[tokio::test]
 async fn group_move_closure_rebuild() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -464,7 +445,7 @@ async fn create_self_parenting_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -474,7 +455,7 @@ async fn create_self_parenting_type(
         .await
         .expect("create self-parenting type");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -497,7 +478,7 @@ async fn create_self_parenting_type(
 #[tokio::test]
 async fn group_move_under_deep_parent_rebuilds_every_depth() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -564,7 +545,7 @@ async fn group_move_under_deep_parent_rebuilds_every_depth() {
 #[tokio::test]
 async fn group_move_to_parent_in_another_tenant_rejected() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let t = create_self_parenting_type(&type_svc, "xtenant").await;
@@ -612,7 +593,7 @@ async fn group_move_to_parent_in_another_tenant_rejected() {
 #[tokio::test]
 async fn group_update_parent_to_another_tenant_rejected() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let t = create_self_parenting_type(&type_svc, "xtenantupd").await;
@@ -660,7 +641,7 @@ async fn group_update_parent_to_another_tenant_rejected() {
 #[tokio::test]
 async fn group_move_under_descendant_cycle() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -696,7 +677,7 @@ async fn group_move_under_descendant_cycle() {
 #[tokio::test]
 async fn group_move_self_parent_cycle() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -720,7 +701,7 @@ async fn group_move_self_parent_cycle() {
 #[tokio::test]
 async fn group_move_incompatible_parent_type() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -761,7 +742,7 @@ async fn group_move_incompatible_parent_type() {
 #[tokio::test]
 async fn group_move_child_to_root() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -773,7 +754,7 @@ async fn group_move_child_to_root() {
         Uuid::now_v7().as_simple()
     );
     let _flexible_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![root_type.code.clone()],
@@ -807,7 +788,7 @@ async fn group_move_child_to_root() {
 #[tokio::test]
 async fn group_move_to_root_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -856,7 +837,7 @@ async fn group_move_nonexistent() {
 #[tokio::test]
 async fn group_move_to_nonexistent_parent() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -880,7 +861,7 @@ async fn group_move_to_nonexistent_parent() {
 #[tokio::test]
 async fn group_move_max_width_exceeded() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(1),
@@ -895,7 +876,7 @@ async fn group_move_max_width_exceeded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: child_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![root_type.code.clone()],
@@ -940,7 +921,7 @@ async fn group_move_max_width_exceeded() {
 #[tokio::test]
 async fn group_update_name_and_metadata() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1011,7 +992,7 @@ async fn group_update_name_and_metadata() {
 #[tokio::test]
 async fn group_delete_leaf() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1061,7 +1042,7 @@ async fn group_delete_leaf() {
 #[tokio::test]
 async fn group_delete_with_children_no_force() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1097,7 +1078,7 @@ async fn group_delete_with_children_no_force() {
 #[tokio::test]
 async fn group_delete_with_memberships_no_force() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1147,7 +1128,7 @@ async fn group_delete_with_memberships_no_force() {
 #[tokio::test]
 async fn group_force_delete_subtree() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1256,7 +1237,7 @@ async fn group_delete_nonexistent() {
 #[tokio::test]
 async fn group_force_delete_leaf() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1292,7 +1273,7 @@ async fn group_force_delete_leaf() {
 #[tokio::test]
 async fn group_hierarchy_depth_traversal() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1391,7 +1372,7 @@ async fn group_hierarchy_nonexistent() {
 #[tokio::test]
 async fn group_create_max_depth_exceeded() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let profile = QueryProfile {
         max_depth: Some(1), // only root allowed (depth 0), child at depth 1 is >= max
         max_width: None,
@@ -1409,13 +1390,8 @@ async fn group_create_max_depth_exceeded() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "TooDeep".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "TooDeep".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -1431,7 +1407,7 @@ async fn group_create_max_depth_exceeded() {
 #[tokio::test]
 async fn group_create_max_width_exceeded() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(1),
@@ -1461,13 +1437,8 @@ async fn group_create_max_width_exceeded() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "Child2".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "Child2".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -1483,7 +1454,7 @@ async fn group_create_max_width_exceeded() {
 #[tokio::test]
 async fn group_move_max_depth_exceeded() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     // max_depth=2: root(0), child(1) ok, but grandchild(2) would be >= max
     let profile = QueryProfile {
         max_depth: Some(2),
@@ -1502,7 +1473,7 @@ async fn group_move_max_depth_exceeded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: sub_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![child_type.code.clone()],
@@ -1534,7 +1505,7 @@ async fn group_move_max_depth_exceeded() {
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: subsub_code.clone(),
             can_be_root: false,
             allowed_parent_types: vec![sub_code.clone()],
@@ -1574,7 +1545,7 @@ async fn group_move_max_depth_exceeded() {
 #[tokio::test]
 async fn group_create_depth_exact_boundary() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     // max_depth=2: root is at depth 0, child at depth 1 (parent_depth=0, 0+1=1 < 2 ok)
     // grandchild at depth 2 (parent_depth=1, 1+1=2 >= 2 -> violation)
     let profile = QueryProfile {
@@ -1606,13 +1577,8 @@ async fn group_create_depth_exact_boundary() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: grandchild_type.code.clone(),
-                name: "Grandchild".to_owned(),
-                parent_id: Some(child.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(grandchild_type.code.clone(), "Grandchild".to_owned())
+                .with_parent_id(Some(child.id)),
             tenant_id,
         )
         .await
@@ -1628,7 +1594,7 @@ async fn group_create_depth_exact_boundary() {
 #[tokio::test]
 async fn group_create_width_exact_boundary() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(2),
@@ -1667,13 +1633,8 @@ async fn group_create_width_exact_boundary() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "Child3".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "Child3".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -1693,7 +1654,7 @@ async fn group_create_width_exact_boundary() {
 #[tokio::test]
 async fn group_create_name_empty() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1703,13 +1664,7 @@ async fn group_create_name_empty() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: String::new(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(root_type.code.clone(), String::new()),
             tenant_id,
         )
         .await
@@ -1725,7 +1680,7 @@ async fn group_create_name_empty() {
 #[tokio::test]
 async fn group_create_name_too_long() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1736,13 +1691,7 @@ async fn group_create_name_too_long() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: long_name,
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(root_type.code.clone(), long_name),
             tenant_id,
         )
         .await
@@ -1763,7 +1712,7 @@ async fn group_create_name_too_long() {
 #[tokio::test]
 async fn group_metadata_barrier_stored() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1774,13 +1723,8 @@ async fn group_metadata_barrier_stored() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "BarrierGroup".to_owned(),
-                parent_id: None,
-                metadata: Some(meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "BarrierGroup".to_owned())
+                .with_metadata(Some(meta.clone())),
             tenant_id,
         )
         .await
@@ -1807,7 +1751,7 @@ async fn group_metadata_barrier_stored() {
 #[tokio::test]
 async fn group_metadata_rich_multiple_fields() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1823,13 +1767,8 @@ async fn group_metadata_rich_multiple_fields() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "RichMeta".to_owned(),
-                parent_id: None,
-                metadata: Some(meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "RichMeta".to_owned())
+                .with_metadata(Some(meta.clone())),
             tenant_id,
         )
         .await
@@ -1843,7 +1782,7 @@ async fn group_metadata_rich_multiple_fields() {
 #[tokio::test]
 async fn group_metadata_update_replaces_entirely() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1854,13 +1793,8 @@ async fn group_metadata_update_replaces_entirely() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "ReplaceMe".to_owned(),
-                parent_id: None,
-                metadata: Some(old_meta),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "ReplaceMe".to_owned())
+                .with_metadata(Some(old_meta)),
             tenant_id,
         )
         .await
@@ -1903,7 +1837,7 @@ async fn group_metadata_update_replaces_entirely() {
 #[tokio::test]
 async fn group_metadata_none_to_some() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1913,13 +1847,7 @@ async fn group_metadata_none_to_some() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "NoMeta".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "NoMeta".to_owned()),
             tenant_id,
         )
         .await
@@ -1949,7 +1877,7 @@ async fn group_metadata_none_to_some() {
 #[tokio::test]
 async fn group_metadata_some_to_none() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1960,13 +1888,8 @@ async fn group_metadata_some_to_none() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "WithMeta".to_owned(),
-                parent_id: None,
-                metadata: Some(meta),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "WithMeta".to_owned())
+                .with_metadata(Some(meta)),
             tenant_id,
         )
         .await
@@ -1993,7 +1916,7 @@ async fn group_metadata_some_to_none() {
 #[tokio::test]
 async fn group_metadata_barrier_in_hierarchy() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2010,13 +1933,9 @@ async fn group_metadata_barrier_in_hierarchy() {
     let barrier = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "BarrierChild".to_owned(),
-                parent_id: Some(root.id),
-                metadata: Some(json!({"self_managed": true})),
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "BarrierChild".to_owned())
+                .with_parent_id(Some(root.id))
+                .with_metadata(Some(json!({"self_managed": true}))),
             tenant_id,
         )
         .await
@@ -2059,7 +1978,7 @@ async fn group_metadata_barrier_in_hierarchy() {
 #[tokio::test]
 async fn group_metadata_in_hierarchy_response() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2071,13 +1990,8 @@ async fn group_metadata_in_hierarchy_response() {
     let root = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "Root".to_owned(),
-                parent_id: None,
-                metadata: Some(root_meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "Root".to_owned())
+                .with_metadata(Some(root_meta.clone())),
             tenant_id,
         )
         .await
@@ -2087,13 +2001,9 @@ async fn group_metadata_in_hierarchy_response() {
     let child = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: child_type.code.clone(),
-                name: "Child".to_owned(),
-                parent_id: Some(root.id),
-                metadata: Some(child_meta.clone()),
-            },
+            CreateGroupRequest::new(child_type.code.clone(), "Child".to_owned())
+                .with_parent_id(Some(root.id))
+                .with_metadata(Some(child_meta.clone())),
             tenant_id,
         )
         .await
@@ -2143,7 +2053,7 @@ async fn create_adr_types(
 
     // Tenant type: create first without self-reference, then update
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: tenant_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2154,7 +2064,7 @@ async fn create_adr_types(
         .expect("create tenant type");
 
     let tenant_type = type_svc
-        .update_type(
+        .update_type_unscoped(
             &tenant_code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -2192,10 +2102,7 @@ async fn create_adr_types(
 #[tokio::test]
 async fn adr_full_hierarchy_reproduction() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -2268,10 +2175,7 @@ async fn adr_full_hierarchy_reproduction() {
 #[tokio::test]
 async fn adr_tenant_self_nesting() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2289,10 +2193,7 @@ async fn adr_tenant_self_nesting() {
 #[tokio::test]
 async fn adr_department_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2302,13 +2203,7 @@ async fn adr_department_cannot_be_root() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: dept_type.code.clone(),
-                name: "RootDept".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(dept_type.code.clone(), "RootDept".to_owned()),
             tenant_id,
         )
         .await
@@ -2324,10 +2219,7 @@ async fn adr_department_cannot_be_root() {
 #[tokio::test]
 async fn adr_branch_only_under_department() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2339,13 +2231,8 @@ async fn adr_branch_only_under_department() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: branch_type.code.clone(),
-                name: "BadBranch".to_owned(),
-                parent_id: Some(t1.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(branch_type.code.clone(), "BadBranch".to_owned())
+                .with_parent_id(Some(t1.id)),
             tenant_id,
         )
         .await
@@ -2364,10 +2251,7 @@ async fn adr_branch_only_under_department() {
 #[tokio::test]
 async fn adr_branch_allows_users_and_courses() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -2398,10 +2282,7 @@ async fn adr_branch_allows_users_and_courses() {
 #[tokio::test]
 async fn adr_tenant_rejects_course_membership() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -2429,10 +2310,7 @@ async fn adr_tenant_rejects_course_membership() {
 #[tokio::test]
 async fn adr_same_user_in_multiple_groups() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -2462,10 +2340,7 @@ async fn adr_same_user_in_multiple_groups() {
 #[tokio::test]
 async fn adr_same_resource_different_types() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -2501,10 +2376,7 @@ async fn adr_same_resource_different_types() {
 #[tokio::test]
 async fn security_group_metadata_sql_injection() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2520,13 +2392,8 @@ async fn security_group_metadata_sql_injection() {
     let group = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "SQLMetaGroup".to_owned(),
-                parent_id: None,
-                metadata: Some(evil_meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "SQLMetaGroup".to_owned())
+                .with_metadata(Some(evil_meta.clone())),
             tenant_id,
         )
         .await
@@ -2552,10 +2419,7 @@ async fn security_group_metadata_sql_injection() {
 #[tokio::test]
 async fn security_group_metadata_large_payload() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2570,13 +2434,8 @@ async fn security_group_metadata_large_payload() {
     let result = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "BigMetaGroup".to_owned(),
-                parent_id: None,
-                metadata: Some(big_meta.clone()),
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "BigMetaGroup".to_owned())
+                .with_metadata(Some(big_meta.clone())),
             tenant_id,
         )
         .await;
@@ -2628,7 +2487,7 @@ async fn create_tenant_type(
     // `allowed_parent_types = []` because self-references aren't allowed at
     // create time (the type is not yet in the registry). Suitable for testing
     // the uniqueness invariant at root level.
-    svc.create_type(resource_group_sdk::CreateTypeRequest {
+    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
         code: unique_tenant_type_code(),
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -2645,7 +2504,7 @@ async fn create_tenant_sub_type(
     svc: &TypeService<TypeRepository>,
     parent_type_code: &str,
 ) -> resource_group_sdk::models::ResourceGroupType {
-    svc.create_type(resource_group_sdk::CreateTypeRequest {
+    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
         code: unique_tenant_type_code(),
         can_be_root: true,
         allowed_parent_types: vec![parent_type_code.to_owned()],
@@ -2660,7 +2519,7 @@ async fn create_tenant_sub_type(
 #[tokio::test]
 async fn tenant_root_first_create_allowed() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2669,13 +2528,7 @@ async fn tenant_root_first_create_allowed() {
     let root = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: tenant_type.code.clone(),
-                name: "MainTenant".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(tenant_type.code.clone(), "MainTenant".to_owned()),
             tenant_id,
         )
         .await
@@ -2689,7 +2542,7 @@ async fn tenant_root_first_create_allowed() {
 #[tokio::test]
 async fn tenant_root_second_create_rejected() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2699,13 +2552,7 @@ async fn tenant_root_second_create_rejected() {
     group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: tenant_type.code.clone(),
-                name: "First".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(tenant_type.code.clone(), "First".to_owned()),
             tenant_id,
         )
         .await
@@ -2717,13 +2564,7 @@ async fn tenant_root_second_create_rejected() {
     let err = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: second_type.code.clone(),
-                name: "Second".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(second_type.code.clone(), "Second".to_owned()),
             Uuid::now_v7(),
         )
         .await
@@ -2738,7 +2579,7 @@ async fn tenant_root_second_create_rejected() {
 #[tokio::test]
 async fn non_tenant_root_alongside_tenant_root_allowed() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2748,13 +2589,7 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
     let tenant_root = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: tenant_type.code.clone(),
-                name: "MainTenant".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(tenant_type.code.clone(), "MainTenant".to_owned()),
             tenant_id,
         )
         .await
@@ -2766,13 +2601,7 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
     let workspace = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: workspace_type.code.clone(),
-                name: "Workspaces".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(workspace_type.code.clone(), "Workspaces".to_owned()),
             tenant_root.hierarchy.tenant_id,
         )
         .await
@@ -2785,7 +2614,7 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
 #[tokio::test]
 async fn tenant_root_update_to_second_root_rejected() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2795,13 +2624,7 @@ async fn tenant_root_update_to_second_root_rejected() {
     let root = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: root_type.code.clone(),
-                name: "Root".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(root_type.code.clone(), "Root".to_owned()),
             tenant_id,
         )
         .await
@@ -2812,13 +2635,8 @@ async fn tenant_root_update_to_second_root_rejected() {
     let child = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: sub_type.code.clone(),
-                name: "SubTenant".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            CreateGroupRequest::new(sub_type.code.clone(), "SubTenant".to_owned())
+                .with_parent_id(Some(root.id)),
             root.hierarchy.tenant_id,
         )
         .await
@@ -2852,7 +2670,7 @@ async fn tenant_root_update_to_second_root_rejected() {
 #[tokio::test]
 async fn tenant_root_self_update_allowed() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2861,13 +2679,7 @@ async fn tenant_root_self_update_allowed() {
     let root = group_svc
         .create_group(
             &ctx,
-            CreateGroupRequest {
-                id: None,
-                code: tenant_type.code.clone(),
-                name: "RootA".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            CreateGroupRequest::new(tenant_type.code.clone(), "RootA".to_owned()),
             tenant_id,
         )
         .await
@@ -2898,10 +2710,7 @@ async fn tenant_root_self_update_allowed() {
 #[tokio::test]
 async fn get_group_unscoped_returns_group_without_ctx() {
     let db = common::test_db().await;
-    let type_svc = resource_group::domain::type_service::TypeService::new(
-        db.clone(),
-        Arc::new(TypeRepository),
-    );
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2942,7 +2751,7 @@ async fn get_group_unscoped_missing_is_not_found() {
 #[tokio::test]
 async fn group_create_duplicate_id_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -2952,12 +2761,8 @@ async fn group_create_duplicate_id_is_already_exists() {
     let root_type = common::create_root_type(&type_svc, "dupid").await;
 
     let id = Uuid::now_v7();
-    let req = |name: &str| CreateGroupRequest {
-        id: Some(id),
-        code: root_type.code.clone(),
-        name: name.to_owned(),
-        parent_id: None,
-        metadata: None,
+    let req = |name: &str| {
+        CreateGroupRequest::new(root_type.code.clone(), name.to_owned()).with_id(Some(id))
     };
 
     group_svc
@@ -2994,7 +2799,7 @@ async fn group_create_duplicate_id_is_already_exists() {
 #[tokio::test]
 async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -3002,12 +2807,8 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     let root_type = common::create_root_type(&type_svc, "dupidsame").await;
 
     let id = Uuid::now_v7();
-    let req = |name: &str| CreateGroupRequest {
-        id: Some(id),
-        code: root_type.code.clone(),
-        name: name.to_owned(),
-        parent_id: None,
-        metadata: None,
+    let req = |name: &str| {
+        CreateGroupRequest::new(root_type.code.clone(), name.to_owned()).with_id(Some(id))
     };
 
     group_svc
@@ -3046,7 +2847,7 @@ fn filter_query(expr: &str) -> ODataQuery {
 #[tokio::test]
 async fn list_groups_filters_by_a_single_type() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -3074,7 +2875,7 @@ async fn list_groups_filters_by_either_of_two_types() {
     // `or` is a Composite node: the walk has to recurse into every child to
     // find the literals, and again to substitute them.
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -3107,7 +2908,7 @@ async fn list_groups_filters_by_negated_type() {
     // passes, and a miss there would silently drop the substitution and leave
     // a GTS path where the column wants a SMALLINT.
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -3163,7 +2964,7 @@ async fn list_groups_leaves_a_filter_without_a_type_alone() {
     // Nothing to resolve: the walk must pass the node through untouched
     // rather than rewriting or rejecting it.
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -3179,4 +2980,592 @@ async fn list_groups_leaves_a_filter_without_a_type_alone() {
 
     let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
     assert_eq!(ids, vec![a.id]);
+}
+
+// =========================================================================
+// `update_group` isolation-escalation race (uncovered lines 498-519, 1233)
+// =========================================================================
+
+/// A `GroupRepositoryTrait` decorator that delegates everything to the real
+/// [`GroupRepository`], except that the *first* call to `find_model_by_id`
+/// for one watched group also reparents that group in the database, as a
+/// side effect, before returning.
+///
+/// This stages the exact race `update_group`'s doc comment describes:
+/// `update_group` reads the group once, before opening its transaction, to
+/// guess whether the request changes the parent (cheap, pre-transaction
+/// isolation-level hint); this decorator lets a "concurrent" reparent land
+/// in the gap between that guess and the authoritative in-transaction
+/// re-read, without needing a second thread or a real concurrent client --
+/// SQLite's single pooled connection (`max_conns: 1`, see
+/// [`common::test_db`]) makes the side effect's write visible to every
+/// later read on the same connection, deterministically.
+///
+/// With `stale_unlocked_parent` set, it stages the *other* half of the same
+/// race, the one a single connection cannot produce on its own: the reparent
+/// lands on the first in-transaction read, and every **unlocked** model read
+/// then answers with the parent the group had *before* it -- what a
+/// READ COMMITTED transaction sees from its own snapshot while the writer
+/// commits beside it. Only the locked read (`FOR UPDATE`, which on
+/// PostgreSQL waits for that writer and re-reads) reports the new parent.
+/// A transaction that decides "no parent change" from the unlocked read
+/// then writes the old `parent_id` back over the committed move while the
+/// closure table keeps the move's ancestry.
+struct ParentFlippingGroupRepo {
+    inner: GroupRepository,
+    watched_group_id: Uuid,
+    new_parent_id: Uuid,
+    /// When set, unlocked model reads of the watched group report this
+    /// parent regardless of what the row now holds -- the stale snapshot
+    /// described above. `None` disables the simulation entirely.
+    stale_unlocked_parent: Option<Uuid>,
+    fired: AtomicBool,
+}
+
+impl ParentFlippingGroupRepo {
+    fn new(watched_group_id: Uuid, new_parent_id: Uuid) -> Self {
+        Self {
+            inner: GroupRepository,
+            watched_group_id,
+            new_parent_id,
+            stale_unlocked_parent: None,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    /// The stale-snapshot variant: the reparent fires on the first
+    /// in-transaction read, and unlocked model reads keep answering
+    /// `stale_parent_id` afterwards.
+    fn with_stale_unlocked_reads(
+        watched_group_id: Uuid,
+        new_parent_id: Uuid,
+        stale_parent_id: Uuid,
+    ) -> Self {
+        Self {
+            inner: GroupRepository,
+            watched_group_id,
+            new_parent_id,
+            stale_unlocked_parent: Some(stale_parent_id),
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    /// Perform the "concurrent" reparent once, on this connection.
+    async fn flip_once<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
+        if id != self.watched_group_id || self.fired.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(model) = self.inner.find_model_by_id(db, id).await? {
+            self.inner
+                .update(
+                    db,
+                    id,
+                    Some(self.new_parent_id),
+                    model.gts_type_id,
+                    &model.name,
+                    model.metadata.as_ref(),
+                )
+                .await?;
+            // A real move rewrites the closure table too -- and that is the
+            // half a lost update cannot put back. Without it this decorator
+            // would stage a race whose two halves cancel out.
+            self.inner
+                .rebuild_subtree_closure(db, id, Some(self.new_parent_id))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GroupRepositoryTrait for ParentFlippingGroupRepo {
+    async fn find_by_id<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<ResourceGroupSdkModel>, DomainError> {
+        // In the stale-snapshot variant the "concurrent" reparent lands
+        // here -- on the first read `update_group_inner` makes -- so that
+        // every later read in this transaction has to decide for itself
+        // whether it can see it.
+        if self.stale_unlocked_parent.is_some() {
+            self.flip_once(db, id).await?;
+        }
+        self.inner.find_by_id(db, scope, id).await
+    }
+
+    async fn find_model_by_id<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<RgModel>, DomainError> {
+        if let Some(stale_parent) = self.stale_unlocked_parent {
+            let mut result = self.inner.find_model_by_id(db, id).await?;
+            if id == self.watched_group_id
+                && let Some(model) = &mut result
+            {
+                model.parent_id = Some(stale_parent);
+            }
+            return Ok(result);
+        }
+        let result = self.inner.find_model_by_id(db, id).await?;
+        if id == self.watched_group_id
+            && !self.fired.swap(true, Ordering::SeqCst)
+            && let Some(model) = &result
+        {
+            // The "concurrent" write: reparent the watched group right now,
+            // on the same (pre-transaction) connection, using the model just
+            // read so name/metadata round-trip unchanged.
+            self.inner
+                .update(
+                    db,
+                    id,
+                    Some(self.new_parent_id),
+                    model.gts_type_id,
+                    &model.name,
+                    model.metadata.as_ref(),
+                )
+                .await?;
+        }
+        Ok(result)
+    }
+
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<RgModel>, DomainError> {
+        self.inner.find_model_by_id_for_update(db, id).await
+    }
+
+    async fn find_root_id_with_type_prefix<C: DBRunner>(
+        &self,
+        db: &C,
+        type_prefix: &str,
+    ) -> Result<Option<Uuid>, DomainError> {
+        self.inner
+            .find_root_id_with_type_prefix(db, type_prefix)
+            .await
+    }
+
+    async fn list_groups<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupSdkModel>, DomainError> {
+        self.inner.list_groups(db, scope, query).await
+    }
+
+    async fn get_descendants<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        self.inner.get_descendants(db, scope, group_id, query).await
+    }
+
+    async fn get_ancestors<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        self.inner.get_ancestors(db, scope, group_id, query).await
+    }
+
+    async fn insert<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+        parent_id: Option<Uuid>,
+        gts_type_id: i16,
+        name: &str,
+        metadata: Option<&serde_json::Value>,
+        tenant_id: Uuid,
+    ) -> Result<RgModel, DomainError> {
+        self.inner
+            .insert(db, id, parent_id, gts_type_id, name, metadata, tenant_id)
+            .await
+    }
+
+    async fn update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+        parent_id: Option<Uuid>,
+        gts_type_id: i16,
+        name: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<u64, DomainError> {
+        self.inner
+            .update(db, id, parent_id, gts_type_id, name, metadata)
+            .await
+    }
+
+    async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
+        self.inner.delete_by_id(db, id).await
+    }
+
+    async fn insert_closure_self_row<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.inner.insert_closure_self_row(db, group_id).await
+    }
+
+    async fn insert_ancestor_closure_rows<C: DBRunner>(
+        &self,
+        db: &C,
+        child_id: Uuid,
+        parent_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        self.inner
+            .insert_ancestor_closure_rows(db, child_id, parent_id)
+            .await
+    }
+
+    async fn delete_by_id_many<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        self.inner.delete_by_id_many(db, ids).await
+    }
+
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        self.inner.delete_memberships_many(db, group_ids).await
+    }
+
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        self.inner.delete_all_closure_rows_many(db, group_ids).await
+    }
+
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<Vec<(Uuid, i32)>, DomainError> {
+        self.inner.get_descendant_ids_with_depth(db, group_id).await
+    }
+
+    async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError> {
+        self.inner.get_depth(db, group_id).await
+    }
+
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError> {
+        self.inner.get_max_descendant_depth(db, group_id).await
+    }
+
+    async fn count_children<C: DBRunner>(
+        &self,
+        db: &C,
+        parent_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        self.inner.count_children(db, parent_id).await
+    }
+
+    async fn is_descendant<C: DBRunner>(
+        &self,
+        db: &C,
+        potential_ancestor: Uuid,
+        potential_descendant: Uuid,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .is_descendant(db, potential_ancestor, potential_descendant)
+            .await
+    }
+
+    async fn delete_ancestor_closure_rows<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+        keep_self: bool,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .delete_ancestor_closure_rows(db, group_id, keep_self)
+            .await
+    }
+
+    async fn delete_all_closure_rows<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.inner.delete_all_closure_rows(db, group_id).await
+    }
+
+    async fn rebuild_subtree_closure<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+        new_parent_id: Option<Uuid>,
+    ) -> Result<u64, DomainError> {
+        self.inner
+            .rebuild_subtree_closure(db, group_id, new_parent_id)
+            .await
+    }
+
+    async fn has_memberships<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        self.inner.has_memberships(db, group_id).await
+    }
+
+    async fn resolve_type_paths_batch<C: DBRunner>(
+        &self,
+        db: &C,
+        type_ids: &[i16],
+    ) -> Result<std::collections::HashMap<i16, String>, DomainError> {
+        self.inner.resolve_type_paths_batch(db, type_ids).await
+    }
+}
+
+/// Records only `isolation_escalation` calls; every other `RgMetricsPort`
+/// method is a no-op. Used to prove `update_group` closed the race by
+/// escalating exactly once, not by looping or silently accepting the stale
+/// hint.
+#[derive(Default)]
+struct EscalationRecorder {
+    isolation_escalations: AtomicU64,
+}
+
+impl RgMetricsPort for EscalationRecorder {
+    fn operation_duration(&self, _operation: Operation, _outcome: Outcome, _seconds: f64) {}
+    fn subtree_nodes(&self, _operation: Operation, _nodes: u64) {}
+    fn closure_rows_written(&self, _operation: Operation, _rows: u64) {}
+    fn isolation_escalation(&self, _operation: Operation) {
+        self.isolation_escalations.fetch_add(1, Ordering::SeqCst);
+    }
+    fn metadata_validation_duration(&self, _operation: Operation, _seconds: f64) {}
+}
+
+/// The lost-update half of the same race, and the one the pre-transaction
+/// hint cannot save the caller from: a rename opens at the backend default,
+/// a concurrent reparent commits while it is open, and the rename's own
+/// UPDATE assigns `parent_id` unconditionally with a predicate of `id`
+/// alone. If the in-transaction read is unlocked, it answers from a
+/// snapshot taken before that commit, `parent_changed` is false, and the
+/// UPDATE puts the old parent back -- while `rebuild_subtree_closure` has
+/// already written the move's ancestry into the closure table. The two
+/// disagree from then on, and nothing detects it: an UPDATE by primary key
+/// under READ COMMITTED never raises `40001`, and SSI pairs only
+/// transactions that are all `SERIALIZABLE`.
+///
+/// The locked read is what closes it. It waits for the in-flight move and
+/// returns the parent that move committed, so the escalation path this
+/// file's sibling test covers is reached at all.
+#[tokio::test]
+async fn group_rename_does_not_revert_a_concurrent_reparent() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let bootstrap_group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "lostupd").await;
+    let child_type =
+        common::create_child_type(&type_svc, "lostupdchild", &[&root_type.code], &[]).await;
+
+    let parent_a = common::create_root_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &root_type.code,
+        "ParentA",
+        tenant_id,
+    )
+    .await;
+    let parent_b = common::create_root_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &root_type.code,
+        "ParentB",
+        tenant_id,
+    )
+    .await;
+    let group = common::create_child_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &child_type.code,
+        parent_a.id,
+        "Original",
+        tenant_id,
+    )
+    .await;
+
+    // Unlocked reads keep reporting `parent_a` after the reparent commits;
+    // only the locked read sees `parent_b`.
+    let racing_repo = Arc::new(ParentFlippingGroupRepo::with_stale_unlocked_reads(
+        group.id,
+        parent_b.id,
+        parent_a.id,
+    ));
+    let group_svc = GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        common::make_enforcer(),
+        racing_repo,
+        Arc::new(TypeRepository),
+        common::make_types_registry(),
+    );
+
+    // A pure rename: the request carries the parent the group already had.
+    group_svc
+        .update_group(
+            &ctx,
+            group.id,
+            UpdateGroupRequest {
+                name: "Renamed".to_owned(),
+                parent_id: Some(parent_a.id),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("rename must succeed");
+
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let model = RgEntity::find()
+        .filter(RgColumn::Id.eq(group.id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("found");
+    assert_eq!(model.name, "Renamed");
+
+    // Whichever parent the row ends up with, the closure table must agree
+    // with it. A rename that reverted the committed move while the closure
+    // kept the move's ancestry is the corruption this guards.
+    common::assert_closure_matches_parent_links(&conn).await;
+}
+
+/// The race `update_group`'s module doc and the `UpdateGroupOutcome` doc
+/// describe: the pre-transaction hint says "no parent change" (a pure
+/// rename), so the transaction opens below `SERIALIZABLE`; a concurrent
+/// write reparents the group in the gap before the authoritative
+/// in-transaction read runs. That read must see the new parent, refuse to
+/// proceed below `SERIALIZABLE` (`NeedsSerializable`, without writing
+/// anything), and the caller must escalate and retry -- ending with the
+/// group back under its original parent (the request never asked to move
+/// it) and the new name applied.
+///
+/// Exercises the currently-uncovered `update_group` escalation branch
+/// (lines ~498-519) and `UpdateGroupOutcome::NeedsSerializable` (line
+/// ~1233), and -- via [`EscalationRecorder`] wired through `with_metrics`
+/// (line ~189) -- confirms the close is observable as exactly one
+/// `isolation_escalation(Operation::Update)` recording.
+#[tokio::test]
+async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let bootstrap_group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "escroot").await;
+    let child_type =
+        common::create_child_type(&type_svc, "escchild", &[&root_type.code], &[]).await;
+
+    let parent_a = common::create_root_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &root_type.code,
+        "ParentA",
+        tenant_id,
+    )
+    .await;
+    let parent_b = common::create_root_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &root_type.code,
+        "ParentB",
+        tenant_id,
+    )
+    .await;
+    let group = common::create_child_group(
+        &bootstrap_group_svc,
+        &ctx,
+        &child_type.code,
+        parent_a.id,
+        "Original",
+        tenant_id,
+    )
+    .await;
+
+    let recorder = Arc::new(EscalationRecorder::default());
+    let flipping_repo = Arc::new(ParentFlippingGroupRepo::new(group.id, parent_b.id));
+    let group_svc = GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        common::make_enforcer(),
+        flipping_repo,
+        Arc::new(TypeRepository),
+        common::make_types_registry(),
+    )
+    .with_metrics(recorder.clone());
+
+    // The request itself asks only to rename, keeping the parent it already
+    // has (`parent_a`) -- the pre-transaction hint will therefore say "no
+    // move", which is exactly the case the decorator's side effect races.
+    let updated = group_svc
+        .update_group(
+            &ctx,
+            group.id,
+            UpdateGroupRequest {
+                name: "Renamed".to_owned(),
+                parent_id: Some(parent_a.id),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("update must succeed after escalating to SERIALIZABLE");
+
+    assert_eq!(updated.name, "Renamed");
+    assert_eq!(
+        updated.hierarchy.parent_id,
+        Some(parent_a.id),
+        "the group must end up back under its original parent, not the \
+         concurrent write's target"
+    );
+    assert_eq!(
+        recorder.isolation_escalations.load(Ordering::SeqCst),
+        1,
+        "the race must be resolved by exactly one escalation to SERIALIZABLE"
+    );
+
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let model = RgEntity::find()
+        .filter(RgColumn::Id.eq(group.id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("found");
+    assert_eq!(model.parent_id, Some(parent_a.id));
+    assert_eq!(model.name, "Renamed");
+
+    common::assert_closure_matches_parent_links(&conn).await;
 }

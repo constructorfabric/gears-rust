@@ -6,7 +6,7 @@ use opentelemetry::trace::TraceContextExt as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use authz_resolver_sdk::pep::ResourceType;
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use toolkit_db::DBProvider;
 use toolkit_macros::domain_model;
 
@@ -191,7 +191,7 @@ impl<
     pub(crate) fn new(
         repos: &Repositories<TR, MR, QR, RR, CR, TSR, AR, VSR, MAR>,
         db: Arc<DbProvider>,
-        authz: Arc<dyn AuthZResolverClient>,
+        authz: Arc<dyn AuthZResolverApi>,
         model_resolver: &Arc<dyn ModelResolver>,
         provider_resolver: &Arc<ProviderResolver>,
         streaming_config: StreamingConfig,

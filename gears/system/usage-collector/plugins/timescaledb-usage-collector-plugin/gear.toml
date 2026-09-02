@@ -1,0 +1,7 @@
+[gear]
+name = "TimescaleDB Usage Collector Plugin"
+description = "TimescaleDB time-series storage backend plugin for production usage collection."
+category = "core-functionality"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

@@ -1,4 +1,3 @@
-// Created: 2026-06-10 by Constructor Tech
 // @cpt-dod:cpt-cf-clst-dod-smoke-tests-stubs:p1
 //! Minimal in-process stub backends for the cluster SDK contract smoke tests
 //! (`cpt-cf-clst-dod-smoke-tests-stubs`, `cpt-cf-clst-algo-smoke-tests-stub-model`).
@@ -35,8 +34,15 @@ use cluster_sdk::cache::{
     CacheWatchSender, ClusterCacheBackend, PutRequest, Ttl,
 };
 use cluster_sdk::error::ClusterError;
+use cluster_sdk::leader::LeaderElectionBackend;
+use cluster_sdk::lock::DistributedLockBackend;
 use cluster_sdk::profile::ClusterProfile;
+use cluster_sdk::{
+    CacheDescriptor, ClusterClient, LeaderElectionDescriptor, LockDescriptor, ProfileDescriptor,
+    ProfileHealth, WireLeaderElectionFeatures, WireLockFeatures,
+};
 use tokio::time::Instant;
+use toolkit::client_hub::ClientHub;
 
 /// The typed profile every smoke test binds its backends under. A single shared
 /// profile keeps the register/resolve round-trip uniform across the suite.
@@ -418,5 +424,84 @@ impl ClusterCacheBackend for MemCacheBackend {
             .filter(|(key, stored)| key.starts_with(prefix) && !stored.is_expired(now))
             .map(|(key, _)| key.clone())
             .collect())
+    }
+}
+
+/// A [`ClusterClient`] over one hand-supplied cache backend, bound to
+/// [`SmokeProfile`].
+///
+/// Since item `K4` a facade resolves through the process's single
+/// `dyn ClusterClient` rather than through a per-profile hub registration
+/// (DESIGN.md), so a smoke test that wants a resolvable
+/// profile registers one of these. It is the same shape the gear's
+/// `LocalClusterClient` has, over a fixture instead of a profile registry.
+pub struct SmokeClusterClient {
+    cache: Arc<dyn ClusterCacheBackend>,
+}
+
+impl SmokeClusterClient {
+    /// Registers a client binding `cache` to [`SmokeProfile`] in `hub`.
+    pub fn register(hub: &ClientHub, cache: Arc<dyn ClusterCacheBackend>) {
+        hub.register::<dyn ClusterClient>(Arc::new(Self { cache }));
+    }
+
+    fn not_bound() -> ClusterError {
+        ClusterError::ProfileNotBound {
+            profile: SmokeProfile::NAME,
+        }
+    }
+}
+
+#[async_trait]
+impl ClusterClient for SmokeClusterClient {
+    fn cache_backend(&self, profile: &str) -> Result<Arc<dyn ClusterCacheBackend>, ClusterError> {
+        if profile == SmokeProfile::NAME {
+            return Ok(Arc::clone(&self.cache));
+        }
+        Err(Self::not_bound())
+    }
+
+    fn lock_backend(
+        &self,
+        _profile: &str,
+    ) -> Result<Arc<dyn DistributedLockBackend>, ClusterError> {
+        Err(Self::not_bound())
+    }
+
+    fn leader_election_backend(
+        &self,
+        _profile: &str,
+    ) -> Result<Arc<dyn LeaderElectionBackend>, ClusterError> {
+        Err(Self::not_bound())
+    }
+
+    /// Derived from the bound backend, exactly as the gear's wiring derives a
+    /// profile's descriptor from the real ones - so a capability declared here is
+    /// one the fixture actually has.
+    async fn descriptor(&self, profile: &str) -> Result<ProfileDescriptor, ClusterError> {
+        if profile != SmokeProfile::NAME {
+            return Err(Self::not_bound());
+        }
+        Ok(ProfileDescriptor {
+            name: profile.to_owned(),
+            cache: CacheDescriptor {
+                consistency: self.cache.consistency().into(),
+                features: self.cache.features().into(),
+                provider: self.cache.provider_name().to_owned(),
+            },
+            lock: LockDescriptor {
+                features: WireLockFeatures {
+                    linearizable: false,
+                },
+                provider: self.cache.provider_name().to_owned(),
+            },
+            leader_election: LeaderElectionDescriptor {
+                features: WireLeaderElectionFeatures {
+                    linearizable: false,
+                },
+                provider: self.cache.provider_name().to_owned(),
+            },
+            health: ProfileHealth::Serving,
+        })
     }
 }

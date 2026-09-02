@@ -1,0 +1,7 @@
+[gear]
+name = "Events Broker"
+description = "Durable event streaming with typed topics, pluggable storage, and consumer groups."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

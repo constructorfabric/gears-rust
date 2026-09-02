@@ -23,7 +23,7 @@ use crate::grpc_contract_parse::{GrpcContractModel, GrpcIdempotency, GrpcMethodM
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
     is_platform_security_context_type, is_security_context_type, render_method_inputs,
-    render_method_return_ty, rewrite_streaming_signature, strip_method_attrs,
+    render_method_return_ty, rewrite_streaming_signature, strip_method_attrs, strip_param_attrs,
 };
 use crate::support::contract_support_path;
 
@@ -213,6 +213,11 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
     for trait_item in &mut item.items {
         if let TraitItem::Fn(method) = trait_item {
             strip_method_attrs(method, GRPC_ATTRS);
+            // `#[secctx]` is consumed by this macro; without stripping it the
+            // attribute reaches the compiler unresolved. The cluster contract
+            // needs the explicit form, since the `ctx:`-name heuristic does not
+            // match `PlatformSecurityContext`.
+            strip_param_attrs(method);
             if let Some(model_method) = model_methods.get(&method.sig.ident.to_string()) {
                 if model_method.server_streaming {
                     let (ok, err) = &model_method.result_types;
@@ -395,6 +400,61 @@ fn generate_client_impl(model: &GrpcContractModel, support: &TokenStream) -> Tok
     }
 }
 
+/// The prost type of a method's request message, computed the way
+/// `toolkit-contract-protogen` computes it rather than guessed.
+///
+/// protogen has two cases, and only the second yields `<Method>Request`:
+///
+/// - **exactly one wire parameter of a named (non-primitive) type** — the message
+///   *is* that type, reused. `put_if_absent(req: PutRequest)` therefore has input
+///   `PutRequest`, and `renew(req: LeaseRef)` has input `LeaseRef`;
+/// - **anything else** — protogen synthesizes `<UpperCamelCase(method)>Request`
+///   from the wire fields, which is the case a single primitive parameter or a
+///   multi-parameter method falls into.
+///
+/// Assuming the second case unconditionally happens to work only while every
+/// contract in the tree names its DTO after its method. The moment two methods
+/// share a request DTO — the shape the cluster design specifies, where
+/// `put`/`put_if_absent` share `PutRequest` and `renew`/`release` share `LeaseRef`
+/// — the macro refers to a prost type protogen never emitted.
+///
+/// The two must agree by construction, not by naming discipline: they are two
+/// halves of one pipeline, and a mismatch is a compile error in generated code
+/// pointing at the macro invocation rather than at the cause.
+fn proto_request_ident(method: &GrpcMethodModel) -> syn::Ident {
+    let wire_params: Vec<&GrpcParam> = method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
+        .collect();
+
+    if let [param] = wire_params.as_slice()
+        && !is_proto_direct_primitive(&param.ty)
+        && let Some(named) = named_type_ident(&param.ty)
+    {
+        return named;
+    }
+
+    format_ident!("{}Request", method.ident.to_string().to_upper_camel_case())
+}
+
+/// The last path segment of a type, when it is a plain path that protogen would
+/// render as `TypeRef::Named` — so not a container, whose element type protogen
+/// projects as `repeated` / `optional` rather than as a message of its own.
+fn named_type_ident(ty: &Type) -> Option<syn::Ident> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let last = path.path.segments.last()?;
+    if matches!(
+        last.ident.to_string().as_str(),
+        "Option" | "Vec" | "HashMap" | "BTreeMap"
+    ) {
+        return None;
+    }
+    Some(last.ident.clone())
+}
+
 fn generate_client_method(
     method: &GrpcMethodModel,
     model: &GrpcContractModel,
@@ -402,13 +462,11 @@ fn generate_client_method(
 ) -> TokenStream {
     let rpc_method_ident = format_ident!("{}", method.rpc_name.to_snake_case());
     let stubs = &model.stubs_module;
-    // Mirror `toolkit-contract-protogen`'s naming convention: the proto
-    // request type is `<UpperCamelCase(method.name)>Request`. Used to
-    // anchor type inference through the `Arc<T>` template in retryable
-    // bodies (where the chain `From → Arc::new → Arc::clone → deref →
-    // Request::new` would otherwise leave T ambiguous).
-    let request_ty_ident =
-        format_ident!("{}Request", method.ident.to_string().to_upper_camel_case());
+    // Computed to agree with protogen rather than guessed — see
+    // `proto_request_ident`. Also anchors type inference through the `Arc<T>`
+    // template in retryable bodies (where the chain `From → Arc::new →
+    // Arc::clone → deref → Request::new` would otherwise leave T ambiguous).
+    let request_ty_ident = proto_request_ident(method);
     let proto_request_ty = quote! { #stubs::#request_ty_ident };
 
     let sig_inputs = render_method_inputs(method.params.iter().map(|p| (&p.ident, &p.ty)));
@@ -562,9 +620,10 @@ fn generate_one_shot_unary_method(
                     .#rpc_method_ident(__request)
                     .await
                     .map_err(|__s| #support::grpc::map_tonic_status(&__s))?;
-                // Fallible conversion: the infallible `From<Proto>` panics on a
-                // malformed `via_string` field, which would let a peer take this
-                // process down with one bad response.
+                // Fallible conversion: a `via_string`-bearing response type has no
+                // infallible `From<Proto>` (a malformed field would otherwise let a
+                // peer take this process down with one bad response), so decode
+                // through the fallible path.
                 let __decoded = <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
                     __response.into_inner(),
                 )

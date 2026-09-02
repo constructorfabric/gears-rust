@@ -1018,11 +1018,12 @@ fn enforcer_denied_maps_to_access_denied() {
 // TC-ERR-02: EnforcerError::EvaluationFailed -> DomainError::AccessDenied
 #[test]
 fn enforcer_evaluation_failed_maps_to_access_denied() {
-    use authz_resolver_sdk::AuthZResolverError;
     use authz_resolver_sdk::pep::EnforcerError;
 
-    let err: DomainError =
-        EnforcerError::EvaluationFailed(AuthZResolverError::NoPluginAvailable).into();
+    let err: DomainError = EnforcerError::EvaluationFailed(
+        CanonicalError::internal("no authz plugin available").create(),
+    )
+    .into();
     assert!(
         matches!(err, DomainError::InternalError),
         "Expected InternalError, got: {err:?}"

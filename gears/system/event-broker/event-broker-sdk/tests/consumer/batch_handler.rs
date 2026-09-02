@@ -10,7 +10,7 @@ use event_broker_sdk::{
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.batch.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.batch.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.batch.v1~";
 
 type RecordedBatch = (u32, Vec<i64>);
 type RecordedBatches = Arc<Mutex<Vec<RecordedBatch>>>;
@@ -61,7 +61,6 @@ async fn if_i_want_native_batches_they_stay_inside_one_partition() {
         publish_json(
             &fixture.broker,
             &fixture.ctx,
-            TOPIC,
             EVENT_TYPE,
             &format!("batch-{partition}"),
             Some(partition),

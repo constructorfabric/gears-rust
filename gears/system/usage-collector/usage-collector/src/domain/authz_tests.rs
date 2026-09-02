@@ -76,7 +76,7 @@ fn record_with_tenant(tenant_id: Uuid) -> UsageRecord {
 async fn captured_requests_for(record: &UsageRecord) -> (serde_json::Value, serde_json::Value) {
     let resolver = CapturingTenantPermitResolver::new();
     let enforcer =
-        enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
+        enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverApi>);
 
     authorize_usage_record(
         &enforcer,
@@ -192,7 +192,7 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
 
     let resolver = CapturingTenantPermitResolver::new();
     let enforcer =
-        enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
+        enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverApi>);
 
     authorize_usage_record(
         &enforcer,
@@ -265,7 +265,7 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
     // request) — models a `/tenants/{granted}`-scoped caller.
     let resolver =
         CountingPermitResolver::new(pep_properties::OWNER_TENANT_ID, granted.to_string());
-    let enforcer = enforcer_for(resolver as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
+    let enforcer = enforcer_for(resolver as Arc<dyn authz_resolver_sdk::AuthZResolverApi>);
 
     let foreign_key = AttributionTupleKey::from_record(
         &record_with_tenant(foreign),

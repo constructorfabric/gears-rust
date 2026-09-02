@@ -11,14 +11,17 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext};
 
 use super::IntoPropertyValue;
 use uuid::Uuid;
 
-use crate::api::AuthZResolverClient;
-use crate::error::AuthZResolverError;
+use toolkit::client_hub::ClientHub;
+use toolkit_canonical_errors::CanonicalError;
+
+use crate::api::AuthZResolverApi;
 use crate::models::{
     Action, BarrierMode, Capability, EvaluationRequest, EvaluationRequestContext, Resource,
     Subject, TenantContext, TenantMode,
@@ -35,9 +38,9 @@ pub enum EnforcerError {
         deny_reason: Option<crate::models::DenyReason>,
     },
 
-    /// The `AuthZ` evaluation RPC failed.
+    /// The `AuthZ` evaluation RPC failed (transport/infrastructure error).
     #[error("authorization evaluation failed: {0}")]
-    EvaluationFailed(#[from] AuthZResolverError),
+    EvaluationFailed(#[from] CanonicalError),
 
     /// Constraint compilation failed (missing or unsupported constraints).
     #[error("constraint compilation failed: {0}")]
@@ -242,18 +245,74 @@ impl ResourceType {
 /// let scope = enforcer.access_scope(&ctx, &USER, "get", Some(id)).await?;
 /// let scope = enforcer.access_scope(&ctx, &USER, "create", None).await?;
 /// ```
+/// Default PEP-side deadline for a single PDP `evaluate` call.
+///
+/// `evaluate` sits on the request-gating hot path and, out-of-process, is a
+/// network round-trip. This bounds it independently of the generic REST client
+/// default so a hung/unresponsive `authz-resolver` cannot stall consumers
+/// indefinitely. The default is intentionally generous — it is a hang guard,
+/// not a latency SLO; set a tighter value on latency-sensitive gating paths
+/// with [`PolicyEnforcer::with_deadline`].
+pub const DEFAULT_EVAL_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct PolicyEnforcer {
-    authz: Arc<dyn AuthZResolverClient>,
+    authz: AuthzSource,
     capabilities: Vec<Capability>,
+    deadline: Duration,
+}
+
+/// How the enforcer obtains its `AuthZResolverApi` client.
+///
+/// - `Eager` — a concrete client supplied up front (in-process, tests).
+/// - `Lazy` — resolved from the `ClientHub` at call time. This is what makes a
+///   PEP work out-of-process: the consumed client (registered by the runtime's
+///   proxy-wiring phase, which runs *after* gear `init`) is not available when
+///   the gear builds its services, but it *is* available by the time a request
+///   is served.
+#[derive(Clone)]
+enum AuthzSource {
+    Eager(Arc<dyn AuthZResolverApi>),
+    Lazy(Arc<ClientHub>),
 }
 
 impl PolicyEnforcer {
-    /// Create a new enforcer.
-    pub fn new(authz: Arc<dyn AuthZResolverClient>) -> Self {
+    /// Create a new enforcer from a concrete client (in-process / tests).
+    pub fn new(authz: Arc<dyn AuthZResolverApi>) -> Self {
         Self {
-            authz,
+            authz: AuthzSource::Eager(authz),
             capabilities: Vec::new(),
+            deadline: DEFAULT_EVAL_DEADLINE,
+        }
+    }
+
+    /// Create an enforcer that resolves its `AuthZResolverApi` client lazily
+    /// from the `ClientHub` on each call.
+    ///
+    /// Use this in gears that consume the contract via
+    /// `#[toolkit::consumes(contract = AuthZResolverApi, from = "authz-resolver")]`:
+    /// the client is wired by the proxy-wiring phase after `init`, so eager
+    /// resolution in `init` would fail. Works transparently in-process too (the
+    /// local provider registers the same `dyn AuthZResolverApi`).
+    #[must_use]
+    pub fn from_hub(hub: Arc<ClientHub>) -> Self {
+        Self {
+            authz: AuthzSource::Lazy(hub),
+            capabilities: Vec::new(),
+            deadline: DEFAULT_EVAL_DEADLINE,
+        }
+    }
+
+    /// Resolve the concrete client, either directly (eager) or from the hub
+    /// (lazy). Returns a transport-level `CanonicalError` if a lazily-consumed
+    /// client is not yet registered.
+    fn resolve_authz(&self) -> Result<Arc<dyn AuthZResolverApi>, CanonicalError> {
+        match &self.authz {
+            AuthzSource::Eager(authz) => Ok(Arc::clone(authz)),
+            AuthzSource::Lazy(hub) => hub.get::<dyn AuthZResolverApi>().map_err(|e| {
+                CanonicalError::internal(format!("authz-resolver client not available: {e}"))
+                    .create()
+            }),
         }
     }
 
@@ -261,6 +320,15 @@ impl PolicyEnforcer {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Override the per-call PDP `evaluate` deadline (default:
+    /// [`DEFAULT_EVAL_DEADLINE`]). Use a tighter value on latency-sensitive
+    /// gating paths so a degraded PDP cannot stall request handling.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
         self
     }
 
@@ -391,7 +459,34 @@ impl PolicyEnforcer {
         let require = request.require_constraints.unwrap_or(true);
         let eval_request =
             self.build_request_with(ctx, resource, action, resource_id, require, request);
-        let response = self.authz.evaluate(eval_request).await?;
+        let authz = self.resolve_authz()?;
+        // `evaluate` is a platform-plane method: the transport attaches this
+        // gear's service-identity credential below the contract layer to
+        // authenticate the calling workload. The PEP holds no real
+        // `PlatformSecurityContext` (it is a tenant-plane actor), so it passes a
+        // credential-free plane marker; the caller identity (`ctx`) is conveyed
+        // to the PDP as `req.subject`, built above (`cpt-cf-adr-two-plane-auth`).
+        // Bound the PDP call: `evaluate` gates every request and is a network
+        // round-trip out-of-process, so a slow/unresponsive PDP must fail fast
+        // (retryable) rather than cascade into blocked consumers.
+        let response = match tokio::time::timeout(
+            self.deadline,
+            authz.evaluate(PlatformSecurityContext::outbound_marker(), eval_request),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(EnforcerError::EvaluationFailed(
+                    CanonicalError::service_unavailable()
+                        .with_detail(format!(
+                            "authz-resolver did not respond within {:?}",
+                            self.deadline
+                        ))
+                        .create(),
+                ));
+            }
+        };
 
         // Check decision first: if denied, return error immediately
         // without attempting constraint compilation.

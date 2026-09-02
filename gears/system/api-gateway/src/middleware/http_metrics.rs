@@ -21,6 +21,16 @@ use opentelemetry::{
     metrics::{Histogram, UpDownCounter},
 };
 
+/// [OTel semconv recommended boundaries][semconv] (seconds) for
+/// `http.server.request.duration`. Set explicitly because the SDK defaults
+/// are millisecond-scale and collapse seconds-valued observations into a
+/// single bucket, making percentiles meaningless.
+///
+/// [semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverrequestduration
+const DURATION_BOUNDARIES_SECS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
 /// Holds the two OpenTelemetry instruments for HTTP server metrics.
 pub struct HttpMetrics {
     duration: Histogram<f64>,
@@ -56,6 +66,7 @@ impl HttpMetrics {
             .f64_histogram(duration_name)
             .with_description("Duration of HTTP server requests")
             .with_unit("s")
+            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
 
         let active_requests = meter

@@ -13,17 +13,18 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, PolicyEnforcer,
+    AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    PolicyEnforcer,
     constraints::{Constraint, InPredicate, Predicate},
     models::DenyReason,
 };
 use sea_orm_migration::MigratorTrait;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::test_support::QueryRecorder;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::domain::membership_service::MembershipService;
@@ -38,7 +39,14 @@ use resource_group_sdk::{
 
 // -- Stub TypesRegistryClient (returns NotFound for all types — metadata validation skipped) --
 
-struct StubTypesRegistry;
+#[derive(Default)]
+struct StubTypesRegistry {
+    /// When set, `get_type_schema` answers with an `Internal` error instead
+    /// of `NotFound`. `NotFound` makes `validate_metadata_via_gts` skip
+    /// validation; any other error makes it *fail*, which is what a test
+    /// about the order between the scope check and metadata validation needs.
+    type_schema_unavailable: bool,
+}
 
 #[async_trait]
 impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
@@ -62,6 +70,11 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
         &self,
         type_id: &str,
     ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
+        if self.type_schema_unavailable {
+            return Err(types_registry_sdk::testing::internal(format!(
+                "types registry unavailable for {type_id}"
+            )));
+        }
         Err(types_registry_sdk::testing::not_found(type_id))
     }
 
@@ -178,7 +191,16 @@ impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
 
 /// Build stub `TypesRegistryClient` for tests.
 pub fn make_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    Arc::new(StubTypesRegistry)
+    Arc::new(StubTypesRegistry::default())
+}
+
+/// A registry whose schema lookups fail with `Internal`, so metadata
+/// validation returns an error instead of skipping it.
+#[must_use]
+pub fn make_unavailable_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+    Arc::new(StubTypesRegistry {
+        type_schema_unavailable: true,
+    })
 }
 
 // -- AllowAll AuthZ mock --
@@ -186,11 +208,12 @@ pub fn make_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient>
 struct AllowAllAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAllAuthZ {
+impl AuthZResolverApi for AllowAllAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -223,11 +246,12 @@ impl AuthZResolverClient for AllowAllAuthZ {
 struct DenyAllAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllAuthZ {
+impl AuthZResolverApi for DenyAllAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -279,7 +303,7 @@ pub fn make_ctx(tenant_id: Uuid) -> SecurityContext {
 
 /// Build an allow-all `PolicyEnforcer` with tenant scoping.
 pub fn make_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(AllowAllAuthZ);
     PolicyEnforcer::new(authz)
 }
 
@@ -300,7 +324,7 @@ pub async fn create_root_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -328,7 +352,7 @@ pub async fn create_child_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
@@ -351,13 +375,7 @@ pub async fn create_root_group(
 ) -> ResourceGroupModel {
     svc.create_group(
         ctx,
-        CreateGroupRequest {
-            id: None,
-            code: type_code.to_owned(),
-            name: name.to_owned(),
-            parent_id: None,
-            metadata: None,
-        },
+        CreateGroupRequest::new(type_code.to_owned(), name.to_owned()),
         tenant_id,
     )
     .await
@@ -375,13 +393,8 @@ pub async fn create_child_group(
 ) -> ResourceGroupModel {
     svc.create_group(
         ctx,
-        CreateGroupRequest {
-            id: None,
-            code: type_code.to_owned(),
-            name: name.to_owned(),
-            parent_id: Some(parent_id),
-            metadata: None,
-        },
+        CreateGroupRequest::new(type_code.to_owned(), name.to_owned())
+            .with_parent_id(Some(parent_id)),
         tenant_id,
     )
     .await
@@ -555,7 +568,20 @@ pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
 
 /// Build a `TypeService` from a DB provider.
 pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
-    TypeService::new(db, Arc::new(TypeRepository))
+    TypeService::new(db, make_enforcer(), Arc::new(TypeRepository))
+}
+
+/// Build a `TypeService` wired with the deny-all enforcer. Scoped operations
+/// (`create_type` / `get_type` / `update_type`) would be rejected; an
+/// unscoped call that still succeeds proves it never consulted `PolicyEnforcer`
+/// -- used to pin the `ResourceGroupTypeBootstrap` bypass (see
+/// [`make_group_service_deny`] for the same pattern on the group side).
+pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(
+        db,
+        PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
+        Arc::new(TypeRepository),
+    )
 }
 
 /// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,

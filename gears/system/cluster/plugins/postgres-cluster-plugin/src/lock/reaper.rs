@@ -7,11 +7,10 @@
 //! ## It is garbage collection, not exclusion
 //!
 //! Nothing here is correctness-critical for mutual exclusion, and that is the
-//! single biggest change from the advisory-lock design. Acquire already treats an
-//! expired or unvouched row as free and takes it in the same statement
-//! (`lock`'s module doc), so a sweep that never runs costs table growth and
-//! slower waiter wake-ups — never a double-hold, and never a name wedged
-//! fleet-wide.
+//! single biggest change from the advisory-lock design. Acquire already treats a
+//! lapsed row as free and takes it in the same statement (`lock`'s module doc), so a
+//! sweep that never runs costs table growth and slower waiter wake-ups — never a
+//! double-hold, and never a name wedged fleet-wide.
 //!
 //! Which also means it no longer matters *who* runs it. Every instance sweeps the
 //! same shared table, and whoever wins the `DELETE` frees the name for everyone,
@@ -20,27 +19,18 @@
 //! reclaim, the `cluster_lock_released` NOTIFY back to the owner, and the
 //! `audit_held` backstop — have nothing left to reconcile.
 //!
-//! One liveness responsibility does remain: [`sweep_orphans`] runs on this wake
-//! loop, and an orphaned row wedges its name until TTL if the loop stalls. So
-//! "nothing depends on the reaper" is true of safety and false of liveness.
-//!
-//! ## Orphaned rows
-//!
-//! [`sweep_orphans`] handles the one inconsistency the table cannot resolve on
-//! its own: a row this instance wrote that no live guard here accounts for. That
-//! is what a `try_acquire` cancelled between its committed INSERT and its
-//! `local_holders` registration leaves behind — routine rather than exotic, since
-//! `lock()` wraps every attempt in a timeout.
-//!
-//! Its severity is worth stating plainly: the row is unexpired *and* vouched for
-//! by a live beacon, so **nothing in the fleet will steal it** — including this
-//! instance, whose own next acquire of that name reads its own orphan as a live
-//! holder. The name is wedged for both sides until the TTL.
-//!
-//! Detection is exact rather than heuristic. The beacon key is fresh per
-//! incarnation, so every row bearing it was written by this process, in this
-//! incarnation; any such row whose `holder_id` is not in `local_holders` is an
-//! orphan. No `pg_locks` read, no key-by-key reconciliation, one indexed DELETE.
+//! **Nothing depends on this task for liveness either, now.** An earlier revision
+//! ran an incarnation-keyed *orphan* sweep on this wake loop, which was the one
+//! liveness responsibility here: it reclaimed a row this instance wrote that no live
+//! local guard accounted for — what an acquisition cancelled between its committed
+//! INSERT and its registration leaves behind — because such a row was unexpired *and*
+//! vouched for by a live beacon and so could be stolen by nobody, including its own
+//! writer. Both halves of that went with the beacon (`lock`'s module doc): there is
+//! no incarnation key to filter on, and no local registry to exempt. An abandoned
+//! row is now simply a lapsed lease at its deadline, reclaimed by the TTL sweep
+//! below like any other, so its name is taken until its TTL rather than until the
+//! next interval wake. That is the residual cost of uniform expiry, recorded in
+//! ADR-012 rather than hidden here.
 //!
 //! ## Wake schedule
 //!
@@ -108,43 +98,38 @@ use std::time::Duration;
 use cluster_sdk::observability::fields::label;
 use cluster_sdk::observability::{self, ResourceId};
 use cluster_sdk::{ClusterError, ClusterMetrics};
-use dashmap::DashMap;
 use opentelemetry::metrics::{Gauge, Histogram, Meter};
 use opentelemetry::{InstrumentationScope, KeyValue, global};
 use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
-use sqlx::types::chrono::{DateTime, Utc};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use super::beacon::Beacon;
 use crate::lock::notify;
 use crate::pg_error::map_sqlx_error;
 
-/// Everything the TTL reaper needs: the table to sweep, and the two handles that
-/// let it tell its own orphaned rows from live ones.
+/// Everything the TTL reaper needs: the table to sweep and the sink it reports
+/// failures through.
 ///
-/// Cheap to clone: a pool handle, two `Arc`s, a `String`, and a `&'static str`.
+/// Cheap to clone: a pool handle, one `Arc`, a `String`, and a `&'static str`.
 #[derive(Clone)]
 pub(super) struct ReaperContext {
     /// The write pool — every `cluster_lock` statement and every `pg_notify`.
     pub pool: PgPool,
     /// The schema-qualified `cluster_lock` table name.
     pub table: String,
-    /// This instance's liveness beacon (`lock::beacon`). Its key is what makes
-    /// [`sweep_orphans`] exact: every row bearing it was written by this process,
-    /// in this incarnation.
-    pub beacon: Beacon,
-    /// The locks this instance has a live guard for — [`sweep_orphans`]'s
-    /// exemption set, and the only reason any local registry survives
-    /// (`lock::PostgresLock::local_holders`).
-    pub local_holders: Arc<DashMap<String, Uuid>>,
     /// The ADR-004 error sink.
     pub metrics: Arc<dyn ClusterMetrics>,
     /// The bounded `provider` label.
     pub provider: &'static str,
+    /// How long past `expires_at` a row is left in place so its `fence` survives
+    /// the lapse (`config::PostgresLockConfig::fence_retention_ms`, §5.8.1).
+    ///
+    /// Zero reproduces the pre-retention behaviour exactly — sweep at the
+    /// deadline — which makes every test written before this window
+    /// existed a regression net for the arithmetic below.
+    pub fence_retention: Duration,
 }
 
 /// Instrumentation scope for this plugin's own, non-contract metrics (DESIGN.md
@@ -278,8 +263,7 @@ fn wake_floor(interval: Duration) -> Duration {
     MIN_WAKE.min(interval)
 }
 
-/// Deletes up to [`SWEEP_BATCH`] expired rows, returning the `(name, holder_id)`
-/// of each.
+/// Deletes up to [`SWEEP_BATCH`] expired rows, returning the `name` of each.
 ///
 /// The `LIMIT` lives in a subquery because `DELETE` takes no `LIMIT` of its own.
 /// `ORDER BY expires_at` reaps longest-expired-first and rides
@@ -297,13 +281,36 @@ fn wake_floor(interval: Duration) -> Duration {
 /// `expires_at <= now()` filter; one that arrives *after* blocks on this
 /// statement's own row lock and then finds the row gone, reporting `LockExpired`
 /// — the same reaper-wins outcome the unbounded single-statement delete had.)
-async fn sweep_batch(pool: &PgPool, table: &str) -> Result<Vec<(String, Uuid)>, ClusterError> {
-    sqlx::query_as(AssertSqlSafe(format!(
+///
+/// `RETURNING name` alone. It used to return `holder_id` too, so [`sweep`] could
+/// prune the reaped names from the local holder registry in the same pass; that
+/// registry went with the beacon (module doc), so the name is all a sweep needs.
+///
+/// # The retention window
+///
+/// The predicate is `expires_at <= now() - retention`, not `expires_at <= now()`:
+/// a lapsed row is left in place so its `fence` outlives the lease it fenced, and
+/// only becomes garbage a whole window later (§5.8.1). Two things make that
+/// cheap rather than clever:
+///
+/// * **It stays indexed.** `now() - make_interval(...)` is a runtime constant, so
+///   this is the same `cluster_lock_expires_idx` range scan it always was.
+/// * **A retained row is not a held one.** Acquire's predicate is unchanged and
+///   still reads `expires_at <= now()`, so a retained row is stolen in place at
+///   `fence + 1` by the next acquirer exactly as before. The window changes when
+///   the row is *deleted*, never when the lease is *free*.
+async fn sweep_batch(
+    pool: &PgPool,
+    table: &str,
+    retention: Duration,
+) -> Result<Vec<String>, ClusterError> {
+    sqlx::query_scalar(AssertSqlSafe(format!(
         "DELETE FROM {table} WHERE name IN (\
-             SELECT name FROM {table} WHERE expires_at <= now() \
+             SELECT name FROM {table} WHERE expires_at <= now() - make_interval(secs => $1) \
              ORDER BY expires_at LIMIT {SWEEP_BATCH} FOR UPDATE SKIP LOCKED\
-         ) RETURNING name, holder_id"
+         ) RETURNING name"
     )))
+    .bind(retention.as_secs_f64())
     .fetch_all(pool)
     .await
     .map_err(map_sqlx_error)
@@ -319,32 +326,26 @@ async fn sweep_batch(pool: &PgPool, table: &str) -> Result<Vec<(String, Uuid)>, 
 ///
 /// Every reclaimed name is announced, with no local/foreign split: whoever wins
 /// the `DELETE` frees the name for the whole fleet, so there is no longer a
-/// subset that needs routing back to its owner (module doc). The local registry
-/// is pruned in the same pass, fenced on `holder_id` so a name this instance has
-/// since re-acquired keeps its fresh entry.
+/// subset that needs routing back to its owner (module doc), and no local registry
+/// left to prune alongside it.
 pub(super) async fn sweep(
     ctx: &ReaperContext,
     cancel: &CancellationToken,
 ) -> Result<usize, ClusterError> {
     let mut reclaimed = 0;
     loop {
-        let expired = sweep_batch(&ctx.pool, &ctx.table).await?;
-        if expired.is_empty() {
+        let names = sweep_batch(&ctx.pool, &ctx.table, ctx.fence_retention).await?;
+        if names.is_empty() {
             return Ok(reclaimed);
         }
 
-        let names: Vec<String> = expired
-            .iter()
-            .map(|(name, holder_id)| {
-                ctx.local_holders.remove_if(name, |_, id| id == holder_id);
-                name.clone()
-            })
-            .collect();
-
-        // Wake every waiter blocked on one of these names, rather than leaving
-        // them to their 250ms heartbeat. Batched into one round-trip: a sweep
-        // batch is up to `SWEEP_BATCH` names, and per-row work is exactly what
-        // chunking the sweep was meant to avoid.
+        // Kept, but no longer the thing that wakes a waiter promptly: with a
+        // retention window these names were free a whole window ago, and whoever
+        // was blocked on one took it on its own heartbeat long before this delete.
+        // The notification is now a cheap, harmless re-check rather than the fast
+        // path — the fast path is `lock()`'s 250ms heartbeat, which
+        // `lock`'s wait loop already documents as the bound a lapse is observed
+        // within. Batched into one round-trip either way.
         if let Err(err) = notify::notify_released_many(&ctx.pool, &names).await {
             observability::emit_provider_error(
                 &*ctx.metrics,
@@ -355,120 +356,12 @@ pub(super) async fn sweep(
             );
         }
 
-        reclaimed += expired.len();
+        reclaimed += names.len();
         // A short batch means the table had nothing more to give.
-        if expired.len() < SWEEP_BATCH || cancel.is_cancelled() {
+        if names.len() < SWEEP_BATCH || cancel.is_cancelled() {
             return Ok(reclaimed);
         }
     }
-}
-
-/// Reclaims this instance's **orphaned** rows: rows bearing this incarnation's
-/// beacon that no live local guard accounts for (module doc). Returns how many.
-///
-/// ```sql
-/// DELETE FROM cluster_lock
-///  WHERE holder_beacon_hi = $1 AND holder_beacon_lo = $2
-///    AND holder_id <> ALL($3::uuid[])
-///    AND acquired_at < $4
-/// RETURNING name
-/// ```
-///
-/// `$3` is `local_holders`' value set — `O(locks held by this instance)`, and the
-/// same array-parameter shape the rest of the module uses. An empty array needs
-/// no special case: `<> ALL('{}')` is true, and if we hold nothing then either no
-/// row bears our beacon or every row that does is an orphan.
-///
-/// ## `$4` is the fence that keeps a live acquisition safe
-///
-/// Without it this races an acquisition in flight. The known-`holder_id` set is
-/// snapshotted in Rust *before* the DELETE executes, so a row that commits in
-/// between — an acquisition that has written its row but not yet registered —
-/// would be read as an orphan and deleted out from under its own guard.
-///
-/// Rather than reintroduce a per-acquisition in-flight guard, the fence is a
-/// **database timestamp from the previous reaper wake**: a row is only ever
-/// deleted if it was already unregistered one full wake earlier. The reaper
-/// already issues an indexed `min(expires_at)` probe on every wake, so carrying
-/// `now()` back on that same select list makes the fence free
-/// ([`SchedulingProbe`]).
-///
-/// The residual is an acquisition that straddles two wakes — a committed INSERT
-/// more than one `lock_reaper_interval_ms` before its `local_holders`
-/// registration *on the same task*. That takes pathological runtime starvation
-/// between one statement returning and one `DashMap` insert, and what it costs is
-/// a spurious `LockExpired` for that acquisition, never a double-hold: the row is
-/// gone, so exclusion is not violated.
-///
-/// Skipped entirely when there is no live beacon. Rows written under a *previous*
-/// incarnation are not this sweep's business — they are unvouched, so the fleet
-/// can already take them, and the beacon's own post-reconnect cleanup hands them
-/// over deliberately.
-pub(super) async fn sweep_orphans(
-    ctx: &ReaperContext,
-    fence: DateTime<Utc>,
-) -> Result<usize, ClusterError> {
-    let Some(key) = ctx.beacon.key() else {
-        return Ok(0);
-    };
-    let live: Vec<Uuid> = ctx
-        .local_holders
-        .iter()
-        .map(|entry| *entry.value())
-        .collect();
-
-    let orphans: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "DELETE FROM {table} \
-         WHERE holder_beacon_hi = $1 AND holder_beacon_lo = $2 \
-           AND holder_id <> ALL($3::uuid[]) \
-           AND acquired_at < $4 \
-         RETURNING name",
-        table = ctx.table,
-    )))
-    .bind(key.hi)
-    .bind(key.lo)
-    .bind(&live)
-    .bind(fence)
-    .fetch_all(&ctx.pool)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    if orphans.is_empty() {
-        return Ok(0);
-    }
-    warn!(
-        orphans = orphans.len(),
-        "cluster.lock.orphan_rows_reclaimed: deleted cluster_lock rows this instance wrote but no \
-         longer holds a guard for (acquisitions cancelled after their row committed); those names \
-         were wedged for the whole fleet until their TTL"
-    );
-    // Hand the names over now rather than making waiters discover them by retry.
-    if let Err(err) = notify::notify_released_many(&ctx.pool, &orphans).await {
-        observability::emit_provider_error(
-            &*ctx.metrics,
-            ctx.provider,
-            "reaper_sweep_orphans_notify",
-            ResourceId::Name(&ctx.table),
-            &err,
-        );
-    }
-    Ok(orphans.len())
-}
-
-/// Test-only: a database timestamp `age` in the past, for driving
-/// [`sweep_orphans`] with a deterministic fence instead of waiting out two real
-/// reaper wakes.
-#[cfg(feature = "integration")]
-pub(super) async fn __test_fence_before(
-    pool: &PgPool,
-    age: Duration,
-) -> Result<DateTime<Utc>, ClusterError> {
-    let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-    sqlx::query_scalar("SELECT now() - ($1::bigint * interval '1 millisecond')")
-        .bind(age_ms)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)
 }
 
 /// Seconds until the earliest deadline in `cluster_lock`, or `None` when the
@@ -603,38 +496,45 @@ fn report_notify_queue_failure(metrics: &LockReaperMetrics, err: &ClusterError, 
     }
 }
 
-/// What one wake's scheduling probe reads back, in a single round-trip.
+/// What one wake's scheduling probe reads back.
 pub(super) struct SchedulingProbe {
-    /// Seconds until the earliest deadline in `cluster_lock`, or `None` when the
-    /// table is empty. Negative when a row is already due.
+    /// Seconds until the earliest row in `cluster_lock` becomes *reapable* —
+    /// `min(expires_at) + fence_retention` — or `None` when the table is empty.
+    /// Negative when a row is already due.
+    ///
+    /// The retention window is folded in here rather than at the sleep site
+    /// because this is the only place that knows what the table holds: a row that
+    /// has lapsed but is still inside its window is not work, and waking for it
+    /// would sweep nothing and then sleep again on the same value.
     pub seconds_until_expiry: Option<f64>,
-    /// The database clock at that read — the fence [`sweep_orphans`] uses one
-    /// wake later. Free here: the row was being read anyway, so carrying `now()`
-    /// back on the same select list costs nothing over the probe alone, and it
-    /// keeps the fence on the *database's* clock rather than this instance's.
-    pub now: DateTime<Utc>,
 }
 
-/// Reads the next deadline and the database clock in one statement.
+/// Reads the next deadline.
 ///
 /// The subtraction happens **in Postgres**, so what comes back is a delay
 /// measured entirely on the database clock — this task can then sleep on its own
 /// monotonic clock without ever comparing a Postgres timestamp against a
 /// possibly-skewed local wall clock (PGR-C2). `min(expires_at)` is an index-only
 /// read of `cluster_lock_expires_idx`'s leftmost entry, not a scan.
+///
+/// It used to carry `now()` back on the same select list, as the `acquired_at` fence
+/// the orphan sweep compared against one wake later. That sweep is gone (module
+/// doc), and with it the only reader of the database clock here.
 pub(super) async fn probe_schedule(
     pool: &PgPool,
     table: &str,
+    retention: Duration,
 ) -> Result<SchedulingProbe, ClusterError> {
-    let (seconds_until_expiry, now): (Option<f64>, DateTime<Utc>) = sqlx::query_as(AssertSqlSafe(
-        format!("SELECT extract(epoch FROM (min(expires_at) - now()))::float8, now() FROM {table}"),
-    ))
+    let seconds_until_expiry: Option<f64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT extract(epoch FROM \
+             (min(expires_at) + make_interval(secs => $1) - now()))::float8 FROM {table}"
+    )))
+    .bind(retention.as_secs_f64())
     .fetch_one(pool)
     .await
     .map_err(map_sqlx_error)?;
     Ok(SchedulingProbe {
         seconds_until_expiry,
-        now,
     })
 }
 
@@ -661,16 +561,25 @@ fn next_delay(
     }
 }
 
-/// Counts every row in `cluster_lock` — the cluster-wide number of distinct
-/// lock names currently held (DESIGN.md §8), the value behind the
+/// Counts the **live** rows in `cluster_lock` — the cluster-wide number of
+/// distinct lock names currently held (DESIGN.md §8), the value behind the
 /// `cluster_postgres_lock_active_names` gauge. Deliberately **not**
 /// `local_holders.len()`, which is only this instance's slice of the fleet's
 /// locks.
+///
+/// The `expires_at > now()` filter arrived with the retention window and is not
+/// cosmetic: a lapsed row now lingers for a whole window, so a plain `count(*)`
+/// would report every lock name used in the last hour as *held*. That inflates a
+/// gauge operators alert on and fires `cluster.lock.name_cardinality_high` on a
+/// deployment holding nothing at all. Held means live, which is the same
+/// predicate acquire uses.
 async fn active_name_count(pool: &PgPool, table: &str) -> Result<i64, ClusterError> {
-    sqlx::query_scalar(AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table} WHERE expires_at > now()"
+    )))
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)
 }
 
 /// Spawns the lock TTL reaper.
@@ -687,18 +596,11 @@ async fn active_name_count(pool: &PgPool, table: &str) -> Result<i64, ClusterErr
 /// wake rather than to every sweep is what keeps it rate-limited to once per
 /// interval now that expiry-driven wakes can land in between.
 ///
-/// [`sweep_orphans`] runs on `interval`-boundary wakes only, and its
-/// `acquired_at` fence is the `now()` read by the *previous* such wake — one full
-/// `interval` of grace, which is what keeps an acquisition that is merely slow to
-/// register from being mistaken for an abandoned one. Advancing the fence on
-/// expiry-driven wakes too would make it *younger* and therefore make more rows
-/// eligible, which is the wrong direction; a staler fence only delays cleanup.
-///
 /// `synchronous_commit = on` needs no re-assertion here or anywhere else: every
 /// statement this task issues goes through the write pool, whose
 /// `after_connect`/`before_acquire` hooks enforce it on each checkout
-/// (DESIGN.md §3.4). The one long-lived connection this plugin opens for locks —
-/// the beacon — writes nothing at all.
+/// (DESIGN.md §3.4). This plugin opens no long-lived connection for locks at all
+/// now that the beacon is gone.
 pub(super) fn spawn_lock_reaper(
     ctx: ReaperContext,
     interval: Duration,
@@ -718,11 +620,6 @@ pub(super) fn spawn_lock_reaper(
         // Whether the last notify-queue sample failed — see `sample_notify_queue`
         // for why a persistent failure must not log once per interval forever.
         let mut notify_queue_failing = false;
-        // The `acquired_at` fence for the *next* orphan sweep: a database `now()`
-        // from the previous interval-boundary wake. `None` until one has happened
-        // — and needing no special case beyond that, since every row bearing a
-        // freshly-drawn beacon was written within the current interval anyway.
-        let mut orphan_fence: Option<DateTime<Utc>> = None;
         loop {
             let (errors, provider) = metrics.errors();
             let started = tokio::time::Instant::now();
@@ -753,8 +650,9 @@ pub(super) fn spawn_lock_reaper(
                 let interval_wake = tokio::time::Instant::now() >= metrics_due;
                 if interval_wake {
                     metrics_due = tokio::time::Instant::now() + interval;
-                    // Distinct held names = live row count *after* the TTL
-                    // delete, so expired-but-not-yet-swept rows never inflate it.
+                    // Distinct held names = rows whose lease is still live. Not
+                    // `count(*)`: a lapsed row is retained for the fence window,
+                    // so counting rows would report an hour of history as held.
                     match active_name_count(&ctx.pool, &ctx.table).await {
                         Ok(count) => {
                             metrics.record_active_names(count);
@@ -781,35 +679,14 @@ pub(super) fn spawn_lock_reaper(
                     // cause rather than a downstream victim (§11).
                     notify_queue_failing =
                         sample_notify_queue(&ctx, &metrics, notify_queue_failing).await;
-                    // Interval-cadence too, and against the *previous* interval
-                    // wake's clock reading — see this function's doc for why the
-                    // fence must stay one wake behind. Nothing to sweep against
-                    // before the first one.
-                    if let Some(fence) = orphan_fence
-                        && let Err(err) = sweep_orphans(&ctx, fence).await
-                    {
-                        observability::emit_provider_error(
-                            errors,
-                            provider,
-                            "reaper_sweep_orphans",
-                            ResourceId::Name(&ctx.table),
-                            &err,
-                        );
-                    }
                 }
 
                 let until_metrics =
                     metrics_due.saturating_duration_since(tokio::time::Instant::now());
-                match probe_schedule(&ctx.pool, &ctx.table).await {
-                    Ok(probe) => {
-                        if interval_wake {
-                            orphan_fence = Some(probe.now);
-                        }
-                        next_delay(until_metrics, probe.seconds_until_expiry, floor)
-                    }
+                match probe_schedule(&ctx.pool, &ctx.table, ctx.fence_retention).await {
+                    Ok(probe) => next_delay(until_metrics, probe.seconds_until_expiry, floor),
                     // Can't tell when the next lock is due; fall back to the
-                    // fixed cadence, which is the pre-existing behaviour. The
-                    // fence is left where it was — staler is the safe direction.
+                    // fixed cadence, which is the pre-existing behaviour.
                     Err(err) => {
                         observability::emit_provider_error(
                             errors,

@@ -1,0 +1,7 @@
+[gear]
+name = "Plan & Price Modeling"
+description = "Authoritative catalog for subscription plans, price structures, and billing descriptors."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

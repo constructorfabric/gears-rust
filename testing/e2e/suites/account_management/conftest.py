@@ -282,12 +282,8 @@ def create_metadata_schema(am_base_url, am_headers):
             "entities": [
                 {
                     "$id": f"gts://{type_id}",
-                    # `$schema` is the JSON Schema dialect, NOT the parent type
-                    # — derivation from gts.cf.core.am.tenant_metadata.v1~ is
-                    # encoded by the `~`-chain in `$id`. gts 0.10.0 compiles the
-                    # `x-gts-traits` under this dialect, so it must be a real
-                    # meta-schema (draft-07, matching the base envelope).
                     "$schema": "http://json-schema.org/draft-07/schema#",
+                    "allOf": [{"$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"}],
                     "description": "E2E test metadata schema",
                     "type": "object",
                     "x-gts-traits": {

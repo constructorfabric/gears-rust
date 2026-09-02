@@ -35,7 +35,7 @@ async fn s1_01_positive_stream_multipart_frames() {
     // Three events → offsets 1, 2, 3 (1-based).
     for _ in 0..3 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -411,7 +411,7 @@ async fn s1_14_positive_control_progress_frame() {
                     tenant_depth: crate::api::TenantTraversalDepth::CurrentTenant,
                     barrier_mode: BarrierMode::Respect,
                     types: vec![
-                        gts_id!("cf.core.events.event_type.v1~example.mock.broker.no_match.v1")
+                        gts_id!("cf.core.events.event.v1~example.mock.broker.no_match.v1~")
                             .to_owned(),
                     ],
                     filter: None,
@@ -440,7 +440,7 @@ async fn s1_14_positive_control_progress_frame() {
     // Append heavily; every event is rejected by the narrow filter.
     for _ in 0..5 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }

@@ -30,8 +30,10 @@ pub trait IngestService: Send + Sync {
         event: Event,
     ) -> Result<Event, DomainError>;
 
-    /// Validate and enqueue a batch of events for the same topic
-    /// (`DESIGN.md:639`).
+    /// Validate and enqueue a batch of events whose event types all resolve to
+    /// the same topic (`DESIGN.md:639`). Events name no topic themselves, so
+    /// batch homogeneity is a property of the resolved types, not of a field
+    /// the producer set.
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,

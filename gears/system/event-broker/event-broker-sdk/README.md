@@ -48,8 +48,7 @@ use event_broker_sdk::{
 struct OrderCreated { order_id: Uuid, total_cents: i64 }
 
 impl TypedEvent for OrderCreated {
-    const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~orders.created.v1";
-    const TOPIC:   &'static str = "gts.cf.core.events.topic.v1~orders.v1";
+    const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~orders.created.v1~";
     const SUBJECT_TYPE: &'static str = "gts.cf.core.events.subject.v1~order.v1";
     const SOURCE:  &'static str = "order-service";
     fn subject(&self) -> Cow<'_, str> { Cow::Owned(self.order_id.to_string()) }
@@ -249,7 +248,7 @@ let handle = ConsumerBuilder::new(broker.clone())
     .default_handler(DefaultProjector)
     .route()
     .topic(TopicRef::gts("gts.cf.core.events.topic.v1~orders.v1"))
-    .event_type(EventTypeRef::gts("gts.cf.core.events.event.v1~orders.created.v1"))
+    .event_type(EventTypeRef::gts("gts.cf.core.events.event.v1~orders.created.v1~"))
     .handler(OrderCreatedProjector)
     .start()
     .await?;

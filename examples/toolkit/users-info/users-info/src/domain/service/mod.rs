@@ -62,7 +62,7 @@ use toolkit_macros::domain_model;
 use crate::domain::events::UserDomainEvent;
 use crate::domain::ports::{AuditPort, EventPublisher, UsersMetricsPort};
 use crate::domain::repos::{AddressesRepository, CitiesRepository, UsersRepository};
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::ResourceType;
 use toolkit_db::DBProvider;
@@ -228,7 +228,7 @@ where
         db: Arc<DbProvider>,
         events: Arc<dyn EventPublisher<UserDomainEvent>>,
         audit: Arc<dyn AuditPort>,
-        authz: Arc<dyn AuthZResolverClient>,
+        authz: Arc<dyn AuthZResolverApi>,
         config: ServiceConfig,
         metrics: Arc<dyn UsersMetricsPort>,
     ) -> Self {

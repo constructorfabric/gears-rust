@@ -3,6 +3,7 @@
 //! (REST API implementation) and #4347 (standalone runtime).
 
 use async_trait::async_trait;
+use gts::GtsInstanceId;
 use toolkit::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -17,7 +18,7 @@ use crate::domain::model::{Event, Subscription};
 #[derive(Debug, Clone)]
 pub struct JoinRequest {
     pub consumer_group: String,
-    pub topics: Vec<String>,
+    pub topics: Vec<GtsInstanceId>,
 }
 
 /// Long-poll response - events plus topology-version-aware metadata
@@ -36,7 +37,7 @@ pub struct PollResponse {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct SeekPosition {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: i32,
     pub offset: i64,
 }

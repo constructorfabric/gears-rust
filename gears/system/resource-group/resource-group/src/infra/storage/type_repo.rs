@@ -382,7 +382,20 @@ impl TypeRepositoryTrait for TypeRepository {
         // the generated id in it.
         toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))
+            .map_err(|e| {
+                // A duplicate `schema_id` is a conflict the caller can act on,
+                // not an internal database failure. `UNIQUE(schema_id)` has
+                // held it since the initial migration, on every backend and
+                // at every isolation level -- what was missing was the
+                // translation, so a race that the constraint caught surfaced
+                // as a 500. Symmetric with `GroupRepository::insert` and
+                // `MembershipRepository::insert`, which already do this.
+                if e.is_unique_violation() {
+                    DomainError::type_already_exists(schema_id)
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })
     }
 
     /// Insert allowed parent junction entries.
@@ -466,18 +479,25 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Update the `gts_type` row (`metadata_schema`, `updated_at`).
+    ///
+    /// Returns the updated row, assembled from `current` plus the two
+    /// columns this write just set -- not read back. Every other column on
+    /// `current` is either the key it was addressed by (`id`, `schema_id`)
+    /// or immutable (`created_at`), so the caller no longer has to redo this
+    /// assembly itself, and there was nothing a second SELECT could have
+    /// told it beyond what `current` already holds (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
-        type_id: i16,
+        current: gts_type::Model,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<time::OffsetDateTime, DomainError> {
+    ) -> Result<gts_type::Model, DomainError> {
         let scope = system_scope();
         let updated_at = time::OffsetDateTime::now_utc();
 
         // Use SecureUpdateMany for scoped update
-        GtsTypeEntity::update_many()
-            .filter(gts_type::Column::Id.eq(type_id))
+        let result = GtsTypeEntity::update_many()
+            .filter(gts_type::Column::Id.eq(current.id))
             .secure()
             .col_expr(
                 gts_type::Column::MetadataSchema,
@@ -489,9 +509,15 @@ impl TypeRepositoryTrait for TypeRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // The timestamp is handed back rather than read back: it is the only
-        // thing this write decided that the caller did not already know.
-        Ok(updated_at)
+        if result.rows_affected == 0 {
+            return Err(DomainError::type_not_found(current.schema_id));
+        }
+
+        Ok(gts_type::Model {
+            metadata_schema: metadata_schema.cloned(),
+            updated_at: Some(updated_at),
+            ..current
+        })
     }
 
     /// Delete a GTS type by its surrogate ID. CASCADE handles junction rows.
@@ -503,7 +529,28 @@ impl TypeRepositoryTrait for TypeRepository {
             .scope_with(&scope)
             .exec(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+            .map_err(|e| {
+                // `resource_group.gts_type_id` and the membership table both
+                // reference this row `ON DELETE RESTRICT`, so the constraint
+                // is what actually prevents deleting a type still in use. The
+                // count the caller runs first is a better message, not the
+                // guard -- under a concurrent create it can be stale by the
+                // time the delete runs, and then the answer comes from here.
+                // Same conflict either way.
+                if e.is_foreign_key_violation() {
+                    // No `type_id` in the text: it is the internal SMALLINT
+                    // surrogate the API never exposes, and the count-based
+                    // message for the same conflict in `delete_type_unscoped`
+                    // names the type by its code. Two messages for one
+                    // conflict should not disagree on what they identify.
+                    DomainError::conflict_active_references(
+                        "Cannot delete type: group(s) or membership(s) of this type exist"
+                            .to_owned(),
+                    )
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })?;
         Ok(())
     }
 
@@ -696,6 +743,120 @@ impl TypeRepositoryTrait for TypeRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(groups.into_iter().map(|g| (g.id, g.name)).collect())
+    }
+
+    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
+        &self,
+        db: &C,
+        child_type_id: i16,
+        membership_codes: &[String],
+    ) -> Result<Vec<(String, uuid::Uuid, String)>, DomainError> {
+        use crate::infra::storage::entity::resource_group_membership::{
+            self as membership_entity, Entity as MembershipEntity,
+        };
+
+        if membership_codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = system_scope();
+
+        // Resolve membership type codes to IDs.
+        let mut membership_types: Vec<gts_type::Model> = Vec::new();
+        for chunk in membership_codes.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let found = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            membership_types.extend(found);
+        }
+
+        if membership_types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let id_to_code: std::collections::HashMap<i16, String> = membership_types
+            .iter()
+            .map(|t| (t.id, t.schema_id.clone()))
+            .collect();
+        let type_ids: Vec<i16> = membership_types.iter().map(|t| t.id).collect();
+
+        // Which groups of `child_type_id` have a membership in one of the
+        // removed types -- decided by the database via a subquery, not by
+        // loading every group of that type into the process first (that
+        // was the anti-pattern `find_groups_violating_removed_parents`
+        // above was rewritten to avoid). What comes back grows with the
+        // number of violating memberships, not with the number of groups
+        // of the child type. Unscoped — an integrity sweep must always see
+        // the real data regardless of the caller's scope.
+        let groups_of_child_type = Query::select()
+            .column(rg_entity::Column::Id)
+            .from(ResourceGroupEntity)
+            .and_where(Expr::col(rg_entity::Column::GtsTypeId).eq(child_type_id))
+            .to_owned();
+
+        let mut violating: Vec<(i16, uuid::Uuid)> = Vec::new();
+        for chunk in type_ids.chunks(
+            toolkit_db::secure::max_bind_params_for(db)
+                .saturating_sub(1)
+                .max(1),
+        ) {
+            let members: Vec<membership_entity::Model> = MembershipEntity::find()
+                .filter(membership_entity::Column::GtsTypeId.is_in(chunk.to_vec()))
+                .filter(
+                    membership_entity::Column::GroupId.in_subquery(groups_of_child_type.clone()),
+                )
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+
+            violating.extend(members.into_iter().map(|m| (m.gts_type_id, m.group_id)));
+        }
+
+        // One row came back per violating *membership*, so a group with five
+        // memberships of a removed type appears five times -- and the caller
+        // joins these names into the rejection message without deduplicating
+        // them. Same pair, same violation: report it once.
+        violating.sort_unstable();
+        violating.dedup();
+
+        if violating.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve names only for the groups that actually violate, the same
+        // way the sibling method above bounds its own group lookup by the
+        // answer rather than by the type's popularity.
+        let mut violating_group_ids: Vec<uuid::Uuid> =
+            violating.iter().map(|(_, id)| *id).collect();
+        violating_group_ids.sort_unstable();
+        violating_group_ids.dedup();
+
+        let mut name_by_id: std::collections::HashMap<uuid::Uuid, String> =
+            std::collections::HashMap::new();
+        for id_chunk in violating_group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let groups: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::Id.is_in(id_chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            name_by_id.extend(groups.into_iter().map(|g| (g.id, g.name)));
+        }
+
+        Ok(violating
+            .into_iter()
+            .filter_map(|(type_id, group_id)| {
+                let code = id_to_code.get(&type_id)?.clone();
+                let name = name_by_id.get(&group_id).cloned().unwrap_or_default();
+                Some((code, group_id, name))
+            })
+            .collect())
     }
 
     /// List GTS types with `OData` filtering and cursor-based pagination.

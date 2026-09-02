@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authz-resolver-sdk"
-version = "0.3.21"
+version = "0.3.23"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,6 +18,7 @@ name = "authz_resolver_sdk"
 workspace = true
 
 [dependencies]
+# Serialization / core
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
@@ -25,6 +26,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
 schemars = { workspace = true }
+utoipa = { workspace = true, features = ["uuid"] }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 # GTS types
 gts = { workspace = true }
@@ -32,9 +36,31 @@ toolkit-gts = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
+toolkit-contract = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
 toolkit-security = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
-tracing = { workspace = true }
 
+# Direct deps emitted into the generated REST client (rest-client feature).
+toolkit-http = { workspace = true, optional = true }
+
+# Direct deps emitted into generated server route registration (rest-server).
+axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+
+[features]
+# Generated directory-resolving REST client (`AuthZResolverApiRestClient` +
+# `...ResolvingClient`) used by out-of-process PEP consumers.
+rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http"]
+# Generated server route registration (`register_..._routes`) used by the
+# authz-resolver gear to host the contract's REST surface.
+rest-server = ["toolkit-contract/rest-server", "dep:axum", "dep:http"]
+# Real OTEL propagation + client metrics in the generated REST client.
+otel = ["rest-client", "toolkit-contract/otel"]
+
+# The `rest_roundtrip` test is gated on the `rest-client` + `rest-server`
+# features, which pull in `axum`, `toolkit-http` and `toolkit-contract`'s
+# `runtime-client`; everything else it needs is already a normal dependency
+# (available to integration tests). Only the runtime is test-only.
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"] }

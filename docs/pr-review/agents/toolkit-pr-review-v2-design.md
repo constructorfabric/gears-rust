@@ -36,18 +36,30 @@ Apply **only** these specific check IDs:
    - Non-standard builder patterns or factory methods
    - Overly broad public visibility (pub when pub(crate) suffices)
    - APIs that require the caller to violate Rust idioms (e.g., force them to use unsafe, leak memory, or panic)
+   - Owned-string parameters that force callers to pre-convert instead of accepting `impl Into<String>`
+   - More than 2-3 boolean parameters on one function (should be an options struct/enum/builder)
+   - Validating constructors that panic or silently clamp instead of returning `Result`
+   - `Deref`/`DerefMut` impls used to fake inheritance on a wrapper type (leaks the inner API, blurs ownership)
 
 2. **RUST-TYPE-001** — Type system must preserve invariants. Check for:
    - Types that allow invalid states (should use enum or newtype)
    - Weak typing (using primitives instead of semantic types)
    - Type safety holes (e.g., bool parameters that should be enums)
    - Lost type information (erasing types to dynamic types unnecessarily)
+   - Wildcard `_ =>` catch-all on a crate-owned enum where an exhaustive match would force new variants to be handled
+   - Public enums/structs expected to grow that are missing `#[non_exhaustive]`
+   - Easily-dropped-by-accident results (builders, "must apply" configs) missing `#[must_use]`
 
 3. **RUST-OWN-001** — Ownership and borrowing patterns must be clear and efficient. Check for:
    - Unnecessary copies (passing owned values when references suffice)
    - Over-borrowing (taking &T when T would be clearer)
    - Lifetime confusion (unnecessarily explicit lifetimes or missing lifetime bounds)
    - Inefficient patterns (frequent cloning where a reference would work)
+   - Owned-type parameters where a borrowed type would do (`&String` instead of `&str`, `&Vec<T>` instead of `&[T]`, `&Box<T>` instead of `&T`)
+   - Cloning to move a field out of `&mut self`/an enum variant instead of `mem::take`/`mem::replace`
+   - A single lifetime parameter bounding both an input argument and a stored/returned reference (over-constrains callers)
+   - Manual acquire/release pairs where an RAII guard (`Drop`) would be safer
+   - Fallible functions that take ownership of an argument but don't return that value inside the error variant, forcing the caller to re-clone before retrying
 
 4. **RUST-DATA-001** — Serialization contracts must be explicit and maintainable. Check for:
    - Serialization without explicit versioning or backwards-compatibility consideration
@@ -66,12 +78,14 @@ Apply **only** these specific check IDs:
    - Implementation details exposed as pub (should be pub(crate) or inside modules)
    - Deep nesting without clear separation of concerns
    - Modules mixing unrelated functionality
+   - `#![deny(warnings)]` (or equivalent) added directly in source instead of denying specific lints by name or gating via CI/`RUSTFLAGS`
 
 7. **RUST-NO-007** — No accidental contract drift. Check for:
    - Public API changes without documentation (docs, changelog)
    - Removing or renaming public items without deprecation
    - Breaking changes to serialization formats of published types
    - Changes to error types that break caller code
+   - New blanket trait impls (`impl<T: Bound> Trait for T`) added to a public API without deliberate justification (semver/coherence hazard)
 
 ## Checklist References
 

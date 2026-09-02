@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-event-broker"
 description = "Event Broker: Ingest/Delivery/Dispatcher composite module (deployment-topology skeleton)"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,6 +18,15 @@ name = "event_broker"
 workspace = true
 
 [dependencies]
+# A concrete topic and a concrete event type are both derived GTS type schemas,
+# so the broker models neither itself: the identifier wrapper comes from `gts`,
+# the resolved type schema from `types-registry-sdk`, and the DTO shapes the API
+# reports from its own SDK - projecting a schema onto one of those shapes is
+# broker-side work and lives here.
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.0", path = "../event-broker-sdk" }
+gts = { workspace = true }
+types-registry-sdk = { workspace = true }
+
 cluster = { workspace = true }
 cluster-sdk = { workspace = true }
 
@@ -34,6 +43,9 @@ chrono = { workspace = true, features = ["clock", "serde"] }
 
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
+# `Iso8601Duration`, to parse a resolved retention trait into a real duration
+# rather than passing a string through to the API.
+toolkit-utils = { workspace = true, features = ["serde", "schemars"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

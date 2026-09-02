@@ -1,11 +1,11 @@
 //! The generated gRPC client must not panic on malformed data from a peer.
 //!
-//! `#[derive(ProtoBridge)]` emits an infallible `From<Proto>` that `.expect()`s
-//! on every `#[proto_bridge(via_string)]` field. That is fine for values this
-//! process produced, but a response is peer-controlled: a single unparseable
-//! UUID would abort whichever task is driving the call. The generated client
-//! therefore decodes responses through `TryFromProto`, and these tests pin that
-//! behaviour by serving deliberately malformed values from a hostile server.
+//! A `#[proto_bridge(via_string)]` field decodes through `FromStr`, which can
+//! fail on a peer-controlled response: a single unparseable UUID must not abort
+//! whichever task is driving the call. `#[derive(ProtoBridge)]` therefore emits
+//! no infallible `From<Proto>` for a struct carrying such a field, and the
+//! generated client decodes responses through `TryFromProto`. These tests pin
+//! that behaviour by serving deliberately malformed values from a hostile server.
 //!
 //! One test per decode site in the codegen, since they are separate code paths:
 //! one-shot unary, retryable unary (decode happens inside the retry loop), and

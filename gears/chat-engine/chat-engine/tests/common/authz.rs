@@ -16,11 +16,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError,
+    AuthZResolverApi,
     constraints::{Constraint, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
-use toolkit_security::pep_properties;
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 use uuid::Uuid;
 
 fn resolve_subject_tenant(request: &EvaluationRequest) -> Option<Uuid> {
@@ -43,11 +44,12 @@ fn resolve_subject_tenant(request: &EvaluationRequest) -> Option<Uuid> {
 struct MockAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let subject_id = request.subject.id;
         let constraints = match resolve_subject_tenant(&request) {
             Some(tenant) => vec![Constraint {
@@ -79,11 +81,12 @@ pub fn enforcer_allow() -> PolicyEnforcer {
 struct DenyAllAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllAuthZResolver {
+impl AuthZResolverApi for DenyAllAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext::default(),

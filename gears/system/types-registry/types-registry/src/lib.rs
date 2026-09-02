@@ -11,6 +11,10 @@
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
+// The admission path nests async futures deeply — handler, service, worker,
+// transaction closure, commit — and the default limit of 128 is reached laying out
+// `submit_entities`'s state machine. Nothing here recurses at runtime.
+#![recursion_limit = "256"]
 
 // === PUBLIC API (from SDK) ===
 pub use types_registry_sdk::{
@@ -24,6 +28,7 @@ pub use gear::TypesRegistryGear;
 
 // === CONFIGURATION ===
 pub mod config;
+mod policy_config;
 
 // === INTERNAL MODULES ===
 #[doc(hidden)]

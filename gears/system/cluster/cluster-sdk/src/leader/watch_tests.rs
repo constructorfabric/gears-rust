@@ -1,4 +1,3 @@
-// Created: 2026-06-11 by Constructor Tech
 use super::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use crate::error::{ClusterError, ProviderErrorKind};
 
@@ -336,4 +335,62 @@ async fn run_while_leader_aborts_unresponsive_work_after_timeout() {
 
     drop(tx);
     assert!(driver.await.is_ok());
+}
+
+/// M13: an owed `Lagged` must be payable *proactively*, so a consumer that fell
+/// behind is told even when the election then goes quiet and no further event is
+/// offered.
+///
+/// [`LeaderWatchSender::offer`] pays the debt on the *next* event, which is the
+/// right ordering while events keep coming. But a stable leader's renewal emits
+/// none, so once the election falls quiet a `changed()`-only consumer would
+/// drain a backlog whose last status is a stale `Status(Leader)` and never learn
+/// it dropped anything — the silent-staleness failure ADR-003 exists to
+/// eliminate for a leadership gate. Both profiles' renewal ticks call
+/// `flush_lagged` for exactly this; here it is asserted at the shared mechanism.
+///
+/// The notice is delivered by the flush and by nothing else: no event is offered
+/// between the drained backlog and the flush, so a `changed()` that only returns
+/// after the flush proves the flush paid it.
+#[tokio::test]
+async fn flush_lagged_pays_the_owed_notice_when_the_election_goes_quiet() {
+    // Two usable slots. Fill them, then drop one so a `Lagged` is owed.
+    let (mut tx, _resign, mut watch) = LeaderWatch::channel(2, LeaderStatus::Follower);
+    assert!(tx.try_send_status(LeaderStatus::Leader), "slot 1");
+    assert!(
+        tx.try_send(LeaderWatchEvent::Reset),
+        "slot 2 - buffer now full"
+    );
+    assert!(
+        tx.try_send(LeaderWatchEvent::Reset),
+        "a full buffer still returns true (the subscription is alive); this one is dropped and \
+         a Lagged is owed"
+    );
+
+    // The consumer catches up on the backlog, freeing the room the notice needs.
+    assert!(matches!(
+        watch.changed().await,
+        LeaderWatchEvent::Status(LeaderStatus::Leader)
+    ));
+    assert!(matches!(watch.changed().await, LeaderWatchEvent::Reset));
+
+    // The election now goes quiet: no status change, no further event. The tick
+    // flush is the only thing that can pay the debt — and it must.
+    tx.flush_lagged();
+
+    assert!(
+        matches!(
+            watch.changed().await,
+            LeaderWatchEvent::Lagged { dropped: 1 }
+        ),
+        "the owed Lagged must be delivered by the tick flush, not by an unrelated later event"
+    );
+
+    // And the debt is cleared: a second flush with no new drop adds nothing.
+    tx.flush_lagged();
+    assert!(tx.try_send(LeaderWatchEvent::Reset), "still live");
+    assert!(
+        matches!(watch.changed().await, LeaderWatchEvent::Reset),
+        "no phantom second Lagged once the debt is paid"
+    );
 }

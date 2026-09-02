@@ -65,7 +65,7 @@ The `PolicyEnforcer` is built once in `init` from the AuthZ resolver client (res
 `ClientHub`), then shared by all services. The gear must declare `deps = ["authz-resolver"]`.
 
 ```rust
-let authz = ctx.client_hub().get::<dyn AuthZResolverClient>()?;
+let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
 let enforcer = PolicyEnforcer::new(authz);
 ```
 

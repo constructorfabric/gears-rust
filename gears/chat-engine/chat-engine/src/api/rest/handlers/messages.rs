@@ -56,6 +56,11 @@ pub struct SendMessageBody {
     /// session's `enabled_capabilities`.
     #[serde(default)]
     pub capabilities: Option<Vec<CapabilityValue>>,
+    /// Optional opaque per-turn client context, persisted on the user
+    /// message row. Reserved (assistant-side) keys and payloads over
+    /// `MAX_MESSAGE_METADATA_BYTES` are rejected in the service layer.
+    #[serde(default)]
+    pub metadata: Option<JsonValue>,
 
     // ---- anti-spoof fields (PRD §7; rejected if present) ----
     pub tenant_id: Option<JsonValue>,
@@ -100,6 +105,7 @@ pub async fn send_message(
         file_ids: body.file_ids.unwrap_or_default(),
         parent_message_id: body.parent_message_id,
         capabilities: body.capabilities,
+        metadata: body.metadata,
     };
 
     let event_stream = svc.send_message(req, &ctx, cancel).await?;

@@ -9,11 +9,12 @@ use authz_resolver_sdk::constraints::{Constraint, EqPredicate, Predicate};
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use credstore_sdk::{
     CredStoreError, CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, SharingMode, TenantId,
 };
-use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -55,11 +56,12 @@ pub fn make_ctx(subject_id: Uuid, tenant_id: Uuid) -> SecurityContext {
 struct MockAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let root = request
             .subject
             .properties
@@ -92,11 +94,12 @@ pub fn mock_enforcer() -> PolicyEnforcer {
 struct DenyAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAuthZResolver {
+impl AuthZResolverApi for DenyAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext::default(),
@@ -119,11 +122,12 @@ pub struct TypeAwareAuthZResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for TypeAwareAuthZResolver {
+impl AuthZResolverApi for TypeAwareAuthZResolver {
     async fn evaluate(
         &self,
+        ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         self.seen_resource_types
             .lock()
             .expect("lock")
@@ -134,7 +138,7 @@ impl AuthZResolverClient for TypeAwareAuthZResolver {
                 context: EvaluationResponseContext::default(),
             });
         }
-        MockAuthZResolver.evaluate(request).await
+        MockAuthZResolver.evaluate(ctx, request).await
     }
 }
 
@@ -155,14 +159,15 @@ pub fn type_deny_enforcer(
 struct FailAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for FailAuthZResolver {
+impl AuthZResolverApi for FailAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::ServiceUnavailable(
-            "failing_enforcer: simulated PDP transport failure".to_owned(),
-        ))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::service_unavailable()
+            .with_detail("failing_enforcer: simulated PDP transport failure".to_owned())
+            .create())
     }
 }
 

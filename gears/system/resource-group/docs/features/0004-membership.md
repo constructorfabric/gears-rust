@@ -1,5 +1,5 @@
 <!-- Created: 2026-04-07 by Constructor Tech -->
-<!-- Updated: 2026-04-20 by Constructor Tech -->
+<!-- Updated: 2026-08-21 by Constructor Tech -->
 
 # Feature: Membership Management
 
@@ -145,14 +145,17 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 
 **Input**: resource_type, resource_id, target group's tenant_id
 
-**Output**: Pass or TenantIncompatibility with conflicting tenant details
+**Output**: Pass or TenantIncompatibility (message names neither tenant, to avoid disclosing the other tenant's id to the caller)
 
 **Steps**:
-1. [x] - `p1` - DB: SELECT rgm.group_id, rg.tenant_id FROM resource_group_membership rgm JOIN resource_group rg ON rgm.group_id = rg.id WHERE rgm.gts_type_id = {resource_type_id} AND rgm.resource_id = {resource_id} — find existing memberships for this resource - `inst-tenant-check-1`
-2. [x] - `p1` - **IF** no existing memberships → **RETURN** pass (first membership, any tenant allowed) - `inst-tenant-check-2`
-3. [x] - `p1` - Collect distinct tenant_ids from existing memberships - `inst-tenant-check-3`
-4. [x] - `p1` - **IF** target group's tenant_id is in the same tenant scope as existing memberships (same tenant or related via tenant hierarchy) → **RETURN** pass - `inst-tenant-check-4`
-5. [x] - `p1` - **RETURN** TenantIncompatibility: resource already linked in tenant {existing_tenant}, cannot add to tenant {target_tenant} - `inst-tenant-check-5`
+
+Updated: the check is one existence read, not a scan and not a count, and it shares a `SERIALIZABLE` transaction with the membership insert it gates (RG-01) — see `has_membership_in_other_tenant` in `membership_repo.rs`.
+
+1. [x] - `p1` - DB: SELECT 1 FROM resource_group rg WHERE rg.id IN (SELECT group_id FROM resource_group_membership WHERE gts_type_id = {resource_type_id} AND resource_id = {resource_id}) AND rg.tenant_id <> {target_tenant_id} LIMIT 1 — does this resource already belong to another tenant - `inst-tenant-check-1`
+2. [x] - `p1` - **IF** no row comes back → pass: either the resource has no memberships at all (first membership, any tenant allowed) or every one of them is already the target tenant's - `inst-tenant-check-2`
+3. [x] - `p1` - The read and the insert run in one `SERIALIZABLE` transaction: the read is a predicate the insert writes into, so below that level two first memberships from different tenants both commit - `inst-tenant-check-3`
+4. [x] - `p1` - **IF** pass → the caller proceeds to the membership insert in the same transaction - `inst-tenant-check-4`
+5. [x] - `p1` - **RETURN** TenantIncompatibility: resource already linked to another tenant (the message names neither tenant) - `inst-tenant-check-5`
 
 ### Membership Data Seeding
 

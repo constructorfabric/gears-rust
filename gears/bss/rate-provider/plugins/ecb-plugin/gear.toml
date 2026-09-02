@@ -1,0 +1,7 @@
+[gear]
+name = "ECB Rate Source Plugin"
+description = "ECB daily reference rate source plugin for the FX Rate Provider gear."
+category = "bss"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

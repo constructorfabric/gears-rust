@@ -1,0 +1,7 @@
+[gear]
+name = "Simple User Settings"
+description = "Lightweight per-user settings storage with CRUD API and schema validation."
+category = "serverless"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

@@ -1,0 +1,64 @@
+[package]
+name = "cf-gears-github-mirror"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "GitHub Mirror module"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+
+[lib]
+name = "github_mirror"
+
+[lints]
+workspace = true
+
+[dependencies]
+github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.1.0", path = "../github-mirror-sdk" }
+
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+
+reqwest = { workspace = true, features = ["json"] }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-db-macros = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }
+toolkit-utils = { workspace = true }
+chrono = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+httpmock = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }
+async-trait = { workspace = true }

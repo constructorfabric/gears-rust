@@ -137,8 +137,12 @@ Save the diff output for analysis.
 
 ### Step 2: Identify Rust files in diff
 
-Parse the diff to find all `.rs` files that were added or modified.
-For each file, note the changed line ranges (added lines only — you can only comment on lines present in the diff).
+Parse the diff to find all `.rs` files that were added, modified, or deleted.
+For added/modified files, note the changed line ranges (added lines only — you can only comment on lines present in the diff).
+
+Also record, per file, a **deletion anchor** for every hunk that removes lines with no added replacement in that hunk (a "pure deletion" hunk in a file that still exists at the review head) — needed so a finding about a partially deleted test (e.g. `TEST-QUALITY-9`) still has a valid line to anchor on. The anchor is the hunk's `newStart` value from its `@@ -oldStart,oldCount +newStart,newCount @@` header — the nearest surviving line in the new file at the deletion point. If `newStart` is `0`, use line `1`; if it falls past the end of the file, use the file's last line.
+
+For a `.rs` file **deleted entirely** (present in the base, absent at the review head — its diff hunk targets `/dev/null`), include its path in `rust_files` too, but track it separately in a `deleted_files` list. A deleted file has **no** RIGHT-side line at all, so do not compute `changed_ranges` or a `deletion_anchors` entry for it — see Step 4a for how its content is snapshotted and Step 5 for how findings on it are posted.
 
 ### Step 3: Read review guidelines and classify files
 
@@ -169,22 +173,30 @@ Write `/tmp/toolkit-pr-review-v2-$REVIEW_ID/context.json` with the metadata, fil
   "branch": "<BRANCH_NAME, or null in PR mode>",
   "base_branch": "<BASE_BRANCH, or null in PR mode>",
   "head_sha": "<HEAD_SHA>",
-  "rust_files": [<list of .rs files from Step 2>],
+  "rust_files": [<list of .rs files from Step 2, including deleted files>],
+  "deleted_files": [<subset of rust_files deleted entirely — no RIGHT-side content>],
   "toolkit_owned_files": [<files classified as ToolKit-owned in Step 3>],
-  "has_test_code": <boolean: true if any rust_files contains #[test], #[tokio::test], #[cfg(test)], or lives under tests/>,
+  "has_test_code": <boolean: true if any rust_files contains #[test], #[tokio::test], #[cfg(test)], or lives under tests/ — for deleted_files, check their base-side content instead of the (nonexistent) head content>,
   "changed_ranges": {
     "<filepath>": [[<start_line>, <end_line>], ...]
+  },
+  "deletion_anchors": {
+    "<filepath>": [<line>, ...]
   }
 }
 ```
 
 The `changed_ranges` dict maps each file to its list of changed line ranges (derived from parsing diff hunks in Step 2). Agents use this to validate that line numbers are within the diff.
 
-For each file in `rust_files`, read the file at the review head (the PR head commit in PR mode, `$BRANCH_NAME` in local mode) and write its full content to:
+The `deletion_anchors` dict maps each file to the pure-deletion-hunk anchor lines from Step 2. It is a secondary, narrower set of valid line targets — used only for findings about content partially removed from a file that still exists (no added line exists to anchor on), such as `TEST-QUALITY-9`. Omit a file's entry (or use `[]`) when it has no pure-deletion hunks. **Files listed in `deleted_files` never get an entry here** — they have no RIGHT-side line to anchor on at all; see Step 5 for how findings on them are posted instead.
+
+For each file in `rust_files` that is **not** in `deleted_files`, read the file at the review head (the PR head commit in PR mode, `$BRANCH_NAME` in local mode) and write its full content to:
 ```text
 /tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>
 ```
-where `<escaped-path>` replaces `/` with `__` (e.g., `gears/foo/src/service.rs` → `gears__foo__src__service.rs`).
+For each file **in** `deleted_files`, read it instead at the base commit (the PR's base SHA in PR mode, the merge-base with `$BASE_BRANCH` in local mode) and write that pre-deletion content to the same path — this lets Agent F see what was removed.
+
+`<escaped-path>` replaces `/` with `__` (e.g., `gears/foo/src/service.rs` → `gears__foo__src__service.rs`).
 
 ### Step 4b: Spawn parallel sub-agents
 
@@ -211,7 +223,7 @@ Check IDs: TOOLKIT-CORE-001, TOOLKIT-CORE-002, TOOLKIT-CORE-003, TOOLKIT-REST-00
 (Gated: skip if toolkit_owned_files is empty)
 
 **Agent F — Test Quality** (`toolkit-pr-review-v2-tests`):
-Check IDs: RUST-TEST-001, TEST-QUALITY-1 through TEST-QUALITY-8
+Check IDs: RUST-TEST-001, TEST-QUALITY-1 through TEST-QUALITY-9
 (Gated: skip if has_test_code is false)
 
 Each agent returns a JSON array of findings. See `docs/pr-review/agents/toolkit-pr-review-v2-<name>.md` for detailed prompt structure.
@@ -227,7 +239,8 @@ Wait for all Agent calls to complete. For each result:
 Deduplicate: drop any finding where `(file, line, id)` duplicates an earlier finding.
 
 Apply filter rules:
-- Drop findings where `line` is not in `changed_ranges[file]` for that file.
+- For a finding whose `file` is in `deleted_files`: keep it regardless of `line` (it has none — it posts as a file-level comment in Step 5).
+- For every other finding: drop it if `line` is not in `changed_ranges[file]` and not in `deletion_anchors[file]` for that file.
 - Drop style-only issues that rustfmt or clippy should catch.
 - Drop speculative or hypothetical findings (containing phrases like "might", "could consider", "may want to").
 
@@ -241,7 +254,22 @@ This merged, filtered, sorted, capped list becomes the input to Step 5.
 
 Local mode skips this step entirely — go to Step 5L.
 
-Use `gh api` to create a pull request review with inline comments.
+Split the merged findings into two groups:
+- **Line-anchored findings** — `file` not in `deleted_files`. Post together in one review (below).
+- **File-level findings** — `file` in `deleted_files`. A deleted file has no RIGHT-side line, so these cannot go in the batch review's `comments` array (which requires `line`+`side`). Post each individually via the single-comment endpoint with `subject_type: "file"` and no `line`/`side`:
+
+```bash
+gh api repos/$REPO/pulls/<PR_NUMBER>/comments \
+  --method POST \
+  -f commit_id="<HEAD_SHA>" \
+  -f path="gears/foo/src/tests.rs" \
+  -f subject_type="file" \
+  -f body="**HIGH**\n\nTest `send_dead_letter_on_timeout` was deleted with no follow-up.\n\nRestore the test or open a tracked issue and link it here."
+```
+
+Post these after the batch review below. If there are zero findings in both groups, skip straight to the "zero findings" review call.
+
+Use `gh api` to create a pull request review with the line-anchored inline comments.
 
 Build the review payload:
 
@@ -271,7 +299,9 @@ gh api repos/$REPO/pulls/<PR_NUMBER>/reviews \
   --input /tmp/review-payload.json
 ```
 
-If there are zero findings, skip the payload above and post a single review whose
+If there are zero line-anchored findings but at least one file-level finding, skip this review call and post only the file-level comments above.
+
+If there are zero findings in both groups, skip the payload above and post a single review whose
 `body` carries the message instead of an inline comment:
 
 ```bash
@@ -327,7 +357,7 @@ Structure:
 Rules for the report:
 - One severity section per severity present. Omit empty sections.
 - Findings keep the same wording discipline as inline comments (see [Comment formatting rules](#comment-formatting-rules)) — but the checklist ID **is** included here, since there is no separate terminal-only table.
-- File paths are repo-relative and include the line number, so they are clickable.
+- File paths are repo-relative and include the line number, so they are clickable. Exception: a finding whose `file` is in `deleted_files` has no line — render just the file path (e.g. `` `gears/foo/src/tests.rs` ``).
 - If there are zero findings, write the header plus a single line: `No issues found.`
 
 ### Step 6: Print summary
@@ -343,6 +373,9 @@ After posting (PR mode) or writing the file (local mode), print a compact summar
 |---|----|-----|----------|-------|-----|
 | 1 | RUST-ERR-001 | HIGH | service.rs:42 | Error context lost | Preserve source error |
 | 2 | TOOLKIT-SEC-001 | CRIT | handler.rs:18 | Raw DB connection | Use SecureConn |
+| 3 | TEST-QUALITY-9 | HIGH | tests.rs | Test deleted, no follow-up | Restore or track |
+
+For a finding whose `file` is in `deleted_files`, the Location column shows just the file path (no `:<line>`), since it was posted as a file-level comment.
 
 Posted <N> inline comments on PR #<PR_NUMBER>.
 ```
@@ -378,7 +411,7 @@ Rules:
 - No "consider", "you might want to", "it would be nice if". State what is wrong and what to do.
 - One issue per comment. If a line has two problems, post two comments.
 - Line number must point to an added/modified line that exists in the diff. Do not comment on unchanged lines.
-- If you cannot determine the exact line, do not guess — skip that finding.
+- If you cannot determine the exact line, do not guess — skip that finding. Exception: a finding on a file in `deleted_files` has no line by design — post it as a file-level comment (see Step 5), don't skip it and don't force a line onto it.
 
 ---
 

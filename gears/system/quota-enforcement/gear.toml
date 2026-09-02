@@ -1,0 +1,7 @@
+[gear]
+name = "Quota Enforcer"
+description = "Quota enforcement with validation, reservation, and commit/release lifecycle."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

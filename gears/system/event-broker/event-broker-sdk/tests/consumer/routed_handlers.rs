@@ -9,8 +9,8 @@ use event_broker_sdk::{
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.routed.v1";
-const CREATED: &str = "gts.cf.core.events.event_type.v1~example.mock.routed.created.v1";
-const UPDATED: &str = "gts.cf.core.events.event_type.v1~example.mock.routed.updated.v1";
+const CREATED: &str = "gts.cf.core.events.event.v1~example.mock.routed.created.v1~";
+const UPDATED: &str = "gts.cf.core.events.event.v1~example.mock.routed.updated.v1~";
 
 struct NamedHandler {
     name: &'static str,
@@ -60,7 +60,6 @@ async fn if_i_need_topic_type_routing_i_can_register_specific_and_default_handle
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         CREATED,
         "created-1",
         None,
@@ -70,7 +69,6 @@ async fn if_i_need_topic_type_routing_i_can_register_specific_and_default_handle
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         UPDATED,
         "updated-1",
         None,

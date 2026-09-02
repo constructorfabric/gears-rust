@@ -73,7 +73,7 @@ fn consumer_builder_accepts_default_and_routed_handlers() {
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .event_type(EventTypeRef::gts(gts_id!(
-            "cf.core.events.event.v1~example.orders.order_created.x.v1"
+            "cf.core.events.event.v1~example.orders.order_created.x.v1~"
         )))
         .handler(NoopHandler)
         .route()
@@ -179,7 +179,7 @@ async fn routed_consumer_rejects_duplicate_routes() {
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .event_type(EventTypeRef::gts(gts_id!(
-            "cf.core.events.event.v1~example.orders.order_created.x.v1"
+            "cf.core.events.event.v1~example.orders.order_created.x.v1~"
         )))
         .handler(NoopHandler)
         .route()
@@ -187,7 +187,7 @@ async fn routed_consumer_rejects_duplicate_routes() {
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .event_type(EventTypeRef::gts(gts_id!(
-            "cf.core.events.event.v1~example.orders.order_created.x.v1"
+            "cf.core.events.event.v1~example.orders.order_created.x.v1~"
         )))
         .handler(NoopHandler);
 
@@ -219,7 +219,7 @@ async fn routed_consumer_without_default_rejects_incomplete_routes() {
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .event_type(EventTypeRef::gts(gts_id!(
-            "cf.core.events.event.v1~example.orders.order_created.x.v1"
+            "cf.core.events.event.v1~example.orders.order_created.x.v1~"
         )))
         .handler(NoopHandler);
 
@@ -514,7 +514,7 @@ mod tx_typestate {
                 "cf.core.events.topic.v1~example.orders.x.x.v1"
             )))
             .event_type(EventTypeRef::gts(gts_id!(
-                "cf.core.events.event.v1~example.orders.order_created.x.v1"
+                "cf.core.events.event.v1~example.orders.order_created.x.v1~"
             )))
             .batch_handler(NoopTxBatchHandler);
     }
@@ -585,8 +585,7 @@ mod tx_typestate {
         use uuid::Uuid;
 
         const TOPIC: &str = gts_id!("cf.core.events.topic.v1~cf.core.orders.topic.v1");
-        const EVENT_TYPE: &str =
-            gts_id!("cf.core.events.event_type.v1~example.mock.broker.event.v1");
+        const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.event.v1~");
 
         let mock = MockBroker::new();
         let control = MockBrokerHandle::from_broker(&mock);
@@ -625,12 +624,10 @@ mod tx_typestate {
                 &Event {
                     id: Uuid::new_v4(),
                     type_id: EVENT_TYPE.to_owned(),
-                    topic: TOPIC.to_owned(),
                     tenant_id: ctx.subject_tenant_id(),
                     source: "consumer.builder.test".to_owned(),
                     subject: "subject-1".to_owned(),
                     subject_type: "test".to_owned(),
-                    partition_key: None,
                     occurred_at: chrono::Utc::now(),
                     trace_parent: None,
                     data: Some(serde_json::json!({ "ok": true })),

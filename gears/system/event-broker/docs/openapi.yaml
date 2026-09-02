@@ -39,7 +39,9 @@ paths:
       tags: [events]
       summary: Publish a single event
       description: |
-        Enqueue one event into the per-topic ingest outbox. Default response is
+        Enqueue one event into the per-topic ingest outbox. The broker resolves the
+        owning topic from the `topic` trait on the event `type`'s resolved GTS type
+        schema. Default response is
         `202 Accepted` once the event is durably enqueued; opt into synchronous
         backend persistence via the `Sync-Wait: true` header or `?wait=persisted`
         query parameter. Offset is assigned asynchronously by the storage backend
@@ -49,7 +51,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "./schemas/event.v1.schema.json"
+              $ref: "./schemas/gts.cf.core.events.event.v1~.schema.json"
       responses:
         "202":
           description: Accepted, durably enqueued in the outbox
@@ -80,7 +82,8 @@ paths:
       summary: Publish a batch of events (atomic per topic)
       description: |
         Atomic per-topic batch of up to 100 events. All-or-nothing per topic.
-        Mixing topics in one batch is rejected.
+        Each event's owning topic is resolved from the `topic` trait on its `type`;
+        a batch whose event types resolve to more than one topic is rejected.
       requestBody:
         required: true
         content:
@@ -92,7 +95,7 @@ paths:
                 events:
                   type: array
                   items:
-                    $ref: "./schemas/event.v1.schema.json"
+                    $ref: "./schemas/gts.cf.core.events.event.v1~.schema.json"
                   minItems: 1
                   maxItems: 100
       responses:
@@ -427,6 +430,9 @@ paths:
       description: |
         Returns a paginated, filterable list of topics. To retrieve a single topic by its
         GTS identifier use `$filter=id eq '<gts-id>'`. No `GET /v1/topics/{id}` path exists.
+        Items are `Topic` DTOs projected from each topic's registered instance. Topics are
+        registered in `types_registry` by their owning gear - no creation path exists in the
+        REST API.
       parameters:
         - name: $filter
           in: query
@@ -454,7 +460,7 @@ paths:
                   items:
                     type: array
                     items:
-                      $ref: "./schemas/topic.v1.schema.json"
+                      $ref: "#/components/schemas/Topic"
                   page_info:
                     $ref: "#/components/schemas/PageInfo"
         "400":
@@ -527,7 +533,9 @@ paths:
       description: |
         Returns a paginated, filterable list of event types. Event types are registered
         via the in-process SDK and types_registry — no creation path exists in the REST API.
-        To retrieve a single event type by GTS id use `$filter=id eq '<gts-id>'`.
+        To retrieve a single event type by GTS id use `$filter=id eq '<gts-id>'`. Items are
+        `EventType` DTOs projected from each event type's registered type schema, `data_schema`
+        included.
       parameters:
         - name: $filter
           in: query
@@ -555,7 +563,7 @@ paths:
                   items:
                     type: array
                     items:
-                      $ref: "./schemas/event_type.v1.schema.json"
+                      $ref: "#/components/schemas/EventType"
                   page_info:
                     $ref: "#/components/schemas/PageInfo"
         "400":
@@ -579,7 +587,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "./schemas/consumer_group.v1.schema.json#/definitions/CreateRequest"
+              $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json#/definitions/CreateRequest"
       responses:
         "201":
           description: Created
@@ -590,7 +598,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./schemas/consumer_group.v1.schema.json"
+                $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
         "403":
           description: Forbidden (caller lacks `consumer_group:define` permission)
           content:
@@ -627,7 +635,7 @@ paths:
                   items:
                     type: array
                     items:
-                      $ref: "./schemas/consumer_group.v1.schema.json"
+                      $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
                   page_info:
                     $ref: "#/components/schemas/PageInfo"
 
@@ -647,7 +655,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./schemas/consumer_group.v1.schema.json"
+                $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
         "403":
           description: Forbidden
           content:
@@ -717,7 +725,7 @@ paths:
                   items:
                     type: array
                     items:
-                      $ref: "./schemas/subscription.v1.schema.json"
+                      $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
                   page_info:
                     $ref: "#/components/schemas/PageInfo"
         "400":
@@ -741,14 +749,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "./schemas/subscription.v1.schema.json"
+              $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
       responses:
         "201":
           description: Subscription created; assignment computed
           content:
             application/json:
               schema:
-                $ref: "./schemas/subscription.v1.schema.json"
+                $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
         "400":
           description: |
             Validation error. Common codes:
@@ -815,7 +823,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./schemas/subscription.v1.schema.json"
+                $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
         "403":
           description: Forbidden
           content:
@@ -955,15 +963,74 @@ paths:
 components:
   schemas:
     Topic:
-      $ref: "./schemas/topic.v1.schema.json"
+      type: object
+      description: |
+        A topic as this API reports it. A concrete topic is an instance of
+        `gts.cf.core.events.topic.v1~`, carrying the stream's own data and no trait metadata.
+        How many partitions the broker gives it and which backend stores them are the
+        broker's configuration and are not reported here. This DTO is projected from the
+        registered instance.
+      required: [id, description]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          x-gts-instance: "gts.cf.core.events.topic.v1~"
+          description: >-
+            GTS instance identifier of the topic, chained under
+            `gts.cf.core.events.topic.v1~`.
+        description:
+          type: string
+          description: What the stream carries, for a reader deciding whether to subscribe.
+        retention:
+          type: ["string", "null"]
+          format: duration
+          description: >-
+            ISO 8601 duration events on this topic are retained for. Absent means the
+            broker's configured default.
     EventType:
-      $ref: "./schemas/event_type.v1.schema.json"
+      type: object
+      description: |
+        An event type as this API reports it. A concrete event type is a derived type schema
+        under `gts.cf.core.events.event.v1~`. This DTO is projected from the resolved schema:
+        `topic` and `allowed_subject_types` are trait values merged across the derivation
+        chain, and `data_schema` is the payload contract composed out of the schema's `data`
+        narrowings. Traits are schema-only, so none of them appear in a published event and a
+        producer cannot supply them.
+      required: [id, topic, allowed_subject_types, data_schema]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: >-
+            GTS type identifier of the event type, chained under
+            `gts.cf.core.events.event.v1~` and ending in `~`.
+        topic:
+          type: string
+          description: >-
+            GTS type identifier of the topic events of this type are published to, ending
+            in `~`.
+        description:
+          type: ["string", "null"]
+        allowed_subject_types:
+          type: array
+          items: { type: string }
+          description: >-
+            GTS Type-id patterns the event's `subject_type` must match - a concrete Type, a
+            wildcard suffix `<prefix>.*`, or a bare base Type `<base>~`.
+        data_schema:
+          type: object
+          additionalProperties: true
+          description: >-
+            JSON Schema for the event's `data` member, composed from the type's `data`
+            narrowings along the derivation chain. Producers and consumers validate payloads
+            against it. It is a projection of the resolved schema rather than a stored field.
     Event:
-      $ref: "./schemas/event.v1.schema.json"
+      $ref: "./schemas/gts.cf.core.events.event.v1~.schema.json"
     Subscription:
-      $ref: "./schemas/subscription.v1.schema.json"
+      $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
     ConsumerGroup:
-      $ref: "./schemas/consumer_group.v1.schema.json"
+      $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
     PageInfo:
       type: object
       required: [limit]
