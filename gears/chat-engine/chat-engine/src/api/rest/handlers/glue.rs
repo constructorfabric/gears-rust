@@ -66,7 +66,7 @@ fn reaction_to_dto(r: MessageReaction) -> ReactionDto {
 }
 
 /// `POST /chat-engine/v1/sessions/{id}/messages` — send a user message and
-/// stream the assistant response as NDJSON.
+/// stream the assistant response as SSE.
 #[tracing::instrument(skip(svc, ctx, body), fields(session_id = %session_id))]
 pub async fn send_message_in_session(
     Extension(ctx): Extension<SecurityContext>,
@@ -180,7 +180,7 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// `POST /chat-engine/v1/messages/{id}/recreate` — regenerate an assistant
-/// variant, streaming the new response as NDJSON.
+/// variant, streaming the new response as SSE.
 #[tracing::instrument(skip(messages, variants, ctx, body), fields(message_id = %message_id))]
 pub async fn recreate_message(
     Extension(ctx): Extension<SecurityContext>,
@@ -271,7 +271,7 @@ pub async fn set_reaction(
 }
 
 /// `POST /chat-engine/v1/sessions/{id}/summarize` — trigger an on-demand
-/// session summary, streaming progress + the persisted summary as NDJSON.
+/// session summary, streaming progress + the persisted summary as SSE.
 #[tracing::instrument(skip(svc, ctx), fields(session_id = %session_id))]
 pub async fn summarize_session(
     Extension(ctx): Extension<SecurityContext>,

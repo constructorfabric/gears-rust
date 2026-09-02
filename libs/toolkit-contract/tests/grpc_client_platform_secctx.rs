@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use secrecy::SecretString;
 use tonic::metadata::MetadataMap;
-use toolkit_contract::grpc_repr::{GrpcRepr, TryFromProto, ViaStringParseError};
+use toolkit_contract::grpc_repr::{GrpcRepr, ProtoDecodeError, TryFromProto};
 use toolkit_contract::runtime::config::{ClientConfig, InternalTokenProvider};
 use toolkit_contract::runtime::transport_error::TransportError;
 use toolkit_contract::{contract, grpc_contract};
@@ -61,7 +61,7 @@ pub struct RegResult {
 impl GrpcRepr for RegResult {}
 
 impl TryFromProto<stubs::RegisterResponse> for RegResult {
-    fn try_from_proto_wire(proto: stubs::RegisterResponse) -> Result<Self, ViaStringParseError> {
+    fn try_from_proto_wire(proto: stubs::RegisterResponse) -> Result<Self, ProtoDecodeError> {
         Ok(Self {
             accepted: proto.accepted,
         })

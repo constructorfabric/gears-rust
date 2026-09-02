@@ -1,5 +1,5 @@
 ---
-description: Review a GitHub PR for Rust + ToolKit compliance. Runs 6 specialized agents in parallel, then posts inline comments.
+description: Review a GitHub PR for Rust + ToolKit compliance. Runs up to 6 specialized agents in parallel (some are skipped based on repository conditions), then posts inline comments.
 ---
 
 # ToolKit PR Review
@@ -44,7 +44,7 @@ If `--repo` was passed as an argument, use that value instead. Store as `REPO`.
 PR_NUMBER=<PR_NUMBER>
 mkdir -p /tmp/toolkit-pr-review-v2-${PR_NUMBER}/files
 gh pr view ${PR_NUMBER} --repo ${REPO} \
-  --json number,title,body,headRefOid,baseRefName,headRefName \
+  --json number,title,body,headRefOid,baseRefOid,baseRefName,headRefName \
   > /tmp/toolkit-pr-review-v2-${PR_NUMBER}/meta.json
 gh pr diff ${PR_NUMBER} --repo ${REPO} \
   > /tmp/toolkit-pr-review-v2-${PR_NUMBER}/diff.patch
@@ -55,13 +55,15 @@ echo "HEAD SHA: $(jq -r .headRefOid /tmp/toolkit-pr-review-v2-${PR_NUMBER}/meta.
 
 Parse `/tmp/toolkit-pr-review-v2-${PR_NUMBER}/diff.patch` to extract:
 
-- **`rust_files`** — all added/modified `.rs` files (strip `a/`/`b/` prefix)
-- **`changed_ranges`** — per-file list of `[start, end]` line ranges from diff hunks
+- **`rust_files`** — all added, modified, or deleted `.rs` files (strip `a/`/`b/` prefix)
+- **`deleted_files`** — subset of `rust_files` whose diff hunk targets `/dev/null` on the new side (deleted entirely). These have no RIGHT-side line at all — no `changed_ranges` or `deletion_anchors` entry is computed for them; see Step 4 (base-side snapshot) and Step 7 (file-level comment).
+- **`changed_ranges`** — per-file list of `[start, end]` line ranges from diff hunks (added lines only; empty for files in `deleted_files`)
+- **`deletion_anchors`** — per-file list of anchor lines for pure-deletion hunks in a file that still exists (hunks that remove lines with no added replacement). The anchor is the hunk's `newStart` from its `@@ -oldStart,oldCount +newStart,newCount @@` header (clamp to line `1` if `0`, or the file's last line if past EOF). Needed so a finding about a partially deleted test (e.g. `TEST-QUALITY-9`) still has a valid line to anchor on.
 - **`toolkit_owned_files`** — subset of `rust_files` where **any** of these signals is present:
   - nearest `Cargo.toml` declares `toolkit` dependency/feature, or crate name starts with `toolkit`
   - file path matches `libs/toolkit*/`, `gears/*/src/`
   - source imports `use toolkit_*` or references `OperationBuilder`, `SecureConn`, `SecureORM`, `ClientHub`, `GearLifecycle`
-- **`has_test_code`** — `true` if any file contains `#[test]`, `#[tokio::test]`, or `#[cfg(test)]`
+- **`has_test_code`** — `true` if `diff.patch` contains `#[test]`, `#[tokio::test]`, or `#[cfg(test)]` on **any** line (added or removed) — scanning the raw diff, not just head-side file content, so a wholesale-deleted test file still sets this `true`
 
 ## Step 4: Write context and file snapshots
 
@@ -74,15 +76,23 @@ cat > /tmp/toolkit-pr-review-v2-${PR_NUMBER}/context.json << 'EOF'
   "repo": "<REPO>",
   "head_sha": "<HEAD_SHA>",
   "rust_files": [],
+  "deleted_files": [],
   "toolkit_owned_files": [],
   "has_test_code": false,
-  "changed_ranges": {}
+  "changed_ranges": {},
+  "deletion_anchors": {}
 }
 EOF
 
-# For each rust file, fetch content at HEAD and write to files/ with / replaced by __
+# For each rust file NOT in deleted_files, fetch content at HEAD and write to files/ with / replaced by __
 # Example:
 # gh api repos/${REPO}/contents/path/to/file.rs?ref=<HEAD_SHA> -q .content \
+#   | base64 -d > /tmp/toolkit-pr-review-v2-${PR_NUMBER}/files/path__to__file.rs
+
+# For each file IN deleted_files, fetch its pre-deletion content at the base commit instead
+# (BASE_SHA = baseRefOid from meta.json) — the file no longer exists at HEAD_SHA:
+# BASE_SHA=$(jq -r .baseRefOid /tmp/toolkit-pr-review-v2-${PR_NUMBER}/meta.json)
+# gh api repos/${REPO}/contents/path/to/file.rs?ref=${BASE_SHA} -q .content \
 #   | base64 -d > /tmp/toolkit-pr-review-v2-${PR_NUMBER}/files/path__to__file.rs
 ```
 
@@ -161,23 +171,28 @@ for name in order:
     except Exception as e:
         print(f"WARNING: {name}: {e}", file=sys.stderr)
 
-# Load changed_ranges for line validation
+# Load changed_ranges / deletion_anchors / deleted_files for line validation
 ctx = json.load(open(f"/tmp/toolkit-pr-review-v2-{PR_NUMBER}/context.json"))
 ranges = ctx.get("changed_ranges", {})
+deletion_anchors = ctx.get("deletion_anchors", {})
+deleted_files = set(ctx.get("deleted_files", []))
 
 def in_range(file, line):
     for start, end in ranges.get(file, []):
         if start <= line <= end:
             return True
-    return False
+    # TEST-QUALITY-9 findings on partially deleted content may anchor here instead
+    return line in deletion_anchors.get(file, [])
 
-# Deduplicate by (file, line, id), validate line in diff
+# Deduplicate by (file, line, id), validate line in diff.
+# A finding on a fully deleted file has no line at all (it posts as a
+# file-level comment in Step 7) and skips the line check entirely.
 seen, filtered = set(), []
 for f in combined:
-    key = (f["file"], f["line"], f["id"])
+    key = (f["file"], f.get("line"), f["id"])
     if key in seen:
         continue
-    if not in_range(f["file"], f["line"]):
+    if f["file"] not in deleted_files and not in_range(f["file"], f.get("line")):
         continue
     seen.add(key)
     filtered.append(f)
@@ -208,6 +223,15 @@ import json, os
 PR_NUMBER = os.environ["PR_NUMBER"]
 HEAD_SHA = os.environ["HEAD_SHA"]
 findings = json.load(open(f"/tmp/toolkit-pr-review-v2-{PR_NUMBER}/findings.json"))
+ctx = json.load(open(f"/tmp/toolkit-pr-review-v2-{PR_NUMBER}/context.json"))
+deleted_files = set(ctx.get("deleted_files", []))
+
+# A deleted file has no RIGHT-side line, so its findings can't go in the
+# batch review's `comments` array (which requires line+side). Post those
+# individually via the single-comment endpoint with subject_type="file".
+line_findings = [f for f in findings if f["file"] not in deleted_files]
+file_findings = [f for f in findings if f["file"] in deleted_files]
+
 comments = [
     {
         "path": f["file"],
@@ -215,28 +239,45 @@ comments = [
         "side": "RIGHT",
         "body": f"**{f['severity']}**\n\n{f['issue']}\n\n{f['fix']}"
     }
-    for f in findings
+    for f in line_findings
 ]
 payload = {
     "commit_id": HEAD_SHA,
     "event": "COMMENT",
     "body": "",
-    "comments": comments if comments else []
+    "comments": comments
 }
 json.dump(payload, open("/tmp/review-payload.json", "w"))
-print(f"Prepared {len(comments)} comments")
+json.dump(file_findings, open("/tmp/file-level-findings.json", "w"))
+print(f"Prepared {len(comments)} line comments, {len(file_findings)} file-level comments")
 PY
 
-if [ $(jq '.comments | length' /tmp/review-payload.json) -eq 0 ]; then
+LINE_COUNT=$(jq '.comments | length' /tmp/review-payload.json)
+FILE_COUNT=$(jq 'length' /tmp/file-level-findings.json)
+
+if [ "$LINE_COUNT" -eq 0 ] && [ "$FILE_COUNT" -eq 0 ]; then
   gh api repos/${REPO}/pulls/${PR_NUMBER}/reviews \
     --method POST \
     -f commit_id="${HEAD_SHA}" \
     -f event="COMMENT" \
     -f body="No issues found."
 else
-  gh api repos/${REPO}/pulls/${PR_NUMBER}/reviews \
-    --method POST \
-    --input /tmp/review-payload.json
+  if [ "$LINE_COUNT" -gt 0 ]; then
+    gh api repos/${REPO}/pulls/${PR_NUMBER}/reviews \
+      --method POST \
+      --input /tmp/review-payload.json
+  fi
+  # File-level comments: a deleted file has no RIGHT-side line to anchor on.
+  jq -c '.[]' /tmp/file-level-findings.json | while read -r finding; do
+    path=$(echo "$finding" | jq -r '.file')
+    body=$(echo "$finding" | jq -r '"**" + .severity + "**\n\n" + .issue + "\n\n" + .fix')
+    gh api repos/${REPO}/pulls/${PR_NUMBER}/comments \
+      --method POST \
+      -f commit_id="${HEAD_SHA}" \
+      -f path="${path}" \
+      -f subject_type="file" \
+      -f body="${body}"
+  done
 fi
 ```
 
@@ -252,7 +293,8 @@ print(f"\n## Rust PR Review: #{PR_NUMBER}\n")
 print("| # | ID | Sev | Location | Issue | Fix |")
 print("|---|----|-----|----------|-------|-----|")
 for i, f in enumerate(findings, 1):
-    loc = f"{f['file'].split('/')[-1]}:{f['line']}"
+    name = f['file'].split('/')[-1]
+    loc = f"{name}:{f['line']}" if f.get('line') else name
     print(f"| {i} | {f['id']} | {f['severity']} | {loc} | {f['issue'][:60]} | {f['fix'][:60]} |")
 print(f"\nPosted {len(findings)} inline comments on PR #{PR_NUMBER}.")
 PY

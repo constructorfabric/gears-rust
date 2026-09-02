@@ -253,7 +253,7 @@ fn noop_publisher() -> Arc<LedgerEventPublisher> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn close_blocked_by_tieout_variance() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -299,7 +299,7 @@ async fn close_blocked_by_tieout_variance() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clean_close_succeeds_and_is_idempotent() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -345,7 +345,7 @@ async fn clean_close_succeeds_and_is_idempotent() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn close_unknown_period_is_not_found() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -375,7 +375,7 @@ async fn close_unknown_period_is_not_found() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn close_blocked_by_open_exception() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -440,7 +440,7 @@ async fn close_blocked_by_open_exception() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn close_blocked_by_due_recognition_segment() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -487,7 +487,7 @@ async fn close_blocked_by_due_recognition_segment() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reopen_after_close_flips_to_open_and_records_reopened() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

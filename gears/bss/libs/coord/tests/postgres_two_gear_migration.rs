@@ -47,8 +47,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// A bare sea-orm connection rather than the toolkit `Db` the lease tests use:
 /// the subject is the migration's SQL and `SchemaManager` is what applies it.
 async fn fresh_pg() -> (ContainerAsync<Postgres>, DatabaseConnection) {
-    // Image pinned by cf-gears-test-containers, like every fixture in the repo.
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let conn = Database::connect(&url).await.expect("connect postgres");

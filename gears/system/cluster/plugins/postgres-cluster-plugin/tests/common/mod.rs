@@ -104,7 +104,7 @@ async fn spawn_postgres() -> (ContainerAsync<Postgres>, String) {
     let attempts = backoffs.len() + 1;
     let mut last_error = String::new();
     for attempt in 1..=attempts {
-        let container = match cf_gears_test_containers::postgres_with_db("cluster_test")
+        let container = match test_containers::postgres_named("cluster_test")
             .start()
             .await
         {
@@ -211,8 +211,8 @@ pub async fn isolated_schema_connection_string(
 /// instances on one shared container (`tests/conformance.rs`) need to stay well
 /// under the server's global `max_connections` (the stock image's default is
 /// 100). A combined-plugin instance's steady-state connection cost is
-/// `pool_max_size + 3` — the two dedicated LISTEN connections (cache watch +
-/// lock release-wake) plus the liveness beacon (DESIGN.md §3.3) — and the
+/// `pool_max_size + 2` — the two dedicated LISTEN connections (cache watch +
+/// lock release-wake) — and the
 /// pool half of that really is used, not merely permitted: the cache TTL reaper
 /// and the lock TTL reaper each grab a pool connection on their first sweep and
 /// then sit idle-but-open (normal pool reuse — sqlx doesn't close an idle pooled
@@ -220,9 +220,9 @@ pub async fn isolated_schema_connection_string(
 /// the two reapers alone would take the whole per-instance pool budget.
 ///
 /// Nothing here holds a pool connection *indefinitely*: held locks no longer pin
-/// one at all (§3.3), so a lock-heavy scenario needs no extra pool headroom —
-/// only the fixed +1 for its beacon, which is per-instance and does not grow with
-/// the number of locks held.
+/// one at all (§3.3), so a lock-heavy scenario needs no extra pool headroom
+/// whatsoever — and since the liveness beacon was removed there is no longer even a
+/// fixed per-instance connection for it.
 pub fn cluster_config_for_schema(connection_string: &str, schema: &str) -> PostgresClusterConfig {
     cluster_config_json(
         connection_string,
@@ -253,8 +253,8 @@ pub fn cluster_config_for_schema_with(
 /// That is now the *only* reason for the extra headroom — a held lock is a
 /// `cluster_lock` row, not an advisory lock on a connection (DESIGN.md §3.3), so
 /// holding it consumes nothing from the pool and held locks no longer figure into
-/// this number. The instance's liveness beacon is the sole advisory lock, and it
-/// sits on its own connection outside the pool.
+/// this number. This plugin takes no advisory lock anywhere, and the lock backend
+/// opens no connection outside the pool at all.
 pub fn lock_config_for_schema(connection_string: &str, schema: &str) -> PostgresLockConfig {
     lock_config_json(
         connection_string,

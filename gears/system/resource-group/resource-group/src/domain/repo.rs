@@ -32,6 +32,22 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
+    /// Same read, taking a row lock on the group for the rest of the
+    /// transaction.
+    ///
+    /// For the paths that decide something from rows *related* to this group
+    /// -- its children, its memberships -- and then write based on that
+    /// decision. Serializing those writers on the group row is what keeps the
+    /// decision true, and is why such a path does not need SERIALIZABLE.
+    ///
+    /// Backends without row locks (`SQLite`) ignore the clause; they are
+    /// serializable regardless, so the guarantee is unchanged.
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
+
     /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness
@@ -112,12 +128,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written, as the database counted
+    /// them: the statement is an `INSERT ... SELECT`, so the rows never reach
+    /// this process and nothing here can derive the figure.
     async fn insert_ancestor_closure_rows<C: DBRunner>(
         &self,
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     /// Delete every group in `group_ids` in one statement per bind-parameter
     /// chunk, not one per group (RG-10).
@@ -153,6 +172,17 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
+    /// Deepest descendant of `group_id` relative to it, or `0` when it has
+    /// none. A single `MAX(depth)` aggregate over the closure table, for
+    /// callers -- the move path's depth-limit check -- that need only the
+    /// scalar; see [`Self::get_descendant_ids_with_depth`] for callers
+    /// (force delete) that need the row set itself.
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError>;
+
     async fn count_children<C: DBRunner>(
         &self,
         db: &C,
@@ -179,12 +209,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written; see
+    /// [`Self::insert_ancestor_closure_rows`] for why the caller cannot
+    /// compute it.
     async fn rebuild_subtree_closure<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     async fn has_memberships<C: DBRunner>(
         &self,
@@ -270,16 +303,17 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
     /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
     ///
-    /// Returns the `updated_at` it wrote rather than the row: every other
-    /// column is either the key it was addressed by or immutable, so the
-    /// caller can assemble the new row from what it already holds. Reading
-    /// it back cost a second `gts_type` SELECT per update (RG-08).
+    /// Returns the row as the database now holds it: assembled from
+    /// `current` plus the two columns this write just set, not re-read.
+    /// Every other column is either the key `current` was addressed by or
+    /// immutable, so a second `gts_type` SELECT per update could not have
+    /// told the caller anything `current` didn't already have (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
-        type_id: i16,
+        current: gts_type::Model,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<time::OffsetDateTime, DomainError>;
+    ) -> Result<gts_type::Model, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
 
@@ -321,6 +355,25 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         db: &C,
         type_id: i16,
     ) -> Result<Vec<(Uuid, String)>, DomainError>;
+
+    /// The membership counterpart of `find_groups_violating_removed_parents`,
+    /// and it makes the same decisions for the same reasons: one query per
+    /// bind-parameter chunk rather than one per candidate path, the system
+    /// scope because an integrity sweep must see the real data regardless of
+    /// the caller's view, and a result bounded by the violating memberships
+    /// rather than by the popularity of the child type.
+    ///
+    /// Returns `(membership_code, group_id, group_name)` triples -- one per
+    /// violating pair, deduplicated, so a group with several memberships of
+    /// the same removed type is named once. A `membership_code` that no
+    /// longer resolves to a `gts_type` row is skipped: a type that does not
+    /// exist has no memberships to protect.
+    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
+        &self,
+        db: &C,
+        child_type_id: i16,
+        membership_codes: &[String],
+    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
 
     async fn list_types<C: DBRunner>(
         &self,
@@ -367,10 +420,35 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         resource_id: &str,
     ) -> Result<Option<membership_entity::Model>, DomainError>;
 
-    async fn get_existing_membership_tenant_ids<C: DBRunner>(
+    /// Whether `(gts_type_id, resource_id)` already has a membership owned by
+    /// a tenant other than `tenant_id`.
+    ///
+    /// An existence check, not a count and not a fetch: one statement,
+    /// `LIMIT 1`, no rows carried back into the process. The question the
+    /// caller asks is "is this resource already someone else's", and the
+    /// first conflicting row answers it -- a resource in a hundred groups
+    /// costs the same as one in two.
+    ///
+    /// The inner subquery is deliberately unscoped and this method builds
+    /// `system_scope()` itself: it is an integrity read, and it must see
+    /// every membership of the pair regardless of the caller's view.
+    /// `resource_group_membership` declares no scope columns, so a
+    /// constrained `AccessScope` would not merely narrow this read -- every
+    /// constraint fails to resolve a column and the whole condition compiles
+    /// to `WHERE false` (`cond.rs`, `build_constraint_condition`), which
+    /// would report every resource compatible with every tenant.
+    ///
+    /// This read and the membership insert it gates must share one
+    /// `SERIALIZABLE` transaction. It is a predicate read followed by a
+    /// write into that same predicate: two first memberships from different
+    /// tenants each see no conflict and both commit otherwise (RG-01). At
+    /// `SERIALIZABLE` that is the write skew SSI cancels, and the retry
+    /// already wrapping the transaction re-runs it against the winner.
+    async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
         gts_type_id: i16,
         resource_id: &str,
-    ) -> Result<Vec<Uuid>, DomainError>;
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError>;
 }

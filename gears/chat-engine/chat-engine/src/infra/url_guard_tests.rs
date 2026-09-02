@@ -23,13 +23,52 @@ fn rejects_bare_path() {
 }
 
 #[test]
-fn rejects_http_scheme() {
-    let err = validate_outbound_url("http://api.example.com/v1", "endpoint").unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("https"),
-        "must surface scheme requirement: {msg}"
-    );
+fn accepts_http_scheme() {
+    // Cleartext is allowed: an in-cluster backend behind the mesh, or a
+    // staging host with no certificate, is a legitimate endpoint. The
+    // address-range checks below still apply to it.
+    let url = validate_outbound_url("http://api.example.com/v1", "endpoint").expect("ok");
+    assert_eq!(url.scheme(), "http");
+}
+
+#[test]
+fn accepts_http_with_explicit_port() {
+    let url = validate_outbound_url("http://backend.svc.cluster.local:8080/hook", "endpoint")
+        .expect("ok");
+    assert_eq!(url.port(), Some(8080));
+}
+
+#[test]
+fn http_does_not_bypass_the_address_checks() {
+    // The scheme relaxation must not become an SSRF hole: the same hosts
+    // stay blocked whether they are reached over http or https.
+    for raw in [
+        "http://127.0.0.1/x",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/x",
+        "http://192.168.1.1/x",
+        "http://localhost/x",
+        "http://[::1]/x",
+    ] {
+        let err = validate_outbound_url(raw, "endpoint").unwrap_err_or_else_helper(raw);
+        assert!(matches!(err, PluginError::InvalidInput { .. }), "{raw}");
+    }
+}
+
+#[test]
+fn rejects_non_http_schemes() {
+    for raw in [
+        "ftp://api.example.com/x",
+        "file:///etc/passwd",
+        "ws://api.example.com/x",
+    ] {
+        let err = validate_outbound_url(raw, "endpoint").unwrap_err_or_else_helper(raw);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http"),
+            "must surface scheme requirement: {msg}"
+        );
+    }
 }
 
 #[test]

@@ -127,7 +127,7 @@ async fn setup_and_settle(
     DBProvider<DbError>,
     Chart,
 ) {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();

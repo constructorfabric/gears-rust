@@ -91,14 +91,17 @@ fn chain_len() -> usize {
     Migrator::migrations().len()
 }
 
+/// Below the workspace floor (`test_containers::POSTGRES_TAG`) on purpose,
+/// matching `pg_support::PG_TAG`; see its note on why `postgres_tagged` and not
+/// the bare default. `GEARS_TEST_PG_TAG` still overrides it.
+const PG_TAG: &str = "16-alpine";
+
 /// A running Postgres, its port, and the container guard.
 ///
 /// The guard is returned because dropping it stops the container: a caller that
 /// bound only the port would race its own database to the end of the test.
 async fn pg() -> (u16, ContainerAsync<Postgres>) {
-    // The image tag comes from cf-gears-test-containers, the single source of
-    // truth for database container versions across the workspace.
-    let container = cf_gears_test_containers::postgres()
+    let container = test_containers::postgres_tagged(PG_TAG)
         .start()
         .await
         .expect("start postgres");

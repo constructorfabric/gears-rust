@@ -1,0 +1,7 @@
+[gear]
+name = "Cluster Plane"
+description = "Distributed cache, leader election, and locks with pluggable coordination backends."
+category = "serverless"
+is_plugin = false
+has_plugins = true
+has_extension_point = false

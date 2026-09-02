@@ -38,7 +38,7 @@ fn lift(e: RepoError) -> DbError {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn claim_then_finalize_then_replay() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

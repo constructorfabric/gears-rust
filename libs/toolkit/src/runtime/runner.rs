@@ -130,7 +130,7 @@ pub struct RunOptions {
     pub oop: Option<OopSpawnOptions>,
     /// Maximum time allowed for each gear's graceful shutdown before hard-stop.
     ///
-    /// If `None`, uses `DEFAULT_SHUTDOWN_DEADLINE` (30 seconds).
+    /// If `None`, uses [`DEFAULT_SHUTDOWN_DEADLINE`](crate::runtime::DEFAULT_SHUTDOWN_DEADLINE) (35 seconds).
     ///
     /// See `HostRuntime::with_shutdown_deadline` for details on the relationship
     /// with `WithLifecycle::stop_timeout`.

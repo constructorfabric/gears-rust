@@ -140,7 +140,11 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
     let db = test_db().await;
     let enforcer = make_enforcer();
 
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        enforcer.clone(),
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -233,7 +237,7 @@ async fn create_type_duplicate_returns_409() {
 
     // Pre-create via service
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -287,7 +291,7 @@ async fn list_types_returns_200_with_page() {
     let code = rg_type_id!("test.list.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -314,7 +318,7 @@ async fn get_type_returns_200() {
     let code = rg_type_id!("test.get.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -362,7 +366,7 @@ async fn delete_type_returns_204() {
     let code = rg_type_id!("test.del.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -392,7 +396,7 @@ async fn create_group_returns_201() {
     let type_code = rg_type_id!("test.grp.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -458,7 +462,7 @@ async fn create_group_duplicate_id_returns_409() {
     let type_code = rg_type_id!("test.dupid.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -576,7 +580,7 @@ async fn rest_put_type_returns_200() {
     let code = rg_type_id!("test.put.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -639,7 +643,7 @@ async fn rest_post_membership_returns_201() {
 
     let mt_code = rg_type_id!("test.mt2._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -651,7 +655,7 @@ async fn rest_post_membership_returns_201() {
 
     let gt_code = rg_type_id!("test.gt2.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -664,13 +668,7 @@ async fn rest_post_membership_returns_201() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: gt_code,
-                name: "G1".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(gt_code, "G1".to_owned()),
             tenant_id,
         )
         .await
@@ -701,7 +699,7 @@ async fn rest_post_membership_returns_201() {
 async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &str) -> String {
     let code = rg_type_id!("test.{}.{}.v1~", suffix, Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -711,7 +709,7 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -734,7 +732,11 @@ async fn build_shared_router() -> (
 ) {
     let db = test_db().await;
     let enforcer = make_enforcer();
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        enforcer.clone(),
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -769,7 +771,7 @@ async fn rest_delete_membership_returns_204() {
 
     let mt = rg_type_id!("test.mtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -781,7 +783,7 @@ async fn rest_delete_membership_returns_204() {
 
     let gt = rg_type_id!("test.gtr.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -794,13 +796,7 @@ async fn rest_delete_membership_returns_204() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: gt,
-                name: "GDel".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(gt, "GDel".to_owned()),
             tenant_id,
         )
         .await
@@ -849,7 +845,7 @@ async fn rest_post_group_with_parent_returns_201() {
     let root_type = rg_type_id!("test.rtp.{}.v1~", Uuid::now_v7().as_simple());
     // Create type first without self-reference, then update to allow self as parent
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: root_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -859,7 +855,7 @@ async fn rest_post_group_with_parent_returns_201() {
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &root_type,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -874,13 +870,7 @@ async fn rest_post_group_with_parent_returns_201() {
     let parent = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: root_type.clone(),
-                name: "Parent".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(root_type.clone(), "Parent".to_owned()),
             tenant_id,
         )
         .await
@@ -916,13 +906,7 @@ async fn rest_delete_group_force_returns_204() {
     let parent = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt.clone(),
-                name: "FParent".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt.clone(), "FParent".to_owned()),
             tenant_id,
         )
         .await
@@ -932,13 +916,8 @@ async fn rest_delete_group_force_returns_204() {
     group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt,
-                name: "FChild".to_owned(),
-                parent_id: Some(parent.id),
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt, "FChild".to_owned())
+                .with_parent_id(Some(parent.id)),
             tenant_id,
         )
         .await
@@ -966,13 +945,7 @@ async fn rest_get_group_hierarchy_returns_200() {
     let root = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt.clone(),
-                name: "HRoot".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt.clone(), "HRoot".to_owned()),
             tenant_id,
         )
         .await
@@ -981,13 +954,8 @@ async fn rest_get_group_hierarchy_returns_200() {
     let child = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt,
-                name: "HChild".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt, "HChild".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -1068,7 +1036,7 @@ async fn rest_create_group_with_metadata() {
 
     let code = rg_type_id!("test.gm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1104,7 +1072,7 @@ async fn rest_group_response_omits_null_metadata() {
 
     let code = rg_type_id!("test.nm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1284,7 +1252,7 @@ async fn input_membership_non_gts_resource_type() {
 
     let rt = rg_type_id!("test.ngts.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1297,13 +1265,7 @@ async fn input_membership_non_gts_resource_type() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt,
-                name: "NGGroup".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt, "NGGroup".to_owned()),
             tenant_id,
         )
         .await
@@ -1519,7 +1481,7 @@ async fn input_deser_group_empty_name_returns_400() {
 
     let code = rg_type_id!("test.en.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1621,7 +1583,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1633,7 +1595,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgt.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1646,13 +1608,7 @@ async fn gts_membership_post_tilde_encoded() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: gt,
-                name: "TildeGroup".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(gt, "TildeGroup".to_owned()),
             tenant_id,
         )
         .await
@@ -1681,7 +1637,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmd._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1693,7 +1649,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgd.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1706,13 +1662,7 @@ async fn gts_membership_delete_tilde_encoded() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: gt,
-                name: "TildeDelGrp".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(gt, "TildeDelGrp".to_owned()),
             tenant_id,
         )
         .await
@@ -1745,7 +1695,7 @@ async fn gts_put_type_tilde_encoded() {
 
     let code = rg_type_id!("test.tput.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1778,7 +1728,7 @@ async fn smallint_type_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.sid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1812,7 +1762,7 @@ async fn smallint_group_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.gsid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1849,7 +1799,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let mt = rg_type_id!("test.msid._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1861,7 +1811,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let gt = rg_type_id!("test.gsidm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1874,13 +1824,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
     let group = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: gt,
-                name: "MSIDGrp".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(gt, "MSIDGrp".to_owned()),
             tenant_id,
         )
         .await
@@ -1917,13 +1861,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
     let root = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt.clone(),
-                name: "HSIDRoot".to_owned(),
-                parent_id: None,
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt.clone(), "HSIDRoot".to_owned()),
             tenant_id,
         )
         .await
@@ -1932,13 +1870,8 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
     let child = group_svc
         .create_group(
             &ctx,
-            resource_group_sdk::CreateGroupRequest {
-                id: None,
-                code: rt,
-                name: "HSIDChild".to_owned(),
-                parent_id: Some(root.id),
-                metadata: None,
-            },
+            resource_group_sdk::CreateGroupRequest::new(rt, "HSIDChild".to_owned())
+                .with_parent_id(Some(root.id)),
             tenant_id,
         )
         .await
@@ -1999,7 +1932,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
     // --- 409 Conflict: duplicate type ---
     let code = rg_type_id!("test.errdup.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2208,4 +2141,201 @@ async fn rest_route_smoke_all_endpoints_registered() {
             "{method} {path} ({desc}) returned 405 -- route not registered"
         );
     }
+}
+// =========================================================================
+// re-parent cycle detection (REST-level regression coverage)
+// =========================================================================
+//
+// `move_group_internal_impl` (src/domain/group_service.rs) detects cycles via
+// `is_descendant`; the resulting `DomainError::CycleDetected` is mapped to
+// `RgError::failed_precondition()` with the `hierarchy` precondition subject
+// (src/api/rest/error.rs). Service-level coverage already exists in
+// `group_service_test.rs` (TC-GRP-06/07, via `move_group_unscoped`) and
+// error-mapping coverage exists in `domain_unit_test.rs`
+// (`domain_to_problem_cycle_detected_is_400`), but neither one drives the
+// actual HTTP path. These two tests close that gap.
+//
+// There is no separate move endpoint: re-parenting stays part of the
+// `UpdateGroupDto` payload (`parent_id`, required, `null` for root -- see
+// its doc comment in `api/rest/dto.rs`), and `update_group_inner` delegates
+// to the same move logic when `parent_id` changes (src/domain/group_service.rs,
+// "Delegate to move logic"). So `PUT /resource-group/v1/groups/{id}` with a
+// changed `parent_id` is how these tests reach cycle detection.
+
+/// moving a group under its own descendant returns 400 with a
+/// `hierarchy` precondition violation.
+#[tokio::test]
+async fn rest_move_group_under_descendant_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc1").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest::new(rt.clone(), "CycRoot".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest::new(rt, "CycChild".to_owned())
+                .with_parent_id(Some(root.id)),
+            tenant_id,
+        )
+        .await
+        .expect("create child group");
+
+    // Move root under its own child -- would create a cycle.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "CycRoot",
+            "parent_id": child.id,
+            "metadata": null,
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400, got {status}: {body}"
+    );
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
+}
+
+/// moving a group under itself returns 400 with a `hierarchy`
+/// precondition violation.
+#[tokio::test]
+async fn rest_move_group_self_parent_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc2").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest::new(rt, "SelfRoot".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    // Move root under itself.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "SelfRoot",
+            "parent_id": root.id,
+            "metadata": null,
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400, got {status}: {body}"
+    );
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
+}
+
+/// `DomainError::TenantNotFound` -> 404, with the foreign tenant id as the
+/// problem's resource (`src/api/rest/error.rs` 56-59, currently uncovered).
+///
+/// Reached through `create_group`'s target-tenant path: `CreateGroupDto`
+/// carries an optional `tenant_id` letting an authorized caller create a
+/// group in a different tenant (see `tests/create_group_target_tenant_test.rs`
+/// for the domain-level coverage of that branch and of `TenantNotFound`
+/// itself). This router's `AllowAllAuthZ` mock compiles a scope constrained
+/// to the caller's own tenant (an `In` predicate over the subject's
+/// `tenant_id`), so a foreign target tenant is outside the compiled
+/// `AccessScope` and `create_group` maps that to `TenantNotFound` -- the
+/// same "we don't know this tenant" answer a real unknown tenant would get.
+#[tokio::test]
+async fn create_group_with_foreign_tenant_id_returns_404() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let foreign_tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.foreigntenant.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "Cross-tenant Group",
+            "tenant_id": foreign_tenant_id,
+        })),
+        tenant_id,
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "expected 404, got {status}: {body}"
+    );
+    assert_eq!(
+        body["context"]["resource_name"],
+        foreign_tenant_id.to_string(),
+        "problem resource_name should name the foreign tenant: {body}"
+    );
 }

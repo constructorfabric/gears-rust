@@ -124,6 +124,10 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore chat-engine companion doc — WEBHOOK-PROTOCOL.md documents the webhook JSON Schema (docs/webhook-protocol.json), the HTTP contract Chat Engine calls backend plugins over. A protocol reference supplementary to DESIGN.md, not a standalone SDLC artifact. Same class as the file-storage api.md/operations.md entry above."
+patterns = ["gears/chat-engine/docs/WEBHOOK-PROTOCOL.md"]
+
+[[ignore]]
 reason = "Ignore module 'mini-chat' docs (temporary: PRD/DESIGN constraints failing in CI)."
 patterns = ["gears/mini-chat/*"]
 

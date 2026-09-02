@@ -1,4 +1,3 @@
-// Created: 2026-06-03 by Constructor Tech
 //! The cache watch-union event type and the [`CacheWatch`] receiver.
 //!
 //! The union shape (`Event`/`Lagged`/`Reset`/`Closed`) is shared across all
@@ -20,7 +19,16 @@ use crate::restart::{RestartingWatch, ResubscribeFuture, RetryPolicy};
 /// The boxed factory the facade installs so an auto-restarted watch can recreate
 /// its subscription (re-running `watch`/`watch_prefix` against the bound
 /// backend). `None` on a bare [`CacheWatch::channel`] watch.
-type CacheResubscribeFn = Arc<dyn Fn() -> ResubscribeFuture<CacheWatch> + Send + Sync>;
+pub(crate) type CacheResubscribeFn = Arc<dyn Fn() -> ResubscribeFuture<CacheWatch> + Send + Sync>;
+
+/// The one extra channel slot
+/// [`channel_with_terminal_headroom`](CacheWatch::channel_with_terminal_headroom)
+/// reserves for the terminal [`CacheWatchEvent::Closed`].
+///
+/// One, not the election watches' two: the cache union's terminal sequence is a
+/// single `Closed`, where an election's is `Status(Lost)` then
+/// `Closed(Shutdown)`.
+const TERMINAL_HEADROOM: usize = 1;
 
 /// A cache watch-union event (DESIGN §3.9). Infallible at the type level:
 /// terminal failures arrive as [`CacheWatchEvent::Closed`]; transient backend
@@ -89,6 +97,59 @@ impl CacheWatch {
         )
     }
 
+    /// Creates a watch whose terminal [`CacheWatchEvent::Closed`] has a
+    /// **reserved slot**, returned as a [`CacheTerminalPermit`] alongside the
+    /// ordinary sender.
+    ///
+    /// The consumer-visible in-flight buffer stays `capacity`: the channel is one
+    /// slot larger and that slot is reserved here, at construction, against a
+    /// channel that was created on the line above and whose receiver is still
+    /// held — so the reservation cannot fail. That is the whole point of doing it
+    /// here rather than at first use: a pump that reserved lazily would be making
+    /// the reservation under exactly the back-pressure it exists to survive.
+    ///
+    /// Why a pump needs this at all: a `try_send`-only pump drops the terminal
+    /// `Closed` when the consumer is behind, and the consumer then observes
+    /// *end of stream* instead. Those are not interchangeable —
+    /// [`RestartingWatch`] treats end-of-stream on a resubscribable watch as the
+    /// canonical reconnect trigger, so a dropped `Closed(Shutdown)` turns a
+    /// terminal shutdown into a reconnect loop against a gear that is going away.
+    /// The election watches already reserve headroom for the same reason
+    /// (`LeaderWatch::channel`, ADR-003); the cache pumps did not.
+    ///
+    /// One slot rather than two: the cache union's terminal sequence is a single
+    /// `Closed`, where an election's is the `Status(Lost)` → `Closed(Shutdown)`
+    /// two-step.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero — a bounded channel requires a non-zero
+    /// buffer.
+    #[must_use]
+    pub fn channel_with_terminal_headroom(
+        capacity: usize,
+    ) -> (CacheWatchSender, CacheTerminalPermit, Self) {
+        assert!(
+            capacity > 0,
+            "CacheWatch::channel_with_terminal_headroom requires a non-zero capacity"
+        );
+        let (tx, rx) = mpsc::channel(capacity + TERMINAL_HEADROOM);
+        // Infallible here, and the type says so: `rx` is live and the channel is
+        // empty, so `try_reserve_owned` cannot report `Full` or `Closed`. Written
+        // as a fallback rather than an `expect` because a capacity-accounting
+        // mistake must cost the terminal event its guarantee, not the process its
+        // liveness — the same reading `ElectionSubscriptions::attach` takes.
+        let permit = tx.clone().try_reserve_owned().ok();
+        (
+            CacheWatchSender { tx: tx.clone() },
+            CacheTerminalPermit { permit, sender: tx },
+            Self {
+                rx,
+                resubscribe: None,
+                observability: None,
+            },
+        )
+    }
+
     /// Awaits the next event, or `None` once the backend has dropped the sender
     /// without sending a terminal [`CacheWatchEvent::Closed`] (end of stream).
     pub async fn recv(&mut self) -> Option<CacheWatchEvent> {
@@ -132,6 +193,17 @@ impl CacheWatch {
         self.resubscribe.as_ref().map(|factory| factory())
     }
 
+    /// The installed resubscribe seam itself, for a layer that must *re-wrap*
+    /// each fresh subscription rather than hand it to the consumer unchanged —
+    /// see `ScopedCacheBackend::strip_watch`, whose fresh inner watch speaks the
+    /// backend's name space and has to be re-stripped. [`try_resubscribe`] gives
+    /// a single future and so cannot be re-armed for the next reconnect.
+    ///
+    /// [`try_resubscribe`]: Self::try_resubscribe
+    pub(crate) fn resubscribe_factory(&self) -> Option<CacheResubscribeFn> {
+        self.resubscribe.clone()
+    }
+
     /// Wraps this watch in the opt-in [`RestartingWatch`] combinator, which
     /// transparently reconnects on retryable terminal closes per `policy`
     /// (DESIGN §3.9). The raw watch remains consumable without this wrapper.
@@ -153,6 +225,56 @@ pub enum CacheWatchTrySendError {
     /// The consumer dropped the watch; the subscription is dead and should be
     /// pruned.
     Closed,
+}
+
+/// The reserved slot a pump delivers its terminal [`CacheWatchEvent::Closed`]
+/// through, handed out by
+/// [`CacheWatch::channel_with_terminal_headroom`].
+///
+/// Deliberately **not** `Clone` and consumed by [`close`](Self::close): there is
+/// exactly one terminal event per subscription, so there is exactly one
+/// reservation, and a pump cannot spend it twice. Dropping it without closing
+/// releases the slot, which is the abrupt-teardown case — the consumer then
+/// observes end of stream, as it would from any dropped sender.
+pub struct CacheTerminalPermit {
+    /// `None` only if the reservation failed at construction, which cannot happen
+    /// on a fresh channel; the fallback exists so an accounting mistake degrades
+    /// to best-effort rather than panicking. See
+    /// [`CacheWatch::channel_with_terminal_headroom`].
+    permit: Option<mpsc::OwnedPermit<CacheWatchEvent>>,
+    /// The best-effort path used when no permit was reserved.
+    sender: mpsc::Sender<CacheWatchEvent>,
+}
+
+impl std::fmt::Debug for CacheTerminalPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `OwnedPermit`'s own `Debug` says nothing useful; whether a slot is
+        // actually held is the whole of what a reader wants to know.
+        f.debug_struct("CacheTerminalPermit")
+            .field("reserved", &self.permit.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CacheTerminalPermit {
+    /// Delivers the terminal `Closed(err)` through the reserved slot, without
+    /// ever blocking and without ever being dropped for want of buffer space.
+    ///
+    /// A no-op if the consumer has already dropped the watch — it has observed
+    /// the end of the subscription by a shorter route.
+    pub fn close(self, err: ClusterError) {
+        let event = CacheWatchEvent::Closed(err);
+        match self.permit {
+            // `send` consumes the permit and returns the sender clone it held,
+            // which is dropped here: its reserved slot has served its purpose.
+            Some(permit) => {
+                let _sender = permit.send(event);
+            }
+            None => {
+                let _dropped = self.sender.try_send(event);
+            }
+        }
+    }
 }
 
 /// The backend-side sender paired with a [`CacheWatch`] by

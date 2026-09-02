@@ -117,6 +117,17 @@ pub const fn assert_grpc_repr<T: GrpcRepr + ?Sized>() {}
 /// lives in [`crate::grpc`] under the `grpc-client` feature.
 pub trait SecurityContextMarker {}
 
+/// References are transparent.
+///
+/// The projection macros classify `&SecurityContext` exactly as they classify
+/// `SecurityContext` — `projection::type_path_ends_with` recurses through
+/// `Type::Reference` on purpose, and DESIGN §2.2 permits either spelling. The
+/// guard they emit asserts on the parameter type *as written*, so without this
+/// impl the by-reference form fails the assertion for **both** planes while the
+/// by-value form passes. That asymmetry is invisible until someone writes the
+/// reference form, which is the shape the cluster contract uses.
+impl<T: SecurityContextMarker + ?Sized> SecurityContextMarker for &T {}
+
 /// Compile-time helper used by generated code. Calling
 /// `assert_security_context::<T>()` requires `T: SecurityContextMarker` —
 /// so any type the macro classifies as "security context" must explicitly
@@ -135,10 +146,10 @@ pub struct UnknownEnumDiscriminant(pub i32);
 
 /// Error returned by the generated `try_from_proto` inherent method on a
 /// `ProtoBridge` struct when a `#[proto_bridge(via_string)]` field carries a
-/// value that fails to parse via `FromStr`. The parallel infallible
-/// `From<Proto>` impl panics with `.expect(...)` on malformed input — use
-/// `try_from_proto` to convert wire input from peers without exposing a
-/// remote-DoS surface.
+/// value that fails to parse via `FromStr`. Because that parse can fail on
+/// peer-supplied input, a struct with such a field gets no infallible
+/// `From<Proto>` impl at all — `try_from_proto` is its only decode path, so
+/// wire input from peers cannot expose a remote-DoS surface.
 #[derive(Debug, thiserror::Error)]
 #[error("proto bridge: invalid `{field}` value (could not parse from string): {source}")]
 pub struct ViaStringParseError {
@@ -149,12 +160,13 @@ pub struct ViaStringParseError {
 
 /// Fallible proto → Rust conversion for inbound wire data.
 ///
-/// `#[derive(ProtoBridge)]` emits both an infallible `From<Proto>` and a
-/// fallible counterpart. The infallible one panics on a malformed
-/// `#[proto_bridge(via_string)]` field, which is fine for data this process
-/// produced and unacceptable for data a peer sent — a malformed UUID from a
-/// remote would take the process down. Generated gRPC clients and hand-written
-/// tonic servers therefore convert inbound messages through this trait.
+/// `#[derive(ProtoBridge)]` always emits this fallible conversion, and emits an
+/// infallible `From<Proto>` alongside it *unless* the struct has a
+/// `#[proto_bridge(via_string)]` field — such a field decodes through `FromStr`,
+/// which a peer can make fail (a malformed UUID from a remote would take the
+/// process down), so no infallible path is generated for it. Generated gRPC
+/// clients and hand-written tonic servers convert inbound messages through this
+/// trait.
 ///
 /// The derive implements it for structs and enums alike, so codegen can call it
 /// uniformly. A hand-written proto bridge used as an RPC response type must
@@ -164,9 +176,50 @@ pub trait TryFromProto<P>: Sized {
     /// Convert a proto message into its Rust representation.
     ///
     /// # Errors
-    /// Returns [`ViaStringParseError`] when a `via_string` field carries a
-    /// value its `FromStr` impl rejects.
-    fn try_from_proto_wire(proto: P) -> Result<Self, ViaStringParseError>;
+    /// Returns [`ProtoDecodeError::ViaString`] when a `via_string` field carries a
+    /// value its `FromStr` impl rejects, and [`ProtoDecodeError::MissingMessage`]
+    /// when a required nested message is absent on the wire.
+    fn try_from_proto_wire(proto: P) -> Result<Self, ProtoDecodeError>;
+}
+
+/// A required nested message was absent on the wire.
+///
+/// prost renders every proto3 message field as `Option<T>`, so "required" is a
+/// property of the Rust DTO rather than of the wire. A peer that omits such a field
+/// — an older build, a hand-written client, a corrupted frame — is a decode error
+/// here rather than a zeroed field that fails a predicate much later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingRequiredMessage {
+    /// The DTO field whose required nested message was missing.
+    pub field: &'static str,
+}
+
+impl ::std::fmt::Display for MissingRequiredMessage {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "required nested message `{}` is absent", self.field)
+    }
+}
+
+impl ::std::error::Error for MissingRequiredMessage {}
+
+/// Error returned by the fallible decode path
+/// ([`TryFromProto::try_from_proto_wire`] and the generated inherent
+/// `try_from_proto`).
+///
+/// An enum rather than a single boxed type so a caller can distinguish an absent
+/// required message from a malformed `via_string` field **by variant**, without
+/// downcasting a `Box<dyn Error>`. The two failures want different handling: a
+/// missing message is a wire-shape/version-skew problem, a bad string is a value
+/// problem.
+#[derive(Debug, thiserror::Error)]
+pub enum ProtoDecodeError {
+    /// A `#[proto_bridge(via_string)]` field carried a value its `FromStr`
+    /// rejected.
+    #[error(transparent)]
+    ViaString(#[from] ViaStringParseError),
+    /// A required nested message was absent on the wire.
+    #[error(transparent)]
+    MissingMessage(#[from] MissingRequiredMessage),
 }
 
 /// Logging hook called from generated `From<i32>` impls when the wire value

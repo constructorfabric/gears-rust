@@ -93,10 +93,10 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
 /// LibreSSL (or nothing) is available, so callers can skip rather than fail.
 fn resolve_openssl() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("OPENSSL_BIN") {
-        if !p.is_empty() {
-            candidates.push(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("OPENSSL_BIN")
+        && !p.is_empty()
+    {
+        candidates.push(PathBuf::from(p));
     }
     candidates.push(PathBuf::from("openssl")); // resolved via PATH
     for p in [
@@ -312,8 +312,9 @@ fn do_handshake_and_get(
     Vec<u8>,
 ) {
     let mut sock = TcpStream::connect(("localhost", port)).expect("tcp connect");
-    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(5)))
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(30)))
         .unwrap();
 
     let server = ServerName::try_from("localhost").unwrap();
@@ -508,8 +509,9 @@ fn run_one_request(
     // Server thread.
     let server_handle = std::thread::spawn(move || {
         let (mut tcp, _) = listener.accept().expect("accept");
-        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut conn = ServerConnection::new(server_cfg).expect("server conn");
         let mut tls = Stream::new(&mut conn, &mut tcp);
 

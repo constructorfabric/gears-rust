@@ -8,10 +8,21 @@
 //! cycle detection, closure table management, query profile enforcement,
 //! and CRUD orchestration.
 //!
-//! All hierarchy-mutating operations (`create_group`, `update_group`,
-//! `move_group`, `delete_group`) use `SERIALIZABLE` transactions with
-//! bounded retry (max 3 attempts) to prevent phantom reads and ensure
-//! closure table consistency under concurrent mutations.
+//! Every write runs in a transaction with bounded retry (max 3 attempts).
+//! The isolation level is chosen per operation, not fixed:
+//!
+//! - `SERIALIZABLE` where a write depends on a predicate over rows it does
+//!   not itself lock — `create_group`, `move_group`, `update_group`'s
+//!   parent-change branch, and a force delete, all of which rewrite closure
+//!   rows across a subtree.
+//! - The backend default where there is no such predicate: `update_group`'s
+//!   rename/metadata path, which changes one row by primary key, and a
+//!   non-force delete, which takes a row lock on its target so the children
+//!   and membership checks it decides from stay true until it commits.
+//!
+//! See `update_group` for how a level is picked before the transaction opens
+//! when the answer is not yet known, and how the race with that guess is
+//! closed. `delete_group` needs none of that: `force` is a request field.
 
 use std::sync::Arc;
 
@@ -20,7 +31,7 @@ use resource_group_sdk::models::{
     CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
-use toolkit_db::secure::{DBRunner, TxConfig};
+use toolkit_db::secure::{DBRunner, Db, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use tracing::debug;
@@ -28,6 +39,7 @@ use uuid::Uuid;
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
+use crate::domain::metrics::{NoopMetrics, Operation, Outcome, RgMetricsPort};
 use crate::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::validation;
 
@@ -70,6 +82,88 @@ pub struct GroupService<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> {
     group_repo: Arc<GR>,
     type_repo: Arc<TR>,
     types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    /// Defaults to `NoopMetrics`; the composition root installs the real
+    /// recorder through `with_metrics`, whose doc carries the rationale for
+    /// keeping it out of the constructor. An uninstrumented run -- including
+    /// every test here -- records nothing and pays nothing.
+    metrics: Arc<dyn RgMetricsPort>,
+}
+
+/// The isolation level one `update_group` attempt opens its transaction at.
+///
+/// Named rather than passed as a bare `bool`: `attempt_update_group` and
+/// `update_group_inner` thread this value straight from the pre-transaction
+/// hint through to `TxConfig` and back out to the `NeedsSerializable` check,
+/// and a `bool` at those call sites reads as "the flag" rather than "which
+/// level" -- exactly backwards for the one parameter this whole branch of
+/// the PR is about getting right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteIsolation {
+    /// The backend default. Correct for a rename or metadata-only edit:
+    /// one row by primary key, locked explicitly
+    /// (`find_model_by_id_for_update`) rather than protected by a
+    /// cross-row predicate.
+    RowLocked,
+    /// A parent change. Cycle detection and the closure rebuild read a
+    /// predicate over rows the write does not itself lock.
+    Serializable,
+}
+
+impl WriteIsolation {
+    fn tx_config(self) -> TxConfig {
+        match self {
+            Self::RowLocked => TxConfig::default(),
+            Self::Serializable => TxConfig::serializable(),
+        }
+    }
+
+    fn is_serializable(self) -> bool {
+        matches!(self, Self::Serializable)
+    }
+}
+
+/// Result of one `update_group_inner` attempt.
+///
+/// Internal control flow only -- it never crosses a `?` boundary into
+/// `DomainError`, so it changes nothing a caller can observe.
+/// `update_group` picks the transaction's isolation level from a
+/// pre-transaction hint about whether the request moves the group;
+/// `NeedsSerializable` is how the authoritative in-transaction read reports
+/// that the hint was wrong in the direction that matters. It is returned
+/// before that attempt writes anything, so abandoning the attempt is always
+/// a no-op, never a partial write.
+enum UpdateGroupOutcome {
+    /// The update finished under a transaction strong enough for what it
+    /// turned out to need.
+    Done(ResourceGroup),
+    /// The move branch is required, but this transaction is not
+    /// SERIALIZABLE. Nothing was written.
+    NeedsSerializable,
+}
+
+/// Enough of a new-parent row for `move_group_internal_impl`'s checks: the
+/// GTS type id, which it resolves itself for the allowed-parent-type check,
+/// and the tenant, which it does nothing with except hand back so the
+/// caller can run its own cross-tenant check against the same read (see
+/// `MoveOutcome`).
+///
+/// Built by the caller from a single `find_model_by_id`, not by this
+/// function -- both call sites already need that row for their own purposes
+/// (a pre-call cross-tenant check on the update path, the snapshot itself on
+/// the move path), and a second read of the same id inside this function on
+/// top of that was the redundant one this type exists to remove.
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+pub(crate) struct ParentSnapshot {
+    pub tenant_id: Uuid,
+    pub gts_type_id: i16,
+}
+
+/// What a subtree move hands back to its caller: enough to assemble the
+/// response and record the metric, and nothing of the persistence layer.
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+pub(crate) struct MoveOutcome {
+    pub parent_tenant_id: Option<Uuid>,
+    pub closure_rows: u64,
 }
 
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
@@ -91,7 +185,44 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo,
             type_repo,
             types_registry,
+            metrics: Arc::new(NoopMetrics),
         }
+    }
+
+    /// Record one operation's wall time and whether it succeeded.
+    ///
+    /// Taken around the whole public method, so it includes the retries the
+    /// caller never sees as separate attempts -- which is the point: a
+    /// latency tail made of retried work looks like slow work from outside,
+    /// and that is what a caller experiences.
+    fn record_op<T>(
+        &self,
+        operation: Operation,
+        started: std::time::Instant,
+        result: &Result<T, DomainError>,
+    ) {
+        self.metrics.operation_duration(
+            operation,
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+            started.elapsed().as_secs_f64(),
+        );
+    }
+
+    /// Install a metrics recorder.
+    ///
+    /// Separate from `new` on purpose. The constructor has 150-odd call
+    /// sites, nearly all of them tests that have no interest in metrics, and
+    /// a required parameter would bury the change that matters in churn. The
+    /// composition root -- `gear.rs`, which is where infrastructure belongs
+    /// -- calls this; everything else keeps the no-op and records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn RgMetricsPort>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-create-group:p1
@@ -105,17 +236,59 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: CreateGroupRequest,
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
         // Pre-validation (stateless, outside transaction)
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
+        // Metadata validation belongs here rather than inside the transaction:
+        // it resolves the chained GTS schema through `TypesRegistryClient` --
+        // a network round-trip -- and then compiles it. Held open, that time
+        // is snapshot lifetime and SSI read-set age, and every retry paid for
+        // the lookup and the compile again. It reads no database state, so
+        // nothing about the transaction makes its answer more correct.
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+        let validation_started = std::time::Instant::now();
+        let validated = validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await;
+        self.metrics.metadata_validation_duration(
+            Operation::Create,
+            validation_started.elapsed().as_secs_f64(),
+        );
+        validated?;
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+
         // Derive `is_tenant` for AuthZ properties from the code prefix: any type
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
         let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
 
+        // Reject a caller-supplied `tenant_id` on tenant-typed groups: the
+        // effective tenant is always the group's own (generated) id.
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        // Resolve the target tenant: omitted `tenant_id` defaults to the
+        // caller's own tenant. A present `tenant_id` lets an authorized
+        // caller (platform admin / onboarding) target a different tenant.
+        let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
+
+        // Guardrail: explicit id + cross-tenant target is rejected while
+        // identifier ownership policy is undecided.
+        if req.id.is_some() && target_tenant_id != tenant_id {
+            return Err(DomainError::validation(
+                "id and tenant_id cannot both be set on group creation: an explicit id \
+                 combined with a cross-tenant target is not accepted while identifier \
+                 ownership policy is undecided"
+                    .to_owned(),
+            ));
+        }
+
         // AuthZ gate with provisioning context
-        let _scope =
+        let scope =
             self.enforcer
                 .access_scope_with(
                     ctx,
@@ -131,42 +304,65 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                                     serde_json::Value::String(id.to_string())
                                 }),
                             ),
+                            (
+                                pep_properties::OWNER_TENANT_ID.to_owned(),
+                                serde_json::Value::String(target_tenant_id.to_string()),
+                            ),
                         ])),
                 )
                 .await
                 .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
+        // When the target tenant differs from the caller's own, re-verify
+        // it against the compiled `AccessScope` rather than trusting the
+        // PDP's `decision: true` alone: a policy that grants "create"
+        // unconditionally must not become an unbounded cross-tenant create.
+        // Skipped when the target is the caller's own tenant, so the common
+        // path is unchanged.
+        if target_tenant_id != tenant_id {
+            let permitted = scope.is_unconstrained()
+                || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
+            if !permitted {
+                debug!(
+                    caller_tenant_id = %tenant_id,
+                    target_tenant_id = %target_tenant_id,
+                    "create_group rejected: target tenant outside caller's AccessScope"
+                );
+                return Err(DomainError::tenant_not_found(target_tenant_id));
+            }
+        }
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let req = req.clone();
-            let profile = profile.clone();
-            let group_repo = group_repo.clone();
-            let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
-            Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+        let result = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let req = req.clone();
+                let profile = profile.clone();
+                let group_repo = group_repo.clone();
+                let type_repo = type_repo.clone();
+                Box::pin(async move {
+                    Self::create_group_inner(
+                        &*group_repo,
+                        &*type_repo,
+                        tx,
+                        &req,
+                        target_tenant_id,
+                        &profile,
+                    )
+                    .await
+                })
             })
-        })
-        .await
+            .await;
+        self.record_op(Operation::Create, started, &result);
+        result
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
@@ -230,14 +426,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-update-group:p1
     /// Update a resource group (full replacement via PUT, AuthZ-scoped).
     ///
-    /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
-    /// to ensure invariant checks, closure table mutations, and the update are atomic.
+    /// Runs inside one transaction with bounded retry (max 3 attempts) so the
+    /// invariant checks, the closure-table mutations and the update itself are
+    /// atomic. The isolation level is chosen per call, not fixed: a rename or a
+    /// metadata edit touches one row by primary key and runs at the backend
+    /// default, while a parent change needs `SERIALIZABLE` for the cycle,
+    /// depth and width predicates it decides from. See the comment on the
+    /// isolation hint below -- when the hint turns out to be wrong, the whole
+    /// operation reruns at `SERIALIZABLE`.
     pub async fn update_group(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
         req: UpdateGroupRequest,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id}
         // AuthZ gate: verify the caller can update this group (tenant check).
@@ -258,15 +461,144 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+        // One pre-transaction read, serving two purposes.
+        //
+        // Metadata validation goes over the network and compiles a schema, so
+        // it must not run with the transaction open -- see `create_group`.
+        // Unlike create, the type is not in the request; it has to be read,
+        // and it cannot go stale, because a group's type is immutable (which
+        // is why `UpdateGroupRequest` has no `code` field).
+        //
+        // The same row also carries the current `parent_id`, which decides
+        // the transaction's isolation level below. `conn` is scoped to this
+        // block so the pooled connection is back before the transaction asks
+        // for its own.
+        let existing = {
+            let conn = db
+                .conn()
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            // Scoped read first, before anything whose *shape* the caller can
+            // observe. `find_model_by_id` builds `system_scope()`, so on its
+            // own it answers for a group in any tenant -- and the metadata
+            // validation right below returns a schema-shaped 400, which a
+            // cross-tenant id must not be able to tell apart from the 404 an
+            // unknown id gets. Same rule the delete path states: a foreign id
+            // and a non-existent one look identical from outside.
+            group_repo
+                .find_by_id(&conn, &scope, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+            let existing = group_repo
+                .find_model_by_id(&conn, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+            if req.metadata.is_some() {
+                let type_path =
+                    Self::resolve_type_path_from_id(&conn, existing.gts_type_id).await?;
+                let validation_started = std::time::Instant::now();
+                let validated = validation::validate_metadata_via_gts(
+                    req.metadata.as_ref(),
+                    &type_path,
+                    &*self.types_registry,
+                )
+                .await;
+                self.metrics.metadata_validation_duration(
+                    Operation::Update,
+                    validation_started.elapsed().as_secs_f64(),
+                );
+                validated?;
+            }
+            existing
+        };
+
+        // Take the least-strict level that stays correct for this update.
+        // Write-skew here -- cycle detection racing a concurrent create or
+        // move, and the closure rebuild -- is reachable only on the
+        // parent-change branch. A rename or metadata edit touches one row by
+        // primary key and has no cross-row predicate to protect, so the
+        // backend default is enough. On SQLite that changes nothing, since it
+        // is serializable regardless; this is a PostgreSQL saving.
+        //
+        // It is a *hint*: computed before the transaction opens, so a
+        // concurrent request can change this group's parent in the gap. The
+        // authoritative answer is always `update_group_inner`'s own fresh
+        // read. If the hint was wrong in the dangerous direction -- it said
+        // "no move", the fresh read says otherwise -- the inner function
+        // returns `NeedsSerializable` before writing anything and the whole
+        // operation reruns at `TxConfig::serializable()`. Wrong in the other
+        // direction is harmless: SERIALIZABLE is a safe superset, so a hint
+        // that overshoots costs a little and protects the same invariants.
+        let guessed_parent_changed = existing.parent_id != req.parent_id;
+        let hinted_isolation = if guessed_parent_changed {
+            WriteIsolation::Serializable
+        } else {
+            WriteIsolation::RowLocked
+        };
+
+        let first = Self::attempt_update_group(
+            &db,
+            &group_repo,
+            &type_repo,
+            &scope,
+            group_id,
+            &req,
+            &profile,
+            hinted_isolation,
+        )
+        .await?;
+
+        let result = match first {
+            UpdateGroupOutcome::Done(group) => Ok(group),
+            UpdateGroupOutcome::NeedsSerializable => {
+                self.metrics.isolation_escalation(Operation::Update);
+                match Self::attempt_update_group(
+                    &db,
+                    &group_repo,
+                    &type_repo,
+                    &scope,
+                    group_id,
+                    &req,
+                    &profile,
+                    WriteIsolation::Serializable,
+                )
+                .await?
+                {
+                    UpdateGroupOutcome::Done(group) => Ok(group),
+                    // Unreachable: this attempt ran at SERIALIZABLE, which is
+                    // the level `NeedsSerializable` asks for. Reported rather
+                    // than looped, so a future change that breaks the
+                    // invariant surfaces instead of spinning.
+                    UpdateGroupOutcome::NeedsSerializable => Err(DomainError::database(
+                        "update_group still reported NeedsSerializable after escalating to \
+                         SERIALIZABLE",
+                    )),
+                }
+            }
+        };
+        self.record_op(Operation::Update, started, &result);
+        result
+    }
+
+    /// Run one `update_group` attempt at the isolation level `isolation`
+    /// selects, with the usual bounded retry inside it.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_update_group(
+        db: &Db,
+        group_repo: &Arc<GR>,
+        type_repo: &Arc<TR>,
+        scope: &toolkit_security::AccessScope,
+        group_id: Uuid,
+        req: &UpdateGroupRequest,
+        profile: &QueryProfile,
+        isolation: WriteIsolation,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
+        db.transaction_with_retry(isolation.tx_config(), DomainError::db_err, |tx| {
             let req = req.clone();
             let scope = scope.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
                 Self::update_group_inner(
                     &*group_repo,
@@ -276,7 +608,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
-                    &*types_registry,
+                    isolation,
                 )
                 .await
             })
@@ -294,6 +626,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
@@ -306,23 +639,32 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let profile = profile.clone();
-            let group_repo = group_repo.clone();
-            let type_repo = type_repo.clone();
-            Box::pin(async move {
-                Self::move_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    group_id,
-                    new_parent_id,
-                    &profile,
-                )
-                .await
+        let result = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let profile = profile.clone();
+                let group_repo = group_repo.clone();
+                let type_repo = type_repo.clone();
+                Box::pin(async move {
+                    Self::move_group_inner(
+                        &*group_repo,
+                        &*type_repo,
+                        tx,
+                        group_id,
+                        new_parent_id,
+                        &profile,
+                    )
+                    .await
+                })
             })
-        })
-        .await
+            .await;
+        self.record_op(Operation::Move, started, &result);
+        // Record closure-row metrics outside the retry closure so retries
+        // do not double-count (CodeRabbit).
+        if let Ok((_, closure_rows)) = &result {
+            self.metrics
+                .closure_rows_written(Operation::Move, *closure_rows);
+        }
+        result.map(|(group, _)| group)
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
@@ -332,14 +674,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-delete-group:p1
     /// Delete a resource group (AuthZ-scoped).
     ///
-    /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
-    /// to ensure reference checks and cascading deletes are atomic.
+    /// Runs inside one transaction with bounded retry (max 3 attempts) so the
+    /// reference checks and the deletes are atomic. The isolation level
+    /// depends on `force`: a force delete rewrites closure rows across a whole
+    /// subtree and keeps `SERIALIZABLE`, while a non-force delete removes one
+    /// leaf, takes a row lock on it, and runs at the backend default. The
+    /// comment inside spells out why the row lock is enough there.
     pub async fn delete_group(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
         force: bool,
     ) -> Result<(), DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
         // Actor sends DELETE /api/resource-group/v1/groups/{group_id}?force={true|false}
         // AuthZ gate: verify the caller can delete this group (tenant check).
@@ -353,15 +700,60 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
+        // A force delete rewrites a whole subtree -- closure rows for every
+        // node, memberships, the group rows themselves -- and races a
+        // concurrent create or move anywhere inside it. That is write skew,
+        // and it keeps SERIALIZABLE.
+        //
+        // A non-force delete removes one leaf, and refuses if it has children
+        // or memberships. The only thing it needs is for that refusal to
+        // still be true when the delete runs. No cross-row predicate, so
+        // nothing for SERIALIZABLE to protect.
+        //
+        // What actually serializes it against a concurrent `create_group`
+        // under the same parent is not this row lock on its own -- a plain
+        // `SELECT` does not wait on `FOR UPDATE`, so the create reads the
+        // parent and proceeds. It is the foreign key: inserting a child takes
+        // `FOR KEY SHARE` on the parent row, and that conflicts with the
+        // `FOR UPDATE` taken here. Whichever arrives first, the other waits.
+        // If the delete won, the create fails on `ON DELETE RESTRICT`; if the
+        // create won, the delete re-reads and sees the child. The lock is what
+        // makes the ordering decidable rather than what does the blocking, and
+        // the same holds for memberships and closure rows -- every one of
+        // those foreign keys is `RESTRICT`.
+        //
+        // Unlike `update_group`, no hint is involved: `force` is a request
+        // field, known before the transaction opens.
+        let config = if force {
+            TxConfig::serializable()
+        } else {
+            TxConfig::default()
+        };
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let scope = scope.clone();
-            let group_repo = group_repo.clone();
-            Box::pin(async move {
-                Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
+        let result = db
+            .transaction_with_retry(config, DomainError::db_err, |tx| {
+                let scope = scope.clone();
+                let group_repo = group_repo.clone();
+                Box::pin(async move {
+                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
+                })
             })
-        })
-        .await
+            .await;
+        // Record subtree-node metric outside the retry closure (CodeRabbit).
+        if let Ok(Some(subtree_count)) = &result {
+            self.metrics
+                .subtree_nodes(Operation::ForceDelete, *subtree_count);
+        }
+        self.record_op(
+            if force {
+                Operation::ForceDelete
+            } else {
+                Operation::Delete
+            },
+            started,
+            &result,
+        );
+        result.map(|_| ())
     }
 
     /// Get descendants of a group (depth >= 0, AuthZ-scoped).
@@ -502,29 +894,40 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
+        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        if let Some(req_tenant_id) = req.tenant_id
+            && req_tenant_id != tenant_id
+        {
+            return Err(DomainError::validation(format!(
+                "create_group_unscoped: req.tenant_id ({req_tenant_id}) disagrees with the \
+                 trusted tenant_id argument ({tenant_id}); this indicates a caller bug, not a \
+                 policy decision to make silently"
+            )));
+        }
+
+        // Before `BEGIN`, for the reason spelled out in `create_group`.
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await?;
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+                    .await
             })
         })
         .await
@@ -533,7 +936,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
-    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    ///
+    /// Takes no `TypesRegistryClient`, and that is the point: metadata
+    /// validation resolves a schema over the network and compiles it, which
+    /// must not happen with a transaction open. Both callers do it before
+    /// `BEGIN`. Without the parameter the call cannot drift back in here.
+    #[allow(clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
         type_repo: &TR,
@@ -541,7 +949,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: &CreateGroupRequest,
         tenant_id: Uuid,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
         // One lookup for both the surrogate id and the type itself. Asking
@@ -553,12 +960,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
         let type_id = type_model.id;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-
-        // Validate metadata against GTS type schema (applies to both root and child groups)
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
-        validation::validate_metadata_via_gts(req.metadata.as_ref(), &req.code, types_registry)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Determine effective tenant_id by code-prefix rule:
         // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
@@ -608,10 +1009,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
-                return Err(DomainError::validation(format!(
-                    "Child group tenant_id ({tenant_id}) must match parent tenant_id ({})",
-                    parent.tenant_id
-                )));
+                return Err(DomainError::validation(
+                    "Child group tenant must match parent tenant -- cannot create a child \
+                     group in a tenant different from its parent group"
+                        .to_owned(),
+                ));
             }
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3
@@ -750,7 +1152,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
     }
 
-    /// Inner logic for `update_group`, runs inside a SERIALIZABLE transaction.
+    /// Inner logic for `update_group`, runs inside the transaction its caller
+    /// opened -- at `SERIALIZABLE` or at the backend default, per the
+    /// `isolation` argument. When that argument is `WriteIsolation::RowLocked`
+    /// and the authoritative read finds the parent changing after all, this
+    /// returns `UpdateGroupOutcome::NeedsSerializable` without writing
+    /// anything, and the caller reruns the operation at
+    /// `WriteIsolation::Serializable`.
     ///
     /// **Type immutability.** A group's GTS type is fixed at creation —
     /// `UpdateGroupRequest` does not carry a `code` field. The existing
@@ -775,8 +1183,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
-    ) -> Result<ResourceGroup, DomainError> {
+        isolation: WriteIsolation,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
         group_repo
@@ -784,8 +1192,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
 
+        // Locked, not a plain read. This attempt may be running at the
+        // backend default (the rename/metadata path), where the UPDATE below
+        // matches on `id` alone and always assigns `parent_id` -- so a
+        // `SERIALIZABLE` reparent committing between this read and that
+        // write would have its `parent_id` silently reverted while the
+        // closure table kept the ancestry of the move. Nothing detects that:
+        // an UPDATE by primary key under READ COMMITTED never raises
+        // `40001`, and SSI pairs only transactions that are all
+        // `SERIALIZABLE`. `FOR UPDATE` waits for that in-flight move and
+        // returns the parent it committed, so `parent_changed` below sees it
+        // and escalates before anything is written.
         let existing = group_repo
-            .find_model_by_id(tx, group_id)
+            .find_model_by_id_for_update(tx, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
@@ -802,28 +1221,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // and the closure-table compatibility checks performed by
         // `move_group_internal_impl`. The 4a/4b/4c/4d sub-steps are realized
         // by that helper and the metadata validation block right below.
-        // Type is immutable on update — reuse the existing `gts_type_id` and
-        // resolve the type definition for `move_group_internal_impl`'s
-        // parent-compatibility check below.
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
-        // Validate new type's allowed_parents permits current parent's type
-        // (or the new type allows root if no parent). For the immutable-type
-        // case this collapses into `move_group_internal_impl` running the
-        // `rg_type.allowed_parent_types` check on a parent change.
+        // Type is immutable on update — reuse the existing `gts_type_id`.
+        //
+        // Only the path is resolved unconditionally here: the response's
+        // `code` field needs it (see the final `Ok` below) regardless of
+        // whether the parent changes, and it is a single row read by primary
+        // key. The full type -- `rg_type`, which `find_by_code` builds by
+        // also reading `gts_type_allowed_parent` and
+        // `gts_type_allowed_membership` -- is loaded further down, inside
+        // the `parent_changed` branch (see `inst-update-group-4a` there): it
+        // feeds nothing but `move_group_internal_impl`'s parent-compatibility
+        // check, so a plain rename or metadata edit has no use for it and no
+        // longer pays for those two junction-table reads.
         let existing_type_path = Self::resolve_type_path_from_id(tx, existing.gts_type_id).await?;
-        let rg_type = type_repo
-            .find_by_code(tx, &existing_type_path)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        validation::validate_metadata_via_gts(
-            req.metadata.as_ref(),
-            &existing_type_path,
-            types_registry,
-        )
-        .await?;
+        // Already validated against this same type before `BEGIN` -- the type
+        // is immutable, so the path resolved here and the one resolved there
+        // are the same string. See the caller for why it does not run under
+        // an open transaction.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
 
         // Cross-tenant parent change is forbidden. `tenant_id` is established
@@ -833,7 +1249,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // `tenant_id == group_id` by construction; reparenting one under a
         // different parent is also rejected here because the equality check
         // would fail.)
-        if let Some(new_parent_id) = req.parent_id
+        //
+        // Also the one read of the new parent this whole update makes: kept
+        // as a `ParentSnapshot` and handed to `move_group_internal_impl`
+        // below instead of letting it read the same row again.
+        let new_parent_snapshot = if let Some(new_parent_id) = req.parent_id
             && new_parent_id != existing.parent_id.unwrap_or_default()
         {
             let new_parent = group_repo
@@ -850,7 +1270,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                      cross-tenant moves are not supported"
                 )));
             }
-        }
+            Some(ParentSnapshot {
+                tenant_id: new_parent.tenant_id,
+                gts_type_id: new_parent.gts_type_id,
+            })
+        } else {
+            None
+        };
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
         // DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id}
@@ -868,15 +1294,45 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // `DomainError::invalid_parent_type` when the parent's type is not in
         // the moved subtree's `allowed_parent_types`).
         let parent_changed = existing.parent_id != req.parent_id;
+        // The fresh read is the authoritative one. If it says this request
+        // moves the group but the transaction was opened below SERIALIZABLE
+        // on a stale hint, stop here -- before the move branch and before the
+        // update below, so nothing has been written -- and let the caller
+        // rerun the whole operation at the right level.
+        if parent_changed && !isolation.is_serializable() {
+            return Ok(UpdateGroupOutcome::NeedsSerializable);
+        }
         if parent_changed {
+            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
+            // Validate new type's allowed_parents permits current parent's type
+            // (or the new type allows root if no parent). For the immutable-type
+            // case this collapses into `move_group_internal_impl` running the
+            // `rg_type.allowed_parent_types` check on a parent change.
+            //
+            // Loaded here rather than unconditionally above: `rg_type` is
+            // read only to hand to `move_group_internal_impl` a few lines
+            // down, and `find_by_code` loads it by also reading the
+            // `gts_type_allowed_parent` and `gts_type_allowed_membership`
+            // junction tables. A rename or metadata edit never reaches this
+            // branch, so it no longer pays for either.
+            let rg_type = type_repo
+                .find_by_code(tx, &existing_type_path)
+                .await?
+                .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
+            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
+
             // Delegate to move logic (cycle detection + closure rebuild).
             // Type stays the same, so use the resolved `rg_type` for parent
-            // compatibility checks inside the move helper.
+            // compatibility checks inside the move helper. Its
+            // `MoveOutcome::parent_tenant_id` is not read here: the
+            // cross-tenant check already ran above, against the exact row
+            // `new_parent_snapshot` came from.
             Self::move_group_internal_impl(
                 group_repo,
                 tx,
                 group_id,
                 req.parent_id,
+                new_parent_snapshot,
                 &rg_type,
                 profile,
             )
@@ -915,7 +1371,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // the type path was resolved above -- so the row the database now
         // holds is fully determined here. The read this replaces was the
         // second one after the write, the first being inside `update` itself.
-        Ok(ResourceGroup {
+        Ok(UpdateGroupOutcome::Done(ResourceGroup {
             id: group_id,
             code: existing_type_path,
             name: req.name.clone(),
@@ -924,11 +1380,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 tenant_id: existing.tenant_id,
             },
             metadata: req.metadata.clone(),
-        })
+        }))
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
     /// Inner logic for `move_group`, runs inside a SERIALIZABLE transaction.
+    /// Returns the moved group and the number of closure rows written.
     async fn move_group_inner(
         group_repo: &GR,
         type_repo: &TR,
@@ -936,7 +1393,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
-    ) -> Result<ResourceGroup, DomainError> {
+    ) -> Result<(ResourceGroup, u64), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
         // Load group and new parent in transaction
         let existing = group_repo
@@ -957,12 +1414,30 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
+        // The one read of the new parent this move makes -- see
+        // `move_group_internal_impl`'s doc for why it takes this as a
+        // snapshot instead of reading the row itself.
+        let new_parent_snapshot = match new_parent_id {
+            Some(new_pid) => {
+                let parent = group_repo
+                    .find_model_by_id(tx, new_pid)
+                    .await?
+                    .ok_or_else(|| DomainError::group_not_found(new_pid))?;
+                Some(ParentSnapshot {
+                    tenant_id: parent.tenant_id,
+                    gts_type_id: parent.gts_type_id,
+                })
+            }
+            None => None,
+        };
+
         // Cycle detect, type compat, profile enforce, closure rebuild
-        let new_parent = Self::move_group_internal_impl(
+        let outcome = Self::move_group_internal_impl(
             group_repo,
             tx,
             group_id,
             new_parent_id,
+            new_parent_snapshot,
             &rg_type,
             profile,
         )
@@ -978,8 +1453,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // gear-wide invariant). Reject the move when the new parent lives
         // in a different tenant than the moved group; tenant-type roots have
         // `tenant_id == group_id`, so the equality check covers them too.
-        if let Some(new_parent) = new_parent
-            && new_parent.tenant_id != existing.tenant_id
+        if let Some(parent_tenant_id) = outcome.parent_tenant_id
+            && parent_tenant_id != existing.tenant_id
         {
             // Generic message: do not interpolate tenant ids — the caller
             // can't act on them legitimately, and disclosing the foreign
@@ -1016,26 +1491,37 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // Assembled rather than read back, as in `update_group_inner`: a move
         // writes exactly one column, and the rest of the row is `existing`
         // unchanged.
-        Ok(ResourceGroup {
-            id: group_id,
-            code: type_path,
-            name: existing.name,
-            hierarchy: GroupHierarchy {
-                parent_id: new_parent_id,
-                tenant_id: existing.tenant_id,
+        //
+        // `closure_rows` is returned alongside the group so the caller can
+        // record the metric outside the retryable transaction, avoiding
+        // double-count on retry.
+        let closure_rows = outcome.closure_rows;
+        Ok((
+            ResourceGroup {
+                id: group_id,
+                code: type_path,
+                name: existing.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: new_parent_id,
+                    tenant_id: existing.tenant_id,
+                },
+                metadata: existing.metadata,
             },
-            metadata: existing.metadata,
-        })
+            closure_rows,
+        ))
     }
 
-    /// Inner logic for `delete_group`, runs inside a SERIALIZABLE transaction.
+    /// Inner logic for `delete_group`, runs inside the transaction its caller
+    /// opened -- `SERIALIZABLE` for a force delete, the backend default for a
+    /// non-force one.
+    /// Returns the subtree node count (for metric recording) on force delete.
     async fn delete_group_inner(
         group_repo: &GR,
         tx: &impl DBRunner,
         scope: &toolkit_security::AccessScope,
         group_id: Uuid,
         force: bool,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Option<u64>, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
         // DB: SELECT FROM resource_group WHERE id = {group_id}
@@ -1058,7 +1544,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // Force delete: cascade entire subtree + memberships + closure
             #[allow(clippy::let_and_return)]
-            let result = Self::force_delete_subtree(group_repo, tx, group_id).await;
+            let result = Self::force_delete_subtree(group_repo, tx, group_id)
+                .await
+                .map(Some);
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5c
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5b
@@ -1070,6 +1558,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4
             // Non-force: check children and memberships
+            //
+            // Lock the target first. The two checks below decide from rows
+            // that reference this group, and the delete acts on that
+            // decision; without the lock a concurrent `create_group` under
+            // this parent can land between them and leave an orphan. Holding
+            // the row makes that writer wait and then find the parent gone.
+            // This is what lets the transaction run below SERIALIZABLE --
+            // see `delete_group`.
+            group_repo
+                .find_model_by_id_for_update(tx, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
             let children = Self::get_direct_children(tx, group_id).await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
@@ -1098,7 +1599,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo.delete_all_closure_rows(tx, group_id).await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6a
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
-            group_repo.delete_by_id(tx, group_id).await
+            group_repo.delete_by_id(tx, group_id).await.map(|()| None)
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6
         }
@@ -1114,22 +1615,26 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// enforcement, and closure table rebuild. Must be called within a
     /// SERIALIZABLE transaction.
     ///
-    /// Returns the new parent's row when there is a new parent. It has to be
-    /// read here for the type-compatibility check, and the caller needs the
-    /// same row for the cross-tenant check -- handing it back keeps the move
-    /// path to the one parent read the artifact declares in step 3, instead
-    /// of two reads of the same id inside the same transaction.
+    /// Takes the new parent as a `ParentSnapshot` the caller already read,
+    /// rather than reading the row again here. Both callers need this same
+    /// row for their own cross-tenant check -- `update_group_inner` before
+    /// calling in, `move_group_inner` after, via the returned
+    /// `MoveOutcome::parent_tenant_id` -- so a second read of the same id in
+    /// here on top of that was purely redundant. `parent` is `None` exactly
+    /// when `new_parent_id` is; a caller passing `Some(new_parent_id)` with
+    /// no snapshot behind it (which should not happen given the two callers
+    /// above) is treated the same as the read this replaces finding nothing.
     #[allow(clippy::cognitive_complexity)]
     async fn move_group_internal_impl(
         group_repo: &GR,
         conn: &impl DBRunner,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
+        parent: Option<ParentSnapshot>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
-    ) -> Result<Option<crate::infra::storage::entity::resource_group::Model>, DomainError> {
-        let mut new_parent_model: Option<crate::infra::storage::entity::resource_group::Model> =
-            None;
+    ) -> Result<MoveOutcome, DomainError> {
+        let mut parent_tenant_id: Option<Uuid> = None;
         if let Some(new_pid) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
             // Cycle detection: self-parent check (covered by is_descendant via self-row)
@@ -1146,11 +1651,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-3
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-2
 
-            // Validate parent type compatibility
-            let parent = group_repo
-                .find_model_by_id(conn, new_pid)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(new_pid))?;
+            // Validate parent type compatibility. `parent` came from the
+            // caller's own read -- see the function doc -- so `None` here
+            // means that read found nothing, same as this function's own
+            // `find_model_by_id` used to.
+            let parent = parent.ok_or_else(|| DomainError::group_not_found(new_pid))?;
+            parent_tenant_id = Some(parent.tenant_id);
 
             let parent_type_path =
                 Self::resolve_type_path_from_id(conn, parent.gts_type_id).await?;
@@ -1160,7 +1666,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     rg_type.code, parent_type_path
                 )));
             }
-            new_parent_model = Some(parent);
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
@@ -1176,18 +1681,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // One query for the whole subtree. The rows already carry
-                // the depth relative to the moved group, and every id they
-                // contain is a descendant by construction -- so the previous
-                // `is_descendant` + `get_relative_depth` pair per row was
-                // re-asking the database what it had just returned.
-                let max_subtree_depth = group_repo
-                    .get_descendant_ids_with_depth(conn, group_id)
-                    .await?
-                    .into_iter()
-                    .map(|(_id, depth)| depth)
-                    .max()
-                    .unwrap_or(0);
+                // A single `MAX(depth)` aggregate, not the whole subtree
+                // pulled into this process to fold it down to one scalar:
+                // this check has never needed the descendant rows
+                // themselves, and it reruns on every move inside the
+                // SERIALIZABLE transaction the default profile
+                // (`max_depth: Some(10)`) puts every move through. See
+                // `get_descendant_ids_with_depth` for the callers -- force
+                // delete -- that do need the rows.
+                let max_subtree_depth = group_repo.get_max_descendant_depth(conn, group_id).await?;
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1251,11 +1753,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
 
         // Rebuild closure table for the subtree
-        group_repo
+        let closure_rows = group_repo
             .rebuild_subtree_closure(conn, group_id, new_parent_id)
             .await?;
 
-        Ok(new_parent_model)
+        Ok(MoveOutcome {
+            parent_tenant_id,
+            closure_rows,
+        })
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
@@ -1263,7 +1768,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_repo: &GR,
         conn: &impl DBRunner,
         root_id: Uuid,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         let descendants_with_depth = group_repo
             .get_descendant_ids_with_depth(conn, root_id)
             .await?;
@@ -1271,6 +1776,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let all_ids: Vec<Uuid> = std::iter::once(root_id)
             .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
             .collect();
+        let subtree_count: u64 = all_ids.len().try_into().unwrap_or(u64::MAX);
 
         // Memberships and closure rows have no FK ordering constraint among
         // themselves, so both go in one statement for the whole subtree
@@ -1294,7 +1800,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
-        Ok(())
+        Ok(subtree_count)
     }
 
     /// Get direct children of a group.
@@ -1343,6 +1849,23 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         if name.is_empty() || name.chars().count() > 255 {
             return Err(DomainError::validation(
                 "Group name must be between 1 and 255 characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject a caller-supplied `tenant_id` on tenant-typed groups: tenant
+    /// groups derive their `tenant_id` from the group's own id, not from a
+    /// request field.
+    fn reject_tenant_id_on_tenant_type(
+        is_tenant: bool,
+        tenant_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        if is_tenant && tenant_id.is_some() {
+            return Err(DomainError::validation(
+                "Tenant-typed groups cannot have an explicit tenant_id: \
+                 their effective tenant is always the group's own id"
+                    .to_owned(),
             ));
         }
         Ok(())

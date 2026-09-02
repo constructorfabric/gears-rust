@@ -76,6 +76,9 @@ pub const GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group.v1~");
 /// Canonical GTS resource type for a resource-group membership link.
 pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group_membership.v1~");
 
+/// Canonical GTS resource type for a type-registry type definition.
+pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
+
 /// GTS type path for the tenant resource-group type.
 ///
 /// Any RG type whose code **starts with** this path is considered a tenant

@@ -479,13 +479,13 @@ against a live PostgreSQL 19 beta 2 server by @vasylcf (probe branch
   mechanism and its two-branch gate (`Alias::new` always escapes; a `&'static str` used as an
   `Iden` escapes unless it passes `is_static_iden()`); the same reasoning must be applied here
   and pinned by hostile-name tests.
-- **PostgreSQL 19 is pre-GA.** The image pin is no longer a blocker: database images now come
-  from `cf-gears-test-containers` ([libs/test-containers](../../../../libs/test-containers/src/lib.rs)),
-  whose `POSTGRES_GRAPH_TAG` / `postgres_graph()` exist for this feature and whose
-  `graph_lane_required()` decides whether an unavailable PG19 image is a skip or a failure —
-  the default is a skip while the image is pre-GA, and `GEARS_TEST_PG_GRAPH_REQUIRED=1` makes
-  a lane that is supposed to cover PG19 unable to pass vacuously. The workspace floor is now
-  PostgreSQL 18, not `postgres:11-alpine`.
+- **PostgreSQL 19 is pre-GA.** The image-tag half of this blocker is resolved: every fixture
+  now starts through [`libs/test-containers`](../../../../libs/test-containers/src/lib.rs),
+  which pins `POSTGRES_GRAPH_TAG` for the SQL/PGQ lane and exposes `postgres_graph()` to start
+  it. Live coverage is `libs/toolkit-db/tests/pg/secure_graph.rs`, run by `make test-pgq` and
+  by the CI `integration` job with `GEARS_TEST_PG_GRAPH_REQUIRED=1`, so an unavailable image
+  fails that lane rather than letting the isolation suite pass vacuously; locally the default
+  is still a skip while the tag is a pre-GA beta that Docker Hub may withdraw at GA.
 - **Privileges give no isolation help — and no escalation risk.** Verbatim from the
   documentation: *"Access to the base relations underlying the `GRAPH_TABLE` clause is
   determined by the permissions of the user executing the query, rather than the property

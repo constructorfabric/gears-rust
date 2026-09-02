@@ -1,7 +1,7 @@
 # Created: 2026-04-16 by Constructor Tech
 [package]
 name = "cf-gears-resource-group"
-version = "0.3.0"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -31,10 +31,11 @@ integration = []
 
 [dependencies]
 # SDK - public API, models, and errors
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.6", path = "../resource-group-sdk", features = ["odata"] }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.0", path = "../resource-group-sdk", features = ["odata"] }
 
 # Core dependencies
 anyhow = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
@@ -83,6 +84,7 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }
 # "test-support" enables `connect_db_with_metric_callback` and
 # `secure::in_transaction_for_testing`, which the DB-behaviour audit's
 # `QueryRecorder` needs. Test-only: the production dependency above pulls in
@@ -95,8 +97,9 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 # Cargo.toml), used here as test-only dev-dependencies.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-# Database image pins: see libs/test-containers.
-cf-gears-test-containers = { workspace = true }
+# Database images are pinned centrally; `Postgres::default()` would take its
+# tag from testcontainers-modules (see docs/TESTING.md 4.4).
+test-containers = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 # Enable the SDK `test-util` feature so integration-test fakes can build the
@@ -106,3 +109,6 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `toolkit_canonical_errors::CanonicalError` don't rely on it being pulled in
 # transitively via the normal (`[dependencies]`) build graph.
 toolkit-canonical-errors = { workspace = true }
+# Captures `tracing` output for the guard-table backfill migration test's
+# `tracing::warn!` assertion (`#[tracing_test::traced_test]` + `logs_contain`).
+tracing-test = { workspace = true, features = ["no-env-filter"] }

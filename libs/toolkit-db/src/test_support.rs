@@ -13,7 +13,8 @@
 //!
 //! Captured per statement: normalized SQL (literals redacted, placeholder
 //! lists collapsed so batch size doesn't change the "shape"), kind, target
-//! table, parameter count, and whether the transaction-bypass guard was armed.
+//! table, parameter count, whether the transaction-bypass guard was armed,
+//! and which transaction (if any) it ran inside.
 //!
 //! # Why not observe literal BEGIN/COMMIT/ROLLBACK?
 //!
@@ -23,7 +24,12 @@
 //!
 //! Transaction membership is instead read from the transaction-bypass guard
 //! ([`crate::secure::in_transaction_for_testing`]), the same task-local the
-//! production guard enforces.
+//! production guard enforces. That answers "in a transaction or not", but not
+//! "in the *same* transaction as this other statement" -- two statements can
+//! each be `in_tx: true` while running in two different, sequential
+//! transactions. [`crate::secure::transaction_id_for_testing`] answers that:
+//! a fresh id every time a transaction begins, so [`RecordedQuery::tx_id`]
+//! lets [`QueryRecorder::all_in_one_transaction`] tell the two cases apart.
 //!
 //! The callback fires synchronously on the task that issued the query, so
 //! reading the guard is exact, not a heuristic; its only blind spot is a
@@ -106,6 +112,25 @@ pub struct RecordedQuery {
     /// Whether this statement executed while the transaction-bypass guard
     /// was armed (i.e. inside a `Db::transaction*` closure).
     pub in_tx: bool,
+    /// Identity of the transaction this statement ran inside, or `None`
+    /// outside any transaction. Two statements can both have `in_tx: true`
+    /// while running in two different (e.g. sequential) transactions --
+    /// `tx_id` is what lets a test tell that case apart from "genuinely the
+    /// same transaction". See [`crate::secure::transaction_id_for_testing`].
+    pub tx_id: Option<u64>,
+    /// Isolation level the transaction this statement ran inside was *asked*
+    /// to open at, or `None` when it was opened at the backend default (or
+    /// when the statement ran outside a transaction -- `in_tx` tells those
+    /// two apart).
+    ///
+    /// Records the request rather than what the engine did with it, which is
+    /// what makes it useful on `SQLite`: `SQLite` is serializable regardless,
+    /// so an invariant that several paths must all open `SERIALIZABLE` --
+    /// so `PostgreSQL`'s SSI can see them as conflicting -- leaves no trace in
+    /// the statements, the counts or the results. Downgrading one path is
+    /// invisible to every other kind of assertion in this recorder.
+    /// See [`crate::secure::transaction_isolation_for_testing`].
+    pub tx_isolation: Option<crate::secure::TxIsolationLevel>,
     /// Number of bound parameters (an `IN (?, ?, ?)` list of 3 contributes
     /// 3). Statement count stays flat for a batched query as N grows, but
     /// parameter count doesn't -- this lets scale checks budget separately.
@@ -253,6 +278,8 @@ impl QueryRecorder {
             let sql = normalize_sql(&raw_sql);
             // Precise, not a heuristic -- see module docs.
             let in_tx = crate::secure::in_transaction_for_testing();
+            let tx_id = crate::secure::transaction_id_for_testing();
+            let tx_isolation = crate::secure::transaction_isolation_for_testing().flatten();
             let param_count = info
                 .statement
                 .values
@@ -273,6 +300,8 @@ impl QueryRecorder {
                 sql,
                 raw_sql: info.statement.to_string(),
                 in_tx,
+                tx_id,
+                tx_isolation,
                 param_count,
                 elapsed: info.elapsed,
                 failed: info.failed,
@@ -351,6 +380,57 @@ impl QueryRecorder {
             .filter(|e| is_write(e.kind))
             .filter(|e| !e.in_tx)
             .collect()
+    }
+
+    /// Whether every `in_tx` event in the trace ran inside one and the same
+    /// transaction.
+    ///
+    /// Stronger than "every event was `in_tx`": that check passes just as
+    /// well if a regression split one transactional operation into two
+    /// sequential transactions, since each event is still "in a transaction"
+    /// on its own. This compares [`RecordedQuery::tx_id`] across the `in_tx`
+    /// events instead, so it catches that split.
+    ///
+    /// Deliberately silent on out-of-tx events -- pairing this with
+    /// [`Self::writes_outside_tx`] covers that, and plenty of correct traces
+    /// have a stateless pre-validation read before `BEGIN` that this must not
+    /// fail on. `false` if there are no `in_tx` events at all, or if they
+    /// span more than one transaction id.
+    #[must_use]
+    pub fn all_in_one_transaction(&self) -> bool {
+        let mut in_tx_ids = self
+            .events()
+            .into_iter()
+            .filter(|e| e.in_tx)
+            .map(|e| e.tx_id);
+        let Some(first_id) = in_tx_ids.next() else {
+            return false;
+        };
+        first_id.is_some() && in_tx_ids.all(|id| id == first_id)
+    }
+
+    /// Whether every `in_tx` event in the trace ran inside a transaction that
+    /// was opened at `SERIALIZABLE`.
+    ///
+    /// For invariants that hold only when *several* code paths all open that
+    /// level -- so `PostgreSQL`'s SSI tracks them as conflicting with each
+    /// other -- no other check in this recorder can see a regression. Lowering
+    /// one path's level changes no statement, no count, no ordering, and no
+    /// result on `SQLite`, which is serializable regardless. This reads the
+    /// level the path *asked* for, which is the thing under review.
+    ///
+    /// Like [`Self::all_in_one_transaction`], silent on out-of-tx events and
+    /// `false` when there are none in a transaction at all.
+    #[must_use]
+    pub fn all_in_serializable_transaction(&self) -> bool {
+        let mut levels = self
+            .events()
+            .into_iter()
+            .filter(|e| e.in_tx)
+            .map(|e| e.tx_isolation)
+            .peekable();
+        levels.peek().is_some()
+            && levels.all(|level| level == Some(crate::secure::TxIsolationLevel::Serializable))
     }
 
     /// Runs of two or more untransacted writes with no transaction boundary
@@ -462,13 +542,20 @@ impl QueryRecorder {
                 writeln!(out, "{marker}").expect("String Write is infallible");
             }
             last_in_tx = e.in_tx;
+            let tx_id = e.tx_id.map_or_else(|| "-".to_owned(), |id| id.to_string());
+            let iso = match e.tx_isolation {
+                Some(level) => format!("{level:?}"),
+                None => "-".to_owned(),
+            };
             writeln!(
                 out,
-                "{:>3}  {:<7} {:<32} in_tx={:<5} params={:<3} {}",
+                "{:>3}  {:<7} {:<32} in_tx={:<5} tx={:<4} iso={:<15} params={:<3} {}",
                 e.seq,
                 e.kind,
                 e.table.as_deref().unwrap_or("-"),
                 e.in_tx,
+                tx_id,
+                iso,
                 e.param_count,
                 e.sql,
             )
@@ -678,6 +765,8 @@ mod tests {
             sql: format!("<stmt {seq}>"),
             raw_sql: format!("<stmt {seq}>"),
             in_tx,
+            tx_id: None,
+            tx_isolation: None,
             param_count: 0,
             elapsed: std::time::Duration::ZERO,
             failed: false,
@@ -893,6 +982,128 @@ mod tests {
             make(2, QueryKind::Update, Some("gts_type"), true),
         ]);
         assert!(rec.writes_outside_tx().is_empty());
+    }
+
+    #[test]
+    fn all_in_one_transaction_true_when_every_in_tx_event_shares_one_tx_id() {
+        let mut a = make(0, QueryKind::Select, Some("gts_type"), true);
+        a.tx_id = Some(7);
+        let mut b = make(1, QueryKind::Insert, Some("gts_type"), true);
+        b.tx_id = Some(7);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a, b]);
+        assert!(rec.all_in_one_transaction());
+    }
+
+    #[test]
+    fn all_in_one_transaction_false_across_two_sequential_transactions() {
+        // Both events are `in_tx: true`, so `writes_outside_tx` alone would
+        // not catch this: a regression that ran the read and the write as
+        // two separate, sequential transactions instead of one.
+        let mut a = make(0, QueryKind::Select, Some("gts_type"), true);
+        a.tx_id = Some(7);
+        let mut b = make(1, QueryKind::Insert, Some("gts_type"), true);
+        b.tx_id = Some(8);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a, b]);
+        assert!(!rec.all_in_one_transaction());
+    }
+
+    #[test]
+    fn all_in_one_transaction_true_despite_a_pre_transaction_read() {
+        // A stateless read before `BEGIN` is a legitimate, common shape in
+        // this codebase (pre-validation outside the transaction) -- it must
+        // not fail this check on its own. `writes_outside_tx` is what would
+        // catch an actual *write* escaping the transaction; this function is
+        // silent on out-of-tx events entirely, by design.
+        let pre_read = make(0, QueryKind::Select, Some("gts_type"), false);
+        let mut a = make(1, QueryKind::Select, Some("gts_type"), true);
+        a.tx_id = Some(7);
+        let mut b = make(2, QueryKind::Insert, Some("gts_type"), true);
+        b.tx_id = Some(7);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![pre_read, a, b]);
+        assert!(rec.all_in_one_transaction());
+    }
+
+    #[test]
+    fn all_in_one_transaction_false_when_no_event_is_in_a_transaction() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![make(
+            0,
+            QueryKind::Select,
+            Some("gts_type"),
+            false,
+        )]);
+        assert!(!rec.all_in_one_transaction());
+    }
+
+    #[test]
+    fn all_in_one_transaction_false_for_an_empty_trace() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![]);
+        assert!(!rec.all_in_one_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_true_when_every_in_tx_event_is_serializable() {
+        let mut a = make(0, QueryKind::Select, Some("resource_group"), true);
+        a.tx_isolation = Some(crate::secure::TxIsolationLevel::Serializable);
+        let mut b = make(
+            1,
+            QueryKind::Insert,
+            Some("resource_group_membership"),
+            true,
+        );
+        b.tx_isolation = Some(crate::secure::TxIsolationLevel::Serializable);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a, b]);
+        assert!(rec.all_in_serializable_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_false_at_the_backend_default() {
+        // `None` is what `TxConfig::default()` records: opened, but at
+        // whatever the backend's own level is.
+        let mut a = make(
+            0,
+            QueryKind::Delete,
+            Some("resource_group_membership"),
+            true,
+        );
+        a.tx_isolation = None;
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a]);
+        assert!(!rec.all_in_serializable_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_false_when_one_event_is_weaker() {
+        // The case the helper exists for: a mixed trace, where one path was
+        // lowered and the rest were not.
+        let mut a = make(0, QueryKind::Select, Some("gts_type"), true);
+        a.tx_isolation = Some(crate::secure::TxIsolationLevel::Serializable);
+        let mut b = make(1, QueryKind::Insert, Some("gts_type"), true);
+        b.tx_isolation = Some(crate::secure::TxIsolationLevel::ReadCommitted);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a, b]);
+        assert!(!rec.all_in_serializable_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_ignores_a_pre_transaction_read() {
+        // Same shape `all_in_one_transaction` tolerates: a stateless read
+        // before `BEGIN` must not fail the check.
+        let before = make(0, QueryKind::Select, Some("gts_type"), false);
+        let mut inside = make(1, QueryKind::Insert, Some("gts_type"), true);
+        inside.tx_isolation = Some(crate::secure::TxIsolationLevel::Serializable);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![before, inside]);
+        assert!(rec.all_in_serializable_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_false_when_no_event_is_in_a_transaction() {
+        let a = make(0, QueryKind::Select, Some("gts_type"), false);
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a]);
+        assert!(!rec.all_in_serializable_transaction());
+    }
+
+    #[test]
+    fn all_in_serializable_transaction_false_for_an_empty_trace() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![]);
+        assert!(!rec.all_in_serializable_transaction());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use resource_group_sdk::{
-    CreateTypeRequest, ResourceGroupClient, ResourceGroupError, ResourceGroupType,
+    CreateTypeRequest, ResourceGroupError, ResourceGroupType, ResourceGroupTypeBootstrap,
     UpdateTypeRequest,
 };
 use toolkit_macros::domain_model;
@@ -195,7 +195,7 @@ impl TypeSpec {
 /// Called during `AccountManagementGear::init`. On success the
 /// gear may proceed to signal ready.
 pub async fn register_user_group_types(
-    client: &Arc<dyn ResourceGroupClient + Send + Sync>,
+    client: &Arc<dyn ResourceGroupTypeBootstrap + Send + Sync>,
     ctx: &SecurityContext,
 ) -> Result<UserGroupRegistrationOutcome, RegistrationError> {
     // Step 1: member handle first -- step 2 depends on it being
@@ -255,7 +255,7 @@ pub async fn register_user_group_types(
     reason = "flat match-based dispatch across the FEATURE-pinned idempotent-registration matrix; splitting into sub-functions would obscure the deterministic outcome branches the tests check"
 )]
 async fn register_one(
-    client: &Arc<dyn ResourceGroupClient + Send + Sync>,
+    client: &Arc<dyn ResourceGroupTypeBootstrap + Send + Sync>,
     ctx: &SecurityContext,
     spec: &TypeSpec,
 ) -> Result<RegistrationOutcome, RegistrationError> {

@@ -42,7 +42,7 @@ async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn period_open_creates_current_and_next_and_is_idempotent() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

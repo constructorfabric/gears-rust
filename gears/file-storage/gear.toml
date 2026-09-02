@@ -1,0 +1,7 @@
+[gear]
+name = "File Storage"
+description = "Abstract file storage API with pluggable backends for media and generated content."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = false

@@ -38,9 +38,15 @@ let fetched = rg.get_type(&ctx, &rg_type.code).await?;
 ```rust
 use resource_group_sdk::CreateGroupRequest;
 
-let group = rg.create_group(&ctx, CreateGroupRequest { /* ... */ }).await?;
+let req = CreateGroupRequest::new(type_code, "Engineering").with_parent_id(Some(parent_id));
+let group = rg.create_group(&ctx, req).await?;
 let same = rg.get_group(&ctx, group.id).await?;
 ```
+
+`CreateGroupRequest` is `#[non_exhaustive]`: build it through `::new` and the
+`with_*` setters rather than a struct literal. This lets the gear add new
+optional fields (as `tenant_id` was, below) without breaking existing
+callers.
 
 ### Hierarchy Traversal
 
@@ -88,6 +94,17 @@ match rg.get_group(&ctx, id).await {
 
 - `odata` (default) — enables OData filter field definitions and typed query
   helpers (depends on `toolkit-odata-macros` and `toolkit-sdk`).
+
+## Versioning notes
+
+This crate has no separate `CHANGELOG` — notable pre-1.0 API changes are
+recorded here.
+
+- **0.3.0**: `CreateGroupRequest` gained an optional `tenant_id` field and
+  became `#[non_exhaustive]` with a `::new` constructor plus `with_*`
+  setters (see Group Lifecycle above). Per pre-1.0 SemVer, adding a field to
+  a public struct is a breaking change for any consumer still constructing
+  it with a struct literal, hence the minor bump rather than a patch.
 
 ## License
 

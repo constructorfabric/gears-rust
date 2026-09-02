@@ -12,6 +12,12 @@ impl MigrationTrait for Migration {
         let backend = manager.get_database_backend();
         let conn = manager.get_connection();
 
+        // The foreign keys named in the DDL below -- `fk_rg_gts_type`,
+        // `fk_resource_group_parent` and `fk_rgm_group_id` -- are mirrored as
+        // constants in `crate::infra::storage`, because the repositories
+        // classify a violation by matching the constraint name in the driver's
+        // message. Rename one here and the classification silently stops
+        // firing, so the two must move together.
         let sql = match backend {
             sea_orm::DatabaseBackend::Postgres => {
                 r"

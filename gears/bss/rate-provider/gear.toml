@@ -1,0 +1,7 @@
+[gear]
+name = "FX Rate Provider"
+description = "Stateless adapter supplying live foreign-exchange rates via composable source plugins."
+category = "bss"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

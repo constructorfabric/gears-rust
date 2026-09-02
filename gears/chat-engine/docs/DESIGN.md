@@ -792,13 +792,13 @@ Does not decide policy (that is the AuthZ Resolver PDP), does not authenticate (
 
 ### 3.3 API Contracts
 
-See [`api/README.md`](api/README.md) for comprehensive protocol documentation.
+See [`WEBHOOK-PROTOCOL.md`](WEBHOOK-PROTOCOL.md) for the webhook protocol documentation.
 
 #### 3.3.1 HTTP REST API (Client ↔ Chat Engine)
 
-**Specification**: [`api/http-protocol.json`](api/http-protocol.json) (OpenAPI 3.0.3)
+**Specification**: [`docs/openapi.json`](openapi.json) (OpenAPI 3.1, generated from the live routes by `make openapi-chat-engine`)
 
-**Base URL**: `https://chat-engine/api/v1`
+**Base URL**: `{host}{prefix}/chat-engine/v1` (`{prefix}` = the gateway's `prefix_path`)
 
 **Authentication**: JWT Bearer token in Authorization header
 

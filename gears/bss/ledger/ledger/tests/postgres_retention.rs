@@ -125,7 +125,7 @@ fn bytea(hash: &[u8]) -> String {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkpoint_derives_count_and_rejects_noncontiguous() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -207,7 +207,7 @@ async fn checkpoint_derives_count_and_rejects_noncontiguous() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn detach_gate_requires_sealed_and_checkpoint_covered() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;

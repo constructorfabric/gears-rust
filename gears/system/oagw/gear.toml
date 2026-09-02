@@ -1,0 +1,7 @@
+[gear]
+name = "Outbound API Interface"
+description = "Abstraction layer for outbound API calls with credential injection and observability."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

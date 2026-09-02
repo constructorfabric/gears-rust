@@ -352,7 +352,7 @@ async fn credit_note_against_unposted_invoice_is_note_invoice_not_found() {
     // F4 (design §4.2 / §5): a credit note MUST link an originating posted invoice.
     // No `INVOICE_POST` entry for the referenced invoice ⇒ `NOTE_INVOICE_NOT_FOUND`
     // (404), BEFORE any read/split/post — no orphan compensating entry.
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -388,7 +388,7 @@ async fn credit_note_against_unposted_invoice_is_note_invoice_not_found() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn deferred_credit_note_reduces_cl_ar_and_schedule_total() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -459,7 +459,7 @@ async fn deferred_credit_note_reduces_cl_ar_and_schedule_total() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn headroom_check_blocks_over_cap_credit_note() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -508,7 +508,7 @@ async fn headroom_check_blocks_over_cap_credit_note() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn goodwill_credit_uses_goodwill_class_not_contra() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -550,7 +550,7 @@ async fn goodwill_credit_uses_goodwill_class_not_contra() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn paid_invoice_credit_seeds_reusable_credit_wallet() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -614,7 +614,7 @@ async fn mixed_credit_note_books_both_contra_and_cl() {
     // (→ DR CONTRA_REVENUE) AND a deferred part (→ DR CONTRACT_LIABILITY), both
     // against CR AR. The recognized-leg path + the per-stream CL reduction fire
     // together in one balanced post.
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -681,7 +681,7 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
     // cash-equivalent grant. (A non-goodwill paid-invoice credit DOES seed the
     // wallet — that is the `paid_invoice_credit_seeds_reusable_credit_wallet` path;
     // this proves goodwill is held to the stricter AR-only rule.)
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

@@ -48,7 +48,7 @@ async fn boot() -> (
     testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     DatabaseConnection,
 ) {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let db = Database::connect(&url).await.unwrap();
@@ -606,7 +606,7 @@ async fn setup_posted_invoice(url: &str) -> (DatabaseConnection, DBProvider<DbEr
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reads_return_entry_lines_balances_and_ar_invoice() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, f) = setup_posted_invoice(&url).await;
@@ -710,7 +710,7 @@ async fn reads_return_entry_lines_balances_and_ar_invoice() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_reads_are_sql_scoped_to_empty() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, f) = setup_posted_invoice(&url).await;

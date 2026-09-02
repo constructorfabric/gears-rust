@@ -6,10 +6,13 @@
 //!
 //! Helpers here are `pub(crate)` and are **not** re-exported from the crate root.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use super::dsn::is_memory_dsn;
+use percent_encoding::percent_decode_str;
+
+use super::dsn::{is_memory_dsn, split_sqlite_dsn};
 
 /// Where a `SQLite` DSN points.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,101 +182,59 @@ pub fn prepare_sqlite_path(dsn: &str, create_dirs: bool) -> io::Result<String> {
 
 /// Extract the file path from a `SQLite` DSN.
 ///
+/// Uses the same grammar as `sqlx`'s `SqliteConnectOptions::from_str`, via
+/// [`split_sqlite_dsn`]: strip the scheme, cut at the first `?`, percent-decode the rest.
+/// The path is never round-tripped through a generic URL parser, so a native Windows DSN
+/// (`sqlite://C:\dir\app.db`) and drive letters in `sqlite://C:/dir/app.db` survive intact.
+///
 /// Handles:
 /// - `sqlite:///absolute/path/to/db.sqlite`
 /// - `sqlite://./relative/path/to/db.sqlite`
 /// - `sqlite:relative/path/to/db.sqlite`
 /// - `sqlite:./relative.db`
-/// - `sqlite:///C:/data/app.db` / `sqlite:C:/data/app.db` (Windows)
-/// - Plain file paths (fallback)
+/// - `sqlite:///C:/data/app.db`, `sqlite:C:/data/app.db`, `sqlite://C:\data\app.db` (Windows)
+/// - Plain file paths (no scheme)
 ///
-/// Returns `None` for memory DSNs.
+/// Returns `None` for memory DSNs and for DSNs with an empty path.
 #[must_use]
 pub(crate) fn extract_file_path_from_dsn(dsn: &str) -> Option<PathBuf> {
     if is_memory_dsn(dsn) {
         return None;
     }
 
-    if let Some(path_part) = dsn.strip_prefix("sqlite:") {
-        let path_part = strip_query(path_part);
-
-        // `sqlite::memory:` already excluded by is_memory_dsn.
-        if path_part == ":memory:" || path_part.is_empty() {
-            return None;
-        }
-
-        // Absolute URL form: sqlite:///path or sqlite:///C:/path
-        if let Some(rest) = path_part.strip_prefix("///") {
-            return Some(normalize_url_absolute_path(rest));
-        }
-
-        // Authority-ish relative: sqlite://./path → ./path
-        if let Some(rest) = path_part.strip_prefix("//./") {
-            return Some(PathBuf::from(format!("./{rest}")));
-        }
-
-        // sqlite://host/path — uncommon for SQLite files; treat path after host.
-        if let Some(rest) = path_part.strip_prefix("//") {
-            if let Some((_host, path)) = rest.split_once('/') {
-                let path = if path.is_empty() {
-                    return None;
-                } else {
-                    format!("/{path}")
-                };
-                return Some(normalize_url_absolute_path(path.trim_start_matches('/')));
-            }
-            return None;
-        }
-
-        // sqlite:relative or sqlite:./relative or sqlite:C:/windows
-        return Some(PathBuf::from(path_part));
-    }
-
-    // Fallback: treat as plain file path (strip query if present).
-    let path = strip_query(dsn);
-    if path.is_empty() {
+    let (database, _params) = split_sqlite_dsn(dsn);
+    // `:memory:` is already excluded by `is_memory_dsn`; this guards the rest.
+    if database.is_empty() || database == ":memory:" {
         return None;
     }
-    Some(PathBuf::from(path))
+
+    // `sqlx` percent-decodes the path so `?` and `#` can appear in a filename. Invalid UTF-8
+    // makes `sqlx` fail the connection outright, so falling back to the raw bytes is fine here.
+    let decoded = percent_decode_str(database)
+        .decode_utf8()
+        .unwrap_or(Cow::Borrowed(database));
+
+    Some(dsn_path_to_pathbuf(&decoded))
 }
 
-fn strip_query(s: &str) -> &str {
-    s.split_once('?').map_or(s, |(path, _)| path)
-}
-
-/// Convert a URL path body into a filesystem [`PathBuf`].
+/// Convert a DSN path body into a filesystem [`PathBuf`].
 ///
-/// `rest` is the portion after `sqlite:///` (no leading scheme). Unix absolute paths keep a
-/// leading `/`. Windows drive paths (`C:/...`) must **not** keep a leading slash.
-fn normalize_url_absolute_path(rest: &str) -> PathBuf {
+/// The only rewrite is the URL-ism in `sqlite:///C:/data/app.db`, whose path body is
+/// `/C:/data/app.db`: on Windows the leading slash is dropped so [`Component::Prefix`] is
+/// recognized. Everything else is taken verbatim, including backslashes.
+fn dsn_path_to_pathbuf(path: &str) -> PathBuf {
     #[cfg(windows)]
     {
-        // "/C:/data" or "C:/data" after strip of ///
-        let bytes = rest.as_bytes();
-        if rest.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            return PathBuf::from(rest);
-        }
-        if rest.len() >= 3
-            && rest.starts_with('/')
+        let bytes = path.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
             && bytes[1].is_ascii_alphabetic()
             && bytes[2] == b':'
         {
-            return PathBuf::from(&rest[1..]);
-        }
-        // Unix-style absolute on Windows (e.g. WSL-ish): keep as given with leading slash.
-        if rest.starts_with('/') {
-            return PathBuf::from(rest);
-        }
-        PathBuf::from(format!("/{rest}"))
-    }
-    #[cfg(not(windows))]
-    {
-        if rest.starts_with('/') {
-            PathBuf::from(rest)
-        } else {
-            PathBuf::from(format!("/{rest}"))
+            return PathBuf::from(&path[1..]);
         }
     }
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
@@ -311,7 +272,7 @@ mod tests {
         );
 
         assert_eq!(extract_file_path_from_dsn("sqlite::memory:"), None);
-        assert_eq!(extract_file_path_from_dsn("sqlite://memory:"), None);
+        assert_eq!(extract_file_path_from_dsn("sqlite://:memory:"), None);
         assert_eq!(
             extract_file_path_from_dsn("sqlite:///test.db?mode=memory"),
             None
@@ -409,7 +370,7 @@ mod tests {
     fn memory_dsns_are_memory_locations() {
         for dsn in [
             "sqlite::memory:",
-            "sqlite://memory:",
+            "sqlite://:memory:",
             "sqlite:///file.db?mode=memory",
         ] {
             assert!(
@@ -439,8 +400,8 @@ mod tests {
             "sqlite::memory:"
         );
         assert_eq!(
-            prepare_sqlite_path("sqlite://memory:", false).unwrap(),
-            "sqlite://memory:"
+            prepare_sqlite_path("sqlite://:memory:", false).unwrap(),
+            "sqlite://:memory:"
         );
         assert_eq!(
             prepare_sqlite_path("sqlite:///test.db?mode=memory", true).unwrap(),
@@ -459,13 +420,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let test_path = temp_dir.path().join("nested").join("db.sqlite");
 
-        let path_str = test_path.to_string_lossy().replace('\\', "/");
-        let dsn = if path_str.starts_with('/') {
-            format!("sqlite://{path_str}")
-        } else {
-            // Windows drive path: sqlite:///C:/...
-            format!("sqlite:///{path_str}")
-        };
+        // The native path goes in verbatim — no slash rewriting, no extra leading `/`.
+        let dsn = format!("sqlite://{}?mode=rwc", test_path.display());
 
         let result = prepare_sqlite_path(&dsn, true);
         assert!(result.is_ok(), "Failed to prepare path: {:?}", result.err());
@@ -473,5 +429,49 @@ mod tests {
 
         let parent = test_path.parent().unwrap();
         assert!(parent.exists(), "Parent directory should exist");
+    }
+
+    #[test]
+    fn native_path_dsn_round_trips_without_rewriting() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_path = temp_dir.path().join("app.db");
+        let dsn = format!("sqlite://{}?mode=rwc", test_path.display());
+
+        assert_eq!(extract_file_path_from_dsn(&dsn), Some(test_path));
+    }
+
+    #[test]
+    fn windows_backslash_dsn_keeps_its_path() {
+        // Generic URL parsing turns `C:` into a host and flips the separators; `sqlx` does not.
+        assert_eq!(
+            extract_file_path_from_dsn("sqlite://C:\\Users\\runner\\app.db?mode=rwc"),
+            Some(PathBuf::from("C:\\Users\\runner\\app.db"))
+        );
+    }
+
+    #[test]
+    fn windows_drive_letter_is_not_treated_as_a_host() {
+        // Previously `//C:/data/app.db` split into host `C:` + path `data/app.db`,
+        // silently dropping the drive.
+        let path = extract_file_path_from_dsn("sqlite://C:/data/app.db").unwrap();
+        assert!(
+            path.to_string_lossy().starts_with("C:"),
+            "drive prefix lost: {path:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_path_is_decoded_like_sqlx() {
+        assert_eq!(
+            extract_file_path_from_dsn("sqlite:///tmp/db%3Fname.db"),
+            Some(PathBuf::from("/tmp/db?name.db"))
+        );
+    }
+
+    #[test]
+    fn scheme_spellings_of_one_path_share_scope_identity() {
+        let bare = sqlite_scope_identity("sqlite:/tmp/cf-scope-identity.db");
+        let slashed = sqlite_scope_identity("sqlite:///tmp/cf-scope-identity.db");
+        assert_eq!(bare, slashed);
     }
 }

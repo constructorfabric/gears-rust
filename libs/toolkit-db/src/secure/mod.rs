@@ -133,7 +133,7 @@ mod tx_error;
 
 // Core types
 pub use entity_traits::ScopableEntity;
-pub use error::{ScopeError, is_unique_violation};
+pub use error::{ScopeError, is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security
 pub use toolkit_security::{
@@ -151,9 +151,11 @@ pub use runner::DBRunner;
 pub(crate) use runner::{DBRunnerInternal, SeaOrmRunner};
 
 // Primary database types (new secure API)
-#[cfg(feature = "test-support")]
-pub use db::in_transaction_for_testing;
 pub use db::{DEFAULT_TX_RETRY_ATTEMPTS, Db, DbConn, DbTx};
+#[cfg(feature = "test-support")]
+pub use db::{
+    in_transaction_for_testing, transaction_id_for_testing, transaction_isolation_for_testing,
+};
 
 // Transaction error types (no SeaORM types leaked)
 pub use tx_error::{InfraError, TxError};

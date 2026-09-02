@@ -4,19 +4,29 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Single source of truth for the database container images used by the workspace integration tests"
-# Test-only helper, like `cf-gears-toolkit-macros-tests`. Unpublished crates need
-# no `release-plz.toml` entry (see the comment at release-plz.toml:5-9).
+repository.workspace = true
+rust-version.workspace = true
+description = "Pinned database container images for the workspace's integration tests (not published)"
 publish = false
+
+[lib]
+name = "test_containers"
 
 [lints]
 workspace = true
 
-# Regular dependencies, not dev-dependencies: consumers reach `testcontainers`
-# and `testcontainers-modules` types through this crate's return types.
 [dependencies]
+# Regular (not dev) dependencies: their types appear in this crate's public
+# signatures (`ContainerRequest<Postgres>`, `GenericImage`). They are not
+# re-exported — consumers keep their own `testcontainers` dev-dependency, which
+# keeps `Postgres::default()` unreachable through `test_containers::`.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 
 [dev-dependencies]
+# Scoped env-var mutation for the override tests; `std::env::set_var` is
+# `unsafe` on edition 2024 and this workspace forbids `unsafe_code`.
 temp-env = { workspace = true }
+# Env-var tests mutate shared process state; `#[serial]` keeps them off each
+# other's toes.
+serial_test = { workspace = true }

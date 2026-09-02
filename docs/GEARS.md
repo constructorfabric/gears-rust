@@ -36,9 +36,12 @@ All gears can be divided into several categories:
 - **Business Logic Gears** - gears implementing the main SaaS service logic built on top of CF/Gears Toolkit and system gears
 - **Gen AI Gears** - foundational generative AI capabilities such as chat, model management, agents, memory, search, crawling, scheduling, and MCP integration
 - **Serverless** - functions/workflows, runtimes, durable state, settings, and cluster coordination gears
+- **BSS (Business Support System)** - monetization and commercial gears: product catalog, pricing, rating, billing, subscriptions, payments, invoicing, contracts, and marketplace
 - **Core Functionality** - shared platform capabilities such as audit, usage collection, jobs, registries, file handling, quotas, notifications, analytics, and approvals
 - **Core Platform Integration Gears** - interfaces for other gears and adapters for real Core Platform services (see below)
 - **Core Platform Services** - external services that implement Core Platform functionality, such as tenancy management, access policies, licensing, credentials, and outbound egress control
+- **OSS (Operations Support System)** - operational gears for infrastructure management, DNS, certificates, monitoring, service catalog, and multi-region operations
+- **Studio** - developer experience and governance gears for the Constructor Studio product
 
 The **Core Platform Integration Gears** layer abstracts integration with core platform services, such as IdP, policy management, licensing, and credentials management that that can be out of scope of Gears. This keeps Gears reusable: it can run as a standalone platform, or it can integrate into an existing enterprise platform by wiring adapters to the platform’s services.
 
@@ -109,7 +112,7 @@ Provide conversational capabilities (chat messages, conversation history) as a c
 #### More details
 - [PRD](../gears/chat-engine/docs/PRD.md)
 - [Design](../gears/chat-engine/docs/DESIGN.md)
-- [API](../gears/chat-engine/api/README.md)
+- [Webhook protocol](../gears/chat-engine/docs/WEBHOOK-PROTOCOL.md)
 - TODO: SDK link
 
 ### Models Registry
@@ -373,7 +376,7 @@ Provide durable state primitives and generic CRUD storage for typed resources th
 - [ ] p1 - pluggable storage backend (Relational Database plugin via SecureORM as default)
 - [ ] p1 - configurable soft-delete retention with background purge task
 - [ ] p2 - batch CRUD operations (POST /resources:batch, POST /resources:batch-get) per DNA BATCH.md
-- [ ] p2 - per-resource-type lifecycle notification events (created/updated/deleted) via Events Broker
+- [ ] p2 - per-resource-type lifecycle notification events (created/updated/deleted) via Event Broker
 - [ ] p2 - per-resource-type audit events via Audit Gear
 - [ ] p3 - alternative storage plugins (search engines, vendor-provided backends) with per-type routing
 - [ ] p4 - on-change events and serverless functions or workflows invocation
@@ -518,7 +521,7 @@ Measure platform usage (API calls, compute, storage) for quotas, billing, and in
 - TODO: API link
 - TODO: SDK link
 
-### Events Broker
+### Event Broker
 #### Responsibility
 Provide platform-wide event publishing and subscription for asynchronous workflows and loose coupling between gears.
 #### High Level Scenarios
@@ -722,6 +725,258 @@ pluggable storage backends, consumer-group cursor tracking.
 - [Design](../gears/system/event-broker/docs/DESIGN.md) (R4 signed off)
 - [SDK](../gears/system/event-broker/event-broker-sdk/README.md)
 
+## BSS (Business Support System)
+
+**BSS Gears** implement the monetization and commercial capabilities of the platform. They cover the full revenue lifecycle: product catalog, plan and price modeling, subscriptions, usage rating, invoicing, payments, billing ledger, tax, FX rates, contracts, orders, and marketplace. BSS gears compose Core Functionality gears (Usage Collector, Event Broker, Types Registry) and Core Platform Integration gears (Credentials Store, License Resolver) to deliver end-to-end commercial workflows.
+
+BSS gears follow a strict separation of concerns: each gear owns one domain and delegates cross-cutting concerns to its neighbors through stable SDK contracts. Financial-grade auditability, deterministic replay, and multi-tenant isolation are foundational requirements across all BSS gears.
+
+### Product & SKU Management
+#### Responsibility
+Authoritative multi-tenant catalog registry: System of Record for products, SKUs, categories, taxonomy, attributes, localization, and immutable catalog versions with financial-grade governance.
+#### High Level Scenarios
+- [ ] p1 - create and manage products and SKUs with tenant isolation
+- [ ] p1 - category and taxonomy management with hierarchical classification
+- [ ] p2 - attribute schemas, localization, and multi-currency display names
+- [ ] p2 - immutable catalog versioning and deterministic snapshots
+- [ ] p2 - approval-gated publishing with two-person rule and CloudEvents audit trail
+- [ ] p3 - bulk operations, cloning, and import/export
+- [ ] p4 - partner/brand/region-scoped offerings and marketplace integration
+#### More details
+- [PRD](../gears/bss/products/docs/PRD.md)
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Plan & Price Modeling
+#### Responsibility
+Define subscription plans, price structures, add-ons, bundles, and billing descriptors so that Subscriptions can sell, Tariffs can resolve inputs, and Rating can charge deterministically from frozen snapshots.
+#### High Level Scenarios
+- [ ] p1 - plan definition with billing cycles and plan types
+- [ ] p1 - price structure and model kinds (flat, per_unit, tiered, volume, package, hybrid)
+- [ ] p1 - plan composition, descriptors, and billing phases
+- [ ] p2 - multi-currency, regional, and tax-display pricing
+- [ ] p2 - price window linkage and effective-dated price schedules
+- [ ] p2 - publish validation, approval workflow, and plan lifecycle events
+- [ ] p3 - price overlays and segment-based pricing
+- [ ] p3 - plan lifecycle: retirement, grandfathering, and scheduled migration
+- [ ] p4 - advanced pricing primitives and promotion rules
+#### More details
+- [PRD](../gears/bss/pricing/docs/PRD.md)
+- [Design](../gears/bss/pricing/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### Tariffs
+#### Responsibility
+Tariff definitions consumed by Rating and Product Catalog with configurable conditional clauses and tariff shapes.
+#### High Level Scenarios
+- [ ] p1 - define and manage tariff structures
+- [ ] p1 - conditional clause evaluation and tariff shape resolution
+- [ ] p2 - tariff versioning and effective dating
+- [ ] p3 - integration with Rating and Plan & Price Modeling
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Rating
+#### Responsibility
+Convert metered usage and subscription state into deterministic, auditable charges via a pure evaluation core and an operational pipeline.
+#### High Level Scenarios
+- [ ] p1 - deterministic charge evaluation with byte-for-byte reproducible outputs
+- [ ] p1 - pricing model coverage: flat, per_unit, tiered, volume, package, hybrid, committed-usage
+- [ ] p1 - multi-tenant hierarchy evaluation (platform owner, channel partner, end customer)
+- [ ] p2 - multi-currency correctness with separated price/invoice/settlement currencies
+- [ ] p2 - rule-version audit trail with UTC effective dating
+- [ ] p2 - usage ingestion, windowed aggregation, dedup, and evaluation-unit synthesis
+- [ ] p3 - retroactivity, corrections, and period-level obligations
+- [ ] p4 - commitments, reservations, and coupons overlay
+#### More details
+- [PRD](../gears/bss/rating/docs/PRD.md)
+- [Design](../gears/bss/rating/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### FX Rate Provider
+#### Responsibility
+Supply the Billing Ledger with live foreign-exchange reference rates from configured external sources via a stateless, plugin-based adapter.
+#### High Level Scenarios
+- [x] p1 - fetch and compose rates from configured source plugins (ECB primary)
+- [x] p1 - register composite rate provider via types-registry plugin pattern
+- [x] p1 - return per-rate provider provenance and original publication
+- [x] p2 - onboard plain REST feeds via the http-json source plugin
+- [ ] p3 - additional external-FX source plugins (bank/PSP and other provider families)
+#### More details
+- [PRD](../gears/bss/rate-provider/docs/PRD.md)
+- [Design](../gears/bss/rate-provider/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### Subscriptions
+#### Responsibility
+Own the subscription as the primary commercial aggregate for recurring revenue: a versioned, auditable lifecycle state machine with effective-dated composition that aligns Rating and Billing under multi-tenant ownership.
+#### High Level Scenarios
+- [ ] p1 - subscription lifecycle state machine (create, activate, suspend, cancel, expire)
+- [ ] p1 - versioning and effective-dated plan/add-on composition
+- [ ] p1 - multi-tenant ownership (resource, payer, seller tenants)
+- [ ] p2 - plan changes (upgrade/downgrade) with proration triggers
+- [ ] p2 - renewal semantics, grace periods, and failed-renewal handling
+- [ ] p2 - entitlement lifecycle (issue, revoke, point-of-use check)
+- [ ] p3 - trial runtime and conversion
+- [ ] p3 - event model and billing alignment
+#### More details
+- [PRD](../gears/bss/subscriptions/docs/PRD.md)
+- [Design](../gears/bss/subscriptions/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### Contracts & Agreements
+#### Responsibility
+System of Record for the signed commercial relationship between selling and paying tenants: terms, negotiated prices, commitments, and renewal rules consumed by downstream BSS gears.
+#### High Level Scenarios
+- [ ] p1 - contract document lifecycle (draft, active, expired, terminated)
+- [ ] p1 - terms consumed by Subscriptions (renewal, grace, limits)
+- [ ] p2 - negotiated price overrides as highest-precedence rating layer
+- [ ] p2 - commitments, prepaid pools, and ramps
+- [ ] p3 - booking, acceptance, and eligibility rules
+- [ ] p3 - event publication for downstream consumers
+#### More details
+- [PRD](../gears/bss/contracts/docs/PRD.md)
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Order Management
+#### Responsibility
+Manage purchase orders and order documents that reference contracts, subscriptions, and catalog items.
+#### High Level Scenarios
+- [ ] p1 - create, track, and fulfill purchase orders
+- [ ] p2 - order validation against contracts and catalog
+- [ ] p3 - order lifecycle with approval and cancellation
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Order Workflow
+#### Responsibility
+Orchestrate multi-step order fulfillment workflows across BSS and OSS gears.
+#### High Level Scenarios
+- [ ] p1 - define and execute order fulfillment workflows
+- [ ] p2 - step-level error handling, retries, and compensations
+- [ ] p3 - integration with provisioning and activation gears
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Invoicing
+#### Responsibility
+Generate and manage invoice documents from rated charges, applying tax, discounts, and billing rules.
+#### High Level Scenarios
+- [ ] p1 - invoice generation from rated charges and subscription state
+- [ ] p1 - invoice lifecycle management (draft, issued, paid, voided)
+- [ ] p2 - invoice templates and configurable line-item formatting
+- [ ] p2 - tax and discount application
+- [ ] p3 - credit/debit note generation
+- [ ] p4 - PDF rendering and multi-channel delivery
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Billing Ledger
+#### Responsibility
+Append-only, double-entry subledger recording every financially material movement with balanced journal lines, multi-tenant isolation, and immutable audit history.
+#### High Level Scenarios
+- [ ] p1 - double-entry journal engine with balanced posting
+- [ ] p1 - posting rules for invoices, payments, adjustments, and refunds
+- [ ] p2 - AR balances, aging, and statement generation
+- [ ] p2 - ASC 606-compatible revenue recognition
+- [ ] p2 - immutability, audit, and compliance controls
+- [ ] p3 - reconciliation and period close
+- [ ] p3 - chargebacks and dispute handling
+- [ ] p4 - idempotent export to ERP/GL
+#### More details
+- [PRD](../gears/bss/ledger/docs/PRD.md)
+- [Design](../gears/bss/ledger/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### Tax Engine
+#### Responsibility
+Tax calculation engine with pluggable third-party adapters for jurisdiction-aware tax determination.
+#### High Level Scenarios
+- [ ] p1 - tax calculation for invoice line items
+- [ ] p2 - jurisdiction rules and tax type classification
+- [ ] p3 - pluggable third-party tax adapters (Avalara, Vertex)
+- [ ] p4 - tax exemption and override management
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Payments
+#### Responsibility
+Payment processing and lifecycle management with pluggable payment provider backends.
+#### High Level Scenarios
+- [ ] p1 - payment capture, authorization, and settlement lifecycle
+- [ ] p2 - payment method management and tokenization
+- [ ] p2 - pluggable payment providers (Stripe plugin as first backend)
+- [ ] p3 - refunds, chargebacks, and dispute resolution
+- [ ] p4 - recurring payment automation and dunning
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Quota Manager
+#### Responsibility
+Manage quota definitions, allocations, and consumption tracking for tenant-level resource governance.
+#### High Level Scenarios
+- [ ] p1 - define and allocate quotas per tenant and resource type
+- [ ] p2 - track quota consumption from Usage Collector
+- [ ] p3 - quota lifecycle with overage policies and alerts
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Marketplace
+#### Responsibility
+Multi-tenant marketplace for third-party and partner offerings with catalog integration and revenue sharing.
+#### High Level Scenarios
+- [ ] p1 - list and discover marketplace offerings
+- [ ] p2 - partner onboarding and offering publishing workflows
+- [ ] p3 - revenue sharing and commission management
+- [ ] p4 - marketplace governance and compliance controls
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Ticketing Service
+#### Responsibility
+Support ticket management for customer and partner issue tracking within the BSS domain.
+#### High Level Scenarios
+- [ ] p1 - create and manage support tickets with tenant isolation
+- [ ] p2 - ticket lifecycle, assignment, and escalation rules
+- [ ] p3 - SLA tracking and compliance reporting
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
 ## Core Platform Services
 
 Core Platform Services are authoritative, enterprise-level services that may exist outside of Gears and act as systems of record for critical governance domains such as accounts, identity, access policies, licensing, credentials, and outbound egress control. These components typically belong to an organization’s broader platform or SaaS ecosystem and may already be deployed, certified, and governed independently of Gears.
@@ -796,6 +1051,216 @@ Centralized gateway for external-API calls with credentials injection, reliabili
 - TODO: API link
 - TODO: SDK link
 
+## OSS (Operations Support System)
+
+**OSS Gears** provide infrastructure management, operational tooling, and service delivery capabilities. They cover resource lifecycle orchestration, DNS and certificate management, monitoring, service catalogs, user task management, and multi-region operations. OSS gears compose Core Functionality gears and Core Platform Integration gears to deliver operational workflows for platform and tenant administrators.
+
+### Infrastructure Resource Manager
+#### Responsibility
+Central orchestration layer for all infrastructure and application resources: unified management surface, declarative deployment model with safe reconciliation, day-2 lifecycle actions, and automated discovery.
+#### High Level Scenarios
+- [ ] p1 - unified resource management API with typed resource registry
+- [ ] p1 - resource state management and versioning
+- [ ] p2 - custom resource lifecycle actions
+- [ ] p2 - resources explorer and virtual resource graph
+- [ ] p3 - diff engine (no change, create, update, replace, delete)
+- [ ] p3 - declarative deployments with preview, apply, and rollback
+- [ ] p4 - adapter lifecycle management and public adapter Rust SDK
+- [ ] p4 - automated discovery of existing estates
+#### More details
+- [PRD](../gears/infrastructure-resource-manager/docs/PRD.md)
+- [Design](../gears/infrastructure-resource-manager/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
+### Infrastructure Inventory
+#### Responsibility
+Maintain a discoverable inventory of infrastructure assets and their relationships across deployment environments.
+#### High Level Scenarios
+- [ ] p1 - asset registration and inventory queries
+- [ ] p2 - relationship tracking and topology views
+- [ ] p3 - compliance and drift detection
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Reference Account Server
+#### Responsibility
+Reference implementation of account management for standalone Gears deployments without an external identity platform.
+#### High Level Scenarios
+- [ ] p1 - user and tenant account CRUD
+- [ ] p1 - JWT issuance and JWKS endpoint
+- [ ] p2 - hierarchical multi-tenancy
+- [ ] p3 - account lifecycle (suspend, delete, archive)
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### DNS Manager
+#### Responsibility
+Manage DNS zones and records with pluggable provider backends for automated domain lifecycle.
+#### High Level Scenarios
+- [ ] p1 - zone and record CRUD with tenant isolation
+- [ ] p2 - pluggable DNS providers (PowerDNS plugin as first backend)
+- [ ] p3 - automated DNS provisioning as part of resource lifecycle
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### SSL Certificates Manager
+#### Responsibility
+Manage SSL/TLS certificate lifecycle including issuance, renewal, and deployment across platform services.
+#### High Level Scenarios
+- [ ] p1 - certificate issuance and storage
+- [ ] p2 - automated renewal and deployment
+- [ ] p3 - integration with DNS Manager for domain validation
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Service Catalog
+#### Responsibility
+Publish and discover service offerings available to tenants, bridging BSS product catalog and OSS provisioning.
+#### High Level Scenarios
+- [ ] p1 - list and discover available service offerings
+- [ ] p2 - tenant-scoped service availability and entitlements
+- [ ] p3 - self-service provisioning workflows
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### User Tasks Manager
+#### Responsibility
+Track and manage user-facing operational tasks, approvals, and action items within the platform.
+#### High Level Scenarios
+- [ ] p1 - create and assign tasks with tenant isolation
+- [ ] p2 - task lifecycle, due dates, and status tracking
+- [ ] p3 - integration with approval workflows and notifications
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Translation Engine
+#### Responsibility
+Provide multi-language translation and localization services for platform content and tenant-facing artifacts.
+#### High Level Scenarios
+- [ ] p1 - translate content between supported languages
+- [ ] p2 - tenant-scoped translation overrides and glossaries
+- [ ] p3 - batch translation and localization pipelines
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Calendar Manager
+#### Responsibility
+Manage calendar events, schedules, and business-day calculations for platform workflows and billing cycles.
+#### High Level Scenarios
+- [ ] p1 - business calendar definitions and holiday rules
+- [ ] p2 - scheduling and event management
+- [ ] p3 - integration with billing cycles and SLA calculations
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Location Manager (Multi-Region)
+#### Responsibility
+Manage deployment locations, regions, and availability zones for multi-region platform operations.
+#### High Level Scenarios
+- [ ] p1 - location and region registry
+- [ ] p2 - data sovereignty and placement policies
+- [ ] p3 - cross-region resource topology
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Monitoring
+#### Responsibility
+Collect and expose platform health metrics, alerts, and operational dashboards for infrastructure and service observability.
+#### High Level Scenarios
+- [ ] p1 - health check aggregation and status pages
+- [ ] p2 - alerting rules and notification routing
+- [ ] p3 - operational dashboards and trend analysis
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Construct Service
+#### Responsibility
+Provide infrastructure provisioning and orchestration primitives for automated deployment workflows.
+#### High Level Scenarios
+- [ ] p1 - provisioning primitives and deployment automation
+- [ ] p2 - integration with Infrastructure Resource Manager
+- [ ] p3 - multi-tenant provisioning policies
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+## Studio
+
+**Studio Gears** provide the developer experience and governance capabilities for the Constructor Studio product. They enable collaborative development workflows, GitHub integration, and platform governance controls.
+
+### Studio Backend
+#### Responsibility
+Provide the backend services for Constructor Studio: project management, artifact storage, and collaboration features.
+#### High Level Scenarios
+- [ ] p1 - project and workspace management
+- [ ] p1 - artifact storage and retrieval
+- [ ] p2 - collaboration and sharing
+- [ ] p3 - version history and diff views
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### GitHub Mirror
+#### Responsibility
+Synchronize platform artifacts and configurations with GitHub repositories for version control and CI/CD integration.
+#### High Level Scenarios
+- [ ] p1 - bi-directional sync between platform and GitHub repos
+- [ ] p2 - webhook-driven change propagation
+- [ ] p3 - conflict resolution and merge strategies
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
+### Governance Service
+#### Responsibility
+Enforce platform governance policies, compliance controls, and quality gates across artifacts and deployments.
+#### High Level Scenarios
+- [ ] p1 - policy definition and enforcement
+- [ ] p2 - compliance checks and quality gates
+- [ ] p3 - governance audit trails and reporting
+#### More details
+- TODO: PRD link
+- TODO: Design link
+- TODO: API link
+- TODO: SDK link
+
 # SCENARIOS EXAMPLES
 
 ## Sub-scenario - incoming API call processing
@@ -833,7 +1298,7 @@ sequenceDiagram
     participant M as Target gear (REST handler)
     participant D as Domain service
     participant DB as DB (SecureConn)
-    participant EB as Events Broker
+    participant EB as Event Broker
     participant AUD as Audit
     participant UT as Usage Collector
   end
@@ -1040,7 +1505,7 @@ sequenceDiagram
     participant HK as Hook invocation
     participant JM as Jobs Manager
     participant DB as Chat DB
-    participant EB as Events Broker
+    participant EB as Event Broker
   end
 
   U->>C: Attach file + type message
@@ -1101,7 +1566,7 @@ sequenceDiagram
     participant HK as Hook invocation
     participant LLM as LLM Gateway (embeddings)
     participant LSI as Local Search Index
-    participant EB as Events Broker
+    participant EB as Event Broker
     participant CE as Chat Engine
     participant RAG as RAG Gateway
   end
@@ -1400,7 +1865,7 @@ sequenceDiagram
     participant LLM as LLM Gateway
     participant DB as Chat DB
     participant AM as Agent Memory
-    participant EB as Events Broker
+    participant EB as Event Broker
     participant AUD as Audit
     participant UT as Usage Collector
   end

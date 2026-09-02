@@ -3,7 +3,7 @@
 //! These are the only types that derive `utoipa::ToSchema` — domain models
 //! in `domain/` and SDK models in `chat_engine_sdk::models` stay
 //! transport-agnostic. Each DTO carries the exact field names / optionality
-//! locked by `modules/chat-engine/api/http-protocol.json` and the SDK wire
+//! locked by the generated `gears/chat-engine/docs/openapi.json` and the SDK wire
 //! formats sealed in Phase 5.
 //!
 //! The streaming event DTOs ([`StreamingStartDto`], [`StreamingChunkDto`],
@@ -603,7 +603,7 @@ pub struct StreamingErrorDto {
 
 /// Tagged-union of all streaming events. NDJSON serialization writes one
 /// `StreamingEventDto` per line. The discriminator field is `type` per
-/// the OpenAPI spec (`api/http-protocol.json`) — see
+/// the OpenAPI spec (`docs/openapi.json`) — see
 /// `StreamingStartEvent.type`, `StreamingChunkEvent.type`, …
 #[api_dto(request, response)]
 #[serde(tag = "type")]

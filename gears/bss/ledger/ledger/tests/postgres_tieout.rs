@@ -239,7 +239,7 @@ fn noop_publisher() -> Arc<LedgerEventPublisher> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clean_tenant_ties_out() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -264,7 +264,7 @@ async fn clean_tenant_ties_out() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn account_balance_drift_is_detected() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -301,7 +301,7 @@ async fn account_balance_drift_is_detected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ar_sub_grain_drift_is_detected() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -336,7 +336,7 @@ async fn ar_sub_grain_drift_is_detected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pending_mapping_is_flagged() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -372,7 +372,7 @@ async fn pending_mapping_is_flagged() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn entry_balance_backstop_catches_imbalanced_entry() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -464,7 +464,7 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn entry_backstop_catches_mixed_payer_entry() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -564,7 +564,7 @@ async fn entry_backstop_catches_mixed_payer_entry() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_emits_negative_grain_and_entry_imbalance_arms() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -865,7 +865,7 @@ async fn seed_ar_invoice(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn payment_counter_reconcile_through_full_tie_out() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -987,7 +987,7 @@ async fn payment_counter_reconcile_through_full_tie_out() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn incremental_tie_out_covers_reusable_credit_grain() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

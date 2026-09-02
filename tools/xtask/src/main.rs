@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod pins;
+
 fn main() -> ExitCode {
     // codacy:ignore -- build helper CLI, no security context
     let args: Vec<String> = env::args().skip(1).collect();
@@ -11,6 +13,7 @@ fn main() -> ExitCode {
     match cmd {
         "split-debug" => split_debug(&args[1..]),
         "proto-regen" => proto_regen(&args[1..]),
+        "check-test-container-pins" => pins::check(&args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -41,6 +44,13 @@ Commands:
                         for each.
                         With `--check`, fails if any tracked `.proto`
                         or `proto.lock.toml` would change (CI guard).
+
+  check-test-container-pins
+                        Fail if any tracked `.rs` file outside
+                        libs/test-containers constructs a database
+                        container directly -- `Postgres::default()`,
+                        `Mysql::default()` or `GenericImage::new(..)`,
+                        under any alias. See docs/TESTING.md 4.4.
 
   help                  Show this message."
     );

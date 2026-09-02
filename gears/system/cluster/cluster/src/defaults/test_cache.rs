@@ -258,6 +258,54 @@ impl MemoryCache {
         }
     }
 
+    /// Emits `count` [`CacheWatchEvent::Reset`]s to every registered watcher —
+    /// the fixture's stand-in for a backend re-establishing its subscription,
+    /// which is one event per LISTEN reconnect in the Postgres plugin.
+    ///
+    /// `try_send` and a yield between each, rather than an awaited `send`: the
+    /// point of a burst like this is to saturate whatever the *watcher* does with
+    /// the events, so this must not block when the watcher stops draining. The
+    /// yield is what lets the watcher's task run between events, so the events are
+    /// consumed one at a time as a real backend's would be rather than arriving as
+    /// one already-queued batch.
+    pub(super) async fn emit_resets(&self, count: usize) {
+        for _ in 0..count {
+            let senders: Vec<CacheWatchSender> = {
+                let guard = self.lock();
+                guard
+                    .watchers
+                    .iter()
+                    .map(|watcher| watcher.sender.clone())
+                    .collect()
+            };
+            for sender in senders {
+                let _dropped = sender.try_send(CacheWatchEvent::Reset);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Emits one terminal [`CacheWatchEvent::Closed`] to every registered
+    /// watcher — a backend giving up on the subscription, which the election
+    /// state machine has to report to its own consumer.
+    ///
+    /// `try_send`, so a saturated watcher does not block the fixture; that a
+    /// terminal event can be dropped here is the point of the reserved headroom
+    /// one layer up.
+    pub(super) fn emit_watch_close(&self, err: &ClusterError) {
+        let senders: Vec<CacheWatchSender> = {
+            let guard = self.lock();
+            guard
+                .watchers
+                .iter()
+                .map(|watcher| watcher.sender.clone())
+                .collect()
+        };
+        for sender in senders {
+            let _dropped = sender.try_send(CacheWatchEvent::Closed(err.clone()));
+        }
+    }
+
     fn register_watch(&self, kind: WatchKind) -> CacheWatch {
         let (sender, watch) = CacheWatch::channel(WATCH_CAPACITY);
         let mut guard = self.lock();

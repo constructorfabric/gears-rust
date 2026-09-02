@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = []
 file-parser = ["dep:file_parser"]
+github-mirror = ["dep:github_mirror"]
 simple-user-settings = ["dep:simple_user_settings"]
 nodes-registry = ["dep:nodes_registry"]
 resource-group = ["dep:resource_group"]
@@ -86,6 +87,7 @@ resource_group = { package = "cf-gears-resource-group", path = "../../gears/syst
 # user modules
 file_parser = { package = "cf-gears-file-parser", path = "../../gears/file-parser/file-parser", optional = true }
 file_storage = { package = "cf-gears-file-storage", path = "../../gears/file-storage/file-storage", optional = true }
+github_mirror = { package = "cf-gears-github-mirror", path = "../../gears/github-mirror/github-mirror", optional = true }
 nodes_registry = { package = "cf-gears-nodes-registry", path = "../../gears/system/nodes-registry/nodes-registry", optional = true }
 simple_user_settings = { package = "cf-gears-simple-user-settings", path = "../../gears/simple-user-settings/simple-user-settings", optional = true }
 credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore", optional = true }

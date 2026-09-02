@@ -99,7 +99,7 @@ fn account(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_revaluation_then_next_period_reversal() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -406,7 +406,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

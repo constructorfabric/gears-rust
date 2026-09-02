@@ -94,3 +94,49 @@ fn a_running_runs_database_is_left_alone_and_a_finished_ones_is_not() {
     // And this run's own, which need no special case: this process is running.
     assert!(!prunable(&format!("t_{}_0", std::process::id())));
 }
+
+/// **The guard for the channel defect**, which no green run can see.
+///
+/// The defect was never a wrong answer — it was a *second* way of asking. The
+/// adoption, liveness and force-remove questions shelled out to a `docker` CLI
+/// while the container was created through bollard, and where the two do not
+/// resolve to one daemon they can never agree. In a downstream CI image there
+/// was no `docker` binary at all: the first test process created the container
+/// and every later one burned the whole boot budget on `409 Conflict`, until the
+/// step hit its runner's 120-minute cap five builds running.
+///
+/// Every machine that runs this suite has a `docker` on its path, which is
+/// precisely why the hazard sat in `pg_support`'s module doc — written down,
+/// argued about and open — for months: no run this repository can perform is
+/// able to fail on it. What *can* see it is the text. The harness now asks Docker
+/// exactly one way, through the client `.start()` builds the container with, and
+/// a subprocess is the shape the defect takes.
+///
+/// So the assertion is over the whole census rather than a denylist: `ps` is the
+/// one program this harness may execute, which also refuses
+/// `Command::new("/usr/local/bin/docker")` and every other spelling a denylist
+/// would let through. `ps` is sanctioned because it is asked about processes and
+/// not about Docker — see the prune guards above, which are what it serves.
+#[test]
+fn the_harness_executes_no_program_but_ps_and_reaches_docker_one_way() {
+    let harness = include_str!("pg_support/mod.rs");
+
+    let executed: Vec<&str> = harness
+        .split("Command::new(")
+        .skip(1)
+        .map(|rest| rest.split(')').next().unwrap_or(rest).trim())
+        .collect();
+    assert_eq!(
+        executed,
+        vec!["\"ps\""],
+        "the harness must execute nothing but `ps`: a `docker` subprocess is a \
+         second channel, and two channels cannot be kept in agreement"
+    );
+
+    // The positive half: a refusal alone would pass just as well on a harness
+    // that had stopped asking Docker anything.
+    assert!(
+        harness.contains("docker_client_instance()"),
+        "the harness must reach Docker through testcontainers' own client"
+    );
+}

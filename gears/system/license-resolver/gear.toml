@@ -1,0 +1,7 @@
+[gear]
+name = "License Resolver"
+description = "Abstraction layer for license feature checks with caching and metrics collection."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

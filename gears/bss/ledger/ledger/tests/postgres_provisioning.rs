@@ -89,7 +89,7 @@ fn utc_calendar() -> FiscalCalendarSpec {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn provision_is_idempotent_and_additive() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -261,7 +261,7 @@ async fn provision_is_idempotent_and_additive() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn provision_rolls_back_on_out_of_range_scale() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

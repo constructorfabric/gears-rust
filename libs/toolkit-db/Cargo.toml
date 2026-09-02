@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-db"
-version = "0.12.0"
+version = "0.14.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -107,6 +107,7 @@ bigdecimal = { workspace = true }
 rust_decimal = { workspace = true }
 ryu = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
@@ -155,9 +156,8 @@ toolkit-utils = { workspace = true, features = ["serde"] }
 serde-saphyr = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-# Database image pins: see libs/test-containers.
-cf-gears-test-containers = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+test-containers = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 anyhow = { workspace = true }
 temp-env = { workspace = true }
 trybuild = { workspace = true }

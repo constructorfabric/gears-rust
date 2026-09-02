@@ -1,0 +1,7 @@
+[gear]
+name = "Nodes Registry"
+description = "Registry of deployed gear nodes and their capabilities for discovery and management."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

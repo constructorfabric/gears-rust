@@ -4,13 +4,7 @@
 
 use std::sync::Arc;
 
-use secrecy::ExposeSecret;
-use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
-use toolkit_security::{
-    DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
-};
-use toolkit_transport_grpc::extract_internal_token_grpc;
 
 use cf_system_sdks::directory::labels::is_valid_label_segment;
 use cf_system_sdks::directory::{
@@ -42,61 +36,25 @@ fn lookup_status(err: &anyhow::Error) -> Status {
     }
 }
 
-/// gRPC service implementation of Directory Service
+/// gRPC service implementation of Directory Service.
+///
+/// Platform-plane (`x-toolkit-internal-token`) enforcement is applied at the
+/// gRPC server boundary by `grpc-hub`'s `InternalAuthGrpcLayer`
+/// (`cpt-cf-adr-platform-plane-auth`): the token is validated and, on success, a
+/// `PlatformSecurityContext` / `PeerAuthenticated` is placed in the request
+/// extensions before the handler runs.
+///
+/// This is the authentication half only. Authorizing a peer against the gear
+/// name it claims when registering, deregistering, or heartbeating is deferred.
 #[derive(Clone)]
 pub struct DirectoryServiceImpl {
     api: Arc<dyn DirectoryClient>,
-    /// Platform-plane validator. When `Some`, every RPC requires a valid
-    /// `x-toolkit-internal-token` (`cpt-cf-adr-two-plane-auth`); when `None`,
-    /// enforcement is disabled (Profile 1 / in-process only).
-    authenticator: Option<DynInternalAuthenticator>,
 }
 
 impl DirectoryServiceImpl {
-    /// Create a `DirectoryService`. When `authenticator` is `Some`, every RPC
-    /// validates the platform-plane internal token; when `None`, enforcement
-    /// is disabled (Profile 1 / in-process only).
-    pub fn with_authenticator(
-        api: Arc<dyn DirectoryClient>,
-        authenticator: Option<DynInternalAuthenticator>,
-    ) -> Self {
-        Self { api, authenticator }
-    }
-
-    /// Enforce the platform plane on an inbound RPC.
-    ///
-    /// When an authenticator is configured, the `x-toolkit-internal-token`
-    /// metadata must be present and valid; the resolved [`PeerAuthenticated`]
-    /// is returned for workload-policy checks (and traced). When no
-    /// authenticator is configured, enforcement is skipped.
-    async fn authenticate_peer(
-        &self,
-        meta: &MetadataMap,
-    ) -> Result<Option<PeerAuthenticated>, Status> {
-        let Some(authenticator) = &self.authenticator else {
-            return Ok(None);
-        };
-
-        let token = extract_internal_token_grpc(meta)?;
-        match authenticator.authenticate(token.expose_secret()).await {
-            Ok(identity) => {
-                let peer = PeerAuthenticated {
-                    name: identity.peer_name().to_owned(),
-                };
-                tracing::debug!(peer = %peer.name, "platform-plane call authenticated");
-                Ok(Some(peer))
-            }
-            Err(InternalAuthNError::InvalidToken) => {
-                Err(Status::unauthenticated("invalid internal token"))
-            }
-            Err(InternalAuthNError::Unavailable) => {
-                Err(Status::unavailable("internal-auth backend unavailable"))
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "platform-plane authentication failed");
-                Err(Status::internal("internal authentication failure"))
-            }
-        }
+    /// Create a `DirectoryService` backed by `api`.
+    pub fn new(api: Arc<dyn DirectoryClient>) -> Self {
+        Self { api }
     }
 }
 
@@ -106,7 +64,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<ResolveGrpcServiceRequest>,
     ) -> Result<Response<ResolveGrpcServiceResponse>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let service_name = request.into_inner().service_name;
         validate_lookup_name("service_name", &service_name)?;
 
@@ -125,7 +82,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<ResolveRestServiceRequest>,
     ) -> Result<Response<ResolveRestServiceResponse>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let gear_name = request.into_inner().gear_name;
         validate_lookup_name("gear_name", &gear_name)?;
 
@@ -144,7 +100,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<GetOpenApiSpecRequest>,
     ) -> Result<Response<GetOpenApiSpecResponse>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let gear_name = request.into_inner().gear_name;
         validate_lookup_name("gear_name", &gear_name)?;
 
@@ -161,7 +116,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<ListInstancesRequest>,
     ) -> Result<Response<ListInstancesResponse>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let req = request.into_inner();
         let gear_name = req.gear_name;
         validate_lookup_name("gear_name", &gear_name)?;
@@ -205,7 +159,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         _request: Request<ListAllInstancesRequest>,
     ) -> Result<Response<ListAllInstancesResponse>, Status> {
-        self.authenticate_peer(_request.metadata()).await?;
         let instances = self
             .api
             .list_all_instances()
@@ -234,7 +187,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<RegisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let req = request.into_inner();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
@@ -290,7 +242,6 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<DeregisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let req = request.into_inner();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
@@ -303,7 +254,6 @@ impl DirectoryService for DirectoryServiceImpl {
     }
 
     async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<()>, Status> {
-        self.authenticate_peer(request.metadata()).await?;
         let req = request.into_inner();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
@@ -506,16 +456,14 @@ fn validate_identity(gear_name: &str, instance_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Create a `DirectoryService` server with the given API implementation and
-/// optional platform-plane `authenticator`.
+/// Create a `DirectoryService` server backed by `api`.
 ///
-/// When `authenticator` is `Some`, every RPC requires a valid
-/// `x-toolkit-internal-token`; when `None`, enforcement is disabled.
+/// Platform-plane enforcement is applied at the gRPC server boundary by
+/// `grpc-hub`'s `InternalAuthGrpcLayer`.
 pub fn make_directory_service(
     api: Arc<dyn DirectoryClient>,
-    authenticator: Option<DynInternalAuthenticator>,
 ) -> DirectoryServiceServer<DirectoryServiceImpl> {
-    DirectoryServiceServer::new(DirectoryServiceImpl::with_authenticator(api, authenticator))
+    DirectoryServiceServer::new(DirectoryServiceImpl::new(api))
 }
 
 #[cfg(test)]
@@ -534,7 +482,7 @@ mod tests {
     fn service() -> DirectoryServiceImpl {
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        DirectoryServiceImpl::with_authenticator(api, None)
+        DirectoryServiceImpl::new(api)
     }
 
     #[tokio::test]
@@ -851,7 +799,7 @@ mod tests {
         // Directory service backed by an in-memory GearManager.
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        let grpc_service = make_directory_service(api, None);
+        let grpc_service = make_directory_service(api);
 
         // Reserve a free port, then let the tonic server bind it.
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
@@ -935,29 +883,48 @@ mod tests {
         assert!(gears.contains(&"catalog"));
     }
 
-    /// `cpt-cf-adr-platform-plane-auth` acceptance: with a platform-plane
-    /// authenticator installed, the
+    /// `cpt-cf-adr-platform-plane-auth` acceptance: with the platform-plane
+    /// [`InternalAuthGrpcLayer`] on the server (as `grpc-hub` wires it), the
     /// `DirectoryService` gRPC RPCs reject callers lacking a valid internal
-    /// token and accept those that attach the matching shared secret via an
-    /// [`InternalAuthInterceptor`] — the full outbound→inbound loop.
+    /// token and accept those attaching the matching shared secret via an
+    /// [`InternalAuthInterceptor`] — the full outbound→inbound loop. The
+    /// `probe_layer` (a [`tower::util::MapRequestLayer`] mounted just below
+    /// `InternalAuthGrpcLayer`) additionally proves the layer populates the
+    /// `PeerAuthenticated` extension on the request it forwards downstream.
     #[tokio::test]
     async fn grpc_enforces_internal_token_end_to_end() {
         use cf_system_sdks::directory::DirectoryGrpcClient;
         use secrecy::SecretString;
         use tonic::transport::Server;
         use toolkit_security::{DynInternalAuthenticator, SharedSecretInternalAuthenticator};
-        use toolkit_transport_grpc::InternalAuthInterceptor;
+        use toolkit_transport_grpc::{InternalAuthGrpcLayer, InternalAuthInterceptor};
 
         const SECRET: &str = "dev-internal-token";
 
-        // DirectoryService that enforces the platform plane via a shared secret.
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+        let grpc_service = make_directory_service(api);
+
+        // Required mode: an absent token is rejected.
         let authenticator = DynInternalAuthenticator::new(SharedSecretInternalAuthenticator::new(
             SecretString::from(SECRET),
             "peer".to_owned(),
         ));
-        let grpc_service = make_directory_service(api, Some(authenticator));
+        let auth_layer = InternalAuthGrpcLayer::new(authenticator);
+        let saw_expected_peer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_layer = tower::util::MapRequestLayer::new({
+            let saw_expected_peer = Arc::clone(&saw_expected_peer);
+            move |req: http::Request<_>| {
+                if req
+                    .extensions()
+                    .get::<toolkit_security::PeerAuthenticated>()
+                    .is_some_and(|peer| peer.name == "peer")
+                {
+                    saw_expected_peer.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                req
+            }
+        });
 
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -967,6 +934,8 @@ mod tests {
         // ephemeral port still bound.
         let server = tokio::spawn(async move {
             Server::builder()
+                .layer(auth_layer)
+                .layer(probe_layer)
                 .add_service(grpc_service)
                 .serve(addr)
                 .await
@@ -1015,6 +984,12 @@ mod tests {
             .expect("authenticated list");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].gear, "billing");
+
+        assert!(
+            saw_expected_peer.load(std::sync::atomic::Ordering::SeqCst),
+            "InternalAuthGrpcLayer must populate the PeerAuthenticated extension on the request \
+             it forwards to the layers below it"
+        );
 
         server.abort();
     }
@@ -1347,7 +1322,7 @@ mod tests {
 
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        let grpc_service = make_directory_service(api, None);
+        let grpc_service = make_directory_service(api);
 
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()

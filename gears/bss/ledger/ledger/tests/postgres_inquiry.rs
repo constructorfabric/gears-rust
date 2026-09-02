@@ -215,7 +215,7 @@ fn svc(provider: &DBProvider<DbError>, metrics: &MetricsHarness) -> InvoicePostS
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn filter_export_and_drill() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -350,7 +350,7 @@ async fn filter_export_and_drill() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_pack_writes_forensic_record() {
-    let container = cf_gears_test_containers::postgres().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

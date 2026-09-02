@@ -1320,7 +1320,7 @@ mod pg_container {
     pub fn get_pg(rt: &Runtime) -> &'static PgContainer {
         PG.get_or_init(|| {
             rt.block_on(async {
-                let container = cf_gears_test_containers::postgres()
+                let container = test_containers::postgres()
                     .with_env_var("POSTGRES_PASSWORD", "pass")
                     .with_env_var("POSTGRES_USER", "user")
                     .with_env_var("POSTGRES_DB", "bench")
@@ -1373,7 +1373,7 @@ mod mysql_container {
                 //   (COMMIT is 105x slower with binlog enabled vs PG)
                 // - innodb-flush-log-at-trx-commit=2: flush redo log once/sec
                 //   instead of per-commit (safe for benchmarks, not production)
-                let container = cf_gears_test_containers::mysql()
+                let container = test_containers::mysql()
                     .with_env_var("MYSQL_ROOT_PASSWORD", "root")
                     .with_env_var("MYSQL_USER", "user")
                     .with_env_var("MYSQL_PASSWORD", "pass")
@@ -1428,7 +1428,7 @@ mod mariadb_container {
         // MariaDB prints "ready for connections" twice: once during the
         // temporary bootstrap server, once for the real server. We match
         // the version line that only appears in the final startup message.
-        cf_gears_test_containers::mariadb()
+        test_containers::mariadb()
             .with_wait_for(WaitFor::message_on_stderr(
                 "mariadb.org binary distribution",
             ))

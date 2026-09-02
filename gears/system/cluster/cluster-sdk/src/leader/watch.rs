@@ -1,4 +1,3 @@
-// Created: 2026-06-03 by Constructor Tech
 //! The leadership watch-union event type and the [`LeaderWatch`] handle.
 //!
 //! The union shape (`Status`/`Lagged`/`Reset`/`Closed`) is shared across all
@@ -150,6 +149,7 @@ impl LeaderWatch {
             snapshot: snapshot_tx,
             lost_permit: Some(lost_permit),
             closed_permit: Some(closed_permit),
+            dropped: 0,
         };
         let watch = Self {
             events: event_rx,
@@ -428,6 +428,19 @@ pub struct LeaderWatchSender {
     /// receiver still observes channel closure.
     lost_permit: Option<mpsc::OwnedPermit<LeaderWatchEvent>>,
     closed_permit: Option<mpsc::OwnedPermit<LeaderWatchEvent>>,
+    /// Events dropped because the consumer's buffer was full, owed to it as a
+    /// [`LeaderWatchEvent::Lagged`] by the next
+    /// [`try_send_status`](LeaderWatchSender::try_send_status) /
+    /// [`try_send`](LeaderWatchSender::try_send) that finds room, or flushed
+    /// proactively by [`flush_lagged`](LeaderWatchSender::flush_lagged) from the
+    /// renewal tick when the election falls quiet (§6.8's drop-then-`Lagged`
+    /// rule).
+    ///
+    /// Accumulated rather than reported eagerly, exactly as both plugin cache
+    /// fan-outs do: "you missed one", repeated, is more sends into a channel that
+    /// is already full, and the consumer's response to any count is the same —
+    /// treat the leadership status as stale and wait for the next `Status`.
+    dropped: u64,
 }
 
 impl std::fmt::Debug for LeaderWatchSender {
@@ -436,6 +449,7 @@ impl std::fmt::Debug for LeaderWatchSender {
             usize::from(self.lost_permit.is_some()) + usize::from(self.closed_permit.is_some());
         f.debug_struct("LeaderWatchSender")
             .field("terminal_headroom_reserved", &reserved)
+            .field("dropped", &self.dropped)
             .finish_non_exhaustive()
     }
 }
@@ -477,6 +491,142 @@ impl LeaderWatchSender {
              snapshot stays coherent with the event stream",
         );
         self.events.send(event).await.map_err(|err| err.0)
+    }
+
+    /// Records a leadership transition **without ever blocking**: the snapshot is
+    /// updated, and the matching [`LeaderWatchEvent::Status`] is delivered if
+    /// there is room or dropped and owed as a
+    /// [`LeaderWatchEvent::Lagged`] if there is not.
+    ///
+    /// Returns `false` only when the consumer has dropped the watch — a full
+    /// buffer is `true`, because the subscription is alive and the caller has
+    /// nothing to stop for.
+    ///
+    /// # Why a state machine must use this and not [`send_status`](Self::send_status)
+    ///
+    /// The awaiting form puts the consumer in the renewal loop's critical path.
+    /// [`LeaderWatch`] documents and permits a gate-pattern consumer that reads
+    /// [`status`](LeaderWatch::status) synchronously and never drains
+    /// [`changed`](LeaderWatch::changed) — so the buffer *will* fill, and one
+    /// awaited send then parks the election task forever: it stops renewing, never
+    /// re-claims, and cannot even observe its own shutdown signal, while the
+    /// latched snapshot keeps answering `Leader` and a rival takes the lease. Two
+    /// permanent leaders, reproduced. Dropping an event costs the consumer a
+    /// re-read; awaiting one costs the claim.
+    ///
+    /// **The snapshot is updated whichever way the event goes**, which is what
+    /// makes the drop safe for the gate-pattern consumer this exists for: it reads
+    /// the snapshot, and the snapshot is never lossy. The event-stream consumer
+    /// gets the `Lagged` instead, so nothing is lost silently either.
+    pub fn try_send_status(&mut self, status: LeaderStatus) -> bool {
+        // Snapshot first, on exactly `send_status`'s reasoning: a synchronous
+        // `status()` racing this must never observe a value older than the event
+        // about to arrive. `send_replace` latches with no receiver, so it cannot
+        // fail.
+        self.snapshot.send_replace(status);
+        self.offer(LeaderWatchEvent::Status(status))
+    }
+
+    /// Emits a non-status event (`Lagged` / `Reset` / `Closed`) on
+    /// [`try_send_status`](Self::try_send_status)'s terms: never blocking, dropped
+    /// and owed a `Lagged` when the buffer is full, `false` only when the consumer
+    /// is gone.
+    ///
+    /// Status transitions must go through
+    /// [`try_send_status`](Self::try_send_status) for the same reason they must go
+    /// through [`send_status`](Self::send_status) rather than
+    /// [`send`](Self::send) — the snapshot and the event have to move together.
+    /// Asserted in debug builds.
+    pub fn try_send(&mut self, event: LeaderWatchEvent) -> bool {
+        debug_assert!(
+            !matches!(event, LeaderWatchEvent::Status(_)),
+            "LeaderWatchSender::try_send must not carry Status events; use try_send_status so \
+             the snapshot stays coherent with the event stream",
+        );
+        self.offer(event)
+    }
+
+    /// Delivers a **terminal** `Closed(err)` through the reserved headroom, so it
+    /// cannot be dropped by a full buffer and cannot block the caller.
+    ///
+    /// The other terminal path beside
+    /// [`revoke_for_shutdown`](Self::revoke_for_shutdown), and it spends the same
+    /// `Closed` reservation: the two are mutually exclusive by construction — a
+    /// backend that closes terminally stops, so it never revokes afterwards.
+    ///
+    /// Why not [`try_send`](Self::try_send): a dropped `Closed(err)` is not a gap
+    /// the consumer can be told about. [`changed`](LeaderWatch::changed)
+    /// synthesizes `Closed(Shutdown)` when the sender is dropped without a
+    /// terminal event, so losing a `Closed(Provider{..})` would report a provider
+    /// failure to the consumer as an orderly shutdown — the error is the whole
+    /// content of a terminal event, and this is the one send where "drop and owe a
+    /// `Lagged`" is the wrong trade.
+    pub fn try_close(&mut self, err: ClusterError) {
+        match self.closed_permit.take() {
+            // `send` consumes the permit and returns the sender clone it held,
+            // dropped here; the subscription's own sender lives in `events`.
+            Some(permit) => {
+                let _sender = permit.send(LeaderWatchEvent::Closed(err));
+            }
+            // The reservation was already spent — only possible if a caller
+            // closed twice, which is not a state a second `Closed` can improve.
+            None => {
+                let _dropped = self.events.try_send(LeaderWatchEvent::Closed(err));
+            }
+        }
+    }
+
+    /// Flushes any outstanding lag notice proactively, delivering the owed
+    /// [`LeaderWatchEvent::Lagged`] if there is now room and clearing the debt.
+    ///
+    /// [`offer`](Self::offer) pays the debt on the *next* event, which is the
+    /// right ordering while events keep coming. But a stable leader's renewal
+    /// ticks emit no event, so if the election falls quiet after a drop the next
+    /// event may never arrive: a `changed()`-only consumer would drain a backlog
+    /// whose last status is a stale `Status(Leader)` and never learn it fell
+    /// behind — the silent-staleness failure ADR-003 exists to eliminate for a
+    /// leadership gate. Both profiles' renewal loops therefore call this from the
+    /// tick, so the announcement never depends on unrelated future traffic
+    /// (invariant I1: the two profiles must not diverge on this).
+    ///
+    /// The synchronous [`status`](LeaderWatch::status) / [`is_leader`](LeaderWatch::is_leader)
+    /// snapshot stays lossless regardless; this is confined to the event stream.
+    /// A `Lagged` that still does not fit stays owed — the debt is only ever added
+    /// to, never lost.
+    pub fn flush_lagged(&mut self) {
+        if self.dropped > 0
+            && self
+                .events
+                .try_send(LeaderWatchEvent::Lagged {
+                    dropped: self.dropped,
+                })
+                .is_ok()
+        {
+            self.dropped = 0;
+        }
+    }
+
+    /// The one non-blocking send path: pay any outstanding lag notice, then offer
+    /// `event`.
+    ///
+    /// The `Lagged` goes first so the consumer is told to re-read *before* it sees
+    /// the next event rather than after — the same ordering the cache pumps use. A
+    /// `Lagged` that does not fit stays owed; the debt is only ever added to,
+    /// never lost.
+    fn offer(&mut self, event: LeaderWatchEvent) -> bool {
+        self.flush_lagged();
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            // The consumer is behind. Drop, account, and carry on: the claim must
+            // not depend on the consumer's read cadence.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped = self.dropped.saturating_add(1);
+                true
+            }
+            // The consumer dropped the watch; the subscription is over and the
+            // caller should tear down.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     /// Performs the graceful-shutdown revocation sequence (DESIGN §3.13,

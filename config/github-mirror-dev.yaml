@@ -1,0 +1,351 @@
+# CF/Gears Example Server Configuration
+#
+# Database Architecture Overview:
+# ===============================
+#
+# CF/Gears Example Server uses a centralized DbManager that:
+# 1. Loads global database server templates from `database.servers`
+# 2. For each gear, merges server template with gear-specific overrides
+# 3. Creates isolated database connections per gear
+# 4. Caches DbHandle instances for reuse within the same gear
+#
+# Key principles:
+# - Each gear gets its own database connection (no sharing)
+# - SQLite gears automatically get their own database file
+# - Configuration follows a clear precedence hierarchy
+# - Environment variables are expanded (${VAR_NAME})
+# - All paths are resolved relative to server.home_dir
+
+# Core server configuration (global section)
+server:
+  home_dir: "~/.cf-gears"
+
+# Database configuration (DbManager architecture)
+#
+# The database config has two levels:
+# 1. Global "servers" - shared connection templates that gears can reference
+# 2. Per-gear configs - specific database settings for each gear
+#
+# Configuration precedence (highest to lowest):
+# - Gear `params` map (highest priority)
+# - Gear DSN query params
+# - Gear fields (host, port, user, etc.)
+# - Gear DSN base
+# - Server `params` map
+# - Server DSN query params
+# - Server fields
+# - Server DSN base (lowest priority)
+#
+database:
+  # Global database servers - reusable connection templates
+  # These define shared settings that multiple gears can inherit
+  servers:
+    # SQLite server template for user data gears
+    # Note: No DSN or file specified here - gears specify their own database files
+    # This prevents accidental sharing of SQLite databases between gears
+    sqlite_users:
+      engine: "sqlite"
+      # SQLite PRAGMA parameters applied to all connections using this server
+      params:
+        WAL: "true"              # Enable Write-Ahead Logging for better concurrency
+        synchronous: "NORMAL"    # Balance between safety and performance
+        busy_timeout: "5000"     # Wait 5 seconds for locked database
+      # Connection pool settings shared by all gears using this server
+      pool:
+        max_conns: 5             # Maximum 5 concurrent connections
+        acquire_timeout: "30s"   # Timeout when acquiring connection from pool
+
+  # Global database options
+  # auto_provision: true       # (default) Create directories automatically for SQLite files
+  # auto_provision: false      # Fail if directories don't exist
+
+# Logging configuration (global section)
+logging:
+  # global section
+  default:
+    console_level: info
+    file: "logs/cf-gears.log"
+    file_level: info
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 10
+  sqlx:
+    console_level: debug
+    file: "logs/sql.log"
+    file_level: debug
+  api-gateway:
+    console_level: info
+    file: "logs/api.log"
+    file_level: debug
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 100
+
+
+# Per-gear configurations using new structure
+gears:
+  api-gateway:
+    config:
+      bind_addr: "0.0.0.0:8087"
+      enable_docs: true
+      cors_enabled: false
+
+      # OpenAPI Documentation Configuration
+      openapi:
+        title: "CF/Gears Example Server API"
+        version: "0.1.0"
+        description: "CF/Gears Example Server API Documentation"
+
+      # Authentication Configuration
+      auth_disabled: true
+      require_auth_by_default: true
+
+  gear-orchestrator:
+    config: {}
+    # No configuration needed for the gear orchestrator
+
+  grpc-hub:
+    config:
+      # Use ephemeral port; OoP gears receive the actual bound address from master host
+      listen_addr: "127.0.0.1:0"
+
+  users-info:
+    # Gear-specific database configuration
+    database:
+      # Reference to global server template defined above
+      server: "sqlite_users"               # Inherits params and pool settings from sqlite_users
+
+      # Gear-specific database file (required for SQLite gears)
+      file: "users_info.db"                # Creates: ~/.cf-gears/users_info/users_info.db
+
+      # Gear can override server settings:
+      # params:
+      #   synchronous: "FULL"              # Would override server's "NORMAL" setting
+      #   custom_pragma: "value"           # Would add new PRAGMA setting
+      # pool:
+      #   max_conns: 10                    # Would override server's max_conns: 5
+
+      # Alternative ways to specify database location:
+      # path: "/absolute/path/to/db.sqlite" # Use absolute path instead of file
+      # dsn: "sqlite://custom.db?WAL=false" # Complete DSN override (ignores server)
+
+      # For other database types (PostgreSQL, MySQL):
+      # host: "localhost"                  # Override server host
+      # port: 5432                         # Override server port
+      # user: "app_user"                   # Override server user
+      # password: "${DB_PASSWORD}"         # Environment variable expansion
+      # dbname: "users_db"                 # Override server database name
+
+    # Gear-specific application configuration
+    config:
+      default_page_size: 5
+      max_page_size: 100
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      # Tenant tree configuration (example: company with 2 divisions, each with departments)
+      tenants:
+        # Root tenant (company level)
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "company-root"
+          parent_id: null
+          status: active
+
+        # Division 1: Engineering
+        - id: "00000000-0000-0000-0000-000000000010"
+          name: "engineering"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+
+        # Division 2: Sales
+        - id: "00000000-0000-0000-0000-000000000011"
+          name: "sales"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+
+        # Department under Engineering: Backend
+        - id: "00000000-0000-0000-0000-000000000100"
+          name: "backend"
+          parent_id: "00000000-0000-0000-0000-000000000010"
+          status: active
+
+        # Department under Engineering: Frontend (soft-deleted)
+        - id: "00000000-0000-0000-0000-000000000101"
+          name: "frontend"
+          parent_id: "00000000-0000-0000-0000-000000000010"
+          status: deleted
+
+        # Department under Sales: Enterprise
+        - id: "00000000-0000-0000-0000-000000000110"
+          name: "enterprise"
+          parent_id: "00000000-0000-0000-0000-000000000011"
+          status: active
+
+  credstore:
+    database:
+      server: "sqlite_users"
+      file: "credstore.db"
+    config:
+      # Gateway selects its value-store backend plugin by GTS vendor;
+      # must match static-credstore-plugin (default "constructorfabric").
+      vendor: "constructorfabric"
+
+  static-credstore-plugin:
+    config:
+      secrets:
+        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          key: "openai-key"
+          value: "sk-test-e2e-fake-key"
+
+  # File parser gear configuration (no database needed)
+  file-parser:
+    config:
+      allowed_local_base_dir: "/tmp"
+
+  simple-user-settings:
+    database:
+      server: "sqlite_users"
+      file: "simple_user_settings.db"
+    config: {}
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
+      github_token: "${GITHUB_TOKEN}"
+
+# OpenTelemetry configuration (resource identity, tracing, metrics)
+opentelemetry:
+  # Shared resource identity (attached to all traces and metrics)
+  resource:
+    service_name: "cf-gears-api"
+    attributes:
+      service.version: "1.3.7"
+      deployment.environment: "dev"
+      service.namespace: "cf-gears"
+
+  # Default exporter shared by tracing and metrics.
+  # Per-signal `exporter` fields override this when present.
+  exporter:
+    kind: "otlp_grpc"  # or "otlp_http"
+    endpoint: "http://127.0.0.1:4317"
+    headers:
+      # Add any required headers, e.g., for authentication
+      # authorization: "Bearer your-token"
+      uptrace-dsn: "http://project1_secret@localhost:14318?grpc=14317"
+    timeout_ms: 5000
+
+  # Tracing configuration
+  tracing:
+    enabled: false
+
+    # Per-signal exporter override (fully replaces the shared exporter)
+    exporter:
+      kind: "otlp_grpc"
+      endpoint: "http://127.0.0.1:14317"  # Jaeger OTLP gRPC endpoint
+
+    # Sampling configuration
+    sampler:
+      parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
+        ratio: 1.0  # Sample 100% of traces
+
+    # Propagation configuration
+    propagation:
+      w3c_trace_context: true  # Enable W3C Trace Context propagation
+
+    # HTTP-specific options
+    http:
+      inject_request_id_header: "x-request-id"
+      # Credential-bearing headers ("authorization", "cookie", …) must never
+      # be listed here: whatever is recorded reaches the trace collector.
+      record_headers: [ "user-agent", "x-forwarded-for" ]
+
+    # Log correlation (future feature)
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+
+  # Metrics configuration
+  metrics:
+    enabled: false
+
+# Example configurations for different database scenarios:
+#
+# Example 1: PostgreSQL server with multiple gears
+# ==================================================
+# database:
+#   servers:
+#     main_postgres:
+#       host: "localhost"
+#       port: 5432
+#       user: "cf_gears"
+#       password: "${POSTGRES_PASSWORD}"  # From environment variable
+#       params:
+#         sslmode: "require"
+#         application_name: "cf_gears"
+#       pool:
+#         max_conns: 20
+#         acquire_timeout: "30s"
+# gears:
+#   users_gear:
+#     database:
+#       server: "main_postgres"
+#       dbname: "users_db"              # Each gear gets its own database
+#   orders_gear:
+#     database:
+#       server: "main_postgres"
+#       dbname: "orders_db"             # Separate database for orders
+#       pool:
+#         max_conns: 10                 # Gear-specific pool override
+#
+# Example 2: Mixed database types
+# ===============================
+# database:
+#   servers:
+#     postgres_main:
+#       dsn: "postgres://user:${PG_PASS}@localhost:5432/main"
+#     redis_cache:
+#       dsn: "redis://localhost:6379/0"
+# gears:
+#   user_service:
+#     database:
+#       server: "postgres_main"
+#       dbname: "users"
+#   cache_service:
+#     database:
+#       server: "redis_cache"
+#
+# Example 3: Complete DSN override
+# ================================
+# gears:
+#   analytics:
+#     database:
+#       dsn: "postgres://analytics:${ANALYTICS_PASSWORD}@analytics-db:5432/metrics?sslmode=require"
+#       # When DSN is specified, server reference is ignored
+#
+# Example 4: No database gear
+# =============================
+# gears:
+#   static_files:
+#     # No database section - gear won't get database access
+#     config:
+#       static_dir: "/var/www/static"

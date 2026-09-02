@@ -107,7 +107,9 @@ fn require_docker() -> bool {
 /// graceful skip. Skipping is right locally, but wrong in CI, where a broken
 /// daemon would otherwise pass vacuously -- `RG_PG_REQUIRE_DOCKER=1` panics.
 async fn pg_fixture() -> Option<PgFixture> {
-    let request = cf_gears_test_containers::postgres()
+    // No local tag override: the workspace floor is now PG 18, well past the
+    // PG13 that made gen_random_uuid() built-in (RG's migrations use it).
+    let request = test_containers::postgres()
         .with_env_var("POSTGRES_PASSWORD", "pass")
         .with_env_var("POSTGRES_USER", "user")
         .with_env_var("POSTGRES_DB", "app");
@@ -186,7 +188,7 @@ async fn create_self_referencing_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -196,7 +198,7 @@ async fn create_self_referencing_type(
         .await
         .expect("create self-referencing type (initial)");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -246,7 +248,7 @@ async fn build_chain(
 async fn pg_move_under_deep_parent_rebuilds_every_depth() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -303,7 +305,7 @@ async fn pg_move_under_deep_parent_rebuilds_every_depth() {
 async fn pg_force_delete_leaves_no_orphans() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -410,6 +412,15 @@ async fn pg_force_delete_leaves_no_orphans() {
         mem_count, 0,
         "memberships for the deleted group should be gone"
     );
+
+    // With every membership of the subtree gone, nothing on real PostgreSQL
+    // FK-restricts deleting `root_type` any more: `ON DELETE RESTRICT` on
+    // `resource_group_membership.gts_type_id` is what would otherwise answer
+    // with "group(s) or membership(s) of this type exist".
+    type_svc
+        .delete_type_unscoped(&root_type.code)
+        .await
+        .expect("delete_type should succeed once the subtree's memberships are gone");
 }
 
 /// RG-06 on real PostgreSQL: a 4-deep create chain, then the full closure
@@ -419,7 +430,7 @@ async fn pg_force_delete_leaves_no_orphans() {
 async fn pg_create_chain_closure_invariant() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);

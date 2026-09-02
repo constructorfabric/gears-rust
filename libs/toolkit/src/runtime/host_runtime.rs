@@ -185,13 +185,14 @@ impl HostRuntime {
     /// # Relationship with `WithLifecycle::stop_timeout`
     ///
     /// When using `WithLifecycle`, its `stop_timeout` (default 30s) races against this
-    /// `shutdown_deadline` (also default 30s). To ensure deterministic behavior:
+    /// `shutdown_deadline` (default [`DEFAULT_SHUTDOWN_DEADLINE`], 35s). To ensure
+    /// deterministic behavior:
     ///
     /// - `WithLifecycle::stop_timeout` should be **less than** `shutdown_deadline`
     /// - This allows the lifecycle's internal timeout to trigger first for graceful cleanup
     /// - The runtime's `deadline_token` then acts as a hard backstop
     ///
-    /// Example: `stop_timeout = 25s`, `shutdown_deadline = 30s`
+    /// Example: `stop_timeout = 30s`, `shutdown_deadline = 35s`
     #[must_use]
     pub fn with_shutdown_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.shutdown_deadline = deadline;

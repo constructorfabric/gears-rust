@@ -1,0 +1,7 @@
+[gear]
+name = "Gear Orchestrator"
+description = "Internal gear lifecycle orchestration and dependency management for the runtime."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

@@ -737,3 +737,104 @@ async fn pg_cache_010b_later_chunks_still_notify_their_keys() {
 
     handle.stop().await;
 }
+
+/// `PG-CACHE-011`: the reserved lease keyspace, against the real store.
+///
+/// The cluster wiring hands the cache-backed default lock and leader-election
+/// backends a `reserved_lease_cache` view rather than the handle the cache API
+/// serves, so their lease records cannot be read, forged or reset through that
+/// API. Two of that arrangement's assumptions are about *this* backend
+/// specifically and are only checkable here:
+///
+/// - `cluster_cache.key` is the table's `PRIMARY KEY` and carries a
+///   2048-byte `CHECK`, so the prefix has to fit — it costs 7 bytes, against a
+///   name budget the SDK already caps at 255.
+/// - the sigil that makes the prefix inexpressible as a public key (`$`) must be
+///   storable, indexable, `LIKE`-escapable by `scan_prefix`, and legal in a
+///   `NOTIFY` payload. None of that is true by definition; it is true because
+///   the key column is `TEXT` and the sigil is not a `LIKE` metacharacter.
+///
+/// The lock is exercised through its blocking waiter, so the scoped `watch` —
+/// which on this plugin is a real `LISTEN`/`NOTIFY` subscription on the
+/// prefixed key — is on the path rather than only the CAS writes.
+#[tokio::test]
+async fn pg_cache_011_lease_records_land_in_the_reserved_keyspace() {
+    use std::sync::Arc;
+
+    use cluster::defaults::CasBasedDistributedLockBackend;
+    use cluster_sdk::lock::DistributedLockBackend;
+
+    let (_container, config) = common::start_postgres().await;
+    let connection_string = config.connection_string.clone();
+    let handle = PostgresClusterPlugin::builder(config)
+        .build_and_start()
+        .await
+        .unwrap();
+
+    // Exactly the composition the wiring builds: the plugin's own
+    // (instrumented) cache below, the reserved view above, and only the lease
+    // backend holding the latter.
+    let served = handle.cache();
+    let lock = Arc::new(
+        CasBasedDistributedLockBackend::new(cluster_sdk::reserved_lease_cache(handle.cache()))
+            .expect("the postgres cache is linearizable"),
+    );
+
+    let guard = lock
+        .try_lock("res", Duration::from_secs(30))
+        .await
+        .expect("the lock is free");
+
+    // Nothing at the key the default used to share with consumer data...
+    assert!(
+        served
+            .get("lock/res")
+            .await
+            .expect("get succeeds")
+            .is_none(),
+        "the lease must not be readable through the handle the cache API serves"
+    );
+    // ...and nothing in the served keyspace at all: `scan_prefix("")` is every
+    // key this backend holds, and the only key here is a lease.
+    assert_eq!(
+        served.scan_prefix("").await.expect("scan succeeds"),
+        vec!["$lease/lock/res".to_owned()],
+        "the lease is stored under the reserved prefix, not at `lock/res`"
+    );
+
+    // The physical row, since the `PRIMARY KEY` column is the constraint that
+    // has to accept the sigil.
+    let pool = common::raw_pool(&connection_string).await;
+    let keys: Vec<(String, i32)> =
+        sqlx::query_as("SELECT key, octet_length(key) FROM public.cluster_cache ORDER BY key")
+            .fetch_all(&pool)
+            .await
+            .expect("cluster_cache query succeeds");
+    assert_eq!(keys.len(), 1, "one held lock is one row");
+    let (key, key_bytes) = &keys[0];
+    assert_eq!(key, "$lease/lock/res");
+    assert!(
+        *key_bytes < 2048,
+        "the prefixed key must stay inside the `cluster_cache_key_len_check` bound, got {key_bytes}"
+    );
+
+    // The blocking waiter takes the lock the moment the holder releases it,
+    // which it can only learn from a `watch` on the *prefixed* key.
+    let waiter = tokio::spawn({
+        let lock = Arc::clone(&lock);
+        async move {
+            lock.lock("res", Duration::from_secs(30), Duration::from_secs(20))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    guard.release().await.expect("the holder releases");
+
+    let acquired = waiter
+        .await
+        .expect("the waiter task completes")
+        .expect("the waiter takes the released lock through the scoped watch");
+    acquired.release().await.expect("the waiter releases");
+
+    handle.stop().await;
+}

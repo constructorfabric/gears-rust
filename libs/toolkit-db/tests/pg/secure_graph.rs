@@ -443,7 +443,7 @@ struct Stand {
 /// `GEARS_TEST_PG_GRAPH_REQUIRED=1` makes an unavailable image a failure, so a
 /// lane that is supposed to cover PG19 cannot pass by skipping.
 async fn stand() -> Option<Stand> {
-    let request = cf_gears_test_containers::postgres_graph()
+    let request = test_containers::postgres_graph()
         .with_env_var("POSTGRES_PASSWORD", "pass")
         .with_env_var("POSTGRES_USER", "user")
         .with_env_var("POSTGRES_DB", "app");
@@ -452,10 +452,10 @@ async fn stand() -> Option<Stand> {
         Ok(container) => container,
         Err(error) => {
             assert!(
-                !cf_gears_test_containers::graph_lane_required(),
+                !test_containers::graph_lane_required(),
                 "GEARS_TEST_PG_GRAPH_REQUIRED is set but PostgreSQL 19 \
                  ({}) could not start: {error}",
-                cf_gears_test_containers::postgres_graph_tag()
+                test_containers::postgres_graph_tag()
             );
             eprintln!("PostgreSQL 19 unavailable - skipping the SQL/PGQ lane: {error}");
             return None;

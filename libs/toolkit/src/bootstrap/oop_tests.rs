@@ -967,3 +967,93 @@ mod platform_credentials {
         );
     }
 }
+
+/// Tests for `build_directory_client`: the bootstrap slice that must build a
+/// `DirectoryService` client even when the directory is unreachable
+/// (`cpt-cf-adr-eventual-readiness`).
+mod directory_client_bootstrap {
+    use super::*;
+    use cf_system_sdks::directory::DirectoryClient;
+    use tokio_util::sync::CancellationToken;
+    use toolkit_security::InternalAuthConfig;
+
+    #[tokio::test]
+    async fn builds_against_unreachable_directory_without_credential() {
+        // Nothing is listening on port 1, yet the client builds: bootstrap is
+        // not blocked on directory reachability.
+        let (client, provider) =
+            build_directory_client("http://127.0.0.1:1", None, &CancellationToken::new())
+                .await
+                .expect("lazy directory client must build against an unreachable directory");
+        assert!(
+            provider.is_none(),
+            "no internal_auth => no outbound credential"
+        );
+
+        // The deferred connect surfaces as an RPC error, not a hang.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.resolve_grpc_service("cf.directory.v1.DirectoryService"),
+        )
+        .await;
+        assert!(outcome.is_ok(), "first RPC must not hang");
+        assert!(
+            outcome.unwrap().is_err(),
+            "first RPC to an unreachable directory must return Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_against_unreachable_directory_with_credential() {
+        // Same guarantee on the credentialed path: the client still builds and
+        // a configured credential yields an outbound provider.
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "shared-tok".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let (_client, provider) =
+            build_directory_client("http://127.0.0.1:1", Some(&cfg), &CancellationToken::new())
+                .await
+                .expect("credentialed lazy client must build against an unreachable directory");
+        assert!(
+            provider.is_some(),
+            "shared secret must yield an outbound token provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_endpoint() {
+        // A malformed endpoint must still fail fast.
+        assert!(
+            build_directory_client("", None, &CancellationToken::new())
+                .await
+                .is_err(),
+            "a malformed directory endpoint must fail fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_endpoint_is_reported_before_credential_failure() {
+        // Both inputs are broken: a malformed endpoint AND a kube token_path
+        // that does not exist. The endpoint is validated first, so the error is
+        // the endpoint error — never the credential one (which would otherwise
+        // mask the misconfigured endpoint).
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(
+                std::env::temp_dir()
+                    .join("cf-oop-missing-token-regression")
+                    .join("token"),
+            ),
+        };
+        let Err(err) = build_directory_client("", Some(&cfg), &CancellationToken::new()).await
+        else {
+            panic!("a malformed endpoint must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("service-account token"),
+            "endpoint must be validated before credential work; got credential error: {msg}"
+        );
+    }
+}

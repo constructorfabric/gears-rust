@@ -777,11 +777,29 @@ impl Gear for AccountManagementGear {
         // @cpt-begin:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
         {
             use crate::domain::user_groups::registration::RegistrationError;
+            // Resolve the narrow, un-gated bootstrap client instead of the
+            // full `ResourceGroupClient`: at this point in `init` the
+            // platform's `AuthZ` machinery is structurally unreachable (see
+            // `resource_group_sdk::ResourceGroupTypeBootstrap`'s doc
+            // comment for the full rationale). TEMPORARY: this bootstrap
+            // split only exists because the GTS type registry lives inside
+            // the resource-group gear — revisit when it becomes its own
+            // gear (see that trait's "Temporary" doc section).
+            let rg_type_bootstrap: Arc<
+                dyn resource_group_sdk::ResourceGroupTypeBootstrap + Send + Sync,
+            > = ctx
+                .client_hub()
+                .get::<dyn resource_group_sdk::ResourceGroupTypeBootstrap>()
+                .map_err(|e| anyhow::anyhow!("failed to get ResourceGroupTypeBootstrap: {e}"))?;
             // System-actor context: stable subject UUID across processes
             // so a future RG-side authz tightening that rejects anonymous
             // does not regress gear init into permanent fail-closed.
             let sys_ctx = crate::domain::system_actor::for_gear_init();
-            match crate::domain::user_groups::register_user_group_types(&rg_client, &sys_ctx).await
+            match crate::domain::user_groups::register_user_group_types(
+                &rg_type_bootstrap,
+                &sys_ctx,
+            )
+            .await
             {
                 Ok(outcome) => {
                     info!(

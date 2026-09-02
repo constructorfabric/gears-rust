@@ -41,15 +41,13 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
             Some("usage_type_catalog_pkey") => DbErrorClass::CatalogUniqueViolation,
             _ => DbErrorClass::Other,
         },
-        // Two codes, one meaning: the delete was refused because rows still
-        // reference the row. `usage_records_gts_id_fk` is `ON DELETE RESTRICT`,
-        // and PostgreSQL 18 reports a RESTRICT refusal as `23001`
-        // (`restrict_violation`) where 17 and earlier reported `23503`
-        // (`foreign_key_violation`) -- verified on the same TimescaleDB 2.29.2
-        // across pg16/pg17/pg18. `23503` still arrives for `NO ACTION` and for
-        // deferred checks, so both codes have to classify the same way; dropping
-        // either one turns `UsageTypeReferenced` into an opaque `Internal` on
-        // one PostgreSQL major.
+        // 23503 `foreign_key_violation` is what PostgreSQL <= 17 reports for the
+        // `usage_records.gts_id` -> catalog RESTRICT guard. PostgreSQL 18
+        // reports the standard 23001 `restrict_violation` for `ON DELETE
+        // RESTRICT` instead ("violates RESTRICT setting of foreign key
+        // constraint ..."), so both codes mean the same thing to this plugin:
+        // the row is still referenced. Verified against
+        // timescale/timescaledb:2.17.2-pg16 (23503) and 2.29.2-pg18 (23001).
         "23503" | "23001" => DbErrorClass::ForeignKeyViolation,
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,
         _ => DbErrorClass::Other,

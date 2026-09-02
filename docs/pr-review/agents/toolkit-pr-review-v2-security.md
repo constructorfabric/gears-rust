@@ -27,7 +27,12 @@ supplies the concrete directory path. In the filename escaping, `/` becomes `__`
 
 Apply **only** these specific check IDs:
 
-1. **RUST-SEC-001** — Input validation is mandatory at system boundaries. All user-provided input (query params, request bodies, file uploads, API calls) must be validated. Check for missing validation, insufficiently restrictive validators, or data passed directly to queries/commands without sanitization. Tenant/resource scoping must be enforced — endpoints must verify that the caller owns/can access the resource. Secrets (API keys, passwords, tokens) must never be logged, stored in plain text, or embedded in error messages.
+1. **RUST-SEC-001** — Input validation is mandatory at system boundaries. All user-provided input (query params, request bodies, file uploads, API calls) must be validated. Check for missing validation, insufficiently restrictive validators, or data passed directly to queries/commands without sanitization. Tenant/resource scoping must be enforced — endpoints must verify that the caller owns/can access the resource. Secrets (API keys, passwords, tokens) must never be logged, stored in plain text, or embedded in error messages. Also check for:
+   - Internal details (stack traces, file paths, SQL text, dependency versions) leaked in error responses to external callers
+   - Security-sensitive randomness (tokens, session IDs, nonces) generated with a general-purpose or seeded PRNG instead of a CSPRNG
+   - Outbound requests built from user-supplied URLs/hosts with no SSRF guard (destination validation/allowlisting) before the request is issued
+   - Hardcoded secrets, API keys, passwords, or tokens committed literally in the diff
+   - Disabled or weakened TLS certificate validation
 
 2. **RUST-NO-006** — Unsafe blocks are permitted only when necessary for FFI or performance-critical code with formal justification. Every `unsafe` block must have a comment explaining WHY it is safe (the invariant being relied on, not just what the code does). Unsafe code without justification is a finding.
 

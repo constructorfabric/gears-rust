@@ -4,6 +4,7 @@
 //! single cohesive [`axum::Router`] via [`OperationBuilder`]. The wiring
 //! is split across:
 //!
+//! - [`docs`] — the gear-scoped OpenAPI document and its reference page.
 //! - [`dto`] — wire-shape DTOs (`utoipa::ToSchema`).
 //! - [`error`] — RFC-9457 mapping (`From<ChatEngineError> for CanonicalError`).
 //! - [`handlers`] — thin axum handlers (Phases 4-12).
@@ -36,6 +37,7 @@
 // @cpt-cf-chat-engine-api-rest-root:p14
 // @cpt-cf-chat-engine-adr-http-client-protocol:p14
 
+pub mod docs;
 pub mod dto;
 pub mod error;
 pub mod handlers;

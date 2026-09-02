@@ -1,0 +1,7 @@
+[gear]
+name = "Durable Objects"
+description = "Generic typed-resource CRUD storage with GTS validation and pluggable backends."
+category = "serverless"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

@@ -7,7 +7,9 @@
 //!
 //! - Configuration loading using `toolkit-bootstrap`
 //! - Logging initialization with tracing
-//! - gRPC connection to `DirectoryService`
+//! - Lazy gRPC client to the `DirectoryService` (connects on first use, so a
+//!   cold `DirectoryService` never blocks or crashes bootstrap —
+//!   `cpt-cf-adr-eventual-readiness`)
 //! - Gear instance registration
 //! - Heartbeat management
 //! - Gear lifecycle execution
@@ -352,8 +354,9 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 /// 1. Creates a root `CancellationToken` for the process
 /// 2. Hooks OS signals (SIGTERM, SIGINT, Ctrl+C) to trigger cancellation
 /// 3. Loads configuration and initializes logging
-/// 4. Connects to the `DirectoryService`
-/// 5. Registers the gear instance
+/// 4. Creates a lazy `DirectoryService` client (connects on first use, not at
+///    bootstrap — `cpt-cf-adr-eventual-readiness`)
+/// 5. Registers the gear instance (background presence loop, with backoff)
 /// 6. Starts a background heartbeat loop (using a child token)
 /// 7. Runs the gear lifecycle with `ShutdownOptions::Token`
 /// 8. Deregisters from `DirectoryService` on shutdown
@@ -534,37 +537,35 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Connect to DirectoryService. When the gear configures a platform-plane
-    // credential, attach it (as `x-toolkit-internal-token`) to every outbound
-    // system call via an InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
+    // Create the DirectoryService client on a LAZY channel. Per
+    // `cpt-cf-adr-eventual-readiness`, an OoP gear must start even when the
+    // DirectoryService is not yet reachable; blocking or crashing on it at
+    // bootstrap would make it a hard startup dependency (the SPOF the ADR
+    // rejects). A lazy channel performs no eager connection: it fails fast only
+    // on a malformed endpoint and defers the connect to the first RPC.
+    //
+    // Recovery from a cold directory differs by lifecycle:
+    // - `oop_http` configured: the presence loop retries registration with
+    //   exponential backoff (100ms -> 30s, forever).
+    // - Legacy path (no `oop_http`): only a fixed-interval heartbeat runs, with
+    //   no registration retry — it relies on an external orchestrator.
+    //
+    // When a platform-plane credential is configured, it is attached (as
+    // `x-toolkit-internal-token`) to outbound system calls via an
+    // InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
     info!(
-        "Connecting to directory service at {}",
+        "Creating directory service client (lazy connect) for {}",
         opts.directory_endpoint
     );
     let internal_auth_cfg = final_config
         .oop_http
         .as_ref()
         .and_then(|h| h.internal_auth.as_ref());
-    // Build the outbound DirectoryService interceptor and the
-    // `InternalTokenProvider` (for `#[toolkit::provides]` clients) from one
-    // credential source so they can't diverge after a rotation — see
-    // `build_platform_credentials`. `None` => no outbound platform credential.
-    let (directory_client, internal_token_provider) = if let Some(cfg) = internal_auth_cfg {
-        let (interceptor, provider) = build_platform_credentials(cfg, &cancel).await?;
-        info!("Attaching platform-plane credential to outbound DirectoryService calls");
-        let client =
-            DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor)
-                .await?;
-        (client, provider)
-    } else {
-        (
-            DirectoryGrpcClient::connect(&opts.directory_endpoint).await?,
-            None,
-        )
-    };
+    let (directory_client, internal_token_provider) =
+        build_directory_client(&opts.directory_endpoint, internal_auth_cfg, &cancel).await?;
     let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
 
-    info!("Successfully connected to directory service");
+    info!("Directory service client ready (will connect on first use)");
 
     // Capture OoP HTTP config (if any) before moving the config into the provider.
     let oop_http = final_config.oop_http.clone();
@@ -713,10 +714,14 @@ async fn build_oop_serve_options(
 /// Construct the inbound platform-plane authenticator from configuration.
 ///
 /// The `shared_secret` provider is built here directly (no external backend).
-/// The `kube` provider initializes the Kubernetes `TokenReview` authenticator
-/// and requires the `k8s-auth` feature; without it, `provider: kube` is an
-/// error rather than a silent enforcement downgrade. `Ok(None)` is returned
-/// only when no `internal_auth` is configured.
+/// The `kube` provider is built (with the default positive/negative
+/// validation cache) by the single shared
+/// `toolkit_k8s_auth::build_cached_k8s_authenticator` helper also used by
+/// `grpc-hub`, so the two never drift on what `provider: kube` means or how
+/// it is cached. The `kube` provider requires the `k8s-auth` feature; without
+/// it, `provider: kube` is an error rather than a silent enforcement
+/// downgrade, as is any other unrecognized provider value. `Ok(None)` is
+/// returned only when no `internal_auth` is configured at all (Profile 1).
 #[cfg_attr(not(feature = "k8s-auth"), allow(clippy::unused_async))]
 async fn build_internal_authenticator(
     cfg: Option<&toolkit_security::InternalAuthConfig>,
@@ -736,13 +741,13 @@ async fn build_internal_authenticator(
         if cfg.is_kube() {
             info!("Initializing Kubernetes TokenReview platform-plane authenticator");
             let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
-            let authenticator =
-                toolkit_k8s_auth::K8sTokenReviewAuthenticator::try_default(audiences)
-                    .await
-                    .context("failed to initialize Kubernetes TokenReview authenticator")?;
-            return Ok(Some(toolkit_security::DynInternalAuthenticator::new(
-                authenticator,
-            )));
+            let authenticator = toolkit_k8s_auth::build_cached_k8s_authenticator(
+                audiences,
+                Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+            )
+            .await
+            .context("failed to initialize Kubernetes TokenReview authenticator")?;
+            return Ok(Some(authenticator));
         }
     }
     #[cfg(not(feature = "k8s-auth"))]
@@ -752,7 +757,50 @@ async fn build_internal_authenticator(
         }
     }
 
-    Ok(None)
+    anyhow::bail!(
+        "internal_auth is configured but no authenticator could be built for the selected provider"
+    )
+}
+
+/// Build the `OoP` gear's `DirectoryService` client on a **lazy** channel, plus
+/// the outbound
+/// [`InternalTokenProvider`](toolkit_contract::runtime::config::InternalTokenProvider)
+/// when a platform-plane credential is configured (`None` => no credential).
+///
+/// The lazy channel performs no eager connection, so this succeeds even when
+/// `directory_endpoint` is unreachable (`cpt-cf-adr-eventual-readiness`).
+/// Interceptor and provider come from one credential source (see
+/// [`build_platform_credentials`]) so they can't diverge after a rotation.
+///
+/// # Errors
+/// Only if the endpoint is malformed or a configured credential source fails to
+/// initialise — never for an unreachable directory. The endpoint is validated
+/// before any credential work, so a malformed endpoint is reported ahead of a
+/// credential-source failure.
+async fn build_directory_client(
+    directory_endpoint: &str,
+    internal_auth_cfg: Option<&toolkit_security::InternalAuthConfig>,
+    cancel: &CancellationToken,
+) -> Result<(
+    DirectoryGrpcClient,
+    Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+)> {
+    // Validate the endpoint up front — before any credential-source work — so a
+    // malformed endpoint is reported ahead of a credential failure. The lazy
+    // client performs no connection, only URI validation; it is reused as-is on
+    // the no-credential path.
+    let client = DirectoryGrpcClient::connect_lazy(directory_endpoint)?;
+
+    let Some(cfg) = internal_auth_cfg else {
+        return Ok((client, None));
+    };
+
+    let (interceptor, provider) = build_platform_credentials(cfg, cancel).await?;
+    // Rebuild with the interceptor attached (it must be set at construction);
+    // the endpoint was already validated above.
+    let client =
+        DirectoryGrpcClient::connect_lazy_with_interceptor(directory_endpoint, interceptor)?;
+    Ok((client, provider))
 }
 
 /// Build the platform-plane credential material from config: the **outbound**

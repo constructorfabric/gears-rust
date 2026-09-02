@@ -38,6 +38,24 @@ mod stubs {
             }
         }
     }
+
+    // Two-level nested message shape (message fields are `Option<T>` in prost),
+    // so the derive's recursing `try_from_proto` codegen is compile-checked.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct LineItem {
+        pub sku: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct Cart {
+        pub head: Option<LineItem>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct Order {
+        pub cart: Option<Cart>,
+        pub extras: Vec<LineItem>,
+    }
 }
 
 #[derive(Debug, Clone, ProtoBridge)]
@@ -62,6 +80,32 @@ pub enum PaymentStatus {
     Pending,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, ProtoBridge)]
+#[proto_bridge(stub = "crate::stubs::LineItem")]
+pub struct LineItem {
+    pub sku: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, ProtoBridge)]
+#[proto_bridge(stub = "crate::stubs::Cart")]
+pub struct Cart {
+    // Required nested message (level 2 lives inside `LineItem`-bearing chains).
+    #[proto_bridge(message)]
+    pub head: LineItem,
+}
+
+// A required nested message that itself contains a required nested message — the
+// two-level chain H1 makes decode fallibly. Compile-checked here; its runtime
+// behaviour is asserted in `tests/proto_bridge_message.rs`.
+#[derive(Debug, Clone, Default, PartialEq, ProtoBridge)]
+#[proto_bridge(stub = "crate::stubs::Order")]
+pub struct Order {
+    #[proto_bridge(message)]
+    pub cart: Cart,
+    #[proto_bridge(message)]
+    pub extras: Vec<LineItem>,
 }
 
 fn main() {

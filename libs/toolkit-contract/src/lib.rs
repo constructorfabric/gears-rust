@@ -17,8 +17,8 @@ pub use contract::{Contract, ServiceContract};
 pub use descriptor::{ContractDescriptor, ContractKind, MethodDescriptor, ServiceDescriptor};
 pub use error::ContractError;
 pub use grpc_repr::{
-    GrpcRepr, GrpcReprScalar, SecurityContextMarker, TryFromProto, UnknownEnumDiscriminant,
-    ViaStringParseError, assert_security_context,
+    GrpcRepr, GrpcReprScalar, MissingRequiredMessage, ProtoDecodeError, SecurityContextMarker,
+    TryFromProto, UnknownEnumDiscriminant, ViaStringParseError, assert_security_context,
 };
 pub use ir::{
     ContractIr, FieldIr, FieldRole, GrpcBindingIr, GrpcIdempotency, GrpcMethodBindingIr,
