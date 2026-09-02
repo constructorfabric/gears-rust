@@ -222,7 +222,6 @@ where
 
     let mut compiled: Vec<Condition> = Vec::new();
     let mut siblings: Vec<SiblingSource> = Vec::new();
-    let mut constraints_with_siblings = 0_usize;
 
     for (index, constraint) in scope.constraints().iter().enumerate() {
         // A constraint whose property does not resolve is dropped, as it always
@@ -240,23 +239,23 @@ where
             build_constraint_condition::<E>(constraint, address, index, &mut constraint_siblings)?
         {
             compiled.push(cond);
-            if !constraint_siblings.is_empty() {
-                constraints_with_siblings += 1;
-            }
             siblings.append(&mut constraint_siblings);
         }
     }
 
-    // OR-ed constraints whose siblings come from *different* constraints cannot
-    // be served by comma joins: the relations are placed unconditionally, so an
-    // empty alternative zeroes the whole result and two non-empty ones multiply
-    // each match by the other relation's cardinality. Refused loudly rather
-    // than compiled wrong (`docs/arch/secure-orm/ADR/0002`).
-    if constraints_with_siblings > 1 {
+    // A correlated sibling is placed as an unconditional comma join, so it
+    // cannot serve a disjunction: with more than one surviving alternative, an
+    // empty relation zeroes every branch — including the ones that never
+    // referenced it — and a relation with k rows returns each other-branch
+    // match k times. That holds whether the other alternatives need a sibling
+    // of their own or not, so the condition is "a sibling exists and the OR has
+    // more than one branch". Refused loudly rather than compiled wrong
+    // (`docs/arch/secure-orm/ADR/0002`).
+    if !siblings.is_empty() && compiled.len() > 1 {
         return Err(ScopeError::Invalid(
-            "more than one OR-ed scope constraint needs a correlated FROM item; \
-             comma-joined siblings from different alternatives would zero or \
-             multiply the result; narrow the scope or query per alternative",
+            "more than one OR-ed scope constraint survives and one of them needs a \
+             correlated FROM item; a comma-joined sibling would zero or multiply \
+             the other alternatives; narrow the scope or query per alternative",
         ));
     }
 
@@ -800,6 +799,42 @@ mod tests {
         assert!(
             build_scope_predicate::<E>(&scope, ColumnAddress::Table).is_ok(),
             "the select path inlines both subqueries and stays servable"
+        );
+    }
+
+    /// The mixed case: only one alternative needs a sibling. The relation is
+    /// still an unconditional comma join, so it zeroes or multiplies the
+    /// alternative that never referenced it — refused all the same. A lone
+    /// sibling-needing constraint stays servable, so the guard is about the
+    /// disjunction, not about siblings as such.
+    #[test]
+    fn a_sibling_beside_a_plain_alternative_is_refused_too() {
+        use custom_prop_entity::Entity as E;
+        let needs_sibling = || {
+            ScopeConstraint::new(vec![ScopeFilter::in_group(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(uuid::Uuid::from_u128(7))],
+            )])
+        };
+        let plain =
+            ScopeConstraint::new(vec![ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, NIL)]);
+
+        let mixed = AccessScope::from_constraints(vec![needs_sibling(), plain]);
+        let err = build_scope_predicate::<E>(&mixed, graph(SiblingSupport::Allowed))
+            .expect_err("a sibling beside a plain alternative must be refused");
+        assert!(
+            matches!(err, ScopeError::Invalid(msg) if msg.contains("more than one OR-ed")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            build_scope_predicate::<E>(&mixed, ColumnAddress::Table).is_ok(),
+            "the select path inlines the subquery and stays servable"
+        );
+
+        let alone = AccessScope::from_constraints(vec![needs_sibling()]);
+        assert!(
+            build_scope_predicate::<E>(&alone, graph(SiblingSupport::Allowed)).is_ok(),
+            "one constraint with a sibling is the ordinary correlated case"
         );
     }
 
