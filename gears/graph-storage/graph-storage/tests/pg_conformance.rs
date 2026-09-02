@@ -252,6 +252,11 @@ pg_case!(
     conformance::the_envelope_records_the_subject_of_each_verb
 );
 
+pg_case!(
+    a_projection_row_carries_the_envelope,
+    conformance::a_projection_row_carries_the_envelope
+);
+
 #[tokio::test]
 async fn colliding_node_keys_stay_inside_their_tenants() {
     let Some(stand) = stand(HopStrategy::Pgq).await else {

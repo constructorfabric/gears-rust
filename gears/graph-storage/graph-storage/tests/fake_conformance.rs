@@ -172,3 +172,8 @@ async fn one_snapshot_spans_every_arm_of_one_read() {
 async fn the_envelope_records_the_subject_of_each_verb() {
     conformance::the_envelope_records_the_subject_of_each_verb(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn a_projection_row_carries_the_envelope() {
+    conformance::a_projection_row_carries_the_envelope(&store(), Uuid::now_v7()).await;
+}

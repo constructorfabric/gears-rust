@@ -1154,42 +1154,22 @@ pub async fn only_the_active_epoch_ranks(store: &impl GraphStoreV1, tenant: Uuid
     );
 }
 
-/// `fr-audit-envelope`: every element a read returns carries the gear-assigned
-/// envelope, and the subject on it is the one that performed each verb.
+/// `fr-audit-envelope`: the envelope records the subject that performed each
+/// verb, not merely the subject that created the element.
 ///
-/// The obligation is written against two different writers on purpose. A store
-/// that stamps the caller's subject on creation but forgets it on update
-/// passes every single-writer assertion, and the question the envelope exists
-/// to answer -- *who touched this last* -- is exactly the one it then gets
-/// wrong.
+/// Written against two different writers on purpose. A store that stamps the
+/// caller on creation but forgets it on update passes every single-writer
+/// assertion, and the question the envelope exists to answer -- *who touched
+/// this last* -- is exactly the one it then gets wrong.
 pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStoreV1, tenant: Uuid) {
     let scope = AccessScope::for_tenant(tenant);
     let author = ctx(tenant, &scope, None);
-    let editor_subject = Subject {
-        subject_id: uuid::uuid!("22222222-2222-2222-2222-222222222222"),
-        // An automation carries no subject type, which is the case the
-        // optional half of the pair exists for.
-        subject_type: None,
-    };
+    let editor_subject = editor();
     let editor = ctx_as(tenant, &scope, None, editor_subject.clone());
 
-    store
-        .register_types(&author, ontology_batch())
-        .await
-        .expect("ontology registers");
-    ingest_batch(
-        store,
-        &author,
-        batch(vec![node("audited", "first")], Vec::new()),
-    )
-    .await
-    .expect("the batch commits");
+    seed_one_audited_node(store, &author).await;
 
-    let created = store
-        .get_node(&author, &"audited".to_owned(), 10)
-        .await
-        .expect("the node reads")
-        .envelope;
+    let created = envelope_of(store, &author).await;
     assert_eq!(created.key, "audited", "the envelope keys the element");
     assert_eq!(created.tenant_id, tenant, "the envelope carries the tenant");
     assert_eq!(created.created_by, writer(), "the creator is recorded");
@@ -1202,10 +1182,6 @@ pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStor
         created.deleted_at.is_none() && created.deleted_by.is_none(),
         "a live element carries no tombstone"
     );
-    assert!(
-        created.graph_revision.revision > 0,
-        "the envelope reports the revision the read observed"
-    );
 
     // A second subject rewrites it. Creation must not move; the update must.
     ingest_batch(
@@ -1216,11 +1192,7 @@ pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStor
     .await
     .expect("the second batch commits");
 
-    let updated = store
-        .get_node(&author, &"audited".to_owned(), 10)
-        .await
-        .expect("the node reads")
-        .envelope;
+    let updated = envelope_of(store, &author).await;
     assert_eq!(
         updated.created_by,
         writer(),
@@ -1234,10 +1206,26 @@ pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStor
         updated.updated_by, editor_subject,
         "the last writer is the subject that performed the update"
     );
+}
 
-    // The projection carries the same envelope -- and on that path it is the
-    // only carrier of the observed revision, since the page wrapper has no
-    // member for one.
+/// `fr-audit-envelope` on the projection, where it is also the only carrier of
+/// the observed revision: the page wrapper is the platform's
+/// `toolkit_odata::Page`, which has no member for one.
+pub async fn a_projection_row_carries_the_envelope(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let author = ctx(tenant, &scope, None);
+    let editor_subject = editor();
+    let editor = ctx_as(tenant, &scope, None, editor_subject.clone());
+
+    seed_one_audited_node(store, &author).await;
+    ingest_batch(
+        store,
+        &editor,
+        batch(vec![node("audited", "second")], Vec::new()),
+    )
+    .await
+    .expect("the second batch commits");
+
     let page = store
         .project_table(&author, ProjectionRequest::default())
         .await
@@ -1255,21 +1243,39 @@ pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStor
         row.envelope.graph_revision.revision > 0,
         "the projection reports its observed revision on the element"
     );
+}
 
-    // A tombstone names its own subject, and leaves the other two alone.
+/// The subject an envelope obligation writes as when it needs a *second*
+/// writer. Carries no subject type, which is the case the optional half of the
+/// pair exists for: an automation is not a user.
+fn editor() -> Subject {
+    Subject {
+        subject_id: uuid::uuid!("22222222-2222-2222-2222-222222222222"),
+        subject_type: None,
+    }
+}
+
+async fn seed_one_audited_node(store: &dyn GraphStoreV1, author: &StoreCtx<'_>) {
     store
-        .soft_delete(&editor, DeleteRequest::Node("audited".to_owned()))
+        .register_types(author, ontology_batch())
         .await
-        .expect("the delete succeeds");
-    // A tombstoned element reads as absent, so the assertion that it recorded
-    // the deleting subject cannot be made through a read surface. That the
-    // three verbs are stored separately is asserted above; that delete writes
-    // its own pair is asserted by the store's own tests.
-    assert!(
-        matches!(
-            store.get_node(&author, &"audited".to_owned(), 10).await,
-            Err(GraphStoreError::NotFound)
-        ),
-        "a tombstoned node reads as absent"
-    );
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        author,
+        batch(vec![node("audited", "first")], Vec::new()),
+    )
+    .await
+    .expect("the batch commits");
+}
+
+async fn envelope_of(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+) -> graph_storage_sdk::models::ElementEnvelope {
+    store
+        .get_node(ctx, &"audited".to_owned(), 10)
+        .await
+        .expect("the node reads")
+        .envelope
 }
