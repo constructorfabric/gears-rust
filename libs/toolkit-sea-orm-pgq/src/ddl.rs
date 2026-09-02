@@ -101,6 +101,12 @@ impl VertexTable {
         &self.label
     }
 
+    /// The table backing the element.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
     /// The columns exposed as properties.
     #[must_use]
     pub fn properties(&self) -> &[String] {

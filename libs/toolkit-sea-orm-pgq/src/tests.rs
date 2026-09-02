@@ -241,25 +241,108 @@ fn outside_identifiers(sql: &str) -> Result<String, &'static str> {
 }
 
 /// A hostile name must render as exactly one identifier — it must not be able
-/// to close its own quoting and become syntax.
+/// to close its own quoting and become syntax — in **every** position the
+/// construct quotes: the graph name, a vertex label, an edge label, an element
+/// variable, a projected property and a projected alias. Each position is
+/// exercised alone, so a position that bypassed `write_ident` fails on its own
+/// assertion instead of hiding behind the others.
 #[test]
-fn a_hostile_identifier_renders_as_one_escaped_identifier() {
+fn a_hostile_identifier_renders_as_one_escaped_identifier_in_every_position() {
     let hostile = r#"a" IS "node") COLUMNS ("x"."y" AS "z"); DROP TABLE t; --"#;
-    let table = GraphTable::new("kb", GraphPattern::new(Element::new(hostile, "node")))
-        .column(ProjectedColumn::new(hostile, "id", "n"));
-    let sql = render(&table);
+    let one_vertex = |graph: &str, variable: &str, label: &str| {
+        GraphTable::new(graph, GraphPattern::new(Element::new(variable, label)))
+    };
+    let positions: Vec<(&str, GraphTable)> = vec![
+        (
+            "graph name",
+            one_vertex(hostile, "a", "node").column(ProjectedColumn::new("a", "id", "n")),
+        ),
+        (
+            "vertex label",
+            one_vertex("kb", "a", hostile).column(ProjectedColumn::new("a", "id", "n")),
+        ),
+        (
+            "edge label",
+            GraphTable::new(
+                "kb",
+                GraphPattern::new(Element::new("a", "node")).hop(
+                    Element::new("e", hostile),
+                    Direction::Outgoing,
+                    Element::new("b", "node"),
+                ),
+            )
+            .column(ProjectedColumn::new("b", "id", "n")),
+        ),
+        (
+            "element variable",
+            one_vertex("kb", hostile, "node").column(ProjectedColumn::new(hostile, "id", "n")),
+        ),
+        (
+            "projected property",
+            one_vertex("kb", "a", "node").column(ProjectedColumn::new("a", hostile, "n")),
+        ),
+        (
+            "projected alias",
+            one_vertex("kb", "a", "node").column(ProjectedColumn::new("a", "id", hostile)),
+        ),
+    ];
 
-    let syntax = outside_identifiers(&sql).expect("identifiers must be balanced");
-    assert_eq!(
-        syntax.matches(" MATCH ").count(),
-        1,
-        "the payload became a second MATCH: {syntax}"
+    for (position, table) in positions {
+        let sql = render(&table);
+        let syntax = outside_identifiers(&sql).expect("identifiers must be balanced");
+        assert_eq!(
+            syntax.matches(" MATCH ").count(),
+            1,
+            "{position}: the payload became a second MATCH: {syntax}"
+        );
+        assert_eq!(
+            syntax.matches(" COLUMNS (").count(),
+            1,
+            "{position}: the payload became a second COLUMNS: {syntax}"
+        );
+        assert!(
+            !syntax.contains("DROP"),
+            "{position}: the payload escaped its identifier: {syntax}"
+        );
+        assert!(
+            !syntax.contains("--"),
+            "{position}: the payload introduced a comment: {syntax}"
+        );
+    }
+}
+
+/// The DDL has an identifier path of its own, and the ADR names it too: the
+/// graph name, table names, labels, key columns, properties and endpoint
+/// references must each render as one escaped identifier in
+/// `CREATE PROPERTY GRAPH`, and the graph name in `DROP PROPERTY GRAPH`.
+#[test]
+fn a_hostile_identifier_in_the_ddl_renders_as_one_escaped_identifier() {
+    let hostile = r#"kb"); DROP TABLE t; --"#;
+    let element = |table: &str, key: &str, label: &str, property: &str| {
+        VertexTable::new(table, columns(&[key]), label, columns(&[property]))
+            .expect("a valid element")
+    };
+    let graph = PropertyGraph::new(
+        hostile,
+        vec![element(hostile, hostile, hostile, hostile)],
+        vec![EdgeTable::new(
+            element("graph_edge", "id", "edge", "id"),
+            EndpointRef::new(columns(&[hostile]), hostile, columns(&[hostile]))
+                .expect("a valid source"),
+            EndpointRef::new(columns(&["dst"]), hostile, columns(&[hostile]))
+                .expect("a valid destination"),
+        )],
     );
+
+    let create = graph.create_statement().expect("renders");
+    let syntax = outside_identifiers(&create).expect("identifiers must be balanced");
     assert_eq!(
-        syntax.matches(" COLUMNS (").count(),
+        syntax.matches("CREATE PROPERTY GRAPH").count(),
         1,
-        "the payload became a second COLUMNS: {syntax}"
+        "{syntax}"
     );
+    assert_eq!(syntax.matches("VERTEX TABLES (").count(), 1, "{syntax}");
+    assert_eq!(syntax.matches("EDGE TABLES (").count(), 1, "{syntax}");
     assert!(
         !syntax.contains("DROP"),
         "the payload escaped its identifier: {syntax}"
@@ -267,6 +350,13 @@ fn a_hostile_identifier_renders_as_one_escaped_identifier() {
     assert!(
         !syntax.contains("--"),
         "the payload introduced a comment: {syntax}"
+    );
+
+    let drop = graph.drop_statement().expect("renders");
+    let syntax = outside_identifiers(&drop).expect("identifiers must be balanced");
+    assert_eq!(
+        syntax, "DROP PROPERTY GRAPH IF EXISTS ",
+        "only the keyword frame may survive outside the identifier"
     );
 }
 
