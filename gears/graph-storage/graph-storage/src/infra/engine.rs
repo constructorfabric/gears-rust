@@ -18,8 +18,8 @@ use graph_storage_sdk::models::{
     Direction, EdgeRef, EngineCapabilities, GraphRevision, TruncationReason, TypeIdSet,
 };
 use graph_storage_sdk::plugin_api::{
-    EngineCursor, ExpandRequest, ExpandResponse, GraphEngineError, GraphEngineV1, PathResponse,
-    PatternRequest, PatternResponse, ShortestPathRequest, StoreCtx,
+    EngineCursor, ExpandRequest, ExpandResponse, GraphEngineError, GraphEngineV1, HopBackend,
+    PathResponse, PatternRequest, PatternResponse, ShortestPathRequest, StoreCtx,
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait as _};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult};
@@ -171,11 +171,18 @@ impl GraphEngineV1 for PgGraphEngine {
                 what: "per-hop label filters",
             });
         }
+        // Nothing is walked on either of these paths, so the backend named is
+        // the one that would have walked it.
+        let would_serve = match self.effective_strategy() {
+            HopStrategy::Pgq => HopBackend::Pattern,
+            HopStrategy::TwoQuery => HopBackend::TwoQuery,
+        };
         if req.frontier.is_empty() {
             return Ok(ExpandResponse {
                 reached: Vec::new(),
                 edges: Vec::new(),
                 truncated: None,
+                served_by: would_serve,
             });
         }
         if req.frontier.len() as u64 > u64::from(req.budget.max_frontier) {
@@ -183,6 +190,7 @@ impl GraphEngineV1 for PgGraphEngine {
                 reached: Vec::new(),
                 edges: Vec::new(),
                 truncated: Some(TruncationReason::FrontierCap),
+                served_by: would_serve,
             });
         }
 
@@ -348,6 +356,7 @@ async fn expand_pgq(
         reached: live,
         edges,
         truncated,
+        served_by: HopBackend::Pattern,
     }))
 }
 
@@ -501,5 +510,6 @@ async fn expand_two_query(
         reached,
         edges,
         truncated,
+        served_by: HopBackend::TwoQuery,
     })
 }

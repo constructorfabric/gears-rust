@@ -22,7 +22,7 @@ use graph_storage::infra::engine::PgGraphEngine;
 use graph_storage::infra::storage::migrations::Migrator;
 use graph_storage::infra::store::PgGraphStore;
 use graph_storage_sdk::models::{Direction, HopBudget, TruncationReason};
-use graph_storage_sdk::plugin_api::{ExpandRequest, GraphEngineV1, GraphStoreV1};
+use graph_storage_sdk::plugin_api::{ExpandRequest, GraphEngineV1, GraphStoreV1, HopBackend};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::runners::AsyncRunner as _;
 use testcontainers::{ContainerAsync, ImageExt as _};
@@ -321,14 +321,32 @@ async fn the_pattern_hop_walks_the_graph() {
         .await
         .expect("the pattern hop runs");
 
+    // Asserted first, and deliberately: the pattern backend declines by
+    // falling back, so a hop that never executed returns the *right answer*
+    // from the two-query backend. Without this line this test passes while
+    // testing nothing it claims to test -- which is how a pattern that lost
+    // its anchor and failed on every request went unnoticed.
+    assert_eq!(
+        response.served_by,
+        HopBackend::Pattern,
+        "the single-statement pattern must be what answered, not the fallback"
+    );
     let reached: Vec<String> = response.edges.iter().map(|e| e.dst.clone()).collect();
     assert_eq!(reached, vec!["b".to_owned()], "one hop reaches exactly `b`");
     assert!(response.truncated.is_none());
 }
 
-/// Seed one stand and expand one hop, returning the reached ids and the
-/// producer keys of the traversed edges.
-async fn seed_and_expand(stand: &Stand, direction: Direction) -> (Vec<i64>, Vec<String>) {
+/// Seed one stand and expand one hop, returning the reached ids, the producer
+/// keys of the traversed edges, and which backend actually answered.
+///
+/// The last of the three is not decoration. The pattern backend declines by
+/// falling back, so a comparison of "the two backends" run against a stand
+/// whose pattern silently failed compares the fallback with itself and agrees
+/// perfectly.
+async fn seed_and_expand(
+    stand: &Stand,
+    direction: Direction,
+) -> (Vec<i64>, Vec<String>, HopBackend) {
     let tenant = tenant_on(stand).await;
     let scope = AccessScope::for_tenant(tenant);
     let ctx = conformance::ctx(tenant, &scope, None);
@@ -390,7 +408,7 @@ async fn seed_and_expand(stand: &Stand, direction: Direction) -> (Vec<i64>, Vec<
         .flat_map(|e| [e.src.clone(), e.dst.clone()])
         .collect();
     keys.sort();
-    (response.reached, keys)
+    (response.reached, keys, response.served_by)
 }
 
 /// The two backends must answer identically. Compared **at the seam**, not
@@ -406,8 +424,15 @@ async fn both_hop_backends_return_the_same_answer() {
     };
 
     for direction in [Direction::Outgoing, Direction::Incoming, Direction::Either] {
-        let (pattern_reached, pattern_keys) = seed_and_expand(&pgq, direction).await;
-        let (fallback_reached, fallback_keys) = seed_and_expand(&two_query, direction).await;
+        let (pattern_reached, pattern_keys, pattern_backend) =
+            seed_and_expand(&pgq, direction).await;
+        let (fallback_reached, fallback_keys, fallback_backend) =
+            seed_and_expand(&two_query, direction).await;
+        assert_eq!(
+            (pattern_backend, fallback_backend),
+            (HopBackend::Pattern, HopBackend::TwoQuery),
+            "the {direction:?} comparison must be between two different backends"
+        );
         assert_eq!(
             pattern_reached.len(),
             fallback_reached.len(),

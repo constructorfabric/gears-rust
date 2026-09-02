@@ -281,6 +281,26 @@ pub struct ExpandResponse {
     pub edges: Vec<EdgeRef>,
     /// Never silent.
     pub truncated: Option<TruncationReason>,
+    /// Which backend produced this answer.
+    ///
+    /// **Found while building the prototype.** The pattern backend declines by
+    /// falling back, and the decline was recorded only in a log line. A log
+    /// line is not something a test can assert on, so the suite could not tell
+    /// a pattern hop that ran from one that failed and was silently served by
+    /// the two-query hop instead -- which is exactly what happened, for every
+    /// traversal, when the pattern lost its anchor. Reporting the backend on
+    /// the response is what makes "the pattern actually served this" an
+    /// assertion rather than an assumption.
+    pub served_by: HopBackend,
+}
+
+/// The hop backends of ADR-0005, as the answer reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HopBackend {
+    /// One scoped `GRAPH_TABLE` statement.
+    Pattern,
+    /// Two scoped queries per hop; always available.
+    TwoQuery,
 }
 
 /// The engine's applied `(source epoch, graph revision)` position. The epoch
