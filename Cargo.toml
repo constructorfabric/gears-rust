@@ -105,6 +105,7 @@ members = [
     "gears/system/cluster/plugins/standalone-cluster-plugin",
     "gears/system/cluster/plugins/postgres-cluster-plugin",
     "gears/system/cluster/plugins/redis-cluster-plugin",
+    "gears/system/cluster/plugins/k8s-cluster-plugin",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",

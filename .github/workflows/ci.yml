@@ -381,6 +381,12 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
+        # k3s runs in a **privileged** container (testcontainers-modules sets it);
+        # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
+        # nextest, so one k3s container is shared per test binary -- see the Makefile.
+        run: make test-cluster-k8s
+
       - name: Test resource-group (pg smoke, integration)
         # Fail if Docker is unreachable instead of letting the suite skip itself
         # into a green step that asserted nothing.
@@ -719,15 +725,15 @@ jobs:
       #
       #   1. `nextest --workspace` — the whole workspace at default features.
       #   2. The redis-cluster-plugin integration suites. These live behind
-      #      `required-features = ["integration"]` and drive a real Redis via
-      #      testcontainers, so pass 1 never builds or runs them and the plugin's
-      #      actual logic (connection / lock / pub-sub / lifecycle) showed as
-      #      uncovered — the reason this crate's patch coverage understates it.
-      #      Running them here, instead of mocking the Redis connection (brittle,
-      #      tautological), credits that code with the coverage its integration
-      #      tests already exercise. Redis containers are lightweight and
-      #      unprivileged, so this mirrors `make test-cluster-redis` verbatim
-      #      (plain `nextest`, no per-binary loop) — keep the two in sync.
+      #      `required-features = ["integration"]`.
+      #   3. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
+      #      `required-features = ["integration"]`.
+      #
+      # The per-binary k3s loop (one container per binary, cleaned between —
+      # nextest's process-per-test would start ~70 of them) lives in the
+      # `coverage-cluster-k8s` Makefile target so this step stays readable; it
+      # inherits this step's CARGO_LLVM_COV_* env and accumulates into the same
+      # session. Keep it in sync with `test-cluster-k8s`.
       - name: Coverage (lcov)
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
@@ -738,9 +744,11 @@ jobs:
           # Pass 1: whole workspace, default features. Accumulate, don't report.
           cargo llvm-cov nextest --workspace --no-report
           # Pass 2: redis-cluster-plugin integration suites (real Redis via
-          # testcontainers). Same instrumentation, still no report.
+          # testcontainers).
           cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
-          # Merge both passes into the single report that gets uploaded.
+          # Pass 3: k8s-cluster-plugin k3s suites
+          make coverage-cluster-k8s
+          # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
