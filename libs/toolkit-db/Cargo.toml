@@ -60,12 +60,9 @@ mysql = [
 # deliberate — discovering non-portability from a runtime error in production
 # would be strictly worse (docs/arch/secure-orm/ADR/0002, "Backend gating").
 #
-# The syntax crate itself is a regular dependency (see [dependencies]); this
-# feature gates the `secure::pgq` module — everything that can reach a database.
-#
 # NB `metadata.docs.rs.all-features = true`, so the gated code has to compile in
 # the docs build too.
-pgq = ["pg"]
+pgq = ["pg", "dep:toolkit-sea-orm-pgq"]
 
 integration = []
 
@@ -95,12 +92,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 toolkit-security = { workspace = true }
-# SQL/PGQ syntax layer. A regular dependency rather than a `pgq`-optional one,
-# because `ScopeError::Pgq` wraps its error type unconditionally (a
-# feature-gated enum variant breaks downstream exhaustive matches under feature
-# unification). The crate is tiny, security-agnostic and adds no transitive
-# dependencies; the `pgq` feature still gates the secure graph builder.
-toolkit-sea-orm-pgq = { workspace = true }
+# SQL/PGQ syntax layer; optional, pulled in by the `pgq` feature. Nothing
+# outside that feature names its types: `ScopeError::GraphSyntax` carries the
+# syntax layer's message as a `String`, so a gear without a Postgres backend
+# never links this crate (docs/arch/secure-orm/ADR/0002, "Backend gating").
+toolkit-sea-orm-pgq = { workspace = true, optional = true }
 toolkit-odata = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 bigdecimal = { workspace = true }

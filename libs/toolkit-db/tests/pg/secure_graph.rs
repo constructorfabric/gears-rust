@@ -774,6 +774,7 @@ async fn an_anchored_walk_starts_from_the_anchor_rows() {
                                         .eq(Expr::col((Alias::new("pgq_node"), Alias::new("id")))),
                                 ),
                         )
+                        .correlate_with_anchor()
                         .edge_to::<edge::Entity>("e")
                         .to::<node::Entity>("b")
                 })

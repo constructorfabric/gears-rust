@@ -111,7 +111,7 @@ impl GraphDeclaration {
     /// # Errors
     /// Returns [`ScopeError::Invalid`] when `J` resolves no scope column
     /// (Policy 2) or when its label is already taken (Policy 1), and
-    /// [`ScopeError::Pgq`] when the element cannot be rendered (e.g. an empty
+    /// [`ScopeError::GraphSyntax`] when the element cannot be rendered (e.g. an empty
     /// key).
     pub fn vertex<G, J>(mut self, key: &[&str]) -> Result<Self, ScopeError>
     where
@@ -183,20 +183,21 @@ impl GraphDeclaration {
             }
         }
 
-        Ok(VertexTable::new(
+        VertexTable::new(
             J::default().table_name(),
             key.iter().map(|c| (*c).to_owned()).collect(),
             label,
             properties,
-        )?)
+        )
+        .map_err(syntax_error)
     }
 
     /// Render the `CREATE PROPERTY GRAPH` statement.
     ///
     /// # Errors
-    /// Returns [`ScopeError::Pgq`] when the declaration cannot be rendered.
+    /// Returns [`ScopeError::GraphSyntax`] when the declaration cannot be rendered.
     pub fn create_statement(&self) -> Result<String, ScopeError> {
-        Ok(self.ddl().create_statement()?)
+        self.ddl().create_statement().map_err(syntax_error)
     }
 
     /// Render the matching `DROP PROPERTY GRAPH IF EXISTS`.
@@ -204,7 +205,7 @@ impl GraphDeclaration {
     /// # Errors
     /// As [`Self::create_statement`].
     pub fn drop_statement(&self) -> Result<String, ScopeError> {
-        Ok(self.ddl().drop_statement()?)
+        self.ddl().drop_statement().map_err(syntax_error)
     }
 
     fn ddl(&self) -> GraphDdl {
@@ -225,14 +226,33 @@ impl GraphDeclaration {
             .find(|element| element.label() == label)
             .map(VertexTable::properties)
     }
+
+    /// Table backing the element declared as `label`, if it is declared.
+    #[must_use]
+    pub fn table_of(&self, label: &str) -> Option<&str> {
+        self.vertices
+            .iter()
+            .chain(self.edges.iter().map(EdgeTable::element))
+            .find(|element| element.label() == label)
+            .map(VertexTable::table)
+    }
 }
 
 fn into_endpoint(endpoint: Endpoint) -> Result<EndpointRef, ScopeError> {
-    Ok(EndpointRef::new(
-        endpoint.key,
-        endpoint.table,
-        endpoint.references,
-    )?)
+    EndpointRef::new(endpoint.key, endpoint.table, endpoint.references).map_err(syntax_error)
+}
+
+/// Carry a syntax-layer refusal into this crate's error type.
+///
+/// A plain function rather than a `From` impl, and the payload is the rendered
+/// message: the syntax crate's error type must not appear in `ScopeError`, or
+/// every gear on every backend would link a `PostgreSQL` 19 crate to name the
+/// variant. The refusal's own wording is what a caller can act on.
+// By value because it is the `map_err` adapter at every syntax-layer call
+// site; a by-reference signature would cost a closure at each of them.
+#[allow(clippy::needless_pass_by_value)]
+fn syntax_error(error: toolkit_sea_orm_pgq::PgqError) -> ScopeError {
+    ScopeError::GraphSyntax(error.to_string())
 }
 
 // ───────────────────────── the secure graph query ─────────────────────────
@@ -290,6 +310,9 @@ struct SiblingPlacement {
 struct PendingElement {
     variable: &'static str,
     label: &'static str,
+    /// The entity's table, so the build can check the label resolves to *this*
+    /// entity in the declaration and not to another one sharing the label.
+    table: String,
     caller: Vec<Condition>,
     scope: Condition,
 }
@@ -314,10 +337,11 @@ struct PathState {
         PendingElement,
     )>,
     pending_edge: Option<(PendingElement, toolkit_sea_orm_pgq::Direction)>,
-    /// Whether any element carries a caller predicate. A caller predicate is
-    /// the only construct that can correlate the pattern against the anchor,
-    /// so without one the anchor is dropped from the `FROM`.
-    has_caller_predicate: bool,
+    /// Whether the caller asked to keep the anchor in the `FROM`
+    /// ([`PathBuilder::correlate_with_anchor`]). Not inferred from the
+    /// predicates: a `where_` that never names the anchor would keep it as an
+    /// uncorrelated cross join.
+    anchor_correlated: bool,
 }
 
 impl PathState {
@@ -352,12 +376,12 @@ where
     /// query's `AccessScope`.
     ///
     /// The query itself becomes the *anchor*: it stays in the `FROM` — already
-    /// scoped — when the pattern correlates against it through an element
-    /// predicate ([`PathBuilder::where_`]), which is the "start from these
-    /// rows and walk out one hop" shape. A pattern with no element predicate
-    /// has no way to reference the anchor, so the anchor is dropped from the
-    /// `FROM` rather than left as an uncorrelated cross join that multiplies
-    /// every match by the anchor's row count.
+    /// scoped — when the pattern asks for it with
+    /// [`PathBuilder::correlate_with_anchor`] and correlates against it through
+    /// an element predicate ([`PathBuilder::where_`]), which is the "start from
+    /// these rows and walk out one hop" shape. Otherwise the anchor is dropped
+    /// from the `FROM` rather than left as an uncorrelated cross join that
+    /// multiplies every match by the anchor's row count.
     #[must_use]
     pub fn with_graph<G: PropertyGraph>(self) -> SecureGraphSelect<E, G> {
         let scope = self.scope_arc();
@@ -460,9 +484,10 @@ impl<G: PropertyGraph> PathBuilder<G> {
     /// The predicate is written inside the element's body, **before** the scope
     /// condition — scope is applied on top of it and cannot be filtered back
     /// off. Columns are addressed by the element's variable
-    /// (`Expr::col(("a", "id"))`), and a predicate that compares against the
-    /// anchor entity's own columns is what correlates the pattern with the
-    /// anchor query — the "start from these rows, walk out one hop" shape.
+    /// (`Expr::col(("a", "id"))`). A predicate comparing an element's columns
+    /// against the anchor entity's own columns is how a pattern correlates with
+    /// the anchor query — pair it with [`Self::correlate_with_anchor`], which
+    /// is what keeps the anchor in the `FROM`.
     #[must_use]
     pub fn where_(mut self, condition: Condition) -> Self {
         if condition.is_empty() {
@@ -474,12 +499,29 @@ impl<G: PropertyGraph> PathBuilder<G> {
         }
         if let Some(element) = self.state.last_element_mut() {
             element.caller.push(condition);
-            self.state.has_caller_predicate = true;
         } else {
             self.fail(ScopeError::Invalid(
                 "where_() narrows the last added element; add a vertex or an edge first",
             ));
         }
+        self
+    }
+
+    /// Keep the anchor query in the `FROM`, because a predicate on this pattern
+    /// correlates against it.
+    ///
+    /// The anchor — the scoped entity query `with_graph` was called on — is
+    /// dropped by default: nothing but a caller predicate can reference it, and
+    /// an unreferenced comma-joined relation multiplies every match by its row
+    /// count. Whether a predicate *does* reference it is not inferred from the
+    /// predicate (a `where_` that never names the anchor would reproduce that
+    /// cross join), so keeping the anchor is this explicit decision. Pair it
+    /// with a [`Self::where_`] comparing an element's columns against the anchor
+    /// entity's own columns — the "start from these rows, walk out one hop"
+    /// shape.
+    #[must_use]
+    pub fn correlate_with_anchor(mut self) -> Self {
+        self.state.anchor_correlated = true;
         self
     }
 
@@ -568,6 +610,7 @@ impl<G: PropertyGraph> PathBuilder<G> {
         Ok(PendingElement {
             variable,
             label,
+            table: J::default().table_name().to_owned(),
             caller: Vec::new(),
             scope: condition,
         })
@@ -712,7 +755,9 @@ where
     /// an `impl` to the declaration — an entity could be patterned into a graph
     /// it was never registered in, and the mistake would surface as a server
     /// error naming no Rust construct. Checked here instead: every label must
-    /// be declared, and every projected property must be in the element's
+    /// be declared *for the entity the pattern uses* (two entities may share a
+    /// label; only the registered one is what the label means), and every
+    /// projected property must be in the element's
     /// `PROPERTIES` list, where a missing entry is otherwise *silently*
     /// unfilterable.
     fn check_declaration(
@@ -723,11 +768,26 @@ where
 
         let mut label_of: BTreeMap<&str, &str> = BTreeMap::new();
         for element in state.elements() {
-            if declaration.properties_of(element.label).is_none() {
-                return Err(ScopeError::Invalid(
-                    "the pattern addresses a label the graph declaration does not \
-                     declare; register the entity in the declaration",
-                ));
+            match declaration.table_of(element.label) {
+                None => {
+                    return Err(ScopeError::Invalid(
+                        "the pattern addresses a label the graph declaration does not \
+                         declare; register the entity in the declaration",
+                    ));
+                }
+                // The label alone is not membership: two entities can both
+                // implement the marker trait under one label, and only the
+                // registered one is what the label resolves to on the server.
+                // Scope compiled from the other entity's columns would then
+                // guard a traversal of a table it was never written for.
+                Some(table) if table != element.table => {
+                    return Err(ScopeError::Invalid(
+                        "the pattern binds a label to an entity other than the one the \
+                         graph declaration registers under it; the scope predicate would \
+                         be compiled for one table while the label resolves to another",
+                    ));
+                }
+                Some(_) => {}
             }
             label_of.insert(element.variable, element.label);
         }
@@ -766,12 +826,12 @@ where
 
         Self::check_declaration(&state, &self.columns)?;
 
-        // The anchor can only be referenced through a caller predicate, so
-        // without one it would be a pure row multiplier: `column()` selects
-        // graph columns only, and a comma-joined relation nothing references
-        // returns each match once per anchor row. The scope it carried is not
-        // lost — every element body embeds the same scope.
-        let mut outer = if state.has_caller_predicate {
+        // The anchor stays only on the caller's explicit say-so. Nothing but a
+        // caller predicate can reference it, and an unreferenced comma-joined
+        // relation is a pure row multiplier: `column()` selects graph columns
+        // only, so each match would return once per anchor row. The scope the
+        // anchor carried is not lost — every element body embeds the same scope.
+        let mut outer = if state.anchor_correlated {
             self.anchor
         } else {
             Query::select()
@@ -811,7 +871,11 @@ where
                 Alias::new(sibling.alias.as_str()).into_iden(),
             ));
         }
-        outer.from(table.into_table_ref(self.graph_alias)?);
+        outer.from(
+            table
+                .into_table_ref(self.graph_alias)
+                .map_err(syntax_error)?,
+        );
 
         for filter in self.filters {
             outer.cond_where(filter);

@@ -76,11 +76,10 @@ fn map_scope_error(e: ScopeError) -> DomainError {
         ScopeError::TenantNotInScope { tenant_id } => {
             DomainError::forbidden(format!("tenant {tenant_id} not in scope"))
         }
-        // Graph-query refusals; this gear issues no graph queries, so reaching
-        // either is a programmer error, like `Invalid`.
-        err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
-            DomainError::internal(format!("scope invalid: {err}"))
-        }
+        // `ScopeError` is `#[non_exhaustive]`: variants this gear has no
+        // specific answer for (today the graph-query refusals, which it can
+        // never trigger) map to an internal error, like `Invalid`.
+        other => DomainError::internal(format!("scope invalid: {other}")),
     }
 }
 

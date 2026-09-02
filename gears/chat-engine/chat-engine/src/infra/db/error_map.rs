@@ -66,14 +66,13 @@ impl From<ScopeError> for ChatEngineError {
                 reason: format!("invalid scope: {msg}"),
                 source: None,
             },
-            // Graph-query refusals; chat-engine issues no graph queries, so
-            // reaching either is a programmer error, like `Invalid`.
-            err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
-                Self::Internal {
-                    reason: format!("invalid scope: {err}"),
-                    source: None,
-                }
-            }
+            // `ScopeError` is `#[non_exhaustive]`: variants this gear has no
+            // specific answer for (today the graph-query refusals, which it can
+            // never trigger) map to an internal error, like `Invalid`.
+            other => Self::Internal {
+                reason: format!("invalid scope: {other}"),
+                source: None,
+            },
         }
     }
 }

@@ -411,10 +411,7 @@ fn a_mismatched_endpoint_arity_is_refused() {
 
     let err = Mismatched::declaration().expect_err("arity must match");
     assert!(
-        matches!(
-            err,
-            ScopeError::Pgq(toolkit_sea_orm_pgq::PgqError::MismatchedEndpointArity { .. })
-        ),
+        matches!(err, ScopeError::GraphSyntax(ref msg) if msg.contains("as many columns")),
         "unexpected error: {err}"
     );
 }
@@ -614,6 +611,7 @@ fn the_outer_where_does_not_stand_in_for_element_scope() {
                             .eq(Expr::col((Alias::new("graph_node"), Alias::new("id")))),
                     ),
                 )
+                .correlate_with_anchor()
                 .edge_to::<edge::Entity>("e")
                 .to::<node::Entity>("b")
         })
@@ -900,17 +898,15 @@ fn the_exact_value_list_is_bound_when_elements_differ() {
             // element `e`: the caller predicate first, then its scope.
             sea_orm::Value::from(5_i64),
             sea_orm::Value::from(tenant),
-            // element `b`: its scope.
-            sea_orm::Value::from(tenant),
-            // the anchor's outer WHERE — the caller predicate kept it in the
-            // FROM, and its scope binds after the pattern renders.
+            // element `b`: its scope. No anchor value: without
+            // `correlate_with_anchor()` the anchor is not in the statement.
             sea_orm::Value::from(tenant),
         ],
         "values must bind in pattern order, caller predicate before scope"
     );
     assert!(
-        stmt.sql.contains("$5") && !stmt.sql.contains("$6"),
-        "exactly five placeholders: {}",
+        stmt.sql.contains("$4") && !stmt.sql.contains("$5"),
+        "exactly four placeholders: {}",
         stmt.sql
     );
 }
@@ -1098,6 +1094,77 @@ fn a_second_match_path_is_refused() {
         .expect_err("a second pattern must be refused");
     assert!(
         matches!(err, ScopeError::Invalid(msg) if msg.contains("twice")),
+        "unexpected error: {err}"
+    );
+}
+
+/// The middle case between "no predicate" and "correlated": a caller predicate
+/// that never names the anchor. Keeping the anchor would reproduce the cross
+/// join, so the anchor stays out unless the caller opts in explicitly.
+#[test]
+fn a_predicate_that_does_not_correlate_leaves_the_anchor_out() {
+    use sea_orm::sea_query::{Alias, Expr};
+
+    let sql = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .where_(
+                    sea_orm::Condition::all()
+                        .add(Expr::col((Alias::new("a"), Alias::new("id"))).eq(5_i64)),
+                )
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds")
+        .sql;
+
+    assert!(
+        !sql.contains(r#""graph_node""#),
+        "a predicate alone must not keep the anchor: {sql}"
+    );
+    assert!(
+        element_bodies(&sql)["a"].contains(r#""a"."id" = "#),
+        "the caller predicate itself is kept: {sql}"
+    );
+}
+
+/// Policy 3 is about the *entity*, not the label: two entities may both
+/// implement the marker trait under one label, and only the registered one is
+/// what that label resolves to on the server. Patterning the other one would
+/// compile scope from its columns while the traversal reads the registered
+/// entity's table — refused, rather than quietly guarding the wrong table.
+#[test]
+fn a_label_bound_to_an_unregistered_entity_is_refused() {
+    struct Shared;
+    impl PropertyGraph for Shared {
+        const GRAPH_NAME: &'static str = "shared_label";
+        fn declaration() -> Result<GraphDeclaration, ScopeError> {
+            GraphDeclaration::new::<Self>().vertex::<Self, node::Entity>(&["tenant_id", "id"])
+        }
+    }
+    impl VertexOf<Shared> for node::Entity {
+        const LABEL: &'static str = "node";
+    }
+    // Same label, different entity (and table), never registered.
+    impl VertexOf<Shared> for edge::Entity {
+        const LABEL: &'static str = "node";
+    }
+
+    let err = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Shared>()
+        .match_path(|p| p.vertex::<edge::Entity>("x"))
+        .column("x", "id", "n")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("an unregistered entity must be refused even under a declared label");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("other than the one")),
         "unexpected error: {err}"
     );
 }

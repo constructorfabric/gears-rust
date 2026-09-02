@@ -186,11 +186,12 @@ impl From<ScopeError> for DomainError {
                 tracing::error!("invalid scope: {msg}");
                 DomainError::internal(msg)
             }
-            // Graph-query refusals; mini-chat issues no graph queries, so
-            // reaching either is a programmer error, like `Invalid`.
-            err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
-                tracing::error!("invalid scope: {err}");
-                DomainError::internal(format!("invalid scope: {err}"))
+            // `ScopeError` is `#[non_exhaustive]`: variants this gear has no
+            // specific answer for (today the graph-query refusals, which it can
+            // never trigger) map to an internal error, like `Invalid`.
+            other => {
+                tracing::error!("invalid scope: {other}");
+                DomainError::internal(format!("invalid scope: {other}"))
             }
         }
     }

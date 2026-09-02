@@ -1,7 +1,16 @@
 use uuid::Uuid;
 
 /// Errors that can occur during scoped query execution.
+///
+/// `#[non_exhaustive]`: this is the error enum every gear's repository layer
+/// matches on, and the ORM grows variants a gear has no specific answer for
+/// (the graph-query refusals below are constructible only under the `pgq`
+/// feature). A downstream `match` keeps one wildcard arm for those instead of
+/// gaining a dead arm per new variant — the cost is that a future variant a
+/// gear *should* handle specifically lands in the wildcard rather than failing
+/// its build, which is the standard trade for a library error enum.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum ScopeError {
     /// Database error occurred during query execution.
     #[error("database error: {0}")]
@@ -34,17 +43,19 @@ pub enum ScopeError {
         property: String,
     },
 
-    /// The SQL/PGQ syntax layer refused to render. Carried as its own variant
-    /// so the distinct refusals (no projected columns, a duplicate pattern
-    /// variable, an empty identifier) stay distinguishable to the caller.
+    /// The SQL/PGQ syntax layer refused to render a graph declaration or
+    /// pattern: no projected columns, a duplicate pattern variable, an empty
+    /// identifier, an endpoint whose key and referenced columns differ in
+    /// arity. The message is the syntax layer's own.
     ///
-    /// Present unconditionally, although only the `pgq`-gated builder
-    /// constructs it: a feature-gated variant would change this enum's shape
-    /// under feature unification, breaking every downstream exhaustive `match`
-    /// the moment any crate in the build enables `pgq` (including
-    /// `--all-features` CI lanes).
+    /// The payload is this crate's, not the syntax crate's error type. The
+    /// variant exists in every build — a feature-gated variant would change
+    /// the enum's shape under feature unification — while the syntax crate is
+    /// linked only under `pgq`: a gear on `SQLite` must not carry a `PostgreSQL` 19
+    /// dependency to name this arm (`docs/arch/secure-orm/ADR/0002`, "Backend
+    /// gating").
     #[error("graph syntax error: {0}")]
-    Pgq(#[from] toolkit_sea_orm_pgq::PgqError),
+    GraphSyntax(String),
 }
 
 impl ScopeError {
