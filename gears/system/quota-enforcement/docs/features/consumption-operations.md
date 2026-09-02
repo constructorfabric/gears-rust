@@ -107,8 +107,8 @@ earlier features (per DECOMPOSITION §2.5).
   [ADR-0003 Metadata snapshot timing](../ADR/0003-cpt-cf-quota-enforcement-adr-metadata-snapshot-timing.md),
   [ADR-0004 Settlement window emit](../ADR/0004-cpt-cf-quota-enforcement-adr-settlement-window-emit.md),
   [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; the ingress and resolution contracts this
-  pipeline consumes follow that ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; the ingress and resolution contracts this
+  pipeline consumes follow that ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-quota-lifecycle` (Quota records and the allocation-counter
   materialization), `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (Policy selection, Engine invocation,
   and the Debit-Plan invariant boundary), plus transitively
@@ -710,10 +710,10 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
 
 ## 7. Additional Context (optional)
 
-- **ADR dependencies**: ADR-0002 (acquisition ordering), ADR-0003 (metadata snapshot timing), and ADR-0004
-  (settlement window emit) are accepted and load-bearing for this pipeline. ADR-0007 is still **proposed**; the
-  ingress and subject-resolution contracts this pipeline consumes follow the projection-contracts feature if the
-  Architecture review changes that ADR.
+- **ADR dependencies**: ADR-0002 (acquisition ordering), ADR-0003 (metadata snapshot timing), ADR-0004
+  (settlement window emit), and ADR-0007 (declarative GTS projection contracts) are accepted and load-bearing for
+  this pipeline. The projection-contracts feature owns the ingress and subject-resolution contracts this pipeline
+  consumes.
 - **Boundary with resolution-policy-engine**: Policy selection, the Engine contract, the per-Policy timeout, and the
   Debit-Plan invariant boundary are defined there
   (`cpt-cf-quota-enforcement-algo-engine-boundary`); this feature owns the pipeline that invokes them and the atomic

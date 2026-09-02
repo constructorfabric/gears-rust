@@ -90,8 +90,8 @@ of P1 per PRD §4.2).
   group, error model, telemetry surface)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.3)
 - **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; the constraint contract shape and
-  the write-time-only validation rule follow that ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; the constraint contract shape and
+  the write-time-only validation rule follow that ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (storage plugin, Gateway admission, telemetry
   conventions), `cpt-cf-quota-enforcement-feature-projection-contracts` (catalogue-membership check, constraint
   contract resolution)
@@ -336,6 +336,8 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 2. [ ] - `p1` - Validate the object against the constraint contract attached to the metric request contract (derived from
    `gts.cf.core.qe.constraint.v1~`, published per the projection-contracts feature); the contract defines keys,
    requiredness, types, enums, and nesting - `inst-qmd-contract`
+   1. [ ] - `p1` - Wrap the wire object into the contract envelope `{type, metadata}` and validate the whole document,
+      never the inner subschema alone (ADR-0007 envelope rule) - `inst-qmd-envelope`
 3. [ ] - `p1` - **IF** the object violates the contract - `inst-qmd-mismatch-if`
    1. [ ] - `p1` - **RETURN** `DomainError::ConstraintContractMismatch` (canonical `FailedPrecondition`);
       increment `contract_validation_failures_total` with the closed `arbitration` surface - `inst-qmd-mismatch`
@@ -583,8 +585,7 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
   (`cpt-cf-quota-enforcement-fr-quota-snapshot-read`); the DESIGN Quota read response does not yet name the field,
   and that read-contract alignment is a tracked upstream prerequisite.
 - **ADR dependency**: the constraint contract shape and the write-time-only validation rule follow
-  `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007, status **proposed**); if the Architecture review
-  changes the ADR, this document follows it.
+  `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007, status accepted).
 - **Shared component**: `cpt-cf-quota-enforcement-component-quota-management-service` is owned here and later
   extended by the bulk-quota-crud feature (P2) through the same contract, per DECOMPOSITION §2.12; the P2 bulk
   endpoints are deliberately absent from this document.

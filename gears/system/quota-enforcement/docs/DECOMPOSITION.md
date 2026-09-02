@@ -10,17 +10,17 @@
 
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
-  - [2.1 Gear Foundation, Storage & Coordination ⏳ HIGH](#21-gear-foundation-storage--coordination--high)
-  - [2.2 Projection Contracts & Subject Attribution ⏳ HIGH](#22-projection-contracts--subject-attribution--high)
-  - [2.3 Quota Lifecycle & Metadata ⏳ HIGH](#23-quota-lifecycle--metadata--high)
-  - [2.4 Resolution Policy & Engine ⏳ HIGH](#24-resolution-policy--engine--high)
-  - [2.5 Consumption Operations & Idempotency ⏳ HIGH](#25-consumption-operations--idempotency--high)
-  - [2.6 Lease Operations ⏳ HIGH](#26-lease-operations--high)
-  - [2.7 Batch Debit ⏳ MEDIUM](#27-batch-debit--medium)
-  - [2.8 Quota Snapshot Reads ⏳ MEDIUM](#28-quota-snapshot-reads--medium)
-  - [2.9 Notification Outbox & Dispatch ⏳ MEDIUM](#29-notification-outbox--dispatch--medium)
-  - [2.10 Bulk Quota CRUD ⏳ MEDIUM](#210-bulk-quota-crud--medium)
-  - [2.11 Rate Quotas ⏳ LOW](#211-rate-quotas--low)
+  - [2.1 Gear Foundation, Storage & Coordination (HIGH)](#21-gear-foundation-storage--coordination-high)
+  - [2.2 Projection Contracts & Subject Attribution (HIGH)](#22-projection-contracts--subject-attribution-high)
+  - [2.3 Quota Lifecycle & Metadata (HIGH)](#23-quota-lifecycle--metadata-high)
+  - [2.4 Resolution Policy & Engine (HIGH)](#24-resolution-policy--engine-high)
+  - [2.5 Consumption Operations & Idempotency (HIGH)](#25-consumption-operations--idempotency-high)
+  - [2.6 Lease Operations (HIGH)](#26-lease-operations-high)
+  - [2.7 Batch Debit (MEDIUM)](#27-batch-debit-medium)
+  - [2.8 Quota Snapshot Reads (MEDIUM)](#28-quota-snapshot-reads-medium)
+  - [2.9 Notification Outbox & Dispatch (MEDIUM)](#29-notification-outbox--dispatch-medium)
+  - [2.10 Bulk Quota CRUD (MEDIUM)](#210-bulk-quota-crud-medium)
+  - [2.11 Rate Quotas (LOW)](#211-rate-quotas-low)
   - [2.12 Deliberate Omissions & Shared Elements](#212-deliberate-omissions--shared-elements)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
@@ -41,9 +41,11 @@ not here.
 
 ## 2. Entries
 
-### 2.1 Gear Foundation, Storage & Coordination ⏳ HIGH
+### 2.1 Gear Foundation, Storage & Coordination (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-foundation`
+
+- **Feature**: [features/foundation.md](features/foundation.md)
 
 - **Purpose**: Stand up the `quota-enforcement` gear and SDK crates, the `QuotaEnforcementStoragePluginV1` contract
   with its `toolkit-db` reference plugin, the `CoordinationPluginV1` contract with its storage-backed default, gear
@@ -113,9 +115,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.2 Projection Contracts & Subject Attribution ⏳ HIGH
+### 2.2 Projection Contracts & Subject Attribution (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-projection-contracts`
+
+- **Feature**: [features/projection-contracts.md](features/projection-contracts.md)
 
 - **Purpose**: Register the abstract QE subject/resource/request/constraint bases and the scope-discriminator type,
   resolve owner projections into the immutable `ProjectionContractCatalog`, validate every evaluation request at
@@ -183,9 +187,11 @@ not here.
 
   - None (contracts are registry-resident; no QE-side table)
 
-### 2.3 Quota Lifecycle & Metadata ⏳ HIGH
+### 2.3 Quota Lifecycle & Metadata (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-quota-lifecycle`
+
+- **Feature**: [features/quota-lifecycle.md](features/quota-lifecycle.md)
 
 - **Purpose**: Implement the Quota entity and its lifecycle — create, update, deactivate, read — with metric
   validation against `types-registry`, cap and validity-window semantics, opaque size-capped metadata, the closed
@@ -248,9 +254,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.4 Resolution Policy & Engine ⏳ HIGH
+### 2.4 Resolution Policy & Engine (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-resolution-policy-engine`
+
+- **Feature**: [features/resolution-policy-engine.md](features/resolution-policy-engine.md)
 
 - **Purpose**: Implement the Quota Resolution Policy entity with immutable versioning and rollback, the
   `QuotaResolutionEngineV1` plugin contract with the `most-restrictive-wins` and `cel` built-ins, multi-Quota
@@ -324,9 +332,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.5 Consumption Operations & Idempotency ⏳ HIGH
+### 2.5 Consumption Operations & Idempotency (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-consumption-operations`
+
+- **Feature**: [features/consumption-operations.md](features/consumption-operations.md)
 
 - **Purpose**: Implement the `EvaluationOrchestrator` pipeline and the single-shot counter operations — debit,
   credit, rollback, and read-only preview — over allocation and consumption counters, with calendar-aligned UTC
@@ -409,9 +419,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.6 Lease Operations ⏳ HIGH
+### 2.6 Lease Operations (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-lease-operations`
+
+- **Feature**: [features/lease-operations.md](features/lease-operations.md)
 
 - **Purpose**: Implement the two-phase lease protocol — atomic multi-Quota acquisition, commit with unused-capacity
   return, release, and TTL auto-release — under the lazy-expiry semantic that keeps correctness independent of
@@ -473,9 +485,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.7 Batch Debit ⏳ MEDIUM
+### 2.7 Batch Debit (MEDIUM)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-batch-debit`
+
+- **Feature**: [features/batch-debit.md](features/batch-debit.md)
 
 - **Purpose**: Implement the multi-item debit envelope for single logical operations that consume several metrics
   at once: atomic all-or-nothing evaluation where each item observes the running batch state, envelope idempotency,
@@ -523,9 +537,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.8 Quota Snapshot Reads ⏳ MEDIUM
+### 2.8 Quota Snapshot Reads (MEDIUM)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-snapshot-reads`
+
+- **Feature**: [features/snapshot-reads.md](features/snapshot-reads.md)
 
 - **Purpose**: Implement the engine-agnostic per-Quota state read — the unified snapshot endpoint serving single,
   bulk-paginated, and end-user-restricted cases — with `currently_within_window` computation, PDP-scoped
@@ -576,9 +592,11 @@ not here.
 
   - None (reads existing counter and Quota rows; period materialization is owned by `consumption-operations`)
 
-### 2.9 Notification Outbox & Dispatch ⏳ MEDIUM
+### 2.9 Notification Outbox & Dispatch (MEDIUM)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-notifications`
+
+- **Feature**: [features/notifications.md](features/notifications.md)
 
 - **Purpose**: Implement the `QuotaNotificationSinkV1` plugin contract and the outbox-backed dispatcher delivering
   the eight-kind event catalog at-least-once to every registered sink, with per-sink failure isolation,
@@ -627,9 +645,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.10 Bulk Quota CRUD ⏳ MEDIUM
+### 2.10 Bulk Quota CRUD (MEDIUM)
 
 - [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-feature-bulk-quota-crud`
+
+- **Feature**: [features/bulk-quota-crud.md](features/bulk-quota-crud.md)
 
 - **Purpose**: Implement the transactional bulk Quota endpoints — `bulk_create_quotas`, `bulk_update_quotas`,
   `bulk_deactivate_quotas` — with envelope idempotency, all-or-nothing semantics, batch-size limits, and per-item
@@ -678,9 +698,11 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.11 Rate Quotas ⏳ LOW
+### 2.11 Rate Quotas (LOW)
 
 - [ ] `p3` - **ID**: `cpt-cf-quota-enforcement-feature-rate-quotas`
+
+- **Feature**: [features/rate-quotas.md](features/rate-quotas.md)
 
 - **Purpose**: Activate the reserved `rate` quota type per the P3 field contract (`rate`, `burst_capacity`,
   `smoothing_window`), with `RATE_WINDOW_EXHAUSTED` denials carrying a `Retry-After` floor and migration-free

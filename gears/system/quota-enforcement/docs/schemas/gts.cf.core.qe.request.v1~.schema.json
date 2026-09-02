@@ -9,7 +9,7 @@
     "properties": {
       "metric": {
         "type": "string",
-        "format": "gts-type-id",
+        "format": "gts-instance-id",
         "x-gts-ref": "gts.cf.qe.metric.type.v1~",
         "description": "The single registered metric governed by this request contract."
       },

@@ -130,7 +130,7 @@ idempotent operations, and a uniform evaluation contract.
 | Quota Snapshot            | A point-in-time per-Quota view returned by the snapshot read APIs (§5.10): for each applicable Quota — `quota_id`, `cap` (numeric or `null` for unbounded Quotas), current consumed, `remaining` (numeric or `null`), period boundary, validity window, metadata. Engine-agnostic — no aggregate "headline" cap/balance is computed, since under cascade, split, or attribute-gated Engines no single number is universally meaningful. Authoritative admission for a specific operation is given by the Engine's `Decision` (or its read-only `Preview`, `cpt-cf-quota-enforcement-fr-evaluate-preview`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Quota Resolution Policy   | An operator-managed entity that binds a Quota Resolution Engine and its config to a scope. P1 supports two scope levels: platform default (`global`) and per-metric. The most-specific-scope Policy applies at evaluation time. The scope ladder is intentionally extensible — narrower scopes (e.g., per-subject) are deferred and tracked in §13 Open Questions. See `cpt-cf-quota-enforcement-fr-quota-resolution-policy` for versioning, scope precedence, and seeded defaults.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Quota Resolution Engine   | The pluggable component that implements multi-Quota arbitration logic. Receives the applicable-Quotas set, current usage, the request, and an opaque engine-specific config; returns a Decision (result + debit plan + diagnostics). P1 ships two built-ins: `most-restrictive-wins` (hardcoded; fastest path; produces a single-entry Debit Plan against the binding Quota — see §5.9) and `cel` (sandboxed CEL evaluator; customizable). Multi-Quota debit patterns (cascade, attribute-weighted splits) are expressed via a `cel` Policy or future Engines. Additional engines (Starlark, Lua, Wasm-loaded) plug in via the same trait without changes to evaluation core.                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Debit Plan                | A `{quota_id → QuotaDebitPlan}` map produced by the active Engine alongside the result verdict. `QuotaDebitPlan` carries `amount` (total counter mutation for that Quota; ≥ 0, integer). The struct is extension-ready — additional per-Quota fields (e.g., a `clamped` marker if cap-clamp admission lands in P3) MAY be added in future phases without breaking the top-level Decision shape. The system mutates counters strictly per the Debit Plan; Quotas not named in the plan are not touched. P1 invariants enforce per-entry `0 ≤ amount ≤ request.amount` (integer arithmetic; see `cpt-cf-quota-enforcement-fr-quota-resolution-engine`). The per-entry cap prevents accidental over-charge of any single counter; the system does **not** constrain `Σ amount`, leaving operators free to express either sum-semantics (one operation distributed across pools — cascade, proportional split: `Σ = request.amount`) or multi-counter / AND-semantics (each applicable pool tracks the same operation independently: `Σ = N × request.amount`) through the active Engine. |
+| Debit Plan                | A `{quota_id → QuotaDebitPlan}` map produced by the active Engine alongside the result verdict. `QuotaDebitPlan` carries `amount` (total counter mutation for that Quota; ≥ 0, integer). The struct is extension-ready — additional per-Quota fields (e.g., a `clamped` marker if cap-clamp admission lands in P3) MAY be added in future phases without breaking the top-level Decision shape. The system mutates counters strictly per the Debit Plan; Quotas not named in the plan are not touched. P1 invariants enforce per-entry `0 ≤ amount ≤ request.amount` (integer arithmetic; see `cpt-cf-quota-enforcement-fr-quota-resolution-engine`). The per-entry cap prevents accidental over-charge of any single counter; the system does **not** constrain `sum(amount)`, leaving operators free to express either sum-semantics (one operation distributed across pools — cascade, proportional split: `sum(amount) = request.amount`) or multi-counter / AND-semantics (each applicable pool tracks the same operation independently: `sum(amount) = N × request.amount`) through the active Engine. |
 | Quota Cascade / Spillover | An arbitration pattern where one Quota acts as primary pool and another as fallback; debit is routed to the primary first and falls through to the fallback only when the primary's remaining capacity is insufficient. P1 ships two cascade capabilities: the default `most-restrictive-wins` Engine implements subject-scope cascade (more-specific subject scope wins; P1: user-scope > tenant-scope) with single-entry Debit Plans; the customizable `cel` Engine produces arbitrary multi-entry plans for cross-tier splits (primary takes X, fallback takes `amount − X`), intra-tier cascade (between same-scope Quotas identified by metadata), and proportional distributions.                                                                                                                                                                                                                                                                                                                                                                                               |
 | Arbitration Constraints   | Operator-supplied constraints attached to a Quota at create/update, validated once against the metric owner's constraint GTS contract and then snapshotted from storage for Engine evaluation. Their business meaning remains opaque to QE core.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Request Metadata          | One required caller-supplied operation-level object, validated for subject-based evaluation requests against the metric owner's request contract. It is distinct from arbitration constraints because the two sides may intentionally use different shapes and cardinalities.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -647,10 +647,10 @@ Each subject projection **MUST** declare a required `scope` trait in the base's 
 Scope **MUST NOT** be inferred from the type-id name segment.
 
 Each projection **MUST** declare its admitted metrics through a typed
-`x-gts-traits` value whose entries are metric type ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
+`x-gts-traits` value whose entries are metric instance ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
 validates that a value is a well-formed GTS id under the declared prefix. The system **MUST** therefore itself verify,
 at bootstrap per `cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is
-genuinely derived from the metric base — a narrowed `x-gts-ref` is a prefix match, not a derivation check. The request
+genuinely an instance of the metric base. A narrowed `x-gts-ref` is a prefix match, not an instance-of check. The request
 may also carry a resource projection for typed resource properties; resource does not enter the P1 counter key. Metric
 identity remains owned by `types-registry` and is not changed by this requirement.
 
@@ -664,7 +664,7 @@ the intended arrangement and **MUST NOT** be rejected — it is what makes scope
 (`cpt-cf-quota-enforcement-fr-quota-cascade`) expressible.
 
 For each metric, the owner **MUST** publish exactly one concrete request contract derived from
-`gts.cf.core.qe.request.v1~`. Its required traits identify the single `metric: GtsTypeId` and attach a concrete
+`gts.cf.core.qe.request.v1~`. Its required traits identify the single `metric: GtsInstanceId` and attach a concrete
 `constraint_contract: GtsTypeId` derived from `gts.cf.core.qe.constraint.v1~`. The request contract refines the one
 operation-level `metadata` object shared by all callers and subject scopes. The request schema **MUST NOT** be reused
 for arbitration constraints because the two sides may intentionally differ in shape and cardinality.
@@ -686,6 +686,10 @@ every subject-based consumer evaluation operation, including each batch item, QE
 before Engine dispatch. Missing, duplicate, unknown, or unadmitted subject kinds; absent metadata; or schema violations
 **MUST** receive a canonical `InvalidArgument` error. QE **MUST NOT** default absent metadata to `{}` and **MUST NOT**
 encode validation failure as `Decision::Denied`.
+
+QE **MUST** validate operation metadata, the optional resource projection, and Quota metadata against their complete
+resolved contracts, including the base contract rules. The subject family declares traits only and carries no
+`metadata`. ADR-0007 defines the validation mechanics.
 
 Contract schema resolution **MUST NOT** add a live `types-registry` dependency to evaluation. Quota and Policy writes
 resolve and snapshot contracts outside storage transactions; the hot path consumes those snapshots. Contracts validate
@@ -1877,16 +1881,16 @@ counter mutation, and the Decision shape **MUST NOT** be returned to the caller:
 2. For every entry: `amount ≥ 0`.
 3. For every entry: `amount ≤ request.amount`. No single counter is charged more than the operation requested. This
    prevents accidental per-Quota over-charge while permitting both sum-semantics (one operation distributed across
-   pools: `Σ = request.amount`) and multi-counter / AND-semantics (each applicable pool tracks the operation
-   independently: `Σ = N × request.amount` for N entries) — the choice is Engine-driven, not core-mandated.
+   pools: `sum(amount) = request.amount`) and multi-counter / AND-semantics (each applicable pool tracks the operation
+   independently: `sum(amount) = N × request.amount` for N entries) — the choice is Engine-driven, not core-mandated.
 4. Result-plan consistency:
    - `result = Allowed` ⇒ `debit_plan` is non-empty.
    - `result = Denied` ⇒ `debit_plan` is empty.
 
-The system intentionally does **not** constrain `Σ amount`. Cascade and proportional-split
-Engines naturally produce `Σ = request.amount`; AND-across-tiers Engines naturally produce `Σ = N × request.amount`;
+The system intentionally does **not** constrain `sum(amount)`. Cascade and proportional-split
+Engines naturally produce `sum(amount) = request.amount`; AND-across-tiers Engines naturally produce `sum(amount) = N × request.amount`;
 clamp-style admission (where the Engine admits fewer units than requested, e.g., the future `hard-with-clamp`
-enforcement mode tracked in §13) naturally produces `Σ < request.amount` paired with an appropriate non-`Allowed`
+enforcement mode tracked in §13) naturally produces `sum(amount) < request.amount` paired with an appropriate non-`Allowed`
 result variant — all expressible within the existing invariants without future schema relaxation. Engines that produce
 sparse Debit Plans (e.g., cascade) commit to integer per-Quota magnitudes; rounding choices in CEL or future Engines
 are the Engine author's responsibility.
@@ -3466,7 +3470,7 @@ on behalf of a tenant administrator)
 - **Informal upstream requirements**: no formal `UPSTREAM_REQS.md` is maintained for this gear
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: see [DESIGN §5 Traceability](./DESIGN.md) for the canonical ADR catalogue
-- **Features**: feature specifications are to be authored under `docs/features/`
+- **Features**: feature specifications under `docs/features/` (eleven documents, one per DECOMPOSITION entry)
 - **Related gears**: [Usage Collector PRD](../../usage-collector/docs/PRD.md),
   [Account Management PRD](../../account-management/docs/PRD.md),
   [Resource Group PRD](../../resource-group/docs/PRD.md), [Types Registry PRD](../../types-registry/docs/PRD.md)

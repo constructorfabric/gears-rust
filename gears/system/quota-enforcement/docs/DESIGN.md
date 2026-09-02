@@ -541,6 +541,9 @@ classification `QuotaGated`/`Direct` are reported by the registry and consumed d
 
 The same `TypesRegistryClient` and bounded LRU resolve the metric owner's subject projection and separate Quota-
 attribute contract. `quota.metadata` is validated at create/update before persistence, outside the storage transaction.
+Validation wraps the object into the contract envelope `{type, metadata}` and checks the whole document. At evaluation
+ingress, the Gateway applies the same complete-contract rule by wrapping operation metadata and validating the
+already-complete `{type, id?, metadata}` resource projection directly.
 The accepted contract id/version is snapshotted; stored metadata is not revalidated during evaluation. Creation checks
 both the registry contract and membership in the configured `ProjectionContractCatalog`; P1 rejects replacement
 projections outside that catalogue.
@@ -950,7 +953,7 @@ There is no projection-alias, Quota/counter-migration, or breaking-version activ
 |-------|-----------|------|
 | `tenant_id` | `TenantId` | Required caller-supplied target tenant. Untrusted until PDP authorizes it for the authenticated service principal. |
 | `subjects` | `Vec<SubjectRef>` | Additional `{ kind: GtsInstanceId, id: String }` subjects. `kind` is a QE scope instance; ids are opaque and non-empty. Tenant scope is materialized from `tenant_id` and must not be repeated. |
-| `metadata` | `Map<String, JsonValue>` | One operation-level object, required on the wire including `{}` when empty; validated against the metric request contract. |
+| `metadata` | `Map<String, JsonValue>` | One operation-level object, required on the wire including `{}` when empty; QE wraps it into the contract envelope `{type, metadata}` and validates the whole document against the metric request contract. |
 | `resource` | `Option<ResourceProjection>` | Optional concrete resource projection with `type`, optional `id`, and required `metadata`; descriptive in P1 and PDP-authorized with the attribution tuple. |
 
 No consumer DTO carries `caller_type` or a concrete subject projection type. `SecurityContext` supplies only the
@@ -2160,7 +2163,7 @@ plugin chooses physical layout.
   `quota_consumption_counters` row.
 - `quota_resolution_policy.latest_version` always references an existing version row.
 - Outbox events for a mutation are inserted in the same transaction as the mutation; no partial enqueue is observable.
-- Idempotency record `payload_hash` is the canonical SHA-256 of the sorted-JSON payload ; the plugin stores it as
+- Idempotency record `payload_hash` is the canonical SHA-256 of the sorted-JSON payload; the plugin stores it as
   fixed-width binary for index efficiency.
 
 #### Bootstrap seeded state
@@ -2178,11 +2181,12 @@ plugin chooses physical layout.
    projections are published by their owners; QE seeds no platform-wide subject instances.
 1. Resolving every configured subject/resource projection and per-metric request contract into a candidate
    `ProjectionContractCatalog`.
-1. Checking derivation of every configured concrete owner projection from the QE base, admitted metric references,
-   concrete (non-abstract) status, derivation of every admitted metric reference from the metric base (a narrowed `x-gts-ref` is a
-   prefix match only, so neither registration nor derivation is covered by it), uniqueness of every admitted
-   `(metric, scope)` pair across the configured projection set, exactly one concrete request contract per admitted
-   metric, and a registered concrete constraint contract attached by that request contract. QE reads
+1. Checking derivation of every configured concrete owner projection from the QE base, concrete (non-abstract) status,
+   and that every admitted metric reference resolves to a registered instance of the metric base (a narrowed
+   `x-gts-ref` is a prefix match only, so neither registration nor the instance-of relationship is covered by it),
+   uniqueness of every admitted `(metric, scope)` pair across the configured projection set, exactly one concrete
+   request contract per admitted metric, and a registered concrete constraint contract attached by that request
+   contract. QE reads
    each projection's registry-validated effective `scope` trait and compares its `GtsInstanceId` directly. Any
    invalid reference, contract mismatch, or `(metric, scope)` pair claimed by two configured projections fails
    bootstrap. Bootstrap also fails when the configured catalogue is incompatible with any active Quota or Policy.
@@ -2358,4 +2362,4 @@ additively without breaking existing callers.
   [0006 Coordination plugin](./ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md),
   [0007 Declarative projection contracts](./ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
 - **Storage plugin DESIGN**: authored separately by the plugin owner once the plugin crate is created
-- **Features**: `features/` (per-feature implementation guides — to be authored as P1 development progresses)
+- **Features**: `features/` (eleven per-feature implementation guides, one per DECOMPOSITION entry)

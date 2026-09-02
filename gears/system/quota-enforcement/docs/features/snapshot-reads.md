@@ -87,8 +87,8 @@ applies the foundation admission and tenant-isolation machinery unchanged.
   snapshot-read group, §3.3 error model, `cpt-cf-quota-enforcement-seq-end-user-snapshot`)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.8)
 - **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; the owner user/tenant projections the
-  end-user restriction derives from follow that ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; the owner user/tenant projections the
+  end-user restriction derives from follow that ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-quota-lifecycle` (Quota records, the validity-window
   computation), `cpt-cf-quota-enforcement-feature-consumption-operations` (counter rows, period materialization),
   plus transitively `cpt-cf-quota-enforcement-feature-projection-contracts` (subject resolution for the end-user
@@ -385,8 +385,7 @@ follows `cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations 
   this feature surfaces the same two fields on Quota Snapshots per the PRD §5.10 grant, computing the boolean
   through the same algorithm.
 - **ADR dependency**: the owner user/tenant projections behind the end-user restriction follow
-  `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007, status **proposed**); if the Architecture review
-  changes the ADR, this document follows the projection-contracts feature.
+  `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007, status accepted).
 - **No caching or freshness promise**: the snapshot is a point-in-time view. PRD and DESIGN grant no read cache and
   no staleness bound for this surface, so none is promised; the read observes committed state per the storage
   contract's strong consistency within tenant scope (I10, foundation feature).

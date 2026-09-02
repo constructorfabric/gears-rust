@@ -101,8 +101,8 @@ DESIGN/consumption-operations alignment item).
 - **ADR**: [ADR-0005 Pluggable evaluation engine](../ADR/0005-cpt-cf-quota-enforcement-adr-evaluation-engine.md)
   (`cpt-cf-quota-enforcement-adr-evaluation-engine`, status: accepted);
   [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; the Policy-write membership check and
-  stable `{request, resource, arbitration}` input follow that ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; the Policy-write membership check and
+  stable `{request, resource, arbitration}` input follow that ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (bootstrap hook, Gateway admission, storage plugin,
   telemetry conventions), `cpt-cf-quota-enforcement-feature-projection-contracts` (snapshotted contract schemas, the
   catalogue-membership check on Policy writes, request/resource/constraint contract snapshots)
@@ -617,8 +617,8 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
 
 - **ADR dependencies**: `cpt-cf-quota-enforcement-adr-evaluation-engine` (ADR-0005, accepted) fixes the
   capability-based Engine contract this document restates; `cpt-cf-quota-enforcement-adr-projection-contracts`
-  (ADR-0007) is still **proposed**, so the Policy-write membership check and CEL input contract follow the
-  projection-contracts feature if the Architecture review changes that ADR.
+  (ADR-0007, accepted) fixes the Policy-write membership check and the CEL input contract; the
+  projection-contracts feature owns both.
 - **Budget and freshness contracts**: the Engine receives its per-Policy evaluation budget as the typed
   `EvaluationBudget` on `EvaluationContext` and enforces it internally per ADR-0005 (a synchronous `evaluate()`
   cannot be preempted from outside). A Policy activation takes effect on the next evaluation of every replica: the latest-version pointer is read

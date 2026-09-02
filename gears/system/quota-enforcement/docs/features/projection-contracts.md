@@ -1,6 +1,6 @@
 <!-- Created: 2026-08-26 by Constructor Tech -->
 
-# Feature: Projection Contracts & Subject Resolution
+# Feature: Projection Contracts & Subject Attribution
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-featstatus-projection-contracts-implemented`
 
@@ -87,13 +87,13 @@ with active Quotas or Policies; no activation procedure is specified here).
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md) (§5.1 projection contracts, contract validation, subject registry, subject resolution)
+- **PRD**: [PRD.md](../PRD.md) (§5.1 projection contracts, contract validation, subject registry, subject attribution)
 - **Design**: [DESIGN.md](../DESIGN.md) (Gateway, EvaluationOrchestrator subject resolution, bootstrap seeded state,
   contract entities)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.2)
 - **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; this feature's contract shapes follow that
-  ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; this feature's contract shapes follow that
+  ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (bootstrap hook, Gateway admission, telemetry
   conventions)
 
@@ -165,8 +165,10 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
    `AccessScope`; fail closed on denial or PDP unavailability - `inst-ing-authz`
 4. [ ] - `p1` - Map each authorized `(metric, kind)` through the process-local `ProjectionContractCatalog`; no registry
    call occurs on this path - `inst-ing-lookup`
-5. [ ] - `p1` - Validate operation-level `metadata` against the metric request contract and validate the optional
-   resource when declared; absent `metadata` was rejected before PDP and is never defaulted to `{}` - `inst-ing-metadata`
+5. [ ] - `p1` - Validate operation-level `metadata` against the metric request contract by wrapping the wire object
+   into the contract envelope `{type, metadata}` and validating the whole document (never the inner subschema alone);
+   when an optional resource is present, validate its already-complete `{type, id?, metadata}` projection directly;
+   absent operation `metadata` was rejected before PDP and is never defaulted to `{}` - `inst-ing-metadata`
 6. [ ] - `p1` - **IF** any kind is unknown or does not admit the request metric - `inst-ing-metric-if`
    1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed
       validation surface - `inst-ing-metric`
@@ -196,7 +198,7 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
 2. [ ] - `p1` - API: resolve every configured subject/resource projection and metric request contract from `types-registry` into a candidate
    catalogue; `types-registry` remains authoritative and the catalogue is only a validated local snapshot - `inst-cat-resolve`
 3. [ ] - `p1` - Verify each configured projection/request contract is concrete and genuinely derived from its QE base - `inst-cat-concrete`
-4. [ ] - `p1` - Verify every admitted metric reference resolves to a registered type genuinely derived from the metric
+4. [ ] - `p1` - Verify every admitted metric reference resolves to a registered instance of the metric
    base; a narrowed `x-gts-ref` is a pattern-level prefix match only, so QE owns both checks - `inst-cat-metric`
 5. [ ] - `p1` - Read each projection's registry-validated effective `scope` trait, compare the `GtsInstanceId` values
    directly, and reject any `(metric, scope)` pair admitted by two configured projections; scope is never inferred from
@@ -422,7 +424,7 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 - [ ] Repeated bootstraps register the abstract bases, the scope-discriminator type, and its `user`/`tenant` instances
   exactly once; registration is idempotent and touches only QE-owned definitions
 - [ ] Bootstrap fails, and the gear serves nothing, when a configured projection is unregistered, abstract, or not
-  derived from the QE base; when an admitted metric reference is unregistered or not derived from the metric base;
+  derived from the QE base; when an admitted metric reference is unregistered or is not an instance of the metric base;
   when two configured projections admit the same `(metric, scope)` pair; or when an admitted metric lacks exactly one
   concrete request contract with a valid attached constraint contract
 - [ ] Bootstrap fails when the configured catalogue is incompatible with any active Quota or Policy; no activation of a
@@ -452,8 +454,8 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 ## 7. Additional Context (optional)
 
 - **ADR dependency**: the primary decision record, `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007), has
-  status **proposed**. This document restates only what the feature needs; if the Architecture review changes the ADR,
-  the contract shapes here follow it.
+  status accepted. This document restates only what the feature needs; the ADR stays the authority on the
+  contract shapes.
 - **Rollout / rollback**: the catalogue is built per process at bootstrap and is immutable; changing the configured
   projection set is a redeploy. A failed consistency set keeps the previous healthy replicas serving (the new process
   never becomes ready). Runtime catalogue refresh is a P2 item in DESIGN §4.3 and is not specified here.

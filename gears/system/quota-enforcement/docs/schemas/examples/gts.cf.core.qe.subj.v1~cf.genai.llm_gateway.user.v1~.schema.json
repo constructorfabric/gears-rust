@@ -5,7 +5,8 @@
   "x-gts-traits": {
     "scope": "gts.cf.core.qe.scope.v1~cf.core.qe.user.v1",
     "admitted_metrics": [
-      "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1"
+      "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1",
+      "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1"
     ]
   },
   "type": "object",

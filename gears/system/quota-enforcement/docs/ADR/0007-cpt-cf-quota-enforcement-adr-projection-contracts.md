@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-12
 ---
 
@@ -142,6 +142,19 @@ The resource base retains `type`, optional `id`, and `metadata`.
 * **Operation `metadata` is required on the wire.** Omitting it is non-conforming and MUST NOT
   be defaulted to `{}`; callers send an empty object when the request contract declares no
   properties.
+* **The trait surface is closed, and QE owns it.** Both trait-bearing bases declare
+  `required` trait keys in `x-gts-traits-schema` and carry no `x-gts-traits` values of their
+  own. That shape is valid because the bases are abstract: the GTS store type-checks any trait
+  values an abstract type provides, but skips the required-trait completeness check for an
+  abstract leaf, and a concrete descendant closes the required traits (`gts` OP#13). QE cannot
+  use the alternative pattern of a `default` per trait, which
+  `gts.cf.core.am.tenant_type.v1~` uses, because `scope` and `admitted_metrics` have no safe
+  default. Both bases also set `additionalProperties: false` on the trait schema. The registry
+  composes the effective trait schema as an `allOf` over every block in the derivation chain,
+  so a closed base block rejects a new descendant trait key. An owner therefore declares the
+  QE-owned traits and adds none of its own. An owner that restates the trait schema must
+  restate every ancestor trait key, because a closed descendant block that drops one orphans
+  it and fails validation.
 * **Each subject projection declares its subject scope** as a required `scope` trait in the
   base's `x-gts-traits-schema`. Its value is a `GtsInstanceId` narrowed to
   `gts.cf.core.qe.scope.v1~*`; P1 defines the well-known instances
@@ -152,20 +165,20 @@ The resource base retains `type`, optional `id`, and `metadata`.
   type-id name segment would force string parsing, which `guidelines/GTS.md` conventions 14 and
   15 rule out.
 * **Each subject projection declares its admitted metrics** through an inherited
-  `x-gts-traits` value whose entries are `GtsTypeId`s narrowed via `x-gts-ref` to the platform
+  `x-gts-traits` value whose entries are `GtsInstanceId`s narrowed via `x-gts-ref` to the platform
   metric base. `x-gts-ref` is **pattern-level only** — it validates that the value is a
   well-formed GTS id under the declared prefix, and nothing more. Three checks it does *not*
   perform, all of which QE therefore owns:
   * that the referenced metric is registered — checked at bootstrap when the catalog is built;
-  * that the referenced type is genuinely *derived* from the metric base, since a narrowed
-    `x-gts-ref` is a prefix match, not a derivation check;
+  * that the referenced id is genuinely an *instance* of the metric base, since a narrowed
+    `x-gts-ref` is a prefix match, not an instance-of check;
   * that debiting the metric is permitted — checked at Gateway ingress against the catalog.
 
   A request naming an unadmitted metric fails closed. The registry thereby becomes an
   inventory of which metrics are metered against which owner and scope. Narrowing the set is a
   breaking contract change.
 * **Each metric has one request contract.** A concrete contract derived from
-  `gts.cf.core.qe.request.v1~` declares required traits `metric: GtsTypeId` and
+  `gts.cf.core.qe.request.v1~` declares required traits `metric: GtsInstanceId` and
   `constraint_contract: GtsTypeId`, narrowed to the platform metric base and
   `gts.cf.core.qe.constraint.v1~` respectively. It refines the one operation-level `metadata`
   object. QE builds a unique `metric -> request contract` index at bootstrap.
@@ -245,6 +258,16 @@ independently sufficient:
 This is consistent with `cpt-cf-quota-enforcement-adr-metadata-snapshot-timing`: stored Quota
 arbitration values are captured with the locked Quota row.
 
+**Envelope validation.** Three families carry a validated `metadata` object:
+`gts.cf.core.qe.request.v1~`, `gts.cf.core.qe.res.v1~`, and `gts.cf.core.qe.constraint.v1~`.
+Each of those bases requires `type` and `metadata`, and the derived contract refines the
+`metadata` subschema alone. QE wraps operation `metadata` and `quota.metadata` into the selected
+`{type, metadata}` contract envelope. The optional resource already arrives as the complete
+`{type, id?, metadata}` projection and is validated directly. In every case QE validates the
+whole document against the resolved contract, never the inner `metadata` subschema alone,
+because that path would skip the base's own `required` and `additionalProperties` rules. The
+subject family declares traits only and carries no `metadata`, so the rule does not apply to it.
+
 | Surface | Validation point | Rule |
 |---------|------------------|------|
 | `quota.metadata` | Quota create/update | Resolve the constraint contract attached to the metric request contract and validate once before persistence. Stored arbitration data is not revalidated during evaluation. |
@@ -283,8 +306,8 @@ closed consistency set:
 * every configured subject/resource projection and metric request contract is registered,
   concrete, and derived from its
   QE base;
-* every admitted metric reference resolves to a registered type that is genuinely derived from
-  the metric base — neither check is covered by `x-gts-ref`, which is pattern-level only;
+* every admitted metric reference resolves to a registered instance of the metric base.
+  `x-gts-ref` covers neither check, because it is pattern-level only;
 * no two configured projections admit the same metric at the same declared scope;
 * every admitted metric resolves to exactly one concrete request contract, and that contract's
   attached constraint contract is registered, concrete, and derived from the constraint base.
@@ -368,16 +391,18 @@ only as prose: the four abstract bases, the concrete scope-discriminator type wi
 well-known instances, and worked `cf.genai.llm_gateway` owner examples for all four contract
 families under [`docs/schemas/examples/`](../schemas/examples/). The examples exercise the
 decisions above: one owner publishing user- and tenant-scope projections that admit the same
-metric (scope cascade), one metric request contract shared by both projections, an empty object
-when that contract declares no properties, and a constraint contract whose `regions: string[]` pairs with the request's
-scalar `region` (the cel operator/cardinality check).
+metrics (scope cascade), one metric request contract per metric and each shared by both
+projections, a constraint contract whose `regions: string[]` pairs with the request's scalar
+`region` (the cel operator/cardinality check), a request contract that declares no properties
+and therefore takes `{}` on the wire, and a constraint contract that carries only an
+arbitration field with no request-side counterpart.
 
 The naming, one-level derivation, traits, abstract types, and typed-id rules come from
 [`guidelines/GTS.md`](../../../../../guidelines/GTS.md). The reference decisions are
 [`license-resolver` ADR-0001](../../../license-resolver/docs/ADR/0001-cpt-cf-license-resolver-adr-gts-resource-identity.md)
 and
 [`license-resolver` ADR-0003](../../../license-resolver/docs/ADR/0003-cpt-cf-license-resolver-adr-typed-licensing-contracts.md).
-The reference SDK in PR #4458 confirms abstract bases, required wire `metadata`, `GtsTypeId`
+The reference SDK in PR #4458 confirms abstract bases, required wire `metadata`, typed GTS id
 fields, and `x-gts-ref` narrowing; QE intentionally differs by accepting a PDP-authorized
 caller-supplied attribution tuple and keeping all registry access off its hot path.
 

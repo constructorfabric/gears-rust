@@ -18,11 +18,11 @@
         "minItems": 1,
         "items": {
           "type": "string",
-          "format": "gts-type-id",
+          "format": "gts-instance-id",
           "x-gts-ref": "gts.cf.qe.metric.type.v1~",
           "description": "Registered metric id under the platform metric base (illustrative base pending the cross-gear naming decision, PRD section 3.2)."
         },
-        "description": "Metrics this projection admits. x-gts-ref narrowing is pattern-level only: metric registration, genuine derivation from the metric base, and debit admission are checked by QE at bootstrap and Gateway ingress (ADR-0007). At most one projection admits a given metric per (metric, scope) pair per deployment; narrowing this set is a breaking contract change."
+        "description": "Metrics this projection admits. x-gts-ref narrowing is pattern-level only: metric registration, the instance-of relationship to the metric base, and debit admission are checked by QE at bootstrap and Gateway ingress (ADR-0007). At most one projection admits a given metric per (metric, scope) pair per deployment; narrowing this set is a breaking contract change."
       }
     },
     "required": [

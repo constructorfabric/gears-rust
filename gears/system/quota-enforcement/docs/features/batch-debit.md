@@ -82,8 +82,8 @@ DECOMPOSITION §2.7).
 - **ADR**: [ADR-0002 Acquisition ordering](../ADR/0002-cpt-cf-quota-enforcement-adr-acquisition-ordering.md),
   [ADR-0003 Metadata snapshot timing](../ADR/0003-cpt-cf-quota-enforcement-adr-metadata-snapshot-timing.md),
   [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: **proposed**; the per-item ingress and resolution
-  contracts follow that ADR and may shift if the Architecture review changes it)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; the per-item ingress and resolution
+  contracts follow that ADR)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-consumption-operations` (the `EvaluationOrchestrator` pipeline,
   the idempotency replay mechanism, and the counter shapes this envelope mutates), plus transitively
   `cpt-cf-quota-enforcement-feature-quota-lifecycle`, `cpt-cf-quota-enforcement-feature-resolution-policy-engine`,
