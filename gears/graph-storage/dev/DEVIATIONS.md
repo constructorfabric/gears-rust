@@ -36,9 +36,10 @@ now records how it was verified.
 **Status.** Every `[doc-gap]` below **up to D-016** is folded into PR #4523
 (commit `facd5da29` on `feature/graph-storage-prd-adr`), marked in the
 documents as "Found while building the prototype" so a reader can tell a
-decision taken up front from one the implementation forced. **D-017 and D-018
-are not**: they came out of building vector search after that sweep, and doc
-edits are agreed before they are published. The `[platform-gap]` entries are
+decision taken up front from one the implementation forced. **D-017 through
+D-024 are not**: D-017 and D-018 came out of building vector search after that
+sweep, and D-020 through D-024 out of implementing the element envelope and
+adapting to PR #4639. Doc edits are agreed before they are published. The `[platform-gap]` entries are
 recorded in the documents too — at the place where they bite — but they close
 only with platform work, so they stay open here. The `[deferred]` entries are
 accepted scope cuts and need no documentation change.
@@ -214,6 +215,58 @@ A deployment that does not configure `graph-storage.embedding_provider = onnx` g
 ADR-0005 has no such mode: its three providers are ONNX, remote and "a deterministic fake for CI". Shipping the CI fake as the *runtime default* is this prototype's choice, made so the write path, the epoch bookkeeping and the four vector states could be exercised before a deployment has model artifacts. It is defensible for a prototype and wrong for a release: the failure it produces is a quiet quality loss, which is the exact failure mode ADR-0005 is written to prevent.
 
 **Proposal:** before release, either make `onnx` the compiled-in default with no fallback, or make an unconfigured provider a boot failure. A warning in a log is not a guard.
+
+## D-020 [doc-gap] The envelope's subject id is a `Uuid`, and DESIGN types it `TEXT`
+
+DESIGN § 3.7 gives the audit columns as `created_by_subject_id / created_by_subject_type | TEXT`. The vocabulary that column is pointing at is `SecurityContext`, whose `subject_id()` returns a **`Uuid`** — `subject_type()` is the `&str` half, a GTS type identifier.
+
+**Implementation:** `UUID` for the id, `TEXT` for the type (migration `m0004`). Writing a `Uuid` into `TEXT` widens the domain for nothing, costs 20 bytes a row against 16, and makes an equality join against any other subject column a text comparison.
+
+**Proposal:** fix the doc — one word in two table rows. This is not a design disagreement, it is a table sketch written before the platform type was looked up.
+
+**How it was checked:** **Verified on the live stand.** `\d node` on the PostgreSQL 19 instance shows `created_by_subject_id | uuid | not null`, and a node read back over REST carries `"subject_id": "00000000-0000-0000-0000-00000000a001"` with `"subject_type": "gts.cf.core.security.subject_user.v1~"` — both halves populated from the request's own security context.
+
+## D-021 [doc-gap] `graph_revision` on the element is what lets the projection report one at all
+
+PRD § `fr-tabular-projection` carries a "Found while building the prototype" note: the continuation token cannot be `CursorV1` *extended with the observed graph revision*, because `CursorV1` has no revision member and the platform page envelope carries only items and cursors. It concludes that tabular projection is **the one read path that does not report `(source_epoch, graph_revision)`**, and that closing it needs a platform slot.
+
+**It does not.** DESIGN's envelope table already lists `graph_revision` as an envelope member — "the revision the read observed" — and the envelope rides on the *element*, not on the response. `toolkit_odata::Page` constrains the wrapper; it does not constrain the items, which are this gear's own DTO. So the projection reports its observed revision on every row, and the gap closes with no platform change.
+
+**Implementation:** `ElementEnvelope.graph_revision`, resolved from the call's compound-read snapshot when it has one and from `graph_meta` otherwise. Per element rather than per response, which duplicates one value across a page — the cost of the platform wrapper having no place for it.
+
+**Proposal:** replace the PRD note. The finding it records is real (the cursor cannot carry it); the conclusion drawn from it is not.
+
+**How it was checked:** **Verified on the live stand.** `GET /nodes?limit=2` returns each row with `"graph_revision": {"source_epoch": 1, "revision": 5}`, and the conformance obligation `a_projection_row_carries_the_envelope` asserts it against both store implementations.
+
+## D-022 [impl-gap] No read surface returns an edge, so half of `fr-audit-envelope` is unexercised
+
+`fr-audit-envelope` says **every node and edge** returned by any read surface must carry the envelope. The prototype has no surface that returns an edge as an element: `DELETE /edges/{edge_key}` exists, `GET` does not, and an edge appears in a response only as a topology reference — `EdgeRef` in a traversal, `AdjacencyEntry` in a node read — which is a key, a type and two endpoints by design.
+
+**Implementation:** the edge table carries the full envelope and every write populates it (migration `m0004` adds `updated_at` and the three subject pairs), so the data is there and correct. Nothing reads it back.
+
+**Why this is `[impl-gap]` and not `[deferred]`:** a requirement that cannot be observed is a requirement nothing tests, and the columns will drift the first time an ingest path is added that forgets one. The conformance obligation asserts the node half against both stores; the edge half has no assertion because it has no surface to assert through.
+
+**Proposal:** either add the edge read the FR implies, or state in the FR that an edge's envelope is reachable only through a future edge read. The first is small — the columns and the mapping already exist.
+
+## D-023 [doc-gap] "Falling back is never silent" was silent to everything except a human reading logs
+
+DESIGN's traversal section says the pattern backend's decline is "never silent — the reason is logged either way", and the implementation did exactly that: `warn!` on `PatternOutcome::Unavailable`.
+
+**A log line is not observable to a test.** Adapting the gear to PR #4639's anchor opt-in, the fix was removed to see what would fail, and **nothing did**: the pattern statement referenced a relation absent from its `FROM`, PostgreSQL refused it with `missing FROM-clause entry for table "node"`, every traversal was served by the two-query fallback, and the whole PG lane passed. `the_pattern_hop_walks_the_graph` walked the graph without the pattern; `both_hop_backends_return_the_same_answer` compared the fallback with itself and found perfect agreement.
+
+**Implementation:** `ExpandResponse::served_by`, a `HopBackend` of `Pattern` or `TwoQuery`. The two tests now assert which backend answered them.
+
+**Proposal:** DESIGN should say the backend is reported *on the answer*, not only logged. The general form is worth stating once: a fallback that returns the right answer is invisible unless the answer says which path produced it — a property this gear has now met twice, here and in D-004.
+
+**How it was checked:** **Verified by control experiment on a live PostgreSQL 19 stand.** With `correlate_with_anchor()` removed, exactly those two tests fail on exactly those assertions and the other 22 pass; restored, all 24 pass and the stand's own log records zero fallbacks across every traversal served over REST.
+
+## D-024 [doc-gap] The envelope's `key` repeats a node's `node_key`
+
+DESIGN's envelope table gives `key` as an envelope member on both element kinds — "echoes the producer's id" for a node, the derived hash for an edge — while the node base type declares `node_key` as producer-authored. A node read therefore carries the same string twice, once in the body and once in the envelope.
+
+**Kept, deliberately.** Dropping `node_key` from the body would break the round-trip the envelope contract asks for ("a document read from the API can be sent back unchanged"): ingest addresses a node by a top-level `node_key`. Dropping `key` from the envelope would make the envelope a different shape for nodes and for edges, which is the one property it is defined by.
+
+**Proposal:** none — but DESIGN should say the repetition is intended, because the alternative reading is that one of the two is a mistake.
 
 # Acceptance criteria: what the prototype actually establishes
 
