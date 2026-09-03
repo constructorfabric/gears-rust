@@ -7,7 +7,8 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureOnConflict, SecureUpdateExt,
+    secure_insert,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -106,6 +107,12 @@ impl MultipartRepo {
     /// against the declared MIME type. The `in_progress` → `aborted`
     /// transition passes `None` — an aborted upload's content was never
     /// validated.
+    ///
+    /// Also doubles as a row-locking primitive: [`Self::upsert_part`] calls
+    /// this with `expected_state == new_state == "in_progress"` purely to
+    /// take Postgres's implicit row lock on a matching `UPDATE` -- see that
+    /// method's doc comment for why a real (if value-preserving) `UPDATE` is
+    /// required there instead of a plain `SELECT`.
     pub async fn update_state<C: DBRunner>(
         &self,
         conn: &C,
@@ -138,8 +145,21 @@ impl MultipartRepo {
     /// one conditional UPDATE moving the session to `completing` from either
     /// `in_progress` (fresh acquire) or an **expired** `completing`
     /// (takeover after a crashed completer). Never blocks and never holds a
-    /// transaction across I/O; `false` = someone else holds a live lease or
-    /// the session is terminal.
+    /// transaction across I/O; `false` = someone else holds a live lease, the
+    /// session is terminal, or the session itself has expired (see below).
+    ///
+    /// Fenced by `expires_at > now` (P2 lease-fencing remediation): without
+    /// this, the CAS filter only looks at `state`/`lease_until`, so a session
+    /// whose `expires_at` has already passed but which the abandoned-session
+    /// sweep has not yet reaped can still win a fresh lease here. The
+    /// call site's own `session.expires_at <= now` guard
+    /// (`MultipartService::complete_multipart_upload`) is checked against an
+    /// **earlier-loaded snapshot** and is therefore only a fast, non-authoritative
+    /// rejection -- it cannot see a session that expired in the gap between
+    /// that snapshot read and this CAS. Folding the same condition into the
+    /// CAS's `WHERE` clause makes the database row itself, not a stale
+    /// in-memory copy, the source of truth: the lease can never be acquired
+    /// for a session that is expired *at the instant the UPDATE runs*.
     pub async fn acquire_complete_lease<C: DBRunner>(
         &self,
         conn: &C,
@@ -156,6 +176,7 @@ impl MultipartRepo {
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::ExpiresAt.gt(now))
                     .add(
                         sea_orm::Condition::any()
                             .add(UploadColumn::State.eq("in_progress"))
@@ -318,8 +339,48 @@ impl MultipartRepo {
         Ok(())
     }
 
-    /// Insert or replace a multipart upload part. If `part_number` already exists,
-    /// replace it (idempotent re-upload of a part).
+    /// Insert or update one multipart-upload part row, guarded by a
+    /// same-transaction check that the parent session is still
+    /// `in_progress`. Must be called with `conn` bound to the SAME
+    /// transaction as the caller's other work -- see
+    /// [`crate::infra::storage::store::Store::upsert_multipart_part`], the
+    /// only caller, for the two concrete corruption modes this closes
+    /// (a part accepted after `complete_multipart_upload` already snapshotted
+    /// the part list, and a part inserted after `abort_multipart_upload`'s
+    /// `delete_parts_for_upload` already ran -- becoming a permanent orphan,
+    /// since a `multipart_uploads` row is never deleted, only transitioned).
+    ///
+    /// # Why the guard is a dummy self-CAS, not a plain re-read
+    ///
+    /// The guard performs an `in_progress -> in_progress` self-transition
+    /// through [`Self::update_state`] rather than a plain `SELECT`. Postgres
+    /// takes a row-level lock on every row an `UPDATE` matches for the
+    /// duration of the transaction, even when the written value equals the
+    /// existing one -- so this single call both (a) checks, right now, that
+    /// the session is still `in_progress`, and (b) forces any concurrent CAS
+    /// against the SAME session row (`abort_multipart_upload`'s
+    /// `in_progress -> aborted`, `acquire_complete_lease`'s
+    /// `in_progress -> completing`) to block until this transaction commits
+    /// or rolls back, then re-evaluate its own `WHERE state = 'in_progress'`
+    /// against the now-current row.
+    ///
+    /// A plain unlocked `SELECT` re-read would NOT close the race this
+    /// exists to fix, even inside a transaction: under the default `READ
+    /// COMMITTED` isolation, two transactions can each read `in_progress`
+    /// before either commits, and then commit in either order -- so the part
+    /// row this method inserts could still land in the table AFTER a
+    /// concurrent abort's `delete_parts_for_upload` already ran and
+    /// committed, reintroducing the exact orphaned-row bug this change
+    /// exists to close. Only serializing on the shared row via a real
+    /// (dummy) `UPDATE` prevents that interleaving.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the part row was written. `false` if the guard lost --
+    /// the session is not currently `in_progress` (including "does not
+    /// exist", though in practice a session row is never deleted, only
+    /// transitioned, so this only ever means "not `in_progress`"); the part
+    /// row is then left untouched.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_part<C: DBRunner>(
         &self,
@@ -330,19 +391,35 @@ impl MultipartRepo {
         part_hash: Vec<u8>,
         size: i64,
         now: OffsetDateTime,
-    ) -> Result<(), DomainError> {
-        // Delete existing row with the same PK first (insert-or-replace semantics).
-        PartEntity::delete_many()
-            .filter(
-                sea_orm::Condition::all()
-                    .add(PartColumn::UploadId.eq(upload_id))
-                    .add(PartColumn::PartNumber.eq(part_number)),
-            )
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .exec(conn)
-            .await
-            .map_err(db_err)?;
+    ) -> Result<bool, DomainError> {
+        let locked = self
+            .update_state(conn, upload_id, "in_progress", "in_progress", None)
+            .await?;
+        if !locked {
+            return Ok(false);
+        }
+
+        // Single-statement `INSERT ... ON CONFLICT (upload_id, part_number)
+        // DO UPDATE`, replacing the previous DELETE-then-INSERT pair. Those
+        // two statements were not transactional with each other (this method
+        // used to run on a bare connection -- see the caller's doc comment),
+        // so a `complete_multipart_upload` racing between them could
+        // snapshot the part list in the instant the row was absent. A single
+        // upsert statement has no such instant: the row is either the old
+        // version or the new one, never neither. `SecureOnConflict` is used
+        // (rather than raw `sea_orm::sea_query::OnConflict`) purely for its
+        // tenant-immutability check -- moot here since this entity has no
+        // tenant column (`#[secure(no_tenant, ...)]` on the entity), but it
+        // is the project's standard on-conflict entry point regardless.
+        let on_conflict =
+            SecureOnConflict::<PartEntity>::columns([PartColumn::UploadId, PartColumn::PartNumber])
+                .update_columns([
+                    PartColumn::BackendEtag,
+                    PartColumn::PartHash,
+                    PartColumn::Size,
+                    PartColumn::UploadedAt,
+                ])
+                .map_err(db_err)?;
 
         let am = PartActiveModel {
             upload_id: Set(upload_id),
@@ -352,10 +429,15 @@ impl MultipartRepo {
             size: Set(size),
             uploaded_at: Set(now),
         };
-        secure_insert::<PartEntity>(am, &AccessScope::allow_all(), conn)
+        PartEntity::insert(am)
+            .secure()
+            .scope_unchecked(&AccessScope::allow_all())
+            .map_err(db_err)?
+            .on_conflict(on_conflict)
+            .exec(conn)
             .await
             .map_err(db_err)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete all `multipart_upload_parts` rows for `upload_id`. Returns the
@@ -451,13 +533,19 @@ impl MultipartRepo {
     /// deleting the parent `files` row in that window would `ON DELETE
     /// CASCADE` the still-`in_progress` session out from under the upload.
     ///
+    /// Existence via `LIMIT 1` + `one()` rather than `COUNT(*)`: this project
+    /// forbids `COUNT` queries for existence checks (a full/partial scan just
+    /// to throw the number away) -- `LIMIT 1` lets the planner stop at the
+    /// first matching row instead of counting every `in_progress` session for
+    /// the file.
+    ///
     /// @cpt-cf-file-storage-fr-orphan-reconciliation
     pub async fn has_in_progress_for_file<C: DBRunner>(
         &self,
         conn: &C,
         file_id: Uuid,
     ) -> Result<bool, DomainError> {
-        let count = UploadEntity::find()
+        let row = UploadEntity::find()
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::FileId.eq(file_id))
@@ -465,10 +553,11 @@ impl MultipartRepo {
             )
             .secure()
             .scope_with(&AccessScope::allow_all())
-            .count(conn)
+            .limit(1)
+            .one(conn)
             .await
             .map_err(db_err)?;
-        Ok(count > 0)
+        Ok(row.is_some())
     }
 }
 
