@@ -16,6 +16,7 @@
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
 #![allow(clippy::doc_markdown)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -94,18 +95,40 @@ impl PolicyService {
         scope_owner_id: Option<Uuid>,
         body: PolicyBody,
     ) -> Result<StoredPolicy, DomainError> {
-        // Tenant-scope requests (`scope_owner_id == None`) stay gated on plain
-        // `WRITE` — there is no "owner" to compare at tenant scope. Tightening
-        // tenant-scope writes to require `ADMIN_POLICY` as well is a follow-up
-        // the team may choose to make; not mandated here.
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
-        let scope = self
-            .authorize_scope_owner(ctx, actions::WRITE, scope_owner_id)
-            .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
+        // Tenant-scope requests (`scope_owner_id == None`) set a policy that
+        // applies to every subject in the tenant — allowed-mime-types, size
+        // limits, and metadata limits for the whole tenant, not just the
+        // caller. There is no "owner" to fall back to self-service for, so
+        // (unlike the `Some(owner)` branch below) this must never fall back
+        // to plain `WRITE`: an unprivileged tenant member holding ordinary
+        // file-`WRITE` could otherwise unilaterally tighten or loosen policy
+        // for the entire tenant. This used to fall back to `WRITE` via
+        // `authorize_scope_owner`'s `treat_missing_owner_as_authorized = true`
+        // — closed here by requiring `ADMIN_POLICY` outright, no fallback.
         // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-validate
+        // Shape validation runs BEFORE the authorization branch below, which
+        // keys off `scope_owner_id`: a `User`-scope request that omits its
+        // owner is a malformed body (`400`), not an administrative act, and
+        // must not be reported as `403` just because a missing owner is also
+        // how tenant scope is spelled. Validating first costs nothing --
+        // it inspects only the caller's own request, discloses no stored
+        // state, and mirrors `create_file`, which likewise validates its GTS
+        // type before authorizing.
         Self::validate_policy_body(&policy_scope, scope_owner_id, &body)?;
         // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-validate
+        // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
+        let scope = match scope_owner_id {
+            None => {
+                self.authorizer
+                    .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                    .await?
+            }
+            Some(owner) => {
+                self.authorize_admin_or_owner(ctx, actions::WRITE, Some(owner), false)
+                    .await?
+            }
+        };
+        // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
         // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-upsert
@@ -143,6 +166,22 @@ impl PolicyService {
             .authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
+        // Plain `READ` only clears reading the tenant policy and the
+        // caller's *own* user policy. `user_owner_id` is caller-supplied
+        // (from the request query), so without a further check any tenant
+        // member could pass an arbitrary victim's id here and have their
+        // user-level policy (allowed mime types, size/metadata limits)
+        // merged into the response — a policy-disclosure side channel.
+        // Require `ADMIN_POLICY` for any `user_owner_id` other than the
+        // caller's own subject id, mirroring the same cross-owner gate used
+        // elsewhere in this gear (`read_ops::list_files`, `set_policy` above).
+        if let Some(uid) = user_owner_id
+            && uid != ctx.subject_id()
+        {
+            self.authorizer
+                .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                .await?;
+        }
         // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-authz
         let tenant_id = ctx.subject_tenant_id();
 
@@ -183,10 +222,170 @@ impl PolicyService {
             .await?;
         // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-authz
         // @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-load
-        self.store
+        let rules = self
+            .store
             .list_retention_rules(&scope, ctx.subject_tenant_id())
-            .await
+            .await?;
         // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-load
+
+        // Plain `READ` above only clears "may list retention rules at all" —
+        // the store call itself has no owner/target filter and returns
+        // EVERY rule in the tenant, including `User`-scope rules that target
+        // another subject and `File`-scope rules that target another
+        // owner's file. Left unfiltered, any tenant member could enumerate
+        // every other member's retention configuration. Gate the extra
+        // visibility on `ADMIN_POLICY` — the same administrative escape
+        // hatch `set_policy`/`get_effective_policy` use above — and filter
+        // down to what a non-admin caller may actually see:
+        // - `Tenant`-scope rules are visible to everyone (nothing
+        //   owner-specific to hide);
+        // - `User`-scope rules only when `scope_target_id` is the caller's
+        //   own subject id;
+        // - `File`-scope rules are visible when their `scope_target_id`
+        //   resolves to a file this caller owns (see the per-rule handling
+        //   below for the two ways that resolution costs less than
+        //   dropping the whole scope, and for what still cannot be
+        //   expressed). A `File`-scope rule is reachable by any caller
+        //   holding per-file `WRITE` on their own file
+        //   (`authorize_retention_scope`'s `File` arm, and
+        //   `create_retention_rule` runs it before insert) and removable by
+        //   `rule_id` alone (`delete_retention_rule`) — dropping the scope
+        //   entirely from this listing, as the previous revision did, meant
+        //   a caller who created such a rule and then lost track of its
+        //   `rule_id` had no way left to find it again.
+        //
+        // Note this whole non-admin branch, `File`-scope or not, still costs
+        // one extra `ADMIN_POLICY` probe on every listing before it even
+        // knows the caller is not an admin — `Authorizer::authorize` gives
+        // no cheaper "is this subject an admin" query, so there is no way to
+        // skip straight to the non-admin path without first trying (and
+        // failing) the admin one.
+        match self
+            .authorizer
+            .authorize(ctx, actions::ADMIN_POLICY, "", None)
+            .await
+        {
+            Ok(_) => Ok(rules),
+            Err(DomainError::Forbidden) => {
+                let subject_id = ctx.subject_id();
+                // Same normalization `FileService::actor_kind` applies for
+                // audit rows: anything that is not explicitly an app subject
+                // is a user. Duplicated rather than shared because that helper
+                // is private to `FileService`.
+                let subject_kind = match ctx.subject_type() {
+                    Some("app") => "app",
+                    _ => "user",
+                };
+                let tenant_scope = Self::tenant_scope(ctx);
+                // `PolicyStore` (`domain/ports.rs`, this service's only
+                // store port) exposes just `require_file(scope, file_id)` —
+                // one id at a time, no batched-by-ids fetch — so a page of
+                // `File`-scope rules cannot be resolved in a single query
+                // the way an ideal fix would. `ports.rs` is out of scope
+                // for this change, so this dedupes by `file_id` instead of
+                // adding a batch port method: several rules commonly target
+                // the same file (e.g. an age rule and a metadata rule on
+                // one upload), and this cache ensures each distinct target
+                // is still only fetched once per listing rather than once
+                // per rule. Worst case (every rule targets a different
+                // file) this is still up to N extra round-trips for a page
+                // of N `File`-scope rules — strictly more than the single
+                // extra query a real batch fetch would cost, but paid only
+                // on this already-more-expensive non-admin branch, and only
+                // for the `File`-scope subset of the page.
+                let mut owner_by_file: HashMap<Uuid, Option<(String, Uuid)>> = HashMap::new();
+                let mut visible = Vec::with_capacity(rules.len());
+                for rule in rules {
+                    let keep = match rule.scope {
+                        RetentionScope::Tenant => true,
+                        RetentionScope::User => rule.scope_target_id == Some(subject_id),
+                        // A row without a target should not occur --
+                        // `validate_retention_rule` rejects it on write --
+                        // but the column is nullable, so the `None` case is
+                        // matched here rather than asserted away: it resolves
+                        // to nothing and is simply invisible.
+                        RetentionScope::File => {
+                            let Some(file_id) = rule.scope_target_id else {
+                                continue;
+                            };
+                            let owner = if let Some(cached) = owner_by_file.get(&file_id) {
+                                cached.clone()
+                            } else {
+                                // A `File`-scope rule can be created by
+                                // anyone holding per-file `WRITE`, not only
+                                // the file's owner (`authorize_retention_scope`'s
+                                // `File` arm checks `WRITE`, not ownership) —
+                                // so comparing `owner_id` here is an
+                                // under-approximation of "created by /
+                                // reachable by this caller". It is the same
+                                // approximation `create.rs`'s cross-owner
+                                // guards and `read_ops::list_files` already
+                                // make elsewhere in this gear (comparing
+                                // `owner_id` directly rather than re-running
+                                // a full per-file `WRITE` authorization
+                                // decision for every rule on the page, which
+                                // would turn this into up to N *authorizer*
+                                // round-trips on top of the N store fetches
+                                // above). A rule whose target file this
+                                // caller can `WRITE` but does not own stays
+                                // invisible here, same as before this fix —
+                                // no worse, just cheaper than the exact
+                                // check.
+                                //
+                                // `FileNotFound` means the target file has
+                                // since been deleted (no FK ties
+                                // `retention_rules.scope_target_id` to
+                                // `files.file_id`, see
+                                // `delete_retention_rule`'s comment on the
+                                // same migration). `StoredRetentionRule`
+                                // carries no creator/`subject_id` column, so
+                                // once the file is gone there is no stored
+                                // fact left to tell who may still see the
+                                // rule — unlike `delete_retention_rule`
+                                // (which only needs to know *that* the
+                                // target is gone to fall back to a coarser
+                                // check), this listing would need to know
+                                // *who created it*, which was never
+                                // recorded. Not expressible without a schema
+                                // change, so the rule is dropped for every
+                                // non-admin caller here, same as before this
+                                // fix; an admin can still reach it via the
+                                // `Ok` arm above, or remove it via
+                                // `delete_retention_rule`'s own
+                                // dangling-target fallback.
+                                let owner =
+                                    match self.store.require_file(&tenant_scope, file_id).await {
+                                        Ok(file) => Some((
+                                            file.owner_kind.as_str().to_owned(),
+                                            file.owner_id,
+                                        )),
+                                        Err(DomainError::FileNotFound { .. }) => None,
+                                        Err(err) => return Err(err),
+                                    };
+                                owner_by_file.insert(file_id, owner.clone());
+                                owner
+                            };
+                            // Compare the owner PAIR, not just the id: `user`
+                            // and `app` are disjoint owner spaces that can
+                            // legitimately carry the same UUID, so matching on
+                            // `owner_id` alone would show an app subject the
+                            // retention rules of a user's file with the same
+                            // id (and vice versa). Same reasoning as
+                            // `create.rs`'s cross-owner guard, which already
+                            // compares kind and id together.
+                            owner
+                                .as_ref()
+                                .is_some_and(|(kind, id)| *id == subject_id && kind == subject_kind)
+                        }
+                    };
+                    if keep {
+                        visible.push(rule);
+                    }
+                }
+                Ok(visible)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Create a new retention rule.
@@ -199,14 +398,24 @@ impl PolicyService {
         scope_target_id: Option<Uuid>,
         body: RetentionRuleBody,
     ) -> Result<StoredRetentionRule, DomainError> {
+        // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
+        // Shape/semantic validation runs BEFORE the authorization check
+        // below, exactly like `set_policy`'s reordering above (see its
+        // comment for the full rationale): otherwise the same malformed
+        // body (e.g. `scope: user` with no `scope_target_id`) answers `403`
+        // for a non-admin caller (denied before validation ever runs) and
+        // `400` for an admin caller (validation reached first) -- one
+        // malformed request, two different status codes depending on who
+        // sent it. Validating first costs nothing here either: it inspects
+        // only the caller's own `(retention_scope, scope_target_id, body)`
+        // request and discloses no stored state.
+        Self::validate_retention_rule(&retention_scope, scope_target_id, &body)?;
+        // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
         // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-authz
         let scope = self
             .authorize_retention_scope(ctx, &retention_scope, scope_target_id)
             .await?;
         // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-authz
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
-        Self::validate_retention_rule(&retention_scope, scope_target_id, &body)?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
         // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-insert
@@ -273,14 +482,30 @@ impl PolicyService {
             // would otherwise be permanently undeletable: every future call
             // re-resolves the (now-gone) target via `require_file` and 404s
             // before authorization is even attempted. Fall back to the same
-            // plain tenant-wide `WRITE` gate the `Tenant`-scope arm uses —
-            // there is no file left to check per-file `WRITE` against, so this
-            // is the closest equivalent, not a weaker one: the actual DELETE
-            // below still runs under the caller's own tenant scope, so a
-            // foreign-tenant caller's `delete_retention_rule` still matches
+            // plain tenant-wide `WRITE` gate — there is no file left to check
+            // per-file `WRITE` against, so this is the closest equivalent, not
+            // a weaker one: the actual
+            // DELETE below still runs under the caller's own tenant scope, so
+            // a foreign-tenant caller's `delete_retention_rule` still matches
             // zero rows and 404s (never `Forbidden`), staying consistent with
             // how the `Tenant`/`User` arms already behave for a foreign-tenant
-            // `rule_id`.
+            // `rule_id`. Deliberately NOT raised to `ADMIN_POLICY` alongside
+            // the `Tenant`-scope arm, for two reasons. First, the escalation
+            // that motivated tightening `Tenant` scope does not exist here: a
+            // `File`-scope rule whose target file is already gone governs
+            // nothing, so deleting it cannot reach anyone else's data — it is
+            // pure garbage collection, and requiring an admin would strand
+            // such rules permanently for the user who created them. Second,
+            // requiring `ADMIN_POLICY` here would answer `403` where a
+            // nonexistent `rule_id` answers `404`, handing a non-admin caller
+            // an existence oracle for dangling rules. Note this is a
+            // *within-tenant* oracle only: the rule row is fetched under
+            // `tenant_scope(ctx)` above, so another tenant's `rule_id` is
+            // already indistinguishable from a nonexistent one before this
+            // arm is reached (what
+            // `delete_retention_rule_foreign_tenant_gets_same_error_as_nonexistent_id`
+            // pins). The decisive argument is the first one: this is garbage
+            // collection of a rule that governs nothing.
             Err(DomainError::FileNotFound { .. }) if rule.scope == RetentionScope::File => {
                 self.authorizer
                     .authorize(ctx, actions::WRITE, "", None)
@@ -450,8 +675,10 @@ impl PolicyService {
     // ── authorization helpers ────────────────────────────────────────────────
 
     /// Shared "try `ADMIN_POLICY` first, else require owner == subject" gate
-    /// used by both [`Self::authorize_scope_owner`] (policy read/write) and
-    /// the `RetentionScope::User` arm of [`Self::authorize_retention_scope`].
+    /// used by [`Self::authorize_scope_owner`] (own-policy *read*, own-scope
+    /// policy *write* for `Some(owner)`), `set_policy`'s `Some(owner)` write
+    /// branch directly, and the `RetentionScope::User` arm of
+    /// [`Self::authorize_retention_scope`].
     ///
     /// Tries `ADMIN_POLICY` first (cross-owner / tenant-wide administration);
     /// on `Forbidden`, falls back to `fallback_action` (`READ`/`WRITE`) and
@@ -459,9 +686,12 @@ impl PolicyService {
     /// own subject id.
     ///
     /// `required_owner_id == None` is ambiguous between the two callers:
-    /// - the policy endpoints use `None` for "tenant scope", which has no
-    ///   owner to compare, so the fallback should succeed on
-    ///   `fallback_action` alone;
+    /// - `get_own_policy`'s tenant-scope *read* uses `None` for "tenant
+    ///   scope", which has no owner to compare, so the fallback should
+    ///   succeed on `fallback_action` (`READ`) alone — reading the tenant
+    ///   policy is not the sensitive operation, *setting* it is (see
+    ///   `set_policy`, which no longer routes its tenant-scope branch through
+    ///   here at all — it requires `ADMIN_POLICY` outright, no fallback);
     /// - a `User`-scope retention rule always has a target user, so a missing
     ///   target must be treated as a mismatch, not as "no check".
     ///
@@ -500,9 +730,17 @@ impl PolicyService {
     /// Try `ADMIN_POLICY` first (cross-owner / tenant-wide administration); on
     /// `Forbidden`, fall back to `fallback_action` (`READ`/`WRITE`) and require
     /// `scope_owner_id` — when present — to match the caller's own subject id.
-    /// `scope_owner_id == None` means "tenant scope" for the policy endpoints,
-    /// which has no owner to compare, so the fallback succeeds on
-    /// `fallback_action` alone in that case.
+    ///
+    /// Only [`Self::get_own_policy`] calls this now, always with
+    /// `fallback_action = READ`; `scope_owner_id == None` there means "tenant
+    /// scope", which has no owner to compare, so the fallback succeeds on
+    /// plain `READ` alone — reading the tenant policy is not the sensitive
+    /// operation. `set_policy` used to share this helper for its *write* path
+    /// too, which let the same `None`-owner fallback authorize a tenant-wide
+    /// policy *write* under plain `WRITE`; it now requires `ADMIN_POLICY`
+    /// directly for `scope_owner_id == None` instead of calling this helper,
+    /// and calls [`Self::authorize_admin_or_owner`] directly (not through
+    /// here) for `Some(owner)`.
     async fn authorize_scope_owner(
         &self,
         ctx: &SecurityContext,
@@ -516,7 +754,10 @@ impl PolicyService {
     /// Authorize a retention-rule mutation (create or delete) for the given
     /// `(retention_scope, scope_target_id)` pair.
     ///
-    /// - `Tenant`: stays `WRITE`-gated — there is no owner to compare.
+    /// - `Tenant`: requires `ADMIN_POLICY`, with no fallback. A tenant-scope
+    ///   retention rule is a standing instruction for the sweep to delete
+    ///   every matching file in the tenant, so it must not be reachable
+    ///   with the ordinary file `WRITE` grant every uploader holds.
     /// - `User`: requires `scope_target_id == Some(ctx.subject_id())` unless
     ///   the caller holds `ADMIN_POLICY` (unlike [`Self::authorize_scope_owner`],
     ///   a missing target is treated as a mismatch, not as "no check" — a
@@ -539,8 +780,18 @@ impl PolicyService {
     ) -> Result<AccessScope, DomainError> {
         match retention_scope {
             RetentionScope::Tenant => {
+                // A `Tenant`-scope retention rule is a standing instruction
+                // for the background sweep to permanently delete every file
+                // in the tenant older than N days (or idle/matching some
+                // metadata) — with no owner filter, this reaches every other
+                // subject's files. Gating it on plain file-`WRITE` (the same
+                // grant an ordinary user has for uploading their own files)
+                // let any tenant member schedule irreversible, tenant-wide
+                // data loss. Require `ADMIN_POLICY` outright, with no
+                // fallback to `WRITE` — unlike the `User`/`File` arms below,
+                // there is no owner to fall back to self-service for.
                 self.authorizer
-                    .authorize(ctx, actions::WRITE, "", None)
+                    .authorize(ctx, actions::ADMIN_POLICY, "", None)
                     .await
             }
             RetentionScope::User => {

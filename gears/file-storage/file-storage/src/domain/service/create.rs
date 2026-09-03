@@ -152,6 +152,47 @@ impl FileService {
             .authorize(ctx, actions::WRITE, &new.gts_file_type, None)
             .await?;
 
+        // `owner_id`/`owner_kind` are caller-supplied (from the request body,
+        // via `new`) and drive which owner's effective policy is resolved
+        // (allowed mime types, size limits, metadata limits) and whose quota
+        // is debited, both further down -- and, via `owner_id`, whose
+        // listing later surfaces this file (effective policy and listing
+        // both key off `owner_id` alone, see `get_effective_policy_internal`
+        // above and `read_ops::list_files`). Without this check, a subject
+        // holding only ordinary file `WRITE` could create a file under an
+        // arbitrary `owner_id`, evaluate it against *that* owner's (possibly
+        // laxer) policy instead of their own, and charge the bytes to a
+        // victim's quota instead of their own.
+        //
+        // Checking `owner_id` alone is not enough: `owner_kind` picks
+        // between two *disjoint* owner spaces (`OwnerKind::User` /
+        // `OwnerKind::App`, see `file_storage_sdk::OwnerKind`), so a caller
+        // whose own subject id happens to equal some app's id could pass
+        // `owner_id: <self>, owner_kind: app` and have the `owner_id ==
+        // ctx.subject_id()` comparison alone pass while actually authoring
+        // the file into the *app* owner space -- a different effective
+        // policy and a different owner's listing/quota than the caller's
+        // own `user`-space identity. `Self::actor_kind(ctx)` (already used by
+        // the audit-trail helpers in `service/mod.rs`) derives the caller's
+        // own kind from `SecurityContext::subject_type()` the same way, so
+        // comparing it against the request's `owner_kind` closes this
+        // without inventing a new classification. The self-service fast path
+        // (no `ADMIN_POLICY` needed) now requires the *pair* to match, not
+        // just `owner_id`. Mirrors the symmetric read-side guard
+        // `read_ops::list_files` already applies to a caller-supplied
+        // `owner.owner_id` (require `ADMIN_POLICY` for any owner other than
+        // the caller) — that guard still only compares `owner_id`, leaving
+        // the same `owner_kind`-substitution gap open on the read side (not
+        // fixed here: `read_ops.rs` is outside this change's scope) —
+        // closing it here on the *creation* path is still worthwhile on its
+        // own, since creation is what lets a caller pick which owner space a
+        // new file's policy/quota is evaluated against in the first place.
+        if owner_id != ctx.subject_id() || owner_kind_str != Self::actor_kind(ctx) {
+            self.authorizer
+                .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                .await?;
+        }
+
         // @cpt-cf-file-storage-fr-upload-idempotency
         // Now that the caller is authorized, consult the idempotency store.
         // The stored record is bound to the subject that created it
@@ -418,6 +459,20 @@ impl FileService {
             .authorizer
             .authorize(ctx, actions::WRITE, &new.gts_file_type, None)
             .await?;
+
+        // Same cross-owner guard as `create_file` above (see its comment for
+        // the full rationale, including why `owner_id` alone is not enough
+        // and `owner_kind` must match too): `owner_id`/`owner_kind` are
+        // caller-supplied and drive both policy resolution and quota
+        // debiting below, so creating under a foreign owner -- including the
+        // same `owner_id` under the *other* `owner_kind`'s disjoint owner
+        // space -- requires `ADMIN_POLICY`, symmetric with the cross-owner
+        // guard `read_ops::list_files` applies on the read side.
+        if owner_id != ctx.subject_id() || new.owner_kind.as_str() != Self::actor_kind(ctx) {
+            self.authorizer
+                .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                .await?;
+        }
 
         // Same policy + quota gates as `create_file`.
         let policy = self
