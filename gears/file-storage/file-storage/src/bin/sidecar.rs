@@ -30,6 +30,29 @@
 //!     control plane's configured secret once it flips
 //!     `require_finalize_internal_secret` on (see the migration-path note in
 //!     `docs/ADR/0003-…-sidecar-data-plane.md`).
+//!   - `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- caps how many
+//!     `upload_multipart_part` requests against a `multipart_native` backend
+//!     (e.g. `S3Backend`) this sidecar processes at once (default `2`; must
+//!     be at least `1` -- `0` fails sidecar startup rather than silently
+//!     rejecting every part upload). Each such request buffers up to one
+//!     whole part (`write_multipart_part_native`, bounded by `MAX_PART_SIZE`,
+//!     currently 5 GiB, the same as `DEFAULT_MAX_BODY_BYTES`) in memory
+//!     before writing it -- a deliberate tradeoff documented at that
+//!     function's call site, since S3's `UploadPart` needs the whole part up
+//!     front to sign and send. Without a cap on concurrent in-flight part
+//!     uploads, N simultaneous large parts from ordinary authorized traffic
+//!     (not an attack) can OOM the sidecar process; this bounds worst-case
+//!     buffered memory from this path to exactly `N * MAX_PART_SIZE` --
+//!     `2 * 5 GiB = 10 GiB` at the default -- so raising it is a direct,
+//!     linear tradeoff against the sidecar's available memory, not a knob to
+//!     turn without doing that arithmetic first. The non-native
+//!     (offset-object, e.g. `LocalFsBackend`) write path streams each part
+//!     straight to the backend without buffering it whole and is therefore
+//!     NOT gated by this limiter at all -- see `write_multipart_part`'s doc
+//!     comment. A request that cannot acquire a slot within
+//!     `PART_UPLOAD_ACQUIRE_TIMEOUT` (200ms) gets `503` with `Retry-After`
+//!     rather than queuing indefinitely -- see `upload_multipart_part`'s doc
+//!     comment.
 //!   - `FS_SIDECAR_S3_BACKENDS` — P2 1.7.3 config wiring: an optional JSON array of
 //!     `file_storage::config::S3BackendConfig` entries, e.g. a single entry
 //!     `{"id":"s3-primary","endpoint":"http://127.0.0.1:9000","region":"us-east-1",
@@ -130,6 +153,18 @@ struct SidecarState {
     /// module note on `FileStorageMetricsMeter` re: exporter wiring being out
     /// of scope here).
     metrics: Arc<dyn FileStorageMetricsPort>,
+    /// Concurrency limiter for `upload_multipart_part` requests that take the
+    /// `multipart_native` write path, sized by
+    /// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`. Lives on `SidecarState`
+    /// rather than as a process-wide `static` so that (a) `main()`'s
+    /// fail-fast-parsed configured value is never silently shadowed by a
+    /// lazily-initialized default racing ahead of it, and (b) two
+    /// independently configured `SidecarState`s (e.g. two routers under test,
+    /// or a future multi-listener deployment) can each carry their own limit
+    /// instead of sharing one process-global choke point. See
+    /// [`acquire_part_upload_slot`] for how a request acquires a permit from
+    /// this field.
+    part_upload_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +178,27 @@ struct TokenQuery {
 /// per-request by the signed token's `claims.upload.max_size`/`exact_size`;
 /// this constant only bounds axum's blanket request-body floor (2 MiB default).
 const DEFAULT_MAX_BODY_BYTES: usize = 5_368_709_120;
+
+/// Default value for `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`.
+///
+/// Worst-case buffered memory from this limiter's guarded path
+/// (`write_multipart_part_native`, the only one it gates -- see
+/// `write_multipart_part`'s doc comment) is exactly
+/// `max_concurrent_part_uploads * MAX_PART_SIZE`. `MAX_PART_SIZE` is
+/// currently 5 GiB (`domain::multipart::MAX_PART_SIZE`), so at this default
+/// of `2` the sidecar can buffer up to `2 * 5 GiB = 10 GiB` at once purely
+/// from this path. The previous default of `4` (`4 * 5 GiB = 20 GiB`) made
+/// the "cap" a poor description of what it actually bounded; `2` still lets
+/// two large native-multipart parts land in parallel -- plenty of
+/// concurrency for a single sidecar instance under typical multipart upload
+/// fan-out (control-plane-level parallelism across sidecar replicas is
+/// unaffected by this per-process cap) -- while halving the worst case an
+/// operator has to provision memory against. Raising this value is a direct,
+/// linear tradeoff against available memory: an operator overriding it via
+/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` should redo this multiplication
+/// against their own deployment's memory budget, not just pick a bigger
+/// number for more throughput.
+const DEFAULT_MAX_CONCURRENT_PART_UPLOADS: usize = 2;
 
 /// Parse an optional environment variable's raw value (already fetched by
 /// the caller, so this half is a pure function and unit-testable without
@@ -215,6 +271,26 @@ async fn main() -> anyhow::Result<()> {
     let finalize_timeout_secs: u64 = parse_env_or_default("FS_SIDECAR_FINALIZE_TIMEOUT_SECS", 10)?;
     let finalize_connect_timeout_secs: u64 =
         parse_env_or_default("FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS", 5)?;
+
+    // `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- see the module
+    // doc comment and `DEFAULT_MAX_CONCURRENT_PART_UPLOADS` for the
+    // memory-DoS rationale and the worst-case-memory arithmetic. `0` is
+    // rejected explicitly below: `Semaphore::new(0)` would not panic, but it
+    // would silently turn every `multipart_native` part-upload request into
+    // an unconditional `503` -- a configuration mistake, not a legitimate
+    // "disable part uploads" knob, so it must fail sidecar startup instead of
+    // failing quietly at request time.
+    let max_concurrent_part_uploads: usize = parse_env_or_default(
+        "FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS",
+        DEFAULT_MAX_CONCURRENT_PART_UPLOADS,
+    )?;
+    if max_concurrent_part_uploads == 0 {
+        return Err(anyhow::anyhow!(
+            "FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS=0 would reject every multipart part \
+             upload with 503; unset it to use the default of \
+             {DEFAULT_MAX_CONCURRENT_PART_UPLOADS} or set it to a value >= 1"
+        ));
+    }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(finalize_timeout_secs))
         .connect_timeout(Duration::from_secs(finalize_connect_timeout_secs))
@@ -289,6 +365,10 @@ async fn main() -> anyhow::Result<()> {
         internal_token,
         http,
         metrics,
+        // The part-upload concurrency limiter lives on `SidecarState`
+        // itself (see that field's doc comment for why), built here from the
+        // fail-fast-parsed `max_concurrent_part_uploads` above.
+        part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_part_uploads)),
     };
 
     let app = build_router(state, max_body_bytes);
@@ -313,9 +393,14 @@ fn build_router(state: SidecarState, max_body_bytes: usize) -> Router {
             "/api/file-storage-data/v1/upload/{file_id}/{version_id}",
             put(upload),
         )
+        // `.head(download_head)` overrides axum's default GET-derived HEAD
+        // handling: without it, a HEAD request would run the full
+        // `download` handler — including streaming the entire object off the
+        // backend — only to discard the body afterwards. See
+        // `download_head`'s doc comment.
         .route(
             "/api/file-storage-data/v1/download/{file_id}/{version_id}",
-            get(download),
+            get(download).head(download_head),
         )
         // Server-authoritative multipart part upload (multipart-coordinator feature).
         // The control plane mints a `multipart_part` token for each part; the
@@ -518,12 +603,24 @@ async fn upload(
         .exact_size
         .is_some_and(|exact| bytes_written != exact)
     {
-        return (StatusCode::BAD_REQUEST, "size does not match exact_size").into_response();
+        return reject_upload_bad_content(
+            backend.as_ref(),
+            &claims,
+            created,
+            "size does not match exact_size",
+        )
+        .await;
     }
     if let Some(expected) = &claims.upload.expected_hash {
         let got = format!("{}:{}", hash::ALGORITHM, hex::encode(digest));
         if !expected.eq_ignore_ascii_case(&got) {
-            return (StatusCode::BAD_REQUEST, "content hash mismatch").into_response();
+            return reject_upload_bad_content(
+                backend.as_ref(),
+                &claims,
+                created,
+                "content hash mismatch",
+            )
+            .await;
         }
     }
 
@@ -613,6 +710,54 @@ async fn upload(
         Err(resp) => resp,
         Ok(echo) => uploaded_response(&echo),
     }
+}
+
+/// Reject an upload whose streamed bytes failed the post-publish
+/// `exact_size`/`expected_hash` check (immutable-path-poisoning fix)
+/// with `400 Bad Request`, first cleaning up the object `publish_exclusive`
+/// just wrote **iff this request is the one that created it**
+/// (`created == true`).
+///
+/// # Why the `created` gate matters
+/// `publish_exclusive` runs *before* these constraints can be checked (the
+/// streamed length/hash are only final once the whole body has been read —
+/// see `upload`'s own doc comment), so a validation failure here can mean one
+/// of two very different things:
+/// * `created == true`: this call's own bytes just landed at
+///   `claims.backend_path` and immediately failed validation. Left in place,
+///   that object would permanently poison the version's immutable path —
+///   `publish_exclusive` never overwrites an existing object (the whole
+///   point of the replay-`PUT` fix), so a corrected retry with the *right*
+///   bytes would itself get `created: false` and be rejected as a conflict,
+///   with no way to ever land the correct content short of the orphan-sweep
+///   reclaiming the path (an hour, by default). Deleting it here —
+///   best-effort, `tracing::warn!` on failure rather than failing the
+///   response — lets an immediate corrected retry succeed instead of waiting
+///   out that reclaim window.
+/// * `created == false`: some *other* request (an earlier successful PUT, or
+///   a concurrent one that landed first) already owns whatever object
+///   currently lives at that path. This request's own bytes were never
+///   written anywhere — `publish_exclusive` measured them in memory/on a temp
+///   file and then discarded them without touching the destination — so there
+///   is nothing of *this* request's to clean up, and deleting the live object
+///   would destroy content this request has no claim to (and no evidence is
+///   even wrong: the mismatch is between *this* replay's bytes and the
+///   claims, not necessarily between the stored object and the claims).
+async fn reject_upload_bad_content(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    created: bool,
+    reason: &'static str,
+) -> Response {
+    if created && let Err(e) = backend.delete(&claims.backend_path).await {
+        tracing::warn!(
+            error = %e,
+            backend_path = %claims.backend_path,
+            "failed to clean up freshly-published object after post-validation failure; \
+             path will stay poisoned until orphan reconciliation reclaims it"
+        );
+    }
+    (StatusCode::BAD_REQUEST, reason).into_response()
 }
 
 /// Build the sidecar's `200 uploaded` response, echoing the control plane's
@@ -960,14 +1105,31 @@ async fn report_part_with_control_plane(
 /// `testing/e2e/suites/file_storage/lifecycle_s3/`, which is what surfaced
 /// this bug: `CompleteMultipartUpload` 500s against a real S3-compatible
 /// endpoint because none of its parts were ever uploaded).
+///
+/// `semaphore` (`SidecarState::part_upload_semaphore`) is only ever
+/// acquired around the `multipart_native` branch. Only that branch buffers a
+/// whole part in memory (`write_multipart_part_native`'s own doc comment);
+/// the offset-object branch streams straight to the backend via
+/// `put_stream`, so gating it behind the same limiter would throttle a path
+/// that never needed the protection in the first place, wasting concurrency
+/// this sidecar could otherwise offer to `LocalFsBackend`-style traffic.
 async fn write_multipart_part(
     backend: &dyn StorageBackend,
     claims: &Claims,
     part_number: u32,
     body: Body,
+    semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Result<(u64, String, String), Response> {
     if backend.capabilities().multipart_native {
-        write_multipart_part_native(backend, claims, part_number, body).await
+        // The permit is held only for the duration of the buffering write
+        // below -- see `acquire_part_upload_slot`'s call site in
+        // `upload_multipart_part` for why it used to be acquired earlier
+        // (before this fix) and why releasing it right after the write, not
+        // after the report-part callback, is correct either way.
+        let permit = acquire_part_upload_slot(semaphore).await?;
+        let result = write_multipart_part_native(backend, claims, part_number, body).await;
+        drop(permit);
+        result
     } else {
         write_multipart_part_offset_object(backend, claims, part_number, body).await
     }
@@ -1105,18 +1267,99 @@ async fn write_multipart_part_offset_object(
     Ok((body_len, part_etag.clone(), part_etag))
 }
 
+/// How long `upload_multipart_part` will wait for a concurrency-limit permit
+/// once the semaphore is observed exhausted, before giving up and
+/// answering `503`/`Retry-After` instead. Short by design: this is meant to
+/// smooth over a slot freeing up moments later (a part write finishing), not
+/// to let requests queue behind a sustained overload — a sidecar at its
+/// concurrency ceiling should shed load quickly so clients back off and
+/// retry, rather than accumulating held-open connections.
+const PART_UPLOAD_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Build the `503 Service Unavailable` response `upload_multipart_part`
+/// returns when it cannot acquire a concurrency-limit permit within
+/// `PART_UPLOAD_ACQUIRE_TIMEOUT`. `Retry-After: 1` is a deliberately
+/// short, fixed hint — a part write is typically fast, so a slot is likely to
+/// free up well within a second — not a promise, just a cheap nudge for a
+/// well-behaved retrying client.
+fn part_upload_busy_response() -> Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "sidecar is at its concurrent-part-upload limit, retry shortly",
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    resp
+}
+
+/// Acquire one part-upload slot from `semaphore`
+/// ([`SidecarState::part_upload_semaphore`]), or hand back the response to
+/// return.
+///
+/// Split out of [`upload_multipart_part`] so that handler stays under the
+/// crate's cognitive-complexity ceiling; the policy itself is described at
+/// the call site. `Err` carries a ready-made response -- `503` +
+/// `Retry-After` when the sidecar is simply busy, `500` for the
+/// never-closed-in-practice closed-semaphore case.
+async fn acquire_part_upload_slot(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    match Arc::clone(semaphore).try_acquire_owned() {
+        Ok(permit) => return Ok(permit),
+        Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            tracing::error!("part-upload semaphore unexpectedly closed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
+        }
+    }
+
+    match tokio::time::timeout(
+        PART_UPLOAD_ACQUIRE_TIMEOUT,
+        Arc::clone(semaphore).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        // The semaphore is never `close()`d anywhere in this process, so this
+        // is unreachable in practice; treated as a hard failure rather than
+        // silently proceeding unbounded.
+        Ok(Err(_)) => {
+            tracing::error!("part-upload semaphore unexpectedly closed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+        }
+        Err(_) => Err(part_upload_busy_response()),
+    }
+}
+
 /// `PUT` multipart part: verify `op=multipart_part` token, stream the part
 /// straight to the backend, enforce the exact `size` claim, compute and
 /// return the part hash.
 ///
-/// P2 1.2b (memory-DoS fix): the part body is never buffered whole here —
+/// Concurrency limit: [`write_multipart_part`] acquires a
+/// permit from `state.part_upload_semaphore` (sized by
+/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) around its `multipart_native`
+/// branch only, held until that write completes. See
+/// [`acquire_part_upload_slot`]'s own inline comment for the
+/// try-then-bounded-wait contract, and [`part_upload_busy_response`] for the
+/// `503` a caller gets when no slot is available in time.
+///
+/// P2 1.2b (memory-DoS fix): on the offset-object path the part body is
+/// never buffered whole here —
 /// like `upload`, it streams through `StorageBackend::put_stream`, which
 /// enforces the token's declared `size` as an upper bound (`max_size`) while
 /// bytes arrive, aborting mid-stream on an oversized part instead of
 /// buffering it first. An *undersized* part can only be detected once the
 /// stream is fully drained, so the exact-length check (FEATURE §4, point 2)
 /// now runs after the write completes, comparing against the streamed
-/// `bytes_written`.
+/// `bytes_written`. The *native* multipart path is the exception and is
+/// deliberately different: S3's `UploadPart` needs the part's full length up
+/// front, so `write_multipart_part_native` does buffer one whole part in
+/// memory (see its own doc comment). That is what the permit
+/// [`write_multipart_part`] acquires bounds -- it caps how many such buffers
+/// can exist at once, since the per-part size ceiling alone does not; the
+/// offset-object branch never buffers a whole part and so never needs a
+/// permit at all.
 ///
 /// This is the sidecar half of the server-authoritative multipart model. The
 /// control plane mints the token (sole minter, ADR-0004); the sidecar only
@@ -1188,14 +1431,32 @@ async fn upload_multipart_part(
         }
     };
 
-    // Write the part — see `write_multipart_part`'s doc comment for the two
-    // models this dispatches between, and why the branch exists at all (P2
-    // 1.7 Stage 6 fix).
-    let (body_len, backend_etag, hash_hex) =
-        match write_multipart_part(backend.as_ref(), &claims, part_number, body).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    // Write the part -- see `write_multipart_part`'s doc comment for the two
+    // models this dispatches between, why the branch exists at all (P2 1.7
+    // Stage 6 fix), and the concurrency-limit permit it acquires around only
+    // the `multipart_native` branch: `try_acquire_owned` is
+    // checked first so a request never even starts waiting once the
+    // semaphore is provably exhausted; `PART_UPLOAD_ACQUIRE_TIMEOUT` then
+    // bounds how long a request that arrives just as capacity frees up will
+    // wait for a slot, rather than letting client connections pile up
+    // indefinitely behind a busy sidecar. Either way, a request that can't
+    // get a slot promptly gets `503`/`Retry-After` -- cheap for the client to
+    // retry -- instead of buffering that part's body. The permit is released
+    // as soon as the write completes, before the report-part callback below
+    // (pure network I/O with no bearing on the memory this semaphore
+    // guards).
+    let (body_len, backend_etag, hash_hex) = match write_multipart_part(
+        backend.as_ref(),
+        &claims,
+        part_number,
+        body,
+        &state.part_upload_semaphore,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     // P2 1.8 remediation: ingress bytes for this part.
     #[allow(clippy::cast_precision_loss)]
@@ -1333,20 +1594,24 @@ async fn download(
 
     let path = &claims.backend_path;
 
-    // Resolve existence first, distinctly from any later I/O failure: a
-    // missing blob must be `404`, never folded into `416` (bad range) or
-    // `500` (genuine backend fault). `exists` already distinguishes a real
-    // `NotFound` from other I/O errors per backend (see
-    // `StorageBackend::exists`'s contract), so anything failing after this
-    // point is a genuine backend error, not a missing blob.
-    match backend.exists(path).await {
-        Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    // Resolve existence and size together via `stat`, distinctly from
+    // any later I/O failure -- a missing blob must be `404`, never folded
+    // into `416` (bad range) or `500` (genuine backend fault). `stat`
+    // already distinguishes a real "not found" from other I/O errors per
+    // backend (see `StorageBackend::stat`'s contract), so anything failing
+    // after this point is a genuine backend error, not a missing blob. This
+    // used to be two backend round-trips (`exists` here, then a separate
+    // `size` call inside whichever of `download_range`/`download_whole` ran
+    // next -- two `HeadObject`s against `S3Backend`); `total` is now resolved
+    // once here and threaded through to both.
+    let total = match backend.stat(path).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "backend existence check failed");
+            tracing::error!(error = %e, "backend stat failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
         }
-    }
+    };
 
     // Range support (random read access) — a single signed URL serves many ranges.
     let range = headers
@@ -1355,28 +1620,109 @@ async fn download(
         .and_then(range::parse);
 
     match range {
-        Some(r) => download_range(&state, &backend, path, r, &claims).await,
-        None => download_whole(&state, &backend, path, &claims).await,
+        Some(r) => download_range(&state, &backend, path, total, r, &claims).await,
+        None => download_whole(&state, &backend, path, total, &claims).await,
     }
 }
 
-/// Serve a `Range`-qualified `GET` once the blob's existence has already been
-/// confirmed by the caller (`download`). Split out of `download` to keep its
-/// cognitive complexity down.
+/// `HEAD` download: same token verification and `404` contract as
+/// `download`, but never reads any content -- only `StorageBackend::stat` is
+/// called (one metadata-only round-trip on every backend: a single `stat(2)`
+/// on `local-fs`, a single `HeadObject` on `S3Backend`), and the body is
+/// always empty.
+///
+/// Registered explicitly via `.head(download_head)` in `build_router`
+/// because axum's `get(download)` would otherwise silently answer `HEAD`
+/// itself by running the *entire* `download` handler — including streaming
+/// the whole object off the backend — and only discarding the body
+/// afterwards. Media players and `curl -I` both send `HEAD` routinely (a
+/// player probing metadata/`Accept-Ranges` before deciding how to fetch a
+/// video), so without this override every such probe against a large object
+/// paid the full cost of a real download for a response that was always
+/// going to throw the body away.
+///
+/// Returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as
+/// `download`'s `200`, plus `Content-Length` (which a real `200`/`206`
+/// response gets for free from its body's known size — `HEAD` has no body to
+/// derive it from, so it is set explicitly here from `backend.stat`).
+async fn download_head(
+    State(state): State<SidecarState>,
+    Path((file_id, version_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = extract_token(&q, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing fs-token").into_response();
+    };
+    let claims = match state.verifier.verify(&token, OffsetDateTime::now_utc()) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    };
+    if claims.op != Op::Get || claims.file_id != file_id || claims.version_id != version_id {
+        return (
+            StatusCode::FORBIDDEN,
+            "token does not authorize this operation",
+        )
+            .into_response();
+    }
+
+    let backend = match state.backends.get(&claims.backend_id) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown backend '{}': {e}", claims.backend_id),
+            )
+                .into_response();
+        }
+    };
+
+    let path = &claims.backend_path;
+
+    // Same existence-and-size contract as `download`, in one combined
+    // round-trip instead of the previous `exists` + `size` pair.
+    let total = match backend.stat(path).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "backend stat failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
+        }
+    };
+
+    let mut resp = (StatusCode::OK, ()).into_response();
+    let headers_mut = resp.headers_mut();
+    headers_mut.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers_mut.insert(header::CONTENT_TYPE, content_type_header(&claims));
+    if let Some(v) = etag_header(&claims) {
+        headers_mut.insert(header::ETAG, v);
+    }
+    headers_mut.insert(header::CONTENT_LENGTH, header_value(&total.to_string()));
+    resp
+}
+
+/// Serve a `Range`-qualified `GET` once the blob's existence and size have
+/// already been resolved by the caller (`download`'s single `stat` call,
+/// -- `total` is that call's result, not a fresh backend round-trip).
+/// Split out of `download` to keep its cognitive complexity down.
+///
+/// The response body is streamed from `StorageBackend::get_range_stream`
+/// (`axum::body::Body::from_stream`) instead of materializing the resolved
+/// range into a `Bytes` buffer first (the old `get_range`-based path
+/// allocated a `len`-sized buffer up front). This matters even for a
+/// "partial" request: `Range: bytes=0-` (`ByteRange::OpenEnded { start: 0 }`)
+/// resolves to a range spanning the *entire* object — it is the very first
+/// request many media players issue — so the unbounded case was never a rare
+/// edge, as `testing/e2e/gears/file_storage/web_ui/`'s scrubbable video demo
+/// demonstrates against a real backend.
 async fn download_range(
     state: &SidecarState,
     backend: &Arc<dyn StorageBackend>,
     path: &str,
+    total: u64,
     r: file_storage_sdk::ByteRange,
     claims: &Claims,
 ) -> Response {
-    let total = match backend.size(path).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!(error = %e, "backend size lookup failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
-        }
-    };
     let Some((start, end)) = r.resolve(total) else {
         // Genuine range-unsatisfiable (RFC 9110 §14.4): the client asked for
         // bytes past the end of a blob that does exist.
@@ -1391,17 +1737,39 @@ async fn download_range(
         headers_mut.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         return resp;
     };
-    match backend.get_range(path, r).await {
-        Ok(bytes) => {
-            // P2 1.8 remediation: egress bytes for this range read.
-            #[allow(clippy::cast_precision_loss)]
-            state.metrics.record_egress_bytes(bytes.len() as f64);
-            let mut resp = (StatusCode::PARTIAL_CONTENT, bytes).into_response();
+    match backend.get_range_stream(path, r).await {
+        Ok(stream) => {
+            // P2 1.8 remediation, now counted per chunk rather than as one
+            // lump `bytes.len()` up front (the old buffered path's shape):
+            // the stream is not fully materialized before any of it reaches
+            // the client, so egress must be attributed as each chunk
+            // actually leaves the process — otherwise a connection that
+            // drops mid-transfer would over-report bytes that were never
+            // actually sent.
+            let metrics = Arc::clone(&state.metrics);
+            let body_stream = stream.map(move |chunk| {
+                if let Ok(bytes) = &chunk {
+                    #[allow(clippy::cast_precision_loss)]
+                    metrics.record_egress_bytes(bytes.len() as f64);
+                }
+                chunk
+            });
+
+            let mut resp =
+                (StatusCode::PARTIAL_CONTENT, Body::from_stream(body_stream)).into_response();
             let headers_mut = resp.headers_mut();
             headers_mut.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             headers_mut.insert(
                 header::CONTENT_RANGE,
                 header_value(&format!("bytes {start}-{end}/{total}")),
+            );
+            // A fixed-size `Bytes` body (the old shape) got `Content-Length`
+            // for free from axum; a streamed body does not, since nothing
+            // here knows the stream's length up front — set it explicitly
+            // from the already-resolved range bounds instead.
+            headers_mut.insert(
+                header::CONTENT_LENGTH,
+                header_value(&(end - start + 1).to_string()),
             );
             headers_mut.insert(header::CONTENT_TYPE, content_type_header(claims));
             if let Some(v) = etag_header(claims) {
@@ -1413,39 +1781,61 @@ async fn download_range(
             // Existence and range satisfiability were already confirmed
             // above, so a failure here is a genuine I/O fault (e.g. disk
             // error), not a missing blob or a bad range.
-            tracing::error!(error = %e, "backend get_range failed");
+            tracing::error!(error = %e, "backend get_range_stream failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
         }
     }
 }
 
-/// Serve a whole-blob `GET` (no `Range` header) once the blob's existence has
-/// already been confirmed by the caller (`download`). Split out of
-/// `download` to keep its cognitive complexity down.
+/// Serve a whole-blob `GET` (no `Range` header) once the blob's existence and
+/// size have already been resolved by the caller (`download`'s single `stat`
+/// call -- `total` is that call's result, not a fresh backend
+/// round-trip). Split out of `download` to keep its cognitive complexity
+/// down.
+///
+/// The response body is streamed from `StorageBackend::get_stream`
+/// (`axum::body::Body::from_stream`) instead of materializing the whole
+/// object into a `Bytes` buffer first — the sidecar's own
+/// `FS_SIDECAR_MAX_BODY_BYTES` default alone permits objects up to 5 GiB, so
+/// the old `backend.get(path)` path meant one full in-memory copy per
+/// concurrent whole-object download.
 async fn download_whole(
     state: &SidecarState,
     backend: &Arc<dyn StorageBackend>,
     path: &str,
+    total: u64,
     claims: &Claims,
 ) -> Response {
-    match backend.get(path).await {
-        Ok(bytes) => {
-            // P2 1.8 remediation: egress bytes for this whole-blob read.
-            #[allow(clippy::cast_precision_loss)]
-            state.metrics.record_egress_bytes(bytes.len() as f64);
-            let mut resp = (StatusCode::OK, bytes).into_response();
+    match backend.get_stream(path).await {
+        Ok(stream) => {
+            // P2 1.8 remediation, now counted per chunk as it is handed to
+            // the client rather than as one `bytes.len()` lump computed
+            // before anything was sent — see `download_range`'s identical
+            // comment for why that distinction matters once nothing is
+            // buffered ahead of time.
+            let metrics = Arc::clone(&state.metrics);
+            let body_stream = stream.map(move |chunk| {
+                if let Ok(bytes) = &chunk {
+                    #[allow(clippy::cast_precision_loss)]
+                    metrics.record_egress_bytes(bytes.len() as f64);
+                }
+                chunk
+            });
+
+            let mut resp = (StatusCode::OK, Body::from_stream(body_stream)).into_response();
             let headers_mut = resp.headers_mut();
             headers_mut.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             headers_mut.insert(header::CONTENT_TYPE, content_type_header(claims));
             if let Some(v) = etag_header(claims) {
                 headers_mut.insert(header::ETAG, v);
             }
+            headers_mut.insert(header::CONTENT_LENGTH, header_value(&total.to_string()));
             resp
         }
         Err(e) => {
             // Existence was already confirmed above, so this is a genuine
             // backend fault, not a missing blob.
-            tracing::error!(error = %e, "backend get failed after existence check");
+            tracing::error!(error = %e, "backend get_stream failed after existence check");
             (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
         }
     }

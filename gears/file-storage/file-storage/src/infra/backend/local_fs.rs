@@ -234,6 +234,88 @@ impl LocalFsBackend {
         let digest = hash::digest_to_array(hasher.finalize());
         Ok((bytes_written, digest))
     }
+
+    /// Fixed-size chunk length shared by [`Self::chunked_file_stream`]'s two
+    /// callers (`get_stream`/`get_range_stream`) — matches the chunk size
+    /// `write_stream_to_tmp`'s write side effectively uses via its
+    /// caller-supplied stream, and is small enough that a single in-flight
+    /// chunk is never a meaningful memory concern.
+    const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Shared chunked-read core for `get_stream` (whole-object) and
+    /// `get_range_stream` (a resolved byte range): pulls up to
+    /// [`Self::READ_CHUNK_SIZE`] bytes at a time from `file` — already
+    /// positioned via `seek` by the caller when a range read starts mid-file
+    /// — stopping at EOF (`remaining: None`, the whole-file case) or once
+    /// exactly `remaining` bytes have been yielded (a resolved range's
+    /// length, so a range read never reads even one byte past its own end).
+    ///
+    /// Returns `BoxStream<'static, _>` rather than borrowing `&self`: `file`
+    /// is moved wholesale into the `unfold` state and nothing here ever
+    /// touches `self` again, so the stream owns everything it needs outright
+    /// — see [`StorageBackend::get_stream`]'s doc comment for why that
+    /// `'static` bound matters (it is what lets the sidecar hand the stream
+    /// straight to `axum::body::Body::from_stream`).
+    ///
+    /// `state` in the `unfold` closure is `None` once a read has errored or
+    /// the file/range is exhausted, so the stream terminates cleanly rather
+    /// than re-polling a file handle that already reported an error.
+    ///
+    /// Reaching EOF (`read` returns `Ok(0)`) while `remaining` still
+    /// names an outstanding byte count (i.e. the file turned out shorter
+    /// than the length the caller committed to -- `get_range_stream`'s
+    /// resolved range length, or `get_stream`'s already-observed
+    /// `Content-Length`) is a genuine short-read: the caller already told an
+    /// HTTP client how many bytes to expect, so silently ending the stream
+    /// here would just hand back a body shorter than its own
+    /// `Content-Length` with no diagnostic. That case yields an
+    /// `UnexpectedEof` error instead of ending the stream cleanly.
+    ///
+    /// Both of this module's callers now pass a length: `get_range_stream`
+    /// its resolved range, `get_stream` the size it observed when it opened
+    /// the handle. `remaining: None` therefore means only "read to EOF, no
+    /// length was ever promised" -- kept for callers that legitimately do not
+    /// know the size up front, where an `Ok(0)` ends the stream as before.
+    fn chunked_file_stream(
+        file: tokio::fs::File,
+        remaining: Option<u64>,
+    ) -> BoxStream<'static, std::io::Result<Bytes>> {
+        let stream =
+            futures::stream::unfold((Some(file), remaining), |(state, remaining)| async move {
+                let mut file = state?;
+                if remaining == Some(0) {
+                    return None;
+                }
+                let want = remaining.map_or(Self::READ_CHUNK_SIZE, |r| {
+                    usize::try_from(r)
+                        .unwrap_or(usize::MAX)
+                        .min(Self::READ_CHUNK_SIZE)
+                });
+                let mut buf = vec![0u8; want];
+                match file.read(&mut buf).await {
+                    // `remaining == Some(0)` is already handled above, so
+                    // reaching an EOF read with `remaining: Some(r)` here
+                    // means `r > 0`: the file ended before yielding the
+                    // bytes the caller expected.
+                    Ok(0) => remaining.map(|r| {
+                        (
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!("file ended {r} byte(s) short of the expected read length"),
+                            )),
+                            (None, None),
+                        )
+                    }),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        let next_remaining = remaining.map(|r| r - n as u64);
+                        Some((Ok(Bytes::from(buf)), (Some(file), next_remaining)))
+                    }
+                    Err(e) => Some((Err(e), (None, None))),
+                }
+            });
+        Box::pin(stream)
+    }
 }
 
 #[async_trait]
@@ -365,39 +447,29 @@ impl StorageBackend for LocalFsBackend {
         Ok(Bytes::from(data))
     }
 
-    /// Stream the blob at `path` from disk in fixed-size chunks via manual
-    /// `AsyncReadExt` reads, so a read-back (e.g. finalize's) never
+    /// Stream the blob at `path` from disk in fixed-size chunks, so a
+    /// read-back (e.g. finalize's) or a whole-object download never
     /// materializes more than one chunk of the file in memory regardless of
-    /// its size. This crate does not otherwise depend on `tokio-util`, so
-    /// this deliberately avoids `ReaderStream` rather than pulling in a new
-    /// dependency for a single call site.
+    /// its size. Delegates to [`Self::chunked_file_stream`] with no length
+    /// cap (`remaining: None`, i.e. read to EOF) — see that method's doc
+    /// comment for the shared chunking mechanics it and
+    /// [`Self::get_range_stream`] both build on.
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
-        const CHUNK_SIZE: usize = 64 * 1024;
-
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let target = self.resolve(path)?;
         let file = tokio::fs::File::open(&target)
             .await
             .map_err(|e| self.io_err(e))?;
-
-        // `state` is `None` once a read has errored or the file is exhausted,
-        // so the stream terminates cleanly rather than re-polling a file
-        // handle that already reported an error.
-        let stream = futures::stream::unfold(Some(file), |state| async move {
-            let mut file = state?;
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            match file.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(n) => {
-                    buf.truncate(n);
-                    Some((Ok(Bytes::from(buf)), Some(file)))
-                }
-                Err(e) => Some((Err(e), None)),
-            }
-        });
-        Ok(Box::pin(stream))
+        // Bound the stream by the length observed at open time rather than
+        // reading to EOF. The sidecar declares `Content-Length` from a `stat`
+        // taken just before this call, so a file truncated in between would
+        // otherwise end the body early and leave the client with a response
+        // shorter than its own header and no diagnostic. With the length
+        // passed in, `chunked_file_stream` surfaces `UnexpectedEof` instead.
+        let len = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+        Ok(Self::chunked_file_stream(file, Some(len)))
     }
 
     /// Native range read: seek to the requested offset and read only the
@@ -425,6 +497,37 @@ impl StorageBackend for LocalFsBackend {
             .await
             .map_err(|e| self.io_err(e))?;
         Ok(Bytes::from(buf))
+    }
+
+    /// Native streaming range read: resolve the range against the file's
+    /// real length (identical to `get_range`'s own resolution/clamping), seek
+    /// once, then hand off to the same [`Self::chunked_file_stream`] core
+    /// `get_stream` uses — bounded this time by the range's length — so a
+    /// `Range` request (including `bytes=0-`, which resolves to the whole
+    /// object and is the very first request many media players issue) never
+    /// allocates a `len`-sized buffer up front the way the old
+    /// `get_range`-based response path did.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let target = self.resolve(path)?;
+        let mut file = tokio::fs::File::open(&target)
+            .await
+            .map_err(|e| self.io_err(e))?;
+        let total = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+        let Some((start, end)) = range.resolve(total) else {
+            return Err(DomainError::validation("range", "unsatisfiable byte range"));
+        };
+        // `resolve` yields an inclusive end; clamp defensively against `total`
+        // exactly like `get_range` does.
+        let end = end.min(total.saturating_sub(1));
+        let len = end - start + 1;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| self.io_err(e))?;
+        Ok(Self::chunked_file_stream(file, Some(len)))
     }
 
     /// Cheap stat: reads only the file's metadata, never its content, so
@@ -455,6 +558,19 @@ impl StorageBackend for LocalFsBackend {
         match tokio::fs::metadata(&target).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(self.io_err(e)),
+        }
+    }
+
+    /// Native combined stat: a single `stat(2)` distinguishes "not
+    /// found" (`Ok(None)`) from "present, this many bytes" (`Ok(Some(len))`)
+    /// from a genuine I/O fault (`Err`) -- exactly what `exists` followed by
+    /// `size` used to need two separate syscalls for.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let target = self.resolve(path)?;
+        match tokio::fs::metadata(&target).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(self.io_err(e)),
         }
     }

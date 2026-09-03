@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use file_storage_sdk::ByteRange;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use uuid::Uuid;
@@ -157,8 +158,24 @@ impl StorageBackend for InMemoryBackend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
+
+    /// Yields the resolved range as a single chunk — same non-hardening
+    /// rationale as `get_stream`'s override: this backend is explicitly
+    /// non-durable, in-process storage for tests/dev deployments, so a
+    /// one-chunk stream (via the trait's own `get_range` for the actual
+    /// slicing) is enough to let the shared backend contract tests exercise
+    /// `get_range_stream` against every backend, not just
+    /// `LocalFsBackend`/`S3Backend`.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let bytes = self.get_range(path, range).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 
@@ -169,6 +186,14 @@ impl StorageBackend for InMemoryBackend {
 
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         Ok(self.lock_blobs()?.contains_key(path))
+    }
+
+    /// Native combined stat: one lock acquisition instead of the
+    /// default's `exists` (lock + lookup) followed by `size` (another lock +
+    /// `get`, which for this backend would otherwise clone the whole blob
+    /// just to measure it).
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        Ok(self.lock_blobs()?.get(path).map(|b| b.len() as u64))
     }
 
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
