@@ -36,8 +36,9 @@ make run                   # default example server
 make test                  # unit tests (workspace, all OS)
 make test-sqlite           # integration — SQLite
 make test-pg               # integration — PostgreSQL
+make test-pgq              # integration — PostgreSQL 19 SQL/PGQ (Docker)
 make test-mysql            # integration — MySQL
-make test-db               # all DB integration tests
+make test-db               # all DB integration tests (sqlite, pg, pgq, mysql)
 make test-users-info-pg    # users-info gear integration (Postgres)
 make e2e-docker            # E2E — Docker environment
 make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
@@ -149,15 +150,17 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 ```bash
 make test-sqlite           # quick, no external services needed
 make test-pg               # requires Postgres
+make test-pgq              # requires Docker; PostgreSQL 19 SQL/PGQ lane (testcontainers)
 make test-mysql            # requires MySQL
-make test-db               # all of the above
+make test-db               # all of the above, test-pgq included
 make test-users-info-pg    # users-info Postgres integration
 ```
 
 ### 4.3 CI
 
-The `integration` job in `ci.yml` runs SQLite, Postgres, and MySQL integration tests
-plus macro UI tests on every PR (Ubuntu only).
+The `integration` job in `ci.yml` runs the SQLite, Postgres, PGQ (PostgreSQL 19, with
+`GEARS_TEST_PG_GRAPH_REQUIRED=1` so an unavailable image fails the step rather than skipping
+it) and MySQL integration tests plus macro UI tests on every PR (Ubuntu only).
 
 ### 4.4 Database container images
 
