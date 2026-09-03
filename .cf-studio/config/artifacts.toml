@@ -1,4 +1,8 @@
 [[ignore]]
+reason = ""
+patterns = ["gears/task-engine/docs/DESIGN.md"]
+
+[[ignore]]
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
 patterns = ["gears/system/resource-group/docs/rust-traits.md"]
 
