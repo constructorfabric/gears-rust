@@ -228,6 +228,31 @@ impl S3Backend {
         format!("/{key}")
     }
 
+    /// Build the HTTP `Range` header value for `range`, or fail locally (no
+    /// S3 round trip needed) for the two range shapes that are already
+    /// known-unsatisfiable without asking the server (`start > end` for an
+    /// inclusive range, `length == 0` for a suffix range). Shared by
+    /// `get_range` and `get_range_stream` so the header text is built in
+    /// exactly one place — a divergence here would mean the two methods could
+    /// silently serve different bytes for what should be the same range.
+    fn range_header_value(range: ByteRange) -> Result<String, DomainError> {
+        match range {
+            ByteRange::Inclusive { start, end } => {
+                if start > end {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes={start}-{end}"))
+            }
+            ByteRange::OpenEnded { start } => Ok(format!("bytes={start}-")),
+            ByteRange::Suffix { length } => {
+                if length == 0 {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes=-{length}"))
+            }
+        }
+    }
+
     fn transport_err(&self, e: &reqwest::Error) -> DomainError {
         DomainError::backend(&self.id, e.to_string())
     }
@@ -620,7 +645,7 @@ impl StorageBackend for S3Backend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
             .bucket
@@ -651,21 +676,7 @@ impl StorageBackend for S3Backend {
     /// Builds the header directly from `range` without a prior `HEAD`, so a
     /// range read never costs more than one round trip.
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let header_value = match range {
-            ByteRange::Inclusive { start, end } => {
-                if start > end {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes={start}-{end}")
-            }
-            ByteRange::OpenEnded { start } => format!("bytes={start}-"),
-            ByteRange::Suffix { length } => {
-                if length == 0 {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes=-{length}")
-            }
-        };
+        let header_value = Self::range_header_value(range)?;
 
         let key = Self::path_to_key(path);
         let url = self
@@ -690,6 +701,66 @@ impl StorageBackend for S3Backend {
         } else {
             Err(self.s3_error(status, &body))
         }
+    }
+
+    /// Native streaming range read: identical request shape to `get_range`
+    /// (same unsigned `Range` header, same one-round-trip contract), but
+    /// returns the response body as a `BoxStream` via `bytes_stream()`
+    /// instead of buffering it whole — mirrors `get_stream`'s relationship to
+    /// `get`, applied to a range. `Range: bytes=0-` (`ByteRange::OpenEnded`
+    /// with `start: 0`) resolves to the entire object, so without this a
+    /// player's very first range request would still pull the whole object
+    /// into memory via `resp.bytes()` before the client had read a byte of
+    /// it — this streams it instead. Status handling (416 / non-2xx) is
+    /// checked eagerly before returning, exactly like `get_stream`, so a bad
+    /// range or an S3-side error surfaces from this call directly rather than
+    /// from polling the returned stream.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let header_value = Self::range_header_value(range)?;
+
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        let resp = self
+            .http
+            .get(url)
+            .header(RANGE, header_value)
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+
+        let status = resp.status();
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Err(DomainError::validation("range", "unsatisfiable byte range"));
+        }
+        if !status.is_success() {
+            let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+            return Err(self.s3_error(status, &body));
+        }
+        // The caller turns this stream into a `206 Partial Content` body whose
+        // `Content-Range`/`Content-Length` describe the *requested* range, so a
+        // backend that silently ignored `Range` and answered `200 OK` with the
+        // whole object would make the sidecar emit a response whose body does
+        // not match its own headers -- while streaming an arbitrary amount of
+        // data to do it. Every S3 implementation that honours the header
+        // answers `206`; anything else is refused here rather than trusted.
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(DomainError::backend(
+                &self.id,
+                format!("backend ignored the Range header (answered {status}, expected 206)"),
+            ));
+        }
+
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        Ok(Box::pin(stream))
     }
 
     /// Cheap stat via `HeadObject`: reads only the `Content-Length` response
@@ -762,6 +833,41 @@ impl StorageBackend for S3Backend {
         match resp.status() {
             StatusCode::OK => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
+            other => Err(self.head_error(path, other)),
+        }
+    }
+
+    /// Native combined stat: a single `HeadObject` distinguishes
+    /// "not found" (`Ok(None)`, `404`) from "present, this many bytes"
+    /// (`Ok(Some(len))`, `200` + `Content-Length`) from a genuine backend
+    /// fault (`Err`, any other status or a transport failure) -- exactly
+    /// what `exists` followed by `size` used to need two separate
+    /// `HeadObject` requests for.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        let resp = self
+            .http
+            .head(url)
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+        match resp.status() {
+            StatusCode::OK => {
+                let len = resp
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        DomainError::backend(&self.id, "HEAD response missing Content-Length")
+                    })?;
+                Ok(Some(len))
+            }
+            StatusCode::NOT_FOUND => Ok(None),
             other => Err(self.head_error(path, other)),
         }
     }
