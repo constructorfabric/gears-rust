@@ -436,7 +436,16 @@ pub async fn delete_version(
 
 // ── storages ────────────────────────────────────────────────────────────────────
 
-pub async fn list_storages(Extension(svc): Svc) -> ApiResult<JsonBody<StorageDtoList>> {
+pub async fn list_storages(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+) -> ApiResult<JsonBody<StorageDtoList>> {
+    // `list_backends` itself is a synchronous, authz-free lookup (see
+    // `domain/service/backend.rs`) — this handler used to call it directly
+    // with no `SecurityContext` at all, so any authenticated subject of any
+    // tenant could enumerate backend ids and capabilities. Gate it behind
+    // the same coarse `READ` check the rest of this gear's read paths use.
+    svc.authorize_backends_read(&ctx).await?;
     let items = svc
         .list_backends()
         .into_iter()
@@ -446,9 +455,12 @@ pub async fn list_storages(Extension(svc): Svc) -> ApiResult<JsonBody<StorageDto
 }
 
 pub async fn get_storage(
+    Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(storage_id): Path<String>,
 ) -> ApiResult<JsonBody<StorageDto>> {
+    // Same authz gap as `list_storages` above — see its comment.
+    svc.authorize_backends_read(&ctx).await?;
     let (id, caps) = svc.get_backend(&storage_id)?;
     Ok(Json(StorageDto::new(id, caps)))
 }
