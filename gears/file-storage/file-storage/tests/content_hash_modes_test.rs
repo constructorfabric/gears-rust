@@ -85,7 +85,7 @@ impl StorageBackend for CountingBackend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<futures::stream::BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get_stream(path).await
     }
