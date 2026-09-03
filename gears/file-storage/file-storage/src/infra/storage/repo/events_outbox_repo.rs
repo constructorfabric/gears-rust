@@ -1,6 +1,4 @@
 //! Repository for the `events_outbox` table.
-//!
-//! @cpt-cf-file-storage-fr-file-events
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
@@ -24,8 +22,6 @@ impl EventsOutboxRepo {
 
     /// Enqueue a file-event row into `conn` (which MUST be a transaction runner
     /// so the row is committed atomically with the surrounding mutation).
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn enqueue<C: DBRunner>(
         &self,
         conn: &C,
@@ -49,8 +45,6 @@ impl EventsOutboxRepo {
     }
 
     /// List event rows for a specific file ordered by occurrence time — useful in tests.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn list_for_file<C: DBRunner>(
         &self,
         conn: &C,

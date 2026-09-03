@@ -142,11 +142,10 @@ impl LocalFsBackend {
     }
 
     /// Atomically publish an already-written-and-fsynced temp file at
-    /// `target` **iff `target` does not already exist** (create-exclusive —
-    /// P2 remediation, replay-`PUT` overwrite fix; see
-    /// [`StorageBackend::publish_exclusive`]'s doc comment for why this must
-    /// not silently replace an existing object like [`Self::publish_tmp`]
-    /// does).
+    /// `target` **iff `target` does not already exist** (create-exclusive;
+    /// see [`StorageBackend::publish_exclusive`]'s doc comment for why this
+    /// must not silently replace an existing object like
+    /// [`Self::publish_tmp`] does).
     ///
     /// `std::fs::hard_link` creates a second directory entry pointing at
     /// `tmp`'s inode and, per POSIX `link(2)`, atomically fails with
@@ -271,11 +270,11 @@ impl LocalFsBackend {
     /// `Content-Length` with no diagnostic. That case yields an
     /// `UnexpectedEof` error instead of ending the stream cleanly.
     ///
-    /// Both of this module's callers now pass a length: `get_range_stream`
-    /// its resolved range, `get_stream` the size it observed when it opened
-    /// the handle. `remaining: None` therefore means only "read to EOF, no
+    /// Both of this module's callers pass a length: `get_range_stream` its
+    /// resolved range, `get_stream` the size it observed when it opened the
+    /// handle. `remaining: None` therefore means only "read to EOF, no
     /// length was ever promised" -- kept for callers that legitimately do not
-    /// know the size up front, where an `Ok(0)` ends the stream as before.
+    /// know the size up front, where an `Ok(0)` simply ends the stream.
     fn chunked_file_stream(
         file: tokio::fs::File,
         remaining: Option<u64>,
@@ -389,9 +388,9 @@ impl StorageBackend for LocalFsBackend {
         Ok((bytes_written, digest))
     }
 
-    /// Create-exclusive publish (P2 remediation — replay-`PUT` overwrite
-    /// fix). Writes + hashes the stream into a temp file exactly like
-    /// `put_stream`, but publishes it via [`Self::publish_tmp_exclusive`]
+    /// Create-exclusive publish. Writes + hashes the stream into a temp file
+    /// exactly like `put_stream`, but publishes it via
+    /// [`Self::publish_tmp_exclusive`]
     /// (hard-link, atomically fails on an existing target) instead of
     /// `publish_tmp`'s unconditional rename. See
     /// [`StorageBackend::publish_exclusive`] for the full contract.
@@ -531,8 +530,8 @@ impl StorageBackend for LocalFsBackend {
     }
 
     /// Cheap stat: reads only the file's metadata, never its content, so
-    /// range-aware callers (P2 1.11) can resolve a `Range` request without
-    /// paying for a full read first.
+    /// range-aware callers can resolve a `Range` request without paying for
+    /// a full read first.
     async fn size(&self, path: &str) -> Result<u64, DomainError> {
         let target = self.resolve(path)?;
         let meta = tokio::fs::metadata(&target)
@@ -564,8 +563,8 @@ impl StorageBackend for LocalFsBackend {
 
     /// Native combined stat: a single `stat(2)` distinguishes "not
     /// found" (`Ok(None)`) from "present, this many bytes" (`Ok(Some(len))`)
-    /// from a genuine I/O fault (`Err`) -- exactly what `exists` followed by
-    /// `size` used to need two separate syscalls for.
+    /// from a genuine I/O fault (`Err`), where `exists` followed by `size`
+    /// would need two separate syscalls.
     async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
         let target = self.resolve(path)?;
         match tokio::fs::metadata(&target).await {
@@ -580,8 +579,6 @@ impl StorageBackend for LocalFsBackend {
     ///
     /// Non-existent root (fresh install with no uploads yet) returns an empty
     /// vec rather than an error.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         // If the root does not exist yet (no blobs written), return empty.
         match tokio::fs::metadata(&self.root).await {

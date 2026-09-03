@@ -59,8 +59,6 @@ pub(crate) const MIME_SNIFF_PREFIX_BYTES: usize = 8 * 1024;
 /// A version with no declared MIME type (`declared_mime` empty) is passed
 /// through untouched: there is nothing to validate against, and unrestricted
 /// uploads must keep working exactly as before.
-///
-/// @cpt-cf-file-storage-fr-content-type-validation
 pub(crate) fn validate_and_resolve_mime(
     declared_mime: &str,
     blob: &[u8],

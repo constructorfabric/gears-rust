@@ -19,15 +19,13 @@
 //!    now))`. The existing `multipart_uploads_expired_idx` is a *partial*
 //!    index restricted to `state = 'in_progress'` on Postgres (plain
 //!    `(expires_at, state)` on `SQLite`, where `p2_initial` simply did not
-//!    make it partial — `SQLite` has supported partial indexes since 3.8.0) — either way it does not serve the `completing AND lease_until
-//!    < now` half of the OR, so that branch falls back to a full scan. The
+//!    make it partial (`SQLite` has supported partial indexes since 3.8.0) —
+//!    either way it does not serve the `completing AND lease_until < now`
+//!    half of the OR, so that branch falls back to a full scan. The
 //!    new index is deliberately non-partial and leads with `state` so both
 //!    branches of the OR can use it.
 //!
 //! `down()` drops both indexes on both dialects.
-//!
-//! @cpt-cf-file-storage-fr-upload-idempotency
-//! @cpt-cf-file-storage-fr-orphan-reconciliation
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -82,10 +80,7 @@ impl MigrationTrait for Migration {
                 conn.execute_unprepared(DOWN).await?;
                 Ok(())
             }
-            // MySQL and any backend a future `sea_orm` adds to the
-            // `#[non_exhaustive]` `DatabaseBackend` enum are refused
-            // explicitly here, rather than left to a panic on an uncovered
-            // pattern.
+            // See `up()`'s matching arm.
             _ => Err(DbErr::Custom(
                 "file-storage migrations support Postgres and SQLite only".to_owned(),
             )),

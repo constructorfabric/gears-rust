@@ -59,8 +59,8 @@ impl PolicyRepo {
     /// this first deletes any existing row for that combination, then inserts the
     /// new one.
     ///
-    /// P2 remediation 2.4: callers (`Store::upsert_policy`) run this inside an
-    /// explicit DB transaction so the delete+insert pair is atomic, and the
+    /// Callers (`Store::upsert_policy`) run this inside an explicit DB
+    /// transaction so the delete+insert pair is atomic, and the
     /// `policies_user_scope_unique_idx` / `policies_tenant_scope_unique_idx`
     /// partial unique indexes (migration `m20260706_000003`) act as a
     /// backstop against the remaining no-existing-row race between two
@@ -110,11 +110,11 @@ impl PolicyRepo {
         // above and both reach this insert; the partial unique indexes
         // (`policies_tenant_scope_unique_idx` / `policies_user_scope_unique_idx`,
         // migration `m20260706_000003_policies_unique_scope.rs`) are what
-        // stops the loser from creating a second row. Before this fix that
-        // loss surfaced as an opaque `DomainError::Database` (HTTP 500) via
-        // `db_err`; classify it as a conflict instead, so the losing caller
-        // gets a 409 it can react to (re-fetch via `get` and, if it still
-        // wants its own values, retry the upsert against the row that won).
+        // stops the loser from creating a second row. Classify that loss as
+        // a conflict rather than an opaque `db_err` 500, so the losing
+        // caller gets a 409 it can react to (re-fetch via `get` and, if it
+        // still wants its own values, retry the upsert against the row that
+        // won).
         secure_insert::<Entity>(am, scope, conn)
             .await
             .map_err(|e| {

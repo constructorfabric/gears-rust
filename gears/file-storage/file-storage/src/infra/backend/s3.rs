@@ -7,7 +7,7 @@
 //! `reqwest` client. S3's XML response/error bodies are parsed in-house via
 //! `quick-xml`, per the ADR.
 //!
-//! ## Dependency-feature deviation (Stage 0, recorded here per plan.md)
+//! ## Dependency-feature deviation
 //! `rusty-s3` gates its `ListObjectsV2`/`CreateMultipartUpload`/
 //! `CompleteMultipartUpload` **action builders** (not just their bundled
 //! response-parsing types) behind the `full` cargo feature — disabling it
@@ -20,9 +20,9 @@
 //!
 //! ## `reqwest::Client` ownership
 //! `S3Backend` constructs its own `reqwest::Client` internally (cheap: the
-//! client is a thin `Arc` handle). Stage 4/5 callers may switch to injecting a
-//! shared client if that proves more convenient once those call sites exist;
-//! nothing about this stage's trait contract depends on which is chosen.
+//! client is a thin `Arc` handle). A future caller may switch to injecting a
+//! shared client if that proves more convenient; nothing about the trait
+//! contract depends on which is chosen.
 
 use std::fmt;
 use std::time::Duration;
@@ -153,9 +153,9 @@ impl S3Backend {
         self
     }
 
-    /// Build an `S3Backend` from a `config::S3BackendConfig` entry (P2 1.7.3
-    /// config wiring). Shared by `gear.rs`'s `build_backend_registry` and the
-    /// sidecar's `FS_SIDECAR_S3_BACKENDS` parsing so the two don't duplicate
+    /// Build an `S3Backend` from a `config::S3BackendConfig` entry. Shared by
+    /// `gear.rs`'s `build_backend_registry` and the sidecar's
+    /// `FS_SIDECAR_S3_BACKENDS` parsing so the two don't duplicate
     /// construction logic.
     ///
     /// - `endpoint: None` derives a real-AWS endpoint from `region`
@@ -977,7 +977,6 @@ impl StorageBackend for S3Backend {
         self.finalize_multipart(path, upload_handle, &etag_parts, WriteMode::Overwrite)
             .await?;
 
-        // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest
         build_manifest_and_root(parts)
     }
 
@@ -1035,11 +1034,12 @@ impl StorageBackend for S3Backend {
     /// from "bucket does not exist (or is misconfigured)": both come back as
     /// a bare `404` with no body — HEAD responses never carry one, so there
     /// is nothing in the response to tell `NoSuchBucket` apart from
-    /// `NoSuchKey`. `exists`'s 404-means-absent mapping (correct for its own
-    /// contract) previously leaked into readiness via this method, so a
-    /// missing/misconfigured bucket reported `Ok(false)` — "reachable,
-    /// object absent" — same as the expected steady-state, and `/readyz`
-    /// passed while every real read/write against that backend would fail.
+    /// `NoSuchKey`. Basing readiness on a probe-key `HeadObject` would
+    /// therefore reuse `exists`'s 404-means-absent mapping (correct for its
+    /// own contract) for the wrong question: a missing/misconfigured bucket
+    /// would report `Ok(false)` — "reachable, object absent" — same as the
+    /// expected steady-state, and `/readyz` would pass while every real
+    /// read/write against that backend fails.
     ///
     /// `ListObjectsV2` is bucket-scoped: it returns `200` (with an empty
     /// `<Contents>` list) for *any* existing, accessible bucket regardless of

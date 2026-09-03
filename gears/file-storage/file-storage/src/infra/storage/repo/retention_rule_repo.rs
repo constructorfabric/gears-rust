@@ -85,8 +85,6 @@ impl RetentionRuleRepo {
 
     /// List retention rules for a specific file (`scope = 'file'`), across all
     /// tenants — for the retention sweep engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_by_file_scope<C: DBRunner>(
         &self,
         conn: &C,
@@ -110,8 +108,6 @@ impl RetentionRuleRepo {
 
     /// List every retention rule across all tenants and scopes — for the
     /// retention sweep engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all<C: DBRunner>(
         &self,
         conn: &C,

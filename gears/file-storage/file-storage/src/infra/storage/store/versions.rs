@@ -26,7 +26,7 @@ use crate::infra::storage::store::{Store, pending_version};
 /// retention/orphan-reconciliation sweeps — see [`Store::list_versions`]).
 /// Capping any of those at a page size would silently under-delete backend
 /// blobs or under/over-count usage bytes, so they stay unbounded; only the
-/// REST-facing [`Store::list_versions_page`] is capped (P2 2.2).
+/// REST-facing [`Store::list_versions_page`] is capped.
 ///
 /// Kept within `i64::MAX` (rather than `u64::MAX`) so it binds safely as a
 /// SQL `LIMIT` literal on every backend — `LIMIT`/`OFFSET` are signed 64-bit
@@ -77,7 +77,7 @@ impl Store {
     /// List **all** versions of a file, newest first — internal/unbounded,
     /// for callers that need the complete version set (see
     /// [`UNBOUNDED_VERSIONS`]). The paginated, REST-facing counterpart is
-    /// [`Self::list_versions_page`] (P2 2.2).
+    /// [`Self::list_versions_page`].
     pub async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
@@ -93,7 +93,7 @@ impl Store {
     }
 
     /// List a page of a file's versions, newest first — backs
-    /// `GET /files/{id}/versions` (P2 2.2). `limit`/`offset` are expected to
+    /// `GET /files/{id}/versions`. `limit`/`offset` are expected to
     /// already be clamped by the caller (see
     /// `FileService::list_versions`/`ServiceConfig::max_page_size`).
     pub async fn list_versions_page(
@@ -140,15 +140,12 @@ impl Store {
     ///
     /// An audit row is written in the same transaction.
     ///
-    /// `auto_bind` (upload-flow redesign): when `Some`, the finalized version
-    /// is additionally bound as the file's current content — the same CAS +
+    /// `auto_bind`: when `Some`, the finalized version is additionally bound
+    /// as the file's current content — the same CAS +
     /// current-flag promotion as [`Self::bind_atomic_with_event`], executed
     /// **inside this same transaction**. A lost CAS is reported via
     /// [`FinalizeVersionOutcome::bound`], never an error: the version stays
     /// `available` and can be rebound manually without a re-upload.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn finalize_version(
         &self,
@@ -170,7 +167,6 @@ impl Store {
         let hash_mode_str = hash_mode.as_str();
         let now = OffsetDateTime::now_utc();
         let db = self.db.db();
-        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-commit-or-rollback
         //
         // Retryable (see `db::transaction_with_bounded_retry`): the auto-bind
         // branch below takes `file_versions` then `files` (`versions.finalize`
@@ -215,13 +211,10 @@ impl Store {
                             .insert_manifest(tx, &scope, version_id, &manifest, now)
                             .await?;
                     }
-                    // @cpt-cf-file-storage-nfr-audit-completeness
-                    // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
                     audit_repo.insert(tx, &audit).await?;
-                    // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
 
-                    // Upload-flow redesign: bind in the same transaction
-                    // (mirrors `bind_atomic_with_event`'s steps 1:1).
+                    // Bind in the same transaction (mirrors
+                    // `bind_atomic_with_event`'s steps 1:1).
                     if let Some(ab) = auto_bind {
                         let swapped = files
                             .bind_content_cas(
@@ -264,7 +257,6 @@ impl Store {
             })
         })
         .await
-        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-commit-or-rollback
     }
 
     /// Fetch the `version_hash_manifest` text for a version, if one exists
@@ -302,7 +294,7 @@ impl Store {
     /// transaction.
     ///
     /// Returns `true` if the row was removed, `false` if it does not exist or
-    /// is the file's current version (P2 2.7 — a version cannot be deleted
+    /// is the file's current version -- a version cannot be deleted
     /// while it is current, whether that was already true when the caller
     /// checked or became true concurrently between the caller's check and
     /// this call).
@@ -314,9 +306,6 @@ impl Store {
     /// so even a concurrent `bind` that commits between the read below and the
     /// delete statement cannot leave `files.content_id` dangling: the delete
     /// simply removes 0 rows and this returns `false`.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_version(
         &self,
         file_id: Uuid,
@@ -350,7 +339,6 @@ impl Store {
                         // caught it.
                         return Ok(false);
                     }
-                    // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
                     Ok(true)
                 })
@@ -361,14 +349,11 @@ impl Store {
     /// Delete a single version row iff it is still `pending`, recording an
     /// audit row in the same transaction. Returns `true` if a row was removed.
     ///
-    /// Status-guarded CAS (P2 0.3 step 5) -- used by the cleanup sweep instead
+    /// Status-guarded CAS -- used by the cleanup sweep instead
     /// of the unconditional [`Self::delete_version`] when reclaiming an
     /// expired multipart session's pending version row, so a version that a
     /// racing `complete_multipart_upload` has already flipped to `available`
     /// is never deleted.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_pending_version(
         &self,
         file_id: Uuid,
@@ -391,7 +376,6 @@ impl Store {
                         )
                         .await?;
                     if removed {
-                        // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
                     }
                     Ok::<bool, DomainError>(removed)
@@ -414,9 +398,6 @@ impl Store {
     /// Returns `true` on a successful swap, `false` on a concurrent CAS
     /// conflict (caller maps to PreconditionFailed; REST maps that canonical
     /// error to HTTP 400).
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn bind_atomic(
         &self,
         scope: &AccessScope,
@@ -476,7 +457,6 @@ impl Store {
                         "target version no longer exists -- it was deleted concurrently",
                     ));
                 }
-                // @cpt-cf-file-storage-nfr-audit-completeness
                 audit_repo.insert(tx, &audit).await?;
                 Ok::<bool, DomainError>(true)
             })
@@ -489,10 +469,6 @@ impl Store {
     ///
     /// This is the events-aware variant of [`bind_atomic`]; the original is
     /// preserved for callers that do not need event enqueuing.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn bind_atomic_with_event(
         &self,
@@ -571,8 +547,6 @@ impl Store {
     /// updated. `false` means either the version is gone or a concurrent
     /// migration already moved the pointer away from the expected value —
     /// the caller must re-fetch to tell these apart.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
     #[allow(clippy::too_many_arguments)]
     pub async fn rebind_version_backend(
         &self,
@@ -615,15 +589,12 @@ impl Store {
             .await
     }
 
-    // ── ownership transfer (P2-M5) ────────────────────────────────────────────
+    // ── ownership transfer ──────────────────────────────────────────────────
 
     /// Update `owner_kind` + `owner_id` for a file, enqueue an optional event
     /// row, and record an audit row — all in one transaction.
     ///
     /// Returns `true` if the file row was found and updated.
-    ///
-    /// @cpt-cf-file-storage-fr-ownership-transfer
-    /// @cpt-cf-file-storage-fr-file-events
     #[allow(clippy::too_many_arguments)]
     pub async fn transfer_ownership_atomic(
         &self,

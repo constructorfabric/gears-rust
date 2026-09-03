@@ -6,16 +6,15 @@
 // `pg_concurrency_test.rs`) still needs this allow. Same shared-module shape
 // as resource-group's own `tests/common/mod.rs`.
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
-//! Shared test helpers for the file-storage DB-behavior audit (Step 4 of the
-//! DB-behavior audit program -- see
-//! `docs/toolkit_unified_system/14_db_behavior_testing.md`, methodology
-//! validated against `resource-group`'s own audit).
+//! Shared test helpers for the file-storage DB-behavior audit (see
+//! `docs/toolkit_unified_system/14_db_behavior_testing.md` for the
+//! methodology, validated against `resource-group`'s own audit).
 //!
-//! Mirrors `resource_group`'s `tests/common/mod.rs::test_db_with_recorder()`
-//! (branch `audit/rg-db-behavior`): the recorder's callback must be attached
-//! *before* the connection is wrapped into a `DBProvider` (`SeaORM` captures
-//! the callback by value at query time; `Db`/`DBProvider` never expose the
-//! raw connection afterward, by the `toolkit-db` security model).
+//! Mirrors `resource_group`'s `tests/common/mod.rs::test_db_with_recorder()`:
+//! the recorder's callback must be attached *before* the connection is
+//! wrapped into a `DBProvider` (`SeaORM` captures the callback by value at
+//! query time; `Db`/`DBProvider` never expose the raw connection afterward,
+//! by the `toolkit-db` security model).
 //!
 //! Uses `sqlite::memory:` (unlike this crate's other integration-test files,
 //! which use a file-backed temp DB so a *second*, independent raw connection

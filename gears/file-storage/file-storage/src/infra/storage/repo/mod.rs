@@ -6,9 +6,9 @@
 //! custom-metadata rows are reached only after the parent file is authorized, so
 //! they use an unconstrained scope on their `file_id`-keyed queries.
 //!
-//! P2-M1 adds `PolicyRepo` and `RetentionRuleRepo`.
-//! P2-M3 adds `MultipartRepo` and `IdempotencyRepo`.
-//! P2-M4 adds `AuditRepo`.
+//! `PolicyRepo` and `RetentionRuleRepo` cover the policy engine;
+//! `MultipartRepo` and `IdempotencyRepo` cover multipart uploads; `AuditRepo`
+//! covers audit recording.
 
 mod audit_repo;
 mod events_outbox_repo;
@@ -73,9 +73,6 @@ pub struct Repos {
     pub retention_rules: RetentionRuleRepo,
     pub multipart: MultipartRepo,
     pub idempotency_keys: IdempotencyRepo,
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub audit: AuditRepo,
-    /// @cpt-cf-file-storage-fr-file-events
     pub events_outbox: EventsOutboxRepo,
 }
