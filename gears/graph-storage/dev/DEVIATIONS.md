@@ -281,6 +281,14 @@ D-103 deferred the remote plugin with the reason that *"building the plugin with
 
 The nine base schemas lived under `docs/schemas/` and reached the binary through `include_str!("../../../docs/schemas/...")`. That compiles from a checkout and fails to package: a crate's archive contains only its own directory, so the first `cargo publish` — or the first consumer building the gear as a git dependency — would have found no schemas. They now live in `gears/graph-storage/graph-storage/schemas/` (with the `acme` examples beside them) and DESIGN points there. The gear registers the same bytes; only the path changed.
 
+## D-027 [impl-gap] Unchanged nodes are re-embedded on every ingest
+
+`EmbeddingCoordinator::plan` composes and embeds every node of a batch before `decide_vector` compares the input hash with the stored one, so the *preserved* state is decided correctly but paid for as if it were *embedded*: a byte-identical re-sync of an 824-node repository through the reference consumer took 25 s with the in-process ONNX provider and changed nothing. Reading the stored `embedding_input_hash` for the batch's keys first — one indexed query — and embedding only the inputs whose hash differs would make a no-op re-sync cost what it changes. Found on the studio-web stand; the same run showed the synchronous importer exceeding a 30 s gateway deadline for the same reason.
+
+## D-028 [impl-gap] Lexical search cannot find identifiers inside file names
+
+`compose_search_text` joins the declared paths and the store indexes them with PostgreSQL's default text-search configuration, whose parser emits `README.md` and `rust-watch.Dockerfile` as single `file` tokens. On the stand, `Dockerfile` matched and `README` and `rust` did not, although both name files. The searchable text should also carry the punctuation-split tokens of a name (or the store should index a second, `simple`-configuration vector for identifiers). Producer-side, the reference consumer could add a `name_tokens` payload member, but the gap is in the composition every producer inherits.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
