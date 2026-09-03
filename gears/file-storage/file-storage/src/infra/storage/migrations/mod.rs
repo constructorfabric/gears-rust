@@ -10,6 +10,7 @@ mod m20260706_000002_idempotency_request_hash;
 mod m20260706_000003_policies_unique_scope;
 mod m20260707_000001_content_hash_modes;
 mod m20260722_000001_multipart_auto_bind;
+mod m20260902_000001_index_hardening;
 
 /// File-storage migrator. P1 ships the initial control-plane metadata tables;
 /// P2 adds the policy store, retention rules, multipart uploads + idempotency
@@ -28,6 +29,10 @@ mod m20260722_000001_multipart_auto_bind;
 /// content-hash mode.
 /// The upload-flow redesign adds `auto_bind` to `multipart_uploads` so
 /// `complete` knows whether to bind the finalized version itself.
+/// Index hardening adds `idempotency_keys_file_idx` (covers the
+/// `ON DELETE CASCADE` from `files`) and `multipart_uploads_sweep_idx`
+/// (covers the full `list_expired` OR predicate, including the
+/// `completing`-with-expired-lease branch the existing partial index misses).
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -42,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260706_000003_policies_unique_scope::Migration),
             Box::new(m20260707_000001_content_hash_modes::Migration),
             Box::new(m20260722_000001_multipart_auto_bind::Migration),
+            Box::new(m20260902_000001_index_hardening::Migration),
         ]
     }
 }
