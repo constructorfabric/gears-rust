@@ -100,6 +100,24 @@ impl FileService {
             .await
     }
 
+    /// Authorize `GET /storages` and `GET /storages/{id}` (backend
+    /// discovery). Both handlers previously extracted no `SecurityContext`
+    /// at all and called the synchronous, authz-free
+    /// `FileService::list_backends`/`get_backend` directly — any
+    /// authenticated subject of any tenant could enumerate backend ids and
+    /// capabilities. Those two methods stay synchronous and unauthorized
+    /// (their `AccessScope`-free signature is used elsewhere too, see
+    /// `domain/service/backend.rs`); this is a small async wrapper the
+    /// handlers call first, purely to gate the read behind the same
+    /// resource-less `READ` check the rest of this gear's coarse read paths
+    /// use (e.g. `list_files`, `list_retention_rules`).
+    pub async fn authorize_backends_read(&self, ctx: &SecurityContext) -> Result<(), DomainError> {
+        self.authorizer
+            .authorize(ctx, actions::READ, "", None)
+            .await
+            .map(|_| ())
+    }
+
     // ── pub(crate) accessors for DataPlaneService ─────────────────────────────
 
     /// Fetch a single version by `(file_id, version_id)` — delegated to the
