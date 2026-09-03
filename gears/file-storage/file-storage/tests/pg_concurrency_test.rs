@@ -18,16 +18,28 @@
 //! row/predicate-level SSI, and file-storage's concurrency-safety strategy is
 //! single-statement CAS `UPDATE ... WHERE` predicates whose *interleaving*
 //! behavior under a real connection pool and real wall-clock timing cannot be
-//! faithfully exercised against an in-memory SQLite connection. Runs for
-//! real, automatically, as part of a normal
-//! `cargo test -p cf-gears-file-storage` -- no `#[ignore]`, no environment
-//! variable to remember to set; every test skips itself gracefully (passes,
-//! with a stderr message) if Docker isn't reachable.
+//! faithfully exercised against an in-memory SQLite connection.
+//!
+//! This file is gated behind `#![cfg(feature = "integration")]` (see the top
+//! of this file and this crate's `Cargo.toml`, where `default = []` and
+//! `integration = []`): a plain `cargo test -p cf-gears-file-storage` does
+//! **not** build or run this suite at all. It only runs when the
+//! `integration` feature is enabled explicitly, i.e. via `make test-fs-pg`
+//! (see the `Makefile`) or the "Test file-storage (pg concurrency,
+//! integration)" step in `.github/workflows/ci.yml`. When Docker isn't
+//! reachable, every test here still skips itself gracefully (passes, with a
+//! stderr message) *unless* `FS_PG_REQUIRE_DOCKER` is set (`"1"`/`"true"`),
+//! in which case a missing Docker daemon is a hard panic instead of a silent
+//! skip -- CI sets this so a broken Docker daemon can't produce a green step
+//! that checked nothing. See `require_docker`/`shared_pg` below.
 //!
 //! ## Running locally
 //!
 //! ```sh
-//! cargo test -p cf-gears-file-storage --test pg_concurrency_test
+//! cargo nextest run -p cf-gears-file-storage --features integration \
+//!   --test pg_concurrency_test
+//! # or, equivalently:
+//! make test-fs-pg
 //! ```
 //!
 //! ## Scenarios
@@ -164,9 +176,21 @@ struct PgFixture {
 static PG: OnceCell<Option<Arc<PgFixture>>> = OnceCell::const_new();
 static MIGRATIONS_DONE: OnceCell<()> = OnceCell::const_new();
 
+/// Mirrors resource-group's own `pg_concurrency_test.rs::require_docker`:
+/// when set (`"1"`/`"true"`), a Docker/testcontainers failure is a hard
+/// panic instead of a graceful per-test skip. CI sets `FS_PG_REQUIRE_DOCKER=1`
+/// for exactly this reason -- see the module docs above and
+/// `.github/workflows/ci.yml`'s "Test file-storage (pg concurrency,
+/// integration)" step.
+fn require_docker() -> bool {
+    std::env::var("FS_PG_REQUIRE_DOCKER").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Bring up (once per process) a `testcontainers` PostgreSQL, mirroring
 /// resource-group's own `pg_concurrency_test.rs::shared_pg`. Returns `None`
-/// if Docker isn't reachable -- callers treat that as a graceful skip.
+/// if Docker isn't reachable -- callers treat that as a graceful skip, unless
+/// `FS_PG_REQUIRE_DOCKER` is set, in which case that would silently assert
+/// nothing, so this panics instead.
 async fn shared_pg() -> Option<Arc<PgFixture>> {
     PG.get_or_init(|| async {
         let request = ContainerRequest::from(Postgres::default())
@@ -181,6 +205,11 @@ async fn shared_pg() -> Option<Arc<PgFixture>> {
                     _container: container,
                 })),
                 Err(e) => {
+                    assert!(
+                        !require_docker(),
+                        "Docker required (FS_PG_REQUIRE_DOCKER=1) but the PostgreSQL \
+                         container's port could not be resolved: {e}"
+                    );
                     eprintln!(
                         "skipping PostgreSQL concurrency tests: container started but its \
                          port could not be resolved ({e}). Is Docker healthy?"
@@ -189,6 +218,11 @@ async fn shared_pg() -> Option<Arc<PgFixture>> {
                 }
             },
             Err(e) => {
+                assert!(
+                    !require_docker(),
+                    "Docker required (FS_PG_REQUIRE_DOCKER=1) but the PostgreSQL container \
+                     failed to start: {e}"
+                );
                 eprintln!(
                     "skipping PostgreSQL concurrency tests: could not start a PostgreSQL \
                      container via testcontainers ({e}). Install/start Docker to run these \
@@ -529,7 +563,7 @@ impl StorageBackend for FailingInitiateBackend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<futures::stream::BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.inner.get_stream(path).await
     }
     async fn get_range(
