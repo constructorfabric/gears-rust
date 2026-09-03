@@ -83,6 +83,13 @@ impl CleanupStore for Store {
         Store::list_metadata(self, file_id).await
     }
 
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        Store::list_metadata_for_files(self, file_ids).await
+    }
+
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         Store::list_versions(self, file_id).await
     }

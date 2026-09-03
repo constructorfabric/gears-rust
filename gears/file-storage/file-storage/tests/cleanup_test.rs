@@ -262,6 +262,24 @@ fn new_file() -> NewFile {
     }
 }
 
+/// [`new_file`] with the owner set explicitly, for tests whose authorizer
+/// denies `ADMIN_POLICY`.
+///
+/// `new_file`'s `owner_id` is a fresh UUID that never equals the caller's
+/// own `subject_id`, so every file it builds is owned by *another* subject.
+/// `FileService::create_file` now requires `ADMIN_POLICY` for exactly that
+/// (creating a file under a foreign `owner_id` picks that owner's effective
+/// policy and debits that owner's quota), which an admin-denying authorizer
+/// refuses -- unrelated to whatever such a test is actually asserting.
+/// Passing the caller's own subject id keeps the creation self-owned, the
+/// realistic shape for a non-admin caller.
+fn new_file_owned_by(owner_id: Uuid) -> NewFile {
+    NewFile {
+        owner_id,
+        ..new_file()
+    }
+}
+
 /// A [`CleanupStore`] wrapper that makes `list_versions` fail for one
 /// specific `file_id` while delegating every other method to a real
 /// [`Store`]. `CleanupStore` is a narrow trait, so this is a small
@@ -345,6 +363,13 @@ impl CleanupStore for FaultyListVersionsStore {
 
     async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
         self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
     }
 
     /// The one faulted method: errors for `fault_file_id`, delegates otherwise.
@@ -1671,7 +1696,7 @@ async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
     let ctx = ctx(tenant);
 
     let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
+        .create_file(&ctx, new_file_owned_by(ctx.subject_id()), None, false)
         .await
         .unwrap();
     dp.put_content(

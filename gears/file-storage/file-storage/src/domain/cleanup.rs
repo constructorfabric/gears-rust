@@ -354,7 +354,12 @@ impl CleanupEngine {
                 self.best_effort_delete(backend_id, backend_path).await;
                 // @cpt-end:cpt-cf-file-storage-algo-sweep-abandoned-pending:p1:inst-sweep-pending-blob
                 // @cpt-begin:cpt-cf-file-storage-algo-sweep-abandoned-pending:p1:inst-sweep-pending-orphan-file
-                let files_deleted = self.maybe_delete_orphaned_file(file_id).await;
+                // Reuse the `file` snapshot already read (via
+                // `load_file_for_audit`) above for this function's own audit
+                // row, instead of letting `orphan_candidate_file` fetch it a
+                // second time -- same read-elimination as
+                // `cleanup_expired_session_version_with_file`'s.
+                let files_deleted = self.maybe_delete_orphaned_file(file_id, file).await;
                 // @cpt-end:cpt-cf-file-storage-algo-sweep-abandoned-pending:p1:inst-sweep-pending-orphan-file
                 (1, files_deleted)
             }
@@ -394,9 +399,19 @@ impl CleanupEngine {
     ///
     /// Returns `1` if the file row was deleted, `0` otherwise.
     ///
+    /// `prefetched_file` lets a caller that has already read this `File` row
+    /// moments ago (for its own audit-row `tenant_id`, typically) hand it down
+    /// so [`Self::orphan_candidate_file`] does not read it a third time for
+    /// the same file -- pass `None` when no such snapshot is available, and
+    /// this fetches fresh exactly as it always did.
+    ///
     /// @cpt-cf-file-storage-fr-orphan-reconciliation
-    async fn maybe_delete_orphaned_file(&self, file_id: Uuid) -> usize {
-        let Some(file) = self.orphan_candidate_file(file_id).await else {
+    async fn maybe_delete_orphaned_file(
+        &self,
+        file_id: Uuid,
+        prefetched_file: Option<file_storage_sdk::File>,
+    ) -> usize {
+        let Some(file) = self.orphan_candidate_file(file_id, prefetched_file).await else {
             return 0;
         };
 
@@ -463,7 +478,24 @@ impl CleanupEngine {
     /// Extracted from [`Self::maybe_delete_orphaned_file`] to keep its
     /// cognitive complexity down; see that method's docs for why this being
     /// a pre-transaction snapshot is safe.
-    async fn orphan_candidate_file(&self, file_id: Uuid) -> Option<file_storage_sdk::File> {
+    ///
+    /// `remaining` (the version list) is always re-fetched fresh here
+    /// regardless of `prefetched_file` -- that check is the entire point of
+    /// this pre-check and a caller-supplied `File` snapshot says nothing
+    /// about it. `prefetched_file`, when `Some`, is used in place of this
+    /// method's own `get_file` call for the `content_id`/`tenant_id`/
+    /// `owner_id` fields only; it may be a little older than a fresh read
+    /// would be (taken before whatever version-row cleanup the caller just
+    /// did), but per this method's own doc comment above, that staleness
+    /// cannot cause an incorrect delete -- only, in a rare race, one extra
+    /// delete attempt that the transactional guard safely turns into a
+    /// no-op. `None` reproduces the old always-fresh `get_file` call exactly,
+    /// including its "already gone" (`Ok(None)`) and error handling.
+    async fn orphan_candidate_file(
+        &self,
+        file_id: Uuid,
+        prefetched_file: Option<file_storage_sdk::File>,
+    ) -> Option<file_storage_sdk::File> {
         let remaining = match self.store.list_versions(file_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -479,18 +511,9 @@ impl CleanupEngine {
             return None;
         }
 
-        let file = match self.store.get_file(file_id).await {
-            Ok(Some(f)) => f,
-            Ok(None) => return None, // Already gone -- fine.
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    %file_id,
-                    "cleanup: failed to fetch file while checking for orphaned file"
-                );
-                return None;
-            }
-        };
+        let file = self
+            .resolve_orphan_candidate_row(file_id, prefetched_file)
+            .await?;
         if file.content_id.is_some() {
             // Bound content means a version exists (the `remaining` snapshot
             // above must be stale) -- leave the file alone.
@@ -502,6 +525,35 @@ impl CleanupEngine {
         }
 
         Some(file)
+    }
+
+    /// Resolve the `files` row the orphan check needs: the caller's own
+    /// snapshot when it already read one moments ago, otherwise a fresh
+    /// lookup. `None` means "do not treat this file as an orphan" -- either
+    /// the row is already gone (nothing left to reclaim) or the lookup
+    /// failed, in which case erring toward not deleting is the safe
+    /// direction. Split out of [`Self::orphan_candidate_file`] purely to
+    /// keep that method under the crate's cognitive-complexity ceiling.
+    async fn resolve_orphan_candidate_row(
+        &self,
+        file_id: Uuid,
+        prefetched_file: Option<file_storage_sdk::File>,
+    ) -> Option<file_storage_sdk::File> {
+        if let Some(file) = prefetched_file {
+            return Some(file);
+        }
+        match self.store.get_file(file_id).await {
+            Ok(Some(file)) => Some(file),
+            Ok(None) => None, // Already gone -- fine.
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    %file_id,
+                    "cleanup: failed to fetch file while checking for orphaned file"
+                );
+                None
+            }
+        }
     }
 
     /// Whether `file_id` has a not-yet-expired multipart session that should
@@ -584,13 +636,18 @@ impl CleanupEngine {
         &self,
         session: MultipartUploadSession,
     ) -> (usize, usize) {
-        let audit_tenant_id = self
-            .store
-            .get_file(session.file_id)
-            .await
-            .ok()
-            .flatten()
-            .map_or_else(Uuid::nil, |file| file.tenant_id);
+        // Read the parent `File` once, here, and thread it all the way down
+        // through `cleanup_expired_session_version_with_file` to
+        // `orphan_candidate_file`, instead of letting each of those three
+        // spots fetch it independently (three `get_file` calls -- one per
+        // spot -- collapsing to this one for every expired session the sweep
+        // processes). `.ok().flatten()` deliberately keeps the original
+        // silent-on-error fallback (`Uuid::nil()` for the audit tenant when
+        // the lookup fails) unchanged; see the "known open issue" note on
+        // that fallback elsewhere in this module -- this fix is about read
+        // count, not about that fallback's behavior.
+        let file = self.store.get_file(session.file_id).await.ok().flatten();
+        let audit_tenant_id = file.as_ref().map_or_else(Uuid::nil, |file| file.tenant_id);
         let abort_audit = AuditEntry {
             tenant_id: audit_tenant_id,
             actor_kind: "system".to_owned(),
@@ -616,7 +673,14 @@ impl CleanupEngine {
                 // We won the CAS: no concurrent complete can have bound this
                 // version afterward. Safe to clean up the backend handle and
                 // delete the pending version row.
-                let files_reclaimed = self.cleanup_expired_session_version(&session).await;
+                //
+                // Calls the `_with_file` variant directly (not the public
+                // `cleanup_expired_session_version` wrapper) so the `file`
+                // read above is reused instead of re-fetched -- see that
+                // variant's doc comment.
+                let files_reclaimed = self
+                    .cleanup_expired_session_version_with_file(&session, file)
+                    .await;
                 (1, files_reclaimed)
             }
             // @cpt-end:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-cleanup
@@ -686,7 +750,56 @@ impl CleanupEngine {
     /// the session's own CAS to `aborted`, so `has_in_progress_for_file` no
     /// longer sees it as blocking, and the orphan is correctly reclaimed
     /// within the same sweep pass, symmetric with step 1's own path.
+    ///
+    /// This is a thin wrapper over
+    /// [`Self::cleanup_expired_session_version_with_file`] with no prefetched
+    /// `File` (`None`), kept `pub` with this exact signature specifically
+    /// because the unit test named above calls it directly; changing it
+    /// would break that test, which this crate's other agents/files may
+    /// depend on. The real sweep path (`abort_expired_multipart_session`)
+    /// calls the `_with_file` variant instead, passing the `File` it already
+    /// read for its own audit row -- see that variant's doc comment for why.
     pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) -> usize {
+        self.cleanup_expired_session_version_with_file(session, None)
+            .await
+    }
+
+    /// Implementation behind [`Self::cleanup_expired_session_version`],
+    /// parameterized on an optional already-read parent `File`.
+    ///
+    /// Two spots in this method need the parent `File` (or at least its
+    /// `tenant_id`): the pending-version-delete audit row below, and --
+    /// transitively, via [`Self::maybe_delete_orphaned_file`] ->
+    /// [`Self::orphan_candidate_file`] -- the zero-version orphan pre-check
+    /// at the end. Previously each fetched it independently with its own
+    /// `get_file` call, and `abort_expired_multipart_session` (the only
+    /// production caller) had *already* read the same file a third time just
+    /// before calling in, for its own "session aborted" audit row -- three
+    /// reads of one row per expired session. `prefetched_file` lets a caller
+    /// that already has a (possibly slightly stale) snapshot hand it down
+    /// instead: reused here for the delete-audit `tenant_id`, and passed
+    /// through unchanged to `maybe_delete_orphaned_file` so
+    /// `orphan_candidate_file` can skip its own `get_file` too.
+    ///
+    /// A `None` (the public wrapper's case, e.g. the unit test invoking it
+    /// standalone) reproduces the old fully-fresh, three-reads-worth-of-work
+    /// behavior exactly -- this only removes *redundant* reads, it does not
+    /// change what gets read when there is nothing to reuse.
+    ///
+    /// Reusing a snapshot taken slightly earlier (before the backend abort
+    /// and the pending-version delete this method performs) is safe for both
+    /// uses: `tenant_id` does not change as a side effect of aborting an
+    /// upload, and the orphan pre-check's own doc comment already establishes
+    /// that staleness here cannot cause data loss -- `delete_orphan_file_with_event`
+    /// re-verifies the same zero-versions/`NULL`-`content_id` condition fresh
+    /// *inside* its own transaction, so a pre-check working off a slightly
+    /// older snapshot only risks one extra, safely-aborted delete attempt in
+    /// an already-rare race window, never an incorrect deletion.
+    async fn cleanup_expired_session_version_with_file(
+        &self,
+        session: &MultipartUploadSession,
+        prefetched_file: Option<file_storage_sdk::File>,
+    ) -> usize {
         let ver = self
             .store
             .get_version(session.file_id, session.version_id)
@@ -722,14 +835,18 @@ impl CleanupEngine {
         // version that a racing `complete_multipart_upload` already flipped
         // to `available` (via `finalize_version`, ahead of its own session
         // CAS) is left untouched -- the DELETE simply matches zero rows.
+        // Reuse `prefetched_file` when the caller already has it; otherwise
+        // fetch it here, exactly as this used to unconditionally do. Either
+        // way this is now the ONE read of the file this method performs (the
+        // same snapshot, if present, is handed to `maybe_delete_orphaned_file`
+        // below instead of triggering yet another read there).
+        let file = match prefetched_file {
+            Some(file) => Some(file),
+            None => self.store.get_file(session.file_id).await.ok().flatten(),
+        };
         let del_audit = orphan_reconcile_audit(
             session.file_id,
-            self.store
-                .get_file(session.file_id)
-                .await
-                .ok()
-                .flatten()
-                .map_or_else(Uuid::nil, |file| file.tenant_id),
+            file.as_ref().map_or_else(Uuid::nil, |file| file.tenant_id),
             serde_json::json!({
                 "reason": "expired_multipart_version_cleanup",
                 "upload_id": session.upload_id,
@@ -755,7 +872,12 @@ impl CleanupEngine {
         // just deleted above, or already reclaimed earlier by step 1's own
         // path (`delete_abandoned_pending_version`, whose own attempt was
         // correctly blocked while this session still looked in-progress).
-        self.maybe_delete_orphaned_file(session.file_id).await
+        //
+        // `file` (the same snapshot used for `del_audit`'s tenant_id above)
+        // is handed down so `orphan_candidate_file` does not re-fetch it --
+        // see `cleanup_expired_session_version_with_file`'s doc comment for
+        // why that reuse is safe.
+        self.maybe_delete_orphaned_file(session.file_id, file).await
     }
 
     /// Tell a backend to abort a multipart upload handle; log and ignore errors.
@@ -848,19 +970,106 @@ impl CleanupEngine {
         all_rules: &[crate::domain::policy::StoredRetentionRule],
         now: OffsetDateTime,
     ) -> usize {
+        // N+1 fix (metadata half, page level): fetch the custom metadata of
+        // every file on this page that actually needs it in ONE query,
+        // instead of one query per file inside `maybe_expire_file`. Files
+        // whose applicable rules carry no metadata criterion are not fetched
+        // at all (see `needs_metadata`), so a deployment with only
+        // age/inactivity rules -- the common case -- issues zero metadata
+        // queries per page, and one with metadata rules issues exactly one.
+        //
+        // `RETENTION_SWEEP_BATCH` is 500, so the `IN (...)` list binds at
+        // most 500 parameters, an order of magnitude below the smallest
+        // backend budget `max_bind_params_for` reports (30_000 on SQLite) --
+        // no chunking is needed here, unlike `MetadataRepo::delete_keys`
+        // whose list length follows an unbounded client request.
+        let need_metadata: Vec<Uuid> = batch
+            .iter()
+            .filter(|f| Self::needs_metadata(all_rules, f))
+            .map(|f| f.file_id)
+            .collect();
+        let prefetched = if need_metadata.is_empty() {
+            Some(std::collections::HashMap::new())
+        } else {
+            match self.store.list_metadata_for_files(&need_metadata).await {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    // Mirrors the old per-file failure behaviour, page-wide:
+                    // a file whose rules need metadata we could not read is
+                    // skipped (never expired on incomplete information),
+                    // while files whose rules need no metadata are still
+                    // evaluated normally below.
+                    tracing::warn!(
+                        error = ?e,
+                        page_size = batch.len(),
+                        "cleanup: failed to batch-fetch metadata for retention check -- \
+                         files with metadata-criterion rules are skipped this pass"
+                    );
+                    None
+                }
+            }
+        };
+
         let mut count = 0_usize;
         for file in batch {
-            count += self.maybe_expire_file(file, all_rules, now).await;
+            count += self
+                .maybe_expire_file(file, all_rules, now, prefetched.as_ref())
+                .await;
         }
         count
     }
 
+    /// Whether any retention rule applicable to `file` carries a metadata
+    /// criterion -- i.e. whether [`Self::maybe_expire_file`] will need this
+    /// file's custom metadata to reach a verdict.
+    ///
+    /// Shared by [`Self::expire_batch`]'s page-level prefetch and
+    /// `maybe_expire_file`'s own evaluation so the two can never disagree
+    /// about which files were fetched: if this says `false`, no query is
+    /// issued and `rule_matches` is handed an empty slice, which it treats
+    /// identically (it only reads `metadata` inside its
+    /// `body.metadata.is_some()` branch).
+    fn needs_metadata(
+        all_rules: &[crate::domain::policy::StoredRetentionRule],
+        file: &file_storage_sdk::File,
+    ) -> bool {
+        all_rules
+            .iter()
+            .any(|r| rule_applies_to_file(r, file) && r.body.metadata.is_some())
+    }
+
     /// Check and apply retention rules to one file. Returns 1 if deleted, 0 otherwise.
+    ///
+    /// N+1 fix (metadata half): this used to call
+    /// [`CleanupStore::list_metadata`] unconditionally for every file with at
+    /// least one applicable rule -- one query per such file, every
+    /// `sweep_interval_secs`, for the lifetime of the deployment -- even
+    /// though [`rule_matches`] only ever consults `metadata` inside its
+    /// `body.metadata.is_some()` branch. A deployment with a single
+    /// tenant-scope age/inactivity rule (the common case: one rule, applying
+    /// to every file) paid for a metadata query per file for data no rule
+    /// ever looked at. Skipping the fetch below when no applicable rule has
+    /// a metadata criterion is exactly as correct as fetching real metadata
+    /// and passing it in, since `rule_matches` would ignore it either way --
+    /// it is not a behavior change, only fewer queries.
+    ///
+    /// The page-level half is fixed too: [`Self::expire_batch`] now
+    /// prefetches the metadata of every file on the page that needs it in a
+    /// single [`CleanupStore::list_metadata_for_files`] query (the same
+    /// batching `GET /files` uses on the read path) and hands the result in
+    /// via `prefetched_metadata`, so this method issues no queries of its
+    /// own at all. `None` there means that batch fetch failed, in which case
+    /// a file whose rules need metadata is skipped rather than expired on
+    /// data that could not be read.
+    ///
     async fn maybe_expire_file(
         &self,
         file: &file_storage_sdk::File,
         all_rules: &[crate::domain::policy::StoredRetentionRule],
         now: OffsetDateTime,
+        prefetched_metadata: Option<
+            &std::collections::HashMap<Uuid, Vec<file_storage_sdk::CustomMetadataEntry>>,
+        >,
     ) -> usize {
         // Gather applicable rules: tenant-scope, user-scope (owner), file-scope.
         // @cpt-begin:cpt-cf-file-storage-algo-sweep-retention-expiry:p1:inst-sweep-retention-applicable
@@ -874,26 +1083,35 @@ impl CleanupEngine {
         }
         // @cpt-end:cpt-cf-file-storage-algo-sweep-retention-expiry:p1:inst-sweep-retention-applicable
 
-        // Fetch custom metadata for metadata-criterion rules.
+        // Fetch custom metadata only when some applicable rule actually has a
+        // metadata criterion -- see this method's doc comment. `rule_matches`
+        // treats an empty slice identically to "no matching metadata entry",
+        // and it never reaches the `metadata` parameter at all for a rule
+        // whose `body.metadata` is `None`, so this is semantically a no-op
+        // for every rule that doesn't need it.
         // @cpt-begin:cpt-cf-file-storage-algo-sweep-retention-expiry:p1:inst-sweep-retention-metadata
-        let metadata = match self.store.list_metadata(file.file_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    file_id = %file.file_id,
-                    "cleanup: failed to fetch metadata for retention check -- skipping file"
-                );
-                return 0;
-            }
-        };
+        let metadata: &[file_storage_sdk::CustomMetadataEntry] =
+            if applicable.iter().any(|r| r.body.metadata.is_some()) {
+                match prefetched_metadata {
+                    // Absent from the map == this file simply has no custom
+                    // metadata rows, which `rule_matches` treats the same as
+                    // "no entry matched".
+                    Some(map) => map.get(&file.file_id).map_or(&[][..], Vec::as_slice),
+                    // The page-level batch fetch failed (already logged by
+                    // `expire_batch`): skip rather than expire a file on
+                    // metadata we could not read.
+                    None => return 0,
+                }
+            } else {
+                &[]
+            };
         // @cpt-end:cpt-cf-file-storage-algo-sweep-retention-expiry:p1:inst-sweep-retention-metadata
 
         // OR semantics: if any rule triggers, delete the file.
         // @cpt-begin:cpt-cf-file-storage-algo-sweep-retention-expiry:p1:inst-sweep-retention-match
         let should_expire = applicable
             .iter()
-            .any(|r| rule_matches(&r.body, file, &metadata, now));
+            .any(|r| rule_matches(&r.body, file, metadata, now));
 
         if !should_expire {
             return 0;
