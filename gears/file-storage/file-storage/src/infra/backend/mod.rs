@@ -265,7 +265,22 @@ pub trait StorageBackend: Send + Sync {
     /// verification (`cpt-cf-file-storage-fr-backend-abstraction`,
     /// memory-safety fix mirroring `put_stream`'s streaming-write bound) to
     /// recompute the actual size/hash/MIME-sniff-prefix from the real stored
-    /// bytes without re-inflating a potentially huge object into memory.
+    /// bytes without re-inflating a potentially huge object into memory, and
+    /// by the sidecar's whole-object `download` handler (P2 download-memory
+    /// fix) so a `GET` without a `Range` header streams straight into the
+    /// HTTP response body instead of first landing in a `Bytes` buffer.
+    ///
+    /// Declared `BoxStream<'static, _>` rather than borrowing `&self`'s
+    /// lifetime: every implementation below (and the default here) moves
+    /// fully-owned data into the returned stream (an owned file handle, an
+    /// owned `reqwest::Response`, an owned `Bytes` — never a reference back
+    /// into `self`), so nothing is actually lost by widening the bound, and
+    /// widening it is exactly what lets a caller hand the stream straight to
+    /// `axum::body::Body::from_stream`, which requires a genuinely `'static`
+    /// stream — a `BoxStream<'_, _>` tied to a short-lived `&Arc<dyn
+    /// StorageBackend>` borrow could never satisfy that without an unsound
+    /// lifetime cast, and this crate forbids `unsafe` outright
+    /// (`unsafe_code = "forbid"` at the workspace level).
     ///
     /// The default implementation falls back to `get`, yielding the whole
     /// blob as a single chunk (`futures::stream::once`) — still correct, just
@@ -276,15 +291,21 @@ pub trait StorageBackend: Send + Sync {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<futures::stream::BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
-        let stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>> =
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
             Box::pin(futures::stream::once(async move { Ok(bytes) }));
         Ok(stream)
     }
 
     /// Read a byte range of the blob at `path`. Default impl reads the whole
     /// blob then slices; range-native backends should override.
+    ///
+    /// Still used directly (whole range materialized as `Bytes`) by
+    /// `domain::data_plane::DataPlaneService::read_content` and by
+    /// `domain::multipart_service`'s small (≤512-byte) MIME-sniff-prefix
+    /// reads — both read small, already-memory-appropriate spans, so they
+    /// keep using this rather than [`Self::get_range_stream`].
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
         let full = self.get(path).await?;
         let total = full.len() as u64;
@@ -296,6 +317,39 @@ pub trait StorageBackend: Send + Sync {
             }
             None => Err(DomainError::validation("range", "unsatisfiable byte range")),
         }
+    }
+
+    /// Stream a byte range of the blob at `path`, without necessarily
+    /// buffering the whole resolved range in memory at once — the
+    /// range-request mirror of [`Self::get_stream`]'s relationship to
+    /// [`Self::get`]. Used by the sidecar's `download` handler for a `Range`-
+    /// qualified `GET` (P2 download-memory fix): `Range: bytes=0-` is the
+    /// very first request many media players issue, and
+    /// `ByteRange::OpenEnded::resolve` turns that into a range spanning the
+    /// *entire* object, so an unbounded-media-length upload combined with a
+    /// naive `Vec::with_capacity(len)` read (the old `get_range` default's
+    /// shape) was not a hypothetical — see the e2e video demo under
+    /// `testing/e2e/gears/file_storage/web_ui/`.
+    ///
+    /// Same `'static` rationale as [`Self::get_stream`]: every override below
+    /// moves fully-owned data into the returned stream, never a borrow of
+    /// `self`, so declaring it `'static` costs nothing and is what lets the
+    /// sidecar hand it straight to `axum::body::Body::from_stream`.
+    ///
+    /// The default implementation falls back to `get_range`, yielding the
+    /// whole resolved range as a single chunk — still correct, just not
+    /// memory-bounded — so any backend that hasn't been upgraded to a true
+    /// streaming range read stays correct; `local-fs`, `s3`, and `in-memory`
+    /// all override this natively (see their own doc comments).
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let bytes = self.get_range(path, range).await?;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        Ok(stream)
     }
 
     /// The total length in bytes of the blob at `path`, without necessarily
@@ -317,6 +371,31 @@ pub trait StorageBackend: Send + Sync {
 
     /// Whether a blob exists at `path`.
     async fn exists(&self, path: &str) -> Result<bool, DomainError>;
+
+    /// Combined existence-check-plus-size stat: `Ok(None)` when
+    /// nothing is stored at `path` (mirrors `exists`'s `Ok(false)`),
+    /// `Ok(Some(len))` when a blob is present with byte length `len`
+    /// (mirrors `size`'s `Ok(n)`), and `Err` for a genuine backend fault
+    /// distinct from either -- the same three-way split `exists` already
+    /// documents, just resolved by one round-trip instead of two.
+    ///
+    /// This exists because the sidecar's download handlers previously had to
+    /// call `exists` (to answer `404` distinctly from a backend fault) and
+    /// then, separately, `size` (to size the response / resolve a `Range`) --
+    /// two `HeadObject` calls against `S3Backend` for every `GET`/`HEAD`. A
+    /// caller that needs both facts should call this once instead.
+    ///
+    /// The default implementation composes `exists` then `size` -- the same
+    /// two calls a caller previously had to make itself -- so a backend that
+    /// hasn't been upgraded to a single combined stat still behaves
+    /// correctly; `local-fs`, `s3`, and `in-memory` all override this with a
+    /// single native stat.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        if !self.exists(path).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.size(path).await?))
+    }
 
     /// Initiate a multipart upload for `path`. Returns an opaque backend handle.
     /// Default returns an error — backends must opt-in by overriding this method
