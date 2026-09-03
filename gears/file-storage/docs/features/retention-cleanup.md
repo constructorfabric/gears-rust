@@ -102,7 +102,21 @@ documented as a process in §3 instead.
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
 **Success Scenarios**:
-- Caller receives every retention rule (any scope) belonging to their tenant
+- A caller holding `ADMIN_POLICY` receives every retention rule (any scope) belonging to their tenant
+- A non-admin caller receives only the rules they may see: all `Tenant`-scope rules, `User`-scope
+  rules that target themselves, and `File`-scope rules whose target file they own (owner compared
+  as the `(owner_kind, owner_id)` pair, not `owner_id` alone — `user` and `app` are disjoint owner
+  spaces that can share a UUID) — the store query has no owner/target filter, so without this the
+  response would leak every other tenant member's retention configuration
+- **Known limitations on the `File`-scope branch.** A rule whose target file has since been deleted
+  stays invisible to every non-admin caller, including whoever created it: `StoredRetentionRule`
+  carries no creator/`subject_id` column, so once the target file is gone there is no stored fact
+  left to compare against (an admin can still see it via `ADMIN_POLICY`, or remove it via
+  `delete_retention_rule`'s own dangling-target fallback). Separately, a `File`-scope rule can be
+  created by anyone holding per-file `WRITE` on the target — not only the file's owner — so a
+  subject who created such a rule via delegated `WRITE` on someone else's file will not see it in
+  this listing: visibility is gated on being the target file's *owner*, not on having created the
+  rule.
 
 **Error Scenarios**:
 - Caller lacks `READ` — `403`
@@ -111,7 +125,11 @@ documented as a process in §3 instead.
 1. [x] - `p1` - Client: GET /api/file-storage/v1/retention-rules - `inst-retention-list-request`
 2. [x] - `p1` - Authorize `READ` on `("", None)` - `inst-retention-list-authz`
 3. [x] - `p1` - DB: SELECT all retention rules for the caller's tenant - `inst-retention-list-load`
-4. [x] - `p1` - RETURN 200 with the list - `inst-retention-list-return`
+4. [x] - `p1` - Filter the result: pass it through unfiltered if the caller also holds `ADMIN_POLICY`;
+   otherwise keep only `Tenant`-scope rules, `User`-scope rules targeting the caller, and
+   `File`-scope rules whose target file's `(owner_kind, owner_id)` pair matches the caller —
+   dropping every other `File`-scope rule, including ones targeting an already-deleted file
+5. [x] - `p1` - RETURN 200 with the list - `inst-retention-list-return`
 
 ### Create Retention Rule
 
@@ -135,12 +153,14 @@ documented as a process in §3 instead.
   authorizing, so a foreign tenant's file UUID cannot be distinguished from a
   nonexistent one; both surface identically as `FileNotFound`)
 - `scope = user` and the target is a different user, without `ADMIN_POLICY` — `403`
-- Caller lacks `WRITE` (tenant scope) — `403`
+- Caller lacks `ADMIN_POLICY` (tenant scope, no `WRITE` fallback) — `403` (a tenant-scope rule is a
+  standing instruction for the background sweep to permanently delete every matching file for every
+  subject in the tenant, so ordinary per-file `WRITE` is not enough)
 
 **Steps**:
 1. [x] - `p1` - Client: POST /api/file-storage/v1/retention-rules {scope, scope_target_id?, body} - `inst-retention-create-request`
-2. [x] - `p1` - Authorize by scope: `Tenant` → plain `WRITE`; `User` → `ADMIN_POLICY`-first with a `WRITE`-plus-target-match fallback (a missing target is a mismatch, not "no check" — unlike the policy-engine's tenant-scope fallback); `File` → resolve the target file via `require_file`, scoped to the caller's own tenant (a foreign or missing file surfaces as `FileNotFound`, not silently accepted) then require per-file `WRITE` - `inst-retention-create-authz`
-3. [x] - `p1` - Algorithm: `cpt-cf-file-storage-algo-validate-retention-rule` — reject a dead-on-write or immediately-total-expiry body - `inst-retention-create-validate`
+2. [x] - `p1` - Algorithm: `cpt-cf-file-storage-algo-validate-retention-rule` — reject a dead-on-write or immediately-total-expiry body - `inst-retention-create-validate` (runs before authorization: otherwise the same malformed body answers `403` for a non-admin caller and `400` for an admin, since only the admin ever reaches validation)
+3. [x] - `p1` - Authorize by scope: `Tenant` → `ADMIN_POLICY` outright, no fallback to `WRITE`; `User` → `ADMIN_POLICY`-first with a `WRITE`-plus-target-match fallback (a missing target is a mismatch, not "no check" — unlike the policy-engine's tenant-scope fallback); `File` → resolve the target file via `require_file`, scoped to the caller's own tenant (a foreign or missing file surfaces as `FileNotFound`, not silently accepted) then require per-file `WRITE` - `inst-retention-create-authz`
 4. [x] - `p1` - DB: INSERT the rule row - `inst-retention-create-insert`
 5. [x] - `p1` - RETURN 201 with the created rule - `inst-retention-create-return`
 
@@ -171,7 +191,7 @@ documented as a process in §3 instead.
 **Steps**:
 1. [x] - `p1` - Client: DELETE /api/file-storage/v1/retention-rules/{rule_id} - `inst-retention-delete-request`
 2. [x] - `p1` - DB (fetch-then-reauthorize): SELECT the rule scoped to the caller's own tenant, purely to learn its `(scope, scope_target_id)` — a bare `rule_id` carries no ownership information, so a coarse tenant-wide `DELETE` check alone would let any tenant member delete any other member's rule; scoping this fetch to the caller's own tenant also means a foreign tenant's `rule_id` simply does not resolve, `404`-ing here exactly like a nonexistent one, before authorization is ever consulted - `inst-retention-delete-load`
-3. [x] - `p1` - Re-run the same scope-based authorization [Create Retention Rule](#create-retention-rule) uses, against the rule's actual `(scope, scope_target_id)`; for `scope = file`, if the target file no longer exists (`FileNotFound`), fall back to the same plain tenant-wide `WRITE` gate the `Tenant` arm uses rather than propagating the 404 — an orphaned file-scope rule must remain deletable - `inst-retention-delete-authz`
+3. [x] - `p1` - Re-run the same scope-based authorization [Create Retention Rule](#create-retention-rule) uses, against the rule's actual `(scope, scope_target_id)`; for `scope = file`, if the target file no longer exists (`FileNotFound`), fall back to a plain tenant-wide `WRITE` gate — there is no file left to check per-file `WRITE` against, so this is the closest available equivalent, deliberately NOT raised to `ADMIN_POLICY` since a rule whose target file is already gone governs nothing — rather than propagating the 404 — an orphaned file-scope rule must remain deletable - `inst-retention-delete-authz`
 4. [x] - `p1` - DB: DELETE the rule row, scoped to the authorized `AccessScope` - `inst-retention-delete-remove`
 5. [x] - `p1` - RETURN 204 - `inst-retention-delete-return`
 
@@ -265,7 +285,7 @@ dangerous or permanently dead rather than silently accept it.
 **Steps**:
 1. [x] - `p2` - **IF** `age`, `inactivity`, and `metadata` are all absent: reject — the rule could never match any file - `inst-validate-retention-empty`
 2. [x] - `p2` - **IF** `age.max_age_days < 1` or `inactivity.inactivity_days < 1` (i.e. `== 0`, both are `u32`): reject — `0` would match every file in the tenant on the very next sweep tick, and there is no dry-run or undo - `inst-validate-retention-zero`
-3. [x] - `p2` - **IF** `scope ∈ {User, File}` and `scope_target_id` is absent: reject — a dead rule that can never resolve to a target file (the `File` case already cannot reach this point, since `authorize_retention_scope`'s `File` arm requires the target to resolve via `require_file` first; this check is what catches a `User`-scope rule with no target from an `ADMIN_POLICY` caller, since that arm only checks the target for a non-admin caller) - `inst-validate-retention-target`
+3. [x] - `p2` - **IF** `scope ∈ {User, File}` and `scope_target_id` is absent: reject — a dead rule that can never resolve to a target file (this validation runs *before* authorization in `create_retention_rule`, so this check — not `authorize_retention_scope`'s `File` arm — is what catches a missing target for both `User`- and `File`-scope requests; `authorize_retention_scope` never sees a missing `File`-scope target, since a request that lacks one is already rejected by the time it would run) - `inst-validate-retention-target`
 4. [x] - `p2` - RETURN `Ok(())` otherwise - `inst-validate-retention-return`
 
 ## 4. States (CDSL)
@@ -297,7 +317,7 @@ semantics — any one matching criterion triggers expiry) are defined in `src/do
 `DELETE /retention-rules/{rule_id}` (`src/api/rest/routes.rs:388-440`, `handlers::list_retention_rules`/
 `create_retention_rule`/`delete_retention_rule`) are backed by `PolicyService::list_retention_rules`/
 `create_retention_rule`/`delete_retention_rule` (`src/domain/policy_service.rs`). Scope-aware authorization (`Tenant`
-= plain `WRITE`; `User` = `ADMIN_POLICY`-first with `WRITE`-plus-target-match fallback; `File` = resolve-then-
+= `ADMIN_POLICY` outright, no `WRITE` fallback; `User` = `ADMIN_POLICY`-first with `WRITE`-plus-target-match fallback; `File` = resolve-then-
 per-file-`WRITE`) is covered by `tests/policy_authz_test.rs`
 (`create_retention_rule_file_scope_target_not_writable_is_denied`,
 `create_retention_rule_file_scope_target_writable_is_allowed`, `delete_retention_rule_foreign_owner_is_denied`,

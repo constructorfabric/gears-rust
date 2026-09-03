@@ -218,19 +218,26 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB) for the `PUT` route. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs. |
 | `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks. |
 | `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane — without these timeouts, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
+| `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` | `2` | Caps how many `upload_multipart_part` requests take the `multipart_native` write path (`write_multipart_part_native`) concurrently. Each in-flight request on that path buffers up to `MAX_PART_SIZE` (5 GiB) in memory before writing it out, so with no cap N concurrent part uploads could drive memory to roughly `N * MAX_PART_SIZE`; at the default of `2` that is up to 10 GiB. A request that cannot immediately acquire a slot waits briefly (`PART_UPLOAD_ACQUIRE_TIMEOUT`, 200ms) for one to free up before it is rejected with `503`/`Retry-After: 1` — not queued indefinitely, but not rejected outright the instant the limit is hit either. |
 | `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret once it flips `require_finalize_internal_secret` on. |
 | `FS_SIDECAR_S3_BACKENDS` | unset (no S3 backends) | Optional JSON array of `S3BackendConfig` entries (mirrors the control plane's `s3_backends`), folded into the sidecar's own `BackendRegistry` alongside the always-present `local-fs` backend so a control-plane-registered `S3Backend` is reachable by real traffic dispatched per-request via `claims.backend_id`. Credentials embedded in this JSON blob are acceptable for the sidecar (the one component authorized to hold them, per ADR-0003) but should be sourced from a secrets manager / mounted file in production where supported. |
 
-Every `FS_SIDECAR_*` numeric env var (`FS_SIDECAR_MAX_BODY_BYTES`, the two timeout vars) fails sidecar startup with a
+Every `FS_SIDECAR_*` numeric env var (`FS_SIDECAR_MAX_BODY_BYTES`, the two timeout vars, and
+`FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) fails sidecar startup with a
 descriptive error if the value is *set but does not parse* (`parse_optional`/`parse_env_or_default`,
 `src/bin/sidecar.rs`) — it does **not** silently fall back to the default on a typo like
 `FS_SIDECAR_MAX_BODY_BYTES=5GB`. Only a genuinely unset variable uses the default.
 
 A failed finalize/report-part callback (after the sidecar's retry budget, see `post_with_retry` /
-`CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The upload itself is
-**idempotent** (the backend `PUT` is overwrite-safe), so the documented recovery is: the client retries the upload
-via a fresh `PUT` to the same signed URL, or — for the finalize case specifically — the version may already be
-correctly finalized server-side even though the client saw a transient `502` on a preceding attempt (re-verify via
+`CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The backend write itself
+is **create-exclusive, not overwrite-safe**: `StorageBackend::publish_exclusive` writes only the *first* time a
+given backend path is empty — a retried `PUT` to the same signed URL never overwrites bytes already landed there,
+it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
+`PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
+stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt; if the version
+was already finalized or the retried bytes disagree with what's stored, it answers `409 Conflict` instead — never
+a silent overwrite. For the finalize case specifically, the version may already be correctly finalized
+server-side even though the client saw a transient `502` on a preceding attempt (re-verify via
 `GET /files/{id}/versions` before assuming failure).
 
 ## The background cleanup sweep

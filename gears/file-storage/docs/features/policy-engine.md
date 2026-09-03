@@ -122,13 +122,18 @@ User-facing interactions that start with an actor and describe the end-to-end fl
 - `allowed_mime_types` or `size_limits.per_mime` contains a `*/*` entry — `400` (rejected outright: `*/*` would
   silently match nothing against the wildcard matcher, which only special-cases the *subtype* half of a pattern —
   a caller that wants "no restriction" should omit the field entirely)
-- Caller lacks `WRITE` (and, for a foreign `scope_owner_id`, lacks `ADMIN_POLICY` too) — `403`
+- `scope_owner_id` is absent (tenant scope) and the caller lacks `ADMIN_POLICY` — `403`, with no
+  fallback to `WRITE`: a tenant-scope policy applies to every subject in the tenant (allowed mime
+  types, size and metadata limits), so ordinary file-`WRITE` must not let an unprivileged tenant
+  member unilaterally tighten or loosen it for everyone
+- `scope_owner_id` is present and the caller lacks `WRITE` (or, for a foreign `scope_owner_id`, lacks
+  `ADMIN_POLICY` too) — `403`
 
 **Steps**:
 1. [x] - `p1` - Client: PUT /api/file-storage/v1/policy {scope, scope_owner_id?, body} - `inst-policy-set-request`
 2. [x] - `p1` - API: parse `scope`; `400` if invalid - `inst-policy-set-parse-scope`
-3. [x] - `p1` - Authorize: same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match fallback as [Get Own Policy](#get-own-policy), with `WRITE` instead of `READ` as the fallback action - `inst-policy-set-authz`
-4. [x] - `p1` - Validate: reject `scope = User` with no `scope_owner_id`, and reject any `*/*` mime pattern in `allowed_mime_types`/`size_limits.per_mime` - `inst-policy-set-validate`
+3. [x] - `p1` - Validate: reject `scope = User` with no `scope_owner_id`, and reject any `*/*` mime pattern in `allowed_mime_types`/`size_limits.per_mime` - `inst-policy-set-validate` (runs before authorization: a `User`-scope request missing its owner is a malformed body, `400`, not an administrative act — validating first means it is never misreported as `403` just because a missing owner also happens to be how tenant scope is spelled)
+4. [x] - `p1` - Authorize: if `scope_owner_id` is absent (tenant scope), require `ADMIN_POLICY` outright with no fallback; otherwise the same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match fallback as [Get Own Policy](#get-own-policy), with `WRITE` instead of `READ` as the fallback action - `inst-policy-set-authz`
 5. [x] - `p1` - DB: upsert the `(tenant_id, scope, scope_owner_id)` row transactionally (partial-unique-index backstop; two sequential upserts for the same scope leave exactly one row, never a duplicate) - `inst-policy-set-upsert`
 6. [x] - `p1` - RETURN 200 with the stored policy (`created_at`/`updated_at` both the write's timestamp) - `inst-policy-set-return`
 
@@ -146,10 +151,14 @@ User-facing interactions that start with an actor and describe the end-to-end fl
 
 **Error Scenarios**:
 - Caller lacks `READ` — `403`
+- `user_owner_id` is present and differs from the caller's own subject id, and the caller lacks
+  `ADMIN_POLICY` — `403` (plain `READ` only clears the tenant policy and the caller's own user
+  policy; without this check any tenant member could pass a victim's id and have that user's policy
+  merged into the response — a policy-disclosure side channel)
 
 **Steps**:
 1. [x] - `p1` - Client: GET /api/file-storage/v1/policy/effective?user_owner_id={uuid?} - `inst-policy-eff-request`
-2. [x] - `p1` - Authorize `READ` on `("", None)` - `inst-policy-eff-authz`
+2. [x] - `p1` - Authorize `READ` on `("", None)`; if `user_owner_id` is present and differs from the caller's own subject id, additionally require `ADMIN_POLICY` - `inst-policy-eff-authz`
 3. [x] - `p1` - DB: SELECT the tenant-scope policy row (always) and, if `user_owner_id` is present, the user-scope row for that owner - `inst-policy-eff-load`
 4. [x] - `p1` - Algorithm: `cpt-cf-file-storage-algo-resolve-effective-policy` combines the two (either or both may be absent) - `inst-policy-eff-resolve`
 5. [x] - `p1` - RETURN 200 with the resolved `EffectivePolicy` - `inst-policy-eff-return`
@@ -277,8 +286,10 @@ the field is inert configuration, not enforced gating. See
 
 `GET /api/file-storage/v1/policy` and `PUT /api/file-storage/v1/policy`
 (`src/api/rest/routes.rs:324-363`, `handlers::get_policy`/`set_policy`) are backed by `PolicyService::get_own_policy`/
-`set_policy` (`src/domain/policy_service.rs`). Authorization: `ADMIN_POLICY`-first with a `READ`/`WRITE`-plus-
-owner-match fallback (`authorize_scope_owner`/`authorize_admin_or_owner`), covered by `tests/policy_authz_test.rs`
+`set_policy` (`src/domain/policy_service.rs`). Authorization: `get_own_policy` and `set_policy`'s `Some(scope_owner_id)`
+branch use `ADMIN_POLICY`-first with a `READ`/`WRITE`-plus-owner-match fallback (`authorize_scope_owner`/
+`authorize_admin_or_owner`); `set_policy`'s tenant-scope branch (`scope_owner_id = None`) requires `ADMIN_POLICY`
+outright with no fallback, since a tenant-scope write applies to every subject in the tenant. Covered by `tests/policy_authz_test.rs`
 (`set_policy_foreign_owner_without_admin_scope_is_denied`, `set_policy_self_owner_is_allowed`,
 `set_policy_tenant_admin_scope_allows_foreign_owner`, `set_policy_user_scope_without_owner_is_rejected`,
 `set_policy_star_slash_star_mime_is_rejected_or_defined`). Upsert race-safety (two sequential upserts for the same
@@ -298,7 +309,9 @@ scope leave exactly one row) covered by `tests/policy_test.rs`.
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-policy-effective-endpoint`
 
 `GET /api/file-storage/v1/policy/effective` (`routes.rs:365-386`, `handlers::get_effective_policy`) is
-backed by `PolicyService::get_effective_policy`, gated on plain `READ`.
+backed by `PolicyService::get_effective_policy`, gated on plain `READ` — plus `ADMIN_POLICY` when the
+query's `user_owner_id` differs from the caller's own subject id, to prevent using it as a
+policy-disclosure side channel against another user.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-policy-get-effective`
@@ -355,9 +368,12 @@ the service layer) and `tests/multipart_test.rs` (`PolicySizeExceeded` at multip
 - [x] A user-scope policy write without `scope_owner_id`, or any `*/*` mime pattern in `allowed_mime_types`/
   `size_limits.per_mime`, is rejected at write time rather than silently accepted as a dead or accidental deny-all
   entry
-- [x] Policy read/write authorization tries `ADMIN_POLICY` first (cross-owner/tenant-wide administration) and falls
-  back to `READ`/`WRITE` plus an owner-match check for self-service tenant members; tenant-scope requests (no
-  owner to compare) succeed on the fallback action alone
+- [x] Policy read authorization (`get_own_policy`) tries `ADMIN_POLICY` first (cross-owner/tenant-wide
+  administration) and falls back to `READ` plus an owner-match check for self-service tenant members;
+  a tenant-scope read (no owner to compare) succeeds on `READ` alone. `set_policy`'s user-scope write
+  follows the same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match pattern, but its tenant-scope write
+  requires `ADMIN_POLICY` outright with no fallback — there is no owner to fall back to self-service
+  for, and a tenant-scope write changes policy for every subject in the tenant
 - [ ] `PolicyMimeNotAllowed`/`PolicySizeExceeded`/`PolicyMetadataExceeded` are documented in their own
   `domain/error.rs` doc-comments as `415`/`413`/`422` respectively, but the platform's actual canonical-error
   mapping (pinned by `tests/error_mapping_test.rs`) resolves **all three to `400`** — those doc-comments are stale;

@@ -715,7 +715,13 @@ test-users-info-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p users-info --features "integration"
 
-## Run file-storage gear PostgreSQL concurrency tests
+## Run file-storage gear PostgreSQL concurrency tests (Docker required; spins
+## up its own postgres container via testcontainers -- see
+## gears/file-storage/file-storage/tests/pg_concurrency_test.rs). Skips
+## gracefully when Docker isn't reachable UNLESS FS_PG_REQUIRE_DOCKER=1 is
+## set in the environment (fail-closed), which CI's workflow does for this
+## target -- left unset here so a plain local `make test-fs-pg` without
+## Docker still skips instead of failing.
 test-fs-pg: install-tools
 	cargo nextest run -p cf-gears-file-storage --features integration
 

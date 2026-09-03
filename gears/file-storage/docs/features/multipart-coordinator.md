@@ -152,17 +152,28 @@ User-facing interactions that start with an actor (human or external system) and
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
 `complete` returns **`200`** with a JSON body
-(`version_id`, `size`, `hash_algorithm`, `content_hash`, `hash_mode`, `part_count`, `manifest`). It accepts an
+(`version_id`, `size`, `hash_algorithm`, `content_hash`, `hash_mode`, `part_count`, `manifest`, `bind_state`,
+`etag?`, `current_etag?`). It accepts an
 **optional** `If-Match` header: a concrete value is checked against the file's current content ETag and a mismatch
 is rejected (`400` -- `FailedPrecondition` collapses to `400` on this platform, there is no `412`-mapped
 canonical-error variant); `*` or an absent header is unconditional. Before assembling, `complete` diffs the plan's
 expected part numbers against the parts actually reported and returns `409` with the missing part numbers if any are
 absent, in front of the generic `SUM(part.size) != declared_size` check. `complete` **finalizes** the version
-(`pending -> available`, real assembled size/hash) but does **not bind** it -- `content_id` is untouched, exactly
-like single-shot upload's finalize/bind split (ADR-0003, DESIGN.md §3.6). The client separately issues a
-`POST /files/{id}/bind {version_id}` under `If-Match` afterwards to make the assembled content live -- `complete`'s
-own `If-Match` only guards against the file's content pointer moving out from under a concurrent complete before
-that later bind, not the bind itself.
+(`pending -> available`, real assembled size/hash), and whether it also binds it depends on the session's
+`auto_bind` flag (upload-flow redesign), which is fixed at initiate time and cannot change mid-session:
+- **Manual session** (`auto_bind = false` -- every session opened via the standalone `POST
+  /files/{id}/multipart`, or via `POST /files`'s multipart block with `bind: "manual"`): `content_id` is left
+  untouched, exactly like single-shot upload's manual finalize/bind split (ADR-0003, DESIGN.md §3.6).
+  `bind_state` comes back `"manual"`. The client separately issues a `POST /files/{id}/bind {version_id}` under
+  `If-Match` afterwards to make the assembled content live -- `complete`'s own `If-Match` only guards against the
+  file's content pointer moving out from under a concurrent complete before that later bind, not the bind itself.
+- **Auto-bind session** (`auto_bind = true` -- the default for `POST /files`'s multipart block, `bind: "auto"`):
+  the bind runs **inside the same database transaction** that finalizes the version
+  (`Store::finalize_version`, `src/infra/storage/store/versions.rs`) under a `content_id IS NULL` CAS -- no
+  separate client `bind` request. A won CAS returns `bind_state: "bound"` with `etag` set to the new content
+  `ETag`. A lost CAS (e.g. two create-tokens racing on the same brand-new file) still finalizes the version but
+  leaves `content_id` untouched, returning `bind_state: "conflict"` with `current_etag` set to the ETag a manual
+  `POST /files/{id}/bind` (as a fallback) would need for `If-Match`.
 
 `complete` computes the version's content hash per ADR-0006's **`multipart-composite-sha256`** mode
 (`cpt-cf-file-storage-adr-content-hash-modes`): the backend builds an offset-manifest from the per-part digests
@@ -175,8 +186,11 @@ Manifest Re-Verification").
 **Success Scenarios**:
 - All reported parts are assembled and verified by the backend; the version is **finalized** (`pending -> available`)
   with the real assembled size + ADR-0006 composite hash; session marked completed; the response body carries
-  `version_id`/`size`/`hash_algorithm`/`content_hash`/`hash_mode`/`part_count`/`manifest`. Binding the version as the
-  file's current content is a **separate**, later `POST /files/{id}/bind` call -- `complete` does not bind
+  `version_id`/`size`/`hash_algorithm`/`content_hash`/`hash_mode`/`part_count`/`manifest`/`bind_state`(`/etag`/
+  `current_etag`). For a **manual** session, binding the version as the file's current content is a **separate**,
+  later `POST /files/{id}/bind` call -- `complete` does not bind (`bind_state: "manual"`). For an **auto-bind**
+  session, `complete` binds the version itself in the same transaction as finalize (`bind_state: "bound"`), or
+  reports a lost CAS without binding (`bind_state: "conflict"`, resolved by a manual `bind` call)
 
 **Error Scenarios**:
 - One or more planned parts have not been reported yet -- `409 Conflict` with the missing part numbers in the error
@@ -195,10 +209,10 @@ Manifest Re-Verification").
 6. [x] - `p1` - Policy size check against the assembled total - `inst-complete-policy-check`
 7. [x] - `p1` - Backend: `CompleteMultipartUpload`, building the ADR-0006 offset-manifest and its root hash from the already-persisted per-part digests+offsets -- **no re-read** of the assembled object - `inst-complete-assemble`
 8. [x] - `p1` - Post-assembly, pre-finalize: sniff the assembled object's leading bytes and validate against `session.declared_mime` (`cpt-cf-file-storage-fr-content-type-validation`); re-check the policy size ceiling against the resolved MIME; on mismatch fail **before** any DB finalize (the assembled blob becomes an orphan reclaimed by the orphan-reconciliation sweep) - `inst-complete-mime-validate`
-9. [x] - `p1` - DB: finalize the version row (`status: pending -> available`, real assembled `size`/composite `content_hash`/`hash_mode`/`part_count`/`manifest`); does **not** touch `content_id` - `inst-complete-finalize-version`
+9. [x] - `p1` - DB: finalize the version row (`status: pending -> available`, real assembled `size`/composite `content_hash`/`hash_mode`/`part_count`/`manifest`) transactionally; for a **manual** session (`auto_bind = false`) this leaves `content_id` untouched; for an **auto-bind** session (`auto_bind = true`) the same transaction also attempts the `content_id IS NULL` CAS bind (`Store::finalize_version`), touching `content_id` only if it wins - `inst-complete-finalize-version`
 10. [x] - `p1` - DB: UPDATE multipart_uploads SET status=completed WHERE upload_id = ? - `inst-complete-db-session`
-11. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest}` - `inst-complete-return`
-12. [ ] - `p2` - Client: separately calls `POST /files/{id}/bind {version_id}` under `If-Match` to swap `content_id` and make the content live - `inst-complete-bind-followup`
+11. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` - `inst-complete-return`
+12. [ ] - `p2` - For a **manual** session (`bind_state: "manual"`) or a lost auto-bind CAS (`bind_state: "conflict"`), the client separately calls `POST /files/{id}/bind {version_id}` under `If-Match` to swap `content_id` and make the content live; a won auto-bind CAS (`bind_state: "bound"`) needs no follow-up call - `inst-complete-bind-followup`
 
 ### Abort Multipart Upload
 
@@ -207,20 +221,24 @@ Manifest Re-Verification").
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
 **Success Scenarios**:
-- Session marked aborted; pending version deleted; backend multipart handle aborted; uploaded part bytes discarded
+- Session marked aborted (DB CAS, committed before any backend call is made); part rows and the pending version
+  deleted; backend multipart handle best-effort aborted afterward — a backend failure at that point is logged and
+  counted via a metric, not returned to the client, since the DB-side abort is already committed and irreversible
+  by then
 
 **Error Scenarios**:
-- Session already completed or aborted -- 409 Conflict
+- Session already completed or aborted, or the `in_progress -> aborted` CAS loses a race against a concurrent
+  complete/abort -- 409 Conflict (the backend is never touched in this case, to avoid corrupting a handle a
+  concurrent `complete` may already be assembling from)
 - Session not found or client lacks write permission -- 404 / 403
 
 **Steps**:
 1. [ ] - `p1` - Client: DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id} - `inst-abort-request`
-2. [ ] - `p1` - DB: SELECT multipart_uploads WHERE upload_id = ? -- verify status == in_progress; RETURN 409 if already completed/aborted - `inst-abort-check-status`
-3. [ ] - `p1` - **IF** backend is multipart_native: call backend AbortMultipart(upload_handle) to discard backend-side parts - `inst-abort-backend`
-4. [x] - `p1` - DB: DELETE FROM multipart_upload_parts WHERE upload_id = ? - `inst-abort-delete-parts`
-5. [ ] - `p1` - DB: DELETE pending version row from file_versions WHERE version_id = ? AND status = pending - `inst-abort-delete-version`
-6. [ ] - `p1` - DB: UPDATE multipart_uploads SET status=aborted WHERE upload_id = ? - `inst-abort-db-session`
-7. [ ] - `p1` - RETURN 204 No Content - `inst-abort-return`
+2. [ ] - `p1` - Authorize per-file `WRITE` on the path `file_id`; load the session by `upload_id` and verify it belongs to `file_id` (a foreign or missing `upload_id` is masked as `404`); RETURN 409 if the session's snapshot state is not `in_progress` - `inst-abort-check-status`
+3. [x] - `p1` - DB, one transaction (CAS-first, runs BEFORE any backend call): flip `multipart_uploads.status` `in_progress -> aborted` (or, for a `completing` session whose lease has expired, via `abort_expired_completing`); on success, DELETE FROM `multipart_upload_parts` WHERE `upload_id = ?` and insert the audit row; if the CAS does not win (state already changed under us), RETURN 409 and stop here, before touching the backend or the pending version - `inst-abort-delete-parts`
+4. [ ] - `p1` - Best-effort, now that the CAS has won: call backend `AbortMultipart(upload_handle)` to discard backend-side parts. A failure here is logged (`tracing::warn!`) and recorded via `record_backend_error`, then swallowed — never propagated to the client — leaving the backend-side upload for its own garbage collection - `inst-abort-backend`
+5. [ ] - `p1` - DB: DELETE the pending version row from `file_versions` WHERE `version_id = ?` AND `status = pending` (a missing row is fine — that is the desired end state) - `inst-abort-delete-version`
+6. [ ] - `p1` - RETURN 204 No Content - `inst-abort-return`
 
 ### Introspect and Resume Multipart Upload
 
@@ -373,9 +391,14 @@ then verifies `SUM(reported part sizes) == declared_size` as a residual guard (g
 backend to build the ADR-0006 offset-manifest and compute its composite root hash from the already-persisted
 per-part digests (no re-read of the assembled object); **finalizes** the version (`pending -> available`) with the
 real size + composite hash/mode/part-count/manifest; marks the session completed; returns **`200`** with
-`{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest}`. It accepts an **optional**
-`If-Match` header (a concrete value is checked against the file's current content ETag, `*`/absent is unconditional)
-but does **not bind** the version -- binding is a separate, later client-issued `POST /files/{id}/bind`.
+`{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
+current_etag?}`. It accepts an **optional**
+`If-Match` header (a concrete value is checked against the file's current content ETag, `*`/absent is unconditional).
+Whether it also binds the version depends on the session's `auto_bind` flag, fixed at initiate time: a **manual**
+session (`bind_state: "manual"`) does **not bind** -- binding is a separate, later client-issued
+`POST /files/{id}/bind`; an **auto-bind** session binds the version itself, in the same transaction as finalize,
+under a `content_id IS NULL` CAS (`bind_state: "bound"` on a won CAS, `"conflict"` on a lost one, with no separate
+bind call needed in the `"bound"` case).
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-complete`
@@ -391,7 +414,11 @@ but does **not bind** the version -- binding is a separate, later client-issued 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-abort`
 
-The system **MUST** implement `DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id}`: verify session is in_progress; abort the backend handle (multipart_native only); delete part rows and the pending version; mark the session aborted.
+The system **MUST** implement `DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id}`: verify session is
+in_progress; win the DB CAS marking the session aborted and deleting part rows (in one transaction) BEFORE touching
+the backend; then best-effort abort the backend handle (multipart_native only) -- a backend failure at this point is
+logged and metered, not returned to the client, since the DB-side abort already committed; then delete the pending
+version.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-abort`
@@ -455,11 +482,17 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
   `SUM(reported part sizes) != declared_size` for cases the missing-parts diff cannot catch (e.g. an over-reported part)
 - [x] `POST .../complete` **finalizes** the file version (`pending -> available`) with the real assembled size and
   ADR-0006 composite hash, and returns **`200`** with `{version_id, size, hash_algorithm, content_hash, hash_mode,
-  part_count, manifest}`; session status becomes completed. It does **not** bind the version -- `content_id` is
-  untouched. It accepts an **optional** `If-Match` header (checked against the file's current content ETag; `400`
+  part_count, manifest, bind_state, etag?, current_etag?}`; session status becomes completed. Whether it also
+  binds the version depends on the session's `auto_bind` flag: a **manual** session leaves `content_id` untouched
+  (`bind_state: "manual"`); an **auto-bind** session binds it in the same transaction as finalize under a
+  `content_id IS NULL` CAS (`bind_state: "bound"` on a won CAS, `"conflict"` on a lost one). It accepts an
+  **optional** `If-Match` header (checked against the file's current content ETag; `400`
   on mismatch, `FailedPrecondition` collapses to `400` on this platform -- there is no `412`-mapped canonical-error
   variant; `*`/absent is unconditional)
-- [x] `DELETE .../multipart/{upload_id}` marks the session aborted, deletes part rows and the pending version, and aborts the backend handle for multipart_native backends
+- [x] `DELETE .../multipart/{upload_id}` wins a DB CAS marking the session aborted and deletes part rows (one
+  transaction, before any backend call); deletes the pending version; then best-effort aborts the backend handle for
+  multipart_native backends -- a backend abort failure at that point is logged and metered rather than returned to
+  the client, since the DB-side abort is already committed
 - [x] Initiating a multipart upload with declared_size exceeding the effective size-limit policy returns 413; exceeding storage quota returns 429; unsupported MIME returns 415
   (this `[x]` is exercised only by `tests/enforce_test.rs` injecting a mock `QuotaClient` — no real deployment has
   one wired (`gear.rs`'s `quota_client: None`), so this rejection path does not fire in production; see
