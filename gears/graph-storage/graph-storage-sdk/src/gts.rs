@@ -1,7 +1,7 @@
 //! GTS identifiers owned by the graph-storage gear.
 //!
 //! The base ontology (three abstract bases, six family types) is registered
-//! by the gear at boot from the schemas in `docs/schemas/`; these constants
+//! by the gear at boot from the schemas in its `schemas/` directory; these constants
 //! name them and the resource types authorization decisions use.
 
 use toolkit_gts::gts_id;

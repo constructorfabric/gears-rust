@@ -819,13 +819,13 @@ introduce a hierarchy of its own beneath it.
 
 The schemas above are kept as registrable files under
 [`schemas/`](./schemas/), with the worked producer types in
-[`schemas/examples/`](./schemas/examples/) under the fictional `acme` vendor.
+[`graph-storage/schemas/examples/`](../graph-storage/schemas/examples/) under the fictional `acme` vendor.
 This section is the normative narrative; those files are the same content in the
 form the types-registry accepts, so the chain can be validated mechanically
 rather than read for correctness:
 
 ```bash
-gts --path gears/graph-storage/docs/schemas \
+gts --path gears/graph-storage/graph-storage/schemas \
     validate-type-schema --type-id 'gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~'
 ```
 
