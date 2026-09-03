@@ -1,7 +1,7 @@
 //! Repository for the `files` table (logical file identity + content pointer).
 
 use sea_orm::ExprTrait;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -15,6 +15,9 @@ use file_storage_sdk::{File, OwnerFilter};
 use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::file::{ActiveModel, Column, Entity};
+use crate::infra::storage::entity::file_version::{
+    Column as VersionColumn, Entity as VersionEntity,
+};
 
 /// Repository over the `files` table.
 #[derive(Clone, Default)]
@@ -192,6 +195,94 @@ impl FileRepo {
             .await
             .map_err(db_err)?;
         Ok(res.rows_affected > 0)
+    }
+
+    /// Delete a file row iff it is still a true orphan -- `content_id IS
+    /// NULL` **and** it has zero `file_versions` rows -- evaluated as a
+    /// single conditional `DELETE`, not as separate pre-checks.
+    ///
+    /// # Why this exists instead of `SELECT`-then-`DELETE`
+    ///
+    /// [`crate::infra::storage::store::Store::delete_orphan_file_with_event`]
+    /// used to re-verify the orphan condition inside its transaction with two
+    /// plain `SELECT`s (`files.get` + `versions.list_by_file(..., 1, 0)`)
+    /// before issuing an unconditional `Self::delete`, on the theory that a
+    /// version inserted concurrently would be "guaranteed to be seen" by
+    /// those reads. That claim does not hold under `READ COMMITTED`: each
+    /// plain `SELECT` is its own statement with its own snapshot, ordinary
+    /// reads take no locks, and
+    /// `crate::infra::storage::store::Store::insert_pending_version` runs
+    /// autocommit on a separate connection. Nothing prevents a version from
+    /// being inserted and committed in the gap between the two `SELECT`s, or
+    /// between the second `SELECT` and the `DELETE` -- and once that DELETE
+    /// runs, the FK (`file_versions.file_id -> files.file_id ON DELETE
+    /// CASCADE`) silently removes the just-inserted version along with the
+    /// file. This is invisible on `SQLite`, whose single-writer model
+    /// serializes the interleaving away, which is why the pre-existing test
+    /// suite did not catch it.
+    ///
+    /// Folding the whole guard into the `DELETE`'s own `WHERE` (`content_id
+    /// IS NULL` plus a `NOT EXISTS` subquery over `file_versions`) narrows
+    /// that window from "between two statements" to "inside one statement's
+    /// execution", and removes the `content_id` half of the race outright.
+    ///
+    /// It does **not** make the version half airtight on `PostgreSQL`, and this
+    /// comment previously claimed otherwise. Under `READ COMMITTED` the
+    /// `NOT EXISTS` subquery is evaluated against the snapshot taken when
+    /// this statement began. A concurrent `insert_pending_version` that
+    /// commits after that snapshot is invisible to the subquery; the FK it
+    /// takes on the parent row (`FOR KEY SHARE`) does make this `DELETE`
+    /// wait for it, but once the inserter commits the parent tuple is only
+    /// *locked*, not updated, so `PostgreSQL` resumes without an `EvalPlanQual`
+    /// re-check and the stale `NOT EXISTS` verdict stands. The `ON DELETE
+    /// CASCADE` then removes the freshly inserted version.
+    ///
+    /// Closing it properly needs the two sides to contend on the same parent
+    /// row: either a `SELECT ... FOR UPDATE` on `files` before the check
+    /// (`toolkit-db`'s secure ORM exposes no row-lock API today -- the
+    /// `DBRunner` traits are sealed), or `insert_pending_version` taking a
+    /// conflicting lock on the parent itself, which would add a write to the
+    /// hot upload path. Until one of those lands, this is a narrowed race,
+    /// not an eliminated one, and the residual loss is a pending version
+    /// created in the same instant an hour-old orphan is reclaimed.
+    ///
+    /// Returns the number of rows removed (0 or 1, keyed on `file_id`). `0`
+    /// means the file is already gone, has content bound, or has at least
+    /// one version row -- the caller cannot and does not need to distinguish
+    /// these from the count alone (mirrors
+    /// [`crate::infra::storage::repo::VersionRepo::delete`]'s "returns a
+    /// count, not a reason" shape).
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    pub async fn delete_if_orphan<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        // `EXISTS (SELECT 1 FROM file_versions WHERE file_id = ?)`, negated
+        // below -- same subquery shape as `VersionRepo::list_pending_older_than`'s
+        // `not_in_subquery` and `toolkit_db`'s own `scope_via_exists` helper.
+        let mut has_any_version = Query::select();
+        has_any_version
+            .expr(Expr::value(1))
+            .from(VersionEntity)
+            .and_where(VersionColumn::FileId.eq(file_id));
+        let no_versions_exist = Condition::all().add(Expr::exists(has_any_version)).not();
+
+        let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::ContentId.is_null())
+                    .add(no_versions_exist),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
     }
 
     /// List files across all tenants for the retention sweep engine,

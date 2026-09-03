@@ -272,13 +272,23 @@ impl VersionRepo {
 
     /// Clear the `is_current` flag on all versions of a file (used before
     /// promoting a new current version, to honour the unique-current index).
+    ///
+    /// Returns the number of rows cleared, as reported by `sea_orm`'s
+    /// `UpdateResult::rows_affected`. This is `0` or `1` in practice (at most
+    /// one version of a file can be `is_current = true` at a time), and a `0`
+    /// result is **expected, not an error**: a brand-new file (its first
+    /// version has never been bound yet) or a file whose current version was
+    /// already cleared/removed genuinely has nothing to clear. Callers must
+    /// not apply [`Self::set_current`]'s "zero rows is fatal" rule here — the
+    /// two methods' zero-row cases mean opposite things; see `set_current`'s
+    /// doc comment.
     pub async fn clear_current<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         file_id: Uuid,
-    ) -> Result<(), DomainError> {
-        Entity::update_many()
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
             .col_expr(Column::IsCurrent, Expr::value(false))
             .filter(
                 Condition::all()
@@ -290,18 +300,51 @@ impl VersionRepo {
             .exec(conn)
             .await
             .map_err(db_err)?;
-        Ok(())
+        Ok(res.rows_affected)
     }
 
     /// Promote one version to `is_current = true`.
+    ///
+    /// Returns the raw `rows_affected` from the underlying `UPDATE` (0 or 1,
+    /// since the predicate is keyed on the full `(file_id, version_id)`
+    /// pair) so the caller can detect a lost race instead of silently
+    /// swallowing it (see below).
+    ///
+    /// # The P2 2.7 guarantee, precisely
+    ///
+    /// P2 2.7 says a version can never be deleted while it is a file's
+    /// current version. That guarantee is watertight **only within the
+    /// single transaction** that performs the CAS-then-promote sequence
+    /// ([`crate::infra::storage::repo::FileRepo::bind_content_cas`] followed
+    /// by [`Self::clear_current`] + this method — see
+    /// `Store::bind_atomic`/`bind_atomic_with_event`/`finalize_version`'s
+    /// auto-bind branch, all three of which call these in that order). It is
+    /// NOT a standing invariant that holds at every instant: nothing stops a
+    /// *concurrent* `delete_version` from reading this exact version row
+    /// with `is_current = false` (accurate right up until this call runs),
+    /// deleting it — its own DB-level guard
+    /// ([`Self::delete`]'s `is_current = false` predicate) sees exactly that
+    /// state and lets the delete through — and committing, all before this
+    /// `UPDATE` executes. When that happens, this method's predicate
+    /// (`file_id = ? AND version_id = ?`) matches zero rows: the version
+    /// this call was asked to promote no longer exists.
+    ///
+    /// A `0` result here is therefore the opposite of [`Self::clear_current`]'s
+    /// harmless `0`: every caller MUST treat it as a fatal conflict and abort
+    /// the enclosing transaction (map it to `Err(DomainError::conflict(...))`,
+    /// e.g. "target version no longer exists — it was deleted concurrently"),
+    /// never commit past it. Committing anyway is exactly the data-corruption
+    /// bug this doc comment exists to prevent: `files.content_id` would keep
+    /// pointing at `version_id` after the row backing it is gone, with no
+    /// current version and no error raised anywhere.
     pub async fn set_current<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         file_id: Uuid,
         version_id: Uuid,
-    ) -> Result<(), DomainError> {
-        Entity::update_many()
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
             .col_expr(Column::IsCurrent, Expr::value(true))
             .filter(
                 Condition::all()
@@ -313,7 +356,7 @@ impl VersionRepo {
             .exec(conn)
             .await
             .map_err(db_err)?;
-        Ok(())
+        Ok(res.rows_affected)
     }
 
     /// Delete a single version. Returns the number of rows removed (0 or 1

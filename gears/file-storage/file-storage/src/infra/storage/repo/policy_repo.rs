@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{PolicyBody, PolicyScope, StoredPolicy};
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::policy::{ActiveModel, Column, Entity, Model};
 
 /// Repository over the `policies` table.
@@ -105,9 +105,24 @@ impl PolicyRepo {
             created_at: Set(now),
             updated_at: Set(now),
         };
+        // Two concurrent first-time upserts for the same
+        // `(tenant_id, scope, scope_owner_id)` both see nothing to delete
+        // above and both reach this insert; the partial unique indexes
+        // (`policies_tenant_scope_unique_idx` / `policies_user_scope_unique_idx`,
+        // migration `m20260706_000003_policies_unique_scope.rs`) are what
+        // stops the loser from creating a second row. Before this fix that
+        // loss surfaced as an opaque `DomainError::Database` (HTTP 500) via
+        // `db_err`; classify it as a conflict instead, so the losing caller
+        // gets a 409 it can react to (re-fetch via `get` and, if it still
+        // wants its own values, retry the upsert against the row that won).
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(db_err)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a policy for this scope was just created by a concurrent request",
+                )
+            })?;
         Ok(policy_id)
     }
 }
