@@ -83,6 +83,9 @@ Encoding conventions:
 
 Notes:
 - There is **no** `HEAD /files/{id}` route; no such route exists in `src/api/rest/routes.rs`.
+- `GET /storages` and `GET /storages/{storage_id}` require the caller's `READ` authorization scope
+  (`403` otherwise) — backend enumeration used to run with no `SecurityContext` check at all, letting
+  any authenticated subject of any tenant list backend ids and capabilities.
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
   [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
@@ -90,6 +93,13 @@ Notes:
   "bind": "auto"|"manual" (optional, default "auto") }`. `idempotency_key`
   is the field documented under "Idempotent-create semantics" (`operations.md`) — see the `409` cause in "Status code
   summary" for what happens on a reused key with a different body; it is rejected (`400`) together with `multipart`.
+  Creating a file with `(owner_kind, owner_id)` equal to the caller's own kind and subject id proceeds under the
+  ordinary `WRITE` grant; any other `(owner_kind, owner_id)` pair additionally requires the caller's `ADMIN_POLICY`
+  authorization scope (`403` otherwise) — plain `WRITE` must not let any tenant member create files on another
+  subject's behalf. The comparison is on the *pair*, not `owner_id` alone: `user` and `app` are disjoint owner
+  spaces that can legitimately share the same UUID, so a caller could otherwise pass their own id under
+  `owner_kind: "app"` and have the self-service check pass while actually authoring the file into the other
+  owner space (a different effective policy and a different owner's quota/listing than their own).
 - **Upload-flow redesign.** With the `multipart` block and a server plan of **≥2 parts**, the `201` response carries
   the full parts plan instead of a single-part URL: `{ file_id, version_id, multipart: { upload_id, version_id,
   part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at } }` — no separate
@@ -143,12 +153,24 @@ Notes:
 ```text
 S1. PUT    <signed upload url>             upload the new version's bytes (raw body)
 S2. GET    <signed download url>           download content                                        — Range
+S3. HEAD   <signed download url>           same auth/`404` contract as GET, no body
 ```
 
-**Planned / not implemented**: a sidecar `HEAD <signed download url>` route and `If-None-Match` → `304` support on the
-sidecar `GET`. Neither exists in `src/bin/sidecar.rs` — the router has no `HEAD` route at all, and `download`'s only
-conditional-ish behavior is the `Range` handling below. (`If-None-Match` → `304` **is** implemented on the control
-plane's `GET /files/{id}`, which is a distinct surface — see "Conditional headers" below.)
+`HEAD` is handled by its own `download_head` route (`.head(download_head)` in `build_router`, `src/bin/sidecar.rs`)
+rather than falling through to axum's default GET-derived `HEAD` handling — the latter would run the full `download`
+handler, including streaming the entire object off the backend, only to discard the body afterwards. `download_head`
+calls only `StorageBackend::stat` (a single combined existence-and-size round trip: `stat(2)` on `local-fs`,
+`HeadObject` on `S3Backend` — one call instead of the previous `exists` + `size` pair) and
+returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as `download`'s `200`, plus an explicit
+`Content-Length` (a real `200`/`206` gets this for free from its body; `HEAD` has no body to derive it from).
+`stat` returns `Ok(None)` when nothing is stored at the path (→ `404`, same as `GET`'s missing-blob case) and
+`Err` only for a genuine backend fault distinct from "not found" (→ `500`) — the same three-way split `exists`
+already documents, resolved in one round trip instead of two.
+
+**Planned / not implemented**: `If-None-Match` → `304` support on the sidecar `GET`/`HEAD`. Every download token is
+already single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of a conditional download is small.
+(`If-None-Match` → `304` **is** implemented on the control plane's `GET /files/{id}`, which is a distinct surface —
+see "Conditional headers" below.)
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate
@@ -398,10 +420,12 @@ GET  /policy/effective?user_owner_id=<uuid>              compute the effective (
   outcome, not a `404`.
 - `PUT /policy` request body: `{ "scope": "tenant"|"user", "scope_owner_id": "<uuid, omit for tenant>", "body": { "allowed_mime_types": [...], "size_limits": {...}, "metadata_limits": {...}, "enabled_event_types": [...] } }`.
   Response: the stored `PolicyDto` (`200`).
-- `GET /policy/effective`: no scope is required to read the caller's own effective policy; `user_owner_id` is an
-  optional hint to include a specific user level in the resolution. Response fields are all "effective" (most
-  restrictive already resolved): `allowed_mime_types` (`null` = unrestricted), `max_bytes`, `per_mime_max_bytes`,
-  `metadata_limits`.
+- `GET /policy/effective`: no scope is required to read the caller's own effective policy; `user_owner_id` includes
+  a specific user level in the resolution, but it is not a free-form hint — passing any id other than the caller's
+  own subject id additionally requires the caller's `ADMIN_POLICY` authorization scope (`403` otherwise), since it
+  would otherwise let any tenant member read another subject's user-level policy. Response fields are all
+  "effective" (most restrictive already resolved): `allowed_mime_types` (`null` = unrestricted), `max_bytes`,
+  `per_mime_max_bytes`, `metadata_limits`.
 - `enabled_event_types` (inside the policy body) is stored and returned but does not currently gate anything: file
   events are enqueued into `events_outbox` unconditionally, independent of this field's configured value.
 - **There is no `DELETE /policy` route.** To relax a policy, `PUT` a replacement body (e.g. an empty/permissive one);
@@ -426,7 +450,19 @@ DELETE /retention-rules/{rule_id}   delete a retention rule
   `400`: a body with **all three** of `age`/`inactivity`/`metadata` absent (a rule that could never match any file);
   `age.max_age_days` or `inactivity.inactivity_days` **less than 1** (either would match every file in the tenant on
   the very next sweep tick); and `scope` ∈ `{user, file}` with `scope_target_id` omitted.
-- `GET /retention-rules` returns all rules for the caller's tenant across every scope (no scope filter query param).
+- `GET /retention-rules` (no scope filter query param) returns every rule in the caller's tenant, across every
+  scope, only when the caller holds `ADMIN_POLICY`. A non-admin caller instead gets a filtered view: all
+  `tenant`-scope rules, `user`-scope rules that target themselves, and `file`-scope rules whose target file they
+  own (compared as the `(owner_kind, owner_id)` pair, not `owner_id` alone) — the underlying store query has no
+  owner/target filter, so without this filtering step any tenant member could otherwise enumerate every other
+  member's retention configuration. Two caveats on the `file`-scope case: a rule whose target file has since been
+  deleted stays invisible to every non-admin caller (there is no stored record of who created it, so once the
+  file is gone there is nothing left to compare against); and a rule created via delegated `WRITE` on a file the
+  creator does not own stays invisible to that creator too, since visibility is gated on file *ownership*, not on
+  having created the rule.
+- `POST /retention-rules` with `scope="tenant"` requires the caller's `ADMIN_POLICY` authorization scope, with no
+  fallback to `WRITE` — a tenant-scope rule is a standing instruction for the background sweep to permanently
+  delete every matching file for every subject in the tenant, so ordinary file-`WRITE` is not enough.
 - `DELETE /retention-rules/{rule_id}` → `204`, or `404` if the rule does not exist.
 
 ## P2 — Backend migration
@@ -594,8 +630,8 @@ avoid leaving this unswept sibling behind.
   header (see "Response headers" below). Clients that omit `If-Match-Metadata` get last-write-wins; clients that
   want to detect concurrent metadata edits opt in by sending it.
 - `If-None-Match`: optional on control-plane `GET /files/{id}` (metadata) only; match → `304 Not Modified`. **Not**
-  implemented on the sidecar's download `GET` (see "P1 — Sidecar" above) — there is also no `HEAD` route on either
-  plane.
+  implemented on the sidecar's download `GET`/`HEAD` (see "P1 — Sidecar" above); the control plane also has no
+  `HEAD /files/{id}` route (see "P1 — Control plane" above).
 - ETag is opaque, derived from `(file_id, content_id)`, content-only, and explicitly **not** equal to the content
   hash. It changes exactly when content is (re)bound; a metadata-only `PATCH` does not change it. The content
   hash algorithm+value are exposed in the `GET /files/{id}/versions` body (`hash_algorithm`, `hash`), not as

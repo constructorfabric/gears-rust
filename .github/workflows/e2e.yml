@@ -97,9 +97,52 @@ jobs:
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
       # (tr-authz) are NOT covered by it, so they run as their own steps below.
+      #
+      # file-storage's lifecycle_s3 sub-suite (multipart against a real S3
+      # backend) is part of the file-storage e2e-launcher suite that
+      # `make e2e-local` below runs, but it SKIPS ITSELF ENTIRELY at pytest
+      # collection time unless FS_E2E_S3_ENDPOINT is set (see
+      # testing/e2e/suites/file_storage/lifecycle_s3/conftest.py's module
+      # docstring, "Prerequisites" / "Running the S3 e2e locally") — local-fs
+      # cannot do multipart at all, so without this double the suite's only
+      # multipart-over-S3 coverage never actually runs. This starts Option B
+      # from that docstring (MinIO via docker) rather than Option A
+      # (`cargo install s3s-fs`): this runner already has a reachable Docker
+      # daemon with no extra setup (the usage-collector step further below
+      # relies on that same daemon via testcontainers), so a prebuilt image
+      # is faster and more reliable here than compiling and installing a
+      # crates.io binary on every run.
+      - name: Start S3 test double (MinIO) for file-storage e2e
+        env:
+          # Floating `minio/minio`/`minio/mc` tags make this step
+          # non-reproducible and liable to break without warning. Pinned to a
+          # specific release, by digest, so the image can't change under us.
+          MINIO_IMAGE: "minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+          MC_IMAGE: "minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+        run: |
+          docker run -d --name fs-e2e-minio -p 19099:9000 \
+            -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \
+            "$MINIO_IMAGE" server /data
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:19099/minio/health/live >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh "$MC_IMAGE" -c \
+            "mc alias set local http://127.0.0.1:19099 test-access-key test-secret-key && \
+             mc mb local/file-storage-e2e"
+
       - name: Run E2E tests
         env:
           INPUT_MODE: ${{ inputs.mode }}
+          # See "Start S3 test double" above — values match conftest.py's
+          # own defaults, set explicitly so this doesn't silently drift.
+          FS_E2E_S3_ENDPOINT: "http://127.0.0.1:19099"
+          FS_E2E_S3_BUCKET: "file-storage-e2e"
+          FS_E2E_S3_ACCESS_KEY: "test-access-key"
+          FS_E2E_S3_SECRET_KEY: "test-secret-key"
+          FS_E2E_S3_REGION: "us-east-1"
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             make e2e-local            # nightly — full suite
@@ -108,6 +151,10 @@ jobs:
           else
             make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
           fi
+
+      - name: Stop S3 test double (MinIO)
+        if: always()
+        run: docker rm -f fs-e2e-minio || true
 
       # Self-managed suite (launcher: pytest): owns its own offline server.
       - name: Run mini-chat E2E tests
