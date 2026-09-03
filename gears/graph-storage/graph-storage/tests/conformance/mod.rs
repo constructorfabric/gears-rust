@@ -39,7 +39,6 @@ use uuid::Uuid;
 
 /// Producer types the suite registers on top of the base ontology.
 pub const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.thing.v1~";
-pub const PHANTOM: &str = "gts.cf.core.graph.node.v1~cf.core.graph.phantom_node.v1~";
 /// An edge type that admits only owned nodes at either end — the constraint
 /// that gives the endpoint check something to refuse.
 pub const OWNED_ONLY: &str =
@@ -118,16 +117,6 @@ async fn plan_for(
         epoch: Some(EPOCH),
         nodes,
     }
-}
-
-fn schema_of(base: &str) -> serde_json::Value {
-    graph_storage::domain::ontology::BASE_SCHEMAS
-        .iter()
-        .find(|(id, _)| *id == base)
-        .map_or_else(
-            || panic!("no base schema for {base}"),
-            |(_, raw)| serde_json::from_str(raw).expect("base schema parses"),
-        )
 }
 
 /// The registration batch every case starts from: the base ontology plus one

@@ -5,7 +5,13 @@ publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
 description = "SDK for the graph-storage gear: client trait, transport-agnostic models, plugin contracts, GTS constants"
+keywords = ["constructorfabric", "cf-gears", "graph", "knowledge-graph"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "graph_storage_sdk"

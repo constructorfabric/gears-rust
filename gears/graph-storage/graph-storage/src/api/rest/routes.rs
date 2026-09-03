@@ -93,7 +93,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get(format!("{BASE}/types/{{gts_type_id}}"))
+    OperationBuilder::get(format!("{BASE}/types/{{gts_type_id}}"))
         .operation_id("graph_storage.get_type")
         .summary("One type with its schema and effective traits")
         .tag(API_TAG)
@@ -111,14 +111,12 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
+        .register(router, openapi)
 }
 
 /// Ingest and the two soft deletes.
 fn write_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    let router = OperationBuilder::post(format!("{BASE}/ingest"))
+    OperationBuilder::post(format!("{BASE}/ingest"))
         .operation_id("graph_storage.ingest")
         .summary("Nodes and edges in one transaction")
         .description(
@@ -144,9 +142,7 @@ fn write_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_409(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
+        .register(router, openapi)
 }
 
 /// Node read, tabular projection and the revision surface.
@@ -228,7 +224,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::delete(format!("{BASE}/edges/{{edge_key}}"))
+    OperationBuilder::delete(format!("{BASE}/edges/{{edge_key}}"))
         .operation_id("graph_storage.delete_edge")
         .summary("Soft-delete one edge")
         .tag(API_TAG)
@@ -246,9 +242,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
+        .register(router, openapi)
 }
 
 /// Search and traversal — the retrieval surface.
@@ -322,7 +316,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get(format!("{BASE}/revision"))
+    OperationBuilder::get(format!("{BASE}/revision"))
         .operation_id("graph_storage.revision")
         .summary("The caller-visible graph revision")
         .description("The `(source_epoch, graph_revision)` identity every read reports")
@@ -339,9 +333,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
+        .register(router, openapi)
 }
 
 #[cfg(test)]

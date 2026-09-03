@@ -5,7 +5,13 @@ publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "In-process ONNX embedding provider for the graph-storage gear: the default of ADR-0005"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "In-process ONNX embedding provider for the graph-storage gear: the default of ADR-0004"
+keywords = ["constructorfabric", "cf-gears", "graph", "embeddings", "onnx"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "onnx_embedding_plugin"

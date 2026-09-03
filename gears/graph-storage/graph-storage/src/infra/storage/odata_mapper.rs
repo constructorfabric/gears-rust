@@ -32,10 +32,10 @@ impl ODataFieldMapping<Field> for NodeODataMapper {
 
     fn extract_cursor_value(model: &node::Model, field: Field) -> Value {
         match field {
-            Field::NodeKey => Value::String(Some(model.node_key.clone().into())),
-            Field::Name => Value::String(Some(model.name.clone().into())),
-            Field::CreatedAt => Value::TimeDateTimeWithTimeZone(Some(model.created_at.into())),
-            Field::UpdatedAt => Value::TimeDateTimeWithTimeZone(Some(model.updated_at.into())),
+            Field::NodeKey => Value::String(Some(model.node_key.clone())),
+            Field::Name => Value::String(Some(model.name.clone())),
+            Field::CreatedAt => Value::TimeDateTimeWithTimeZone(Some(model.created_at)),
+            Field::UpdatedAt => Value::TimeDateTimeWithTimeZone(Some(model.updated_at)),
         }
     }
 }

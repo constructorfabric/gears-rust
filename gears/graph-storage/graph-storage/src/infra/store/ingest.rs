@@ -1269,6 +1269,10 @@ async fn write_nodes(
 
 /// Resolve one edge endpoint: from this batch, from storage, or — when the
 /// request allows it — as a freshly created phantom.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one resolution step over the transaction's whole working state; bundling it would name a struct for a single call site"
+)]
 async fn resolve_endpoint(
     w: Writer<'_>,
     tx: &impl DBRunner,
