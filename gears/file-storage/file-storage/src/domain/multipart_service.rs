@@ -695,6 +695,15 @@ impl MultipartService {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
 
+        // Fast path only (P2 report-part-atomicity remediation): this is a
+        // cheap early rejection against the `session` snapshot loaded above,
+        // not the authoritative check. `Store::upsert_multipart_part` below
+        // re-verifies `state == in_progress` itself, atomically with the
+        // part write, inside one transaction -- that re-check is what
+        // actually decides the outcome on a race (a concurrent `complete`
+        // or `abort` landing between this snapshot read and the write
+        // below), and returns this exact same error variant when it loses,
+        // so the contract observed by callers is unchanged either way.
         if session.state != MultipartUploadState::InProgress {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
@@ -725,6 +734,10 @@ impl MultipartService {
         }
 
         // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-db-upsert
+        // Authoritative from here: this call re-checks `state == in_progress`
+        // and writes the part row in one transaction, so its `Err` (when the
+        // guard loses) is the final word, not just this method's earlier
+        // fast-path check -- see `Store::upsert_multipart_part`'s doc comment.
         self.store
             .upsert_multipart_part(
                 upload_id,
@@ -859,6 +872,21 @@ impl MultipartService {
         // background sweep has not yet ticked. Reject explicitly rather
         // than racing ahead of the next sweep and finalizing content that
         // should have been aborted.
+        //
+        // Fast path only (P2 lease-fencing remediation): this check runs
+        // against the `session` snapshot loaded above, which can go stale in
+        // the gap between this read and the lease CAS below -- a session
+        // that expires in that window would sail past this `if` and still
+        // reach `acquire_multipart_complete_lease`. The authoritative check
+        // is now inside that CAS's own `WHERE expires_at > now` clause
+        // (`MultipartRepo::acquire_complete_lease`), which is evaluated
+        // atomically against the current row, not this snapshot -- and, for
+        // a caller that loses that CAS, the re-read fresh session is checked
+        // for the same expiry again in the losing-CAS branch below, so an
+        // expired session is reported as such instead of being read back as
+        // a live `in_progress`/`completing` state. This check up here stays
+        // only to reject the common case cheaply, before spending a write on
+        // a session we can already tell is expired.
         if session.expires_at <= OffsetDateTime::now_utc() {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id, "expired",
@@ -883,11 +911,43 @@ impl MultipartService {
                 .await?
                 .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
             return match fresh.state {
+                // Completed must replay even past `expires_at` -- an
+                // idempotent re-complete is the recorded outcome of an
+                // action that already happened (see the FS-06/F4 comment
+                // above), not a new attempt against a live session, so
+                // expiry can never apply to it. This arm is checked first,
+                // ahead of the expiry guard below, so it always wins.
                 MultipartUploadState::Completed => {
                     self.metrics
                         .record_operation("complete_multipart_upload", "replayed");
                     Ok(MultipartCompleteOutcome::Completed(
                         self.replay_completed(file_id, &fresh).await?,
+                    ))
+                }
+                // The lease CAS is now fenced on `expires_at > now`
+                // (`MultipartRepo::acquire_complete_lease`), so losing it can
+                // mean either a live competing completer or a session that
+                // has simply expired since `session` was loaded above --
+                // `in_progress` with an expired `expires_at` (CAS could not
+                // take the fresh-acquire branch) or `completing` with both
+                // an expired lease AND an expired `expires_at` (CAS could
+                // not take the takeover branch either). Both would otherwise
+                // fall into the arms below and either return the confusing
+                // `multipart_upload_not_in_progress(_, "in_progress")` or,
+                // worse, answer `Completing` forever -- the session will
+                // never un-expire, so the client would poll a 202 until the
+                // abandoned-session sweep eventually aborts it. Reporting the
+                // expiry directly, in the same shape the fast-path check
+                // above uses, gives the client a definitive answer instead.
+                // Scoped to the two states the CAS could have taken, so an
+                // `aborted` session keeps reporting `aborted` rather than
+                // being relabelled `expired` once its `expires_at` passes --
+                // the caller that aborted it deserves the accurate reason.
+                MultipartUploadState::InProgress | MultipartUploadState::Completing
+                    if fresh.expires_at <= now =>
+                {
+                    Err(DomainError::multipart_upload_not_in_progress(
+                        upload_id, "expired",
                     ))
                 }
                 MultipartUploadState::Completing => Ok(MultipartCompleteOutcome::Completing {
@@ -1725,7 +1785,9 @@ impl MultipartService {
             ));
         }
 
-        // Fetch the backend from the version row.
+        // Fetch the backend from the version row. Pure reads, no side
+        // effects yet -- safe to do before the CAS below regardless of who
+        // wins it.
         let version = self.store.get_version(file_id, session.version_id).await?;
         let backend_id = version.as_ref().map_or_else(
             || self.backends.default_id().to_owned(),
@@ -1733,10 +1795,6 @@ impl MultipartService {
         );
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
-
-        backend
-            .abort_multipart(&backend_path, &session.backend_upload_handle)
-            .await?;
 
         // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
@@ -1746,19 +1804,59 @@ impl MultipartService {
             serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
         );
 
-        // Mark the session aborted (CAS: in_progress → aborted).
+        // CAS-first (P2 abort-cas-first remediation): win the DB transition
+        // `in_progress -> aborted` BEFORE ever touching the backend handle.
+        // Previously the backend's `abort_multipart` ran first (destroying
+        // the handle a concurrent `complete_multipart_upload` might already
+        // be assembling from) and only then raced its own CAS against that
+        // same completer -- backwards, and exactly the bug the cleanup
+        // sweep's `CleanupEngine::abort_expired_multipart_session` (see its
+        // doc comment in `cleanup.rs`) does NOT have: that path has always
+        // been CAS-first. This mirrors it.
         let aborted = self.store.abort_multipart_upload(upload_id, audit).await?;
         if !aborted {
             // A concurrent complete/abort transitioned the session out of
             // `in_progress` between our snapshot read and this CAS. Surface a
             // conflict and STOP — critically, we must not fall through to the
-            // pending-version delete below: had the race been a concurrent
-            // *complete*, that version is now finalized/bound and deleting it
-            // would corrupt the completed upload.
+            // backend abort or pending-version delete below: had the race
+            // been a concurrent *complete*, it may right now be assembling
+            // from (or may have already finished with) this exact backend
+            // handle and version, so touching either here would corrupt the
+            // completed upload.
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
                 session.state.as_str(),
             ));
+        }
+
+        // Best-effort backend cleanup, now that the CAS has won. Contract
+        // change from the pre-remediation behavior: a backend
+        // `abort_multipart` failure used to be returned to the caller
+        // (`?` above) -- and since it ran before the CAS, the session was
+        // then left `in_progress`, so the client's retry re-entered this
+        // same method and could try again cleanly. Now the DB-side abort is
+        // already committed and irreversible by the time we get here: a
+        // client retry would just re-hit `multipart_upload_not_in_progress`
+        // (the session is no longer `in_progress`) -- actively misleading
+        // for an abort that in fact already succeeded. So a backend failure
+        // here is logged and counted instead of propagated; the backend is
+        // left holding an orphaned upload handle for its own
+        // garbage-collection/expiry to reclaim, same as it would for any
+        // other abandoned multipart upload the backend never hears about.
+        if let Err(err) = backend
+            .abort_multipart(&backend_path, &session.backend_upload_handle)
+            .await
+        {
+            self.metrics
+                .record_backend_error(backend.id(), "abort_multipart");
+            tracing::warn!(
+                %upload_id,
+                backend_id = backend.id(),
+                error = %err,
+                "abort_multipart_upload: backend abort_multipart failed after the session \
+                 was already marked aborted in the DB; leaving the backend-side upload for \
+                 the backend's own garbage collection"
+            );
         }
 
         // Delete the pending version row (no audit row — a pending version is
