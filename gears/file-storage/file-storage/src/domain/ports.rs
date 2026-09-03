@@ -11,6 +11,8 @@
 //!
 //! `async-trait` is used to match the crate's existing `Authorizer` convention.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -133,6 +135,21 @@ pub trait CleanupStore: Send + Sync {
 
     /// List all custom-metadata entries for a file.
     async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError>;
+
+    /// Batched counterpart of [`Self::list_metadata`]: fetch the custom
+    /// metadata of many files in ONE query, keyed by `file_id`. Files with no
+    /// metadata are simply absent from the map.
+    ///
+    /// The retention sweep needs this to avoid a per-file query while walking
+    /// the whole `files` table: `sweep_retention_expiry` pages through every
+    /// file in the deployment, and any page whose files have a
+    /// metadata-criterion rule applied to them would otherwise cost one
+    /// `list_metadata` round trip per file, every `sweep_interval_secs`. The
+    /// same batching already backs `GET /files` on the read path.
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError>;
 
     /// List all versions of a file, newest first.
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError>;
