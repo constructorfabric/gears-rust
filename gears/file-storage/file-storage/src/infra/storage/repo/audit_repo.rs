@@ -7,9 +7,6 @@
 //!
 //! The `insert` method is designed to be called **inside an open transaction**
 //! so the audit row is committed atomically with the mutation it describes.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
@@ -35,15 +32,11 @@ impl AuditRepo {
     ///
     /// Callers MUST pass a transaction runner so the row is committed with the
     /// surrounding mutation (the atomicity invariant).
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn insert<C: DBRunner>(
         &self,
         conn: &C,
         entry: &AuditEntry,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-insert
         let am = ActiveModel {
             event_id: Set(Uuid::now_v7()),
             tenant_id: Set(entry.tenant_id),
@@ -60,16 +53,11 @@ impl AuditRepo {
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
             .map_err(db_err)?;
-        // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-insert
-        // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-return
     }
 
     /// List unpublished audit rows for a specific file — useful in tests to
     /// verify that exactly the right rows were written.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub async fn list_for_file<C: DBRunner>(
         &self,
         conn: &C,

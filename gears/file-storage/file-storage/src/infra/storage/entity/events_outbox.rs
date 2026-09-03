@@ -3,8 +3,6 @@
 //! Rows are enqueued in the same DB transaction as the write they describe.
 //! Relay to `EventBroker` is DEFERRED — the `EventBroker` gear is not yet present
 //! in this repo (P2-M5 TODO).
-//!
-//! @cpt-cf-file-storage-fr-file-events
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

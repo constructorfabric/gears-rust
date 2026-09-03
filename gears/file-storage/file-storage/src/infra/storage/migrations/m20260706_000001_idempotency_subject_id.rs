@@ -1,11 +1,10 @@
-//! Bind idempotency keys to the authenticated subject (P2 remediation 0.10).
+//! Bind idempotency keys to the authenticated subject.
 //!
-//! `idempotency_keys` previously carried no notion of *who* created a given
-//! key — the composite key `(tenant_id, owner_kind, owner_id, idempotency_key)`
-//! is derived entirely from the request body, so one caller could guess/reuse
-//! another caller's `(owner_id, key)` tuple and, together with the ordering
-//! bug fixed alongside this migration, receive a live upload URL for a file
-//! they never created and are not authorized to write.
+//! `idempotency_keys`' composite key `(tenant_id, owner_kind, owner_id,
+//! idempotency_key)` is derived entirely from the request body, so one
+//! caller could guess/reuse another caller's `(owner_id, key)` tuple and
+//! receive a live upload URL for a file they never created and are not
+//! authorized to write.
 //!
 //! This migration adds a `subject_id` column recording `ctx.subject_id()` at
 //! insert time. It is **not** added to the primary key — the domain layer
@@ -14,17 +13,15 @@
 //! mismatch as `Forbidden` rather than silently falling through to a fresh
 //! create (which would otherwise race the still-live row on insert).
 //!
-//! Deliberately **not** coupled to 2.1's `request_hash` column: 2.1 is not
-//! landed on this branch, and coupling an unrelated, already-necessary Tier 0
-//! fix to a not-yet-designed follow-up would only add churn risk here.
+//! Deliberately not coupled to `m20260706_000002`'s `request_hash` column:
+//! they address independent gaps, and coupling them would only add churn
+//! risk here.
 //!
 //! Existing (pre-migration) rows have no real subject on file; they are
 //! backfilled with the nil UUID, which can never equal a real
 //! `ctx.subject_id()`, so any in-flight replay of a pre-migration key is
 //! correctly treated as a subject mismatch (`Forbidden`) rather than being
 //! silently trusted.
-//!
-//! @cpt-cf-file-storage-fr-upload-idempotency
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

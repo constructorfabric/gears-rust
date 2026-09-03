@@ -262,8 +262,8 @@ impl MultipartStore for Store {
     ) -> Result<crate::domain::ports::FinalizeVersionOutcome, DomainError> {
         // `validated_mime` is the sniffed/canonical type computed by
         // `complete_multipart_upload` from the assembled object's leading
-        // bytes (P2 remediation item 1.10) — persisted in place of the
-        // client's declared type, mirroring the single-part finalize paths.
+        // bytes — persisted in place of the client's declared type,
+        // mirroring the single-part finalize paths.
         Store::finalize_version(
             self,
             file_id,

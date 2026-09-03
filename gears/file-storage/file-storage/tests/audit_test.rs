@@ -6,9 +6,6 @@
 //!    primary operation.
 //! 2. A rolled-back mutation (failed metadata CAS) leaves **zero** audit rows —
 //!    proving that the audit row and the mutation share a single transaction.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -115,8 +112,6 @@ fn new_file() -> NewFile {
 
 // ── 1. create_file leaves exactly one "create" audit row ───────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn create_file_leaves_one_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
@@ -136,8 +131,6 @@ async fn create_file_leaves_one_audit_row() {
 
 // ── 2. finalize_upload leaves a "finalize_version" audit row ──────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn finalize_upload_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
@@ -173,8 +166,6 @@ async fn finalize_upload_leaves_audit_row() {
 
 // ── 3. bind leaves a "patch_content" audit row ────────────────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn bind_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
@@ -213,8 +204,6 @@ async fn bind_leaves_audit_row() {
 
 // ── 4. update_metadata leaves a "patch_metadata" audit row ────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn update_metadata_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
@@ -252,9 +241,6 @@ async fn update_metadata_leaves_audit_row() {
 /// catalog lists the event type, but nothing ever enqueued it). This proves
 /// the event is now enqueued exactly once, in the same transaction as the
 /// audit row and the metadata mutation.
-///
-/// @cpt-cf-file-storage-fr-file-events
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn update_metadata_enqueues_metadata_updated_event() {
     let (svc, _msvc, _dp, store) = build_service().await;
@@ -346,8 +332,6 @@ async fn update_metadata_enqueues_metadata_updated_event() {
 
 // ── 5. delete_file leaves a "delete_file" audit row ──────────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_file_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
@@ -379,8 +363,6 @@ async fn delete_file_leaves_audit_row() {
 
 // ── 6. delete_version leaves a "delete_version" audit row ────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_version_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
@@ -447,8 +429,6 @@ async fn delete_version_leaves_audit_row() {
 
 /// A file with exactly one version must 404 on a random/non-existent
 /// `version_id` instead of silently deleting the whole file.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_version_single_version_file_wrong_id_returns_not_found() {
     let (svc, _msvc, dp, store) = build_service().await;
@@ -492,8 +472,6 @@ async fn delete_version_single_version_file_wrong_id_returns_not_found() {
 
 /// Positive control: deleting the only version by its real id still deletes
 /// the whole file (today's intended behavior).
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_version_single_version_file_matching_id_deletes_whole_file() {
     let (svc, _msvc, dp, store) = build_service().await;
@@ -526,8 +504,6 @@ async fn delete_version_single_version_file_matching_id_deletes_whole_file() {
 
 // -- 7. multipart complete leaves audit rows ----------------------------------
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn multipart_complete_leaves_audit_rows() {
     // Build a custom setup that exposes both the MultipartStore and the
@@ -674,8 +650,6 @@ async fn multipart_complete_leaves_audit_rows() {
 /// A stale `expected_meta_version` causes the CAS to roll back the entire
 /// transaction (both the `meta_version` bump and the audit row). This proves
 /// the same-transaction guarantee of `cpt-cf-file-storage-nfr-audit-completeness`.
-///
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_metadata_cas_leaves_no_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
@@ -715,8 +689,6 @@ async fn failed_metadata_cas_leaves_no_audit_row() {
 
 /// A stale ETag on bind rolls back the whole transaction; no audit row should
 /// be emitted.
-///
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_bind_cas_leaves_no_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;

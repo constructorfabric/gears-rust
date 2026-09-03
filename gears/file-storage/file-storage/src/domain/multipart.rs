@@ -1,6 +1,4 @@
 //! Domain types for multipart upload sessions and parts.
-//!
-//! @cpt-cf-file-storage-fr-multipart-upload
 
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -256,8 +254,6 @@ impl BindState {
 /// capped at `min(session.expires_at, now + url_ttl_secs)`: it never outlives
 /// the session, but it also never gets a longer TTL than any freshly-minted
 /// URL just because the session itself is long-lived.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartUploadStatus {
@@ -319,8 +315,6 @@ pub struct MultipartPart {
 ///
 /// The `upload_url` is a sidecar signed URL containing the exact `size` claim.
 /// The client must `PUT` exactly `size` bytes to `upload_url`.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartPartPlan {
@@ -335,8 +329,6 @@ pub struct MultipartPartPlan {
 }
 
 /// The server-authoritative parts plan returned by `POST /files/{id}/multipart`.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartPlan {
@@ -372,7 +364,7 @@ pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Hard ceiling on the number of parts a single multipart plan may contain,
 /// enforced by [`compute_plan`] independently of any one backend's own
 /// native limit (ADR-0006 §"Manifest storage", `docs/features/
-/// content-hash-modes.md` §12 risk 1: "a backend without such a native limit
+/// content-hash-modes.md` §11 risk 1: "a backend without such a native limit
 /// cannot silently produce an unbounded manifest").
 ///
 /// `10_000` matches S3's own hard multipart-part limit (`S3Backend::upload_part`

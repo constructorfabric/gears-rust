@@ -57,10 +57,6 @@ impl Store {
     /// row (caller maps to PreconditionFailed with "metadata revision changed
     /// concurrently"; REST maps that canonical error to HTTP 400). No audit
     /// row and no event are written in that case.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn patch_metadata_atomic(
         &self,
@@ -102,20 +98,18 @@ impl Store {
                 else {
                     return Ok(false);
                 };
-                // FS-11 fix: batch the patch instead of one delete-then-
-                // insert (or delete) per entry. Every touched key (both
-                // the ones being replaced and the ones being removed)
-                // is deleted in a single statement first -- upsert
-                // semantics, and the pre-existing row for a key being
-                // *set* must go too, exactly like the old per-entry
-                // `upsert` did -- then every entry with a `Some` value
-                // is inserted in a single multi-row statement. Two
-                // statements for any patch that fits the backend's
-                // bind-parameter budget, which is every realistic one
-                // (previously one or two per entry). A patch large enough
-                // to exceed that budget is split into a few more by
-                // `MetadataRepo::delete_keys`/`secure_insert_many`, both
-                // of which chunk against `max_bind_params_for` -- still a
+                // Batch the patch instead of one delete-then-insert (or
+                // delete) per entry. Every touched key (both the ones being
+                // replaced and the ones being removed) is deleted in a
+                // single statement first -- upsert semantics, so the
+                // pre-existing row for a key being *set* must go too -- then
+                // every entry with a `Some` value is inserted in a single
+                // multi-row statement. Two statements for any patch that
+                // fits the backend's bind-parameter budget, which is every
+                // realistic one. A patch large enough to exceed that budget
+                // is split into a few more by
+                // `MetadataRepo::delete_keys`/`secure_insert_many`, both of
+                // which chunk against `max_bind_params_for` -- still a
                 // constant handful rather than a per-entry count, and all
                 // inside this one transaction.
                 //
@@ -148,7 +142,6 @@ impl Store {
                 metadata
                     .insert_many(tx, &AccessScope::allow_all(), file_id, &inserts, now)
                     .await?;
-                // @cpt-cf-file-storage-nfr-audit-completeness
                 audit_repo.insert(tx, &audit).await?;
                 if let Some(mut ev) = event {
                     // Stamp the authoritative post-bump revision the CAS

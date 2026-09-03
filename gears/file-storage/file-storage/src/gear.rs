@@ -1,6 +1,4 @@
 //! Gear entry point and capability wiring.
-//!
-//! @cpt-cf-file-storage-component-http-gateway
 
 use std::sync::{Arc, Mutex, OnceLock};
 

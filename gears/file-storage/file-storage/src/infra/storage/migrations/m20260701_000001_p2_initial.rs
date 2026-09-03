@@ -14,17 +14,6 @@
 //! Mirrors the P2 section of `gears/file-storage/docs/migration.sql`; table
 //! names are flat (unqualified) -- consistent with P1 and the `SeaORM` entity
 //! `table_name` attributes.
-//!
-//! @cpt-cf-file-storage-fr-allowed-types-policy
-//! @cpt-cf-file-storage-fr-size-limits-policy
-//! @cpt-cf-file-storage-fr-metadata-limits
-//! @cpt-cf-file-storage-fr-retention-policies
-//! @cpt-cf-file-storage-fr-multipart-upload
-//! @cpt-cf-file-storage-fr-upload-idempotency
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
-//! @cpt-dod:cpt-cf-file-storage-dod-audit-trail-schema:p2
-//! @cpt-cf-file-storage-fr-file-events
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

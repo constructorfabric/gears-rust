@@ -12,27 +12,34 @@ mod m20260707_000001_content_hash_modes;
 mod m20260722_000001_multipart_auto_bind;
 mod m20260902_000001_index_hardening;
 
-/// File-storage migrator. P1 ships the initial control-plane metadata tables;
-/// P2 adds the policy store, retention rules, multipart uploads + idempotency
-/// keys, and the audit + file-events transactional outboxes in one step.
-/// P2-multipart-coordinator adds the plan columns (`declared_size`, `part_size`)
-/// to `multipart_uploads` for the server-authoritative parts-plan model.
-/// P2-remediation-0.10 adds `subject_id` to `idempotency_keys` so a replay can
-/// be bound to the authenticated caller, not just the request-body owner.
-/// P2-remediation-2.1 adds `request_hash` to `idempotency_keys` so a replay
-/// can be bound to the request body that created it, not just the caller.
-/// P2-remediation-2.4 adds two partial unique indexes on `policies` so at
-/// most one row can exist per `(tenant_id, scope, scope_owner_id)`, closing
-/// the upsert delete-then-insert race.
-/// ADR-0006 adds `hash_mode`/`part_count` to `file_versions` and the new
+/// File-storage migrator. `m20260624_000001_p1_initial` ships the initial
+/// control-plane metadata tables; `m20260701_000001_p2_initial` adds the
+/// policy store, retention rules, multipart uploads + idempotency keys, and
+/// the audit + file-events transactional outboxes in one step.
+/// `m20260701_000002_multipart_plan_columns` adds the plan columns
+/// (`declared_size`, `part_size`) to `multipart_uploads` for the
+/// server-authoritative parts-plan model.
+/// `m20260706_000001_idempotency_subject_id` adds `subject_id` to
+/// `idempotency_keys` so a replay can be bound to the authenticated caller,
+/// not just the request-body owner.
+/// `m20260706_000002_idempotency_request_hash` adds `request_hash` to
+/// `idempotency_keys` so a replay can be bound to the request body that
+/// created it, not just the caller.
+/// `m20260706_000003_policies_unique_scope` adds two partial unique indexes
+/// on `policies` so at most one row can exist per `(tenant_id, scope,
+/// scope_owner_id)`, closing the upsert delete-then-insert race.
+/// `m20260707_000001_content_hash_modes` (ADR-0006) adds
+/// `hash_mode`/`part_count` to `file_versions` and the new
 /// `version_hash_manifest` table for the multipart offset-manifest composite
 /// content-hash mode.
-/// The upload-flow redesign adds `auto_bind` to `multipart_uploads` so
-/// `complete` knows whether to bind the finalized version itself.
-/// Index hardening adds `idempotency_keys_file_idx` (covers the
-/// `ON DELETE CASCADE` from `files`) and `multipart_uploads_sweep_idx`
-/// (covers the full `list_expired` OR predicate, including the
-/// `completing`-with-expired-lease branch the existing partial index misses).
+/// `m20260722_000001_multipart_auto_bind` adds `auto_bind` to
+/// `multipart_uploads` so `complete` knows whether to bind the finalized
+/// version itself.
+/// `m20260902_000001_index_hardening` adds `idempotency_keys_file_idx`
+/// (covers the `ON DELETE CASCADE` from `files`) and
+/// `multipart_uploads_sweep_idx` (covers the full `list_expired` OR
+/// predicate, including the `completing`-with-expired-lease branch the
+/// existing partial index misses).
 pub struct Migrator;
 
 #[async_trait::async_trait]

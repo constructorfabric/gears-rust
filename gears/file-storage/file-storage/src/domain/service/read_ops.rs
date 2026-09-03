@@ -246,8 +246,6 @@ impl FileService {
     /// an `If-Match` content-ETag precondition, then best-effort delete the
     /// backend blobs. `If-Match` is **required** (see api.md §DELETE); pass `"*"`
     /// to delete unconditionally when the ETag is unknown.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn delete_file(
         &self,
@@ -288,8 +286,6 @@ impl FileService {
     /// Inner (unconditional) file deletion: authorization and If-Match must have
     /// already been checked by the caller. Collects versions, removes the DB row
     /// (and FK children via cascade), then best-effort-deletes all backend blobs.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub(super) async fn delete_file_inner(
         &self,
         ctx: &SecurityContext,
@@ -302,7 +298,6 @@ impl FileService {
         // Collect backend blobs before the metadata row (and FK children) vanish.
         let versions = self.store.list_versions(file_id).await?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -310,7 +305,6 @@ impl FileService {
             serde_json::json!({ "version_count": versions.len() }),
         );
 
-        // @cpt-cf-file-storage-fr-file-events
         // We need the file's tenant/owner for the event payload; fetch before deletion.
         let file_meta = self.store.get_file(&scope, file_id).await?;
         let (event_tenant, event_owner) = file_meta.as_ref().map_or_else(
@@ -333,7 +327,6 @@ impl FileService {
             return Err(DomainError::file_not_found(file_id));
         }
 
-        // @cpt-cf-file-storage-fr-usage-reporting
         let total_bytes: i64 = versions.iter().map(|v| v.size).sum();
         self.report_usage(UsageDelta {
             tenant_id: event_tenant,
@@ -352,8 +345,6 @@ impl FileService {
 
     /// Delete a single version (and its backend blob). Deleting the only version
     /// is equivalent to deleting the file.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn delete_version(
         &self,
@@ -389,7 +380,6 @@ impl FileService {
             ));
         }
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -417,7 +407,6 @@ impl FileService {
                 None => DomainError::version_not_found(file_id, version_id),
             });
         }
-        // @cpt-cf-file-storage-fr-usage-reporting
         // Debit this non-current version's bytes. The `all.len() <= 1` branch
         // above already delegated to `delete_file_inner` (which reports its
         // own whole-file debit), so this arm only runs when at least one

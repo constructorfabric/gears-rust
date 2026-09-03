@@ -141,33 +141,28 @@ impl MetadataRepo {
     /// limit is a 500.
     const DELETE_KEYS_RESERVED_PARAMS: usize = 16;
 
-    /// Batched counterpart of [`Self::delete_key`] (FS-11/FS-14 fix): delete
-    /// every row in `keys` for `file_id` via `DELETE ... WHERE key IN (...)`,
-    /// instead of one `DELETE` per key. A no-op (zero statements) for an
-    /// empty `keys` slice. Returns the total number of rows removed.
+    /// Batched counterpart of [`Self::delete_key`]: delete every row in
+    /// `keys` for `file_id` via `DELETE ... WHERE key IN (...)`, instead of
+    /// one `DELETE` per key. A no-op (zero statements) for an empty `keys`
+    /// slice. Returns the total number of rows removed.
     ///
     /// `keys` is chunked to [`max_bind_params_for`] minus
     /// [`Self::DELETE_KEYS_RESERVED_PARAMS`] before building the `IN (...)`
-    /// list, and one `DELETE` is issued per chunk. Without this, the number
-    /// of bind parameters here equals the number of key/value pairs in a
-    /// single client PATCH request, and `metadata_limits.max_pairs` is an
+    /// list, and one `DELETE` is issued per chunk. Without chunking, the
+    /// number of bind parameters here equals the number of key/value pairs in
+    /// a single client PATCH request, and `metadata_limits.max_pairs` is an
     /// `Option<u32>` that defaults to `None` ("no limit") -- so a large
     /// enough request body (the gateway allows up to 16 MiB) reaches the
     /// driver's own bind-parameter ceiling (65535 on `PostgreSQL`, 32766 on
     /// `SQLite`) and the statement fails outright rather than degrading
     /// gracefully. Chunking trades that hard failure for a handful of extra
     /// round trips on the (rare) oversized request, while leaving the common
-    /// case -- a handful of keys -- at exactly one statement, as before.
+    /// case -- a handful of keys -- at exactly one statement.
     ///
     /// This is the delete half of the metadata patch; the insert half
     /// ([`Self::insert_many`], backed by [`secure_insert_many`]) already
-    /// chunks itself internally by row count, so it needs no change here.
-    /// The asymmetry is intentional, not an oversight: `secure_insert_many`
-    /// chunks because one *insert* statement can only hold so many rows
-    /// before hitting the same bind-parameter ceiling, and it does so under
-    /// the very same [`max_bind_params_for`] budget -- this method is simply
-    /// applying the identical reasoning to the `IN (...)` list on the delete
-    /// side, where nothing previously did so.
+    /// chunks itself internally by row count under the same
+    /// [`max_bind_params_for`] budget, for the same reason.
     ///
     /// Splitting one logical delete into several statements is safe here
     /// specifically because [`Store::patch_metadata_atomic`] (the only
@@ -207,9 +202,9 @@ impl MetadataRepo {
         Ok(total_rows_affected)
     }
 
-    /// Batched counterpart of a loop of [`Self::upsert`]'s insert half
-    /// (FS-11/FS-14 fix): insert every `(key, value)` entry in one multi-row
-    /// `INSERT`, instead of one `INSERT` per entry. Callers must have already
+    /// Batched counterpart of a loop of [`Self::upsert`]'s insert half:
+    /// insert every `(key, value)` entry in one multi-row `INSERT`, instead
+    /// of one `INSERT` per entry. Callers must have already
     /// removed any pre-existing rows for these keys (e.g. via
     /// [`Self::delete_keys`]) -- this method only inserts, it does not
     /// upsert. A no-op (zero statements) for an empty `entries` slice.

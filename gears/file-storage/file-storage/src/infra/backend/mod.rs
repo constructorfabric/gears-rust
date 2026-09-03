@@ -61,14 +61,10 @@ pub(crate) fn build_manifest_and_root(
             digest: *digest,
         })
         .collect();
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-sort
     entries.sort_by_key(|e| e.offset);
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-sort
     let manifest = Manifest::new(entries)?;
     let root = manifest.root();
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
     Ok((manifest, root))
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
 }
 
 /// Result of [`StorageBackend::publish_exclusive`]: the measured size/digest
@@ -170,21 +166,20 @@ pub trait StorageBackend: Send + Sync {
     /// single-shot upload handler, publishing a version's *final*, canonical
     /// object at `/{file_id}/{version_id}`.
     ///
-    /// # Why this must not just overwrite (P2 remediation — replay-`PUT` fix)
+    /// # Why this must not just overwrite
     /// A `PUT` token's signature covers `op`/`file_id`/`version_id`/size/hash
     /// *constraints*, never the body bytes (DESIGN.md, ADR-0003), and stays
     /// valid until `exp`. Once a version has been finalized and bound as a
     /// file's live content, a holder of that same still-unexpired token could
     /// otherwise re-`PUT` different bytes to the same backend path and
     /// silently replace the live, already-served content out from under the
-    /// recorded size/hash/`ETag`/MIME — a HIGH-severity immutability break,
-    /// not the merely-orphans-a-version consequence the design previously
-    /// assumed. Making this call create-exclusive closes that: only the
+    /// recorded size/hash/`ETag`/MIME — a HIGH-severity immutability break.
+    /// Making this call create-exclusive closes that: only the
     /// *first* write to a given path ever lands; every subsequent attempt
     /// observes `created: false` and the existing bytes are provably
     /// untouched.
     ///
-    /// # This default implementation is explicitly non-atomic (TOCTOU) — read before relying on it
+    /// # This default implementation is non-atomic (TOCTOU) — read before relying on it
     /// It is an `exists` check followed by a separate `put`, with a real race
     /// window in between: two concurrent callers can both observe "nothing
     /// there yet" and both proceed to `put`, so two racing publishes to the
@@ -354,7 +349,7 @@ pub trait StorageBackend: Send + Sync {
 
     /// The total length in bytes of the blob at `path`, without necessarily
     /// reading its content. Range-aware callers (e.g. the sidecar's
-    /// `download` handler, P2 1.11) use this to resolve `Range` requests
+    /// `download` handler) use this to resolve `Range` requests
     /// against the actual blob length and to build a correct `Content-Range`
     /// header, without materializing the whole blob first.
     ///
@@ -379,17 +374,16 @@ pub trait StorageBackend: Send + Sync {
     /// distinct from either -- the same three-way split `exists` already
     /// documents, just resolved by one round-trip instead of two.
     ///
-    /// This exists because the sidecar's download handlers previously had to
-    /// call `exists` (to answer `404` distinctly from a backend fault) and
-    /// then, separately, `size` (to size the response / resolve a `Range`) --
-    /// two `HeadObject` calls against `S3Backend` for every `GET`/`HEAD`. A
-    /// caller that needs both facts should call this once instead.
+    /// Without this, a caller needing both facts -- e.g. the sidecar's
+    /// download handlers, to answer `404` distinctly from a backend fault
+    /// and to size the response / resolve a `Range` -- would need a separate
+    /// `exists` and `size` call, two `HeadObject`s against `S3Backend` for
+    /// every `GET`/`HEAD`.
     ///
-    /// The default implementation composes `exists` then `size` -- the same
-    /// two calls a caller previously had to make itself -- so a backend that
-    /// hasn't been upgraded to a single combined stat still behaves
-    /// correctly; `local-fs`, `s3`, and `in-memory` all override this with a
-    /// single native stat.
+    /// The default implementation composes `exists` then `size`, so a
+    /// backend that hasn't been upgraded to a single combined stat still
+    /// behaves correctly; `local-fs`, `s3`, and `in-memory` all override this
+    /// with a single native stat.
     async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
         if !self.exists(path).await? {
             return Ok(None);
@@ -400,8 +394,6 @@ pub trait StorageBackend: Send + Sync {
     /// Initiate a multipart upload for `path`. Returns an opaque backend handle.
     /// Default returns an error — backends must opt-in by overriding this method
     /// and setting `multipart_native: true` in their capabilities.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     async fn initiate_multipart(&self, _path: &str) -> Result<String, DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }
@@ -413,8 +405,6 @@ pub trait StorageBackend: Send + Sync {
     /// flat `sha256(data)` exactly as before — but is threaded through so the
     /// backend can build the offset-manifest at `complete` time without
     /// re-deriving it from a plan it may not retain.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     async fn upload_part(
         &self,
         _path: &str,
@@ -438,8 +428,6 @@ pub trait StorageBackend: Send + Sync {
     /// Returns `(manifest, root)` where `root = sha256(manifest.to_wire_string())`
     /// — the control plane stores `root` as the version's `hash_value` and the
     /// manifest text in `version_hash_manifest`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     async fn complete_multipart(
         &self,
         _path: &str,
@@ -450,8 +438,6 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Abort a multipart upload, discarding all uploaded parts.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     async fn abort_multipart(&self, _path: &str, _upload_handle: &str) -> Result<(), DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }
@@ -462,13 +448,11 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// The default implementation returns an empty vec — backends that cannot
     /// enumerate their contents are treated conservatively (unknown = skip).
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         Ok(vec![])
     }
 
-    /// Cheap readiness probe (P2 1.6): confirms the backend can actually
+    /// Cheap readiness probe: confirms the backend can actually
     /// serve requests right now (e.g. its local-fs root is mounted, its S3
     /// endpoint is reachable and its credentials are valid), without moving
     /// any real content. Used by the sidecar's `/readyz` route for k8s
@@ -548,7 +532,7 @@ impl BackendRegistry {
     }
 
     /// Iterate all configured backends as `(id, backend)` pairs. Used by the
-    /// sidecar's `/readyz` probe (P2 1.6), which polls every backend's
+    /// sidecar's `/readyz` probe, which polls every backend's
     /// [`StorageBackend::is_ready`] rather than just the default one.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn StorageBackend>)> {
         self.backends.iter().map(|(id, b)| (id.as_str(), b))

@@ -1,4 +1,4 @@
-//! Multipart upload session intent methods (P2-M3).
+//! Multipart upload session intent methods.
 
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -10,11 +10,9 @@ use crate::infra::storage::db::db_err;
 use crate::infra::storage::store::Store;
 
 impl Store {
-    // ── multipart uploads (P2-M3) ─────────────────────────────────────────────
+    // ── multipart uploads ─────────────────────────────────────────────────────
 
     /// Create a multipart upload session row.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     #[allow(clippy::too_many_arguments)]
     pub async fn create_multipart_upload(
         &self,
@@ -49,8 +47,6 @@ impl Store {
     }
 
     /// Fetch a multipart upload session by `upload_id`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     pub async fn get_multipart_upload(
         &self,
         upload_id: Uuid,
@@ -60,20 +56,20 @@ impl Store {
     }
 
     /// Insert or replace a multipart upload part, guarded and written in a
-    /// single transaction (P2 report-part-atomicity remediation).
+    /// single transaction: the guard (re-checking `state == 'in_progress'`,
+    /// taking a row lock that serializes against any concurrent
+    /// session-row CAS) and the write happen inside one transaction -- see
+    /// `MultipartRepo::upsert_part` for exactly how.
     ///
-    /// Before this fix, `MultipartService::report_part` checked
-    /// `session.state == InProgress` against an already-loaded snapshot and
-    /// then, in a completely separate call, this method took a bare
-    /// (non-transactional) connection and issued a DELETE followed by an
-    /// INSERT -- see `MultipartRepo::upsert_part`'s old doc comment history
-    /// for detail. That left two independent race windows open:
+    /// Without that, a bare (non-transactional) state check followed by a
+    /// separate, unguarded DELETE-then-INSERT leaves two independent race
+    /// windows open:
     ///
     /// 1. `complete_multipart_upload` snapshotting `list_multipart_parts` in
-    ///    the instant between this method's DELETE and INSERT would see the
-    ///    part as missing and fail the upload with a spurious "parts
-    ///    missing" `409`, even though the part had in fact been (re-)reported.
-    /// 2. A `report_part` that raced a concurrent `abort_multipart_upload`
+    ///    the instant between the DELETE and INSERT would see the part as
+    ///    missing and fail the upload with a spurious "parts missing" `409`,
+    ///    even though the part had in fact been (re-)reported.
+    /// 2. A `report_part` that races a concurrent `abort_multipart_upload`
     ///    (whose CAS + `delete_parts_for_upload` run together in one
     ///    transaction) could have its own state check pass, then have its
     ///    unguarded INSERT land AFTER the abort's `delete_parts_for_upload`
@@ -81,24 +77,14 @@ impl Store {
     ///    `multipart_uploads` row is never deleted, only transitioned (so
     ///    nothing ever revisits it to clean the row up).
     ///
-    /// Now the guard (re-checking `state == 'in_progress'`, taking a row
-    /// lock that serializes against any concurrent session-row CAS) and the
-    /// write happen inside one transaction -- see
-    /// `MultipartRepo::upsert_part` for exactly how.
+    /// # Error contract
     ///
-    /// # Error contract (unchanged shape, now also reachable from here)
-    ///
-    /// This method's signature stays `Result<(), DomainError>` -- the
-    /// `MultipartStore` port is not touched by this fix. When the guard
-    /// finds the session no longer `in_progress`, this now returns
-    /// `Err(DomainError::multipart_upload_not_in_progress(..))` directly --
-    /// the SAME error variant `MultipartService::report_part`'s pre-existing
-    /// (now merely fast-path) state check already returns for that case, so
-    /// the HTTP contract is unchanged: callers that already propagate this
-    /// method's `Err` via `?` need no changes to keep returning the correct
-    /// `409`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// When the guard finds the session no longer `in_progress`, this
+    /// returns `Err(DomainError::multipart_upload_not_in_progress(..))`
+    /// directly -- the same error variant `MultipartService::report_part`'s
+    /// own (fast-path) state check returns for that case, so callers that
+    /// propagate this method's `Err` via `?` get the correct `409` either
+    /// way.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_multipart_part(
         &self,
@@ -152,10 +138,8 @@ impl Store {
     /// Whether `file_id` currently has at least one `in_progress` multipart
     /// upload session (regardless of `expires_at`).
     ///
-    /// P2 2.8 orphan-file-reconciliation guard -- see
+    /// Orphan-file-reconciliation guard -- see
     /// `MultipartRepo::has_in_progress_for_file`.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     pub async fn has_in_progress_multipart_for_file(
         &self,
         file_id: Uuid,
@@ -186,8 +170,6 @@ impl Store {
     }
 
     /// List all parts for a multipart upload.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     pub async fn list_multipart_parts(
         &self,
         upload_id: Uuid,
@@ -199,16 +181,12 @@ impl Store {
     /// Mark a multipart upload session as `completed` and record the audit row
     /// in the same transaction.
     ///
-    /// Also flips `mime_validated` to `true` in the same UPDATE (P2
-    /// remediation item 1.10): by the time `MultipartService::complete_multipart_upload`
-    /// calls this, it has already sniffed the assembled object's leading
+    /// Also flips `mime_validated` to `true` in the same UPDATE: by the time
+    /// `MultipartService::complete_multipart_upload` calls this, it has
+    /// already sniffed the assembled object's leading
     /// bytes and validated them against `session.declared_mime` (bailing out
     /// with `DomainError::mime_mismatch` before ever reaching this call on a
     /// mismatch) — so reaching this point means the content is validated.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
@@ -222,14 +200,13 @@ impl Store {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    // Upload-flow redesign: the terminal transition comes
-                    // from `completing` (the completion lease), persisting
-                    // the response snapshot for idempotent re-completes.
+                    // The terminal transition comes from `completing` (the
+                    // completion lease), persisting the response snapshot
+                    // for idempotent re-completes.
                     let updated = multipart
                         .finish_complete(tx, upload_id, &result_json)
                         .await?;
                     if updated {
-                        // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
                     }
                     Ok::<bool, DomainError>(updated)
@@ -272,7 +249,7 @@ impl Store {
     /// `multipart_upload_parts` rows, and record the audit row — all in the
     /// same transaction.
     ///
-    /// Part-row deletion (P2 remediation, `docs/features/multipart-coordinator.md`
+    /// Part-row deletion (`docs/features/multipart-coordinator.md`'s
     /// `inst-abort-delete-parts`) lives here rather than at each call site so
     /// both abort paths that share this single CAS -- the user-driven
     /// `MultipartService::abort_multipart_upload` and the cleanup sweep's
@@ -280,10 +257,6 @@ impl Store {
     /// Folded into the same transaction as the state flip so a crash between
     /// the two can never leave the session `aborted` with its part rows still
     /// dangling.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn abort_multipart_upload(
         &self,
         upload_id: Uuid,
@@ -299,8 +272,8 @@ impl Store {
                         .update_state(tx, upload_id, "in_progress", "aborted", None)
                         .await?;
                     if !updated {
-                        // Upload-flow redesign: a `completing` session whose
-                        // lease has expired (completer died mid-assembly) is
+                        // A `completing` session whose lease has expired
+                        // (completer died mid-assembly) is
                         // also abortable — by the cleanup sweep or an
                         // explicit client abort. A LIVE lease is never
                         // aborted out from under its completer (the CAS
@@ -310,10 +283,7 @@ impl Store {
                             .await?;
                     }
                     if updated {
-                        // @cpt-begin:cpt-cf-file-storage-flow-multipart-abort:p1:inst-abort-delete-parts
                         multipart.delete_parts_for_upload(tx, upload_id).await?;
-                        // @cpt-end:cpt-cf-file-storage-flow-multipart-abort:p1:inst-abort-delete-parts
-                        // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
                     }
                     Ok::<bool, DomainError>(updated)

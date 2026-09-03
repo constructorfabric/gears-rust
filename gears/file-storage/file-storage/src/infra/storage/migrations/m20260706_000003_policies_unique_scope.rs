@@ -1,10 +1,10 @@
-//! Close the policy upsert race with two partial unique indexes (P2
-//! remediation 2.4).
+//! Close the policy upsert race with two partial unique indexes.
 //!
-//! `PolicyRepo::upsert` previously issued a `DELETE` followed by an
-//! independent `INSERT` with no transaction wrapper and no unique constraint
-//! on `(tenant_id, scope, scope_owner_id)`. Two concurrent `PUT /policy`
-//! calls for the same scope could each see zero matching rows to delete and
+//! `PolicyRepo::upsert` issues a `DELETE` followed by an independent
+//! `INSERT` with no transaction wrapper. Without a unique constraint on
+//! `(tenant_id, scope, scope_owner_id)` this is racy: two concurrent
+//! `PUT /policy` calls for the same scope could each see zero matching rows
+//! to delete and
 //! then both insert, leaving two rows for what is supposed to be an at-most-
 //! one-per-scope table — after that, `PolicyRepo::get` (which does not order
 //! or limit) becomes non-deterministic about which row it returns.
@@ -60,10 +60,6 @@
 //! narrowing deletes with no side effects beyond removing the losing
 //! duplicate rows, so re-running this migration's `UP` SQL after it already
 //! succeeded is a no-op (nothing left to delete, indexes already exist).
-//!
-//! @cpt-cf-file-storage-fr-allowed-types-policy
-//! @cpt-cf-file-storage-fr-size-limits-policy
-//! @cpt-cf-file-storage-fr-metadata-limits
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

@@ -25,8 +25,6 @@
 //! offset      = "0" / (nonzero-digit *digit)      ; decimal, no leading zeros
 //! digest      = 64(hex-lower)                     ; sha256(part_bytes), lowercase
 //! ```
-//!
-//! @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-groundwork:p2
 
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
@@ -141,7 +139,6 @@ impl Manifest {
     /// backend and verifier must call this rather than hand-rolling the
     /// format.
     #[must_use]
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-concat
     pub fn to_wire_string(&self) -> String {
         // Pre-size: "v1" + per-entry ",{offset}:{64 hex chars}" (offsets are
         // realistically well under 20 decimal digits).
@@ -149,15 +146,12 @@ impl Manifest {
         s.push_str(VERSION_PREFIX);
         for entry in &self.0 {
             s.push(',');
-            // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-serialize-entry
             s.push_str(itoa_u64(entry.offset).as_str());
             s.push(':');
             s.push_str(&hex::encode(entry.digest));
-            // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-serialize-entry
         }
         s
     }
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-concat
 
     /// Parse a manifest string per §3's exact grammar, rejecting any
     /// deviation: unrecognized version prefix, malformed/missing delimiters,
@@ -214,11 +208,9 @@ impl Manifest {
     /// Compute `root = sha256(to_wire_string())` — the value stored as the
     /// version's `hash_value` for `multipart-composite-sha256` versions.
     #[must_use]
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-root
     pub fn root(&self) -> [u8; 32] {
         hash::digest_to_array(hash::sha256(self.to_wire_string().as_bytes()))
     }
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-root
 }
 
 /// Format a `u64` as a plain decimal `String` with no leading zeros (`"0"`
