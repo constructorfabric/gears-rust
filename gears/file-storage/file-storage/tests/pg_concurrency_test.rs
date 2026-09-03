@@ -7,13 +7,12 @@
     clippy::too_many_lines,
     clippy::too_many_arguments
 )]
-//! PostgreSQL concurrency harness for the file-storage DB-behavior audit
-//! (Step 4 of the DB-behavior audit program -- see
-//! `docs/toolkit_unified_system/14_db_behavior_testing.md`, methodology
-//! validated against `resource-group`'s own PG suite on
-//! `audit/rg-db-behavior`).
+//! PostgreSQL concurrency harness for file-storage's CAS-based concurrency
+//! safety, structured after `resource-group`'s own PG suite (see
+//! `docs/toolkit_unified_system/14_db_behavior_testing.md` for the general
+//! methodology).
 //!
-//! Same reasons real PostgreSQL is needed here as for resource-group:
+//! Real PostgreSQL is required here for the same reason as in resource-group:
 //! SQLite's own "SERIALIZABLE" is a whole-database writer lock, not
 //! row/predicate-level SSI, and file-storage's concurrency-safety strategy is
 //! single-statement CAS `UPDATE ... WHERE` predicates whose *interleaving*
@@ -44,30 +43,40 @@
 //!
 //! ## Scenarios
 //!
-//! - `f1_*` -- known defect FS-01/F1: a multipart-initiate failure (capability
-//!   reject on a non-`multipart_native` backend, or a backend-level
-//!   initiation error) leaves a version-less orphan `files` row that a real
-//!   sweep pass does not reclaim.
-//! - `f2_*` -- known defect FS-02/F2 (the audit's single most severe finding):
-//!   completion is not owner-fenced end-to-end. Two completers, A and B, race
-//!   the same session's lease; deterministic checkpoints (`tokio::sync::
-//!   Notify` gates threaded through a `MultipartStore` decorator, not
-//!   `sleep`-based timing) force the exact interleaving `upload-flow-review.md`
-//!   describes: stale A wins the version-finalize CAS, B's own (redundant)
-//!   finalize attempt then fails and releases B's *own* lease (owner-scoped,
-//!   but the session is still `completing` at that moment) back to
-//!   `in_progress`, and A's own `finish_session` CAS then fails too (the
-//!   state it expected, `completing`, is gone) -- both callers see an error,
-//!   even though the content was, in fact, correctly finalized and bound.
-//!   The session is left stranded at `in_progress` with no live lease and no
-//!   missing parts, so a third caller re-attempts the (already-done)
-//!   assembly, fails again (the specific error shape varies -- a DB conflict
-//!   or a backend "handle already consumed" error, depending on how far the
-//!   redundant attempt gets -- but it always fails), and re-strands it --
-//!   this repeats until `expires_at` passes and the background sweep aborts
-//!   the session, permanently, with the content already live underneath it.
-//! - `f9_*` -- FS-04/F9 fix verification: multipart auto-bind's CAS target
-//!   used to be whatever `content_id` was observed at the *start* of
+//! - `f1_*` -- orphan file on multipart-initiate failure: a multipart-initiate
+//!   failure (capability reject on a non-`multipart_native` backend, or a
+//!   backend-level initiation error) leaves a version-less orphan `files` row
+//!   that a real sweep pass does not reclaim (`sweep_abandoned_pending` only
+//!   ever visits rows returned by `list_abandoned_pending_versions`, and
+//!   there is no pending version here to trigger it). Fixed at the
+//!   orchestration layer: `api/rest/handlers.rs::create_file`'s multipart
+//!   branch now calls `compensate_failed_multipart_initiate` on exactly this
+//!   failure.
+//! - `f2_*` -- completion is not owner-fenced end-to-end (the most severe
+//!   scenario in this file): two completers, A and B, race the same
+//!   session's lease; deterministic checkpoints (`tokio::sync::Notify` gates
+//!   threaded through a `MultipartStore` decorator, not `sleep`-based timing)
+//!   force the exact interleaving where stale A wins the version-finalize
+//!   CAS, B's own (redundant) finalize attempt then fails and releases B's
+//!   *own* lease (owner-scoped, but the session is still `completing` at
+//!   that moment) back to `in_progress`, and A's own `finish_session` CAS
+//!   then fails too (the state it expected, `completing`, is gone) -- both
+//!   callers see an error, even though the content was, in fact, correctly
+//!   finalized and bound. The session is left stranded at `in_progress` with
+//!   no live lease and no missing parts, so a third caller re-attempts the
+//!   (already-done) assembly, fails again (the specific error shape varies --
+//!   a DB conflict or a backend "handle already consumed" error, depending on
+//!   how far the redundant attempt gets -- but it always fails), and
+//!   re-strands it -- this repeats until `expires_at` passes and the
+//!   background sweep aborts the session, permanently, with the content
+//!   already live underneath it. Fixed in
+//!   `multipart_service.rs::assemble_and_finish_inner`: a lost finalize CAS
+//!   now checks whether the version is `Available` (someone else's finalize
+//!   already won) and converges via the same `replay_completed` +
+//!   `finish_session` path the takeover fast-path already used, instead of
+//!   unconditionally erroring and releasing the lease.
+//! - `f9_*` -- auto-bind CAS fix verification: multipart auto-bind's CAS
+//!   target used to be whatever `content_id` was observed at the *start* of
 //!   `complete` (not `IS NULL`, unlike the single-part path), so a
 //!   legitimate rebind that happened *before* an auto-bind `complete` with
 //!   no `If-Match` was silently overwritten. Fixed by requiring
@@ -77,18 +86,17 @@
 //!   the CAS target is still safe). This was a **sequential temporal gap**
 //!   (the exploitable window is the ordinary, often long, user-driven span
 //!   between multipart *initiate* and its *complete*, not a tight
-//!   concurrent race), so unlike F2 this scenario never needed barrier/gate
+//!   concurrent race), so this scenario never needed barrier/gate
 //!   synchronization -- deterministic by construction, both before and
 //!   after the fix. Included here (run against real PostgreSQL, not just
-//!   the SQLite unit-level pin in `db_behavior_audit_test.rs`) for parity
-//!   with the other scenarios and to confirm the same CAS shape holds under
-//!   the production dialect. A negative control shows a *stale* `If-Match`
-//!   (captured before the rebind, still supplied on complete) is correctly
-//!   rejected with a clean `PreconditionFailed` -- unrelated to this fix,
-//!   pre-existing precondition-check behavior.
-//! - `f10_*` -- known defect FS-05/F10 ("second path into F1"): within a
-//!   single `run_sweep()` call, step 1 (`sweep_abandoned_pending`) reclaims
-//!   an abandoned pending version whose backing multipart session is
+//!   the SQLite unit-level pin in `db_behavior_audit_test.rs`) to confirm the
+//!   same CAS shape holds under the production dialect. A negative control
+//!   shows a *stale* `If-Match` (captured before the rebind, still supplied
+//!   on complete) is correctly rejected with a clean `PreconditionFailed` --
+//!   unrelated to this fix, pre-existing precondition-check behavior.
+//! - `f10_*` -- second path to the same orphan as `f1_*`: within a single
+//!   `run_sweep()` call, step 1 (`sweep_abandoned_pending`) reclaims an
+//!   abandoned pending version whose backing multipart session is
 //!   *expired-but-still-`in_progress`* -- `has_in_progress_for_file` blocks
 //!   the parent-file deletion at that moment (the session hasn't been
 //!   aborted by step 2 yet), but the version row is deleted anyway. Step 2
@@ -96,30 +104,32 @@
 //!   pass as a version-less orphan, and -- because the orphan-file check
 //!   only ever runs as a side effect of deleting *a version* -- no later
 //!   sweep pass ever revisits it: a second `run_sweep()` call confirms the
-//!   file is still stuck. Deterministic by construction (backdated
-//!   timestamps, no barrier needed), included here for parity and to confirm
-//!   the same defect holds against a real PostgreSQL FK/cascade dialect.
-//! - `invariant_checker_*` -- the post-state invariant checker required by
-//!   the audit: no version-less `files` rows outside a documented window (a
-//!   window the audit's own findings show is NOT actually bounded --
-//!   demonstrated directly against the f1/f10 fixtures above), every
-//!   non-`NULL` `files.content_id` points at an `available` version, and no
-//!   `pending` version older than a threshold still has a live backing
-//!   session. Usage-invariants are out of scope for an executable check --
-//!   see the module doc's own note below.
+//!   file is still stuck. Fixed by also running the orphan-file check from
+//!   step 2's own cleanup path (which runs after the session is already
+//!   aborted, so it is no longer blocked). Deterministic by construction
+//!   (backdated timestamps, no barrier needed), included here for parity and
+//!   to confirm the same fix holds against a real PostgreSQL FK/cascade
+//!   dialect.
+//! - `invariant_checker_*` -- post-state invariant checker: no version-less
+//!   `files` rows outside a documented window (a window this file's own
+//!   scenarios show is NOT actually bounded -- demonstrated directly against
+//!   the f1/f10 fixtures above), every non-`NULL` `files.content_id` points
+//!   at an `available` version, and no `pending` version older than a
+//!   threshold still has a live backing session. Usage-invariants are out of
+//!   scope for an executable check -- see the note below.
 //!
-//! ## Usage-invariant note (Runtime Caveat, mirrored from `upload-flow-review.md`)
+//! ## Usage-invariant note
 //!
 //! `gear.rs` wires `FileService`/`MultipartService`/`CleanupEngine` with
 //! `usage_reporter: None` in the shipped build (`gear.rs:189-217,230,236,264`,
 //! confirmed by reading the gear wiring) -- no usage delta is emitted at all
 //! today. There is therefore no live usage-invariant to *check* against a
 //! real reporter in this suite; the accounting defects this would otherwise
-//! surface (F1/F3/F10's overcounts/undercounts) are latent until a reporter
-//! is wired, exactly as `upload-flow-review.md` notes. This suite does not simulate
-//! a reporter or assert on `report_usage`'s fire-and-forget calls -- doing so
-//! would test a code path with no observable effect in production today and
-//! risks masking the real gap (documented as latent, not "checked and fine").
+//! surface (overcounts/undercounts in the scenarios above) are latent until a
+//! reporter is wired. This suite does not simulate a reporter or assert on
+//! `report_usage`'s fire-and-forget calls -- doing so would test a code path
+//! with no observable effect in production today and risks masking the real
+//! gap (documented as latent, not "checked and fine").
 
 mod common;
 
@@ -148,7 +158,7 @@ use file_storage_sdk::VersionStatus;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
-use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
+use testcontainers::{ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, OnceCell};
@@ -193,8 +203,12 @@ fn require_docker() -> bool {
 /// nothing, so this panics instead.
 async fn shared_pg() -> Option<Arc<PgFixture>> {
     PG.get_or_init(|| async {
-        let request = ContainerRequest::from(Postgres::default())
-            .with_tag("16-alpine")
+        // Image and tag come from `libs/test-containers`, the single place this
+        // workspace pins database images (docs/TESTING.md 4.4, enforced by
+        // `cargo xtask check-test-container-pins`). Constructing
+        // `Postgres::default()` here would take the tag from
+        // `testcontainers-modules` instead and re-introduce the transitive pin.
+        let request = test_containers::postgres()
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_USER", "user")
             .with_env_var("POSTGRES_DB", "app");
@@ -421,27 +435,22 @@ async fn simulate_all_parts(
 }
 
 // =========================================================================
-// F1 / FS-01: orphan file when multipart initiation fails, real sweep does
-// not reclaim it
+// Orphan file when multipart initiation fails; real sweep does not reclaim
+// it.
 // =========================================================================
 
-/// Capability-reject half of F1: `LocalFsBackend` never advertises
+/// Capability-reject half: `LocalFsBackend` never advertises
 /// `multipart_native` (confirmed by reading `local_fs.rs`'s
 /// `BackendCapabilities::default()`), so initiate is rejected before any
-/// pending version is ever created. A real `run_sweep()` pass against
-/// PostgreSQL does not reclaim the resulting version-less orphan `files`
-/// row -- `sweep_abandoned_pending` only ever visits rows returned by
-/// `list_abandoned_pending_versions`, and there is no pending version here
-/// at all to trigger it.
+/// pending version is created, and a real `run_sweep()` pass does not
+/// reclaim the resulting orphan (see the module doc's `f1_*` entry).
 ///
-/// FS-01/F1 is now FIXED, but at the orchestration layer
-/// (`api/rest/handlers.rs::create_file`'s multipart branch calls
-/// `FileService::compensate_failed_multipart_initiate` on exactly this
-/// failure) -- correctly: only that caller knows "this file was just
-/// created together with this specific initiate attempt." This test calls
-/// `create_file_bare` + `initiate_multipart_upload` directly, the same raw
-/// sequence the handler makes *before* its own error-handling branch, so it
-/// still (by design) shows the sweep alone not reclaiming the orphan. See
+/// The fix lives at the orchestration layer, not in the sweep: only the
+/// caller that made the failed initiate attempt knows which file to clean
+/// up. This test calls `create_file_bare` + `initiate_multipart_upload`
+/// directly -- the same raw sequence the handler makes *before* its own
+/// error-handling branch -- so it still shows the sweep alone not
+/// reclaiming the orphan, by design. See
 /// `f1_capability_reject_with_compensation_reclaims_orphan` below for the
 /// fixed end-to-end flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -492,7 +501,7 @@ async fn f1_capability_reject_orphan_survives_real_sweep() {
     );
 }
 
-/// FS-01/F1 fix, end-to-end, against real PostgreSQL: mirrors exactly what
+/// End-to-end, against real PostgreSQL: mirrors exactly what
 /// `api/rest/handlers.rs::create_file`'s multipart branch now does on an
 /// initiate failure -- call `compensate_failed_multipart_initiate` with the
 /// same `file_id`, then confirm the orphan is gone (no sweep needed at
@@ -539,9 +548,9 @@ async fn f1_capability_reject_with_compensation_reclaims_orphan() {
 
 /// A `StorageBackend` decorator whose `initiate_multipart` always fails,
 /// even though `capabilities()` (delegated to the inner backend) genuinely
-/// advertises `multipart_native: true` -- the *other* half of F1
-/// (`upload-flow-review.md`: "capability rejection... or backend-initiation
-/// failure"), distinct from the capability-reject half above.
+/// advertises `multipart_native: true` -- the backend-initiation-failure
+/// half of the orphan scenario, distinct from the capability-reject half
+/// above.
 struct FailingInitiateBackend {
     inner: Arc<dyn StorageBackend>,
 }
@@ -614,11 +623,11 @@ impl StorageBackend for FailingInitiateBackend {
     }
 }
 
-/// Backend-initiation-failure half of F1: the backend genuinely advertises
+/// Backend-initiation-failure half: the backend genuinely advertises
 /// `multipart_native`, but its `initiate_multipart` call itself fails (a
 /// transient S3-side error, say) -- same orphan outcome as the
-/// capability-reject half, confirming F1 is not specific to the capability
-/// check but to the absence of any rollback/compensation around
+/// capability-reject half, confirming the defect is not specific to the
+/// capability check but to the absence of any rollback/compensation around
 /// `create_file_bare` + initiate as a pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f1_backend_initiation_failure_orphan_survives_real_sweep() {
@@ -668,8 +677,8 @@ async fn f1_backend_initiation_failure_orphan_survives_real_sweep() {
 }
 
 // =========================================================================
-// F2 / FS-02: completion is not owner-fenced end-to-end -- deterministic
-// two-completer race via gated `MultipartStore` checkpoints
+// Completion is not owner-fenced end-to-end: deterministic two-completer
+// race via gated `MultipartStore` checkpoints.
 // =========================================================================
 
 /// Which of the two concurrent completers (`A`, the stale winner-then-loser,
@@ -682,9 +691,9 @@ enum Role {
 
 /// A `MultipartStore` decorator that pauses at two specific checkpoints via
 /// `tokio::sync::Notify` gates, instead of `sleep`-based timing, to force
-/// the *exact* interleaving `upload-flow-review.md`'s F2 stranding counterexample
-/// describes -- deterministically, not "reproduces in N/M trials" the way a
-/// pure wall-clock race would (a real completer's assembly duration is not
+/// the *exact* interleaving that strands the session (see the module doc's
+/// `f2_*` entry) deterministically -- not "reproduces in N/M trials" the way
+/// a pure wall-clock race would (a real completer's assembly duration is not
 /// something a test can pin down to the millisecond, and -- confirmed
 /// empirically while building this harness -- even gating *when a call
 /// starts* is not enough to pin down *which side's commit lands first*: an
@@ -714,8 +723,7 @@ enum Role {
 ///   the fresh one, ends up needing to converge instead) but not the
 ///   specific interleaving this test exists to pin down.
 ///
-/// Post-fix (FS-02 remediation, see `docs/analysis/DB_BEHAVIOR_AUDIT.md`
-/// §5), B's lost `finalize_version` no longer errors-and-releases the
+/// Post-fix, B's lost `finalize_version` no longer errors-and-releases the
 /// lease -- it converges (re-derives the response and calls
 /// `finish_session` directly, same as the takeover fast path) -- so there
 /// is no third gate here anymore: nothing needs to hold A's own
@@ -956,18 +964,14 @@ impl MultipartStore for GatedMultipartStore {
     }
 }
 
-/// FS-02/F2 fix verification -- the audit's single most severe finding, and
-/// the one the coordinator specifically flagged for extra scrutiny ("the
-/// earlier proposed one-line fix is insufficient"). This test used to
-/// reproduce a genuine stranding (see `docs/analysis/DB_BEHAVIOR_AUDIT.md`
-/// §5 for the full before/after and git history for the original repro);
-/// after the fix (`multipart_service.rs::assemble_and_finish_inner`: a lost
-/// finalize CAS now checks whether the version is `Available` -- i.e.
-/// someone else's finalize already won -- and, if so, converges via the
-/// same `replay_completed` + `finish_session` path the takeover fast-path
-/// already used, instead of unconditionally erroring and releasing the
-/// lease), the exact same deterministic interleaving now converges cleanly
-/// instead. Mechanism:
+/// The most severe scenario in this file: two completers race to finish the
+/// same multipart session. After the fix
+/// (`multipart_service.rs::assemble_and_finish_inner`: a lost finalize CAS
+/// now checks whether the version is `Available` -- i.e. someone else's
+/// finalize already won -- and, if so, converges via the same
+/// `replay_completed` + `finish_session` path the takeover fast-path already
+/// used, instead of unconditionally erroring and releasing the lease), the
+/// interleaving below converges cleanly. Mechanism:
 ///
 /// 1. A acquires the completion lease (fresh) with a 1-second lease.
 /// 2. The test waits >1s of real wall-clock time -- A's lease genuinely
@@ -1188,11 +1192,10 @@ async fn backdate_multipart_expires_at(
 }
 
 // =========================================================================
-// F9 / FS-04 fix verification: multipart auto-bind no longer clobbers a
-// rebind that happened before complete started, when no If-Match is
-// supplied -- the CAS now requires content_id IS NULL in that case.
-// Deterministic/sequential by construction (see the module doc) -- no
-// barrier needed.
+// Auto-bind no longer clobbers a rebind that happened before complete
+// started, when no If-Match is supplied -- the CAS now requires
+// content_id IS NULL in that case. Deterministic/sequential by
+// construction (see the module doc) -- no barrier needed.
 // =========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1285,10 +1288,10 @@ async fn f9_autobind_no_if_match_no_longer_clobbers_prior_rebind() {
         .expect("complete_multipart_upload (no If-Match) must still succeed -- only the bind is conditional")
         .unwrap_completed();
 
-    // FS-04/F9 fix: the auto-bind CAS now requires content_id IS NULL when
-    // no If-Match was supplied -- it correctly loses here (content_id is
-    // the legitimate rebind's version, not NULL), leaving that rebind
-    // intact instead of silently clobbering it.
+    // The auto-bind CAS now requires content_id IS NULL when no If-Match
+    // was supplied -- it correctly loses here (content_id is the
+    // legitimate rebind's version, not NULL), leaving that rebind intact
+    // instead of silently clobbering it.
     assert_eq!(
         completed.bind_state,
         BindState::Conflict,
@@ -1407,12 +1410,13 @@ async fn negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind
 }
 
 // =========================================================================
-// F10 / FS-05 fix verification: an expired multipart session used to block
-// parent cleanup on the sweep pass that reclaimed its version, and no later
-// pass ever revisited it either ("second path into F1"). Fixed by also
-// running the orphan-file check from step 2's own cleanup path (which runs
-// after the session is already aborted, so it is no longer blocked).
-// Deterministic by construction -- no barrier needed.
+// An expired multipart session used to block parent cleanup on the sweep
+// pass that reclaimed its version, and no later pass ever revisited it
+// either -- the same orphan shape as the module doc's `f1_*` entry, reached
+// a different way. Fixed by also running the orphan-file check from step
+// 2's own cleanup path (which runs after the session is already aborted,
+// so it is no longer blocked). Deterministic by construction -- no barrier
+// needed.
 // =========================================================================
 
 async fn backdate_version_created_at(
@@ -1515,7 +1519,7 @@ async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
 /// the same transaction as the bind (see `finalize_version`'s `auto_bind`
 /// doc) -- so this function returns the list of violations found (empty is
 /// the healthy, expected result in every scenario in this file, including
-/// the known-defect ones: F2/F9/F10 all leave `content_id` pointing at a
+/// the defect scenarios above: they all leave `content_id` pointing at a
 /// perfectly valid, available version; the defects they demonstrate are
 /// elsewhere).
 async fn find_content_id_violations(db: &Arc<DBProvider<DbError>>, file_id: Uuid) -> Vec<String> {
@@ -1560,8 +1564,9 @@ async fn find_content_id_violations(db: &Arc<DBProvider<DbError>>, file_id: Uuid
 }
 
 /// Whether `file_id` is currently a version-less orphan (zero `file_versions`
-/// rows and `content_id IS NULL`) -- the shape F1/F10 leave behind. Returns
-/// `false` for a file that still has any version or bound content.
+/// rows and `content_id IS NULL`) -- the shape the orphan scenarios above
+/// leave behind. Returns `false` for a file that still has any version or
+/// bound content.
 async fn is_versionless_orphan(db: &Arc<DBProvider<DbError>>, file_id: Uuid) -> bool {
     use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
     use file_storage::infra::storage::entity::file_version::{
@@ -1594,7 +1599,7 @@ async fn is_versionless_orphan(db: &Arc<DBProvider<DbError>>, file_id: Uuid) -> 
 
 /// The post-state invariant checker's own dedicated test: a healthy file
 /// (create + upload + bind) must show zero content_id violations and must
-/// NOT be a version-less orphan; a file put through F1's exact reproduction
+/// NOT be a version-less orphan; a file put through the orphan reproduction
 /// above IS correctly flagged as a version-less orphan by the same checker
 /// -- proving the checker actually distinguishes the two, not just always
 /// reporting "clean" or always reporting "violation".
@@ -1640,8 +1645,8 @@ async fn invariant_checker_distinguishes_healthy_file_from_known_orphan() {
         "a healthy, bound file must not be flagged as a version-less orphan"
     );
 
-    // F1's exact reproduction: bare file, failed initiate, no cleanup path
-    // ever triggered.
+    // Orphan reproduction: bare file, failed initiate, no cleanup path ever
+    // triggered.
     let tmp = tempfile::tempdir().expect("tempdir");
     let local_backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
     let local_backends =

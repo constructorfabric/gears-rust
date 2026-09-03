@@ -82,10 +82,9 @@ Encoding conventions:
 ```
 
 Notes:
-- There is **no** `HEAD /files/{id}` route; no such route exists in `src/api/rest/routes.rs`.
-- `GET /storages` and `GET /storages/{storage_id}` require the caller's `READ` authorization scope
-  (`403` otherwise) — backend enumeration used to run with no `SecurityContext` check at all, letting
-  any authenticated subject of any tenant list backend ids and capabilities.
+- There is **no** `HEAD /files/{id}` route on the control plane.
+- `GET /storages` and `GET /storages/{storage_id}` require the caller's `READ` authorization scope (`403`
+  otherwise).
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
   [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
@@ -100,7 +99,7 @@ Notes:
   spaces that can legitimately share the same UUID, so a caller could otherwise pass their own id under
   `owner_kind: "app"` and have the self-service check pass while actually authoring the file into the other
   owner space (a different effective policy and a different owner's quota/listing than their own).
-- **Upload-flow redesign.** With the `multipart` block and a server plan of **≥2 parts**, the `201` response carries
+- **Multipart plan inline in `POST /files`.** With the `multipart` block and a server plan of **≥2 parts**, the `201` response carries
   the full parts plan instead of a single-part URL: `{ file_id, version_id, multipart: { upload_id, version_id,
   part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at } }` — no separate
   `POST /files/{id}/multipart` call, and no orphan single-part pending version. Resume is unchanged:
@@ -108,8 +107,7 @@ Notes:
   one part falls back to the single-part `upload_url` path below. `bind: "auto"` (default) makes the upload itself
   bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — for a total of
   **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`).
-- `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match` (`handlers::presign_version`
-  has no JSON extractor and no header parameter).
+- `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match`.
 - `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
   caller listing their own files (`owner_id == ` the caller's own subject id) proceeds under the ordinary `READ`
   grant; listing **any other** owner's files additionally requires the caller's `ADMIN_POLICY` authorization scope
@@ -122,7 +120,7 @@ Notes:
   control plane's `POST .../versions/{version_id}/finalize` callback (see
   [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)), which marks the
   version `available`.
-- **Single-part bind outcome headers (upload-flow redesign).** For a file created with `bind: "auto"` (the default),
+- **Single-part bind outcome headers.** For a file created with `bind: "auto"` (the default),
   the finalize also binds the first content under a strict `content_id IS NULL` CAS, and the sidecar's `200` `PUT`
   response forwards the outcome transparently as fixed headers — the single-part half of the ONE bind-state model it
   shares with `complete`'s `bind_state`: `X-FS-Bound: true` + `ETag: <new content etag>` (bound), or
@@ -156,16 +154,13 @@ S2. GET    <signed download url>           download content                     
 S3. HEAD   <signed download url>           same auth/`404` contract as GET, no body
 ```
 
-`HEAD` is handled by its own `download_head` route (`.head(download_head)` in `build_router`, `src/bin/sidecar.rs`)
-rather than falling through to axum's default GET-derived `HEAD` handling — the latter would run the full `download`
-handler, including streaming the entire object off the backend, only to discard the body afterwards. `download_head`
-calls only `StorageBackend::stat` (a single combined existence-and-size round trip: `stat(2)` on `local-fs`,
-`HeadObject` on `S3Backend` — one call instead of the previous `exists` + `size` pair) and
-returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as `download`'s `200`, plus an explicit
-`Content-Length` (a real `200`/`206` gets this for free from its body; `HEAD` has no body to derive it from).
-`stat` returns `Ok(None)` when nothing is stored at the path (→ `404`, same as `GET`'s missing-blob case) and
-`Err` only for a genuine backend fault distinct from "not found" (→ `500`) — the same three-way split `exists`
-already documents, resolved in one round trip instead of two.
+`HEAD` is its own route rather than falling through to axum's default GET-derived `HEAD` handling — the latter would
+run the full `download` handler, including streaming the entire object off the backend, only to discard the body
+afterwards. It resolves existence and size in a single combined backend round trip (`stat(2)` on `local-fs`,
+`HeadObject` on `S3Backend`) and returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as `download`'s
+`200`, plus an explicit `Content-Length` (a real `200`/`206` gets this for free from its body; `HEAD` has no body to
+derive it from). Nothing stored at the path → `404` (same as `GET`'s missing-blob case); a genuine backend fault
+distinct from "not found" → `500`.
 
 **Planned / not implemented**: `If-None-Match` → `304` support on the sidecar `GET`/`HEAD`. Every download token is
 already single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of a conditional download is small.
@@ -275,7 +270,7 @@ Notes:
 | `preferred_part_size` | `uint64` | no | Client hint for the part size in bytes; the server may widen it (see the `MAX_PART_COUNT` note below) or otherwise adjust it to satisfy backend minimums. Rejected with `400` if outside `[DEFAULT_MIN_PART_SIZE (5 MiB), MAX_PART_SIZE (5 GiB)]`. |
 | `concurrency` | `uint32` | no | Advisory hint for client-side upload concurrency; does not change the parts plan itself. |
 
-The server-computed parts plan is capped at `MAX_PART_COUNT = 10_000` parts (`domain::multipart::compute_plan`). If
+The server-computed parts plan is capped at `MAX_PART_COUNT = 10_000` parts. If
 the chosen part size would produce more parts than that, `part_size` is **widened** (never past `MAX_PART_SIZE`, 5
 GiB) just enough to bring the plan back under the ceiling; if even the maximum part size cannot fit `declared_size`
 within 10,000 parts, initiate is rejected with `400` before any parts vector is allocated.
@@ -341,7 +336,7 @@ for a successful part `PUT` is `{ "part_number": <u32>, "etag": "<backend-assign
 }
 ```
 
-**Bind inside complete (upload-flow redesign).** `bind_state` is the multipart half of the shared bind-state model
+**Bind inside complete.** `bind_state` is the multipart half of the shared bind-state model
 (single-part: the `X-FS-Bound` header): `"bound"` — an `auto_bind` session (opened by `POST /files` with
 `bind: "auto"`) was bound here, in the same transaction as the finalize, under the endpoint's `If-Match` CAS
 (first content → `content_id IS NULL`), with the new content `etag`; `"conflict"` — the CAS lost, the response
@@ -415,7 +410,7 @@ GET  /policy/effective?user_owner_id=<uuid>              compute the effective (
 ```
 
 - `GET /policy`: `scope` is required (`"tenant"` or `"user"`); `scope_owner_id` is required when `scope="user"` —
-  omitting it is rejected with `400` (`policy_service.rs::get_own_policy`), not silently treated as tenant scope.
+  omitting it is rejected with `400`, not silently treated as tenant scope.
   Returns `204 No Content` (no body) when no policy is configured for that scope — this is a normal, non-error
   outcome, not a `404`.
 - `PUT /policy` request body: `{ "scope": "tenant"|"user", "scope_owner_id": "<uuid, omit for tenant>", "body": { "allowed_mime_types": [...], "size_limits": {...}, "metadata_limits": {...}, "enabled_event_types": [...] } }`.
@@ -446,7 +441,7 @@ DELETE /retention-rules/{rule_id}   delete a retention rule
 
 - `POST /retention-rules` request body: `{ "scope": "tenant"|"user"|"file", "scope_target_id": "<uuid, omit for tenant>", "body": { "age": {"max_age_days": N}, "inactivity": {"inactivity_days": N}, "metadata": {"key": "...", "value": "..."} } }`
   (`age`/`inactivity`/`metadata` are each optional; a rule may combine more than one criterion). Response: the
-  created `RetentionRuleDto` (`201`). Semantic validation (`policy_service.rs::validate_retention_rule`) rejects with
+  created `RetentionRuleDto` (`201`). Semantic validation rejects with
   `400`: a body with **all three** of `age`/`inactivity`/`metadata` absent (a rule that could never match any file);
   `age.max_age_days` or `inactivity.inactivity_days` **less than 1** (either would match every file in the tenant on
   the very next sweep tick); and `scope` ∈ `{user, file}` with `scope_target_id` omitted.
@@ -537,11 +532,9 @@ avoid leaving this unswept sibling behind.
   - **Implementation note:** because the token is opaque (below), the concrete codec is an internal detail of
     control + sidecar and may move to a literal PASETO library (with a real footer/`kid`) later without any
     client-visible change.
-  - **FIPS posture:** Ed25519 is FIPS 186-5 approved, but a FIPS deployment requires the sign/verify primitive to run
-    inside a FIPS-validated module (the platform's `rustls-corecrypto-provider`). The primitive sits behind an in-house
-    `SignatureProvider` abstraction and we **MUST NOT** pull in any crate that hard-wires a non-FIPS algorithm we
-    cannot replace; a FIPS-approved alternative (e.g. ECDSA P-256) is reachable behind the same opaque token without a
-    codec change. See ADR-0004 "FIPS posture".
+  - **FIPS posture:** the sign/verify primitive sits behind an in-house `SignatureProvider` abstraction specifically
+    so a FIPS-validated module or algorithm can replace it without a codec change; see
+    [DESIGN.md](./DESIGN.md) §4.8 and ADR-0004 "FIPS posture" for the detail.
 - **Opaque to everyone but control + sidecar.** The token's claim-set and crypto are private to the minter and verifier;
   every other participant (browser, CDN, proxy, app, logs, SDK transport) MUST treat it as **opaque bytes** and never
   parse it — the format can and will change ("Token Opacity Contract").
@@ -578,10 +571,9 @@ avoid leaving this unswept sibling behind.
   it can never itself trigger `413` (that's `max_size`'s mid-stream abort, and the two claims are mutually
   exclusive). No presign path (`create.rs`/`write.rs`) currently sets this claim on an issued token, so `exact_size`
   enforcement exists in the verifier but is not currently exercised by any control-plane code path.<br>
-  ² `bin/sidecar.rs`'s `expected_hash` check returns `(StatusCode::BAD_REQUEST, ...)` (`400`) — no `422` response
-  exists anywhere in this gear.<br>
+  ² the sidecar's `expected_hash` check always returns `400` — no `422` response exists anywhere in this gear.<br>
   ³ these two claims are populated only on a **download** (`op = get`) token, at `download-url` issuance time — the
-  control plane reads `version.mime_type` and computes the content ETag (`domain::etag::content_etag`) once and
+  control plane reads `version.mime_type` and computes the content ETag once and
   stamps both into the claims, so the sidecar (no DB access) can emit the real `Content-Type`/`ETag` response
   headers instead of a generic `application/octet-stream` fallback with no `ETag` at all. `#[serde(default)]` keeps
   verification tolerant of a token minted before these fields existed — such a token still falls back exactly as
@@ -592,11 +584,10 @@ avoid leaving this unswept sibling behind.
   to mint. Multipart additionally has a third, independent knob, `multipart_session_ttl_secs` (24h default), that
   bounds the multipart *session's* own lifetime separately from the per-part URL TTL above (see `operations.md`).
   The sidecar rejects at `now >= exp` (expiry is exclusive: a token stops working exactly at `exp`, not one second
-  later). **Stale-permission trade-off:** authorization is evaluated at signing and there is no per-token
-  revocation, so the TTL bounds the exposure window — hence the short default for private content; the 7-day
-  ceiling is an explicitly accepted trade-off for low-sensitivity / deliberately long-lived cases (bare query-token
-  URLs in particular MUST use a short TTL; durable/anonymous sharing is handled by a separate FileShare gear, not
-  yet built — see "Two planes" above). "Available to everyone for 5 minutes" = only `exp` (the `tok.<claim>`
+  later). Authorization is evaluated once, at signing, with no per-token revocation, so the TTL is the only bound on
+  a stale-permission window — see [DESIGN.md](./DESIGN.md) §4.5 "Stale-permission window" for the full trade-off;
+  bare query-token URLs in particular MUST use a short TTL (durable/anonymous sharing is a separate, not-yet-built
+  FileShare gear — see "Two planes" above). "Available to everyone for 5 minutes" = only `exp` (the `tok.<claim>`
   predicate is not implemented — see the claims table above).
 - **`max_size` and `exact_size` are mutually exclusive by construction** — no code path mints a token with both set —
   but this is **not independently validated** as a "both present" error at presign or verify time; there is no
@@ -661,7 +652,7 @@ Served by the **sidecar**.
 
 ## Response headers (download, on the sidecar)
 
-Emitted by the sidecar's download handlers (`src/bin/sidecar.rs`'s `download`/`download_range`/`download_whole`):
+Emitted by the sidecar's download handlers:
 
 ```text
 Accept-Ranges: bytes
@@ -761,7 +752,7 @@ access or carry substantially more per-request state in the token than it does t
 - `412 Precondition Failed` — **not used anywhere in this gear.** This platform's canonical-error taxonomy has no
   `412`-mapped variant; `FailedPrecondition` collapses to `400` on the control plane (see above), and the sidecar
   never performs an `If-Match`/conditional check at all — it only streams bytes and calls finalize, so there is no
-  data-plane `412` either. `grep -n "412" src/bin/sidecar.rs` returns no matches. A bind conflict is always a `400`
+  data-plane `412` either. A bind conflict is always a `400`
   from the control-plane `bind` handler (see "Upload, bind, and the conflict retry" above).
 - `413 Payload Too Large` — upload exceeds the `max_size` claim, aborted mid-stream (sidecar, `PUT`).
 - `416 Range Not Satisfiable` — a well-formed `Range` that cannot be satisfied against the size (sidecar). An
@@ -775,9 +766,8 @@ access or carry substantially more per-request state in the token than it does t
 - `502 Bad Gateway` — the sidecar's own response to the client when its finalize or report-part callback to the
   control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx). This
   is a **retry signal**: the callback failure does not mean the bytes failed to land — see "Data-plane callbacks"
-  above (`FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`, `post_with_retry`) and the
-  `upload`/`upload_multipart_part` handlers' own doc comments in `src/bin/sidecar.rs` for the exact decision table
-  between `200`, `409`, and `502` on a replayed `PUT`.
+  above (`FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`) for the retry/timeout
+  configuration and the decision between `200`, `409`, and `502` on a replayed `PUT`.
 
 `422 Unprocessable Entity`, `415 Unsupported Media Type`, and `507 Insufficient Storage` are not used anywhere in this
 gear: an `expected_hash` mismatch and an invalid GTS file type both map to `400`; a magic-bytes MIME mismatch

@@ -439,7 +439,7 @@ read-back-and-rehash at finalize/complete indefinitely.
 
 ### Open decisions and risks
 
-Carried forward from `content-hash-modes.md` §12, not resolved by this ADR — flagged honestly rather than glossed over:
+Carried forward from `content-hash-modes.md` §11, not resolved by this ADR — flagged honestly rather than glossed over:
 
 1. **Manifest storage size is bounded but not tiny.** Worst case ~10,000 parts × ~80 bytes/entry ≈ ~800 KB per
    manifest. This is why the manifest lives in its own table (not inline on `file_versions`), and why the multipart

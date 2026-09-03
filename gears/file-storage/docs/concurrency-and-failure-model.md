@@ -4,7 +4,7 @@
 
 The exhaustive state / race / failure model of the write path, **as implemented** — every claim below is
 traceable to a function in `gears/file-storage/file-storage/src/`. Companion to [DESIGN.md](./DESIGN.md)
-(§3.6 upload sequences and their upload-flow-redesign amendment, §4.5 signed URLs, §4.7 multipart worked
+(§3.6 upload sequences and the auto-bind-on-finalize behavior, §4.5 signed URLs, §4.7 multipart worked
 example) and [api.md](./api.md) (wire contract, `X-FS-Bound` / `bind_state`, `202 completing`). Where this
 document and those disagree, the code cited here wins; file an issue.
 

@@ -9,10 +9,6 @@
 //!    is deleted and a `retention_delete` audit row is written.
 //! 4. Backend migration (`migrate_backend`) — happy path and rejection of
 //!    versioned files.
-//!
-//! @cpt-cf-file-storage-fr-orphan-reconciliation
-//! @cpt-cf-file-storage-fr-retention-policies
-//! @cpt-cf-file-storage-fr-backend-migration
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -429,8 +425,6 @@ impl CleanupStore for FaultyListVersionsStore {
 /// With `orphan_grace_secs = 0` every pending version created before `now()` is
 /// immediately eligible; `run_sweep()` must delete it and return
 /// `abandoned_pending_deleted = 1`.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
     // grace = 0 → any pre-existing pending version is eligible immediately.
@@ -481,8 +475,6 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
 }
 
 /// With `orphan_grace_secs = 86400` a newly-created pending version is NOT swept.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn recent_pending_version_is_not_swept_within_grace_window() {
     // grace = 24 hours → a freshly created version must not be deleted.
@@ -517,8 +509,6 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
 /// Once the sweep reclaims that last (only) pending version, it must also
 /// delete the now-permanently-orphaned parent `files` row -- otherwise it
 /// lingers forever in `GET /files`, unable to ever serve content.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_deletes_abandoned_zero_version_file() {
     // grace = 0 → the file's only pending version is immediately eligible.
@@ -575,8 +565,6 @@ async fn sweep_deletes_abandoned_zero_version_file() {
 /// one bound `Available` version must keep its parent `files` row -- the
 /// sweep may only reclaim the abandoned version, never the file itself, once
 /// real content still exists.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_keeps_file_with_other_versions() {
     let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(0).await;
@@ -645,8 +633,6 @@ async fn sweep_keeps_file_with_other_versions() {
 /// with a far-future `now` to confirm it returns the session (simulating passage
 /// of time), then call the sweep directly with a past-pointing clock by inserting
 /// a session with a manually-backdated `expires_at`.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn expired_multipart_session_is_aborted_by_sweep() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
@@ -761,8 +747,6 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 /// `orphan_grace_secs` would have its backing version deleted out from under
 /// it -- and the eventual `complete_multipart_upload` would fail at
 /// `finalize_version`, losing the whole upload's work.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_skips_pending_version_of_active_multipart_session() {
     use sea_orm::sea_query::Expr;
@@ -835,8 +819,6 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
 /// once the same session's `expires_at` has also passed, it is no longer
 /// "live" from the sweep's perspective -- `sweep_expired_multipart` aborts
 /// it, and its now-unprotected backing version becomes reclaimable.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_reclaims_version_after_session_expires() {
     use sea_orm::sea_query::Expr;
@@ -934,8 +916,6 @@ async fn sweep_reclaims_version_after_session_expires() {
 /// incomplete S3 MPU parts) AND the `multipart_upload_parts` row deletion
 /// for this session (unbounded growth). Both must still happen in this
 /// reordering.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_deletes_parts() {
     use sea_orm::sea_query::Expr;
@@ -1113,8 +1093,6 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
 /// by inserting the rule directly through the store — bypassing the service's
 /// validation guard, the same way `expired_multipart_session_is_aborted_by_sweep`
 /// bypasses normal session creation to simulate a backdated row.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn retention_expired_file_is_deleted_by_sweep() {
     let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
@@ -1200,8 +1178,6 @@ async fn retention_expired_file_is_deleted_by_sweep() {
 /// the sweep in the first place — `PolicyService::create_retention_rule`
 /// rejects it at write time (P2 remediation 0.11), so zero rows are ever
 /// written, and a file that would otherwise match survives the sweep.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn sweep_does_not_run_zero_age_rule() {
     let (svc, psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
@@ -1279,8 +1255,6 @@ async fn sweep_does_not_run_zero_age_rule() {
 /// silently orphan the file's real, un-enumerated version blobs. A second,
 /// unrelated matching file (real `list_versions`) must still be deleted in
 /// the same sweep, proving one file's fault does not abort the whole sweep.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn expire_file_list_versions_error_does_not_delete_file() {
     let (svc, _psvc, _msvc, dp, store, _engine, backend) = build_all(86400).await;
@@ -1390,8 +1364,6 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
 }
 
 /// A file that does NOT match any retention rule is NOT deleted.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn file_without_matching_retention_rule_is_not_deleted() {
     let (svc, _psvc, _msvc, dp, _store, engine, _backend) = build_all(86400).await;
@@ -1435,8 +1407,6 @@ async fn file_without_matching_retention_rule_is_not_deleted() {
 /// - The file is readable via the service (content unchanged).
 /// - The version row points to the "alt" backend.
 /// - A `backend_migrate` audit row is written.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_moves_content_and_updates_version_row() {
     let (svc, dp, store, _engine) = build_all_dual_backend(86400).await;
@@ -1499,8 +1469,6 @@ async fn migrate_backend_moves_content_and_updates_version_row() {
 }
 
 /// Migrating to the same backend is a no-op.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_to_same_backend_is_noop() {
     let (svc, dp, store, _engine) = build_all_dual_backend(86400).await;
@@ -1543,8 +1511,6 @@ async fn migrate_backend_to_same_backend_is_noop() {
 
 /// Versioned files (more than 1 version) cannot be migrated — the service
 /// returns `VersionedFileMigrationNotSupported`.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_rejects_versioned_file() {
     use file_storage::domain::error::DomainError;
@@ -1686,8 +1652,6 @@ async fn build_all_dual_backend_scoped(
 /// A non-admin caller may not migrate content onto a non-durable ("alt",
 /// `InMemoryBackend`) target: `migrate_backend` must reject with `Forbidden`
 /// and the version row must stay unchanged.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
     let (svc, dp, store, authorizer) = build_all_dual_backend_scoped(86400).await;
@@ -1734,8 +1698,6 @@ async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
 
 /// An admin-scoped caller may migrate content onto a non-durable ("alt")
 /// target; the version row is updated as usual.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
     let (svc, dp, store, authorizer) = build_all_dual_backend_scoped(86400).await;
@@ -1864,8 +1826,6 @@ async fn complete_one_part_multipart_upload(
 /// expired session outright, which would defeat the point of this test (it
 /// must exercise the sweep's session CAS losing against an
 /// already-`completed` row, not `complete` being rejected up front).
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     let (svc, _psvc, msvc, _dp, store, engine, backend) = build_all(0).await;
@@ -1937,8 +1897,6 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
 /// been blocking step 1's own orphan-file check). A subsequent `complete`
 /// attempt therefore hits `FileNotFound` (the file itself is gone), not
 /// `MultipartUploadNotInProgress`.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_before_complete_wins_cleans_up_expired_session() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
@@ -2030,8 +1988,6 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
 /// whose `expires_at` is already in the past but whose state is still
 /// `in_progress` (no sweep tick has run at all) must be rejected by
 /// `complete_multipart_upload` itself.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_after_session_expired_is_rejected() {
     let (svc, _psvc, msvc, _dp, store, _engine, _backend) = build_all(0).await;
@@ -2087,8 +2043,6 @@ async fn complete_after_session_expired_is_rejected() {
 /// directly (as `abort_expired_multipart_session` does immediately after
 /// winning its own session CAS) and confirm the now-`Available` version is
 /// left untouched -- the status-guarded delete must match zero rows.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_available_version()
 {
@@ -2188,8 +2142,6 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
 /// `list_abandoned_pending_versions` returned) rather than via a real
 /// concurrent task, for the same determinism reason the step-2 sibling test
 /// above calls `cleanup_expired_session_version` directly.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete() {
     let (svc, _psvc, _msvc, _dp, store, engine, backend) = build_all(0).await;
@@ -2299,8 +2251,6 @@ async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete()
 /// `idempotency_key::Entity::find()` -- mirroring the pattern already used by
 /// `multipart_test.rs` for asserting DB state independent of the store's own
 /// read methods.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn run_sweep_deletes_expired_idempotency_rows() {
     use sea_orm::EntityTrait;
@@ -2442,9 +2392,6 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
 /// purge would silently drop events that were never delivered. This test seeds
 /// an ancient, unpublished row in each outbox table directly (there is no
 /// public API to backdate `occurred_at`) and confirms both survive a sweep.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
     use sea_orm::{EntityTrait, Set};
@@ -2542,7 +2489,6 @@ async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
 // `UPDATE` affect zero rows, so `migrate_backend` can detect and correctly
 // react to the race -- see the three-way branch below.
 //
-// @cpt-cf-file-storage-fr-backend-migration
 
 /// Two racers that both captured the SAME pre-migration `(backend_id,
 /// backend_path)` call `VersionRepo::rebind_backend` directly with that

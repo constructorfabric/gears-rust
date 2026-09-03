@@ -5,17 +5,8 @@
     clippy::doc_markdown,
     clippy::too_many_lines
 )]
-//! DB-behavior audit for file-storage (Step 4 of the DB-behavior audit
-//! program -- see `docs/toolkit_unified_system/14_db_behavior_testing.md`,
-//! methodology validated against `resource-group`'s Step 1-3 audit).
-//!
-//! Ground truth for this module comes from an independent review
-//! (`docs/analysis/upload-flow-review.md` -- read once, findings
-//! transcribed here as FS-IDs) verified directly against this branch's code
-//! during this audit (see `docs/analysis/DB_BEHAVIOR_AUDIT.md` for the full
-//! inventory and validation matrix). F1/F2/F3/F4/F9/F10 map to FS-01/02/03/06/
-//! 04/05; F5-F8 (contract/doc corrections) map to FS-07..FS-10; FS-11/FS-12
-//! are new findings from this audit's own read.
+//! DB-behavior audit for file-storage, mirroring resource-group's own
+//! methodology (see `docs/toolkit_unified_system/14_db_behavior_testing.md`).
 //!
 //! Two mechanisms, mirroring resource-group's:
 //!
@@ -36,8 +27,7 @@
 //!      is single-statement CAS `UPDATE ... WHERE` predicates under
 //!      whatever the connection's default isolation is, not
 //!      SERIALIZABLE+retry -- a different, and not inherently wrong,
-//!      architecture. See `DB_BEHAVIOR_AUDIT.md` "Method Boundaries" for the
-//!      full reasoning.
+//!      architecture.
 //!    - **Scale-invariance**: statement counts for a given (kind, table)
 //!      shape must not grow with N (a patch's entry count, a page size) --
 //!      growth is the `n-plus-one` class.
@@ -53,19 +43,19 @@
 //!      module boundary the compiler enforces, not a regex over text.
 //!    - `check-then-act-without-constraint`: no mechanized rule exists yet
 //!      for this class (matching `14_db_behavior_testing.md`'s own stated
-//!      boundary) -- FS-02/FS-04/FS-05 are CAS predicates missing a
-//!      column, which a regex can't reliably detect without a real SQL
-//!      parser + schema cross-reference. Validated instead by inspecting
-//!      the recorder's *raw* captured SQL text for the specific CAS
-//!      statements (this file, Section 3) and by live PostgreSQL barrier
-//!      races with a post-state invariant checker
-//!      (`tests/pg_concurrency_test.rs`).
+//!      boundary) -- a CAS predicate missing a WHERE-clause column is
+//!      something a regex can't reliably detect without a real SQL parser +
+//!      schema cross-reference. Validated instead by inspecting the
+//!      recorder's *raw* captured SQL text for the specific CAS statements
+//!      (this file, Section 3) and by live PostgreSQL barrier races with a
+//!      post-state invariant checker (`tests/pg_concurrency_test.rs`).
 //!
-//! Known defects are asserted for real and marked `#[ignore = "known defect
-//! FS-XX: ..."]` so the suite stays green while the defect stays
-//! executable-and-documented. Operations that are *not* known-defective
-//! assert the healthy invariant directly (non-ignored) -- these double as
-//! negative controls proving the rules don't fire indiscriminately.
+//! Known defects are pinned by asserting their current (defective) behavior
+//! directly, with no `#[ignore]`: the defect is expected and stable, and a
+//! future fix would make the assertion fail, which is the point. Operations
+//! that are *not* known-defective assert the healthy invariant directly --
+//! these double as negative controls proving the rules don't fire
+//! indiscriminately.
 
 mod common;
 
@@ -237,8 +227,7 @@ async fn trace_multipart_complete() {
         .unwrap_completed();
     assert_eq!(completed.size, 10 * 1024 * 1024);
 
-    // FS-13 (new finding, LOW-MEDIUM -- see docs/analysis/DB_BEHAVIOR_AUDIT.md):
-    // exactly one write runs outside a transaction --
+    // Exactly one write runs outside a transaction --
     // `acquire_complete_lease`'s own CAS UPDATE (`state`/`lease_until`/
     // `lease_owner`, fresh-acquire-or-takeover). A single UPDATE is atomic
     // regardless of an enclosing transaction, so this specific statement's
@@ -246,13 +235,13 @@ async fn trace_multipart_complete() {
     // the lease is acquired as an independent step from everything that
     // follows (the backend assembly, then the finalize transaction, then
     // `finish_complete`), with no overarching transaction tying the whole
-    // workflow together. This is mechanical evidence *for* FS-02 (F2): the
-    // gap isn't "no transaction anywhere", it's "several independently-
-    // atomic steps with no cross-step ownership fence", exactly what FS-02
-    // describes at the domain level. Pinned directly (not `#[ignore]`d,
-    // since it's the intentional/expected shape, not a regression target)
-    // so a future change that adds a *second* untransacted write here would
-    // still be caught.
+    // workflow together. This is mechanical evidence for the owner-fencing
+    // gap covered by `pg_concurrency_test.rs`'s `f2_*` scenarios: the gap
+    // isn't "no transaction anywhere", it's "several independently-atomic
+    // steps with no cross-step ownership fence". Pinned directly (not
+    // ignored, since it's the intentional/expected shape, not a regression
+    // target) so a future change that adds a *second* untransacted write
+    // here would still be caught.
     let outside = rec.writes_outside_tx();
     assert_eq!(
         outside.len(),
@@ -279,15 +268,16 @@ async fn trace_multipart_complete() {
 }
 
 // =========================================================================
-// Section 2 -- FS-01 (F1): orphan file when multipart initiation fails
+// Section 2 -- orphan file when multipart initiation fails
 // =========================================================================
 
 /// Build a `FileService` + `MultipartService` pair backed by a
 /// `LocalFsBackend` (`multipart_native == false`, per `local_fs.rs`'s
 /// `BackendCapabilities::default()` -- confirmed by reading the impl: it
 /// only ever sets `range_native`/`durable`, never `multipart_native`).
-/// Reproduces F1's capability-reject half deterministically, with no test
-/// double needed -- just backend topology choice.
+/// Reproduces the capability-reject half of the initiate-failure scenario
+/// deterministically, with no test double needed -- just backend topology
+/// choice.
 async fn make_services_local_fs_only() -> common::Services {
     let db = common::test_db().await;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -297,8 +287,7 @@ async fn make_services_local_fs_only() -> common::Services {
 
 #[tokio::test]
 async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
-    // FS-01 / F1 -- FIXED at the orchestration layer (see
-    // docs/analysis/DB_BEHAVIOR_AUDIT.md §5): `FileService::
+    // Fixed at the orchestration layer: `FileService::
     // compensate_failed_multipart_initiate` now reclaims this orphan, but
     // only the merged `POST /files` handler (`api/rest/handlers.rs::
     // create_file`'s multipart branch) actually calls it -- correctly:
@@ -340,8 +329,8 @@ async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
     );
 
     // Without the handler's compensation call, the bare file survives --
-    // this is the raw two-call sequence's behavior, unchanged by the FS-01
-    // fix (which lives one layer up, in the orchestrating caller).
+    // this is the raw two-call sequence's behavior, unchanged by the fix
+    // (which lives one layer up, in the orchestrating caller).
     let still_there = svc.get_file(&ctx, file_id).await;
     assert!(
         still_there.is_ok(),
@@ -352,7 +341,7 @@ async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
 
 #[tokio::test]
 async fn multipart_initiate_capability_reject_with_compensation_reclaims_orphan() {
-    // FS-01 / F1 fix, end-to-end: mirrors exactly what
+    // End-to-end: mirrors exactly what
     // `api/rest/handlers.rs::create_file`'s multipart branch now does on an
     // initiate failure -- call `compensate_failed_multipart_initiate` with
     // the same `file_id`, then confirm the orphan is gone.
@@ -388,31 +377,32 @@ async fn multipart_initiate_capability_reject_with_compensation_reclaims_orphan(
 }
 
 // =========================================================================
-// Section 3 -- FS-02/FS-04 (F2/F9): CAS predicates inspected via raw SQL
+// Section 3 -- CAS predicates inspected via raw SQL
 // =========================================================================
 //
 // `check-then-act-without-constraint` has no general mechanized rule (see
 // this file's module doc and `docs/toolkit_unified_system/
 // 14_db_behavior_testing.md`'s own stated boundary) -- but the recorder
-// already captures the *exact* SQL text of every CAS `UPDATE`, so the
+// already captures the *exact* SQL text of every CAS `UPDATE`, so a
 // specific, already-known-from-code-reading gap (a WHERE clause missing a
 // column) can be asserted directly against the captured statement text.
 // This is not a general rule that would find a *new*, unknown instance of
 // the class the way `writes_outside_tx()` would for `no-tx-write` -- it is
 // a targeted regression pin for the two gaps this audit's code reading
-// already found (FS-02, FS-04), analogous to `redundant_reads_after_write`
-// being "general" but the fault-injection table still needing a *specific*
-// site to inject into.
+// found, analogous to `redundant_reads_after_write` being "general" but
+// the fault-injection table still needing a *specific* site to inject
+// into.
 
 #[tokio::test]
 async fn multipart_finish_complete_cas_omits_lease_owner() {
-    // FS-02 / F2 (known defect, MEDIUM, worst case: session stranded until
-    // expiry -- see docs/analysis/DB_BEHAVIOR_AUDIT.md). `finish_complete`'s
-    // UPDATE filters on `state = 'completing'` only; unlike
+    // Known defect (worst case: session stranded until expiry -- see
+    // `pg_concurrency_test.rs`'s `f2_*` scenarios for the full stranding
+    // mechanism). `finish_complete`'s UPDATE filters on
+    // `state = 'completing'` only; unlike
     // `release_complete_lease`/`abort_expired_completing`, it has no
     // `lease_owner` predicate. This pins the *current* (defective) SQL
     // shape directly -- if `lease_owner` is added to the WHERE clause, this
-    // test starts failing, signaling FS-02 (this half of it) is fixed.
+    // test starts failing, signaling the defect is fixed.
     let (db, rec) = common::test_db_with_recorder().await;
     let s = common::make_services_full(&db);
     let tenant_id = Uuid::now_v7();
@@ -484,8 +474,7 @@ async fn multipart_finish_complete_cas_omits_lease_owner() {
 
 #[tokio::test]
 async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is_null() {
-    // FS-04 / F9 fix (see docs/analysis/DB_BEHAVIOR_AUDIT.md §5): the
-    // embedded auto-bind CAS inside finalize_version used to bind against
+    // The embedded auto-bind CAS inside finalize_version used to bind against
     // `expected_content_id = file.content_id` observed at completion time,
     // unconditionally -- a stale snapshot from the top of
     // `complete_multipart_upload`, not a caller-confirmed precondition.
@@ -548,9 +537,9 @@ async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is
         .await
         .expect("complete_multipart_upload (no If-Match) must still succeed -- only the bind is conditional")
         .unwrap_completed();
-    // FS-04/F9 fix: the auto-bind CAS correctly loses -- the previously
-    // bound content survives, with no client-supplied CAS token needed to
-    // protect it (the protection is now the CAS's own NULL requirement).
+    // The auto-bind CAS correctly loses -- the previously bound content
+    // survives, with no client-supplied CAS token needed to protect it
+    // (the protection is now the CAS's own NULL requirement).
     assert_eq!(
         completed.bind_state,
         file_storage::domain::multipart::BindState::Conflict,
@@ -585,7 +574,7 @@ async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is
     );
 }
 
-/// Negative control for the FS-04/F9 fix: supplying a correct `If-Match`
+/// Negative control: supplying a correct `If-Match`
 /// (matching the file's current content) is the caller explicitly
 /// confirming the pointer it observed -- the auto-bind CAS then correctly
 /// targets that observed (non-NULL) pointer and wins, exactly as before the
@@ -664,7 +653,7 @@ async fn negative_control_multipart_complete_auto_bind_with_if_match_still_binds
 }
 
 // =========================================================================
-// Section 4 -- scale-invariance (FS-11, new n-plus-one finding)
+// Section 4 -- scale-invariance (n-plus-one on metadata patch)
 // =========================================================================
 
 async fn metadata_upsert_statements_for_patch_size(n: usize) -> usize {
@@ -696,12 +685,11 @@ async fn metadata_upsert_statements_for_patch_size(n: usize) -> usize {
         .sum()
 }
 
-// FS-11 fix: patch_metadata_atomic now batches its DELETE and INSERT into
-// one statement each (Store::metadata's patch_metadata_atomic, via the new
+// patch_metadata_atomic now batches its DELETE and INSERT into one
+// statement each (Store::metadata's patch_metadata_atomic, via
 // MetadataRepo::delete_keys/insert_many, backed by toolkit-db's
-// secure_insert_many -- cherry-picked from fix/rg-db-remediation for this
-// fix). No longer `#[ignore]`d: this is now the healthy invariant, asserted
-// directly.
+// secure_insert_many). Asserted directly, since this is now the healthy
+// invariant.
 #[tokio::test]
 async fn scale_metadata_patch_inserts_do_not_grow_with_entry_count() {
     let small = metadata_upsert_statements_for_patch_size(2).await;
@@ -766,9 +754,9 @@ fn visit_rs_files(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path, &s
 #[tokio::test]
 async fn negative_control_read_paths_produce_no_write_statements() {
     // Read paths don't produce write-statements (not "don't produce noise" --
-    // FS-11 is itself a legitimate n-plus-one finding on a write path driven
-    // by a small request-supplied N, and this audit doesn't claim reads are
-    // exempt from the scale-invariance rule either, only that the
+    // the scale-invariance scenarios above are legitimate n-plus-one
+    // findings on write paths driven by a small request-supplied N; reads
+    // aren't claimed exempt from that rule either, only that the
     // write-oriented no-tx-write/redundant-io rules can't misfire on a
     // read-only call).
     let (db, rec) = common::test_db_with_recorder().await;
@@ -804,11 +792,12 @@ async fn negative_control_read_paths_produce_no_write_statements() {
 
 #[tokio::test]
 async fn negative_control_multipart_native_backend_initiate_succeeds() {
-    // Same scenario as FS-01's repro, but with a multipart_native backend
-    // (InMemoryBackend) instead of LocalFsBackend -- proves the capability
-    // gate itself works correctly (rejects only when it should), and gives
-    // the FS-01 repro a same-shape control: identical call sequence, only
-    // the backend topology differs.
+    // Same scenario as
+    // `multipart_initiate_capability_reject_leaves_orphan_bare_file`, but
+    // with a multipart_native backend (InMemoryBackend) instead of
+    // LocalFsBackend -- proves the capability gate itself works correctly
+    // (rejects only when it should), and gives that test a same-shape
+    // control: identical call sequence, only the backend topology differs.
     let (db, _rec) = common::test_db_with_recorder().await;
     let (svc, msvc) = common::make_services(&db);
     let tenant_id = Uuid::now_v7();
@@ -834,8 +823,8 @@ async fn negative_control_multipart_native_backend_initiate_succeeds() {
 }
 
 // =========================================================================
-// Section 7 -- scale-invariance (FS-14 fix, the same n-plus-one shape as
-// FS-11 at create_file's own sibling call site)
+// Section 7 -- scale-invariance: the same n-plus-one shape as Section 4,
+// at create_file's own sibling call site
 // =========================================================================
 
 async fn create_file_metadata_insert_statements_for_entry_count(n: usize) -> usize {
@@ -865,11 +854,11 @@ async fn create_file_metadata_insert_statements_for_entry_count(n: usize) -> usi
         .sum()
 }
 
-/// FS-14 fix: `create_file_with_pending_version{,_with_event,_with_idempotency}`'s
-/// own initial-`custom_metadata` loop had the exact same n-plus-one shape as
-/// FS-11's `patch_metadata_atomic`, found while fixing that one. Fixed the
-/// same way (batched via `MetadataRepo::insert_many`); asserted directly
-/// (not `#[ignore]`d) since this is the healthy invariant now.
+/// `create_file_with_pending_version{,_with_event,_with_idempotency}`'s own
+/// initial-`custom_metadata` loop had the exact same n-plus-one shape as
+/// `patch_metadata_atomic` in Section 4, found while fixing that one. Fixed
+/// the same way (batched via `MetadataRepo::insert_many`); asserted
+/// directly since this is the healthy invariant now.
 #[tokio::test]
 async fn scale_create_file_metadata_inserts_do_not_grow_with_entry_count() {
     let small = create_file_metadata_insert_statements_for_entry_count(2).await;

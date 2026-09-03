@@ -36,8 +36,7 @@ Updated:  2026-07-07 by Constructor Tech
   - [8. Cross-backend mapping](#8-cross-backend-mapping)
   - [9. Mode selection](#9-mode-selection)
   - [10. FIPS handling](#10-fips-handling)
-  - [11. Staged implementation plan](#11-staged-implementation-plan)
-  - [12. Risks & open decisions](#12-risks--open-decisions)
+  - [11. Risks & open decisions](#11-risks--open-decisions)
 
 <!-- /toc -->
 
@@ -315,7 +314,7 @@ and no second hash algorithm to gate behind a FIPS feature flag —
 This document is intentionally blunt about trade-offs: mode 2's digest is a
 hash of "content *and* split layout," not of the object's bytes alone, so it
 is **not** comparable to a whole-object SHA-256 of the same content. That is
-an accepted, explicitly documented consequence (§12), not an oversight.
+an accepted, explicitly documented consequence (§11), not an oversight.
 
 ### 1. Current state
 
@@ -472,7 +471,7 @@ digests, no re-read of the assembled object required.
   and CHECK as mode 1's), **plus `part_count`** (also derivable by parsing
   the manifest, but stored redundantly on `file_versions` so simple
   "does this version's shape look sane" queries — and the manifest-size
-  bound in §12 — don't require fetching and parsing the manifest itself),
+  bound in §11 — don't require fetching and parsing the manifest itself),
   **plus the manifest itself**, stored per the decision in §4.
 - **Client re-verification is self-contained.** A client that has (a) the
   full object bytes, (b) the returned `root`, and (c) the returned
@@ -508,7 +507,7 @@ digests, no re-read of the assembled object required.
 | Manifest stored? | No | Yes (§4) |
 | Re-download at complete? | N/A | No |
 | Re-verify from object bytes alone? | Yes, always | Yes, **but only together with the stored manifest** — self-contained once both are in hand, not from object bytes alone |
-| Cross-mode identity (same content, both modes → same digest)? | — | **No, by design** — see §12's split-dependent-identity risk |
+| Cross-mode identity (same content, both modes → same digest)? | — | **No, by design** — see §11's split-dependent-identity risk |
 
 ### 3. Manifest encoding — canonical wire format
 
@@ -610,7 +609,7 @@ manifest is returned over the API and is meant to be independently
 re-implementable by any client with a stock SHA-256 library and a text
 parser — no custom binary framing, no endianness question, no length-prefix
 convention to get subtly wrong. The size cost (hex digests are 2× the raw
-byte count) is accepted deliberately; §12 shows this is still bounded to
+byte count) is accepted deliberately; §11 shows this is still bounded to
 well under a megabyte at realistic part counts.
 
 ### 4. Manifest storage
@@ -632,7 +631,7 @@ CREATE TABLE file_storage.version_hash_manifest (
 * **Inline column on `file_versions`** (e.g. `file_versions.manifest text
   NULL`) — rejected. `file_versions` is the hot row read on every metadata
   fetch, list, and download-path lookup; a ~800 KB worst-case manifest
-  (§12) sitting on that row means every unrelated read of that row (e.g. a
+  (§11) sitting on that row means every unrelated read of that row (e.g. a
   `SELECT size, mime_type FROM file_versions WHERE id = $1` that never asks
   about the manifest) pays for fetching and potentially TOAST-decompressing
   a large text value it does not need, and it bloats the row's physical
@@ -914,77 +913,7 @@ non-approved algorithm being present at all.
   story is needed at all** — this section is intentionally short because
   there is nothing further to resolve.
 
-### 11. Staged implementation plan
-
-This is the staging the implementation below followed; every stage is complete. Each stage landed independently
-reviewable and (where feasible) independently shippable/toggleable.
-
-**Stage 0 — groundwork, no behavior change**
-- Introduce `HashMode`, `ManifestEntry`, and `Manifest` types in
-  `src/infra/content/` (new `hash_mode.rs` alongside `hash.rs`), with
-  `Manifest::to_wire_string()`/`from_wire_string()` implementing §3's grammar
-  exactly, plus round-trip and cross-implementation-stability unit tests
-  (encode → decode → re-encode is byte-identical; a hand-written reference
-  manifest string parses to the expected entries and vice versa).
-- Unit tests: given a fixed set of `(offset, digest)` pairs, confirm
-  `to_wire_string()` output matches a hand-computed expected string exactly,
-  and `sha256(to_wire_string(...))` matches an independently-computed
-  reference `root` — the single most important test in this project, since
-  it is the concrete proof the wire format in §3 is unambiguous.
-
-**Stage 1 — schema migration**
-- New migration: `file_versions` gets `hash_mode`, `part_count` + the new
-  CHECKs from §5 (no `hash_algorithm` widening). New
-  `version_hash_manifest` table.
-  Backfill: existing rows get `hash_mode = 'whole-sha256'`, `part_count =
-  NULL`, no `version_hash_manifest` row (correct — every extant row is
-  a P1 single-part SHA-256 upload).
-- `FileVersion` SDK type / entity / mapper updated with the new fields.
-- Update `pending_version` / `VersionRepo::finalize` / `Store::finalize_version`
-  signatures to carry `(hash_mode, part_count)` end-to-end, with the mode set
-  at **finalize** time (not pending-insert time — see §1's gap note), and to
-  insert the `version_hash_manifest` row transactionally for
-  `multipart-composite-sha256` completions.
-- Files: `migrations/mNNNN_hash_modes.rs`, `entity/file_version.rs`,
-  `entity/version_hash_manifest.rs` (new), `repo/version_repo.rs`,
-  `store/versions.rs`, `storage/mapper.rs`, `file-storage-sdk`'s
-  `FileVersion` type.
-
-**Stage 2 — multipart-composite-sha256**
-- `StorageBackend::upload_part`/`complete_multipart` trait signature changes
-  (§7). Every multipart-capable backend impl updated.
-  `MultipartService::complete_multipart_upload` stops discarding part hashes
-  and offsets; threads them into `complete_multipart`, persists the returned
-  `Manifest` and `root`.
-- `Store::verify_content_hash` becomes mode-aware (§6); `migrate_backend`
-  updated to fetch the manifest row and perform the split-rehash-rebuild
-  sequence for `multipart-composite-sha256` versions.
-- Tests: multipart upload asserting **no `GetObject`/re-read call** happens
-  at complete time (a request-counting wrapper backend or an S3-mock
-  call-count assertion); assert the stored `root` matches an
-  independently-computed `sha256(manifest)` reference built from the test's
-  own knowledge of the uploaded parts; assert a client-side re-verification
-  helper (split object at manifest offsets, rehash, rebuild, compare)
-  succeeds against real uploaded content and fails against a tampered byte
-  in any part.
-- Migration test: assert an existing multipart-session's
-  `multipart_upload_parts` rows are *not* required to still exist for
-  `migrate_backend`'s verification path to succeed once the version has a
-  `version_hash_manifest` row (directly exercises §4's "no need to retain
-  `multipart_upload_parts` forever" resolution).
-
-**Stage 3 — docs**
-- ADR-0006 and this document record the design.
-- `DESIGN.md`'s hash-design passages (the multipart-upload section, the
-  DB-tables section's `multipart_upload_parts.part_hash` line, and the
-  hash/ETag pipeline section) describe the `hash_mode`-conditional behavior —
-  SHA-256 for both modes, a manifest table for the multipart mode.
-- `SECURITY.md` — no addendum is needed under this design (§10).
-- `docs/api.md` — the `hash_mode`, `part_count`, and (for
-  `multipart-composite-sha256` versions) `manifest` fields in the metadata/
-  upload response shapes; additive, non-breaking wire-format content.
-
-### 12. Risks & open decisions
+### 11. Risks & open decisions
 
 Flagged honestly rather than glossed over. Two real, accepted trade-offs
 remain:

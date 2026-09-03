@@ -160,7 +160,7 @@ canonical-error variant); `*` or an absent header is unconditional. Before assem
 expected part numbers against the parts actually reported and returns `409` with the missing part numbers if any are
 absent, in front of the generic `SUM(part.size) != declared_size` check. `complete` **finalizes** the version
 (`pending -> available`, real assembled size/hash), and whether it also binds it depends on the session's
-`auto_bind` flag (upload-flow redesign), which is fixed at initiate time and cannot change mid-session:
+`auto_bind` flag, which is fixed at initiate time and cannot change mid-session:
 - **Manual session** (`auto_bind = false` -- every session opened via the standalone `POST
   /files/{id}/multipart`, or via `POST /files`'s multipart block with `bind: "manual"`): `content_id` is left
   untouched, exactly like single-shot upload's manual finalize/bind split (ADR-0003, DESIGN.md §3.6).

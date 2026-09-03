@@ -203,14 +203,10 @@ impl FileRepo {
     ///
     /// # Why this exists instead of `SELECT`-then-`DELETE`
     ///
-    /// [`crate::infra::storage::store::Store::delete_orphan_file_with_event`]
-    /// used to re-verify the orphan condition inside its transaction with two
-    /// plain `SELECT`s (`files.get` + `versions.list_by_file(..., 1, 0)`)
-    /// before issuing an unconditional `Self::delete`, on the theory that a
-    /// version inserted concurrently would be "guaranteed to be seen" by
-    /// those reads. That claim does not hold under `READ COMMITTED`: each
-    /// plain `SELECT` is its own statement with its own snapshot, ordinary
-    /// reads take no locks, and
+    /// A `SELECT`-then-`DELETE` re-verification of the orphan condition, as
+    /// two plain `SELECT`s followed by an unconditional `Self::delete`, does
+    /// not hold under `READ COMMITTED`: each plain `SELECT` is its own
+    /// statement with its own snapshot, ordinary reads take no locks, and
     /// `crate::infra::storage::store::Store::insert_pending_version` runs
     /// autocommit on a separate connection. Nothing prevents a version from
     /// being inserted and committed in the gap between the two `SELECT`s, or
@@ -218,17 +214,16 @@ impl FileRepo {
     /// runs, the FK (`file_versions.file_id -> files.file_id ON DELETE
     /// CASCADE`) silently removes the just-inserted version along with the
     /// file. This is invisible on `SQLite`, whose single-writer model
-    /// serializes the interleaving away, which is why the pre-existing test
-    /// suite did not catch it.
+    /// serializes the interleaving away.
     ///
     /// Folding the whole guard into the `DELETE`'s own `WHERE` (`content_id
     /// IS NULL` plus a `NOT EXISTS` subquery over `file_versions`) narrows
     /// that window from "between two statements" to "inside one statement's
     /// execution", and removes the `content_id` half of the race outright.
     ///
-    /// It does **not** make the version half airtight on `PostgreSQL`, and this
-    /// comment previously claimed otherwise. Under `READ COMMITTED` the
-    /// `NOT EXISTS` subquery is evaluated against the snapshot taken when
+    /// It does **not** make the version half airtight on `PostgreSQL`. Under
+    /// `READ COMMITTED` the `NOT EXISTS` subquery is evaluated against the
+    /// snapshot taken when
     /// this statement began. A concurrent `insert_pending_version` that
     /// commits after that snapshot is invisible to the subquery; the FK it
     /// takes on the parent row (`FOR KEY SHARE`) does make this `DELETE`
@@ -252,8 +247,6 @@ impl FileRepo {
     /// these from the count alone (mirrors
     /// [`crate::infra::storage::repo::VersionRepo::delete`]'s "returns a
     /// count, not a reason" shape).
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     pub async fn delete_if_orphan<C: DBRunner>(
         &self,
         conn: &C,
@@ -292,8 +285,6 @@ impl FileRepo {
     /// advancing `after` to the last returned `file_id`, until it gets a short
     /// page. Keyset (not offset) paging is used so that deleting expired files
     /// mid-sweep does not shift the window and skip rows.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_for_sweep<C: DBRunner>(
         &self,
         conn: &C,
@@ -318,8 +309,6 @@ impl FileRepo {
 
     /// Update `owner_kind` and `owner_id` for a file row, and bump
     /// `last_modified_at`. Returns `true` if a row was found and updated.
-    ///
-    /// @cpt-cf-file-storage-fr-ownership-transfer
     pub async fn update_owner<C: DBRunner>(
         &self,
         conn: &C,

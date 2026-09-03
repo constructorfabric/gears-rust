@@ -161,7 +161,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 - **Out of scope**:
   - Any second hash algorithm, per-request hash-mode preference, or capability-discovery endpoint (ADR-0002's P2 `hash_policy`/`selection_rules` vision -- dropped entirely, not deferred, since SHA-256 is the only algorithm for both modes)
   - Changes to the multipart session state machine or any multipart endpoint's method/path/request shape (owned by `cpt-cf-file-storage-feature-multipart-coordinator`)
-  - Cross-mode or cross-split-choice content deduplication (an accepted, documented trade-off -- see [features/content-hash-modes.md](features/content-hash-modes.md) §7 "12. Risks & open decisions")
+  - Cross-mode or cross-split-choice content deduplication (an accepted, documented trade-off -- see [features/content-hash-modes.md](features/content-hash-modes.md) §11 "Risks & open decisions")
 
 - **Requirements Covered**:
 

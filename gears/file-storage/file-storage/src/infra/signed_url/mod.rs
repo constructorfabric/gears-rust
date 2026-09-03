@@ -43,8 +43,6 @@ pub enum Op {
     /// Carries additional multipart-specific claims (`upload_id`, `part_number`,
     /// `offset`, exact `size`) that the sidecar enforces before writing any bytes.
     /// The control plane is the sole minter; the sidecar only verifies (ADR-0004).
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload (FEATURE §4)
     MultipartPart,
 }
 

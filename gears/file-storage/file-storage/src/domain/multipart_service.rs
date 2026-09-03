@@ -118,26 +118,24 @@ pub struct MultipartService {
     sidecar_base_url: String,
     /// Signed-URL TTL in seconds, applied to every per-part upload URL
     /// (`default_url_ttl_secs` -- kept short to bound the stale-permission
-    /// window, DESIGN §4.5). Independent of [`Self::session_ttl_secs`] since
-    /// the `multipart-session-ttl` remediation: a large upload's session
-    /// lifetime must not be capped at the same short window used for
-    /// individual signed URLs -- see [`Self::session_ttl_secs`]'s own doc.
+    /// window, DESIGN §4.5). Independent of [`Self::session_ttl_secs`]: a
+    /// large upload's session lifetime must not be capped at the same short
+    /// window used for individual signed URLs -- see
+    /// [`Self::session_ttl_secs`]'s own doc.
     url_ttl_secs: i64,
     /// Lifetime (seconds) of the multipart session itself -- i.e. how long
     /// `expires_at` on the `multipart_uploads` row is set to at initiate
-    /// time. Defaults to [`Self::url_ttl_secs`] in [`Self::new`] (preserving
-    /// the pre-remediation behavior for callers that don't opt in), but
-    /// `gear.rs` overrides it via [`Self::with_session_ttl_secs`] to a much
-    /// longer, dedicated `multipart_session_ttl_secs` config value. Before
-    /// this remediation the session shared `url_ttl_secs` (a short,
-    /// stale-permission bound meant for individual signed URLs, DESIGN
-    /// §4.5), which capped every multi-GB multipart upload's *total* time
-    /// budget at 15 minutes by default -- self-defeating for the very
-    /// large-upload use case multipart exists for, and for the
-    /// introspect/resume feature (`cpt-cf-file-storage-flow-
-    /// multipart-introspect`), whose resume-token expiry is capped at the
-    /// session's own `expires_at` and so could never extend a session past
-    /// that same 15 minutes.
+    /// time. Defaults to [`Self::url_ttl_secs`] in [`Self::new`] (so callers
+    /// that don't opt in keep the old behavior), but `gear.rs` overrides it
+    /// via [`Self::with_session_ttl_secs`] to a much longer, dedicated
+    /// `multipart_session_ttl_secs` config value. Kept independent of
+    /// `url_ttl_secs` (a short, stale-permission bound meant for individual
+    /// signed URLs, DESIGN §4.5): sharing it would cap every multi-GB
+    /// multipart upload's *total* time budget at that same short window --
+    /// self-defeating for the large-upload use case multipart exists for,
+    /// and for the introspect/resume feature, whose resume-token expiry is
+    /// capped at the session's own `expires_at` and so could never extend a
+    /// session past that window either.
     session_ttl_secs: i64,
     /// Completion-lease duration (seconds) — how long a `complete` may hold
     /// the `completing` state before another `complete` can take it over
@@ -145,13 +143,12 @@ pub struct MultipartService {
     /// knob `multipart_complete_lease_secs` (default 120), threaded by
     /// `gear.rs` via [`Self::with_complete_lease_secs`].
     complete_lease_secs: i64,
-    /// Metrics port (P2 1.8 remediation). Defaults to a no-op implementation
-    /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
-    /// [`Self::with_metrics`].
+    /// Metrics port. Defaults to a no-op implementation (see [`Self::new`]);
+    /// `gear.rs` opts into the real OTel-backed meter via [`Self::with_metrics`].
     metrics: Arc<dyn FileStorageMetricsPort>,
-    /// Usage-reporting sink (P2 1.12 remediation). `None` disables reporting
-    /// (fire-and-forget no-op); `gear.rs` opts in via
-    /// [`Self::with_usage_reporter`] once a Usage Collector client is wired.
+    /// Usage-reporting sink. `None` disables reporting (fire-and-forget
+    /// no-op); `gear.rs` opts in via [`Self::with_usage_reporter`] once a
+    /// Usage Collector client is wired.
     usage_reporter: Option<Arc<dyn UsageReporter>>,
 }
 
@@ -173,10 +170,8 @@ impl MultipartService {
             issuer,
             sidecar_base_url,
             url_ttl_secs,
-            // Defaults to url_ttl_secs so existing `MultipartService::new(...)`
-            // call sites across the integration-test suite keep compiling and
-            // behaving unchanged; `gear.rs` opts into a real, decoupled value
-            // via `with_session_ttl_secs`.
+            // See the `session_ttl_secs` field doc for why this defaults to
+            // `url_ttl_secs`.
             session_ttl_secs: url_ttl_secs,
             complete_lease_secs: 120,
             metrics: Arc::new(NoopMetrics),
@@ -185,8 +180,7 @@ impl MultipartService {
     }
 
     /// Install a dedicated completion-lease duration (upload-flow redesign).
-    /// Same builder shape as [`Self::with_metrics`] — existing
-    /// `MultipartService::new(...)` call sites keep compiling unchanged.
+    /// Same builder shape as [`Self::with_metrics`] (see its doc for why).
     #[must_use]
     pub fn with_complete_lease_secs(mut self, complete_lease_secs: i64) -> Self {
         self.complete_lease_secs = complete_lease_secs;
@@ -194,28 +188,25 @@ impl MultipartService {
     }
 
     /// Install a dedicated multipart-session lifetime, decoupled from the
-    /// per-part signed-URL TTL (`multipart-session-ttl` remediation). Same
-    /// builder shape as [`Self::with_metrics`] -- existing
-    /// `MultipartService::new(...)` call sites keep compiling unchanged.
+    /// per-part signed-URL TTL. Same builder shape as [`Self::with_metrics`].
     #[must_use]
     pub fn with_session_ttl_secs(mut self, session_ttl_secs: i64) -> Self {
         self.session_ttl_secs = session_ttl_secs;
         self
     }
 
-    /// Install a real metrics port (P2 1.8 remediation). Kept as a builder
-    /// step rather than a `new()` parameter so existing
-    /// `MultipartService::new(...)` call sites across the integration-test
-    /// suite keep compiling unchanged; only `gear.rs` needs to opt in.
+    /// Install a real metrics port. Kept as a builder step rather than a
+    /// `new()` parameter so existing `MultipartService::new(...)` call sites
+    /// across the integration-test suite keep compiling unchanged; only
+    /// `gear.rs` needs to opt in.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn FileStorageMetricsPort>) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Install a usage-reporting sink (P2 1.12 remediation). Same builder
-    /// shape as [`Self::with_metrics`] -- existing `MultipartService::new(...)`
-    /// call sites keep compiling unchanged.
+    /// Install a usage-reporting sink. Same builder shape as
+    /// [`Self::with_metrics`].
     #[must_use]
     pub fn with_usage_reporter(mut self, usage_reporter: Option<Arc<dyn UsageReporter>>) -> Self {
         self.usage_reporter = usage_reporter;
@@ -227,8 +218,6 @@ impl MultipartService {
     ///
     /// Mirrors `FileService::report_usage` (kept private/independent per this
     /// service's fan-in-isolation design -- see the module doc).
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
     fn report_usage(&self, delta: UsageDelta) {
         if let Some(reporter) = self.usage_reporter.clone() {
             tokio::spawn(async move {
@@ -255,8 +244,6 @@ impl MultipartService {
     }
 
     /// Build a success audit entry for a file-scoped write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     fn audit_ok(
         ctx: &SecurityContext,
         file_id: Option<Uuid>,
@@ -274,9 +261,6 @@ impl MultipartService {
     }
 
     /// Resolve the effective policy for a given `(tenant_id, owner_id)` pair.
-    ///
-    /// @cpt-cf-file-storage-fr-allowed-types-policy
-    /// @cpt-cf-file-storage-fr-size-limits-policy
     async fn get_effective_policy_internal(
         &self,
         tenant_id: Uuid,
@@ -303,8 +287,6 @@ impl MultipartService {
     /// giving the quota service a precise figure rather than a pessimistic ceiling.
     ///
     /// **Fail-closed**: a failing quota client denies the request.
-    ///
-    /// @cpt-cf-file-storage-fr-storage-quota
     async fn check_quota_bytes(
         &self,
         tenant_id: Uuid,
@@ -418,8 +400,8 @@ impl MultipartService {
                 backend_handle: backend_handle.to_owned(),
             },
             request_id: request_id.to_owned(),
-            // P2 1.11: content_type/etag are GET-only claims; a
-            // multipart-part token is always `op = multipart_part`.
+            // content_type/etag are GET-only claims; a multipart-part token
+            // is always `op = multipart_part`.
             content_type: String::new(),
             etag: String::new(),
             // Multipart binds via `complete` (session auto_bind), never via
@@ -448,10 +430,6 @@ impl MultipartService {
     /// - Storage quota: `507`
     ///
     /// The complete-time total-size check is kept as defence-in-depth.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-storage-quota
     #[tracing::instrument(skip_all)]
     /// `auto_bind` (upload-flow redesign): when `true`, `complete` will bind
     /// the finalized version itself (recorded on the session row). Only the
@@ -482,8 +460,8 @@ impl MultipartService {
         }
 
         // Validate the client-supplied `preferred_part_size` hint against a
-        // sane range *before* it can reach `compute_plan` (P2 remediation
-        // 2.11). Left unchecked, a near-`u64::MAX` value risks an arithmetic
+        // sane range *before* it can reach `compute_plan`. Left unchecked,
+        // a near-`u64::MAX` value risks an arithmetic
         // overflow in `compute_plan`/`round_up_to` and, on backends that
         // don't hit that overflow, a huge `Vec::with_capacity` allocation.
         // Rejecting is preferred over silently clamping so the client gets
@@ -503,7 +481,6 @@ impl MultipartService {
         // Policy checks: allowed mime type and size (at initiate, against the
         // declared total size — DESIGN §4.6 server-authoritative gate).
         //
-        // @cpt-cf-file-storage-fr-size-limits-policy
         let tenant_id = ctx.subject_tenant_id();
         let policy = self
             .get_effective_policy_internal(tenant_id, file.owner_id)
@@ -516,10 +493,9 @@ impl MultipartService {
         );
 
         // Gate: reject if the declared total size exceeds the effective limit.
-        // This is the DESIGN-aligned fix for CodeRabbit F2: validate up front at
-        // initiate time rather than deferring to complete time.
+        // Validated up front at initiate time (DESIGN-aligned) rather than
+        // deferring to complete time.
         //
-        // @cpt-cf-file-storage-fr-size-limits-policy
         if let Some(limit) = effective_max
             && declared_size > limit
         {
@@ -529,11 +505,10 @@ impl MultipartService {
             ));
         }
 
-        // Quota check against the declared size (not the pessimistic effective_max).
-        // PRD §5.4: "check before accepting any operation that increases storage
-        // consumption" — the declared size is our best estimate at this stage.
+        // Quota check against the declared size, not the pessimistic
+        // effective_max (PRD §5.4: check before accepting any operation
+        // that increases storage consumption).
         //
-        // @cpt-cf-file-storage-fr-storage-quota
         self.check_quota_bytes(tenant_id, file.owner_id, declared_size)
             .await?;
 
@@ -569,15 +544,10 @@ impl MultipartService {
         // Initiate the multipart upload on the backend.
         let backend_handle = backend.initiate_multipart(&backend_path).await?;
 
-        // The session's own lifetime (`multipart_session_ttl_secs`, e.g. 24h)
-        // is a dedicated, much longer-lived budget than the per-part signed
-        // URLs' TTL (`default_url_ttl_secs`, e.g. 15 min) -- a multi-GB
-        // upload needs real wall-clock time to complete, while any one
-        // signed URL should stay short-lived to bound the stale-permission
-        // window (DESIGN §4.5). A session that outlives its own URLs is the
-        // whole point of the introspect/resume flow: the client re-fetches
-        // fresh part URLs (capped at the session's own `expires_at`, see
-        // `introspect_multipart_upload`) as earlier ones expire.
+        // Session lifetime is independent of the URL TTL -- see
+        // `session_ttl_secs`'s field doc for why -- so it can outlive several
+        // regenerated per-part URL batches; that is the whole point of the
+        // introspect/resume flow (`introspect_multipart_upload`).
         let session_expires_at = now + time::Duration::seconds(self.session_ttl_secs.max(1));
         let url_expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
 
@@ -613,9 +583,9 @@ impl MultipartService {
 
         // Mint one signed URL per part (FEATURE §4).
         // Each token carries the exact `size` claim the sidecar will enforce.
-        // P2 1.8: every part of the same upload shares one correlation id, so
-        // the sidecar's report-part callbacks for this upload all echo back
-        // the same `x-request-id`.
+        // Every part of the same upload shares one correlation id, so the
+        // sidecar's report-part callbacks for this upload all echo back the
+        // same `x-request-id`.
         let exp = url_expires_at.unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let mut parts = Vec::with_capacity(raw_parts.len());
@@ -656,12 +626,9 @@ impl MultipartService {
 
     /// `POST /files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report`:
     /// token-authenticated callback used by the sidecar to record a
-    /// successfully-written part (P2 0.2 group B — the "report part" fix).
+    /// successfully-written part.
     ///
-    /// Before this existed, nothing ever called
-    /// `MultipartStore::upsert_multipart_part` in a real deployment, so
-    /// `complete_multipart_upload`'s `list_multipart_parts` was always
-    /// structurally empty. `claims` has already been verified by the caller
+    /// `claims` has already been verified by the caller
     /// (mirrors `finalize_version`'s handler-level token verification) and
     /// `claims.op == Op::MultipartPart` has already been asserted there; this
     /// method re-validates the claims against the session so a valid token for
@@ -671,8 +638,6 @@ impl MultipartService {
     /// per-part size minted into the token at initiate time) so a holder of
     /// the signed token cannot forge a part's size and corrupt the summed
     /// `version.size` computed by `complete_multipart_upload`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     pub async fn report_part(
         &self,
         claims: &Claims,
@@ -695,15 +660,15 @@ impl MultipartService {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
 
-        // Fast path only (P2 report-part-atomicity remediation): this is a
-        // cheap early rejection against the `session` snapshot loaded above,
-        // not the authoritative check. `Store::upsert_multipart_part` below
-        // re-verifies `state == in_progress` itself, atomically with the
-        // part write, inside one transaction -- that re-check is what
-        // actually decides the outcome on a race (a concurrent `complete`
-        // or `abort` landing between this snapshot read and the write
-        // below), and returns this exact same error variant when it loses,
-        // so the contract observed by callers is unchanged either way.
+        // Fast path only: this is a cheap early rejection against the
+        // `session` snapshot loaded above, not the authoritative check.
+        // `Store::upsert_multipart_part` below re-verifies `state ==
+        // in_progress` itself, atomically with the part write, inside one
+        // transaction -- that re-check is what actually decides the outcome
+        // on a race (a concurrent `complete` or `abort` landing between this
+        // snapshot read and the write below), and returns this exact same
+        // error variant when it loses, so the contract observed by callers
+        // is unchanged either way.
         if session.state != MultipartUploadState::InProgress {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
@@ -733,7 +698,6 @@ impl MultipartService {
             ));
         }
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-db-upsert
         // Authoritative from here: this call re-checks `state == in_progress`
         // and writes the part row in one transaction, so its `Err` (when the
         // guard loses) is the final word, not just this method's earlier
@@ -748,7 +712,6 @@ impl MultipartService {
                 OffsetDateTime::now_utc(),
             )
             .await
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-db-upsert
     }
 
     /// `POST /files/{id}/multipart/{upload_id}/complete`: finalize all parts.
@@ -775,11 +738,6 @@ impl MultipartService {
     ///   finish; otherwise re-assemble), and finishes the job. Sessions
     ///   stuck in `completing` past `expires_at` are backstopped by the
     ///   cleanup engine's abandoned-session sweep.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-dod:cpt-cf-file-storage-dod-multipart-complete:p1
-    /// @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-multipart-composite:p2
     #[tracing::instrument(skip_all)]
     pub async fn complete_multipart_upload(
         self: &Arc<Self>,
@@ -788,16 +746,13 @@ impl MultipartService {
         upload_id: Uuid,
         if_match: Option<&str>,
     ) -> Result<MultipartCompleteOutcome, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-request
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-request
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
         let session = self
             .store
             .get_multipart_upload(upload_id)
@@ -813,21 +768,20 @@ impl MultipartService {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
 
-        // FS-06/F4 fix: idempotent re-complete (replay the persisted snapshot,
-        // or rebuild from the version row for pre-snapshot sessions) is
-        // checked BEFORE the If-Match precondition below now, not after.
-        // This used to run after the precondition check, so a caller
-        // retrying an honest, already-successful complete (its own request
-        // never got a response -- a dropped connection, a timeout) with the
-        // SAME If-Match it originally sent would get PreconditionFailed
-        // instead of the persisted 200: this session's own earlier success
-        // (or, for an auto_bind session, its own embedded bind) had already
-        // moved the file's current ETag past whatever the caller observed
-        // before that first attempt. A replay is not a new conflicting
-        // action against CURRENT state -- it is the recorded outcome of an
-        // action that already happened -- so it must not be gated on a
-        // precondition meant to protect against a NEW one. Never a 409 (or a
-        // stale-precondition 412) on an honest retry.
+        // Idempotent re-complete (replay the persisted snapshot, or rebuild
+        // from the version row for pre-snapshot sessions) is checked BEFORE
+        // the If-Match precondition below: a replay is the recorded outcome
+        // of an action that already happened, not a new conflicting action
+        // against CURRENT state, so it must not be gated on a precondition
+        // meant to protect a NEW one. This ordering matters for an honest
+        // retry (its own request never got a response -- a dropped
+        // connection, a timeout) with the SAME If-Match it originally sent:
+        // this session's own earlier success (or, for an auto_bind session,
+        // its own embedded bind) already moved the file's current ETag past
+        // what the caller observed before that first attempt, so checking
+        // the precondition first would wrongly answer PreconditionFailed
+        // instead of the persisted 200. Never a 409 (or a stale-precondition
+        // 412) on an honest retry.
         if session.state == MultipartUploadState::Completed {
             self.metrics
                 .record_operation("complete_multipart_upload", "replayed");
@@ -841,7 +795,6 @@ impl MultipartService {
                 session.state.as_str(),
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
 
         // Optional If-Match precondition (item 3.3): unlike `bind`, `None`
         // stays unconditional here (backward compatible with the pre-3.3
@@ -867,14 +820,14 @@ impl MultipartService {
             }
         }
 
-        // Defence-in-depth (P2 0.3 step 3): the session may still read as
-        // live here even though `expires_at` has already passed, if the
-        // background sweep has not yet ticked. Reject explicitly rather
-        // than racing ahead of the next sweep and finalizing content that
-        // should have been aborted.
+        // Defence-in-depth: the session may still read as live here even
+        // though `expires_at` has already passed, if the background sweep
+        // has not yet ticked. Reject explicitly rather than racing ahead of
+        // the next sweep and finalizing content that should have been
+        // aborted.
         //
-        // Fast path only (P2 lease-fencing remediation): this check runs
-        // against the `session` snapshot loaded above, which can go stale in
+        // Fast path only: this check runs against the `session` snapshot
+        // loaded above, which can go stale in
         // the gap between this read and the lease CAS below -- a session
         // that expires in that window would sail past this `if` and still
         // reach `acquire_multipart_complete_lease`. The authoritative check
@@ -913,8 +866,8 @@ impl MultipartService {
             return match fresh.state {
                 // Completed must replay even past `expires_at` -- an
                 // idempotent re-complete is the recorded outcome of an
-                // action that already happened (see the FS-06/F4 comment
-                // above), not a new attempt against a live session, so
+                // action that already happened (see the comment above), not
+                // a new attempt against a live session, so
                 // expiry can never apply to it. This arm is checked first,
                 // ahead of the expiry guard below, so it always wins.
                 MultipartUploadState::Completed => {
@@ -961,23 +914,23 @@ impl MultipartService {
         }
         let takeover = session.state == MultipartUploadState::Completing;
 
-        // FS-04/F9 fix: whether the caller supplied ANY If-Match value
-        // (a concrete etag or `*`) -- not whether it was `*` specifically.
-        // Threaded down to the embedded auto-bind CAS below: a caller who
-        // supplied one has already had it validated, moments ago, against
-        // `file.content_id` (the `if let Some(m) = if_match` block above),
-        // so proceeding to target that exact observed pointer is safe --
-        // the client explicitly confirmed it. A caller who supplied
-        // *nothing* gets the pre-3.3 unconditional-complete contract for
-        // *whether complete succeeds*, but must not also get an unconditional
-        // *bind* for free -- see `assemble_and_finish_inner`'s own doc for
-        // why an unqualified observed-pointer CAS target is exactly F9.
+        // Whether the caller supplied ANY If-Match value (a concrete etag or
+        // `*`) -- not whether it was `*` specifically. Threaded down to the
+        // embedded auto-bind CAS below: a caller who supplied one has
+        // already had it validated, moments ago, against `file.content_id`
+        // (the `if let Some(m) = if_match` block above), so proceeding to
+        // target that exact observed pointer is safe -- the client
+        // explicitly confirmed it. A caller who supplied *nothing* gets the
+        // unconditional-complete contract for *whether complete succeeds*,
+        // but must not also get an unconditional *bind* for free -- see
+        // `assemble_and_finish_inner`'s own doc for why an unqualified
+        // observed-pointer CAS target would be unsafe.
         let if_match_was_supplied = if_match.is_some();
 
         // Winner: run the assembly in a DETACHED task — a client that
         // disconnects (or a request future that is dropped) cannot cancel
         // the work; the result is persisted and any later `complete`
-        // (F5, another tab) replays it. The current request still awaits
+        // (e.g. another tab) replays it. The current request still awaits
         // the task's handle so the ordinary path returns 200 directly.
         let svc = Arc::clone(self);
         let ctx = ctx.clone();
@@ -1109,9 +1062,9 @@ impl MultipartService {
     // finish); deliberately kept as one flat sequence rather than
     // fragmented across several small methods that would each need the
     // full context to make sense on their own (extracting
-    // converge_or_error_after_lost_finalize_cas already pulled out the one
+    // `converge_or_error_after_lost_finalize_cas` already pulled out the one
     // piece that had its own independent reasoning worth a doc comment of
-    // its own -- see FS-02/F2).
+    // its own -- see that method's doc).
     #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     async fn assemble_and_finish_inner(
         &self,
@@ -1136,11 +1089,8 @@ impl MultipartService {
             self.finish_session(ctx, session, &completed).await?;
             return Ok(completed);
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-parts
         let parts = self.store.list_multipart_parts(upload_id).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-parts
 
         // Fetch the backend from the version row.
         let version = self.store.get_version(file_id, session.version_id).await?;
@@ -1151,7 +1101,6 @@ impl MultipartService {
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-missing-parts
         // Reject with the specific missing part numbers before falling through
         // to the coarser residual size check below (item 3.3) — a caller
         // debugging a stalled upload gets an actionable list instead of an
@@ -1160,9 +1109,7 @@ impl MultipartService {
         if !missing.is_empty() {
             return Err(DomainError::multipart_parts_missing(upload_id, missing));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-missing-parts
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-size-verify
         // Compute total assembled size from the parts that the sidecar wrote.
         let total_size: i64 = parts.iter().map(|p| p.size).sum();
 
@@ -1181,9 +1128,7 @@ impl MultipartService {
                 )));
             }
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-size-verify
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-policy-check
         // Policy size check.
         let policy = self
             .get_effective_policy_internal(ctx.subject_tenant_id(), file.owner_id)
@@ -1202,16 +1147,13 @@ impl MultipartService {
                 "policy size limit",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-policy-check
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-assemble
         // Build the parts list for the backend, threading each part's byte
         // offset and its already-computed SHA-256 digest (ADR-0006) — these
         // are no longer discarded. The offset is the running sum of prior
         // parts' sizes; parts are listed in ascending part-number order (the
         // repo's `list_parts` `ORDER BY part_number`), which for any valid
         // plan is identical to ascending offset order.
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sort
         // `parts` is already in ascending part_number order (`list_parts`'s
         // `ORDER BY part_number`, verified gapless by the missing-parts diff
         // above), which for any valid plan is identical to ascending offset
@@ -1236,14 +1178,12 @@ impl MultipartService {
             ));
             running_offset += u64::try_from(p.size).unwrap_or(0);
         }
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sort
 
         // Assemble on the backend, which builds the offset-manifest and its
         // `root` from the per-part digests+offsets above — **no re-read of the
         // assembled object** (ADR-0006). `root` becomes the version's
         // `hash_value`; the manifest text is persisted in
         // `version_hash_manifest` transactionally with the version row below.
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sha256
         let (manifest, root) = match backend
             .complete_multipart(
                 &backend_path,
@@ -1282,8 +1222,6 @@ impl MultipartService {
             }
             Err(e) => return Err(e),
         };
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sha256
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-return
         // ADR-0006 single-part amendment: a **one-part plan degenerates to
         // `whole-sha256`** — the single part's streaming digest IS
         // `sha256(whole object bytes)` (part 1 spans the entire object), so
@@ -1308,19 +1246,16 @@ impl MultipartService {
                 Some(manifest.to_wire_string()),
             )
         };
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-return
         let part_count = i32::try_from(parts.len())
             .map_err(|_| DomainError::validation("part_count", "part count overflows i32"))?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-assemble
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-mime-validate
         // Sniff the assembled object's leading bytes and validate against
         // `session.declared_mime` -- the single-part finalize paths
         // (`write.rs::finalize_upload`/`finalize_upload_by_token`) already do
         // this; multipart-complete was the one finalize path that let a
         // policy restricting MIME types be bypassed by declaring an allowed
-        // type at initiate and multipart-uploading arbitrary bytes (P2
-        // remediation item 1.10). Validation runs post-assembly (S3 part
+        // type at initiate and multipart-uploading arbitrary bytes.
+        // Validation runs post-assembly (S3 part
         // objects are not independently readable pre-complete, so the backend
         // is the only place the *whole* assembled object can be sniffed).
         //
@@ -1329,7 +1264,6 @@ impl MultipartService {
         // always accepted as-is for an empty upload, exactly like the
         // single-part path's read-back handles empty content.
         //
-        // @cpt-cf-file-storage-fr-content-type-validation
         let mime_sniff_prefix = if total_size == 0 {
             Vec::new()
         } else {
@@ -1356,9 +1290,7 @@ impl MultipartService {
             backend.capabilities().max_size_bytes,
             total_size,
         )?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-mime-validate
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-finalize-version
         // Finalize the version row (no separate audit row — complete below covers it).
         let finalize_audit = Self::audit_ok(
             ctx,
@@ -1369,26 +1301,21 @@ impl MultipartService {
         // Upload-flow redesign: an `auto_bind` session (merged create+plan
         // with `bind: "auto"`) binds inside this same finalize transaction.
         //
-        // FS-04/F9 fix: the CAS precondition used to be `file.content_id`
-        // unconditionally -- a snapshot taken once at the very top of
-        // `complete_multipart_upload`, long before this finalize call. For
-        // the common case (a brand-new file from the merged create+plan
-        // path) that snapshot is `None`, so the CAS already correctly
-        // required `content_id IS NULL`. But if this session's `file_id`
-        // already had content bound by the time `complete` started (e.g. a
-        // legitimate rebind that happened during the -- often long --
-        // window between this multipart upload's *initiate* and its
-        // *complete*) and the caller supplied no `If-Match`, using that
-        // stale non-NULL snapshot as the CAS target let this auto-bind
+        // The CAS target depends on whether the caller supplied `If-Match`,
+        // not on `file`'s `content_id` snapshot unconditionally: `file` was
+        // read once at the very top of `complete_multipart_upload`, long
+        // before this finalize call, so by the time we get here it can be
+        // stale -- e.g. a legitimate rebind may have landed during the
+        // -- often long -- window between this multipart upload's
+        // *initiate* and its *complete*. Using that stale non-NULL snapshot
+        // unconditionally as the CAS target would let this auto-bind
         // silently clobber content the caller never confirmed it knew
-        // about: the snapshot merely reflected "whatever was there when
-        // complete started", not a caller-confirmed precondition. A caller
-        // who DID supply an `If-Match` already had it validated against
-        // this exact `content_id` moments ago (the `if let Some(m) =
-        // if_match` block in `complete_multipart_upload`), so proceeding
-        // with that observed pointer is safe -- the client explicitly
-        // confirmed it. A caller who supplied nothing gets the same
-        // guarantee the single-part finalize path already gives a
+        // about. A caller who DID supply an `If-Match` already had it
+        // validated against this exact `content_id` moments ago (the
+        // `if let Some(m) = if_match` block in `complete_multipart_upload`),
+        // so proceeding with that observed pointer is safe -- the client
+        // explicitly confirmed it. A caller who supplied nothing gets the
+        // same guarantee the single-part finalize path already gives a
         // brand-new file: the auto-bind CAS requires `content_id IS NULL`,
         // so it can never overwrite content it didn't know about. A lost
         // CAS is still not an error either way: complete still succeeds,
@@ -1440,18 +1367,16 @@ impl MultipartService {
         let finalized = finalize_outcome.updated;
         let bound = finalize_outcome.bound;
         if !finalized {
-            // FS-02/F2 fix -- see the helper's own doc for the full
-            // reasoning: a lost finalize CAS can mean either "someone else
-            // already finished this correctly" (converge) or "the row is
-            // genuinely gone" (a real error).
+            // See the helper's own doc for the full reasoning: a lost
+            // finalize CAS can mean either "someone else already finished
+            // this correctly" (converge) or "the row is genuinely gone" (a
+            // real error).
             return self
                 .converge_or_error_after_lost_finalize_cas(ctx, file_id, session, upload_id)
                 .await;
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-finalize-version
 
-        // ONE shared bind-state model (see `BindState`): bound (+new ETag) /
-        // conflict (+the file's CURRENT ETag for a manual rebind) / manual.
+        // Same bind-state model as [`Self::bind_state_for`]'s doc.
         let (bind_state, bind_etag, current_etag) = if bound {
             (
                 BindState::Bound,
@@ -1482,12 +1407,9 @@ impl MultipartService {
             current_etag,
         };
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-db-session
         // Terminal state transition + response snapshot + audit (fast tx).
         self.finish_session(ctx, session, &result).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-db-session
 
-        // @cpt-cf-file-storage-fr-usage-reporting
         // Credit the assembled object's total bytes. Multipart finalize does
         // not go through `FileService::finalize_upload`, so it needs its own
         // credit call; `file_count_delta` is `0` because the file itself was
@@ -1506,25 +1428,25 @@ impl MultipartService {
         Ok(result)
     }
 
-    /// FS-02/F2 fix: `assemble_and_finish_inner`'s finalize CAS
-    /// (`Store::finalize_version`, fenced only by `status = 'pending'`, not
-    /// by lease ownership) can lose for two genuinely different reasons
-    /// that a blanket hard error used to conflate:
+    /// `assemble_and_finish_inner`'s finalize CAS (`Store::finalize_version`,
+    /// fenced only by `status = 'pending'`, not by lease ownership) can lose
+    /// for two genuinely different reasons that a blanket hard error would
+    /// wrongly conflate:
     ///
     /// (a) A stale, lease-expired completer that was taken over by another
     /// caller can still reach this point and lose the race to that other
     /// caller's own finalize -- the version is already `available`
     /// (possibly bound), finalized *correctly*, just not by this call.
-    /// Erroring here (the pre-fix behavior) made this caller's own
-    /// `finish_session` fail too (its expected `completing` state can have
+    /// Erroring unconditionally here would fail this caller's own
+    /// `finish_session` too (its expected `completing` state can have
     /// already moved on), and if the *other* completer's redundant loss
     /// happened to reach its own error-recovery
     /// `release_multipart_complete_lease` first, the session could be
-    /// knocked back to `in_progress` and left stranded there indefinitely
-    /// -- see `docs/analysis/DB_BEHAVIOR_AUDIT.md` FS-02 for the full
-    /// mechanism this was reproducing (and its real-PostgreSQL repro,
+    /// knocked back to `in_progress` and left stranded there indefinitely.
+    /// See its real-PostgreSQL repro,
     /// `tests/pg_concurrency_test.rs::
-    /// f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`).
+    /// f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`,
+    /// for the full interleaving.
     ///
     /// (b) The pending version row genuinely disappeared (a concurrent
     /// abort or cleanup sweep) -- there is nothing to converge to, and this
@@ -1562,8 +1484,6 @@ impl MultipartService {
 
     /// Terminal `completing → completed` transition, persisting the response
     /// snapshot + the main audit row in one fast transaction.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     async fn finish_session(
         &self,
         ctx: &SecurityContext,
@@ -1616,8 +1536,6 @@ impl MultipartService {
     /// the caller *resume* an upload (it hands out live upload URLs), so it
     /// is gated the same as initiate/complete/abort rather than opened to a
     /// read-capable-but-not-write principal.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     #[tracing::instrument(skip_all)]
     pub async fn introspect_multipart_upload(
         &self,
@@ -1625,16 +1543,13 @@ impl MultipartService {
         file_id: Uuid,
         upload_id: Uuid,
     ) -> Result<MultipartUploadStatus, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-authz
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-authz
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-session
         let session = self
             .store
             .get_multipart_upload(upload_id)
@@ -1647,14 +1562,9 @@ impl MultipartService {
         if session.file_id != file_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-session
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-parts
         let parts = self.store.list_multipart_parts(upload_id).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-parts
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-diff
         let missing_numbers = missing_part_numbers(&session, &parts);
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-diff
 
         let now = OffsetDateTime::now_utc();
         let can_resume =
@@ -1672,13 +1582,12 @@ impl MultipartService {
 
         // Resume tokens get the same short URL TTL as any freshly-minted
         // part URL, capped so they never outlive the session -- NOT the
-        // session's own (long-lived, `multipart_session_ttl_secs`) expiry.
-        // The session may legitimately outlive any one URL's TTL (that is
-        // the whole point of resume/introspect); minting a resume URL with
-        // `exp = session.expires_at` would let an early resume URL stay
-        // valid for the session's full lifetime (e.g. ~24h), defeating the
-        // short-URL-TTL design (DESIGN §4.5). So: `exp = min(session
-        // expiry, now + url_ttl_secs)`.
+        // session's own (long-lived, `multipart_session_ttl_secs`) expiry
+        // (see `session_ttl_secs`'s field doc for why the two differ).
+        // Minting a resume URL with `exp = session.expires_at` would let an
+        // early resume URL stay valid for the session's full lifetime (e.g.
+        // ~24h), defeating the short-URL-TTL design (DESIGN §4.5). So:
+        // `exp = min(session expiry, now + url_ttl_secs)`.
         let url_ttl_cap = now + time::Duration::seconds(self.url_ttl_secs.max(1));
         let exp = session.expires_at.min(url_ttl_cap).unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
@@ -1686,11 +1595,8 @@ impl MultipartService {
 
         let mut missing = Vec::with_capacity(missing_numbers.len());
         for part_number in missing_numbers {
-            // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-recompute-bounds
             let (offset, size) = part_bounds(&session, part_number);
-            // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-recompute-bounds
             let upload_url = if can_resume {
-                // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-mint-urls
                 Some(self.mint_part_url(
                     file_id,
                     session.version_id,
@@ -1705,11 +1611,8 @@ impl MultipartService {
                     &request_id,
                     now,
                 )?)
-                // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-mint-urls
             } else {
-                // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-no-urls
                 None
-                // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-no-urls
             };
             missing.push(MissingPart {
                 part_number,
@@ -1730,7 +1633,6 @@ impl MultipartService {
 
         self.metrics
             .record_operation("introspect_multipart_upload", "ok");
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-return
         Ok(MultipartUploadStatus {
             upload_id,
             version_id: session.version_id,
@@ -1743,13 +1645,9 @@ impl MultipartService {
             received,
             missing,
         })
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-return
     }
 
     /// `DELETE /files/{id}/multipart/{upload_id}`: abort a multipart upload.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub async fn abort_multipart_upload(
         &self,
         ctx: &SecurityContext,
@@ -1769,11 +1667,8 @@ impl MultipartService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
+        // Bind the session to the authorized path `file_id` -- same masking
+        // guard `complete_multipart_upload` uses (see its own comment for why).
         if session.file_id != file_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
@@ -1796,7 +1691,6 @@ impl MultipartService {
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -1804,15 +1698,13 @@ impl MultipartService {
             serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
         );
 
-        // CAS-first (P2 abort-cas-first remediation): win the DB transition
-        // `in_progress -> aborted` BEFORE ever touching the backend handle.
-        // Previously the backend's `abort_multipart` ran first (destroying
-        // the handle a concurrent `complete_multipart_upload` might already
-        // be assembling from) and only then raced its own CAS against that
-        // same completer -- backwards, and exactly the bug the cleanup
+        // CAS-first: win the DB transition `in_progress -> aborted` BEFORE
+        // ever touching the backend handle. Destroying the backend handle
+        // first would race a concurrent `complete_multipart_upload` that may
+        // already be assembling from it -- this order mirrors the cleanup
         // sweep's `CleanupEngine::abort_expired_multipart_session` (see its
-        // doc comment in `cleanup.rs`) does NOT have: that path has always
-        // been CAS-first. This mirrors it.
+        // doc comment in `cleanup.rs`), which needs the same CAS-first
+        // guarantee for the same reason.
         let aborted = self.store.abort_multipart_upload(upload_id, audit).await?;
         if !aborted {
             // A concurrent complete/abort transitioned the session out of
@@ -1829,18 +1721,12 @@ impl MultipartService {
             ));
         }
 
-        // Best-effort backend cleanup, now that the CAS has won. Contract
-        // change from the pre-remediation behavior: a backend
-        // `abort_multipart` failure used to be returned to the caller
-        // (`?` above) -- and since it ran before the CAS, the session was
-        // then left `in_progress`, so the client's retry re-entered this
-        // same method and could try again cleanly. Now the DB-side abort is
-        // already committed and irreversible by the time we get here: a
-        // client retry would just re-hit `multipart_upload_not_in_progress`
-        // (the session is no longer `in_progress`) -- actively misleading
-        // for an abort that in fact already succeeded. So a backend failure
-        // here is logged and counted instead of propagated; the backend is
-        // left holding an orphaned upload handle for its own
+        // Best-effort backend cleanup, now that the CAS has won: the DB-side
+        // abort is already committed and irreversible here, so propagating a
+        // backend failure to the caller would be misleading -- a retry would
+        // just re-hit `multipart_upload_not_in_progress`, for an abort that
+        // in fact already succeeded. Log and count it instead; the backend
+        // is left holding an orphaned upload handle for its own
         // garbage-collection/expiry to reclaim, same as it would for any
         // other abandoned multipart upload the backend never hears about.
         if let Err(err) = backend

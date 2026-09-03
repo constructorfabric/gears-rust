@@ -11,8 +11,6 @@
 //!
 //! `version_id` was already present in the P2-initial migration
 //! (`m20260701_000001_p2_initial`).
-//!
-//! @cpt-cf-file-storage-fr-multipart-upload
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

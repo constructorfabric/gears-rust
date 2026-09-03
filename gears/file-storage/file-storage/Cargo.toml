@@ -143,3 +143,8 @@ regex = { workspace = true }
 # dependencies (root Cargo.toml), used here as test-only dev-dependencies.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# Database image + tag come from one place workspace-wide (docs/TESTING.md 4.4,
+# enforced by `cargo xtask check-test-container-pins`): constructing
+# `Postgres::default()` directly would take the tag from `testcontainers-modules`
+# and re-introduce the transitive pin this crate exists to remove.
+test-containers = { workspace = true }

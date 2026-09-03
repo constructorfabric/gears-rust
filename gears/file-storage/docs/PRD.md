@@ -960,7 +960,7 @@ system **MUST**:
 - Support `If-Match` on reads — return `400 failed_precondition` when the ETag does not match
 - Require `If-Match` on every content **bind** (the optimistic CAS that swaps `content_id`) and on `DELETE` —
   `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload.
-  *Amendment (upload-flow redesign):* the bind may also execute **inside** the upload itself (`bind: "auto"`, the
+  The bind may also execute **inside** the upload itself (`bind: "auto"`, the
   default on `POST /files`) — the CAS requirement is unchanged, only the transport differs: multipart `complete`
   reuses its own `If-Match` (absent → the first-content `content_id IS NULL` case) as the embedded bind's
   precondition, and the single-part finalize binds strictly under `content_id IS NULL` (first content of a new file

@@ -6,7 +6,7 @@
 //! constraints (size / hash), and streams content to/from a storage backend.
 //! Clients never address a backend directly — the signed URL always points here.
 //!
-//! Configuration (env, P1 static):
+//! Configuration (env):
 //!   - `FS_SIDECAR_ADDR`         — bind address (default `0.0.0.0:8087`)
 //!   - `FS_SIDECAR_PUBLIC_KEY`   — base64url Ed25519 public key (from control)
 //!   - `FS_SIDECAR_BACKEND_ROOT` — local-fs backend root (default `./.file-storage-data`)
@@ -21,15 +21,14 @@
 //!     sidecar→control-plane finalize/report-part callbacks (default `10`).
 //!   - `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` — connect timeout (seconds) for the
 //!     same callbacks (default `5`). Together these bound how long a client's upload
-//!     request can be held open by an unreachable or hung control plane (P2 1.5).
-//!   - `FS_SIDECAR_INTERNAL_TOKEN` — optional interim gear-local shared secret (P2
-//!     0.1 remaining) sent as the `x-fs-internal-token` header on BOTH the finalize
-//!     and report-part control-plane callbacks. Unset/empty = the header is not
-//!     sent, which is exactly what a control plane with
-//!     `FileStorageConfig::finalize_internal_secret` unset expects. Must match the
-//!     control plane's configured secret once it flips
-//!     `require_finalize_internal_secret` on (see the migration-path note in
-//!     `docs/ADR/0003-…-sidecar-data-plane.md`).
+//!     request can be held open by an unreachable or hung control plane.
+//!   - `FS_SIDECAR_INTERNAL_TOKEN` — optional gear-local shared secret sent as the
+//!     `x-fs-internal-token` header on BOTH the finalize and report-part
+//!     control-plane callbacks. Unset/empty = the header is not sent, which is
+//!     exactly what a control plane with `FileStorageConfig::finalize_internal_secret`
+//!     unset expects. Must match the control plane's configured secret once it
+//!     flips `require_finalize_internal_secret` on (see the migration-path note
+//!     in `docs/ADR/0003-…-sidecar-data-plane.md`).
 //!   - `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- caps how many
 //!     `upload_multipart_part` requests against a `multipart_native` backend
 //!     (e.g. `S3Backend`) this sidecar processes at once (default `2`; must
@@ -37,8 +36,7 @@
 //!     rejecting every part upload). Each such request buffers up to one
 //!     whole part (`write_multipart_part_native`, bounded by `MAX_PART_SIZE`,
 //!     currently 5 GiB, the same as `DEFAULT_MAX_BODY_BYTES`) in memory
-//!     before writing it -- a deliberate tradeoff documented at that
-//!     function's call site, since S3's `UploadPart` needs the whole part up
+//!     before writing it, since S3's `UploadPart` needs the whole part up
 //!     front to sign and send. Without a cap on concurrent in-flight part
 //!     uploads, N simultaneous large parts from ordinary authorized traffic
 //!     (not an attack) can OOM the sidecar process; this bounds worst-case
@@ -53,49 +51,39 @@
 //!     `PART_UPLOAD_ACQUIRE_TIMEOUT` (200ms) gets `503` with `Retry-After`
 //!     rather than queuing indefinitely -- see `upload_multipart_part`'s doc
 //!     comment.
-//!   - `FS_SIDECAR_S3_BACKENDS` — P2 1.7.3 config wiring: an optional JSON array of
+//!   - `FS_SIDECAR_S3_BACKENDS` — an optional JSON array of
 //!     `file_storage::config::S3BackendConfig` entries, e.g. a single entry
 //!     `{"id":"s3-primary","endpoint":"http://127.0.0.1:9000","region":"us-east-1",
 //!     "bucket":"my-bucket","access_key_id":"...","secret_access_key":"...","path_style":true}`
-//!     wrapped in a JSON array.
-//!     Unset or empty = no S3 backends. Credentials embedded in this env var are
-//!     acceptable for the sidecar (it is the one component authorized to hold them,
-//!     per ADR-0003's sidecar/control-plane split) but in production this JSON blob
-//!     should be sourced from a secrets manager / mounted file, not a plain process
-//!     env var, where the deployment platform supports it. Each entry is
-//!     validated at startup (a bad endpoint or missing credentials fails the sidecar
-//!     fast) and, alongside the always-present `local-fs` backend, is folded into a
-//!     `BackendRegistry` (`cpt-cf-file-storage` P2 1.7.2 / Stage 5): every request
-//!     resolves its backend per request from the verified token's
-//!     `claims.backend_id`, so a control-plane-registered `S3Backend` is reachable
-//!     by real traffic.
+//!     wrapped in a JSON array. Unset or empty = no S3 backends. Credentials
+//!     embedded in this env var are acceptable for the sidecar (it is the one
+//!     component authorized to hold them, per ADR-0003's sidecar/control-plane
+//!     split) but in production this JSON blob should be sourced from a
+//!     secrets manager / mounted file where the deployment platform supports
+//!     it. Each entry is validated at startup (a bad endpoint or missing
+//!     credentials fails the sidecar fast) and, alongside the always-present
+//!     `local-fs` backend, is folded into a `BackendRegistry`: every request
+//!     resolves its backend from the verified token's `claims.backend_id`.
 //!
 //! ## Upload lifecycle
 //!
 //! After a successful single-part `PUT`, the sidecar:
 //! 1. Publishes the blob to the backend, **create-exclusive**
-//!    (`StorageBackend::publish_exclusive`, P2 remediation): a fresh
-//!    `backend_path` (a new version's canonical, never-before-used path)
-//!    always lands; a second `PUT` to a path that already holds a published
-//!    blob never overwrites it — closing a `PUT`-token-replay integrity gap
-//!    (a signed upload token's signature never covers the body bytes and
-//!    remains valid until `exp`, so without this guard a replay within the
-//!    TTL could silently swap out already-served content).
+//!    (`StorageBackend::publish_exclusive`): a fresh `backend_path` (a new
+//!    version's canonical, never-before-used path) always lands; a second
+//!    `PUT` to a path that already holds a published blob never overwrites
+//!    it — closing a `PUT`-token-replay integrity gap (a signed upload
+//!    token's signature never covers the body bytes and remains valid until
+//!    `exp`, so without this guard a replay within the TTL could silently
+//!    swap out already-served content).
 //! 2. Posts a finalize callback to the control plane:
 //!    `POST {control_url}/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize`
 //!    carrying the signed upload token + the measured size+hash.
-//! 3. Returns `200 OK` to the client only when the callback succeeds.
-//!    A failed callback returns `502 Bad Gateway` and the client should
-//!    retry — safe because step 1 is idempotent, not because it is
-//!    overwrite-safe: if the earlier attempt's publish already landed but
-//!    its finalize call never did (version still `pending`), the retry's
-//!    publish is rejected (already-exclusive) but its finalize attempt still
-//!    runs and, once the control plane accepts it, converges the retry to
-//!    `200` without ever re-touching the backend object. If step 1 is
-//!    instead rejected because the version was already finalized (a genuine
-//!    replay, not a retry) the client gets `409 Conflict` and the live blob
-//!    is left untouched — see `upload`'s own doc comment for the exact
-//!    decision table.
+//! 3. Returns `200 OK` to the client only when the callback succeeds. A
+//!    failed callback returns `502 Bad Gateway` and the client should retry
+//!    — safe because step 1 is idempotent, never overwriting an
+//!    already-published blob — see `upload`'s own doc comment for the exact
+//!    retry/replay decision table.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -134,24 +122,21 @@ struct SidecarState {
     verifier: Arc<Verifier>,
     /// Backends this sidecar can dispatch to, keyed by id. The backend used
     /// for a given request is resolved *per request* from the verified
-    /// token's `claims.backend_id` (Stage 5 / P2 1.7.2) — never a single
-    /// hardcoded backend.
+    /// token's `claims.backend_id` — never a single hardcoded backend.
     backends: BackendRegistry,
     /// Base URL of the control plane, e.g. `http://localhost:8080`.
     /// Empty string = finalize callback disabled (dev/no-control-plane mode).
     control_base_url: String,
-    /// Interim gear-local shared secret (P2 0.1 remaining, `FS_SIDECAR_INTERNAL_TOKEN`)
-    /// sent as `x-fs-internal-token` on the finalize/report-part callbacks. `None` =
+    /// Gear-local shared secret (`FS_SIDECAR_INTERNAL_TOKEN`) sent as
+    /// `x-fs-internal-token` on the finalize/report-part callbacks. `None` =
     /// header not sent (matches a control plane with the check disabled).
     internal_token: Option<String>,
     http: reqwest::Client,
-    /// Metrics port (P2 1.8 remediation) — ingress/egress bytes and
-    /// route/method/status/latency for the sidecar's own HTTP routes. The
-    /// control-plane's routes are already covered by the platform's
-    /// api-gateway `http.server.request.duration` middleware; this process is
-    /// never proxied by it, so it owns its own `OTel` `Meter` instance (see the
-    /// module note on `FileStorageMetricsMeter` re: exporter wiring being out
-    /// of scope here).
+    /// Ingress/egress bytes and route/method/status/latency for the
+    /// sidecar's own HTTP routes. The control plane's routes are already
+    /// covered by the platform's api-gateway `http.server.request.duration`
+    /// middleware; this process is never proxied by it, so it owns its own
+    /// `OTel` `Meter` instance.
     metrics: Arc<dyn FileStorageMetricsPort>,
     /// Concurrency limiter for `upload_multipart_part` requests that take the
     /// `multipart_native` write path, sized by
@@ -179,25 +164,9 @@ struct TokenQuery {
 /// this constant only bounds axum's blanket request-body floor (2 MiB default).
 const DEFAULT_MAX_BODY_BYTES: usize = 5_368_709_120;
 
-/// Default value for `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`.
-///
-/// Worst-case buffered memory from this limiter's guarded path
-/// (`write_multipart_part_native`, the only one it gates -- see
-/// `write_multipart_part`'s doc comment) is exactly
-/// `max_concurrent_part_uploads * MAX_PART_SIZE`. `MAX_PART_SIZE` is
-/// currently 5 GiB (`domain::multipart::MAX_PART_SIZE`), so at this default
-/// of `2` the sidecar can buffer up to `2 * 5 GiB = 10 GiB` at once purely
-/// from this path. The previous default of `4` (`4 * 5 GiB = 20 GiB`) made
-/// the "cap" a poor description of what it actually bounded; `2` still lets
-/// two large native-multipart parts land in parallel -- plenty of
-/// concurrency for a single sidecar instance under typical multipart upload
-/// fan-out (control-plane-level parallelism across sidecar replicas is
-/// unaffected by this per-process cap) -- while halving the worst case an
-/// operator has to provision memory against. Raising this value is a direct,
-/// linear tradeoff against available memory: an operator overriding it via
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` should redo this multiplication
-/// against their own deployment's memory budget, not just pick a bigger
-/// number for more throughput.
+/// Default value for `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- see the
+/// module doc comment for the worst-case-memory arithmetic this default is
+/// chosen against.
 const DEFAULT_MAX_CONCURRENT_PART_UPLOADS: usize = 2;
 
 /// Parse an optional environment variable's raw value (already fetched by
@@ -205,10 +174,9 @@ const DEFAULT_MAX_CONCURRENT_PART_UPLOADS: usize = 2;
 /// touching real process env) as `T`, falling back to `default` when unset
 /// (`raw.is_none()`) — but failing fast when a value WAS supplied and
 /// doesn't parse, mirroring `FS_SIDECAR_PUBLIC_KEY`'s "set but invalid ->
-/// hard error at startup" treatment below. Silently swallowing a parse
-/// failure into the default (the previous `.ok().unwrap_or(default)`
-/// pattern) turns a typo like `FS_SIDECAR_MAX_BODY_BYTES=5GB` into a quiet,
-/// hard-to-notice fallback to the default instead of a loud misconfiguration.
+/// hard error at startup" treatment below. A silently swallowed parse
+/// failure would turn a typo like `FS_SIDECAR_MAX_BODY_BYTES=5GB` into a
+/// quiet fallback to the default instead of a loud misconfiguration.
 fn parse_optional<T>(name: &str, raw: Option<String>, default: T) -> anyhow::Result<T>
 where
     T: std::str::FromStr,
@@ -257,27 +225,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(control_base_url = %control_base_url, "sidecar finalize callback enabled");
     }
 
-    // `FS_SIDECAR_MAX_BODY_BYTES` — raises axum's blanket 2 MiB request-body floor.
-    // The real per-request ceiling is still enforced by the signed token's
-    // `claims.upload.max_size`/`exact_size` inside the handlers; this value only
-    // needs to be large enough that no policy-permitted upload ever hits it.
+    // Raises axum's blanket 2 MiB request-body floor. The real per-request
+    // ceiling is still enforced by the signed token's
+    // `claims.upload.max_size`/`exact_size` inside the handlers; this value
+    // only needs to be large enough that no policy-permitted upload hits it.
     let max_body_bytes: usize =
         parse_env_or_default("FS_SIDECAR_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)?;
 
-    // `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` / `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`
-    // bound how long the sidecar will wait on the control-plane finalize/report-part
-    // callbacks (P2 1.5) — without these, a hung or unreachable control plane could
-    // block the client's upload request indefinitely.
+    // Bound how long the sidecar will wait on the control-plane
+    // finalize/report-part callbacks — without these, a hung or unreachable
+    // control plane could block the client's upload request indefinitely.
     let finalize_timeout_secs: u64 = parse_env_or_default("FS_SIDECAR_FINALIZE_TIMEOUT_SECS", 10)?;
     let finalize_connect_timeout_secs: u64 =
         parse_env_or_default("FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS", 5)?;
 
-    // `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- see the module
-    // doc comment and `DEFAULT_MAX_CONCURRENT_PART_UPLOADS` for the
-    // memory-DoS rationale and the worst-case-memory arithmetic. `0` is
-    // rejected explicitly below: `Semaphore::new(0)` would not panic, but it
-    // would silently turn every `multipart_native` part-upload request into
-    // an unconditional `503` -- a configuration mistake, not a legitimate
+    // See the module doc comment and `DEFAULT_MAX_CONCURRENT_PART_UPLOADS` for
+    // the memory rationale and worst-case arithmetic. `0` is rejected
+    // explicitly below: `Semaphore::new(0)` would not panic, but it would
+    // silently turn every `multipart_native` part-upload request into an
+    // unconditional `503` -- a configuration mistake, not a legitimate
     // "disable part uploads" knob, so it must fail sidecar startup instead of
     // failing quietly at request time.
     let max_concurrent_part_uploads: usize = parse_env_or_default(
@@ -297,8 +263,8 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("reqwest client: {e}"))?;
 
-    // `FS_SIDECAR_INTERNAL_TOKEN` (P2 0.1 remaining) — attached as
-    // `x-fs-internal-token` on both callbacks below. Unset/empty = not sent.
+    // Attached as `x-fs-internal-token` on both callbacks below. Unset/empty
+    // = not sent.
     let internal_token = std::env::var("FS_SIDECAR_INTERNAL_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
@@ -309,13 +275,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // `FS_SIDECAR_S3_BACKENDS` (P2 1.7.3 config wiring) — a JSON array of
-    // `S3BackendConfig` entries. Parsed and eagerly constructed here (so a
-    // misconfigured entry, e.g. a bad endpoint URL or missing credentials
-    // with no env fallback, fails sidecar startup fast). Folded into the
-    // `BackendRegistry` below alongside `local-fs`, so entries here are
-    // reachable by traffic via `claims.backend_id` dispatch (Stage 5 / P2
-    // 1.7.2).
+    // A JSON array of `S3BackendConfig` entries. Parsed and eagerly
+    // constructed here (so a misconfigured entry, e.g. a bad endpoint URL or
+    // missing credentials with no env fallback, fails sidecar startup fast).
+    // Folded into the `BackendRegistry` below alongside `local-fs`, so
+    // entries here are reachable by traffic via `claims.backend_id` dispatch.
     let s3_backends: Vec<Arc<dyn StorageBackend>> = match std::env::var("FS_SIDECAR_S3_BACKENDS") {
         Ok(json) if !json.trim().is_empty() => {
             let entries: Vec<file_storage::config::S3BackendConfig> =
@@ -345,9 +309,9 @@ async fn main() -> anyhow::Result<()> {
     let backends = BackendRegistry::new(backend_list, LOCAL_FS_ID)
         .map_err(|e| anyhow::anyhow!("failed to build sidecar backend registry: {e}"))?;
 
-    // P2 1.8 remediation: the sidecar is its own OS process, so it owns its
-    // own OTel `Meter` — mirrors the control plane's `meter_with_scope` call
-    // in `gear.rs`, scoped under the sidecar's own instrumentation name.
+    // The sidecar is its own OS process, so it owns its own OTel `Meter` —
+    // mirrors the control plane's `meter_with_scope` call in `gear.rs`,
+    // scoped under the sidecar's own instrumentation name.
     let metrics_scope =
         opentelemetry::InstrumentationScope::builder("file-storage-sidecar".to_owned()).build();
     let metrics: Arc<dyn FileStorageMetricsPort> = Arc::new(FileStorageMetricsMeter::new(
@@ -365,9 +329,8 @@ async fn main() -> anyhow::Result<()> {
         internal_token,
         http,
         metrics,
-        // The part-upload concurrency limiter lives on `SidecarState`
-        // itself (see that field's doc comment for why), built here from the
-        // fail-fast-parsed `max_concurrent_part_uploads` above.
+        // See `SidecarState::part_upload_semaphore`'s doc comment for why it
+        // lives here rather than as a process-wide static.
         part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_part_uploads)),
     };
 
@@ -402,9 +365,9 @@ fn build_router(state: SidecarState, max_body_bytes: usize) -> Router {
             "/api/file-storage-data/v1/download/{file_id}/{version_id}",
             get(download).head(download_head),
         )
-        // Server-authoritative multipart part upload (multipart-coordinator feature).
-        // The control plane mints a `multipart_part` token for each part; the
-        // sidecar verifies and enforces the exact `size` claim before writing.
+        // Server-authoritative multipart part upload. The control plane
+        // mints a `multipart_part` token for each part; the sidecar verifies
+        // and enforces the exact `size` claim before writing.
         .route(
             "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/{part_number}",
             put(upload_multipart_part),
@@ -412,13 +375,13 @@ fn build_router(state: SidecarState, max_body_bytes: usize) -> Router {
         // Liveness probe: always 200 once the process is up and the router is
         // wired. No backend/dependency check — see `readyz` below for that.
         .route("/healthz", get(healthz))
-        // Readiness probe (P2 1.6): reflects real backend availability (e.g.
-        // an unmounted local-fs root or an unreachable S3 endpoint) — see
+        // Readiness probe: reflects real backend availability (e.g. an
+        // unmounted local-fs root or an unreachable S3 endpoint) — see
         // `readyz`'s doc comment.
         .route("/readyz", get(readyz))
-        // P2 1.8 remediation: route-level latency + status. Bound to its own
-        // state clone (not the shared router state) via `from_fn_with_state`
-        // so it wraps every route above regardless of extractor ordering.
+        // Route-level latency + status. Bound to its own state clone (not
+        // the shared router state) via `from_fn_with_state` so it wraps every
+        // route above regardless of extractor ordering.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             record_request_metrics,
@@ -429,10 +392,9 @@ fn build_router(state: SidecarState, max_body_bytes: usize) -> Router {
 
 /// Records one `file_storage_sidecar_request_duration_ms` observation per
 /// request: route (from [`MatchedPath`], falling back to `"unmatched"` so
-/// cardinality stays bounded), method, status, and latency (P2 1.8
-/// remediation — the control plane's routes already get an equivalent metric
-/// for free from the platform's api-gateway; this process is never proxied by
-/// it).
+/// cardinality stays bounded), method, status, and latency. The control
+/// plane's routes already get an equivalent metric for free from the
+/// platform's api-gateway; this process is never proxied by it.
 async fn record_request_metrics(
     State(state): State<SidecarState>,
     matched_path: Option<MatchedPath>,
@@ -466,15 +428,13 @@ async fn healthz() -> &'static str {
 /// (~10s default).
 const READYZ_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Readiness probe handler (P2 1.6). Polls every configured backend's
+/// Readiness probe handler. Polls every configured backend's
 /// [`StorageBackend::is_ready`] concurrently, each bounded by
 /// `READYZ_PROBE_TIMEOUT`. Returns `200 "ready"` only when every backend
 /// answers `Ok` within the timeout; otherwise `503`, naming only the failing
 /// backend ids in the body (e.g. `"not ready: s3-primary"`) — never the
 /// underlying error text, so a probe response can never leak backend
-/// internals (transport details, credentials-adjacent error strings, etc.),
-/// matching P2 1.11's no-leak stance for the sidecar's other user-facing
-/// responses.
+/// internals (transport details, credentials-adjacent error strings, etc.).
 async fn readyz(State(state): State<SidecarState>) -> Response {
     let checks = state.backends.iter().map(|(id, backend)| {
         let id = id.to_owned();
@@ -519,17 +479,17 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
 
 /// `PUT` upload: verify token (op=PUT), stream bytes straight to the backend.
 ///
-/// P2 1.2b (memory-DoS fix): the body is never buffered whole in this
-/// handler — it is converted to a byte stream and handed to
-/// `StorageBackend::publish_exclusive`, which writes + hashes chunks as they
-/// arrive and aborts mid-stream the moment `claims.upload.max_size` is
-/// exceeded. `exact_size`/`expected_hash` can only be checked once the
-/// stream is fully drained (the incremental length/hash are only final at
-/// that point), so those checks now run *after* `publish_exclusive` returns.
+/// The body is never buffered whole in this handler — it is converted to a
+/// byte stream and handed to `StorageBackend::publish_exclusive`, which
+/// writes + hashes chunks as they arrive and aborts mid-stream the moment
+/// `claims.upload.max_size` is exceeded. `exact_size`/`expected_hash` can
+/// only be checked once the stream is fully drained (the incremental
+/// length/hash are only final at that point), so those checks run *after*
+/// `publish_exclusive` returns.
 ///
-/// P2 remediation (replay-`PUT` overwrite fix): `publish_exclusive` reports
-/// `created: false` instead of overwriting when `claims.backend_path` already
-/// holds a blob. This handler's response for that case is:
+/// `publish_exclusive` reports `created: false` instead of overwriting when
+/// `claims.backend_path` already holds a blob. This handler's response for
+/// that case is:
 /// * finalize succeeds (the earlier publish landed but finalize never ran,
 ///   and this attempt's measured bytes match what's already stored) → `200`,
 ///   a benign retry has converged;
@@ -583,9 +543,7 @@ async fn upload(
     {
         Ok(v) => v,
         // `publish_exclusive`'s only `Validation` error is the mid-stream
-        // `max_size` guard (see `StorageBackend::publish_exclusive`'s
-        // default/`LocalFsBackend` implementations) — every other failure is
-        // a genuine backend error.
+        // `max_size` guard — every other failure is a genuine backend error.
         Err(DomainError::Validation { .. }) => {
             return (StatusCode::PAYLOAD_TOO_LARGE, "exceeds max_size").into_response();
         }
@@ -627,16 +585,16 @@ async fn upload(
     let size = i64::try_from(bytes_written).unwrap_or(i64::MAX);
     let hash_hex = hex::encode(digest);
 
-    // P2 1.8 remediation: ingress bytes (sidecar is the only component that
-    // ever sees content bytes, so this is the sole place to record them).
+    // The sidecar is the only component that ever sees content bytes, so
+    // this is the sole place to record ingress.
     #[allow(clippy::cast_precision_loss)]
     state.metrics.record_ingress_bytes(bytes_written as f64);
 
     // Finalize callback: notify the control plane that bytes have landed so it
     // can mark the version `available`. The same signed token proves this was
-    // a pre-authorized upload (DESIGN §bind-service). `claims.request_id`
-    // (P2 1.8) is echoed back as `x-request-id` so both planes' logs for this
-    // upload can be correlated.
+    // a pre-authorized upload (DESIGN §bind-service). `claims.request_id` is
+    // echoed back as `x-request-id` so both planes' logs for this upload can
+    // be correlated.
     let finalize_result = finalize_with_control_plane(
         &state,
         &token,
@@ -649,48 +607,36 @@ async fn upload(
     .await;
 
     if !created {
-        // Immutability guard (P2 remediation — replay-`PUT` overwrite fix):
-        // `publish_exclusive` refused to write because `claims.backend_path`
-        // already held a blob — either an earlier successful PUT for this
-        // same upload (finalize may or may not have run yet), or a
-        // PUT-token replay after the version was already finalized/bound.
-        // The live bytes on the backend were NOT touched either way. The
-        // finalize call above was still attempted with *this* attempt's
-        // measured size/hash: if the earlier publish landed but finalize
-        // never ran, this is a benign retry and finalize's own
-        // read-back-and-compare converges it to success without ever
-        // re-touching the backend object; any other outcome (finalize
-        // already ran, a transport failure, or no control plane configured)
-        // is reported as `409` rather than `502` — see `upload`'s doc
-        // comment for the full decision table.
+        // Immutability guard: `publish_exclusive` refused to write because
+        // `claims.backend_path` already held a blob — either an earlier
+        // successful PUT for this same upload (finalize may or may not have
+        // run yet), or a PUT-token replay after the version was already
+        // finalized/bound. The live bytes on the backend were NOT touched
+        // either way. The finalize call above was still attempted with
+        // *this* attempt's measured size/hash: if the earlier publish
+        // landed but finalize never ran, this is a benign retry and
+        // finalize's own read-back-and-compare converges it to success
+        // without ever re-touching the backend object; any other outcome
+        // (finalize already ran, a transport failure, or no control plane
+        // configured) is reported as `409` rather than `502` — see
+        // `upload`'s doc comment for the full decision table.
         //
         // Why reporting *this* attempt's digest here cannot poison metadata:
         // finalize never trusts the size/hash the sidecar reports, in this
         // `!created` case or any other. `finalize_upload_by_token`
         // (`domain/service/write.rs`) independently re-reads the actual
         // stored blob at `version.backend_path` and recomputes both size and
-        // hash from those bytes (`read_back_and_hash_streaming`,
-        // `write.rs:757`), then rejects the request if that recomputed pair
-        // doesn't match what was reported (`write.rs`'s `actual_size !=
-        // size` / `actual_hash != hash_value` checks, immediately after the
-        // read-back). So there are exactly two possible outcomes here, and
-        // both are safe:
-        //   - this retry's bytes are identical to what's already published
-        //     (the common case: same client resending the same body) — the
-        //     reported digest matches the read-back digest, finalize
-        //     succeeds, and metadata reflects the one real object on disk;
-        //   - this retry's bytes differ from what's already published (an
-        //     adversarial or corrupted replay) — the reported digest does
-        //     NOT match the read-back digest of the *actual*, untouched
-        //     object, so finalize's own re-verification rejects it and the
-        //     version is never marked `available` from this call. The
-        //     version simply stays whatever it already was (`pending` or
-        //     `available` from the original successful publish); this
-        //     attempt cannot make it `available` with mismatched metadata.
-        // In neither case does the sidecar's self-reported digest get
-        // persisted unverified — `publish_exclusive` returning
-        // `created: false` only ever changes what gets *asserted* to
-        // finalize, never what finalize actually *trusts*.
+        // hash from those bytes, then rejects the request if that recomputed
+        // pair doesn't match what was reported. So there are exactly two
+        // possible outcomes here, and both are safe: this retry's bytes are
+        // identical to what's already published (the common case) and
+        // finalize succeeds against the one real object on disk; or this
+        // retry's bytes differ (an adversarial or corrupted replay) and
+        // finalize's re-verification rejects it, leaving the version exactly
+        // as it already was. In neither case does the sidecar's
+        // self-reported digest get persisted unverified — `created: false`
+        // only ever changes what gets *asserted* to finalize, never what
+        // finalize actually *trusts*.
         return match finalize_result {
             Err(_) => (
                 StatusCode::CONFLICT,
@@ -713,10 +659,9 @@ async fn upload(
 }
 
 /// Reject an upload whose streamed bytes failed the post-publish
-/// `exact_size`/`expected_hash` check (immutable-path-poisoning fix)
-/// with `400 Bad Request`, first cleaning up the object `publish_exclusive`
-/// just wrote **iff this request is the one that created it**
-/// (`created == true`).
+/// `exact_size`/`expected_hash` check with `400 Bad Request`, first cleaning
+/// up the object `publish_exclusive` just wrote **iff this request is the
+/// one that created it** (`created == true`).
 ///
 /// # Why the `created` gate matters
 /// `publish_exclusive` runs *before* these constraints can be checked (the
@@ -761,8 +706,8 @@ async fn reject_upload_bad_content(
 }
 
 /// Build the sidecar's `200 uploaded` response, echoing the control plane's
-/// auto-bind outcome (upload-flow redesign) as `X-FS-Bound` / `ETag` headers
-/// when the finalize response carried them.
+/// auto-bind outcome as `X-FS-Bound` / `ETag` headers when the finalize
+/// response carried them.
 fn uploaded_response(echo: &FinalizeEcho) -> Response {
     let mut resp = (StatusCode::OK, "uploaded").into_response();
     if let Some(bound) = &echo.bound
@@ -796,13 +741,12 @@ fn finalize_body(size: i64, hash_hex: &str) -> Result<Vec<u8>, Response> {
     })
 }
 
-/// Auto-bind outcome echoed by the control plane's finalize response
-/// (upload-flow redesign): the `x-fs-bound` / `etag` response headers set by
-/// `handlers::finalize_version` when the upload token carried
-/// `bind_on_finalize`. The sidecar copies them verbatim onto its own `200`
-/// `PUT` response (as `X-FS-Bound` / `ETag`) so the uploading client learns
-/// the bind outcome without any extra request. Both `None` for tokens that
-/// did not request a bind (manual mode / pre-redesign clients).
+/// Auto-bind outcome echoed by the control plane's finalize response: the
+/// `x-fs-bound` / `etag` response headers set by `handlers::finalize_version`
+/// when the upload token carried `bind_on_finalize`. The sidecar copies them
+/// verbatim onto its own `200` `PUT` response (as `X-FS-Bound` / `ETag`) so
+/// the uploading client learns the bind outcome without any extra request.
+/// Both `None` for tokens that did not request a bind (manual mode).
 #[derive(Debug, Default, Clone)]
 struct FinalizeEcho {
     bound: Option<String>,
@@ -838,15 +782,15 @@ async fn interpret_finalize_response(
         body = %body_text,
         "control-plane finalize callback returned error"
     );
-    // P2 1.11: the detailed status/body stay in the server-side log above —
-    // forwarding them to the client would leak the control plane's raw error
-    // body (which can carry internal details) to an uploading client.
+    // The detailed status/body stay in the server-side log above — forwarding
+    // them to the client would leak the control plane's raw error body
+    // (which can carry internal details) to an uploading client.
     Err((StatusCode::BAD_GATEWAY, "finalize failed").into_response())
 }
 
 /// Maximum number of attempts (including the first) for a sidecar→control-plane
-/// callback POST (finalize or report-part) — P2 1.5. Only transport-level
-/// failures (`reqwest::Error::is_connect()` / `is_timeout()`) are retried; a
+/// callback POST (finalize or report-part). Only transport-level failures
+/// (`reqwest::Error::is_connect()` / `is_timeout()`) are retried; a
 /// successful-but-error HTTP status is a real 4xx/5xx from the control plane
 /// and is returned immediately by the caller's response interpretation.
 const CALLBACK_MAX_ATTEMPTS: u32 = 3;
@@ -860,11 +804,11 @@ const CALLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// `CALLBACK_MAX_ATTEMPTS` attempts total, retrying only on a transport
 /// connect/timeout failure, with `CALLBACK_RETRY_DELAY` between attempts.
 /// Shared by `finalize_with_control_plane` and `report_part_with_control_plane`
-/// so both callbacks get the same bounded-retry behavior (P2 1.5).
+/// so both callbacks get the same bounded-retry behavior.
 ///
-/// `internal_token` (P2 0.1 remaining, `SidecarState::internal_token`) is
-/// attached as `x-fs-internal-token` when present; `None` omits the header
-/// entirely (works against a control plane with the check disabled).
+/// `internal_token` (`SidecarState::internal_token`) is attached as
+/// `x-fs-internal-token` when present; `None` omits the header entirely
+/// (works against a control plane with the check disabled).
 async fn post_with_retry(
     http: &reqwest::Client,
     url: &str,
@@ -884,14 +828,12 @@ async fn post_with_retry(
             .post(url)
             .header("content-type", "application/json")
             .header("x-fs-token", token);
-        // P2 1.8 remediation: propagate the signed URL's correlation id so the
-        // control plane's finalize/report-part log lines can be joined with
-        // this sidecar's own logs for the same upload.
+        // Propagate the signed URL's correlation id so the control plane's
+        // finalize/report-part log lines can be joined with this sidecar's
+        // own logs for the same upload.
         if !request_id.is_empty() {
             req = req.header("x-request-id", request_id);
         }
-        // P2 0.1 remaining: interim shared-secret credential, see the doc
-        // comment above.
         if let Some(internal_token) = internal_token {
             req = req.header("x-fs-internal-token", internal_token);
         }
@@ -912,8 +854,8 @@ async fn post_with_retry(
         }
     };
     // Retry only transport connect/timeout failures; a real HTTP status is
-    // returned to the caller unchanged (P2 1.5). `CALLBACK_MAX_ATTEMPTS`
-    // includes the initial attempt, so the schedule carries one fewer delay.
+    // returned to the caller unchanged. `CALLBACK_MAX_ATTEMPTS` includes the
+    // initial attempt, so the schedule carries one fewer delay.
     let retryable = |e: &reqwest::Error| e.is_connect() || e.is_timeout();
     let strategy =
         FixedInterval::new(CALLBACK_RETRY_DELAY).take((CALLBACK_MAX_ATTEMPTS - 1) as usize);
@@ -965,9 +907,9 @@ async fn finalize_with_control_plane(
                 %file_id, %version_id, error = %e,
                 "control-plane finalize callback failed"
             );
-            // P2 1.11: `e` (a `reqwest::Error`) embeds the request URL, i.e.
-            // the internal `FS_SIDECAR_CONTROL_URL` host:port — never forward
-            // it to the client. The detail is already in the log above.
+            // `e` (a `reqwest::Error`) embeds the request URL, i.e. the
+            // internal `FS_SIDECAR_CONTROL_URL` host:port — never forward it
+            // to the client. The detail is already in the log above.
             Err((StatusCode::BAD_GATEWAY, "finalize failed").into_response())
         }
     }
@@ -1008,15 +950,15 @@ async fn interpret_report_part_response(
         body = %body_text,
         "control-plane report-part callback returned error"
     );
-    // P2 1.11: same no-leak principle as `interpret_finalize_response` — the
-    // detailed status/body stay server-side only.
+    // Same no-leak principle as `interpret_finalize_response` — the detailed
+    // status/body stay server-side only.
     Err((StatusCode::BAD_GATEWAY, "report failed").into_response())
 }
 
 /// Call the control-plane report-part endpoint after a successful part write.
 ///
-/// This is the sidecar half of the "report part" callback (P2 0.2 group B):
-/// without it, nothing ever populates `multipart_upload_parts`, so
+/// This is the sidecar half of the "report part" callback: without it,
+/// nothing ever populates `multipart_upload_parts`, so
 /// `complete_multipart_upload`'s `list_multipart_parts` is structurally empty
 /// in a real deployment. Mirrors `finalize_with_control_plane`'s contract:
 /// returns `Ok(())` when the control plane accepted the report, or
@@ -1069,8 +1011,8 @@ async fn report_part_with_control_plane(
                 %file_id, %version_id, %upload_id, part_number, error = %e,
                 "control-plane report-part callback failed"
             );
-            // P2 1.11: same no-leak principle as `finalize_with_control_plane`
-            // — `e` embeds the internal control-plane URL.
+            // Same no-leak principle as `finalize_with_control_plane` — `e`
+            // embeds the internal control-plane URL.
             Err((StatusCode::BAD_GATEWAY, "report failed").into_response())
         }
     }
@@ -1080,8 +1022,7 @@ async fn report_part_with_control_plane(
 /// hash_hex)` on success or an early terminal `Response` on any client/backend
 /// error.
 ///
-/// Two write models, chosen by the backend's own capabilities (P2 1.7 Stage 6
-/// fix — see the "Before this fix" note below for why this branch exists):
+/// Two write models, chosen by the backend's own capabilities:
 /// * `multipart_native` (e.g. `S3Backend`): call the backend's own
 ///   `upload_part` against its native multipart session
 ///   (`claims.multipart.backend_handle`, minted by `initiate_multipart_upload`
@@ -1091,28 +1032,15 @@ async fn report_part_with_control_plane(
 ///   token's exact `size` claim (the same bound the non-native path enforces
 ///   via `put_stream`'s `max_size`), so this never buffers more than one
 ///   part's worth of bytes.
-/// * otherwise (e.g. `LocalFsBackend`, which has no native multipart): the
-///   original offset-object model — each part is written as its own backend
-///   object at `{backend_path}.part.{n}` via `put_stream`, and
-///   `complete_multipart_upload`'s local-fs fallback assembles them (§4
-///   "otherwise offset-write into `/{file_id}/{version_id}`").
+/// * otherwise (e.g. `LocalFsBackend`, which has no native multipart): each
+///   part is written as its own backend object at `{backend_path}.part.{n}`
+///   via `put_stream`, and `complete_multipart_upload`'s local-fs fallback
+///   assembles them.
 ///
-/// Before this fix, EVERY backend (including `multipart_native` ones) went
-/// through the offset-object path unconditionally, so a real multipart
-/// session was `initiate_multipart`'d but never actually received any
-/// `UploadPart` calls — `complete_multipart` then failed against the backend
-/// (proven by the P2 1.7 Stage 6 S3 e2e suite,
-/// `testing/e2e/suites/file_storage/lifecycle_s3/`, which is what surfaced
-/// this bug: `CompleteMultipartUpload` 500s against a real S3-compatible
-/// endpoint because none of its parts were ever uploaded).
-///
-/// `semaphore` (`SidecarState::part_upload_semaphore`) is only ever
-/// acquired around the `multipart_native` branch. Only that branch buffers a
-/// whole part in memory (`write_multipart_part_native`'s own doc comment);
-/// the offset-object branch streams straight to the backend via
-/// `put_stream`, so gating it behind the same limiter would throttle a path
-/// that never needed the protection in the first place, wasting concurrency
-/// this sidecar could otherwise offer to `LocalFsBackend`-style traffic.
+/// `semaphore` (`SidecarState::part_upload_semaphore`) is only ever acquired
+/// around the `multipart_native` branch, since only that branch buffers a
+/// whole part in memory; the offset-object branch streams straight to the
+/// backend via `put_stream` and would gain nothing from the same limiter.
 async fn write_multipart_part(
     backend: &dyn StorageBackend,
     claims: &Claims,
@@ -1122,10 +1050,8 @@ async fn write_multipart_part(
 ) -> Result<(u64, String, String), Response> {
     if backend.capabilities().multipart_native {
         // The permit is held only for the duration of the buffering write
-        // below -- see `acquire_part_upload_slot`'s call site in
-        // `upload_multipart_part` for why it used to be acquired earlier
-        // (before this fix) and why releasing it right after the write, not
-        // after the report-part callback, is correct either way.
+        // below, released right after it completes and before the
+        // report-part callback -- see `upload_multipart_part`'s doc comment.
         let permit = acquire_part_upload_slot(semaphore).await?;
         let result = write_multipart_part_native(backend, claims, part_number, body).await;
         drop(permit);
@@ -1175,7 +1101,6 @@ async fn write_multipart_part_native(
     // mismatch is an *undersized* part (client sent fewer bytes than
     // claimed) — a client error, not a body exceeding a size limit, hence
     // `400 Bad Request` rather than `413 Payload Too Large`.
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-size-enforce
     if body_len != max_size {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1183,8 +1108,6 @@ async fn write_multipart_part_native(
         )
             .into_response());
     }
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-size-enforce
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-native
     match backend
         .upload_part(
             &claims.backend_path,
@@ -1203,7 +1126,6 @@ async fn write_multipart_part_native(
             Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
         }
     }
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-native
 }
 
 /// Non-native (offset-object) backend write path — see
@@ -1214,7 +1136,6 @@ async fn write_multipart_part_offset_object(
     part_number: u32,
     body: Body,
 ) -> Result<(u64, String, String), Response> {
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-offset
     let part_path = format!("{}.part.{}", claims.backend_path, part_number);
     let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
         body.into_data_stream()
@@ -1240,7 +1161,6 @@ async fn write_multipart_part_offset_object(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response());
         }
     };
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-offset
 
     // FEATURE §4, point 2: reject if body length ≠ size claim. The
     // `max_size` guard above only rejects an *oversized* part mid-stream (via
@@ -1336,30 +1256,26 @@ async fn acquire_part_upload_slot(
 /// straight to the backend, enforce the exact `size` claim, compute and
 /// return the part hash.
 ///
-/// Concurrency limit: [`write_multipart_part`] acquires a
-/// permit from `state.part_upload_semaphore` (sized by
+/// Concurrency limit: [`write_multipart_part`] acquires a permit from
+/// `state.part_upload_semaphore` (sized by
 /// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) around its `multipart_native`
 /// branch only, held until that write completes. See
 /// [`acquire_part_upload_slot`]'s own inline comment for the
 /// try-then-bounded-wait contract, and [`part_upload_busy_response`] for the
 /// `503` a caller gets when no slot is available in time.
 ///
-/// P2 1.2b (memory-DoS fix): on the offset-object path the part body is
-/// never buffered whole here —
+/// On the offset-object path the part body is never buffered whole here —
 /// like `upload`, it streams through `StorageBackend::put_stream`, which
 /// enforces the token's declared `size` as an upper bound (`max_size`) while
 /// bytes arrive, aborting mid-stream on an oversized part instead of
 /// buffering it first. An *undersized* part can only be detected once the
 /// stream is fully drained, so the exact-length check (FEATURE §4, point 2)
-/// now runs after the write completes, comparing against the streamed
-/// `bytes_written`. The *native* multipart path is the exception and is
-/// deliberately different: S3's `UploadPart` needs the part's full length up
-/// front, so `write_multipart_part_native` does buffer one whole part in
-/// memory (see its own doc comment). That is what the permit
-/// [`write_multipart_part`] acquires bounds -- it caps how many such buffers
-/// can exist at once, since the per-part size ceiling alone does not; the
-/// offset-object branch never buffers a whole part and so never needs a
-/// permit at all.
+/// runs after the write completes, comparing against the streamed
+/// `bytes_written`. The *native* multipart path is the exception: S3's
+/// `UploadPart` needs the part's full length up front, so
+/// `write_multipart_part_native` does buffer one whole part in memory (see
+/// its own doc comment) — that is what the permit bounds, since the per-part
+/// size ceiling alone does not cap how many such buffers can exist at once.
 ///
 /// This is the sidecar half of the server-authoritative multipart model. The
 /// control plane mints the token (sole minter, ADR-0004); the sidecar only
@@ -1367,9 +1283,6 @@ async fn acquire_part_upload_slot(
 ///
 /// Idempotent per `(upload_id, part_number)`: a re-PUT with the same token
 /// overwrites the earlier part (safe for resume — ADR-0004 §4).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-dod:cpt-cf-file-storage-dod-multipart-sidecar-enforcement:p1
 async fn upload_multipart_part(
     State(state): State<SidecarState>,
     Path((file_id, version_id, part_number)): Path<(Uuid, Uuid, u32)>,
@@ -1377,26 +1290,18 @@ async fn upload_multipart_part(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-request
     let Some(token) = extract_token(&q, &headers) else {
         return (StatusCode::UNAUTHORIZED, "missing fs-token").into_response();
     };
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-request
-    // Sidecar: verify the signed token (asymmetric Ed25519; sidecar cannot mint
-    // tokens -- ADR-0004). `inst-part-token-reject` below covers the reject-on-
-    // invalid-token branch (FEATURE §2 "Upload a Part" step 3); the verify call
-    // itself is not a separately doc-declared instruction (FEATURE step 2's
-    // instruction reference is on a wrapped doc line the CDSL parser does not
-    // associate with a step, so it is intentionally left unmarked here rather
-    // than referencing an artifact-side ID that cfs cannot resolve).
+    // Sidecar: verify the signed token (asymmetric Ed25519; sidecar cannot
+    // mint tokens -- ADR-0004). `inst-part-token-reject` below covers the
+    // reject-on-invalid-token branch (FEATURE §2 "Upload a Part" step 3).
     let claims = match state
         .verifier
         .verify(&token, time::OffsetDateTime::now_utc())
     {
         Ok(c) => c,
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-token-reject
         Err(e) => return (StatusCode::FORBIDDEN, e.to_string()).into_response(),
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-token-reject
     };
 
     // Verify op and path bindings.
@@ -1432,10 +1337,9 @@ async fn upload_multipart_part(
     };
 
     // Write the part -- see `write_multipart_part`'s doc comment for the two
-    // models this dispatches between, why the branch exists at all (P2 1.7
-    // Stage 6 fix), and the concurrency-limit permit it acquires around only
-    // the `multipart_native` branch: `try_acquire_owned` is
-    // checked first so a request never even starts waiting once the
+    // models this dispatches between and the concurrency-limit permit it
+    // acquires around only the `multipart_native` branch: `try_acquire_owned`
+    // is checked first so a request never even starts waiting once the
     // semaphore is provably exhausted; `PART_UPLOAD_ACQUIRE_TIMEOUT` then
     // bounds how long a request that arrives just as capacity frees up will
     // wait for a slot, rather than letting client connections pile up
@@ -1458,16 +1362,13 @@ async fn upload_multipart_part(
         Err(resp) => return resp,
     };
 
-    // P2 1.8 remediation: ingress bytes for this part.
     #[allow(clippy::cast_precision_loss)]
     state.metrics.record_ingress_bytes(body_len as f64);
 
     // Report-part callback: notify the control plane that this part's bytes
     // have landed so it can record the part row `complete_multipart_upload`
-    // assembles from (P2 0.2 group B — the "report part" fix).
-    // `claims.request_id` (P2 1.8) is echoed back as `x-request-id` so both
-    // planes' logs for this upload can be correlated.
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-report
+    // assembles from. `claims.request_id` is echoed back as `x-request-id`
+    // so both planes' logs for this upload can be correlated.
     if let Err(resp) = report_part_with_control_plane(
         &state,
         &token,
@@ -1484,9 +1385,7 @@ async fn upload_multipart_part(
     {
         return resp;
     }
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-report
 
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-return
     // Return the part hash and ETag so callers can track per-part integrity.
     let body = serde_json::json!({
         "part_number": part_number,
@@ -1495,23 +1394,22 @@ async fn upload_multipart_part(
         "hash": hash_hex,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-return
 }
 
 /// Fallback `Content-Type` for a sidecar download response.
 ///
-/// P2 1.11: the control plane now stamps the version's real stored MIME into
-/// the GET token's `content_type` claim at download-URL-issuance time (the
-/// sidecar itself remains a stateless byte-mover with no DB access — it only
-/// echoes what the token carries). This fallback still applies to a token
-/// minted before this field existed (`claims.content_type` empty) or if the
-/// claim's value somehow fails to parse as a header value — a generic
-/// octet-stream type is always a safe (if non-specific) answer.
+/// The control plane stamps the version's real stored MIME into the GET
+/// token's `content_type` claim at download-URL-issuance time (the sidecar
+/// itself remains a stateless byte-mover with no DB access — it only echoes
+/// what the token carries). This fallback applies to a token minted before
+/// this field existed (`claims.content_type` empty) or if the claim's value
+/// fails to parse as a header value — a generic octet-stream type is always
+/// a safe (if non-specific) answer.
 const FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// Resolve the `Content-Type` header for a download response from the
-/// token's claims (P2 1.11) — see [`FALLBACK_CONTENT_TYPE`] for when it
-/// falls back instead of echoing `claims.content_type`.
+/// token's claims — see [`FALLBACK_CONTENT_TYPE`] for when it falls back
+/// instead of echoing `claims.content_type`.
 fn content_type_header(claims: &Claims) -> HeaderValue {
     if claims.content_type.is_empty() {
         return HeaderValue::from_static(FALLBACK_CONTENT_TYPE);
@@ -1521,11 +1419,11 @@ fn content_type_header(claims: &Claims) -> HeaderValue {
 }
 
 /// Resolve the `ETag` header for a download response from the token's
-/// claims (P2 1.11). `claims.etag` already carries the quoted, opaque
-/// content `ETag` (`domain::etag::content_etag`) minted by the control plane —
-/// one source of truth, no re-quoting here. `None` when the claim is empty
-/// (a token minted before this field existed) or fails to parse as a header
-/// value, in which case the response simply omits `ETag`.
+/// claims. `claims.etag` already carries the quoted, opaque content `ETag`
+/// (`domain::etag::content_etag`) minted by the control plane — one source of
+/// truth, no re-quoting here. `None` when the claim is empty (a token minted
+/// before this field existed) or fails to parse as a header value, in which
+/// case the response simply omits `ETag`.
 fn etag_header(claims: &Claims) -> Option<HeaderValue> {
     if claims.etag.is_empty() {
         return None;
@@ -1544,22 +1442,20 @@ fn header_value(s: &str) -> HeaderValue {
 
 /// `GET` download: verify token (op=GET), stream bytes, honour `Range`.
 ///
-/// P2 1.11: every backend error is now mapped distinctly instead of folding
-/// blob-not-found, unsatisfiable-range, and genuine I/O failures into a
-/// blanket `416`. `Content-Range` is emitted on every `206` (and on `416`,
-/// per RFC 9110 §14.4). `Content-Type` and `ETag` are sourced from the
-/// token's `content_type`/`etag` claims (real stored MIME + content `ETag`,
-/// see [`content_type_header`]/[`etag_header`]), falling back to
+/// Every backend error is mapped distinctly: blob-not-found, unsatisfiable-
+/// range, and genuine I/O failures never fold into a blanket `416`.
+/// `Content-Range` is emitted on every `206` (and on `416`, per RFC 9110
+/// §14.4). `Content-Type` and `ETag` are sourced from the token's
+/// `content_type`/`etag` claims (real stored MIME + content `ETag`, see
+/// [`content_type_header`]/[`etag_header`]), falling back to
 /// [`FALLBACK_CONTENT_TYPE`] and no `ETag` at all for a token minted before
 /// those claims existed.
 ///
-/// *Not implemented (optional P2 1.11 stretch, documented rather than
-/// silently skipped)*: `If-None-Match` → `304` on a match. Every download
-/// token is already single-use-scoped to one `(file_id, version_id)`
-/// (re-issuing a new signed URL is the normal client flow whenever content
-/// changes), so the bandwidth win of a conditional download is small; add it
-/// here, mirroring `api/rest/handlers.rs::get_file`'s pattern, if a caller
-/// class needs it.
+/// *Not implemented, documented rather than silently skipped*:
+/// `If-None-Match` → `304` on a match. Every download token is already
+/// single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of
+/// a conditional download is small; add it here, mirroring
+/// `api/rest/handlers.rs::get_file`'s pattern, if a caller class needs it.
 async fn download(
     State(state): State<SidecarState>,
     Path((file_id, version_id)): Path<(Uuid, Uuid)>,
@@ -1599,11 +1495,9 @@ async fn download(
     // into `416` (bad range) or `500` (genuine backend fault). `stat`
     // already distinguishes a real "not found" from other I/O errors per
     // backend (see `StorageBackend::stat`'s contract), so anything failing
-    // after this point is a genuine backend error, not a missing blob. This
-    // used to be two backend round-trips (`exists` here, then a separate
-    // `size` call inside whichever of `download_range`/`download_whole` ran
-    // next -- two `HeadObject`s against `S3Backend`); `total` is now resolved
-    // once here and threaded through to both.
+    // after this point is a genuine backend error, not a missing blob.
+    // Resolved once here and threaded through to both `download_range` and
+    // `download_whole`.
     let total = match backend.stat(path).await {
         Ok(Some(n)) => n,
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -1629,17 +1523,8 @@ async fn download(
 /// `download`, but never reads any content -- only `StorageBackend::stat` is
 /// called (one metadata-only round-trip on every backend: a single `stat(2)`
 /// on `local-fs`, a single `HeadObject` on `S3Backend`), and the body is
-/// always empty.
-///
-/// Registered explicitly via `.head(download_head)` in `build_router`
-/// because axum's `get(download)` would otherwise silently answer `HEAD`
-/// itself by running the *entire* `download` handler — including streaming
-/// the whole object off the backend — and only discarding the body
-/// afterwards. Media players and `curl -I` both send `HEAD` routinely (a
-/// player probing metadata/`Accept-Ranges` before deciding how to fetch a
-/// video), so without this override every such probe against a large object
-/// paid the full cost of a real download for a response that was always
-/// going to throw the body away.
+/// always empty. Registered explicitly via `.head(download_head)` in
+/// `build_router` -- see that route's comment for why.
 ///
 /// Returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as
 /// `download`'s `200`, plus `Content-Length` (which a real `200`/`206`
@@ -1679,8 +1564,7 @@ async fn download_head(
 
     let path = &claims.backend_path;
 
-    // Same existence-and-size contract as `download`, in one combined
-    // round-trip instead of the previous `exists` + `size` pair.
+    // Same existence-and-size contract as `download`, via one `stat` round-trip.
     let total = match backend.stat(path).await {
         Ok(Some(n)) => n,
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -1707,14 +1591,11 @@ async fn download_head(
 /// Split out of `download` to keep its cognitive complexity down.
 ///
 /// The response body is streamed from `StorageBackend::get_range_stream`
-/// (`axum::body::Body::from_stream`) instead of materializing the resolved
-/// range into a `Bytes` buffer first (the old `get_range`-based path
-/// allocated a `len`-sized buffer up front). This matters even for a
-/// "partial" request: `Range: bytes=0-` (`ByteRange::OpenEnded { start: 0 }`)
-/// resolves to a range spanning the *entire* object — it is the very first
-/// request many media players issue — so the unbounded case was never a rare
-/// edge, as `testing/e2e/gears/file_storage/web_ui/`'s scrubbable video demo
-/// demonstrates against a real backend.
+/// (`axum::body::Body::from_stream`) rather than materialized into a `Bytes`
+/// buffer first. This matters even for a "partial" request: `Range:
+/// bytes=0-` (`ByteRange::OpenEnded { start: 0 }`) resolves to a range
+/// spanning the *entire* object — it is the very first request many media
+/// players issue — so the unbounded case is not a rare edge.
 async fn download_range(
     state: &SidecarState,
     backend: &Arc<dyn StorageBackend>,
@@ -1739,13 +1620,11 @@ async fn download_range(
     };
     match backend.get_range_stream(path, r).await {
         Ok(stream) => {
-            // P2 1.8 remediation, now counted per chunk rather than as one
-            // lump `bytes.len()` up front (the old buffered path's shape):
-            // the stream is not fully materialized before any of it reaches
-            // the client, so egress must be attributed as each chunk
-            // actually leaves the process — otherwise a connection that
-            // drops mid-transfer would over-report bytes that were never
-            // actually sent.
+            // Counted per chunk, not as one lump up front: the stream is not
+            // fully materialized before any of it reaches the client, so
+            // egress must be attributed as each chunk actually leaves the
+            // process — otherwise a connection that drops mid-transfer would
+            // over-report bytes that were never actually sent.
             let metrics = Arc::clone(&state.metrics);
             let body_stream = stream.map(move |chunk| {
                 if let Ok(bytes) = &chunk {
@@ -1763,10 +1642,9 @@ async fn download_range(
                 header::CONTENT_RANGE,
                 header_value(&format!("bytes {start}-{end}/{total}")),
             );
-            // A fixed-size `Bytes` body (the old shape) got `Content-Length`
-            // for free from axum; a streamed body does not, since nothing
-            // here knows the stream's length up front — set it explicitly
-            // from the already-resolved range bounds instead.
+            // A streamed body gets no `Content-Length` for free from axum,
+            // since nothing here knows the stream's length up front — set it
+            // explicitly from the already-resolved range bounds instead.
             headers_mut.insert(
                 header::CONTENT_LENGTH,
                 header_value(&(end - start + 1).to_string()),
@@ -1787,18 +1665,15 @@ async fn download_range(
     }
 }
 
-/// Serve a whole-blob `GET` (no `Range` header) once the blob's existence and
-/// size have already been resolved by the caller (`download`'s single `stat`
-/// call -- `total` is that call's result, not a fresh backend
-/// round-trip). Split out of `download` to keep its cognitive complexity
-/// down.
+/// Serve a whole-blob `GET` (no `Range` header) -- see `download_range`'s
+/// doc comment for why `total` is a parameter rather than a fresh backend
+/// round-trip, and why this is split out of `download`.
 ///
 /// The response body is streamed from `StorageBackend::get_stream`
-/// (`axum::body::Body::from_stream`) instead of materializing the whole
-/// object into a `Bytes` buffer first — the sidecar's own
-/// `FS_SIDECAR_MAX_BODY_BYTES` default alone permits objects up to 5 GiB, so
-/// the old `backend.get(path)` path meant one full in-memory copy per
-/// concurrent whole-object download.
+/// (`axum::body::Body::from_stream`) rather than materialized into a `Bytes`
+/// buffer first — the sidecar's own `FS_SIDECAR_MAX_BODY_BYTES` default alone
+/// permits objects up to 5 GiB, and a whole in-memory copy per concurrent
+/// whole-object download at that size is not acceptable.
 async fn download_whole(
     state: &SidecarState,
     backend: &Arc<dyn StorageBackend>,
@@ -1808,11 +1683,8 @@ async fn download_whole(
 ) -> Response {
     match backend.get_stream(path).await {
         Ok(stream) => {
-            // P2 1.8 remediation, now counted per chunk as it is handed to
-            // the client rather than as one `bytes.len()` lump computed
-            // before anything was sent — see `download_range`'s identical
-            // comment for why that distinction matters once nothing is
-            // buffered ahead of time.
+            // Counted per chunk as it is handed to the client — see
+            // `download_range`'s identical comment for why.
             let metrics = Arc::clone(&state.metrics);
             let body_stream = stream.map(move |chunk| {
                 if let Ok(bytes) = &chunk {

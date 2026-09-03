@@ -341,8 +341,6 @@ async fn simulate_sidecar_put_part(
 
 /// Server-authoritative multipart: initiate returns a plan, sidecar simulated
 /// part writes (via native upload_part), complete assembles.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_happy_path_in_memory() {
     let db = build_db().await;
@@ -465,8 +463,6 @@ async fn multipart_happy_path_in_memory() {
 /// retry, and never a re-finalize of the version (the P2 0.4 version-level
 /// CAS in `VersionRepo::finalize` stays untouched because the replay path
 /// never reaches it).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_complete_retry_is_idempotent() {
     let db = build_db().await;
@@ -572,8 +568,6 @@ async fn multipart_complete_retry_is_idempotent() {
 /// `MultipartService::abort_multipart_upload` never deleted part rows at
 /// all -- they accumulated forever, since the session row itself is never
 /// deleted (only its `state` column flips to `aborted`).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn abort_multipart_upload_deletes_part_rows_and_pending_version() {
     let db = build_db().await;
@@ -696,9 +690,6 @@ const JPEG_MAGIC: &[u8] = &[
 /// never sniffed the assembled bytes at all, so a policy restricting allowed
 /// MIME types could be bypassed by declaring an allowed type at initiate and
 /// multipart-uploading arbitrary content.
-///
-/// @cpt-cf-file-storage-fr-content-type-validation
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_complete_rejects_content_not_matching_declared_mime() {
     let db = build_db().await;
@@ -814,9 +805,6 @@ async fn multipart_complete_rejects_content_not_matching_declared_mime() {
 /// successfully, and both the version's persisted `mime_type` and the
 /// session's `mime_validated` flag reflect that the multipart-complete path
 /// now actually performs the validation (P2 remediation item 1.10).
-///
-/// @cpt-cf-file-storage-fr-content-type-validation
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_complete_persists_validated_mime_and_flag() {
     let db = build_db().await;
@@ -924,9 +912,6 @@ async fn multipart_complete_persists_validated_mime_and_flag() {
 /// upload its content through the server-authoritative multipart flow, complete
 /// + bind it, confirm it exists and is readable, then delete it and confirm the
 /// file (and its versions, via FK cascade) are gone.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn multipart_full_lifecycle_create_to_delete() {
     let db = build_db().await;
@@ -1037,7 +1022,6 @@ async fn multipart_full_lifecycle_create_to_delete() {
 
 // -- 2. LocalFsBackend rejects multipart -------------------------------------
 
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_rejected_on_local_fs() {
     let db = build_db().await;
@@ -1105,8 +1089,6 @@ async fn multipart_rejected_on_local_fs() {
 /// - `parts = ceil(declared_size / part_size)`.
 /// - Last part's `size = declared_size - (n-1) * part_size`.
 /// - Sum of all parts' sizes == declared_size.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn initiate_returns_coherent_parts_plan() {
     let (svc, msvc, _dp) = build_service().await;
@@ -1171,7 +1153,6 @@ async fn initiate_returns_coherent_parts_plan() {
 
 // -- 4. Idempotency: same key returns same file --------------------------------
 
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_same_key_returns_same_file() {
     let (svc, _msvc, _dp) = build_service().await;
@@ -1217,9 +1198,6 @@ fn max_size_claim(url: &str, verifier: &file_storage::infra::signed_url::Verifie
 /// `idempotency_key` must not still be able to hand out (or use) a token
 /// carrying the old, larger `max_size` claim for the rest of the
 /// idempotency TTL.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
-/// @cpt-cf-file-storage-fr-size-limits-policy
 #[tokio::test]
 async fn idempotency_replay_reflects_tightened_size_policy() {
     use file_storage::infra::signed_url::Issuer;
@@ -1315,8 +1293,6 @@ async fn idempotency_replay_reflects_tightened_size_policy() {
 /// A retry with the same `idempotency_key` but a different `name` must be
 /// rejected with `409 Conflict` instead of silently replaying the original
 /// ticket, and must never create a second file.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_replay_with_diverging_name_returns_conflict() {
     let (svc, dsn) = build_file_service_with_dsn(86400).await;
@@ -1347,8 +1323,6 @@ async fn idempotency_replay_with_diverging_name_returns_conflict() {
 
 /// Same as above, but the divergence is in `custom_metadata` — proving the
 /// canonicalization actually covers metadata and not just the scalar fields.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_replay_with_diverging_metadata_returns_conflict() {
     let (svc, dsn) = build_file_service_with_dsn(86400).await;
@@ -1395,8 +1369,6 @@ async fn idempotency_replay_with_diverging_metadata_returns_conflict() {
 /// to look as if it had been computed for a different owner than the row's
 /// own primary key, then replays with the row's *actual* owner and expects
 /// the recomputed (correct) hash to disagree with the tampered one.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_replay_with_diverging_owner_returns_conflict() {
     let (svc, dsn) = build_file_service_with_dsn(86400).await;
@@ -1444,7 +1416,6 @@ async fn idempotency_replay_with_diverging_owner_returns_conflict() {
 
 // -- 5. Different owner -> different file -------------------------------------
 
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_different_owner_different_file() {
     let (svc, _msvc, _dp) = build_service().await;
@@ -1476,7 +1447,6 @@ async fn idempotency_different_owner_different_file() {
 
 // -- 6. Idempotency expiry creates a fresh file --------------------------------
 
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn idempotency_expiry_creates_new_file() {
     // Very short TTL: 1 second.
@@ -1511,9 +1481,6 @@ async fn idempotency_expiry_creates_new_file() {
 /// This is the DESIGN §4.6 (server-authoritative) fix for CodeRabbit F2: the
 /// control plane gates the declared total size at initiate so that an
 /// oversized upload cannot be started at all, not merely rejected at complete.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
 #[tokio::test]
 async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
     let (svc, msvc, psvc, _dp) = build_service_with_policy().await;
@@ -1574,9 +1541,6 @@ async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
 }
 
 /// Declaring a total size within the policy limit succeeds.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
 #[tokio::test]
 async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
     let (svc, msvc, psvc, _dp) = build_service_with_policy().await;
@@ -1639,8 +1603,6 @@ async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
 /// rejected up front with `DomainError::Validation`, not passed through to
 /// `compute_plan` where it could overflow the part-size arithmetic or drive
 /// a huge `Vec::with_capacity` allocation.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn initiate_multipart_rejects_absurd_preferred_part_size() {
     let (svc, msvc, _dp) = build_service().await;
@@ -1673,8 +1635,6 @@ async fn initiate_multipart_rejects_absurd_preferred_part_size() {
 
 /// Each upload_url in the plan must be a valid fs-token-bearing sidecar URL
 /// that the Verifier can decode with correct multipart claims.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload (FEATURE §4)
 #[tokio::test]
 async fn initiate_plan_urls_carry_valid_multipart_tokens() {
     use file_storage::infra::signed_url::Op;
@@ -1788,8 +1748,6 @@ async fn initiate_plan_urls_carry_valid_multipart_tokens() {
 ///
 /// Flip the assertion once a real default-topology backend sets
 /// `multipart_native: true` (S3, item 1.7).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_initiate_against_real_default_topology_is_rejected_until_backend_supports_it() {
     use file_storage::config::FileStorageConfig;
@@ -1880,8 +1838,6 @@ async fn multipart_initiate_against_real_default_topology_is_rejected_until_back
 /// structurally empty. This test asserts the DB state directly via the
 /// `multipart_upload_part` entity -- NOT via `list_multipart_parts`, which is
 /// the very method under test and would make the assertion tautological.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_complete_uses_reported_parts_not_empty_list() {
     use axum::Router;
@@ -2087,8 +2043,6 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
 /// reject a `size` that does not match the authoritative
 /// `claims.multipart.size` minted into the token at initiate time, and must
 /// not persist a part row for the forged size.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn report_part_rejects_forged_size() {
     use axum::Router;
@@ -2232,8 +2186,6 @@ async fn report_part_rejects_forged_size() {
 /// and only surfaced later as an opaque `400` at `complete` — against the
 /// wrong actor (whoever calls `complete`, not the caller that reported the
 /// bad hash).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn report_part_rejects_short_hash() {
     use axum::Router;
@@ -2372,8 +2324,6 @@ async fn report_part_rejects_short_hash() {
 /// (`multipart_native == true`). Complements the single-case
 /// `multipart_rejected_on_local_fs` / `multipart_happy_path_in_memory` tests
 /// by pinning both sides of the same capability gate in one place.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn multipart_initiate_rejected_when_backend_not_multipart_native() {
     struct Case {
@@ -2569,9 +2519,6 @@ impl StorageBackend for CompleteCallCountingBackend {
 /// `content_hash` is plain `sha256(object bytes)` (== the single part's
 /// digest), no composite root, no manifest in the response, no
 /// `version_hash_manifest` row, and `part_count` NULL on the version row.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-dod:cpt-cf-file-storage-dod-multipart-complete:p1
 #[tokio::test]
 async fn complete_returns_version_size_and_composite_hash() {
     let db = build_db().await;
@@ -2689,8 +2636,6 @@ async fn complete_returns_version_size_and_composite_hash() {
 /// (superseding it -- version A's ETag is now stale/"pre-[most-recent]-bind").
 /// A third, still-in-progress session's `complete` call carrying that stale
 /// ETag must fail.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_with_stale_if_match_is_rejected() {
     let db = build_db().await;
@@ -2877,8 +2822,6 @@ async fn complete_with_stale_if_match_is_rejected() {
 /// `If-Match: *` bypasses the precondition unconditionally, even when the
 /// file already has bound content whose ETag differs from nothing in
 /// particular -- the point is that no comparison happens at all.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_wildcard_if_match_succeeds() {
     let db = build_db().await;
@@ -3003,8 +2946,6 @@ async fn complete_wildcard_if_match_succeeds() {
 /// and must never reach the backend's native `complete_multipart` (a
 /// request-counting backend wrapper proves this, mirroring
 /// `tests/content_hash_modes_test.rs`'s `CountingBackend` pattern).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_with_missing_parts_lists_them() {
     use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
@@ -3128,8 +3069,6 @@ async fn complete_with_missing_parts_lists_them() {
 /// offsets/sizes matching the original plan, and a fresh `upload_url` for
 /// each still-missing part (the session is still `in_progress` and
 /// unexpired).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn introspect_reports_received_and_missing_parts() {
     use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
@@ -3255,8 +3194,6 @@ async fn introspect_reports_received_and_missing_parts() {
 /// session must be masked as `MultipartUploadNotFound`, exactly like
 /// `complete`/`abort`'s same-shaped guard -- a foreign `upload_id` must not
 /// be distinguishable from a missing one.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn introspect_foreign_upload_id_is_not_found() {
     let (svc, msvc, _dp) = build_service().await;
@@ -3302,8 +3239,6 @@ async fn introspect_foreign_upload_id_is_not_found() {
 /// `complete_multipart_upload`'s defense-in-depth check does, but instead of
 /// rejecting the call outright it simply omits `upload_url` from every
 /// missing part.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn introspect_expired_session_returns_state_without_urls() {
     let db = build_db().await;
@@ -3394,8 +3329,6 @@ async fn introspect_expired_session_returns_state_without_urls() {
 /// equal, so `min(session.expires_at, now + url_ttl_secs)` collapses to
 /// `session.expires_at`; see `initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl`
 /// below for the case where the URL-TTL cap actually bites.)
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn introspect_resume_urls_expire_with_session() {
     use file_storage::infra::signed_url::Op;
@@ -4106,8 +4039,6 @@ async fn complete_takes_over_expired_lease_and_finishes() {
 /// `Completing`, and answered HTTP 202 forever -- the session can never
 /// un-expire, so the client would poll until the abandoned-session sweep
 /// eventually aborted it.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_on_expired_completing_session_returns_expired_not_completing() {
     let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;

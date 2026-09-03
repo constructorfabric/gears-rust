@@ -956,7 +956,7 @@ and is called by the **sidecar**, authorized solely by the same signed upload to
 app-token, no on-behalf-of delegation. `bind` swaps the file's `content_id` pointer under `If-Match` and is called
 **only** by the client, as a separate request after a successful upload; the sidecar never binds.
 
-**Amendment (upload-flow redesign): auto-bind on finalize for a NEW file's first content.** `POST /files` defaults to
+**Auto-bind on finalize for a NEW file's first content.** `POST /files` defaults to
 `bind: "auto"`, which bakes a `bind_on_finalize` claim into the upload token: the finalize callback then also swaps
 `content_id` — in the same transaction as the `pending → available` flip, under a strict `content_id IS NULL` CAS —
 making the dominant single-file upload exactly **2 requests** (`POST /files` + `PUT`). The `PUT` response reports the
@@ -1610,19 +1610,8 @@ backend's publish is create-exclusive (`StorageBackend::publish_exclusive`) and 
 the live bytes are never mutated in place. Acceptable.
 
 **Constraints.** All are AND-combined inside the signed token (tamper-evident as a whole). Every token carries **`exp`**;
-everything else is optional.
-
-| Constraint | Claim | Required | Status | Applies to | Violation |
-|---|---|---|---|---|---|
-| Expiry | `exp` | **yes** | **shipped** | all | `403` — at/past `exp` |
-| Operation | `op` (+ method check) | **yes** | **shipped** | all | `403` |
-| Client address | `ip` (addr/CIDR) | no | **not implemented** | all | — |
-| Token-claim predicate | `tok.<claim>` | no | **not implemented** | all | — |
-| Max size | `max_size` | no | **shipped** | upload | `413` (mid-stream) |
-| Exact size | `exact_size` | no | **shipped** | upload | `400` (checked after the stream drains, once length is final) |
-| Expected hash | `expected_hash` (`<alg>:<hex>`) | no | **shipped** | upload | `400` |
-| Max rate | `max_rate` (bytes/s) | no | **not implemented** | up/down | — |
-| Max connections | `max_conns` | no | **not implemented** | up/down | — |
+everything else is optional. The full claim-by-claim table (required/enforced, applies-to, violation status code) is
+[api.md](./api.md)'s "Signed URLs" section — not repeated here.
 
 The sidecar's verification surface: **signature, expiry, and the `op`/`file_id`/`version_id` binding** (plus, for
 `multipart_part` tokens, the `part_number` binding), and the upload-only `max_size`/`exact_size`/`expected_hash`
@@ -1733,296 +1722,125 @@ microseconds — no DB hit, no network in the signing step. Two cases:
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-design-worked-example`
 
 A concrete end-to-end walkthrough tying together presign, the sidecar transfer, pre-register, bind, and a later
-download — a student uploading a screenshot into an LMS assessment, then that image rendering in a browser. Example
-hosts: control plane `https://api.example.com/api/file-storage/v1`, sidecar `https://fs-data.example.com`. IDs are
-shortened for readability.
+download — a student uploading a screenshot into an LMS assessment, then that image rendering in a browser.
 
-**Who talks to whom.** The student / browser **never calls the FileStorage control plane (FSCP) directly.** For every
-control operation it goes through the **LMS API**, which runs its own business logic and validation first — e.g. the
-assessment is open, the attempt belongs to this student, attempt/upload limits are not exceeded, the file type and size
-are allowed for *this* question — and only then **proxies** the request into FSCP via the FileStorage SDK
-(server-to-server, on behalf of the student). FSCP authorizes independently on the GTS type; the LMS checks are an
-additional, domain-specific layer on top. The **only** FileStorage endpoint the browser touches directly is the
-**sidecar**, and only with a signed URL the LMS handed back — so the byte transfer is direct (no LMS in the data path)
-while every control decision stays mediated by the LMS.
+**Who talks to whom.** The student's browser never calls the FileStorage control plane directly. The LMS backend
+runs its own business checks first (assessment open, attempt ownership, upload limits, allowed type/size for this
+question) and only then **proxies** the request into the control plane via the FileStorage SDK, on the student's
+behalf; the control plane authorizes independently on the GTS type — the LMS checks are an additional,
+domain-specific layer on top. The **only** FileStorage endpoint the browser touches directly is the **sidecar**,
+and only with a signed URL the LMS handed back — so the byte transfer is direct while every control decision stays
+mediated by the LMS.
 
 #### Phase 1 — Upload
 
-1. The student picks `answer.png` in the LMS assessment UI. The LMS frontend asks the LMS backend (a gear) for an
-   upload target, passing the file's `name`, `mime_type`, and `gts_file_type` (**required**) plus, **optionally**, the
-   `size` and content `hash` it already knows. The optional values let the control plane tighten the token: a declared
-   `size` is baked as the `exact_size` claim (otherwise a policy-driven `max_size` applies), and a declared `hash` is
-   baked as `expected_hash` — so the sidecar verifies the upload against exactly what the client committed up front.
-   (`mime_type` is always required; it is validated against the content's magic bytes on the **control plane** at
-   `finalize`/`complete`, not by the sidecar in-stream — §4.2.)
-2. The LMS backend runs its own business checks first (assessment open, attempt ownership, limits, allowed type/size
-   for this question), then **proxies** to FSCP via the FileStorage **SDK** (on behalf of the student). The control
-   plane runs its own authz (`write` on `gts.cf.fstorage.file.type.v1~x.lms.assessment.image.v1~`), creates the
-   `files` row (`content_id = NULL`), pre-registers a `pending` `file_versions` row, and mints a **signed PUT token**
-   (§4.5) for the sidecar with claims baked in (15-min `exp`, 10 MiB `max_size`, `expected_hash`), returned as an
-   `?fs-token=<token>` URL:
+1. The student picks `answer.png`. The LMS backend asks the control plane for an upload target via `POST /files`,
+   passing `name`, `mime_type`, `gts_file_type` (required), `owner_kind`/`owner_id`, and optionally a client-known
+   `size`/`hash`: a declared size tightens the token's `exact_size` claim (otherwise a policy-driven `max_size`
+   applies), and a declared hash becomes `expected_hash` — so the sidecar can check the upload against exactly what
+   the client committed. `mime_type` is validated against the actual bytes at finalize (§4.2), not by the sidecar
+   in-stream.
+2. The control plane authorizes (`write` on the GTS type), creates the `files` row (`content_id = NULL`),
+   pre-registers a `pending` `file_versions` row, and returns `{ file_id, version_id, upload_url }` — an
+   `?fs-token=…` URL whose claims follow §4.5's shape (`op: Put`, `file_id`/`version_id`, `backend_id`/
+   `backend_path`, a short `exp`, plus the size/hash constraints from step 1).
+3. The LMS hands `upload_url` to the browser, which `PUT`s the bytes straight to the **sidecar**.
+4. The sidecar verifies the token's signature and claims (§4.5); it applies no tenant/user/backend policy of its
+   own and makes no platform-JWT call — those checks already happened at the LMS and at presign.
+5. The sidecar streams to the backend — the object path was already allocated in step 2, so there is no
+   sidecar→control pre-register call — counting bytes against `max_size` and hashing incrementally; it does not
+   sniff MIME/magic bytes in-stream (that happens on the control plane at finalize).
+6. At end-of-stream the sidecar checks the digest against `expected_hash`, then calls the control plane's
+   token-authenticated **finalize** callback with `{size, hash_hex}`. The control plane re-reads the object,
+   recomputes size/hash, sniffs its magic bytes against the declared MIME, and only then flips the version
+   `pending → available`. Finalize never touches `content_id`.
+7. The sidecar returns `200` to the browser once finalize succeeds. The LMS backend then makes a **separate**
+   `POST /files/{id}/bind { version_id }` request to make the upload the file's live content — no `If-Match` is
+   required for a file's first content. Total for the write: three control-plane requests (presign, finalize,
+   bind) and one data-plane request (the `PUT`).
 
-   ```http
-   POST https://api.example.com/api/file-storage/v1/files
-   Authorization: Bearer <LMS app token, on-behalf-of stu_91a2>
-   Content-Type: application/json
-
-   { "name": "answer.png", "gts_file_type": "gts.cf.fstorage.file.type.v1~x.lms.assessment.image.v1~",
-     "owner_kind": "user", "owner_id": "stu_91a2", "mime_type": "image/png" }
-   ```
-   ```json
-   201 Created
-   { "file_id": "3b1e8c4a",
-     "version_id": "7d9f2b10",
-     "upload_url": "https://fs-data.example.com/files/3b1e8c4a?fs-token=eyJvcCI6IlB1dCIsImZpbGVfaWQiOiIzYjFlOGM0YSIsInZlcnNpb25faWQiOiI3ZDlmMmIxMCIsImJhY2tlbmRfaWQiOiJsb2NhbC1mcyIsImV4cCI6MTc1MDAwMDkwMCwidXBsb2FkIjp7Im1heF9zaXplIjoxMDQ4NTc2MCwiZXhwZWN0ZWRfaGFzaCI6IlNIQS0yNTY6Yjk0ZDI3Li4uIn19.c2lnbmF0dXJlYnl0ZXM" }
-   ```
-
-   `version_id` is already allocated: the control plane pre-registers the `pending` `file_versions` row in this same
-   request, **before** returning the token — the sidecar never pre-registers anything itself (`bind-service`, §3.2).
-
-   On the wire it is **one opaque `fs-token`** (`file_id` is the path). The control plane and the sidecar — and **no
-   one else** — read the claims it carries (per the Token Opacity Contract); decoded, they are:
-
-   | Claim | Value | Meaning |
-   |---|---|---|
-   | `op` | `Put` | bound operation (also checked against the HTTP method) |
-   | `file_id`, `version_id` | `3b1e8c4a`, `7d9f2b10` | the exact object this token authorizes |
-   | `backend_id`, `backend_path` | `local-fs`, `/3b1e8c4a/7d9f2b10` | carried directly — the sidecar has no DB to resolve them from (§4.5) |
-   | `exp` | `1750000900` | +15 min (the `max_url_ttl` cap is enforced at signing) |
-   | `upload.max_size` | `10485760` | upload constraint — ≤ 10 MiB (policy default; no client-declared size) |
-   | `upload.expected_hash` | `SHA-256:b94d27...` | upload constraint — content must hash to this (client-committed) |
-
-   A programmatic caller could instead receive the token to send as an `X-FS-Token` header (same bytes). There is no
-   `ip` or token-claim-predicate claim — the token is usable by anyone who holds it until `exp` (§4.5).
-
-3. The LMS hands `upload_url` to the browser, which uploads the bytes straight to the **sidecar**:
-
-   ```http
-   PUT https://fs-data.example.com/files/3b1e8c4a?fs-token=eyJvcCI6IlB1dCwuLn0.c2lnbmF0dXJl HTTP/1.1
-   Content-Type: image/png
-   <binary image bytes>
-   ```
-4. The sidecar **verifies the token's signature** with its public key, then checks the claims: `exp` not passed, and
-   the `op` claim matches the HTTP method (`PUT`). It applies no tenant/user/backend quota or policy of its own, and
-   makes no platform-JWT call at all — those checks already happened at the LMS and the control-plane presign step
-   (§4.5 "No policy or quota in the data plane").
-5. The sidecar **starts accepting data** straight away — `version_id = 7d9f2b10` and object path `/3b1e8c4a/7d9f2b10`
-   were already allocated by the control plane in step 2, so there is no separate sidecar→control pre-register call.
-   It streams to the backend while it (a) counts bytes against `max_size` (aborts `413` if exceeded) and (b) runs
-   SHA-256 incrementally; it does **not** sniff MIME/magic bytes in-stream — that check happens on the control plane
-   at finalize (step 6).
-6. At end-of-stream the sidecar checks the digest against `expected_hash` (`400` on mismatch, before ever calling
-   finalize), then calls the control plane's token-authenticated **finalize** callback:
-   `POST /files/3b1e8c4a/versions/7d9f2b10/finalize {size, hash_hex}` — authorized solely by the same `fs-token`
-   (no app-token, no on-behalf-of delegation, no FS SDK call). The control plane independently re-reads the object
-   from the backend, recomputes size/hash, sniffs its magic bytes against the declared `image/png`, and only then
-   flips the version `pending → available`. Finalize does **not** touch `content_id`.
-7. The sidecar returns `200` to the browser once finalize succeeds. The LMS backend then makes a **separate** control
-   request to bind the version as the file's live content:
-
-   ```http
-   POST https://api.example.com/api/file-storage/v1/files/3b1e8c4a/bind
-   Authorization: Bearer <LMS app token, on-behalf-of stu_91a2>
-
-   { "version_id": "7d9f2b10" }
-   ```
-
-   Because this is the file's first content, no `If-Match` precondition is required; the control plane sets
-   `content_id := 7d9f2b10` and flips `is_current` atomically, and the LMS stores `file_id = 3b1e8c4a` on the
-   assessment answer. Total for the write: **three control-plane requests** (presign, the sidecar's finalize
-   callback, bind) and **one data-plane request** (the `PUT`).
-
-> If a concurrent write had moved `content_id` between presign and bind, the bind call above fails its `If-Match`
-> precondition instead; the client re-reads the current ETag and replays `POST /files/3b1e8c4a/bind` with the fresh
-> `If-Match` — no re-upload, because `version_id = 7d9f2b10` and its bytes are already finalized.
+> A concurrent write between presign and bind fails the bind's `If-Match` precondition instead; the client re-reads
+> the current ETag and replays `POST /files/{id}/bind` with the fresh `If-Match` — no re-upload, since the
+> version's bytes are already finalized.
 
 #### Phase 2 — Display in the browser
 
-9. The grader opens the assessment. The LMS backend asks the control plane for a download URL (authz `read`,
-   on-behalf-of the grader), pinning the current version:
+8. The grader opens the assessment. The LMS backend asks for a download URL (authz `read`, on behalf of the
+   grader), pinning the current version: `GET /files/{id}/download-url` → `{ etag, download_url }`, whose token
+   additionally carries `content_type`/`etag` (§4.5) so the sidecar can echo them with no DB lookup.
+9. The LMS drops that URL straight into `<img src="…">` — it is a bare, shareable URL (ADR-0004), no JS/header
+   glue needed.
+10. The browser `GET`s the sidecar URL directly; the sidecar streams the bytes and emits `Content-Type`/`ETag` from
+    the token's claims plus `Accept-Ranges: bytes`. The image renders inline (no `Content-Disposition` in play);
+    forcing a download instead is a client-side concern (e.g. `<a download>`), not a token claim.
+11. **Large media (random access).** For a large video instead of a PNG, the same signed URL serves
+    arbitrary-offset `Range` reads (§4.1) — a `<video>` element seeks freely until `exp`, no re-presign per seek.
 
-   ```http
-   GET https://api.example.com/api/file-storage/v1/files/3b1e8c4a/download-url
-   Authorization: Bearer <LMS app token, on-behalf-of grader>
-   ```
-   ```json
-   200 OK
-   { "etag": "\"Ox...c4a7d9f\"",
-     "download_url": "https://fs-data.example.com/files/3b1e8c4a?fs-token=eyJvcCI6IkdldCIsImZpbGVfaWQiOiIzYjFlOGM0YSIsInZlcnNpb25faWQiOiI3ZDlmMmIxMCIsImJhY2tlbmRfaWQiOiJsb2NhbC1mcyIsImV4cCI6MTc1MDYwODQwMCwiY29udGVudF90eXBlIjoiaW1hZ2UvcG5nIiwiZXRhZyI6Ilx1MDAyMk94Li4uYzRhN2Q5Zlx1MDAyMiJ9.YmRjNHpsaWdu" }
-   ```
-
-   One opaque `fs-token` (`file_id` is the path). Decoded by control/sidecar only, its claims are:
-
-   | Claim | Value | Meaning |
-   |---|---|---|
-   | `op` | `Get` | bound operation (checked against the HTTP method) |
-   | `exp` | `1750608400` | +7 days (the `max_url_ttl` cap is enforced at signing) |
-   | `version_id` | `7d9f2b10` | **pins this version** — stable, cacheable; "latest" = re-presign |
-   | `backend_id`, `backend_path` | `local-fs`, `/3b1e8c4a/7d9f2b10` | the sidecar has no DB, so these come straight from the token |
-   | `content_type` | `image/png` | the version's stored MIME, echoed verbatim as `Content-Type` |
-   | `etag` | `"Ox...c4a7d9f"` | the same content `ETag` returned above, echoed verbatim as `ETag` |
-
-   No upload-only claims here (`max_size`/`exact_size`/`expected_hash` are PUT-only). There is no `Cache-Control` or
-   `Content-Disposition` claim — `content_type`/`etag` are the only response-affecting fields the token carries
-   (§4.5); it also carries no `ip` or token-claim predicate, so it is usable by anyone who holds it until `exp` —
-   see the domain-placement note below.
-
-10. The LMS drops that URL straight into the page — it is a **bare, shareable URL** (ADR-0004), so no JS/header glue:
-
-    ```html
-    <img src="https://fs-data.example.com/files/3b1e8c4a?fs-token=eyJvcCI6IkdldCwuLn0.YmRjNHpsaWdu">
-    ```
-11. The browser `GET`s the sidecar URL directly. The sidecar verifies the token, streams the bytes from
-    `/3b1e8c4a/7d9f2b10`, and emits `Content-Type: image/png` and `ETag` from the token's claims, plus
-    `Accept-Ranges: bytes`. The image **renders inline** — the default browser behavior for an `<img>` tag, since
-    there is no `Content-Disposition` in play.
-12. **Forcing a download instead of inline rendering is a client-side concern, not a token claim**: the sidecar never
-    sets `Content-Disposition`, so the LMS front-end uses the ordinary browser mechanism instead — e.g. an
-    `<a href="…" download="answer.png">` link — rather than a server-baked header.
-13. **Large media (random access).** If the object were a large video instead of a PNG, the same single signed URL
-    serves **arbitrary-offset reads**: a `<video>` element (or a downloader) seeks by issuing `Range` requests against
-    it, and the sidecar answers each with `206 Partial Content` (§4.1). Because the `Range` header is not part of the
-    signature, one presigned URL covers the whole scrub/resume session until `exp` — no re-presign per seek.
-
-**Sidecar domain placement (deployment choice).** The signed-URL contract is identical regardless of where the
-sidecar is hosted relative to the app — there is no token-claim predicate to enable or disable (§4.5), so domain
-placement is purely an operational choice, not an access-control one:
-
-- **Same site as the app** — the sidecar as a **subdomain** (`fs-data.app.example.com`) or **sub-path**
-  (`app.example.com/fs-data/...`). Simplifies CORS/CSP configuration for browser clients; has no effect on who can
-  use a given signed URL.
-- **Different domain** — equally valid; the sidecar never reads platform cookies/JWTs regardless, so there is
-  nothing to "auto-attach". Whoever holds a signed URL can use it until `exp`, on any domain configuration.
-
-Anonymous/predicate-scoped sharing links are the deferred "Sharing boundary (P3)" capability (§1.1), not something
-domain placement substitutes for today.
+**Sidecar domain placement** (same subdomain, sub-path, or a different domain) is purely a deployment choice with
+no effect on who can use a signed URL — there is no token-claim predicate to enable or disable (§4.5), and the
+sidecar never reads platform cookies/JWTs regardless of placement. Anonymous/predicate-scoped sharing links are the
+deferred "Sharing boundary (P3)" capability (§1.1), not something domain placement substitutes for.
 
 ### 4.7 Worked example (multipart upload and resume)
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-design-worked-example-multipart`
 
-Multipart is **P2** (`cpt-cf-file-storage-fr-multipart-upload`); this walks the same scenario style as §4.6 for a large
-file, then the interesting case: the user uploads a few parts, **gets logged out, hours pass, logs back in, and
-resumes** without re-uploading what already landed. Same hosts as §4.6. The student is uploading a 320 MiB
-`lecture.mp4` recording into the LMS.
+Multipart is **P2** (`cpt-cf-file-storage-fr-multipart-upload`). Same scenario style as §4.6, for a 320 MiB
+`lecture.mp4` upload, walking the interesting case: the user uploads a few parts, gets logged out, and later
+resumes without re-uploading what already landed.
 
 #### Phase A — Initiate (server-authoritative plan)
 
-1. The browser tells the LMS it wants to upload a 320 MiB video. The LMS runs its business checks and **proxies** to
-   FSCP via the SDK (on behalf of the student), passing the desired parameters (total size, preferred part size,
-   concurrency):
+1. The LMS proxies the student's desired parameters (total size, preferred part size, concurrency) to
+   `POST /files/{id}/multipart`. The control plane authorizes, allocates a `version_id`, pre-registers a `pending`
+   version, opens the sidecar's multipart session (`CreateMultipartUpload` on a `multipart_native` backend), and
+   returns the exact, server-authoritative parts plan plus one signed `PUT` URL per part (shape: "P2 — Multipart
+   upload" above); each part token additionally carries `part_number`/`offset`/`size` (§4.5).
 
-   ```http
-   POST https://api.example.com/api/file-storage/v1/files/9c2a4f10/multipart
-   Authorization: Bearer <LMS app token, on-behalf-of stu_91a2>
+#### Phase B — Upload parts (durable per-part state)
 
-   { "total_size": 335544320, "preferred_part_size": 67108864, "concurrency": 4, "mime_type": "video/mp4" }
-   ```
-2. The control plane authorizes (`write`), allocates `version_id = 5e0db7a2`, **pre-registers** a `pending` version,
-   and asks the sidecar to begin the multipart session — which (on a `multipart_native` backend) calls
-   `CreateMultipartUpload` and records `upload_id = u7f1b2c3` with a backend handle. The control plane returns the
-   **exact, server-authoritative parts plan** plus one **signed PUT URL per part**:
-
-   ```json
-   200 OK
-   { "file_id": "9c2a4f10", "version_id": "5e0db7a2", "upload_id": "u7f1b2c3",
-     "part_size": 67108864, "parts": [
-       { "part": 1, "offset": 0,         "size": 67108864, "url": "https://fs-data.example.com/files/9c2a4f10/multipart/u7f1b2c3/parts/1?fs-token=eyJvcCI6Im11bHRpcGFydF9wYXJ0Ii4uLn0.cccp1A" },
-       { "part": 2, "offset": 67108864,  "size": 67108864, "url": ".../parts/2?fs-token=eyJvcC...cccp2B" },
-       { "part": 3, "offset": 134217728, "size": 67108864, "url": ".../parts/3?fs-token=eyJvcC...cccp3C" },
-       { "part": 4, "offset": 201326592, "size": 67108864, "url": ".../parts/4?fs-token=eyJvcC...cccp4D" },
-       { "part": 5, "offset": 268435456, "size": 67108864, "url": ".../parts/5?fs-token=eyJvcC...cccp5E" } ] }
-   ```
-   Each part URL carries a signed token exactly like §4.5: an `op=multipart_part` claim, the
-   `file_id`/`upload_id`/part number in the **path** (`/files/9c2a4f10/multipart/u7f1b2c3/parts/3`), and a short
-   `exp` (here ~1 hour). At `complete` the control plane folds the persisted per-part SHA-256 digests and offsets
-   into a canonical offset-manifest and stores `root = sha256(manifest)` — no re-read or re-hash of the assembled
-   object (the multipart-composite mode, ADR-0006; §4.2).
-
-#### Phase B — Upload parts (with durable per-part state)
-
-3. The browser uploads parts in parallel (up to the `concurrency` hint), each straight to the **sidecar**:
-   `PUT .../parts/1`, `PUT .../parts/2`, `PUT .../parts/3`. For each part the sidecar verifies the signature, streams
-   the bytes to the backend (`PutPart` on a native backend, or an offset-write into the single new-version object
-   otherwise), and computes the part's SHA-256 hash on-the-fly (no in-stream MIME/magic-byte check — that runs on the
-   control plane at `complete`, §4.2). The sidecar then reports the part's hash/size over the token-authenticated
-   `report-part` callback, and the control plane **persists the part state** (`multipart_upload_parts`:
-   `backend_etag`/offset, `size`, `part_hash`) — the sidecar itself never writes the DB.
-4. Say parts **1, 3, 4** land successfully (rows written) but parts **2 and 5** fail mid-flight, then the student's
-   session breaks — they are logged out and walk away. Note the gap is **non-contiguous** (a middle part and the last
-   part are missing). Crucially, the durable part rows for 1, 3, 4 survive in the DB, and the `multipart_uploads` row
-   stays `in_progress` with its own `expires_at` (a server-side grace window, e.g. 24 h — independent of the per-part
-   URL `exp`).
+2. The browser uploads parts in parallel to the **sidecar**. For each part the sidecar verifies the signature,
+   streams the bytes, computes the part's SHA-256, and reports hash/size over the token-authenticated
+   `report-part` callback; the control plane persists that state in `multipart_upload_parts` — the sidecar itself
+   never writes the DB, so an uploaded part survives a sidecar crash.
+3. Say parts 1, 3, 4 land (rows written) but parts 2 and 5 fail, and the student's session then breaks. The
+   durable rows for 1, 3, 4 survive; the `multipart_uploads` row stays `in_progress` with its own `expires_at`,
+   independent of any one part URL's `exp`.
 
 #### Phase C — Hours later: re-login and resume
 
-5. Hours pass. **Two clocks matter**, and they are different:
-   - the per-part **signed-URL `exp`** (~1 h) — now expired, so the old part URLs are unusable;
-   - the **multipart session `expires_at`** (~24 h grace) — *not* yet reached, so the session and parts 1, 3, 4 are intact.
-6. The student logs back in (fresh platform JWT). The LMS re-runs its business checks (is the assessment still open, is
-   this still the student's attempt) and, if still allowed, asks FSCP to **resume** by introspecting the session:
-
-   ```http
-   GET https://api.example.com/api/file-storage/v1/files/9c2a4f10/multipart/u7f1b2c3
-   Authorization: Bearer <LMS app token, on-behalf-of stu_91a2>
-   ```
-   ```json
-   200 OK
-   { "upload_id": "u7f1b2c3", "state": "in_progress", "part_size": 67108864,
-     "uploaded": [ { "part": 1, "size": 67108864 }, { "part": 3, "size": 67108864 }, { "part": 4, "size": 67108864 } ],
-     "missing": [
-       { "part": 2, "offset": 67108864,  "size": 67108864, "url": "https://fs-data.example.com/files/9c2a4f10/multipart/u7f1b2c3/parts/2?fs-token=eyJvcCI6Im11bHRpcGFydF9wYXJ0Ii4uLn0.rEsuM2" },
-       { "part": 5, "offset": 268435456, "size": 67108864, "url": ".../parts/5?fs-token=eyJvcC...rEsuM5" } ] }
-   ```
-   The control plane reads `multipart_upload_parts`, reports parts **1, 3, 4 as already uploaded**, and mints **fresh
-   signed URLs only for the missing parts 2 and 5** (new `exp`) — the missing set can be any subset, not just a
-   trailing range. Parts 1, 3, 4 are **not** re-uploaded — that is the resumability guarantee
-   (`cpt-cf-file-storage-fr-multipart-upload`). The same introspect call also covers the humbler **page-reload (F5)
-   case**: a browser client that persisted `{file_id, upload_id}` locally (e.g. localStorage) reloads, re-selects the
-   same file, introspects, and continues with only the missing parts — and since `complete` is idempotent (see
-   Phase D), a reload racing an in-flight `complete` simply re-issues it and receives the recorded result.
-7. The browser uploads only parts 2 and 5 with the fresh URLs (same durable-state path as Phase B).
+4. The per-part URL `exp` (short, e.g. ~1h) has since passed, but the session `expires_at` (24h default) has not.
+   The student logs back in; the LMS re-checks its own business rules and calls
+   `GET /files/{id}/multipart/{upload_id}` to resume. The control plane reports parts 1, 3, 4 as already uploaded
+   and mints fresh signed URLs only for the missing parts 2 and 5 (P2-5 above) — the missing set can be any subset,
+   not just a trailing range, and parts 1, 3, 4 are never re-uploaded. The same call also covers a simple
+   page-reload (F5): a client that persisted `{file_id, upload_id}` locally reloads, introspects, and continues
+   with only the missing parts.
+5. The browser uploads parts 2 and 5 with the fresh URLs (same durable-state path as Phase B).
 
 #### Phase D — Complete
 
-8. The client finalizes:
+6. The client calls `POST /files/{id}/multipart/{upload_id}/complete`. The control plane reads all reported part
+   rows, assembles them at the backend, and finalizes the version from the reported total size and the composite
+   manifest root (folded from the persisted per-part hashes — no re-read of the assembled object beyond the
+   bounded MIME sniff, §4.2). This flips `pending → available` like single-shot finalize.
 
-   ```http
-   POST https://api.example.com/api/file-storage/v1/files/9c2a4f10/multipart/u7f1b2c3/complete
-   ```
-   The control plane reads all reported part rows, asks the backend to assemble them
-   (`CompleteMultipartUpload` on a `multipart_native` backend), and **finalizes** the version (`status = available`)
-   from the **reported total part size** and the **composite manifest root** (`root = sha256(manifest)`, folded from
-   the persisted per-part `(offset, part_hash)` pairs — no re-read or re-hash of the assembled object; the only
-   complete-time read is the bounded ~8 KiB MIME-sniff, §4.2). This flips `pending → available` like single-shot
-   finalize. The endpoint accepts an **optional** `If-Match` and returns `200` with a JSON body `{version_id, size,
-   hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` (see
-   [features/multipart-coordinator.md](./features/multipart-coordinator.md)).
-
-   **Updated by the upload-flow redesign — bind now happens inside `complete` by default.** A session opened by the
-   merged `POST /files` create+plan call with `bind: "auto"` (the default) is bound by `complete` itself, in the same
-   transaction as the finalize, under the same CAS a manual bind uses (the endpoint's `If-Match`; for a new file's
-   first content, `content_id IS NULL`) — `bind_state: "bound"` + the new `etag` in the response, and **no separate
-   `bind` request**. A lost CAS is `bind_state: "conflict"` + `current_etag` (manual rebind, no re-upload);
-   `bind: "manual"` and sessions opened via the standalone `POST /files/{id}/multipart` (this §4.7 example's own
-   path, which presumes an existing file) keep the pre-redesign staged behaviour — `bind_state: "manual"` and the
-   separate `POST /files/9c2a4f10/bind {version_id: "5e0db7a2"}` afterwards. `complete` is also **idempotent** (a
-   retry replays the persisted result — including after an F5/page reload, see the refresh note in Phase C) and can
-   answer `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease: completion
-   runs as a lease-guarded state machine (`in_progress → completing → completed`, single conditional UPDATEs, no DB
-   transaction held across the backend assembly; a crashed completer's lease expires and the next `complete` takes
-   over). The `multipart_uploads` row flips to `completed` once `complete` succeeds. The exhaustive
-   state/race/failure model of this machine — per-transition DB ops, backend I/O, timeout inventory, and the full
-   failure matrix — is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
+   A session opened with `bind: "auto"` (the default for a new file's first content) is bound by `complete`
+   itself, in the same transaction as the finalize, under the endpoint's own `If-Match` CAS — `bind_state:
+   "bound"` plus the new `etag`, no separate `bind` request; a lost CAS is `bind_state: "conflict"` plus
+   `current_etag` (manual rebind, no re-upload). A `bind: "manual"` session (or one opened directly against an
+   existing file, as in this example) keeps `bind_state: "manual"` and needs the separate `POST /files/{id}/bind`
+   afterwards. `complete` is idempotent (a retry, including after a page reload, replays the persisted result) and
+   can return `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease. The
+   full state/race/failure model is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
 #### The other branch — session already reaped
 
-9. If the student had stayed away **longer than the session `expires_at`** (e.g. > 24 h), the P2 **cleanup engine**
-   would have already reaped the abandoned session: `AbortMultipartUpload` at the backend, the uploaded parts
-   discarded, and the `pending` version + `multipart_upload_parts` rows removed (`cpt-cf-file-storage-fr-orphan-reconciliation`).
-   The resume `GET` then returns `404` (no such upload) — the client must **re-initiate from scratch** (Phase A) and
-   re-upload everything. So the session `expires_at` is exactly the knob that bounds how long a half-finished upload
-   remains resumable; the short per-part URL `exp` only controls how often the client must re-presign, never whether
+7. Had the student stayed away longer than the session's `expires_at` (e.g. > 24h), the P2 cleanup engine would
+   already have reaped it (`AbortMultipartUpload`, the part and pending-version rows removed,
+   `cpt-cf-file-storage-fr-orphan-reconciliation`); the resume `GET` then returns `404` and the client must
+   re-initiate from scratch. The session `expires_at` is the knob that bounds how long a half-finished upload
+   stays resumable; the short per-part URL `exp` only controls how often the client re-presigns, never whether
    progress is lost.
 
 ### 4.8 P1 implementation notes & decisions

@@ -14,15 +14,14 @@ use crate::domain::error::DomainError;
 use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::{IdempotencyInsert, Store, pending_version};
 
-/// FS-14 fix: de-duplicate a new file's initial `custom_metadata` entries
-/// (last occurrence in the request wins) before batching them into one
+/// De-duplicate a new file's initial `custom_metadata` entries (last
+/// occurrence in the request wins) before batching them into one
 /// `MetadataRepo::insert_many` call. Nothing upstream (`NewFile::
 /// custom_metadata: Vec<CustomMetadataEntry>`) guarantees a client can't
-/// list the same key twice in one create request; the pre-fix sequential
-/// per-entry `upsert` loop (delete-then-insert per entry) naturally gave
-/// "last one wins" for such a duplicate, whereas a single multi-row INSERT
-/// with the same `(file_id, key)` twice would instead violate the primary
-/// key and fail the whole create. This preserves the exact old semantics.
+/// list the same key twice in one create request, and a single multi-row
+/// INSERT with the same `(file_id, key)` twice would violate the primary key
+/// and fail the whole create -- so duplicates must be resolved to "last one
+/// wins" before batching.
 fn dedup_initial_metadata(entries: &[(String, String)]) -> Vec<(String, String)> {
     let mut deduped: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (k, v) in entries {
@@ -77,9 +76,6 @@ impl Store {
     /// write an audit row — both in a single transaction.
     ///
     /// Returns `true` if a row was removed.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_file(
         &self,
         scope: &AccessScope,
@@ -103,7 +99,6 @@ impl Store {
             Box::pin(async move {
                 let removed = files.delete(tx, &del_scope, file_id).await?;
                 if removed {
-                    // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
                 }
                 Ok::<bool, DomainError>(removed)
@@ -119,9 +114,6 @@ impl Store {
     /// leave a visible file with no version (or partial metadata) behind.
     ///
     /// An audit row is written in the same transaction.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn create_file_with_pending_version(
         &self,
@@ -183,7 +175,6 @@ impl Store {
                             now,
                         )
                         .await?;
-                    // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
                     Ok::<(), DomainError>(())
                 })
@@ -191,7 +182,7 @@ impl Store {
             .await
     }
 
-    // ── file-events variants (P2-M5) ─────────────────────────────────────────
+    // ── file-events variants ─────────────────────────────────────────────────
 
     /// Delete a file row (FK cascade removes versions + custom metadata),
     /// optionally enqueue a file-event, and write an audit row — all in a
@@ -201,10 +192,6 @@ impl Store {
     ///
     /// This is the events-aware variant of [`delete_file`]; the original method
     /// is preserved for callers that do not need event enqueuing.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_file_with_event(
         &self,
         scope: &AccessScope,
@@ -242,7 +229,7 @@ impl Store {
     }
 
     /// Delete the parent `files` row left behind by an abandoned
-    /// pending-version orphan (P2 2.8).
+    /// pending-version orphan.
     ///
     /// Unlike [`Self::delete_file_with_event`] (unconditional -- used by the
     /// retention-expiry sweep, which has already decided the file must go
@@ -270,9 +257,6 @@ impl Store {
     /// Returns `true` if the file row was removed; `false` if the guard did
     /// not match (a version now exists or content is bound) or the row was
     /// already gone (e.g. a concurrent sweep).
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn delete_orphan_file_with_event(
         &self,
         file_id: Uuid,
@@ -313,10 +297,6 @@ impl Store {
     ///
     /// This is the events-aware variant of [`create_file_with_pending_version`];
     /// the original is preserved for callers that do not need event enqueuing.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn create_file_with_pending_version_and_event(
         &self,
@@ -406,15 +386,12 @@ impl Store {
     }
 
     /// Create the file row (+ initial custom metadata, audit, optional event)
-    /// WITHOUT pre-registering any version (upload-flow redesign). Used by
-    /// the merged `POST /files` create+plan path, where the multipart
+    /// WITHOUT pre-registering any version. Used by the merged `POST /files`
+    /// create+plan path, where the multipart
     /// initiate that follows registers its own pending version — the
     /// pre-registered single-part version of
     /// [`Self::create_file_with_pending_version_and_event`] would only become
     /// an orphan here.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn create_file_with_event(
         &self,
         new: &NewFile,
@@ -474,8 +451,6 @@ impl Store {
     /// List file-event rows for a specific file ordered by occurrence time.
     ///
     /// Intended for testing; not exposed on the REST API.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn list_file_events(
         &self,
         file_id: Uuid,

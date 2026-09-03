@@ -1,23 +1,22 @@
-//! Add `auto_bind` to `multipart_uploads` (upload-flow redesign).
+//! Add `auto_bind` to `multipart_uploads`.
 //!
-//! `POST /files` can now open a multipart session directly (merged
-//! create+plan) with `bind: "auto"` (the default), in which case
-//! `complete_multipart_upload` performs the content bind itself — in the same
-//! transaction as the version finalize, under the same CAS as a manual
-//! `POST /files/{id}/bind` — instead of requiring a separate client `bind`
-//! request. The chosen mode is fixed at session creation, so it is persisted
-//! on the session row; `complete` reads it back rather than trusting any
-//! per-request input.
+//! `POST /files` can open a multipart session directly (merged create+plan)
+//! with `bind: "auto"` (the default), in which case `complete_multipart_upload`
+//! performs the content bind itself — in the same transaction as the version
+//! finalize, under the same CAS as a manual `POST /files/{id}/bind` — instead
+//! of requiring a separate client `bind` request. The chosen mode is fixed at
+//! session creation, so it is persisted on the session row; `complete` reads
+//! it back rather than trusting any per-request input.
 //!
 //! Existing rows (and sessions opened via the still-supported standalone
-//! `POST /files/{id}/multipart`) default to `FALSE` — the pre-redesign
-//! staged behaviour (complete never binds; the client binds manually).
+//! `POST /files/{id}/multipart`) default to `FALSE` — staged behaviour
+//! (complete never binds; the client binds manually).
 //!
-//! Also adds the completion-lease state-machine columns (same redesign):
-//! `complete` transitions `in_progress → completing(lease_owner,
-//! lease_until) → completed(complete_result)` via single conditional
-//! UPDATEs — no DB transaction is held across the backend assembly I/O — and
-//! the persisted `complete_result` JSON makes re-complete idempotent.
+//! Also adds the completion-lease state-machine columns: `complete`
+//! transitions `in_progress → completing(lease_owner, lease_until) →
+//! completed(complete_result)` via single conditional UPDATEs — no DB
+//! transaction is held across the backend assembly I/O — and the persisted
+//! `complete_result` JSON makes re-complete idempotent.
 //!
 //! `down()` performs a real rollback on both dialects: it drops the four new
 //! columns and restores the original narrow `state` CHECK (folding any live
@@ -117,13 +116,13 @@ CREATE INDEX IF NOT EXISTS multipart_uploads_expired_idx
     ON multipart_uploads (expires_at, state);
 ";
 
-// PostgreSQL down: drop the four redesign columns and restore the original
-// narrow state CHECK. A `completing` row cannot satisfy the narrow CHECK
-// (that lease state did not exist pre-redesign) — a real rollback can only
-// have live `completing` rows if a completer is lease-holding mid-flight, so
-// treat them the same way an expired lease eventually would and fold them
-// into `aborted` before the CHECK is narrowed, rather than leaving the
-// rollback to fail outright on an active deployment.
+// PostgreSQL down: drop the four new columns and restore the original narrow
+// state CHECK. A `completing` row cannot satisfy the narrow CHECK (that
+// lease state did not exist before this migration) — a real rollback can
+// only have live `completing` rows if a completer is lease-holding
+// mid-flight, so treat them the same way an expired lease eventually would
+// and fold them into `aborted` before the CHECK is narrowed, rather than
+// leaving the rollback to fail outright on an active deployment.
 const POSTGRES_DOWN: &str = r"
 UPDATE multipart_uploads SET state = 'aborted' WHERE state = 'completing';
 ALTER TABLE multipart_uploads DROP CONSTRAINT IF EXISTS multipart_uploads_state_check;
@@ -137,11 +136,10 @@ ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS complete_result;
 ";
 
 // SQLite down: same child-safe rebuild-and-rename pattern as `SQLITE_UP`,
-// mirrored to restore the pre-redesign table shape (no `auto_bind` /
-// `lease_until` / `lease_owner` / `complete_result` columns, narrow state
-// CHECK) — including the same `completing` → `aborted` fold-in (done inline
-// in the copy's `SELECT`, since SQLite's CHECK is enforced at INSERT into the
-// new table) and the same reconstruction of both indexes.
+// mirrored to restore the table shape without the four new columns and with
+// the narrow state CHECK. The `completing` -> `aborted` fold-in (see
+// `POSTGRES_DOWN`'s comment for why) happens inline in the copy's `SELECT`
+// here, since SQLite's CHECK is enforced at INSERT into the new table.
 const SQLITE_DOWN: &str = r"
 CREATE TABLE multipart_upload_parts_backup AS SELECT * FROM multipart_upload_parts;
 
@@ -212,10 +210,7 @@ impl MigrationTrait for Migration {
         let sql = match manager.get_database_backend() {
             sea_orm::DatabaseBackend::Postgres => POSTGRES_DOWN,
             sea_orm::DatabaseBackend::Sqlite => SQLITE_DOWN,
-            // MySQL and any backend a future `sea_orm` adds to the
-            // `#[non_exhaustive]` `DatabaseBackend` enum are refused
-            // explicitly here, rather than left to a panic on an
-            // uncovered pattern.
+            // See `up()`'s matching arm.
             _ => {
                 return Err(DbErr::Custom(
                     "file-storage migrations support Postgres and SQLite only".to_owned(),
