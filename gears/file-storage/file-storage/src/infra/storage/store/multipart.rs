@@ -59,7 +59,44 @@ impl Store {
         self.repos.multipart.get(&conn, upload_id).await
     }
 
-    /// Insert or replace a multipart upload part.
+    /// Insert or replace a multipart upload part, guarded and written in a
+    /// single transaction (P2 report-part-atomicity remediation).
+    ///
+    /// Before this fix, `MultipartService::report_part` checked
+    /// `session.state == InProgress` against an already-loaded snapshot and
+    /// then, in a completely separate call, this method took a bare
+    /// (non-transactional) connection and issued a DELETE followed by an
+    /// INSERT -- see `MultipartRepo::upsert_part`'s old doc comment history
+    /// for detail. That left two independent race windows open:
+    ///
+    /// 1. `complete_multipart_upload` snapshotting `list_multipart_parts` in
+    ///    the instant between this method's DELETE and INSERT would see the
+    ///    part as missing and fail the upload with a spurious "parts
+    ///    missing" `409`, even though the part had in fact been (re-)reported.
+    /// 2. A `report_part` that raced a concurrent `abort_multipart_upload`
+    ///    (whose CAS + `delete_parts_for_upload` run together in one
+    ///    transaction) could have its own state check pass, then have its
+    ///    unguarded INSERT land AFTER the abort's `delete_parts_for_upload`
+    ///    already ran -- leaving a permanently orphaned part row, since a
+    ///    `multipart_uploads` row is never deleted, only transitioned (so
+    ///    nothing ever revisits it to clean the row up).
+    ///
+    /// Now the guard (re-checking `state == 'in_progress'`, taking a row
+    /// lock that serializes against any concurrent session-row CAS) and the
+    /// write happen inside one transaction -- see
+    /// `MultipartRepo::upsert_part` for exactly how.
+    ///
+    /// # Error contract (unchanged shape, now also reachable from here)
+    ///
+    /// This method's signature stays `Result<(), DomainError>` -- the
+    /// `MultipartStore` port is not touched by this fix. When the guard
+    /// finds the session no longer `in_progress`, this now returns
+    /// `Err(DomainError::multipart_upload_not_in_progress(..))` directly --
+    /// the SAME error variant `MultipartService::report_part`'s pre-existing
+    /// (now merely fast-path) state check already returns for that case, so
+    /// the HTTP contract is unchanged: callers that already propagate this
+    /// method's `Err` via `?` need no changes to keep returning the correct
+    /// `409`.
     ///
     /// @cpt-cf-file-storage-fr-multipart-upload
     #[allow(clippy::too_many_arguments)]
@@ -72,18 +109,43 @@ impl Store {
         size: i64,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
-        let conn = self.db.conn().map_err(db_err)?;
-        self.repos
-            .multipart
-            .upsert_part(
-                &conn,
-                upload_id,
-                part_number,
-                backend_etag,
-                part_hash,
-                size,
-                now,
-            )
+        let multipart = self.repos.multipart.clone();
+        let backend_etag = backend_etag.to_owned();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let written = multipart
+                        .upsert_part(
+                            tx,
+                            upload_id,
+                            part_number,
+                            &backend_etag,
+                            part_hash,
+                            size,
+                            now,
+                        )
+                        .await?;
+                    if written {
+                        return Ok(());
+                    }
+                    // Guard lost: the session is no longer `in_progress`.
+                    // Fetch its current state, best-effort, purely to put an
+                    // accurate value on the error -- a lookup failure here
+                    // must not hide the fact that the part was NOT written,
+                    // so it falls back to a placeholder rather than
+                    // propagating and masking the real (guard) failure.
+                    let state = multipart
+                        .get(tx, upload_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map_or("gone", |session| session.state.as_str());
+                    Err(DomainError::multipart_upload_not_in_progress(
+                        upload_id, state,
+                    ))
+                })
+            })
             .await
     }
 

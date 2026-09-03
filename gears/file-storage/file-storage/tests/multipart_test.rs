@@ -2513,7 +2513,7 @@ impl StorageBackend for CompleteCallCountingBackend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<futures::stream::BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.inner.get_stream(path).await
     }
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
@@ -4094,6 +4094,90 @@ async fn complete_takes_over_expired_lease_and_finishes() {
         .unwrap()
         .expect("version");
     assert_eq!(version.status, file_storage_sdk::VersionStatus::Available);
+}
+
+/// A `completing` session whose lease AND `expires_at` have both expired
+/// (the completer died mid-assembly, and then enough time passed that the
+/// session itself expired before any sweep tick or retry came along) must
+/// answer a `complete` retry with a definitive expiry error, never
+/// `Completing`. Before the fix in `complete_multipart_upload`'s losing-CAS
+/// branch, this state was indistinguishable from "someone else is still
+/// completing it": the branch only inspected `fresh.state`, saw
+/// `Completing`, and answered HTTP 202 forever -- the session can never
+/// un-expire, so the client would poll until the abandoned-session sweep
+/// eventually aborted it.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+#[tokio::test]
+async fn complete_on_expired_completing_session_returns_expired_not_completing() {
+    let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            5,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session");
+    let backend_path = format!("/{}/{}", file_id, plan.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        1,
+        Bytes::from_static(b"AAAAA"),
+    )
+    .await;
+
+    // A "dead" completer left the state at `completing` with an EXPIRED
+    // lease -- same setup as `complete_takes_over_expired_lease_and_finishes`.
+    let now = time::OffsetDateTime::now_utc();
+    let acquired = multipart_store
+        .acquire_multipart_complete_lease(
+            plan.upload_id,
+            "dead-completer",
+            now - time::Duration::seconds(5),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(acquired);
+
+    // Unlike the takeover test, the session's own `expires_at` has ALSO
+    // passed by now -- no sweep tick has run to move it to `aborted`.
+    store
+        .set_multipart_expires_at_for_test(
+            plan.upload_id,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+
+    let err = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .expect_err("an expired completing session must never be retried into Completing");
+    match err {
+        DomainError::MultipartUploadNotInProgress { state, .. } => {
+            assert_eq!(
+                state, "expired",
+                "must report the session as expired, not its raw state"
+            );
+        }
+        other => panic!("expected MultipartUploadNotInProgress(\"expired\"), got {other:?}"),
+    }
 }
 
 /// (г) Resume end-to-end: part 1 of 2 lands, introspect reports part 2
