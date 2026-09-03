@@ -51,6 +51,15 @@ reason = "Ignore module 'nodes-registry' (not SDLC-documented yet: missing requi
 patterns = ["gears/system/nodes-registry/*"]
 
 [[ignore]]
+reason = "Ignore file-storage codebase and features — code traceability markers were removed from this gear at the owner's request, so every `to_code` artifact would otherwise report `code-no-marker`. Same shape as the oagw entry below. PRD/DESIGN/ADR/DECOMPOSITION stay validated via autodetect."
+patterns = [
+  "gears/file-storage/file-storage/src/*",
+  "gears/file-storage/file-storage/tests/*",
+  "gears/file-storage/file-storage-sdk/src/*",
+  "gears/file-storage/docs/features/*",
+]
+
+[[ignore]]
 reason = "Ignore oagw codebase and features — code traceability markers reverted, pending re-add. PRD/DESIGN/ADR/DECOMPOSITION still validated via autodetect."
 patterns = [
   "gears/system/oagw/oagw/src/*",

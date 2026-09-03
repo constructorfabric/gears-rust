@@ -131,7 +131,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (flow documented inline in `cpt-cf-file-storage-flow-multipart-initiate`, `cpt-cf-file-storage-flow-multipart-upload-part`, `cpt-cf-file-storage-flow-multipart-complete`, `cpt-cf-file-storage-flow-multipart-abort`)
+  - None (flow documented inline in `docs/features/multipart-coordinator.md`)
 
 - **Data**:
 
@@ -187,7 +187,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (flow documented inline in `cpt-cf-file-storage-flow-content-hash-modes-client-reverify`)
+  - None (flow documented inline in `docs/features/content-hash-modes.md`)
 
 - **Data**:
 
@@ -370,7 +370,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (flow documented inline in `cpt-cf-file-storage-flow-audit-trail-record-write`)
+  - None (flow documented inline in `docs/features/audit-trail.md`)
 
 - **Data**:
 
@@ -426,7 +426,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (flow documented inline in `cpt-cf-file-storage-flow-ownership-transfer`)
+  - None (flow documented inline in `docs/features/ownership-transfer.md`)
 
 - **Data**:
 
@@ -479,8 +479,8 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (flow and race-resolution documented inline in `cpt-cf-file-storage-flow-backend-migration` and
-    `cpt-cf-file-storage-algo-backend-migration-race-resolve`)
+  - None (flow and race-resolution documented inline in `docs/features/backend-migration.md` and
+    `docs/features/backend-migration.md`)
 
 - **Data**:
 
@@ -514,7 +514,7 @@ cpt-cf-file-storage-feature-audit-trail (cross-cutting; every write path above a
 
 - `cpt-cf-file-storage-feature-multipart-coordinator` depends on the upload and versioning foundation: the initiate endpoint pre-registers a pending version in the file_versions table; the complete endpoint finalizes that version (a later, separate `bind` call activates it via the same CAS mechanism used for single-shot uploads); the signed-URL infrastructure (minting and verification -- a codec-equivalent Ed25519 token, not literal PASETO, per ADR-0004's Implementation note) is part of that foundation.
 - `cpt-cf-file-storage-feature-content-hash-modes` depends on `cpt-cf-file-storage-feature-multipart-coordinator`: it consumes the multipart plan's per-part byte offsets (`compute_plan`) and the per-part SHA-256 digests multipart-coordinator already persists into `multipart_upload_parts.part_hash`, combining them into the offset-manifest composite at `complete` instead of multipart-coordinator's current re-read-and-rehash. It introduces no new inter-feature dependency beyond this one.
-- `cpt-cf-file-storage-feature-policy-engine` depends on the upload foundation the same way multipart-coordinator does (its enforcement hooks live in `create_file`/`presign_version`), but is otherwise independent of multipart-coordinator/content-hash-modes -- it is also consumed by multipart-coordinator's own initiate flow (the MIME/size checks in `cpt-cf-file-storage-flow-multipart-initiate`), making it a dependency of that feature too, not shown as a second arrow above to keep the diagram acyclic-readable.
-- `cpt-cf-file-storage-feature-backend-migration` depends on `cpt-cf-file-storage-feature-content-hash-modes`: its pre-commit hash check dispatches through that feature's shared `cpt-cf-file-storage-algo-content-hash-modes-verify` algorithm rather than hard-coding a whole-object-only comparison, so a `multipart-composite-sha256` version can be migrated correctly.
+- `cpt-cf-file-storage-feature-policy-engine` depends on the upload foundation the same way multipart-coordinator does (its enforcement hooks live in `create_file`/`presign_version`), but is otherwise independent of multipart-coordinator/content-hash-modes -- it is also consumed by multipart-coordinator's own initiate flow (the MIME/size checks in `docs/features/multipart-coordinator.md`), making it a dependency of that feature too, not shown as a second arrow above to keep the diagram acyclic-readable.
+- `cpt-cf-file-storage-feature-backend-migration` depends on `cpt-cf-file-storage-feature-content-hash-modes`: its pre-commit hash check dispatches through that feature's shared `docs/features/content-hash-modes.md` algorithm rather than hard-coding a whole-object-only comparison, so a `multipart-composite-sha256` version can be migrated correctly.
 - `cpt-cf-file-storage-feature-audit-trail` is a cross-cutting dependency of every feature with a write path in this document (multipart-coordinator, ownership-transfer, backend-migration, retention-cleanup, and the upload/versioning foundation's own create/finalize/bind/patch/delete operations) -- it does not itself depend on any of them, since its transactional-outbox mechanism is generic over the caller's `AuditEntry`.
 - `cpt-cf-file-storage-feature-ownership-transfer` and `cpt-cf-file-storage-feature-retention-cleanup` both depend on `cpt-cf-file-storage-feature-audit-trail` for their respective `TransferOwnership`/`RetentionDelete`/`OrphanReconcile` audit rows, and are otherwise independent of each other and of multipart-coordinator/content-hash-modes/backend-migration.
