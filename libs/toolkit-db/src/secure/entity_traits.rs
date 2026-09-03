@@ -157,35 +157,21 @@ pub trait ScopableEntity: EntityTrait {
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column>;
 
-    /// Every column a scope predicate can address on this entity — exactly the
-    /// set [`resolve_property`](Self::resolve_property) can return.
+    /// The columns a scope predicate can be compiled against: the same set
+    /// [`resolve_property`](Self::resolve_property) can return, as a list.
     ///
-    /// `resolve_property` answers "which column does this property mean" but
-    /// cannot be enumerated, so nothing could ask the opposite question:
-    /// *which* columns are scope columns at all. Two things need that answer.
+    /// `resolve_property` maps one property name to a column and cannot be
+    /// enumerated. The SQL/PGQ graph declaration needs the whole set: a scope
+    /// column left out of an element's `PROPERTIES` list cannot be filtered on
+    /// inside `MATCH` (`docs/arch/secure-orm/ADR/0002`, Policy 3), and an
+    /// element whose set is empty is refused up front instead of compiling to a
+    /// deny-all traversal (Policy 2).
     ///
-    /// A property-graph declaration must expose every scope column as a graph
-    /// property, because a column absent from a `PROPERTIES` list is invisible
-    /// to `MATCH` — not an error, just silently unfilterable, which for a scope
-    /// column means the pattern cannot be scoped
-    /// (`docs/arch/secure-orm/ADR/0002`, Policy 3). And a graph element must be
-    /// rejected up front when it resolves no scope column at all, rather than
-    /// compiling to a deny-all traversal that looks like missing data
-    /// (Policy 2).
-    ///
-    /// Required rather than defaulted, because a default cannot be right: it
-    /// would either omit the extra properties a hand-written
-    /// `resolve_property` maps (their columns then miss the `PROPERTIES` list
-    /// and the pattern silently cannot filter on them), or enumerate a column
-    /// like [`type_col`](Self::type_col) that no property resolves to (the
-    /// entity then passes the Policy 2 gates while resolving nothing — the
-    /// silent deny-all those gates exist to refuse). Manual implementors
-    /// enumerate the same set their `resolve_property` can return;
-    /// `#[derive(Scopable)]` generates both from one configuration so they
-    /// cannot disagree.
-    ///
-    /// Note `type_col` is **not** a scope column: `resolve_property` has no
-    /// well-known property name for it, so no scope constraint can address it.
+    /// Usually `tenant_col`, `resource_col` and `owner_col` plus any
+    /// `pep_prop(...)` columns. `type_col` is not part of it: no property name
+    /// resolves to it, so no scope can address it. `#[derive(Scopable)]`
+    /// generates this and `resolve_property` from the same attributes; a manual
+    /// implementation must keep the two in step.
     #[must_use]
     fn scope_columns() -> Vec<Self::Column>;
 }
