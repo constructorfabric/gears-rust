@@ -108,8 +108,6 @@ pub struct CreateFileReq {
     /// Within the same `(owner_kind, owner_id)`, a retry with the same key
     /// returns the original response without creating a new file.
     /// Not supported together with `multipart` (rejected with 400).
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
     #[serde(default)]
     pub idempotency_key: Option<String>,
     /// Optional multipart intent (upload-flow redesign). When present and the
@@ -186,8 +184,6 @@ pub struct UpdateMetadataReq {
 ///
 /// Wire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`
 /// fields, ADR-0006).
-///
-/// @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-docs:p2
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct VersionDto {
@@ -416,10 +412,6 @@ impl From<MetadataLimitsDto> for MetadataLimits {
 }
 
 /// Policy body in requests and responses.
-///
-/// @cpt-cf-file-storage-fr-allowed-types-policy
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-metadata-limits
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
 pub struct PolicyBodyDto {
@@ -491,8 +483,6 @@ impl From<StoredPolicy> for PolicyDto {
 }
 
 /// Effective policy response: the most-restrictive combination of tenant ⊕ user.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EffectivePolicyDto {
@@ -607,8 +597,6 @@ impl From<MetadataRetentionDto> for MetadataRetention {
 }
 
 /// Retention rule body in requests and responses.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
 pub struct RetentionRuleBodyDto {
@@ -696,10 +684,6 @@ pub struct CreateRetentionRuleReq {
 ///
 /// The server returns a server-authoritative parts plan with one signed sidecar
 /// URL per part (FEATURE §3, §4; DESIGN §4.6).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-storage-quota
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct InitiateMultipartReq {
@@ -711,9 +695,6 @@ pub struct InitiateMultipartReq {
     /// plane validates this value against the effective policy size limit and the
     /// storage quota at initiate time — exactly as single-part upload does — so
     /// that an oversized upload is rejected before any bytes are transferred.
-    ///
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-storage-quota
     pub declared_size: u64,
     /// Client hint for the preferred part size in bytes. The server may override
     /// it to satisfy the backend's minimum part size requirements (FEATURE §3).
@@ -726,8 +707,6 @@ pub struct InitiateMultipartReq {
 }
 
 /// One part in the server-authoritative parts plan.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartPartPlanDto {
@@ -746,8 +725,6 @@ pub struct MultipartPartPlanDto {
 ///
 /// The client `PUT`s each part's bytes to its `upload_url`; the sidecar
 /// enforces the `size` claim before writing any bytes (FEATURE §4).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartPlanDto {
@@ -771,8 +748,6 @@ pub struct MultipartPlanDto {
 /// the previous bare `204 No Content`. `manifest` lets a client independently
 /// re-verify the composite hash (`docs/features/content-hash-modes.md`
 /// §"Client-Side Manifest Re-Verification") without a second round-trip.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartCompleteDto {
@@ -825,8 +800,6 @@ pub struct MultipartCompletingDto {
 }
 
 /// One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`, item 3.4).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct ReceivedPartDto {
@@ -840,8 +813,6 @@ pub struct ReceivedPartDto {
 ///
 /// `upload_url` is present only while the session is still `in_progress` and
 /// unexpired; a terminal or expired session omits it.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MissingPartDto {
@@ -860,8 +831,6 @@ pub struct MissingPartDto {
 /// each carrying a fresh resume `upload_url` when the session can still be
 /// resumed (`in_progress` and unexpired) — a terminal or expired session
 /// reports state and part accounting only, with no URLs to act on.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartStatusDto {
@@ -883,8 +852,6 @@ pub struct MultipartStatusDto {
 // ── Backend migration DTOs (P2-M4) ─────────────────────────────────────────────
 
 /// Request to migrate a file's content to a different storage backend.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct MigrateBackendReq {
@@ -895,8 +862,6 @@ pub struct MigrateBackendReq {
 // ── Ownership transfer DTOs (P2-M5) ───────────────────────────────────────────
 
 /// Request to transfer ownership of a file (`POST /files/{id}/transfer`).
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct TransferOwnershipReq {

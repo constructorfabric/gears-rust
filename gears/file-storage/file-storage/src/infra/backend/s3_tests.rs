@@ -200,7 +200,7 @@ async fn s3_backend_exists_distinguishes_missing_from_error() {
     assert!(backend.exists("now-present").await.unwrap());
 }
 
-/// P2 1.6: `is_ready` against a reachable, correctly-authenticated `s3s-fs`
+/// `is_ready` against a reachable, correctly-authenticated `s3s-fs`
 /// endpoint with an existing (empty) bucket must succeed — `ListObjectsV2`
 /// returns `200` with an empty listing, which `is_ready` must treat as
 /// "ready".
@@ -216,7 +216,7 @@ async fn s3_is_ready_ok_against_s3s_fs() {
         .expect("is_ready must succeed against a reachable, authenticated endpoint");
 }
 
-/// P2 1.6: `is_ready` against an endpoint nothing listens on must fail
+/// `is_ready` against an endpoint nothing listens on must fail
 /// (transport error), not silently report ready.
 #[tokio::test]
 async fn s3_is_ready_err_against_closed_port() {

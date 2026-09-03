@@ -1,7 +1,6 @@
 // Created: 2026-07-27 by Constructor Tech
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-//! Contract-drift tests for the file-storage DB-behavior audit (Step 4 of
-//! the DB-behavior audit program -- see
+//! Contract-drift tests for the file-storage DB-behavior audit (see
 //! `docs/toolkit_unified_system/14_db_behavior_testing.md`).
 //!
 //! `contract-drift` here means: a documented promise (in `gears/file-storage/
@@ -9,41 +8,41 @@
 //! describing intended behavior) does not match what the code actually
 //! does. Two shapes are covered:
 //!
-//! - **FS-06 / F4** (RESOLVED): a *behavioral* drift -- the documented
-//!   "every retry is safe" property had a real gap (a stale If-Match could
-//!   fail-precondition an otherwise-honest retry of an already-Completed
-//!   session instead of replaying it), reproduced directly against the
-//!   domain layer, then fixed by reordering the session-state replay check
-//!   ahead of the If-Match precondition check.
-//! - **FS-12** (new finding, not in `upload-flow-review.md`, RESOLVED alongside
-//!   FS-02): `concurrency-and-failure-model.md`'s own Race Catalog item 2
-//!   stated a claim that this audit found reachably false for one specific
-//!   interleaving, before FS-02's remediation. The FS-02 fix makes the same
+//! - A *behavioral* drift: the documented "every retry is safe" property
+//!   had a real gap (a stale If-Match could fail-precondition an otherwise-
+//!   honest retry of an already-Completed session instead of replaying it),
+//!   reproduced directly against the domain layer, then fixed by reordering
+//!   the session-state replay check ahead of the If-Match precondition
+//!   check.
+//! - A *doc-claim* drift: `concurrency-and-failure-model.md`'s own Race
+//!   Catalog item 2 stated a claim that this audit found reachably false
+//!   for one specific interleaving, before the owner-fencing fix covered in
+//!   `pg_concurrency_test.rs`'s `f2_*` scenarios. That fix makes the same
 //!   interleaving converge correctly, so the claim is true again -- pinned
 //!   here (via `include_str!`, cross-referenced to
 //!   `tests/pg_concurrency_test.rs::
 //!   f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`)
-//!   so a future regression of the FS-02 fix would also show up as a
-//!   doc-vs-code drift here, not just a silent behavior change.
+//!   so a future regression of that fix would also show up as a doc-vs-code
+//!   drift here, not just a silent behavior change.
 //!
-//! F5 (`POST /files` rejects `multipart` + `idempotency_key` before any DB
-//! call -- `handlers.rs:178-188`) and F6 (single-part `bind:"manual"` emits
-//! no `X-FS-Bound` response header -- `handlers.rs:895-922`) are verified
-//! contract corrections but are deliberately **not** given tests here: both
-//! are request-validation / HTTP-response-shape concerns with no DB
-//! transaction, statement-count, or concurrency dimension at all -- squarely
-//! the layer `14_db_behavior_testing.md`'s own "What Does NOT Belong Here"
-//! section excludes ("JSON wire format, HTTP status codes" -- E2E/unit
-//! tests' job, not this layer's). F7 (the multipart gate is the
-//! `multipart_native` *capability*, not backend identity -- doc's "S3
-//! required" is too strong) is already fully corroborated by this audit's
-//! existing `db_behavior_audit_test.rs` pair
+//! A few other contract corrections from the same review are deliberately
+//! **not** given tests here: request-validation / HTTP-response-shape
+//! concerns (`POST /files`'s multipart+idempotency_key rejection in
+//! `handlers.rs:178-188`; the missing `X-FS-Bound` header on a manual
+//! single-part bind in `handlers.rs:895-922`) have no DB transaction,
+//! statement-count, or concurrency dimension at all -- squarely the layer
+//! `14_db_behavior_testing.md`'s own "What Does NOT Belong Here" section
+//! excludes ("JSON wire format, HTTP status codes" -- E2E/unit tests' job,
+//! not this layer's). The multipart gate being the `multipart_native`
+//! *capability*, not backend identity (the doc's "S3 required" is too
+//! strong), is already fully corroborated by this audit's existing
+//! `db_behavior_audit_test.rs` pair
 //! (`multipart_initiate_capability_reject_leaves_orphan_bare_file` +
 //! `negative_control_multipart_native_backend_initiate_succeeds`, which
-//! differ *only* in backend topology) -- no new test needed. F8 (no
-//! session-list/discovery route) is a documented absence, not a DB-behavior
-//! defect -- verified by direct code reading (`routes.rs`), not given a
-//! test.
+//! differ *only* in backend topology) -- no new test needed. The absence of
+//! a session-list/discovery route is a documented absence, not a
+//! DB-behavior defect -- verified by direct code reading (`routes.rs`), not
+//! given a test.
 
 mod common;
 
@@ -51,13 +50,13 @@ use file_storage::domain::multipart::BindState;
 use uuid::Uuid;
 
 // =========================================================================
-// FS-06 / F4 fix verification: a completed multipart upload's exact retry
-// used to not always be replayed -- a stale If-Match (valid at request
-// time, no longer valid after the completion's own auto-bind moved the
-// pointer) was rejected with PreconditionFailed *before* the session-state
-// check that would otherwise recognize "this exact session is already
-// Completed -- replay it" ever ran. Fixed by moving the session-state
-// replay check before the If-Match precondition check.
+// A completed multipart upload's exact retry used to not always be
+// replayed -- a stale If-Match (valid at request time, no longer valid
+// after the completion's own auto-bind moved the pointer) was rejected
+// with PreconditionFailed *before* the session-state check that would
+// otherwise recognize "this exact session is already Completed -- replay
+// it" ever ran. Fixed by moving the session-state replay check before the
+// If-Match precondition check.
 // =========================================================================
 
 #[tokio::test]
@@ -135,11 +134,9 @@ async fn fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_fail
     // successful response carried, retries the IDENTICAL request: same
     // upload_id, same (now-stale) If-Match value. Per concurrency-and-
     // failure-model.md's Ground Rule 2 ("Every retry is safe by
-    // construction... `complete` replays its persisted result") and
-    // Invariants ("Every retry is safe: ... `complete` (persisted-result
-    // replay)"), this must replay the stored 200 -- FS-06/F4 fix: the
-    // session-state replay check now runs before the If-Match precondition
-    // check, so this no longer fails.
+    // construction... `complete` replays its persisted result"), this must
+    // replay the stored 200 -- the session-state replay check now runs
+    // before the If-Match precondition check, so this no longer fails.
     let retry = s
         .msvc
         .complete_multipart_upload(
@@ -213,11 +210,11 @@ async fn negative_control_fs06_completed_retry_without_if_match_replays_correctl
 }
 
 // =========================================================================
-// FS-12 (new finding, RESOLVED as a side effect of the FS-02 fix):
 // concurrency-and-failure-model.md's Race Catalog item 2 states a claim
-// that was reachably false before FS-02's remediation, and is true again
-// now -- pinned here so a future regression of FS-02's fix would also be
-// caught as a doc-vs-code drift, not just a silent behavior change.
+// that was reachably false before the owner-fencing fix (see
+// pg_concurrency_test.rs's f2_* scenarios), and is true again now -- pinned
+// here so a future regression of that fix would also be caught as a
+// doc-vs-code drift, not just a silent behavior change.
 // =========================================================================
 
 #[test]
@@ -244,33 +241,19 @@ fn fs12_concurrency_doc_race_catalog_item_2_claim_holds_after_fs02_fix() {
     // once-only; a lost finish converges via replay_completed
     // (finish_session's not-finished branch)."
     //
-    // HISTORY: while building this audit's detector (before the FS-02 fix
-    // below existed), this claim was reachably FALSE for a third
-    // interleaving the doc's own two-case narrative didn't consider: a
-    // taken-over completer B could lose its OWN (redundant) finalize
-    // attempt to the original, lease-expired owner A, and B's resulting
-    // `release_multipart_complete_lease` (owner-scoped to B, but the
-    // session was still `completing` at that exact moment -- A hadn't
-    // reached `finish_session` yet) would succeed, flipping the session
-    // back to `in_progress` *before* A's own finish CAS ran. A's finish CAS
-    // then failed (state was no longer `completing`), and the not-finished
-    // branch's `fresh.state == Completed` check was false too (it was
-    // `in_progress`) -- so A got a hard error, not a converged replay,
-    // despite having correctly finalized and bound the content: the session
-    // was left stranded at `in_progress` until `expires_at`.
-    //
-    // FIX (FS-02, `multipart_service.rs::
-    // converge_or_error_after_lost_finalize_cas`): a lost finalize CAS now
-    // checks whether the version is already `Available` and, if so,
-    // converges the SAME way the takeover fast-path already did, instead of
-    // erroring and releasing the lease -- so B never takes the
-    // release-and-strand path in the first place, and the doc's claim is
-    // true again for every reachable interleaving, not just the two the
-    // narrative originally considered. Confirmed live against real
-    // PostgreSQL: `tests/pg_concurrency_test.rs::
-    // f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`
-    // reproduces the identical deterministic interleaving that used to
-    // strand the session and asserts BOTH completers now converge to
-    // `Ok(Completed(...))`. See `docs/analysis/DB_BEHAVIOR_AUDIT.md` §FS-02
-    // for the full writeup.
+    // This was briefly false for a third interleaving the doc's own
+    // two-case narrative didn't consider: a taken-over completer B could
+    // lose its own (redundant) finalize attempt to the original,
+    // lease-expired owner A, and B's `release_multipart_complete_lease`
+    // (owner-scoped to B, but the session was still `completing` at that
+    // moment) would flip the session back to `in_progress` before A's own
+    // finish CAS ran -- stranding it despite the content being correctly
+    // finalized and bound. Fixed in
+    // `multipart_service.rs::converge_or_error_after_lost_finalize_cas` (a
+    // lost finalize CAS now converges instead of erroring -- the same fix
+    // covered in full by `pg_concurrency_test.rs`'s `f2_*` scenarios), so
+    // the claim holds again for every reachable interleaving. Confirmed
+    // live against real PostgreSQL by
+    // `tests/pg_concurrency_test.rs::
+    // f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`.
 }

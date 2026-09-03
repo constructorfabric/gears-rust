@@ -13,8 +13,6 @@
 //! `enforce_test.rs`'s `CappedQuota`/`ErroringQuota`), wired into
 //! `FileService`, `MultipartService`, and `CleanupEngine` so every
 //! `report_usage` call site in this remediation is exercised.
-//!
-//! @cpt-cf-file-storage-fr-usage-reporting
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 

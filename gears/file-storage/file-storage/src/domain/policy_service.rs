@@ -31,7 +31,7 @@ use crate::domain::policy::{
 };
 use crate::domain::ports::PolicyStore;
 
-/// The policy and retention-rule administration service (P2-M1).
+/// The policy and retention-rule administration service.
 ///
 /// Extracted from `FileService` to reduce its Henry-Kafura coupling score.
 /// All standalone policy and retention-rule operations live here; the struct
@@ -48,22 +48,18 @@ impl PolicyService {
         Self { store, authorizer }
     }
 
-    // ── policy management (P2-M1) ─────────────────────────────────────────────
+    // ── policy management ──────────────────────────────────────────────────────
 
     /// Get the raw (own-level) policy body for a scope, if one has been set.
-    ///
-    /// @cpt-cf-file-storage-usecase-configure-policy
     pub async fn get_own_policy(
         &self,
         ctx: &SecurityContext,
         policy_scope: PolicyScope,
         scope_owner_id: Option<Uuid>,
     ) -> Result<Option<StoredPolicy>, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-authz
         let scope = self
             .authorize_scope_owner(ctx, actions::READ, scope_owner_id)
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-authz
         // A `User`-scope read with no `scope_owner_id`, or a `Tenant`-scope
         // read with one, is a malformed request that would otherwise either
         // silently resolve to an always-empty row (`None`, rendered as `204
@@ -72,7 +68,6 @@ impl PolicyService {
         // have an owner). Shared with `validate_policy_body`'s identical
         // check on the write path (`Self::validate_scope_owner_shape`, below).
         Self::validate_scope_owner_shape(&policy_scope, scope_owner_id)?;
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-load
         self.store
             .get_policy(
                 &scope,
@@ -81,13 +76,10 @@ impl PolicyService {
                 scope_owner_id,
             )
             .await
-        // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-load
     }
 
     /// Set (upsert) the policy for a scope. Tenant-level policy requires the
     /// caller to have appropriate authorization; user-level is self-service.
-    ///
-    /// @cpt-cf-file-storage-usecase-configure-policy
     pub async fn set_policy(
         &self,
         ctx: &SecurityContext,
@@ -102,10 +94,8 @@ impl PolicyService {
         // (unlike the `Some(owner)` branch below) this must never fall back
         // to plain `WRITE`: an unprivileged tenant member holding ordinary
         // file-`WRITE` could otherwise unilaterally tighten or loosen policy
-        // for the entire tenant. This used to fall back to `WRITE` via
-        // `authorize_scope_owner`'s `treat_missing_owner_as_authorized = true`
-        // — closed here by requiring `ADMIN_POLICY` outright, no fallback.
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-validate
+        // for the entire tenant. Requires `ADMIN_POLICY` outright here, with
+        // no fallback.
         // Shape validation runs BEFORE the authorization branch below, which
         // keys off `scope_owner_id`: a `User`-scope request that omits its
         // owner is a malformed body (`400`), not an administrative act, and
@@ -115,8 +105,6 @@ impl PolicyService {
         // state, and mirrors `create_file`, which likewise validates its GTS
         // type before authorizing.
         Self::validate_policy_body(&policy_scope, scope_owner_id, &body)?;
-        // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-validate
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
         let scope = match scope_owner_id {
             None => {
                 self.authorizer
@@ -128,15 +116,12 @@ impl PolicyService {
                     .await?
             }
         };
-        // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-authz
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-upsert
         let policy_id = self
             .store
             .upsert_policy(&scope, tenant_id, &policy_scope, scope_owner_id, &body, now)
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-upsert
         Ok(StoredPolicy {
             policy_id,
             tenant_id,
@@ -151,17 +136,11 @@ impl PolicyService {
 
     /// Compute the effective policy for the current caller context, combining
     /// the tenant-level and user-level policies with most-restrictive-wins.
-    ///
-    /// @cpt-cf-file-storage-usecase-configure-policy
-    /// @cpt-cf-file-storage-fr-allowed-types-policy
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-metadata-limits
     pub async fn get_effective_policy(
         &self,
         ctx: &SecurityContext,
         user_owner_id: Option<Uuid>,
     ) -> Result<EffectivePolicy, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-authz
         let scope = self
             .authorizer
             .authorize(ctx, actions::READ, "", None)
@@ -182,10 +161,8 @@ impl PolicyService {
                 .authorize(ctx, actions::ADMIN_POLICY, "", None)
                 .await?;
         }
-        // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-authz
         let tenant_id = ctx.subject_tenant_id();
 
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-load
         let tenant_policy = self
             .store
             .get_policy(&scope, tenant_id, &PolicyScope::Tenant, None)
@@ -198,35 +175,26 @@ impl PolicyService {
             }
             None => None,
         };
-        // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-load
 
-        // @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-resolve
         Ok(PolicyResolver::resolve(
             tenant_policy.as_ref().map(|p| &p.body),
             user_policy.as_ref().map(|p| &p.body),
         ))
-        // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-resolve
     }
 
     /// List retention rules for the caller's tenant.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_retention_rules(
         &self,
         ctx: &SecurityContext,
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-authz
         let scope = self
             .authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-authz
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-load
         let rules = self
             .store
             .list_retention_rules(&scope, ctx.subject_tenant_id())
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-load
 
         // Plain `READ` above only clears "may list retention rules at all" —
         // the store call itself has no owner/target filter and returns
@@ -250,9 +218,9 @@ impl PolicyService {
         //   (`authorize_retention_scope`'s `File` arm, and
         //   `create_retention_rule` runs it before insert) and removable by
         //   `rule_id` alone (`delete_retention_rule`) — dropping the scope
-        //   entirely from this listing, as the previous revision did, meant
-        //   a caller who created such a rule and then lost track of its
-        //   `rule_id` had no way left to find it again.
+        //   entirely from this listing would leave a caller who created such
+        //   a rule and then lost track of its `rule_id` with no way to find
+        //   it again.
         //
         // Note this whole non-admin branch, `File`-scope or not, still costs
         // one extra `ADMIN_POLICY` probe on every listing before it even
@@ -328,9 +296,8 @@ impl PolicyService {
                                 // round-trips on top of the N store fetches
                                 // above). A rule whose target file this
                                 // caller can `WRITE` but does not own stays
-                                // invisible here, same as before this fix —
-                                // no worse, just cheaper than the exact
-                                // check.
+                                // invisible here -- an under-approximation,
+                                // but cheaper than the exact check.
                                 //
                                 // `FileNotFound` means the target file has
                                 // since been deleted (no FK ties
@@ -348,10 +315,9 @@ impl PolicyService {
                                 // *who created it*, which was never
                                 // recorded. Not expressible without a schema
                                 // change, so the rule is dropped for every
-                                // non-admin caller here, same as before this
-                                // fix; an admin can still reach it via the
-                                // `Ok` arm above, or remove it via
-                                // `delete_retention_rule`'s own
+                                // non-admin caller here; an admin can still
+                                // reach it via the `Ok` arm above, or remove
+                                // it via `delete_retention_rule`'s own
                                 // dangling-target fallback.
                                 let owner =
                                     match self.store.require_file(&tenant_scope, file_id).await {
@@ -389,8 +355,6 @@ impl PolicyService {
     }
 
     /// Create a new retention rule.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn create_retention_rule(
         &self,
         ctx: &SecurityContext,
@@ -398,7 +362,6 @@ impl PolicyService {
         scope_target_id: Option<Uuid>,
         body: RetentionRuleBody,
     ) -> Result<StoredRetentionRule, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
         // Shape/semantic validation runs BEFORE the authorization check
         // below, exactly like `set_policy`'s reordering above (see its
         // comment for the full rationale): otherwise the same malformed
@@ -410,15 +373,11 @@ impl PolicyService {
         // only the caller's own `(retention_scope, scope_target_id, body)`
         // request and discloses no stored state.
         Self::validate_retention_rule(&retention_scope, scope_target_id, &body)?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-validate
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-authz
         let scope = self
             .authorize_retention_scope(ctx, &retention_scope, scope_target_id)
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-authz
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-insert
         let rule_id = self
             .store
             .insert_retention_rule(
@@ -430,7 +389,6 @@ impl PolicyService {
                 now,
             )
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-insert
         Ok(StoredRetentionRule {
             rule_id,
             tenant_id,
@@ -442,8 +400,6 @@ impl PolicyService {
     }
 
     /// Delete a retention rule by `rule_id`.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn delete_retention_rule(
         &self,
         ctx: &SecurityContext,
@@ -464,14 +420,11 @@ impl PolicyService {
         // the caller's tenant means a foreign-tenant rule_id simply does not
         // resolve (`None`), so it 404s uniformly with a nonexistent one,
         // before authorization is ever consulted.
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-load
         let rule = self
             .store
             .get_retention_rule(&Self::tenant_scope(ctx), rule_id)
             .await?
             .ok_or_else(|| DomainError::retention_rule_not_found(rule_id))?;
-        // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-load
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-authz
         let scope = match self
             .authorize_retention_scope(ctx, &rule.scope, rule.scope_target_id)
             .await
@@ -513,13 +466,10 @@ impl PolicyService {
             }
             other => other?,
         };
-        // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-authz
-        // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-remove
         self.store.delete_retention_rule(&scope, rule_id).await
-        // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-remove
     }
 
-    // ── semantic validation (P2 remediation 0.11) ───────────────────────────────
+    // ── semantic validation ────────────────────────────────────────────────────
 
     /// Reject a retention-rule body that would be dangerous or dead on write,
     /// rather than letting it be silently accepted and later executed (or
@@ -540,22 +490,17 @@ impl PolicyService {
     ///   resolve a real file), but `User`-scope only rejects a missing target
     ///   for non-`ADMIN_POLICY` callers, so this closes the same gap for an
     ///   admin caller.
-    ///
-    /// @cpt-dod:cpt-cf-file-storage-dod-retention-semantic-validation:p2
     fn validate_retention_rule(
         scope: &RetentionScope,
         scope_target_id: Option<Uuid>,
         body: &RetentionRuleBody,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-empty
         if body.age.is_none() && body.inactivity.is_none() && body.metadata.is_none() {
             return Err(DomainError::validation(
                 "body",
                 "retention rule must specify at least one of: age, inactivity, metadata",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-empty
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-zero
         if let Some(age) = &body.age
             && age.max_age_days < 1
         {
@@ -572,8 +517,6 @@ impl PolicyService {
                 "must be >= 1 (0 would match every file in the tenant immediately)",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-zero
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-target
         if matches!(scope, RetentionScope::User | RetentionScope::File) && scope_target_id.is_none()
         {
             return Err(DomainError::validation(
@@ -581,10 +524,7 @@ impl PolicyService {
                 "user/file-scope retention rule requires a scope_target_id",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-target
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-return
     }
 
     /// Reject a `(scope, scope_owner_id)` pair whose shape is impossible or
@@ -639,17 +579,12 @@ impl PolicyService {
     ///   omit `allowed_mime_types` entirely (`None`/empty already means
     ///   unrestricted), and a caller that wants "no per-mime override" should
     ///   omit the `per_mime` entry.
-    ///
-    /// @cpt-dod:cpt-cf-file-storage-dod-policy-semantic-validation:p2
     fn validate_policy_body(
         scope: &PolicyScope,
         scope_owner_id: Option<Uuid>,
         body: &PolicyBody,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-user-owner
         Self::validate_scope_owner_shape(scope, scope_owner_id)?;
-        // @cpt-end:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-user-owner
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-star-slash-star-allowed
         if body.allowed_mime_types.iter().any(|m| m == "*/*") {
             return Err(DomainError::validation(
                 "allowed_mime_types",
@@ -657,8 +592,6 @@ impl PolicyService {
                  allowed_mime_types entirely to allow all types",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-star-slash-star-allowed
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-star-slash-star-per-mime
         if body.size_limits.per_mime.iter().any(|o| o.mime == "*/*") {
             return Err(DomainError::validation(
                 "size_limits.per_mime",
@@ -666,10 +599,7 @@ impl PolicyService {
                  size_limits.max_bytes for a global limit instead",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-star-slash-star-per-mime
-        // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-return
     }
 
     // ── authorization helpers ────────────────────────────────────────────────
@@ -735,12 +665,9 @@ impl PolicyService {
     /// `fallback_action = READ`; `scope_owner_id == None` there means "tenant
     /// scope", which has no owner to compare, so the fallback succeeds on
     /// plain `READ` alone — reading the tenant policy is not the sensitive
-    /// operation. `set_policy` used to share this helper for its *write* path
-    /// too, which let the same `None`-owner fallback authorize a tenant-wide
-    /// policy *write* under plain `WRITE`; it now requires `ADMIN_POLICY`
-    /// directly for `scope_owner_id == None` instead of calling this helper,
-    /// and calls [`Self::authorize_admin_or_owner`] directly (not through
-    /// here) for `Some(owner)`.
+    /// operation (unlike writing it: see `set_policy`, which calls
+    /// [`Self::authorize_admin_or_owner`] directly instead and requires
+    /// `ADMIN_POLICY` outright for its own tenant-scope case).
     async fn authorize_scope_owner(
         &self,
         ctx: &SecurityContext,
@@ -780,16 +707,9 @@ impl PolicyService {
     ) -> Result<AccessScope, DomainError> {
         match retention_scope {
             RetentionScope::Tenant => {
-                // A `Tenant`-scope retention rule is a standing instruction
-                // for the background sweep to permanently delete every file
-                // in the tenant older than N days (or idle/matching some
-                // metadata) — with no owner filter, this reaches every other
-                // subject's files. Gating it on plain file-`WRITE` (the same
-                // grant an ordinary user has for uploading their own files)
-                // let any tenant member schedule irreversible, tenant-wide
-                // data loss. Require `ADMIN_POLICY` outright, with no
-                // fallback to `WRITE` — unlike the `User`/`File` arms below,
-                // there is no owner to fall back to self-service for.
+                // Requires `ADMIN_POLICY` outright, no fallback -- see this
+                // method's doc comment for why (a standing tenant-wide
+                // delete instruction, reachable by no owner filter).
                 self.authorizer
                     .authorize(ctx, actions::ADMIN_POLICY, "", None)
                     .await

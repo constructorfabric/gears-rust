@@ -2,9 +2,6 @@
 //!
 //! Rows are inserted in the same DB transaction as the write they describe
 //! and drained asynchronously to the platform audit sink.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

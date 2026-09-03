@@ -61,20 +61,15 @@ impl VersionRepo {
 
     /// Fetch a single version by `(file_id, version_id)`.
     ///
-    /// P2 2.2: this used to delegate to [`Self::list_by_file`] and `.find()`
-    /// the target in Rust, with a comment claiming a direct two-column
-    /// predicate "proved unreliable across the secure layer". Re-investigated
-    /// for this change: `mark_available`/`finalize`/`clear_current`/
-    /// `set_current`/`delete`/`delete_if_status`/`rebind_backend` below all
-    /// use this exact `Condition::all()` two-`.add()` shape successfully on
-    /// `update_many()`/`delete_many()`, and `SecureSelect::filter()` (see
-    /// `toolkit_db::secure::select`) supports the same composition on
-    /// `find()`. A direct-predicate `.one()` query was verified against
+    /// A direct two-column `Condition::all()` predicate on `find()` (the same
+    /// shape `mark_available`/`finalize`/`clear_current`/`set_current`/
+    /// `delete`/`delete_if_status`/`rebind_backend` below use successfully on
+    /// `update_many()`/`delete_many()`, via `SecureSelect::filter()` --
+    /// see `toolkit_db::secure::select`) is verified against
     /// `version_repo_get_returns_correct_row_among_many` (versions seeded
     /// across two files, sharing a UUID prefix pattern) with no cross-file
-    /// bleed, so the scan-and-filter workaround was not a real limitation —
-    /// the original comment's claim does not reproduce. Kept as a direct
-    /// query, closing the per-file amplification-DoS surface on the
+    /// bleed. This avoids scanning every version of a file to find one by
+    /// id, closing a per-file amplification-DoS surface on the
     /// `get`/`finalize`/`bind`/`download_url` hot path.
     pub async fn get<C: DBRunner>(
         &self,
@@ -310,10 +305,10 @@ impl VersionRepo {
     /// pair) so the caller can detect a lost race instead of silently
     /// swallowing it (see below).
     ///
-    /// # The P2 2.7 guarantee, precisely
+    /// # The guarantee, precisely
     ///
-    /// P2 2.7 says a version can never be deleted while it is a file's
-    /// current version. That guarantee is watertight **only within the
+    /// A version can never be deleted while it is a file's current version.
+    /// That guarantee is watertight **only within the
     /// single transaction** that performs the CAS-then-promote sequence
     /// ([`crate::infra::storage::repo::FileRepo::bind_content_cas`] followed
     /// by [`Self::clear_current`] + this method — see
@@ -362,7 +357,7 @@ impl VersionRepo {
     /// Delete a single version. Returns the number of rows removed (0 or 1
     /// for this `(file_id, version_id)`-keyed predicate).
     ///
-    /// P2 2.7: the predicate is guarded with `is_current = false` so a delete
+    /// The predicate is guarded with `is_current = false` so a delete
     /// can never remove the version a file's `content_id` currently points
     /// at, even if the caller's own "is this current?" check ran against a
     /// stale snapshot (a concurrent `bind` promoted this exact version to
@@ -399,10 +394,10 @@ impl VersionRepo {
     /// its status no longer matches (a concurrent writer already moved it on).
     ///
     /// Status-guarded delete CAS -- same `Condition::all()` pattern as
-    /// [`Self::finalize`]'s pending-only guard (P2 0.4). Used by the cleanup
-    /// sweep (P2 0.3 step 5) so a pending version that a racing
-    /// `complete_multipart_upload` has already flipped to `available` can
-    /// never be deleted out from under it.
+    /// [`Self::finalize`]'s pending-only guard. Used by the cleanup sweep so
+    /// a pending version that a racing `complete_multipart_upload` has
+    /// already flipped to `available` can never be deleted out from under
+    /// it.
     pub async fn delete_if_status<C: DBRunner>(
         &self,
         conn: &C,
@@ -439,9 +434,6 @@ impl VersionRepo {
     /// it is aborted by the next sweep step (`sweep_expired_multipart`), and
     /// its version becomes reclaimable on a later sweep once the session row
     /// itself transitions out of `in_progress`.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
-    /// @cpt-dod:cpt-cf-file-storage-dod-cleanup-live-multipart-guard:p1
     pub async fn list_pending_older_than<C: DBRunner>(
         &self,
         conn: &C,
@@ -484,8 +476,6 @@ impl VersionRepo {
     /// the race and already moved the row past `expected_backend_id`/
     /// `expected_backend_path`) — the caller must re-fetch to distinguish
     /// these.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
     #[allow(clippy::too_many_arguments)]
     pub async fn rebind_backend<C: DBRunner>(
         &self,

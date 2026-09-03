@@ -586,8 +586,6 @@ async fn list_versions_caps_at_max_page_size() {
 
 /// Deleting the version `content_id` currently points at must be rejected
 /// (`Conflict`/`version_not_found`), and the row must survive.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_current_version_is_rejected() {
     let (svc, dp) = build_service().await;

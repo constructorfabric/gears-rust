@@ -1,6 +1,4 @@
 //! Domain types for upload idempotency.
-//!
-//! @cpt-cf-file-storage-fr-upload-idempotency
 
 use toolkit_macros::domain_model;
 use uuid::Uuid;

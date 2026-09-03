@@ -206,9 +206,9 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): a stream whose cumulative size crosses `max_size` partway
-/// through must be rejected *and* leave no file (partial or final) at the
-/// target path — the memory-DoS fix's "abort mid-stream, clean up" contract.
+/// A stream whose cumulative size crosses `max_size` partway through must
+/// be rejected *and* leave no file (partial or final) at the target path —
+/// abort mid-stream, clean up.
 #[tokio::test]
 async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     let root = unique_root();
@@ -247,9 +247,9 @@ async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): `put_stream`'s incremental hash (fed chunk-by-chunk as they are
-/// written) must equal `hash::sha256` computed over the fully concatenated
-/// bytes, and `bytes_written` must equal the total chunk length.
+/// `put_stream`'s incremental hash (fed chunk-by-chunk as they are written)
+/// must equal `hash::sha256` computed over the fully concatenated bytes, and
+/// `bytes_written` must equal the total chunk length.
 #[tokio::test]
 async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_hash() {
     let root = unique_root();
@@ -320,9 +320,9 @@ async fn local_fs_get_stream_missing_errors() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 remediation (replay-`PUT` overwrite fix): the first `publish_exclusive`
-/// call to a fresh path must create it; a second call to the SAME path with
-/// DIFFERENT bytes must report `created: false` and must leave the
+/// The first `publish_exclusive` call to a fresh path must create it; a
+/// second call to the SAME path with DIFFERENT bytes must report
+/// `created: false` and must leave the
 /// already-published bytes completely untouched — the core integrity
 /// guarantee `StorageBackend::publish_exclusive` exists for.
 #[tokio::test]

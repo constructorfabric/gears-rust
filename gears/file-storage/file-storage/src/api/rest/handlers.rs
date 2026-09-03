@@ -484,102 +484,67 @@ pub struct EffectivePolicyQuery {
 }
 
 /// `GET /policy` — return the raw own policy for a scope.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-/// @cpt-dod:cpt-cf-file-storage-dod-policy-get-put-endpoints:p1
-// @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-request
 pub async fn get_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Query(q): Query<GetPolicyQuery>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-request
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-parse-scope
     let policy_scope = PolicyScope::parse(&q.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-parse-scope
     let stored = svc
         .get_own_policy(&ctx, policy_scope, q.scope_owner_id)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-return
     match stored {
         Some(p) => Ok((StatusCode::OK, Json(PolicyDto::from(p))).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-return
 }
 
 /// `PUT /policy` — upsert the policy for a scope.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-// @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-request
 pub async fn set_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Json(req): Json<SetPolicyReq>,
 ) -> ApiResult<JsonBody<PolicyDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-request
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-parse-scope
     let policy_scope = PolicyScope::parse(&req.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-parse-scope
     let body = req.body.into();
     let stored = svc
         .set_policy(&ctx, policy_scope, req.scope_owner_id, body)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-return
     Ok(Json(PolicyDto::from(stored)))
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-return
 }
 
 /// `GET /policy/effective` — compute the effective (most-restrictive) policy.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-/// @cpt-dod:cpt-cf-file-storage-dod-policy-effective-endpoint:p1
-// @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-request
 pub async fn get_effective_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Query(q): Query<EffectivePolicyQuery>,
 ) -> ApiResult<JsonBody<EffectivePolicyDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-request
     let ep = svc.get_effective_policy(&ctx, q.user_owner_id).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-return
     Ok(Json(EffectivePolicyDto::from(ep)))
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-return
 }
 
 // ── retention rules (P2-M1) ────────────────────────────────────────────────────
 
 /// `GET /retention-rules` — list all retention rules for the caller's tenant.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-/// @cpt-dod:cpt-cf-file-storage-dod-retention-rule-endpoints:p1
-// @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-request
 pub async fn list_retention_rules(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
 ) -> ApiResult<JsonBody<RetentionRuleDtoList>> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-request
     let rules = svc.list_retention_rules(&ctx).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-return
     Ok(Json(RetentionRuleDtoList(
         rules.into_iter().map(RetentionRuleDto::from).collect(),
     )))
-    // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-return
 }
 
 /// `POST /retention-rules` — create a new retention rule.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-// @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-request
 pub async fn create_retention_rule(
     uri: Uri,
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Json(req): Json<CreateRetentionRuleReq>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-request
     let retention_scope = RetentionScope::parse(&req.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant', 'user', or 'file'"))?;
     let body = req.body.into();
@@ -587,29 +552,21 @@ pub async fn create_retention_rule(
         .create_retention_rule(&ctx, retention_scope, req.scope_target_id, body)
         .await?;
     let id = rule.rule_id.to_string();
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-return
     Ok(created_json(RetentionRuleDto::from(rule), &uri, &id).into_response())
-    // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-return
 }
 
 /// `DELETE /retention-rules/{rule_id}` — delete a retention rule.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-// @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-request
 pub async fn delete_retention_rule(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Path(rule_id): Path<Uuid>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-request
     let removed = svc.delete_retention_rule(&ctx, rule_id).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-return
     if removed {
         Ok(no_content().into_response())
     } else {
         Err(DomainError::retention_rule_not_found(rule_id).into())
     }
-    // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-return
 }
 
 // ── multipart upload (multipart-coordinator feature) ──────────────────────────
@@ -636,10 +593,6 @@ fn plan_to_dto(p: MultipartPlan) -> MultipartPlanDto {
 
 /// `POST /files/{id}/multipart` — initiate a server-authoritative multipart
 /// upload session and return the parts plan with per-part signed sidecar URLs.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-storage-quota
 pub async fn initiate_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -670,8 +623,6 @@ pub async fn initiate_multipart(
 /// 3.3) instead of the previous bare `204`. `If-Match` is optional: a
 /// concrete value is checked against the file's current content `ETag`; `*`
 /// (or omission) is unconditional.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn complete_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -682,7 +633,6 @@ pub async fn complete_multipart(
     let outcome = svc
         .complete_multipart_upload(&ctx, file_id, upload_id, if_match.as_deref())
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
     Ok(match outcome {
         MultipartCompleteOutcome::Completed(completed) => Json(MultipartCompleteDto {
             version_id: completed.version_id,
@@ -714,7 +664,6 @@ pub async fn complete_multipart(
             resp
         }
     })
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
 }
 
 fn status_to_dto(s: MultipartUploadStatus) -> MultipartStatusDto {
@@ -752,10 +701,6 @@ fn status_to_dto(s: MultipartUploadStatus) -> MultipartStatusDto {
 /// `GET /files/{id}/multipart/{upload_id}` — introspect a multipart upload
 /// (item 3.4): current state, received parts, and (while resumable) fresh
 /// resume URLs for the missing parts.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-dod:cpt-cf-file-storage-dod-multipart-introspect:p2
-// @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-request
 pub async fn introspect_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -766,11 +711,8 @@ pub async fn introspect_multipart(
         .await?;
     Ok(Json(status_to_dto(status)))
 }
-// @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-request
 
 /// `DELETE /files/{id}/multipart/{upload_id}` — abort a multipart upload.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn abort_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -785,8 +727,6 @@ pub async fn abort_multipart(
 /// `POST /files/{id}/migrate` — migrate a file's content to a different backend.
 ///
 /// Non-versioned files only. Preserves identity and verifies content hash.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 pub async fn migrate_backend(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
@@ -801,33 +741,23 @@ pub async fn migrate_backend(
 // ── ownership transfer (P2-M5) ────────────────────────────────────────────────
 
 /// `POST /files/{id}/transfer` — transfer ownership of a file to a new owner.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
-// @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-request
 pub async fn transfer_ownership(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(file_id): Path<Uuid>,
     Json(req): Json<TransferOwnershipReq>,
 ) -> ApiResult<JsonBody<FileDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-request
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-kind-parse
     let new_owner_kind = file_storage_sdk::OwnerKind::parse(&req.new_owner_kind)
         .ok_or_else(|| DomainError::validation("new_owner_kind", "must be 'user' or 'app'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-kind-parse
     // Capture metadata BEFORE the transfer. A transfer does not change custom
     // metadata, but afterwards the caller may no longer have read access under
     // the new owner — re-reading then and defaulting on failure would return a
     // 200 with empty `custom_metadata` for a file that actually has some.
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-capture-meta
     let (_, meta) = svc.get_file_with_metadata(&ctx, file_id).await?;
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-capture-meta
     let file = svc
         .transfer_ownership(&ctx, file_id, new_owner_kind, req.new_owner_id)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-return
     Ok(Json(FileDto::from_parts(file, meta)))
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-return
 }
 
 // ── data-plane finalize (s2s, token-authenticated) ────────────────────────────
@@ -851,8 +781,6 @@ pub struct FinalizeUploadReq {
 ///
 /// Called by the sidecar immediately after a successful `PUT` to report the
 /// measured size + hash and transition the version from `pending` to `available`.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 pub async fn finalize_version(
     Extension(svc): Svc,
     Extension(verifier): Extension<Arc<Verifier>>,
@@ -966,8 +894,6 @@ pub struct ReportPartReq {
 /// the signed `multipart_part` upload token in the `x-fs-token` request
 /// header. Called by the sidecar immediately after a successful part write to
 /// record the part row that `complete_multipart_upload` assembles from.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn report_multipart_part(
     Extension(msvc): MultiSvc,
     Extension(verifier): Extension<Arc<Verifier>>,

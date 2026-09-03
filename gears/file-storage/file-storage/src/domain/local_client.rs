@@ -1,6 +1,4 @@
 //! In-process adapter implementing the SDK client trait.
-//!
-//! @cpt-cf-file-storage-component-sdk-facade
 
 use file_storage_sdk::FileStorageClientV1;
 

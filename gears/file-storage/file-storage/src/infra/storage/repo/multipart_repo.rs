@@ -100,8 +100,8 @@ impl MultipartRepo {
     /// (e.g. a `complete`/`abort` race where another writer already moved it).
     ///
     /// `mime_validated`, when `Some`, is set in the **same** UPDATE statement
-    /// (P2 remediation item 1.10) — used by the `in_progress` → `completed`
-    /// transition to flip `mime_validated` to `true` alongside the state
+    /// -- used by the `in_progress` → `completed` transition to flip
+    /// `mime_validated` to `true` alongside the state
     /// change, since `complete_multipart_upload` only reaches this call after
     /// the assembled object's content has already been sniffed and validated
     /// against the declared MIME type. The `in_progress` → `aborted`
@@ -141,15 +141,15 @@ impl MultipartRepo {
         Ok(res.rows_affected > 0)
     }
 
-    /// Acquire (or take over) the completion lease (upload-flow redesign):
-    /// one conditional UPDATE moving the session to `completing` from either
+    /// Acquire (or take over) the completion lease: one conditional UPDATE
+    /// moving the session to `completing` from either
     /// `in_progress` (fresh acquire) or an **expired** `completing`
     /// (takeover after a crashed completer). Never blocks and never holds a
     /// transaction across I/O; `false` = someone else holds a live lease, the
     /// session is terminal, or the session itself has expired (see below).
     ///
-    /// Fenced by `expires_at > now` (P2 lease-fencing remediation): without
-    /// this, the CAS filter only looks at `state`/`lease_until`, so a session
+    /// Fenced by `expires_at > now`: without this, the CAS filter only looks
+    /// at `state`/`lease_until`, so a session
     /// whose `expires_at` has already passed but which the abandoned-session
     /// sweep has not yet reaped can still win a fresh lease here. The
     /// call site's own `session.expires_at <= now` guard
@@ -306,12 +306,11 @@ impl MultipartRepo {
     /// bypasses that invariant. This exists so unit tests can
     /// deterministically simulate "time passing" on an already-created
     /// (possibly already-completed) session without a real sleep or
-    /// concurrency, per the unit-testing doctrine (P2 0.3 --
-    /// `sweep_after_complete_wins_does_not_delete_bound_version` in
-    /// `cleanup_test.rs` backdates a session's `expires_at` *after* a
-    /// successful `complete_multipart_upload`, which the P2 0.3 step-3
-    /// defense-in-depth check would otherwise reject if the session were
-    /// built with a past `expires_at` from the start).
+    /// concurrency: `sweep_after_complete_wins_does_not_delete_bound_version`
+    /// in `cleanup_test.rs` backdates a session's `expires_at` *after* a
+    /// successful `complete_multipart_upload`, which a defense-in-depth check
+    /// would otherwise reject if the session were built with a past
+    /// `expires_at` from the start.
     ///
     /// `#[doc(hidden)]` rather than a `test-support` Cargo feature: this
     /// method is called from the external integration-test crate
@@ -488,8 +487,6 @@ impl MultipartRepo {
 
     /// List all `in_progress` upload sessions whose `expires_at` is before `now`.
     /// Used by the orphan-reconciliation sweep to clean up stale sessions.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     pub async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
@@ -502,8 +499,8 @@ impl MultipartRepo {
                     .add(
                         sea_orm::Condition::any()
                             .add(UploadColumn::State.eq("in_progress"))
-                            // Upload-flow redesign: a `completing` session
-                            // whose completer died AND whose session lifetime
+                            // A `completing` session whose completer died
+                            // AND whose session lifetime
                             // has passed is also abandoned — but only once
                             // its lease has expired too, so a live completer
                             // racing `expires_at` is never reaped mid-flight.
@@ -526,7 +523,7 @@ impl MultipartRepo {
     /// Whether `file_id` has at least one `in_progress` multipart upload
     /// session, regardless of its `expires_at`.
     ///
-    /// Used by the P2 2.8 orphan-file-reconciliation guard: a file's pending
+    /// Used by the orphan-file-reconciliation guard: a file's pending
     /// version can look "abandoned" to [`Self::list_expired`]'s sibling sweep
     /// step (`sweep_abandoned_pending`, keyed only on the version's age) even
     /// while it is the live target of a *not-yet-expired* multipart session --
@@ -538,8 +535,6 @@ impl MultipartRepo {
     /// to throw the number away) -- `LIMIT 1` lets the planner stop at the
     /// first matching row instead of counting every `in_progress` session for
     /// the file.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     pub async fn has_in_progress_for_file<C: DBRunner>(
         &self,
         conn: &C,

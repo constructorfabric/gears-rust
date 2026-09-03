@@ -113,12 +113,11 @@ impl IdempotencyRepo {
         // The design documented above *relies on* this insert losing the
         // primary-key race against a concurrent identical request: that is
         // how a duplicate `POST /files` retried after a client-side timeout
-        // is turned away without creating a second file. Before this fix
-        // that race surfaced as an opaque `DomainError::Database` (HTTP
-        // 500) via `db_err`; classify it as a conflict instead, so the
-        // racing caller gets a 409 it can react to (re-fetch via `get` and
-        // replay the winner's stored response) rather than a request that
-        // looks like it failed outright.
+        // is turned away without creating a second file. Classify that race
+        // as a conflict rather than an opaque `db_err` 500, so the racing
+        // caller gets a 409 it can react to (re-fetch via `get` and replay
+        // the winner's stored response) rather than a request that looks
+        // like it failed outright.
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
             .map_err(|e| {
@@ -133,10 +132,10 @@ impl IdempotencyRepo {
 
     /// Bulk-delete all rows whose `expires_at` is at or before `now`.
     ///
-    /// Called by the cleanup sweep (P2 remediation 1.9) so the
-    /// `idempotency_keys` table doesn't grow unboundedly — previously only a
-    /// lapsed row *for the same key* was ever removed (in [`Self::insert`]),
-    /// never a table-wide sweep. Returns the number of rows removed.
+    /// Called by the cleanup sweep so the `idempotency_keys` table doesn't
+    /// grow unboundedly -- [`Self::insert`] only ever removes a lapsed row
+    /// *for the same key*, never sweeps the whole table. Returns the number
+    /// of rows removed.
     pub async fn delete_expired<C: DBRunner>(
         &self,
         conn: &C,

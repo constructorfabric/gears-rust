@@ -2,14 +2,12 @@
 //
 // Copied verbatim (module doc's gear name aside) from
 // gears/system/resource-group/resource-group/tests/common/query_recorder.rs
-// (branch audit/rg-db-behavior) for the file-storage DB-behavior audit (Step
-// 4 of the DB-behavior audit program). This module has no resource-group- or
-// file-storage-specific dependency -- it only touches toolkit_db and
-// sea_orm::metric::Info -- so it is duplicated per gear today rather than
-// extracted into a shared test-support crate. Flagged as a shared-crate
-// candidate in this gear's DB_BEHAVIOR_AUDIT.md: two independent instances
-// (this one and resource-group's) is real evidence of the right shared
-// shape, whereas one alone was judged premature during Step 1.
+// for the file-storage DB-behavior audit. This module has no
+// resource-group- or file-storage-specific dependency -- it only touches
+// toolkit_db and sea_orm::metric::Info -- so it is duplicated per gear
+// today rather than extracted into a shared test-support crate; two
+// independent instances (this one and resource-group's) is real evidence
+// for that shared shape, should it ever be worth extracting.
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 //! SQL query recorder for DB-behavior audits (SQLite only).
 //!
@@ -35,8 +33,7 @@
 //! the same task-local the production bypass guard enforces — and since a
 //! metric callback fires synchronously on the same async task that issued the
 //! query (no `tokio::spawn` in between), reading it from inside the callback
-//! is exact, not a heuristic. See `docs/analysis/DB_BEHAVIOR_AUDIT.md`
-//! ("what this method does not cover") for more detail.
+//! is exact, not a heuristic.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -110,10 +107,9 @@ pub struct RecordedQuery {
     /// ?, ?)` list of 3 contributes 3). Statement *count* is scale-invariant
     /// for a well-batched query (one `IN (...)` regardless of N), but the
     /// parameter count still grows with N -- this exists so scale-invariance
-    /// checks can budget for that separately from statement count. See the
-    /// audit report's "what this method does not cover" section: this
-    /// doesn't capture the cost of a single huge statement (e.g. a 10,000-
-    /// value `IN` list), only that it has 10,000 parameters.
+    /// checks can budget for that separately from statement count. It does
+    /// not capture the cost of a single huge statement (e.g. a 10,000-value
+    /// `IN` list), only that it has 10,000 parameters.
     pub param_count: usize,
     pub elapsed: Duration,
     pub failed: bool,
@@ -151,8 +147,7 @@ static RE_FROM_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 /// This is deliberately a *class*-level signature, not per-line matching: it
 /// groups statements by "what shape of query is this", which is what the
 /// scale-invariance and stats-by-`(kind, table)` rules need. It is a
-/// best-effort heuristic (regex over text, not a SQL parser) — documented as
-/// such in `docs/analysis/DB_BEHAVIOR_AUDIT.md`.
+/// best-effort heuristic (regex over text, not a SQL parser).
 #[must_use]
 pub fn normalize_sql(sql: &str) -> String {
     let s = RE_STRING_LIT.replace_all(sql, "'?'");
