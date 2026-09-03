@@ -17,7 +17,7 @@ use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{AutoBindOnFinalize, FinalizeVersionOutcome};
 use crate::infra::content::hash_mode::HashMode;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::{Store, pending_version};
 
 /// Sentinel "no limit" passed to [`crate::infra::storage::repo::VersionRepo::list_by_file`]
@@ -169,72 +169,101 @@ impl Store {
         let events_repo = self.repos.events_outbox.clone();
         let hash_mode_str = hash_mode.as_str();
         let now = OffsetDateTime::now_utc();
+        let db = self.db.db();
         // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-commit-or-rollback
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let scope = AccessScope::allow_all();
-                    let updated = versions
-                        .finalize(
-                            tx,
-                            &scope,
-                            file_id,
-                            version_id,
-                            size,
-                            hash_value,
-                            hash_mode_str,
-                            part_count,
-                            mime_type,
-                        )
-                        .await?;
-                    let mut bound = false;
-                    if updated {
-                        // Persist the manifest row transactionally with the
-                        // version update for multipart-composite completions.
-                        if let Some(manifest) = manifest {
-                            versions
-                                .insert_manifest(tx, &scope, version_id, &manifest, now)
-                                .await?;
-                        }
-                        // @cpt-cf-file-storage-nfr-audit-completeness
-                        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
-                        audit_repo.insert(tx, &audit).await?;
-                        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
-
-                        // Upload-flow redesign: bind in the same transaction
-                        // (mirrors `bind_atomic_with_event`'s steps 1:1).
-                        if let Some(ab) = auto_bind {
-                            let swapped = files
-                                .bind_content_cas(
-                                    tx,
-                                    &scope,
-                                    file_id,
-                                    ab.expected_content_id,
-                                    version_id,
-                                    now,
-                                )
-                                .await?;
-                            if swapped {
-                                versions.clear_current(tx, &scope, file_id).await?;
-                                versions
-                                    .set_current(tx, &scope, file_id, version_id)
-                                    .await?;
-                                audit_repo.insert(tx, &ab.audit).await?;
-                                if let Some(ev) = ab.event {
-                                    events_repo.enqueue(tx, &ev).await?;
-                                }
-                            }
-                            bound = swapped;
-                        }
+        //
+        // Retryable (see `db::transaction_with_bounded_retry`): the auto-bind
+        // branch below takes `file_versions` then `files` (`versions.finalize`
+        // first, `files.bind_content_cas` after); `Store::delete_file[_with_event]`
+        // take `files` then cascade into `file_versions` -- the reverse order.
+        // Two transactions racing in opposite lock orders is a textbook
+        // PostgreSQL deadlock (40P01), and without a retry the loser used to
+        // surface as a plain 500. Every value the closure needs is cloned
+        // per attempt (see that function's doc comment) rather than moved,
+        // so a retried attempt starts from the same inputs as the first.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let versions = versions.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let hash_value = hash_value.clone();
+            let manifest = manifest.clone();
+            let mime_type = mime_type.clone();
+            let audit = audit.clone();
+            let auto_bind = auto_bind.clone();
+            Box::pin(async move {
+                let scope = AccessScope::allow_all();
+                let updated = versions
+                    .finalize(
+                        tx,
+                        &scope,
+                        file_id,
+                        version_id,
+                        size,
+                        hash_value,
+                        hash_mode_str,
+                        part_count,
+                        mime_type,
+                    )
+                    .await?;
+                let mut bound = false;
+                if updated {
+                    // Persist the manifest row transactionally with the
+                    // version update for multipart-composite completions.
+                    if let Some(manifest) = manifest {
+                        versions
+                            .insert_manifest(tx, &scope, version_id, &manifest, now)
+                            .await?;
                     }
-                    Ok::<FinalizeVersionOutcome, DomainError>(FinalizeVersionOutcome {
-                        updated,
-                        bound,
-                    })
+                    // @cpt-cf-file-storage-nfr-audit-completeness
+                    // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
+                    audit_repo.insert(tx, &audit).await?;
+                    // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
+
+                    // Upload-flow redesign: bind in the same transaction
+                    // (mirrors `bind_atomic_with_event`'s steps 1:1).
+                    if let Some(ab) = auto_bind {
+                        let swapped = files
+                            .bind_content_cas(
+                                tx,
+                                &scope,
+                                file_id,
+                                ab.expected_content_id,
+                                version_id,
+                                now,
+                            )
+                            .await?;
+                        if swapped {
+                            versions.clear_current(tx, &scope, file_id).await?;
+                            // Same guard as `bind_atomic`/`bind_atomic_with_event`:
+                            // a concurrent `delete_version` can remove this
+                            // exact version between the CAS above and this
+                            // promotion (see `VersionRepo::set_current`'s doc
+                            // comment). Abort rather than commit a
+                            // `files.content_id` left pointing at a deleted row.
+                            let promoted = versions
+                                .set_current(tx, &scope, file_id, version_id)
+                                .await?;
+                            if promoted == 0 {
+                                return Err(DomainError::conflict(
+                                    "target version no longer exists -- it was deleted concurrently",
+                                ));
+                            }
+                            audit_repo.insert(tx, &ab.audit).await?;
+                            if let Some(ev) = ab.event {
+                                events_repo.enqueue(tx, &ev).await?;
+                            }
+                        }
+                        bound = swapped;
+                    }
+                }
+                Ok::<FinalizeVersionOutcome, DomainError>(FinalizeVersionOutcome {
+                    updated,
+                    bound,
                 })
             })
-            .await
+        })
+        .await
         // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-commit-or-rollback
     }
 
@@ -401,36 +430,58 @@ impl Store {
         let versions = self.repos.versions.clone();
         let audit_repo = self.repos.audit.clone();
         let bind_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let swapped = files
-                        .bind_content_cas(
-                            tx,
-                            &bind_scope,
-                            file_id,
-                            expected_content_id,
-                            version_id,
-                            now,
-                        )
-                        .await?;
-                    if !swapped {
-                        return Ok(false);
-                    }
-                    // Promote the new version as current (unique-current index honoured).
-                    versions
-                        .clear_current(tx, &AccessScope::allow_all(), file_id)
-                        .await?;
-                    versions
-                        .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
-                        .await?;
-                    // @cpt-cf-file-storage-nfr-audit-completeness
-                    audit_repo.insert(tx, &audit).await?;
-                    Ok::<bool, DomainError>(true)
-                })
+        let db = self.db.db();
+        // Retryable: this transaction locks `files` then `file_versions`
+        // (`bind_content_cas` first, `clear_current`/`set_current` after),
+        // the opposite order from `finalize_version`'s auto-bind branch
+        // (`file_versions` then `files`) -- the same cross-transaction
+        // deadlock risk `finalize_version` documents, seen from the other
+        // side. See `db::transaction_with_bounded_retry` for the retry
+        // contract and why every captured value is cloned per attempt.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let versions = versions.clone();
+            let audit_repo = audit_repo.clone();
+            let bind_scope = bind_scope.clone();
+            let audit = audit.clone();
+            Box::pin(async move {
+                let swapped = files
+                    .bind_content_cas(
+                        tx,
+                        &bind_scope,
+                        file_id,
+                        expected_content_id,
+                        version_id,
+                        now,
+                    )
+                    .await?;
+                if !swapped {
+                    return Ok(false);
+                }
+                // Promote the new version as current (unique-current index honoured).
+                versions
+                    .clear_current(tx, &AccessScope::allow_all(), file_id)
+                    .await?;
+                // `set_current` returning 0 rows means `version_id` was
+                // deleted by a concurrent `delete_version` between the CAS
+                // above and this promotion (see `VersionRepo::set_current`'s
+                // doc comment for the exact race) -- abort the transaction
+                // rather than commit a `files.content_id` that points at a
+                // version row which no longer exists.
+                let promoted = versions
+                    .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
+                    .await?;
+                if promoted == 0 {
+                    return Err(DomainError::conflict(
+                        "target version no longer exists -- it was deleted concurrently",
+                    ));
+                }
+                // @cpt-cf-file-storage-nfr-audit-completeness
+                audit_repo.insert(tx, &audit).await?;
+                Ok::<bool, DomainError>(true)
             })
-            .await
+        })
+        .await
     }
 
     /// Swap the content pointer + promote `version_id` as current, optionally
@@ -458,37 +509,58 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let bind_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let swapped = files
-                        .bind_content_cas(
-                            tx,
-                            &bind_scope,
-                            file_id,
-                            expected_content_id,
-                            version_id,
-                            now,
-                        )
-                        .await?;
-                    if !swapped {
-                        return Ok(false);
-                    }
-                    versions
-                        .clear_current(tx, &AccessScope::allow_all(), file_id)
-                        .await?;
-                    versions
-                        .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
-                        .await?;
-                    audit_repo.insert(tx, &audit).await?;
-                    if let Some(ev) = event {
-                        events_repo.enqueue(tx, &ev).await?;
-                    }
-                    Ok::<bool, DomainError>(true)
-                })
+        let db = self.db.db();
+        // Retryable: same `files` -> `file_versions` lock order as
+        // `bind_atomic`, and so the same deadlock exposure against
+        // `finalize_version`'s reversed order -- see `bind_atomic`'s comment
+        // and `db::transaction_with_bounded_retry`'s doc comment for the
+        // retry contract and per-attempt cloning.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let versions = versions.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let bind_scope = bind_scope.clone();
+            let audit = audit.clone();
+            let event = event.clone();
+            Box::pin(async move {
+                let swapped = files
+                    .bind_content_cas(
+                        tx,
+                        &bind_scope,
+                        file_id,
+                        expected_content_id,
+                        version_id,
+                        now,
+                    )
+                    .await?;
+                if !swapped {
+                    return Ok(false);
+                }
+                versions
+                    .clear_current(tx, &AccessScope::allow_all(), file_id)
+                    .await?;
+                // See `bind_atomic` and `VersionRepo::set_current`'s doc
+                // comment: 0 rows means a concurrent `delete_version` won
+                // the race for this version between the CAS and here, and
+                // must abort the transaction rather than commit a dangling
+                // `files.content_id`.
+                let promoted = versions
+                    .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
+                    .await?;
+                if promoted == 0 {
+                    return Err(DomainError::conflict(
+                        "target version no longer exists -- it was deleted concurrently",
+                    ));
+                }
+                audit_repo.insert(tx, &audit).await?;
+                if let Some(ev) = event {
+                    events_repo.enqueue(tx, &ev).await?;
+                }
+                Ok::<bool, DomainError>(true)
             })
-            .await
+        })
+        .await
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,
