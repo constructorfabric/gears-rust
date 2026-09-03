@@ -192,11 +192,12 @@ impl AuthZResolverApi for CapturingMock {
 struct GroupScopeMock;
 
 #[async_trait]
-impl AuthZResolverClient for GroupScopeMock {
+impl AuthZResolverApi for GroupScopeMock {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
