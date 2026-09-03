@@ -2462,6 +2462,7 @@ dependencies = [
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-graph-storage-onnx-embedding-plugin",
+ "cf-gears-graph-storage-remote-embedding-plugin",
  "cf-gears-graph-storage-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
@@ -2509,6 +2510,24 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "cf-gears-graph-storage-remote-embedding-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-graph-storage-sdk",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

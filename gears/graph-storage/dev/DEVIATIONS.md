@@ -268,6 +268,19 @@ DESIGN's envelope table gives `key` as an envelope member on both element kinds 
 
 **Proposal:** none — but DESIGN should say the repetition is intended, because the alternative reading is that one of the two is a mistake.
 
+## D-025 [impl] The remote embedding provider is built, without the egress policy ADR-0004 puts in front of it
+
+D-103 deferred the remote plugin with the reason that *"building the plugin without that policy would be building the part that is easy to get wrong"*. It is now built anyway (`gears/graph-storage/remote-embedding-plugin`, behind the gear's `remote` feature), and the reason is a deployment fact rather than a change of mind: the reference assembly has to run where a model in the gear's process is not affordable — a memory ceiling, no CPU budget for inference — and a deployment that cannot embed at all is the option ADR-0004 rejects first.
+
+- **What is built:** the `OpenAI`-compatible `POST /embeddings` protocol, batched, aligned by the response `index`, width-checked per vector, L2-normalized on this side; the credential named by environment variable rather than carried in configuration; the SDK's executable provider contract passing against a mock endpoint, as ADR-0004 asks ("remote via mock server").
+- **What the identity can promise, and cannot:** the space is named by *model at endpoint at width*. That is the only identity a remote endpoint offers, and it cannot see a vendor changing weights behind a stable model name. The ONNX provider's content hash can; this one relies on model governance.
+- **What is still not built:** the default-deny per-tenant egress policy (vendor, endpoint, region, data classes, vectorized fields, retention terms). Until it exists, selecting `remote` means every tenant's node text and query text leaves the deployment for the one configured endpoint, and the configuration file is the only record that it does. **A prototype trade, not a release posture.**
+- **Proposal:** the egress policy is a platform concern shared with the LLM gateway (OAGW already models approved upstreams per tenant); the plugin should route through it once a per-tenant upstream can be resolved for embeddings, and the direct client here becomes the no-gateway fallback.
+
+## D-026 [impl] The base-ontology schemas moved into the crate, because `cargo package` ships nothing outside it
+
+The nine base schemas lived under `docs/schemas/` and reached the binary through `include_str!("../../../docs/schemas/...")`. That compiles from a checkout and fails to package: a crate's archive contains only its own directory, so the first `cargo publish` — or the first consumer building the gear as a git dependency — would have found no schemas. They now live in `gears/graph-storage/graph-storage/schemas/` (with the `acme` examples beside them) and DESIGN points there. The gear registers the same bytes; only the path changed.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
@@ -431,7 +444,7 @@ does not ship it, and the API/schema leave room for it.
 
 **Still deferred, and now the whole of what is left:**
 - **The model-change lifecycle.** `requested → scanning → embedding → validating → cutover → complete`, its administrative API, the resumable backfill and per-tenant progress. Nothing opens a second epoch: a boot that finds a different identity reports it and blocks the arm, which is the safe half of the lifecycle without the recovery half. The gear has no background task of any kind, so this is a new capability rather than a missing branch.
-- **The remote provider and its egress policy.** ADR-0005 requires a default-deny per-tenant policy over vendor, endpoint, region, data classes and vectorized fields before node text or user queries may leave a deployment. Building the plugin without that policy would be building the part that is easy to get wrong.
+- **The remote provider and its egress policy.** ADR-0005 requires a default-deny per-tenant policy over vendor, endpoint, region, data classes and vectorized fields before node text or user queries may leave a deployment. Building the plugin without that policy would be building the part that is easy to get wrong. *Superseded by D-025: the plugin is built; the policy is not.*
 - **Chunk embeddings.** The `chunk` table is deferred (D-100), so "and every content chunk" has nothing to embed, and the "bounded content prefix" of the composed text is a prefix of name-plus-attributes only.
 - **The readiness surface** that should report the active identity and dimension. The *behaviour* the FR asks for is enforced — at boot, and per request on the vector arm — but there is nowhere to read it from (D-109).
 

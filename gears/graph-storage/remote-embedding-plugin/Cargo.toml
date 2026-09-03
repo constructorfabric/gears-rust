@@ -1,0 +1,41 @@
+[package]
+name = "cf-gears-graph-storage-remote-embedding-plugin"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Remote embedding provider for the graph-storage gear: the alternative plugin of ADR-0004, over the OpenAI-compatible /embeddings protocol"
+keywords = ["constructorfabric", "cf-gears", "graph", "embeddings"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "remote_embedding_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+graph-storage-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The credential never appears in a `Debug` rendering of the configuration.
+secrecy = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+# Same feature set the other outbound-HTTP gears use (chat-engine, github-mirror).
+reqwest = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+graph-storage-sdk = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = { workspace = true }

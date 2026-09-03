@@ -5,7 +5,13 @@ publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
 description = "Graph Storage gear: typed, multi-tenant knowledge graph with search and traversal over a pluggable store"
+keywords = ["constructorfabric", "cf-gears", "graph", "knowledge-graph"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "graph_storage"
@@ -16,14 +22,19 @@ workspace = true
 [features]
 default = []
 integration = []
-# The in-process ONNX embedding provider (ADR-0005's default). Off by default:
+# The in-process ONNX embedding provider (ADR-0004's default). Off by default:
 # it pulls in ONNX Runtime bindings, and a deployment that has not been given
 # model artifacts cannot use it anyway. Mirrors file-parser's `magika`.
 onnx = ["dep:onnx-embedding-plugin"]
+# The remote embedding provider (ADR-0004's alternative): an OpenAI-compatible
+# `/embeddings` endpoint. Off by default for the same reason `onnx` is — a
+# deployment selects one provider, and links only what it selected.
+remote = ["dep:remote-embedding-plugin"]
 
 [dependencies]
 graph-storage-sdk = { workspace = true }
 onnx-embedding-plugin = { workspace = true, optional = true }
+remote-embedding-plugin = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

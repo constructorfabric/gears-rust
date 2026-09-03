@@ -121,7 +121,58 @@ async fn select_embedding_provider(
             )))
         }
         EmbeddingProviderKind::Onnx => onnx_provider(cfg).await,
+        EmbeddingProviderKind::Remote => remote_provider(cfg),
     }
+}
+
+#[cfg(feature = "remote")]
+fn remote_provider(cfg: &GraphStorageConfig) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
+    let named = |key: &str, value: &Option<String>| -> anyhow::Result<String> {
+        value.clone().ok_or_else(|| {
+            anyhow::anyhow!("graph-storage.{key} is required by the `remote` embedding provider")
+        })
+    };
+    let mut config = remote_embedding_plugin::RemoteProviderConfig::new(
+        named("embedding_remote_base_url", &cfg.embedding_remote_base_url)?,
+        named("embedding_remote_model", &cfg.embedding_remote_model)?,
+    );
+    config.dimension = cfg.embedding_dimension;
+    config.request_dimensions = cfg.embedding_remote_request_dimensions;
+    config.batch_size = cfg.embedding_remote_batch_size as usize;
+    config.timeout = std::time::Duration::from_secs(cfg.embedding_remote_timeout_secs);
+
+    // The credential is named, not carried: the config file (and its dump)
+    // holds the variable's name, the process environment holds the value.
+    if let Some(variable) = &cfg.embedding_remote_api_key_env {
+        let value = std::env::var(variable).map_err(|_| {
+            anyhow::anyhow!(
+                "graph-storage.embedding_remote_api_key_env names {variable}, which is not set \
+                 in this process's environment"
+            )
+        })?;
+        if value.trim().is_empty() {
+            anyhow::bail!(
+                "graph-storage.embedding_remote_api_key_env names {variable}, which is empty"
+            );
+        }
+        config = config.with_api_key(value);
+    }
+
+    let provider = remote_embedding_plugin::RemoteEmbeddingProvider::new(config)?;
+    info!(
+        endpoint = %provider.endpoint(),
+        model = %provider.embedding_space().model_artifact,
+        "configured the remote embedding provider"
+    );
+    Ok(Arc::new(provider))
+}
+
+#[cfg(not(feature = "remote"))]
+fn remote_provider(_cfg: &GraphStorageConfig) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
+    anyhow::bail!(
+        "graph-storage.embedding_provider is `remote` but this binary was built without the \
+         `remote` feature; rebuild with it or choose another provider"
+    )
 }
 
 #[cfg(feature = "onnx")]

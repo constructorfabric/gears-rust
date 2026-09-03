@@ -19,9 +19,13 @@ pub enum EmbeddingProviderKind {
     /// deployment that wants the write path exercised before a model exists.
     #[default]
     Fake,
-    /// ADR-0005's default: a `MiniLM`-class model in this process. Needs the
+    /// ADR-0004's default: a `MiniLM`-class model in this process. Needs the
     /// `onnx` feature at compile time and artifact paths at run time.
     Onnx,
+    /// ADR-0004's alternative: an `OpenAI`-compatible `/embeddings` endpoint.
+    /// Needs the `remote` feature at compile time and an endpoint, a model and
+    /// a credential at run time.
+    Remote,
 }
 
 /// Which backend serves one-hop expansion.
@@ -61,6 +65,24 @@ pub struct GraphStorageConfig {
     /// Path to the matching tokenizer artifact.
     pub embedding_tokenizer_path: Option<String>,
 
+    // --- the `remote` provider ----------------------------------------------
+    /// API root of the `OpenAI`-compatible endpoint, e.g.
+    /// `https://api.openai.com/v1`. Required by the `remote` provider.
+    pub embedding_remote_base_url: Option<String>,
+    /// Model name as the endpoint knows it. Required by the `remote` provider.
+    pub embedding_remote_model: Option<String>,
+    /// Name of the environment variable holding the bearer credential. The
+    /// value never enters the configuration, so a config dump cannot leak it.
+    /// Unset means the endpoint takes no credential.
+    pub embedding_remote_api_key_env: Option<String>,
+    /// Send the `dimensions` request field, so a Matryoshka model returns
+    /// exactly `embedding_dimension` lanes. Off for a fixed-width model.
+    pub embedding_remote_request_dimensions: bool,
+    /// Inputs per request to the endpoint.
+    pub embedding_remote_batch_size: u32,
+    /// Per-request timeout, seconds. The caller's deadline shortens it.
+    pub embedding_remote_timeout_secs: u64,
+
     // --- limits (graph-storage.limits.*) ----------------------------------
     pub ingest_max_nodes: u32,
     pub ingest_max_edges: u32,
@@ -88,6 +110,12 @@ impl Default for GraphStorageConfig {
             embedding_provider: EmbeddingProviderKind::default(),
             embedding_model_path: None,
             embedding_tokenizer_path: None,
+            embedding_remote_base_url: None,
+            embedding_remote_model: None,
+            embedding_remote_api_key_env: None,
+            embedding_remote_request_dimensions: true,
+            embedding_remote_batch_size: 64,
+            embedding_remote_timeout_secs: 60,
             ingest_max_nodes: 10_000,
             ingest_max_edges: 20_000,
             payload_max_bytes: 64 * 1024,
@@ -129,6 +157,8 @@ impl GraphStorageConfig {
         let mut errors: Vec<String> = Vec::new();
         check_range!(errors, self, embedding_dimension, 1u32, 4_096u32);
         check_range!(errors, self, embedding_input_max_bytes, 64u32, 262_144u32);
+        check_range!(errors, self, embedding_remote_batch_size, 1u32, 2_048u32);
+        check_range!(errors, self, embedding_remote_timeout_secs, 1u64, 600u64);
         check_range!(errors, self, ingest_max_nodes, 1u32, 50_000u32);
         check_range!(errors, self, ingest_max_edges, 1u32, 100_000u32);
         check_range!(errors, self, payload_max_bytes, 1_024u32, 1_048_576u32);
