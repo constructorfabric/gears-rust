@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::idempotency_key::{ActiveModel, Column, Entity, Model};
 use crate::infra::storage::store::IdempotencyInsert;
 
@@ -110,9 +110,24 @@ impl IdempotencyRepo {
             created_at: Set(now),
             expires_at: Set(idem.expires_at),
         };
+        // The design documented above *relies on* this insert losing the
+        // primary-key race against a concurrent identical request: that is
+        // how a duplicate `POST /files` retried after a client-side timeout
+        // is turned away without creating a second file. Before this fix
+        // that race surfaced as an opaque `DomainError::Database` (HTTP
+        // 500) via `db_err`; classify it as a conflict instead, so the
+        // racing caller gets a 409 it can react to (re-fetch via `get` and
+        // replay the winner's stored response) rather than a request that
+        // looks like it failed outright.
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a request with this idempotency key is already being processed or has \
+                     already completed",
+                )
+            })?;
         Ok(())
     }
 
