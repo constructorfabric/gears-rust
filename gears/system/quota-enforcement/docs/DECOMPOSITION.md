@@ -29,8 +29,8 @@
 ## 1. Overview
 
 The DESIGN is decomposed into eleven features along its plugin seams and evaluation pipeline. The strategy is
-dependency-ordered vertical slices: the foundation feature stands up the gear skeleton, the storage and coordination
-plugin contracts, authorization, and tenant isolation; the projection-contracts feature adds the declarative GTS
+dependency-ordered vertical slices: the foundation feature stands up the gear skeleton, the storage plugin
+contract, the coordination adapter over the platform `cluster` gear, authorization, and tenant isolation; the projection-contracts feature adds the declarative GTS
 request surface those operations validate against; lifecycle, policy/engine, and the operation features then build the
 evaluation pipeline in the order the `EvaluationOrchestrator` executes it. Read surfaces, notifications, and the
 deferred P2/P3 capabilities close the list. Every P1 functional requirement, NFR, design principle, constraint,
@@ -48,7 +48,7 @@ not here.
 - **Feature**: [features/foundation.md](features/foundation.md)
 
 - **Purpose**: Stand up the `quota-enforcement` gear and SDK crates, the `QuotaEnforcementStoragePluginV1` contract
-  with its `toolkit-db` reference plugin, the `CoordinationPluginV1` contract with its storage-backed default, gear
+  with its `toolkit-db` reference plugin, the coordination adapter over the platform `cluster` gear's leader election, gear
   bootstrap (schema check, config-table defaults, and the bootstrap hook later features extend),
   two-phase PDP authorization, tenant isolation, and the gear-specific telemetry conventions. Every later feature
   builds on these seams.
@@ -58,7 +58,8 @@ not here.
 - **Scope**:
   - `quota-enforcement` and `quota-enforcement-sdk` crate skeletons registered in the workspace
   - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I13, `toolkit-db` plugin
-  - `CoordinationPluginV1` trait (`try_lock`/`renew`/`release`), storage-backed default implementation
+  - `cluster-sdk` dependency (no `deps = [cluster]` edge), typed `quota-enforcement` cluster profile, and the
+    coordination adapter (one leader election per sweeper scope, linearizable requirement validated at startup)
   - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission via
     `PolicyEnforcer` (fail-closed, no QE-side decision cache), phase-2 `AccessScope` pass-through to `SecureConn`
   - Tenant isolation filters at gateway and storage layers
@@ -105,7 +106,8 @@ not here.
 
 - **API**:
   - REST route registration under `/v1/quota-enforcement/...` (routes land with their owning features)
-  - `QuotaEnforcementStoragePluginV1`, `CoordinationPluginV1` plugin traits in the SDK crate
+  - `QuotaEnforcementStoragePluginV1` plugin trait in the SDK crate; cluster leader election consumed through
+    `cluster-sdk`
 
 - **Sequences**:
 
@@ -436,7 +438,8 @@ not here.
   - `LeaseManager` state machine (`Active` → `Committed`/`Released`/`AutoReleased`/`ResolvedByDeactivation`)
   - Atomic multi-Quota hold acquisition in lexicographic `quota_id` order; TTL bounds without clamping
   - Cross-period and cross-validity commit attribution to the acquisition period
-  - Lazy semantic release on every read/write path; `LeaseSweeper` physical reclamation under a coordination lock
+  - Lazy semantic release on every read/write path; `LeaseSweeper` physical reclamation under the `lease-sweeper`
+    cluster election
   - Contention timeout and active-lease-cap enforcement with their telemetry
 
 - **Out of scope**:

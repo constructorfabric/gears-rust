@@ -43,7 +43,7 @@ resolution, contract enforcement, trust boundary — while letting workload-spec
 selection, custom CEL policies) and deployment-specific event routing extend without core changes.
 
 The stateless gateway plus pluggable storage shape gives QE identical operational characteristics across deployments:
-horizontal scale, sweeper singletons coordinated via `CoordinationPluginV1`, fail-closed authorization,
+horizontal scale, sweeper singletons elected through the platform `cluster` gear, fail-closed authorization,
 two-phase PDP integration. The Storage plugin contract is the thin waist — a single Rust trait with a closed error enum
 and thirteen invariants — under which each backend is free to choose its locking discipline, indexing strategy, and
 partitioning approach. The P1 implementation is based on `toolkit-db` backend
@@ -70,7 +70,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-quota-enforcement-fr-lease-acquire`                      | `acquire_lease` storage primitive: atomically inserts lease + per-Quota holds, increments active-lease counter, captures `acquisition_period_id` (I7, I5).                                                                                                                                                                                                                                                                                                                     |
 | `cpt-cf-quota-enforcement-fr-lease-commit`                       | `commit_lease` attributes to acquisition period regardless of wall-clock period (I5); rejects over-commit (StorageError::OverCommitNotAuthorized).                                                                                                                                                                                                                                                                                                                             |
 | `cpt-cf-quota-enforcement-fr-lease-release`                      | Symmetric inverse of acquire, idempotent under replay; returns held capacity to acquisition period.                                                                                                                                                                                                                                                                                                                                                                            |
-| `cpt-cf-quota-enforcement-fr-lease-timeout`                      | Two-tier model: lazy semantic release (gateway and storage treat expired-by-timestamp leases as released, I4) + physical reclamation by `LeaseSweeper` background task; sweeper singleton via `CoordinationPluginV1`.                                                                                                                                                                                                                                                          |
+| `cpt-cf-quota-enforcement-fr-lease-timeout`                      | Two-tier model: lazy semantic release (gateway and storage treat expired-by-timestamp leases as released, I4) + physical reclamation by `LeaseSweeper` background task; sweeper singleton via the `lease-sweeper` cluster election.                                                                                                                                                                                                                                                          |
 | `cpt-cf-quota-enforcement-fr-multi-quota-evaluation`             | `EvaluationOrchestrator` resolves applicable Quotas, calls Engine, validates Debit-Plan invariants, applies via `apply_debit_plan` atomically across N Quotas.                                                                                                                                                                                                                                                                                                                 |
 | `cpt-cf-quota-enforcement-fr-batch-debit`                        | Dedicated `apply_batch_debit` primitive with envelope idempotency key; per-item evaluation, all-or-nothing on the envelope.                                                                                                                                                                                                                                                                                                                                                    |
 | `cpt-cf-quota-enforcement-fr-evaluate-preview`                   | Reuses `read_quota_snapshot` + Engine call; no idempotency record, no row mutation (I3).                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -113,20 +113,20 @@ This table maps non-functional requirements from PRD §6 to specific design resp
 | `cpt-cf-quota-enforcement-nfr-throughput`                 | ≥ 10 K ops/s                             | Stateless gateway, storage plugin tuning   | Horizontal scale (multi-replica gateway behind LB); storage-plugin connection pooling; bulk-read applicable Quotas; sharded counters as a P2 hook. Plugin-side tuning is plugin-internal.                                                                           | Load test sustained 10K ops/s with no SLO breach.                                                              |
 | `cpt-cf-quota-enforcement-nfr-subject-scale`              | ≥ 100 M subjects                         | Storage plugin schema + indexes            | Plugin-side hot-path indexing on `(projection_type, subject_id, metric)`; partitioning strategy plugin-internal; cap of 4 KB on `metadata` keeps row width bounded.                                                                                                 | Synthetic dataset benchmark; query-plan inspection at 100 M subjects.                                          |
 | `cpt-cf-quota-enforcement-nfr-quota-density`              | ≥ 10 Quotas/subject; ≥ 1 B Quotas total  | Storage plugin schema                      | Single `Quota` entity; per-period counter rows; plugin-side hot-path indexing keyed on active Quotas.                                                                                                                                                               | Capacity model in §4 + bench.                                                                                  |
-| `cpt-cf-quota-enforcement-nfr-availability`               | 99.95 %                                  | Stateless gateway, K8s                     | Multi-replica gateway with rolling updates; sweeper singletons use `CoordinationPluginV1` locks; the notification dispatcher rides the `toolkit-db` Outbox lease. | SRE error-budget burn-down and chaos-test gateway pod kills.                                                   |
+| `cpt-cf-quota-enforcement-nfr-availability`               | 99.95 %                                  | Stateless gateway, K8s                     | Multi-replica gateway with rolling updates; sweeper singletons hold cluster leader elections; the notification dispatcher rides the `toolkit-db` Outbox lease. | SRE error-budget burn-down and chaos-test gateway pod kills.                                                   |
 | `cpt-cf-quota-enforcement-nfr-authentication`             | Authenticated requests only              | api-gateway / ToolKit pipeline              | Unauthenticated requests are rejected by the platform `api-gateway` before they reach a QE handler.                                                                                                                                                                 | Integration test: anonymous request → 401.                                                                     |
 | `cpt-cf-quota-enforcement-nfr-authorization`              | PDP-gated, fail-closed                   | Gateway + EvaluationOrchestrator           | Two-phase PDP integration — admission decision before transaction (Gateway calls `PolicyEnforcer`, fail-closed, no QE-side decision cache), returned `AccessScope` consumed by `SecureConn` inside the transaction (EvaluationOrchestrator); PDP unavailability → fail-closed deny.                         | Chaos: PDP down → all writes denied.                                                                           |
 | `cpt-cf-quota-enforcement-nfr-tenant-isolation-integrity` | No cross-tenant leakage                  | Gateway + Storage Plugin                   | Defense-in-depth: PDP authorizes the complete caller-supplied attribution tuple; storage plugin binds the authorized tenant id on every query.                                                                                                                        | Adversarial integration test: service supplies an unauthorized tenant id → PDP denies before storage.         |
 | `cpt-cf-quota-enforcement-nfr-idempotency-guarantee`      | Replay-safe under at-least-once delivery | `IdempotencyCache` + transactional storage | Single-tx upsert on `(tenant_id, idempotency_subject_key, operation_type, key)` (I2); mismatched payload returns `IdempotencyPayloadMismatch`.                                                                                                                           | Replay test: duplicate request → identical Decision, no double mutation.                                       |
 | `cpt-cf-quota-enforcement-nfr-fault-tolerance`            | RPO = 0                                  | Storage plugin                             | Storage plugin guarantees durable commit before acknowledgement (RPO = 0). Concrete realization (synchronous replication, consensus quorum apply, multi-AZ durability ack, …) is plugin-internal.                                                                   | DR drill: kill primary, verify zero data loss.                                                                 |
-| `cpt-cf-quota-enforcement-nfr-recovery`                   | RTO ≤ 15 min                             | Gateway + sweeper                          | Auto-reconnect; lease re-claim is automatic (lazy expiry, I4); sweeper re-acquires its `CoordinationPluginV1` lock after restart.                                                                                                                                   | DR drill: full restart, verify ops resume within 15 min.                                                       |
+| `cpt-cf-quota-enforcement-nfr-recovery`                   | RTO ≤ 15 min                             | Gateway + sweeper                          | Auto-reconnect; lease re-claim is automatic (lazy expiry, I4); sweeper rejoins its cluster election after restart.                                                                                                                                   | DR drill: full restart, verify ops resume within 15 min.                                                       |
 
 #### Key ADRs
 
 | ADR ID                                                  | Decision Summary                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cpt-cf-quota-enforcement-adr-storage-backend`          | Storage is the `QuotaEnforcementStoragePluginV1` plugin trait — capability-based contract (§3.5 + I1–I13), no specific backend mandated by QE-core. Required capabilities: multi-statement ACID transactions, deterministic serialization of concurrent counter mutations (per ADR-0002), filterable metadata, durable RPO = 0 commit, hot-path access patterns, schema-versioned migrations. Concrete realization (mechanism, isolation level, replication strategy, metadata storage shape, storage class) is plugin-internal; backend choice is operator territory. P1 reference impl is `toolkit-db`-based (PostgreSQL recommended default), shipped for default-deployment ergonomics — non-normative. |
-| `cpt-cf-quota-enforcement-adr-coordination-plugin`      | Leader election and distributed locks live in a separate `CoordinationPluginV1` contract. Sweeper singletons consume coordination via ClientHub; the coordination backend is pluggable independently of the storage backend. Implementations are operator-deployable without touching QE-core or the storage plugin.                                                                                                                                                                                                                                                                                                                                                                          |
+| `cpt-cf-quota-enforcement-adr-coordination-plugin`      | Sweeper singletons run under the platform `cluster` gear's leader election (one election per `SingletonScope`) behind a thin QE port and adapter. QE requires a linearizable election at resolve time; the operator selects the backend in the cluster profile YAML, independently of the storage backend. No QE-owned coordination contract or plugin crate (revised 2026-09-03).                                                                                                                                                                                                                                                                                                       |
 | `cpt-cf-quota-enforcement-adr-acquisition-ordering`     | Multi-Quota acquisition ordering = lexicographic by `quota_id` UUID. Deterministic, transaction-stable, deadlock-free; alternatives (compound key, queue-based serialisation) rejected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `cpt-cf-quota-enforcement-adr-metadata-snapshot-timing` | EvaluationContext metadata snapshot taken at applicable-Quotas resolution. Resolves the Quota Metadata mutation-visibility decision — deterministic + replay-safe + simpler than evaluation-start snapshot.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cpt-cf-quota-enforcement-adr-settlement-window-emit`   | Emit nothing during settlement window; closing-period state surfaced via `period-rollover` payload alone. Eliminates need for new event variants for cross-period commits/releases.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -150,9 +150,9 @@ graph TB
     RS[RetentionSweeper] --> SP
     ND[NotificationDispatcher<br/>outbox leased handler] --> Outbox
     ND --> NotifPlug[QuotaNotificationSinkV1 sinks]
-    LS -->|lock| CP[CoordinationPlugin]
-    RS -->|lock| CP
-        CP --> CoordBackend[(Coordination backend)]
+    LS -->|elect| CA[CoordinationAdapter]
+    RS -->|elect| CA
+        CA --> Cluster[(cluster gear<br/>leader election)]
 ```
 
 > The diagram preserves the I11 outbox-same-tx invariant: every component that emits a `NotificationOutboxEvent`
@@ -167,9 +167,9 @@ graph TB
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
 | SDK (`quota-enforcement-sdk` crate) | Rust traits for Quota Consumer, Quota Manager, plugin contracts (`QuotaEnforcementStoragePluginV1`, `QuotaResolutionEngineV1`, `QuotaNotificationSinkV1`); domain types (`Quota`, `Lease`, `LeaseHold`, `DebitPlan`, `Decision`); closed error enums.                                                                                                                                                                                                                          | Rust structs + traits; `cargo` workspace member.                                                                                    |
 | Gateway (`quota-enforcement` crate) | REST handler layer mounted into the platform `api-gateway` gear via ToolKit `RestApiCapability::register_rest`; QE does not run its own HTTP server. Owns DTO validation; phase-1 PDP integration (`PolicyEnforcer` admission, fail-closed, `AccessScope` pass-through); tenant-isolation filter; delegates to `QuotaManagementService` / `QuotaEnforcementService`.                                                                                                                                          | Axum handlers + ToolKit `OperationBuilder` (typed-operation registration auto-generates the OpenAPI fragment via `utoipa`); tracing. |
-| Plugins (separate crates)           | `quota-enforcement-storage-plugin` (transactional persistence via `toolkit-db` per `cpt-cf-quota-enforcement-adr-storage-backend`); `quota-enforcement-coordination-plugin` (leader election / distributed locks, per `cpt-cf-quota-enforcement-adr-coordination-plugin`); `quota-enforcement-engine-most-restrictive`, `quota-enforcement-engine-cel` (built-ins, in-process linkage); `quota-enforcement-notification-plugin` trait (sink implementations operator-supplied). | Rust crates; static linkage at build time per `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`.                 |
-| Background tasks                    | `LeaseSweeper` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `RetentionSweeper` (idempotency / operation log retention); `NotificationDispatcher` (drains outbox to registered sinks).                                                                                                                                                                                                                                                           | Same binary as gateway when bundled, or separate binary in split deployments; sweeper singletons via `CoordinationPluginV1`; the dispatcher is fenced by the `toolkit-db` Outbox lease.    |
-| External                            | Persistent backend reached via the storage plugin (P1 backend choice in `cpt-cf-quota-enforcement-adr-storage-backend`); `authz-resolver` (PDP); `types-registry` (metric registration plus owner projection/request/constraint contracts); platform observability stack — `tracing` plus OpenTelemetry export via `toolkit`'s `otel` feature.                                                                                                                                 | Existing platform components.                                                                                                       |
+| Plugins (separate crates)           | `quota-enforcement-storage-plugin` (transactional persistence via `toolkit-db` per `cpt-cf-quota-enforcement-adr-storage-backend`); `quota-enforcement-engine-most-restrictive`, `quota-enforcement-engine-cel` (built-ins, in-process linkage); `quota-enforcement-notification-plugin` trait (sink implementations operator-supplied). | Rust crates; static linkage at build time per `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`.                 |
+| Background tasks                    | `LeaseSweeper` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `RetentionSweeper` (idempotency / operation log retention); `NotificationDispatcher` (drains outbox to registered sinks).                                                                                                                                                                                                                                                           | Same binary as gateway when bundled, or separate binary in split deployments; sweeper singletons via cluster leader election per `cpt-cf-quota-enforcement-adr-coordination-plugin`; the dispatcher is fenced by the `toolkit-db` Outbox lease.    |
+| External                            | Persistent backend reached via the storage plugin (P1 backend choice in `cpt-cf-quota-enforcement-adr-storage-backend`); platform `cluster` gear (leader election for the sweeper singletons per `cpt-cf-quota-enforcement-adr-coordination-plugin`); `authz-resolver` (PDP); `types-registry` (metric registration plus owner projection/request/constraint contracts); platform observability stack — `tracing` plus OpenTelemetry export via `toolkit`'s `otel` feature.                                                                                                                                 | Existing platform components.                                                                                                       |
 
 ## 2. Principles & Constraints
 
@@ -412,8 +412,9 @@ erDiagram
 
 ### 3.2 Component Model
 
-QE is decomposed into a Gateway, an in-process Orchestrator and Manager set, four plugin families (Storage,
-Coordination, Engine, Notification), background tasks (sweeper, dispatcher), and adapters to platform infrastructure.
+QE is decomposed into a Gateway, an in-process Orchestrator and Manager set, three plugin families (Storage, Engine,
+Notification), a coordination adapter over the platform `cluster` gear, background tasks (sweeper, dispatcher), and
+adapters to platform infrastructure.
 Every component carries a stable `cpt-cf-quota-enforcement-component-{slug}` ID for traceability.
 
 ```mermaid
@@ -440,9 +441,12 @@ graph TB
 
     subgraph "Plugins"
         SP[StoragePlugin]
-        CP[CoordinationPlugin]
         Engines[Engine plugins<br/>most-restrictive-wins / cel]
         Notif[QuotaNotificationSinkV1 sinks]
+    end
+
+    subgraph "Platform adapters"
+        CA[CoordinationAdapter<br/>cluster leader election]
     end
 
     subgraph "Background tasks"
@@ -461,14 +465,14 @@ graph TB
     RS --> SP
     ND --> Outbox2[(toolkit-db Outbox)]
     ND --> Notif
-    LS -->|lock| CP
-    RS -->|lock| CP
+    LS -->|elect| CA
+    RS -->|elect| CA
         GW -->|PDP| AuthzResolver[(authz-resolver)]
     QMS -->|metric + contract resolve/cache| TR[(types-registry)]
     PS -->|Policy contract snapshots| TR
     GWBoot[QE bootstrap] -. bases + consistency validation .-> TR
     GWBoot -->|atomic contract snapshot| PCC
-    CP --> CoordBackend[(Coordination backend)]
+    CA --> Cluster[(cluster gear)]
 ```
 
 #### Gateway
@@ -617,8 +621,8 @@ latency or availability therefore cannot enter the evaluation transaction.
 Synchronization between concurrent EO instances (every gateway replica runs an EO) is delegated entirely to the storage
 plugin's serialization of concurrent row mutations — the deterministic acquisition ordering of
 `cpt-cf-quota-enforcement-adr-acquisition-ordering` plus the storage-capability list in §3.5. EO instances are not
-singletons and do not consume `CoordinationPluginV1`; that contract is reserved for the sweeper singletons (the
-notification dispatcher is fenced by the `toolkit-db` Outbox lease).
+singletons and join no cluster election; only the sweeper singletons do (the notification dispatcher is fenced by the
+`toolkit-db` Outbox lease).
 
 ##### Related components (by ID)
 
@@ -766,7 +770,7 @@ upstream prerequisite), `outbox_rejections_total` (handler-incremented on the `R
 ##### Responsibility boundaries
 
 Does not enqueue events itself — events are enqueued by the Storage plugin's mutating primitives same-tx with the
-mutation. Does not consume `CoordinationPluginV1` — outbox lease fencing replaces the singleton lock for this
+mutation. Does not join a cluster election; outbox lease fencing replaces the singleton election for this
 component. Does not implement EventBus routing (deferred to P2 per PRD §13 EventBus OQ).
 
 ##### Related components (by ID)
@@ -786,8 +790,10 @@ outbox. Optionally deletes lease rows after a grace period.
 
 ##### Responsibility scope
 
-Single-leader execution via `CoordinationPluginV1::try_lock(LockScope::LeaseSweeper, ttl)` with heartbeat-renew on
-TTL/3; on lock loss the sweeper drops to follower mode and re-acquires through jittered backoff. Batch size
+Single-leader execution under the `lease-sweeper` election (`SingletonScope::LeaseSweeper`) through the
+`CoordinationAdapter`: the sweep loop starts when this replica is elected and receives a child cancellation token, the
+resolved cluster backend renews the claim, and the loop stops when leadership is lost; re-election is automatic. Batch
+size
 operator-configurable (P1 reference default: 1000 expired leases per cycle). Surface `lease_unreclaimed_expired` gauge
 by canonical registered `metric`.
 
@@ -814,8 +820,8 @@ concern of the Storage plugin's reclamation primitives.
 
 ##### Responsibility scope
 
-Single-leader execution via `CoordinationPluginV1::try_lock(LockScope::RetentionSweeper, ttl)` with heartbeat-renew on
-TTL/3; on lock loss the sweeper drops to follower mode and re-acquires through jittered backoff.
+Single-leader execution under the `retention-sweeper` election (`SingletonScope::RetentionSweeper`) through the
+`CoordinationAdapter`, with the same run-while-leader semantics as `LeaseSweeper`.
 `reclaim_expired_idempotency` and `reclaim_operation_log` invocations on the Storage plugin; batch-size and frequency
 configuration.
 
@@ -850,9 +856,9 @@ mutation.
 ##### Responsibility boundaries
 
 Locking discipline, indexing strategy, isolation level, partitioning, lock-timeout mechanics, and concrete table layouts
-are **plugin-internal**. The trait surface here is the contractual boundary of QE-core. Distributed leader election /
-locks for the sweeper singletons are **out of scope** — they live in
-`cpt-cf-quota-enforcement-component-coordination-plugin`.
+are **plugin-internal**. The trait surface here is the contractual boundary of QE-core. Leader election for the
+sweeper singletons is **out of scope**; it lives in `cpt-cf-quota-enforcement-component-coordination-plugin`, which
+consumes the platform `cluster` gear.
 
 ##### Related components (by ID)
 
@@ -860,34 +866,42 @@ locks for the sweeper singletons are **out of scope** — they live in
 - Actor: `cpt-cf-quota-enforcement-actor-storage-backend` (the persistent backend the plugin mediates; the trait IS the
   QE-side façade for this actor).
 
-#### CoordinationPlugin
+#### CoordinationAdapter
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-component-coordination-plugin`
 
 ##### Why this component exists
 
-Backend-agnostic distributed leader election and lock primitives, separated from the data-storage contract per
-`cpt-cf-quota-enforcement-adr-coordination-plugin`. Defines the `CoordinationPluginV1` Rust trait. The sweeper
-singletons consume this contract through ClientHub; the coordination backend is selected and deployed
-independently of the storage backend.
+Singleton coordination for the sweepers comes from the platform `cluster` gear's leader election per
+`cpt-cf-quota-enforcement-adr-coordination-plugin`. This component is the QE-side adapter: it resolves the cluster
+leader-election facade for the `quota-enforcement` profile, requires a linearizable election, scopes every name under
+the `qe` prefix, and implements the domain port `SingletonCoordinator` that the sweepers consume. The port exists for
+the domain-layer dependency rule; it is not a plugin extension point, and QE ships no coordination plugin of its own.
 
 ##### Responsibility scope
 
-TTL-bounded lock acquisition (`try_lock`), heartbeat-renew (`renew`), graceful release (`release`). Lock auto-release on
-TTL expiry is an inviolable property of the contract: a lock MUST NOT outlive its TTL even if the holder process crashes
-silently. Bootstrap-time reachability is validated via the `try_lock` + `release` probe on each `LockScope::*` value
-(DESIGN §3.7 bootstrap); the contract has no separate health-check method.
+Maps the closed `SingletonScope` enum (`LeaseSweeper`, `RetentionSweeper`) to the election names `lease-sweeper` and
+`retention-sweeper`. Runs a unit of work while this replica leads a scope: the work starts on election with a child
+cancellation token, the resolved cluster backend renews the claim on its own cadence, the token is cancelled on
+leadership loss,
+the work is aborted after the configured stop timeout, and the work restarts on re-election. The adapter drives the
+election watch itself, with the same reactive pattern the SDK's `run_while_leader` implements, and keeps ownership of
+the watch: the SDK combinator consumes the watch, and a dropped watch performs no resign I/O. On graceful shutdown the
+adapter cancels the work and then resigns every held election so a successor is elected without waiting for the TTL.
+Exposes the election TTL and the missed-renewal budget as operator configuration with the cluster defaults.
 
 ##### Responsibility boundaries
 
-Does not own counter / lease / outbox state — that lives in the storage plugin. Does not own evaluation pipeline
-serialization — that is the storage plugin's row-locking discipline. Concrete coordination backend (its transport,
-quorum semantics, internal storage of lease state) is **plugin-internal** and outside QE-core DESIGN.
+Does not own counter / lease / outbox state (storage plugin). Does not own evaluation pipeline serialization (storage
+plugin row locking). Does not implement the election: transport, quorum, lease storage, and backend selection belong
+to the cluster gear and the operator. Does not use the cluster distributed lock: a sweep cycle is storage I/O from
+start to end, which the cluster lock's critical-section rule forbids (cluster PRD §5.3).
 
 ##### Related components (by ID)
 
-- `cpt-cf-quota-enforcement-component-lease-sweeper`, `cpt-cf-quota-enforcement-component-retention-sweeper`,
-  `cpt-cf-quota-enforcement-component-notification-dispatcher` — the three consumers of `LockScope::*`.
+- `cpt-cf-quota-enforcement-component-lease-sweeper`, `cpt-cf-quota-enforcement-component-retention-sweeper` — the
+  two consumers of `SingletonScope::*`. The `NotificationDispatcher` is fenced by the `toolkit-db` Outbox lease and
+  does not consume this component.
 
 ### 3.3 API Contracts
 
@@ -895,7 +909,7 @@ QE exposes three contractual surfaces:
 
 1. **SDK Rust traits** — in `quota-enforcement-sdk` for in-process callers and SDK consumers
    (`cpt-cf-quota-enforcement-interface-sdk-client` per PRD §7.1).
-1. **Plugin traits** — Storage, Coordination, Engine, Notification — defined in the same SDK crate so plugin authors
+1. **Plugin traits** — Storage, Engine, Notification — defined in the same SDK crate so plugin authors
    implement against a single dependency.
 1. **Public REST API** — for cross-language callers and external consumers
    (`cpt-cf-quota-enforcement-interface-rest-api` per PRD §7.1).
@@ -905,11 +919,13 @@ QE exposes three contractual surfaces:
 - The REST API is served under the `/v1/quota-enforcement/...` path prefix.
 - The SDK trait ships in the `quota-enforcement-sdk` Cargo crate; semver applies.
 - Plugin contracts (`cpt-cf-quota-enforcement-contract-storage-plugin`,
-  `cpt-cf-quota-enforcement-contract-coordination-plugin`, `cpt-cf-quota-enforcement-contract-notification-plugin`,
+  `cpt-cf-quota-enforcement-contract-notification-plugin`,
   `cpt-cf-quota-enforcement-contract-quota-resolution-engine-plugin`) are versioned with the gear's major version;
   backwards-compatible additive changes are allowed within a major, field removals and semantic changes are
-  major-version breaks. All four plugin traits carry a matching `V<major>` suffix — `QuotaEnforcementStoragePluginV1`,
-  `CoordinationPluginV1`, `QuotaResolutionEngineV1`, `QuotaNotificationSinkV1`.
+  major-version breaks. All three plugin traits carry a matching `V<major>` suffix — `QuotaEnforcementStoragePluginV1`,
+  `QuotaResolutionEngineV1`, `QuotaNotificationSinkV1`.
+- Cluster coordination (`cpt-cf-quota-enforcement-contract-cluster-coordination`) is consumed, not defined, by QE;
+  the cluster gear versions the leader-election primitive, and QE tracks the `cluster-sdk` major version.
 
 #### Public REST API
 
@@ -1044,7 +1060,7 @@ field.
 
 Three traits split by actor role; every method is async, takes a `SecurityContext` reference as the first argument after
 `&self`, and returns `Result<_, QuotaEnforcementError>`. Every SDK-defined trait object (client, storage plugin,
-coordination plugin, engine, notification sink) is bound `Send + Sync + 'static` so it registers in ToolKit's
+engine, notification sink) is bound `Send + Sync + 'static` so it registers in ToolKit's
 `ClientHub` (`ClientHub::register` requires those bounds), and async trait methods return `Send` futures.
 
 **`QuotaEnforcementClientV1`** — Quota Consumer surface:
@@ -1182,56 +1198,60 @@ The P1 storage-plugin realisation of this contract — mutation-serialization me
 optimistic CAS vs. hybrid), isolation-level choice, lock-timeout mechanics, indexes, partitioning, replication strategy,
 metadata-storage shape (JSON / document / columnar) — is plugin-internal and lives outside QE-core DESIGN. The
 deterministic acquisition ordering of `cpt-cf-quota-enforcement-adr-acquisition-ordering` is a contract-level
-requirement (lexicographic by `quota_id` UUID); how the impl enforces it is its own concern. Distributed leader election
-for the sweeper singletons is **not** in this contract; it lives in `CoordinationPluginV1` below. The notification
-dispatcher needs no QE-side election: the `toolkit-db` Outbox lease fences it (§3.2).
+requirement (lexicographic by `quota_id` UUID); how the impl enforces it is its own concern. Leader election for the
+sweeper singletons is **not** in this contract; it comes from the platform `cluster` gear through the
+`CoordinationAdapter` (see "Cluster Coordination" below). The notification dispatcher needs no election: the
+`toolkit-db` Outbox lease fences it (§3.2).
 
-#### Coordination Plugin Trait
+#### Cluster Coordination
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-interface-coordination-plugin`
 
-- **Contracts**: `cpt-cf-quota-enforcement-contract-coordination-plugin`
+- **Contracts**: `cpt-cf-quota-enforcement-contract-cluster-coordination`
 
-- **Technology**: Rust trait in `quota-enforcement-sdk`; async; tokio.
+- **Technology**: `cluster-sdk` leader-election facade (`LeaderElectionV1`) resolved through ClientHub; async; tokio.
 
-- **Versioning**: Major-version coupled with gear per PRD §7.2.
+- **Versioning**: owned by the cluster gear per primitive; QE tracks the `cluster-sdk` major version.
 
-**`CoordinationPluginV1`** is a tiny lock-based contract for backend-agnostic singleton coordination of QE background
-tasks. The trait is consumed by `LeaseSweeper` and `RetentionSweeper` through ClientHub (the notification dispatcher
-is fenced by the `toolkit-db` Outbox lease instead); the
-coordination backend is selected and deployed independently of the storage backend per
-`cpt-cf-quota-enforcement-adr-coordination-plugin`. Every method returns `Result<_, CoordinationError>`.
+QE consumes this interface; it does not define it. The `CoordinationAdapter` (§3.2) resolves the facade once, in the
+gear's lifecycle `start`, with the typed profile `QuotaEnforcementProfile` (name `quota-enforcement`) and the
+`Linearizable` capability requirement, then scopes it under the `qe` prefix. `LeaseSweeper` and `RetentionSweeper`
+consume the adapter through the domain port `SingletonCoordinator`; the notification dispatcher is fenced by the
+`toolkit-db` Outbox lease instead.
 
-| Method                 | Returns | Realises                                                                                                                                                                                 |
-| ---------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `try_lock(scope, ttl)` | `Lock`  | Sweeper singleton acquisition for `cpt-cf-quota-enforcement-fr-lease-timeout` (LeaseSweeper) and for retention reclamation (RetentionSweeper). |
-| `renew(lock)`          | `()`    | TTL-extension before expiry; failure surfaces as `LockExpired` and forces follower-mode fallback.                                                                                        |
-| `release(lock)`        | `()`    | Graceful handoff at shutdown / scaledown; cooperating holders can re-acquire without waiting for TTL.                                                                                    |
+QE depends on `cluster-sdk` only and declares no `deps = [cluster]` edge (cluster DESIGN §3.17.7): a deployed consumer
+links no cluster gear, so the edge would fail the registry build. Start ordering comes from the cluster gear's `system`
+tier, and readiness gating from the SDK-submitted consumer registration. The embedded binary links the `cluster` gear,
+a provider plugin, and the mandatory `grpc-hub`; the remote image enables QE's forwarding Cargo feature and links none
+of them. QE source is the same in both.
 
-**Domain types** (closed; no implementation freedom on the wire):
+| Cluster operation           | QE use                                                                                                                                                                                                                                                             |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Resolve with `Linearizable` | Startup validation of the operator's backend binding for the `quota-enforcement` profile. A mismatch or an unbound profile fails startup (embedded profile) or readiness (deployed profile); the health check names `cluster` as the failed dependency.          |
+| Elect with config           | One election per `SingletonScope`, named `lease-sweeper` and `retention-sweeper`, with the configured election TTL and missed-renewal budget.                                                                                                                       |
+| Observe the watch           | The adapter drives the watch's status events itself and keeps the watch: the sweep body starts on `Leader` with a child cancellation token and is cancelled on `Lost` or `Follower`. The resolved cluster backend renews the claim.                              |
+| Resign                      | Graceful shutdown; a successor is elected without waiting for the TTL.                                                                                                                                                                                             |
 
-- `LockScope` — closed enum of permitted scopes: `LeaseSweeper`, `RetentionSweeper`. The
-  closed shape rules out free-form string keys and gives the impl deterministic key namespacing.
-- `Lock` — opaque holder-token carrying `scope`, `holder_id` (UUIDv7 minted per process / per acquisition cycle), `ttl`,
-  and `acquired_at`. Holders treat the value as opaque; only the impl interprets internal fields. Distinct from the
-  domain `Lease` (a quota capacity hold managed by `StoragePluginV1`) — terminology kept separate to avoid confusion.
-- `CoordinationError` — closed enum: `Conflict` (another holder owns the scope), `LockExpired` (renew/release issued on
-  a lock whose TTL has elapsed), `BackendUnavailable` (transport / backend reachability failure), `Internal(String)`
-  (last-resort opaque).
+**QE-side domain types**:
 
-**Semantic guarantees of the contract**:
+- `SingletonScope` — closed enum: `LeaseSweeper`, `RetentionSweeper`. Each variant maps to exactly one election name.
+  Free-form names never reach the cluster facade from QE code.
+- `SingletonCoordinator` — domain port with one operation: run a cancellable unit of work while this replica leads a
+  scope. Its only implementation is the `CoordinationAdapter`.
 
-- TTL-bounded locks. Auto-release on TTL expiry is an inviolable contract property — a lock MUST NOT outlive its TTL
-  even if the holder process crashes silently. This is the precondition for `cpt-cf-quota-enforcement-nfr-recovery` (RTO
-  ≤ 15 min): a dead leader's lock becomes acquirable by any survivor within at most one TTL.
-- `renew` MUST be called on or before TTL/3 of cycle elapsed. Holders that miss the renew window observe `LockExpired`
-  on the next attempt and MUST drop to follower mode immediately, then re-attempt acquisition through jittered backoff.
-- `release` is best-effort and never failure-mode; impls SHOULD treat it as a hint (TTL-driven release remains the
-  authoritative cleanup path).
+**Semantics QE relies on** (cluster PRD §5.2, cluster DESIGN §3.3):
 
-The P1 default impl piggybacks on the storage backend's own locking primitives — no additional ops dependency for
-default deployments. Operators may swap to an independent coordination backend without touching QE-core or the storage
-plugin; the realisation is plugin-internal.
+- At most one participant observes itself as leader in steady state; the claim lapses within the election TTL when the
+  holder dies, so a survivor is elected within the TTL plus observation lag. This bounds
+  `cpt-cf-quota-enforcement-nfr-recovery` (RTO ≤ 15 min).
+- The signal is advisory: two replicas can both run the sweep body for a bounded window after a partition. Both sweep
+  bodies are idempotent (lazy semantic release I4; retention deletes find nothing twice), so the window costs duplicate
+  work, never incorrect state.
+- The `Linearizable` requirement excludes eventually consistent backends, which can elect two leaders on every
+  failover (cluster ADR-009).
+
+The backend behind the election is the operator's choice in the cluster profile YAML (`standalone` for one process,
+`postgres` for multi-instance, further backends as cluster plugins land). QE code does not change with the backend.
 
 #### Engine Plugin Trait
 
@@ -1338,7 +1358,7 @@ through SDK clients, plugin traits, or `ClientHub` (`cpt-cf-quota-enforcement-co
 | Dependency Gear                                       | Interface Used                                                                                                                                                                 | Purpose                                                                                                                                                                                              |
 | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `toolkit-db`                                          | `SecureConn` (DB access), Outbox queue                                                                                                                                         | Storage-plugin connectivity per `cpt-cf-quota-enforcement-constraint-toolkit`; outbox queue for notification-event durability (I11). Backend-specific realisations are plugin-internal.               |
-| `quota-enforcement-coordination-plugin` (impl crate) | `CoordinationPluginV1` trait via ClientHub                                                                                                                                     | Sweeper singleton coordination per `cpt-cf-quota-enforcement-contract-coordination-plugin`. Coordination backend is pluggable independently of the storage backend.                     |
+| `cluster` (platform gear)                            | `cluster-sdk` leader-election facade via ClientHub for the `quota-enforcement` profile                                                                                        | Sweeper singleton election per `cpt-cf-quota-enforcement-contract-cluster-coordination`. The operator selects the election backend in the cluster profile YAML, independently of the storage backend.     |
 | `types-registry`                                     | `types-registry-sdk` GTS schema/type lookup                                                                                                                                    | Metric validation; host for QE abstract bases, scope discriminators, owner projections/admitted-metric traits, metric request contracts, and attached constraint contracts. Called at bootstrap and Quota/Policy writes, never by `EvaluationOrchestrator`. |
 | `authz-resolver`                                     | `authz-resolver-sdk::PolicyEnforcer`                                                                                                                                           | PDP integration — admission decisions with constraint filters; admission decision before tx, constraint filters consumed inside tx. Realises `cpt-cf-quota-enforcement-fr-authorization`.            |
 | `tracing` + `toolkit` `otel` feature                  | `tracing` macros (info/warn/error, instrument) and metric / span emission re-exported from `toolkit` core when the `otel` feature is enabled (OTLP exporter, span propagation). | Metric and trace emission per `cpt-cf-quota-enforcement-fr-telemetry`. No QE-side adapter wrapper; components emit directly from their hot paths.                                                    |
@@ -1416,7 +1436,7 @@ renegotiating the corresponding invariant or NFR, and that renegotiation is out 
 - No circular dependencies.
 - The persistent backend is reached only via the Storage plugin; no other QE component opens connections.
 - Only integration / adapter components talk to external systems (`StoragePlugin` → persistent backend;
-  `CoordinationPluginV1` → coordination backend; `Gateway` → PDP via `authz-resolver-sdk::PolicyEnforcer`).
+  `CoordinationAdapter` → platform `cluster` gear; `Gateway` → PDP via `authz-resolver-sdk::PolicyEnforcer`).
   Telemetry has no QE-side adapter — components emit `tracing` events directly.
 
 ### 3.6 Interactions & Sequences
@@ -1753,31 +1773,36 @@ sequenceDiagram
     autonumber
     participant Sched as Tokio scheduler
     participant LS as LeaseSweeper
-    participant CP as CoordinationPlugin
+    participant CA as CoordinationAdapter (cluster election)
     participant SP as StoragePlugin
 
-    Sched -->> LS: tick (60 s)
-    LS ->> CP: try_lock(LockScope::LeaseSweeper, ttl)
-    alt not leader
-        CP -->> LS: Conflict (another replica holds the lease)
-    else leader
-        CP -->> LS: Lock { holder_id, ttl, acquired_at }
-        LS ->> SP: reclaim_expired_leases(batch=1000, before=now())
-        loop for each batch
-            SP ->> SP: BEGIN tx<br/>UPDATE leases SET state='auto-released' WHERE expiry_at <= now() AND state='active'<br/>DECREMENT lease_capacity_counter per row<br/>RETURN held_amount to acquisition_period counters<br/>ENQUEUE lease-auto-released events in outbox<br/>COMMIT
-            SP -->> LS: Vec<ExpiredLease>
+    LS ->> CA: SingletonCoordinator::run_while_leader(LeaseSweeper, sweep)
+    Note over CA: adapter owns the LeaderWatch (changed() loop, resign on shutdown).<br/>Resolved cluster backend joins election qe/lease-sweeper and renews the claim
+    alt follower
+        Note over LS: no sweep body runs on this replica
+    else elected
+        CA -->> LS: start sweep with child CancellationToken
+        loop every tick (60 s) until cancelled
+            Sched -->> LS: tick
+            LS ->> SP: reclaim_expired_leases(batch=1000, before=now())
+            loop for each batch
+                SP ->> SP: BEGIN tx<br/>UPDATE leases SET state='auto-released' WHERE expiry_at <= now() AND state='active'<br/>DECREMENT lease_capacity_counter per row<br/>RETURN held_amount to acquisition_period counters<br/>ENQUEUE lease-auto-released events in outbox<br/>COMMIT
+                SP -->> LS: Vec<ExpiredLease>
+            end
+            LS ->> LS: emit lease_unreclaimed_expired gauge per canonical registered metric
         end
-        LS ->> CP: renew(lock) on TTL/3 cadence
-        LS ->> LS: emit lease_unreclaimed_expired gauge per canonical registered metric
+        CA -->> LS: leadership lost: cancel token (abort after stop timeout)
+        Note over CA: re-enrols automatically; sweep restarts on re-election
     end
 ```
 
 **Description.** The physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`. Lazy semantic release
 (I4) means correctness does not depend on this sweeper running on schedule — even if the sweeper is paused for hours,
 evaluation paths treat expired leases as released. The sweeper exists to (a) reclaim physical rows and (b) emit
-`lease-auto-released` events as the canonical emission point. Single-leader execution via
-`CoordinationPluginV1::try_lock(LockScope::LeaseSweeper, ttl)` with TTL-renew on TTL/3 and follower-mode fallback on
-lock loss; the coordination backend is plugin-internal.
+`lease-auto-released` events as the canonical emission point. Single-leader execution under the
+`lease-sweeper` cluster election through the `CoordinationAdapter`: the sweep runs only while this replica leads, the
+resolved cluster backend renews the claim, and leadership loss cancels the sweep before its next batch. The election
+backend is the operator's cluster profile binding.
 
 #### Batch Debit
 
@@ -2041,7 +2066,7 @@ sequenceDiagram
         ND -->> OB: Retry
         Note over OB: framework re-delivers to ALL sinks later —<br/>duplicates permitted, sinks idempotent on event_id
     end
-    Note over OB,ND: an expired lease drops the handler future;<br/>another replica's processor claims the batch —<br/>no coordination lock involved
+    Note over OB,ND: an expired lease drops the handler future;<br/>another replica's processor claims the batch —<br/>no cluster election involved
 ```
 
 **Description.** The dispatcher is a `toolkit-db` Outbox leased handler: the framework claims batches under a DB
@@ -2195,8 +2220,11 @@ plugin chooses physical layout.
 1. Seeding default rows for `contention_timeout_config(metric=NULL, timeout_ms=0)`,
    `lease_capacity_config(tenant_id=NULL, metric=NULL, max_active_leases=1000)`, and
    `idempotency_retention_config(tenant=NULL, metric=NULL, retention_seconds=86400)` when missing.
-1. Verifying `CoordinationPluginV1` reachability — a single `try_lock` + `release` roundtrip on a probe key for each
-   `LockScope::*` value to validate the coordination backend; failure aborts bootstrap fail-fast.
+
+Separately, in the gear lifecycle `start` and not in the storage `bootstrap()`, QE resolves the cluster
+leader-election facade for the `quota-enforcement` profile with the `Linearizable` requirement (§3.3 "Cluster
+Coordination"). A capability mismatch or an unbound profile fails startup in the embedded profile and readiness in the
+deployed profile. The cluster resolver validates the operator's binding; QE runs no probe of its own.
 
 ### 3.8 Deployment Topology
 
@@ -2211,10 +2239,10 @@ graph LR
     GW2 -.->|Storage plugin| Backend
     GW3 -.->|Storage plugin| Backend
     Backend -.->|sync replication| BackendR[(Persistent backend<br/>standby)]
-    GW1 -.->|CoordinationPluginV1| Coord[(Coordination backend)]
-    GW2 -.->|CoordinationPluginV1| Coord
-    GW3 -.->|CoordinationPluginV1| Coord
-    Note["Single sweeper per LockScope at a time<br/>via CoordinationPluginV1 lock"]
+    GW1 -.->|cluster leader election| Coord[(cluster gear backend<br/>per quota-enforcement profile)]
+    GW2 -.->|cluster leader election| Coord
+    GW3 -.->|cluster leader election| Coord
+    Note["Single sweeper per SingletonScope at a time<br/>via cluster leader election"]
 ```
 
 **P1 deployment shape.**
@@ -2225,15 +2253,16 @@ graph LR
 - **Stateless gateway.** Multi-replica behind a platform load balancer. Ordinary updates that keep the same projection
   catalogue are rolling-update safe. Breaking projection-version activation is not supported in P1; bootstrap rejects
   a configured catalogue that is incompatible with any active Quota or Policy.
-- **Sweeper coordination.** `LeaseSweeper` and `RetentionSweeper` each acquire a distinct
-  TTL-bounded lock via `CoordinationPluginV1::try_lock(LockScope::*, ttl)` at startup. The replica that wins the lock
-  runs the background loop; others remain in follower mode and serve only request traffic. Holders renew at TTL/3; on
-  lock loss (renew failure) they drop to follower mode and re-acquire through jittered backoff. RTO ≤ 15 min per
-  `cpt-cf-quota-enforcement-nfr-recovery` is bounded by the lock TTL. The coordination backend is pluggable
-  independently of the storage backend; the realisation is plugin-internal.
+- **Sweeper coordination.** `LeaseSweeper` and `RetentionSweeper` each join a distinct cluster election
+  (`qe/lease-sweeper`, `qe/retention-sweeper`) through the `CoordinationAdapter` at startup. The elected replica runs
+  the background loop; the others stay followers and serve only request traffic. The resolved cluster backend renews
+  the claim; on leadership loss the adapter cancels the loop and the replica returns to follower mode, and re-election
+  is automatic.
+  RTO ≤ 15 min per `cpt-cf-quota-enforcement-nfr-recovery` is bounded by the election TTL plus observation lag. The
+  operator selects the election backend in the cluster profile YAML, independently of the storage backend.
 - **Bundling.** Sweepers + dispatcher run in the same binary as the gateway by default (single deployment artefact).
   Operators MAY split them into a dedicated binary by feature-flag if their workload warrants — e.g., a sweeper-only
-  replica with reduced HTTP concurrency. For the two sweepers, `CoordinationPluginV1` lock semantics work identically
+  replica with reduced HTTP concurrency. For the two sweepers, the cluster election semantics work identically
   across both layouts; the dispatcher continues to use the Outbox lease.
 - **Connection pooling.** Provided by the storage plugin; sized to satisfy `cpt-cf-quota-enforcement-nfr-throughput` (≥
   10 K ops/s). Concrete pooler choice is plugin-internal.
@@ -2359,7 +2388,7 @@ additively without breaking existing callers.
   [0003 Metadata snapshot timing](./ADR/0003-cpt-cf-quota-enforcement-adr-metadata-snapshot-timing.md),
   [0004 Settlement window emit](./ADR/0004-cpt-cf-quota-enforcement-adr-settlement-window-emit.md),
   [0005 Pluggable evaluation engine](./ADR/0005-cpt-cf-quota-enforcement-adr-evaluation-engine.md),
-  [0006 Coordination plugin](./ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md),
+  [0006 Coordination via the cluster gear](./ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md),
   [0007 Declarative projection contracts](./ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
 - **Storage plugin DESIGN**: authored separately by the plugin owner once the plugin crate is created
 - **Features**: `features/` (eleven per-feature implementation guides, one per DECOMPOSITION entry)

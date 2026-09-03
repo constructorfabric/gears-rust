@@ -193,8 +193,8 @@ Confirmed for any engine impl (reference or third-party) by:
 - Good, because it isolates QE-core from specific engine technologies; no leak of
   CEL-isms (or any other engine's quirks) into QE-core code.
 - Good, because contract evolution is localized to the trait surface.
-- Good, because mirrors the pluggable-storage / pluggable-coordination /
-  pluggable-notification pattern across QE — single architectural idiom.
+- Good, because mirrors the pluggable-storage / pluggable-notification pattern across QE — single architectural
+  idiom.
 - Good, because trust boundary (Debit-Plan invariants) protects QE-core integrity
   regardless of engine quality.
 - Bad, because each engine plugin owner carries the cost of their own conformance
@@ -246,5 +246,5 @@ This decision directly addresses:
   Debit-Plan invariant validation isolates QE-core from engine bugs.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — same
   pluggable-with-capability-contract pattern applied to storage.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin` — same pattern
-  applied to singleton coordination.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin`: singleton coordination is consumed from the
+  platform `cluster` gear instead of a QE plugin.

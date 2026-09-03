@@ -2640,20 +2640,21 @@ ingress.
 - **Compatibility**: Plugin contract versioned with the gear's major version; plugins must match the gear's major
   version.
 
-#### Coordination Plugin Contract
+#### Cluster Coordination Contract (consumed)
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-contract-coordination-plugin`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-contract-cluster-coordination`
 
-- **Direction**: required from coordination backend implementor
+- **Direction**: consumed from the platform `cluster` gear
 
-- **Protocol/Format**: Rust trait (`CoordinationPluginV1`) implemented by each coordination backend plugin; provides
-  TTL-bounded distributed leader-election locks via three methods (`try_lock`, `renew`, `release`) consumed by the
-  sweeper singletons. Bootstrap reachability is validated via a `try_lock` + `release` probe on each `LockScope::*`
-  value (no separate health-check method).
+- **Protocol/Format**: the cluster gear's leader-election primitive, resolved for the `quota-enforcement` cluster
+  profile with a linearizable-election requirement. One named election per sweeper singleton (`lease-sweeper`,
+  `retention-sweeper`) under the `qe` scope prefix. The operator binds the profile to a backend in the cluster section
+  of the deployment YAML; Quota Enforcement code does not change with the backend.
 
-- **Compatibility**: Plugin contract versioned with the gear's major version; backwards-compatible additive changes
-  are allowed within a major version. The contract is intentionally separate from the Storage Plugin contract so that
-  the coordination backend can evolve independently of the data backend.
+- **Compatibility**: versioned by the cluster gear per primitive; Quota Enforcement tracks the cluster SDK major
+  version. A capability mismatch or an unbound profile fails startup (embedded profile) or readiness (deployed
+  profile) and never degrades silently. This consumed contract replaces the Quota-Enforcement-owned coordination
+  plugin contract that the first version of the coordination ADR defined.
 
 #### Notification Plugin Contract
 
@@ -3289,7 +3290,7 @@ on behalf of a tenant administrator)
 | `types-registry`                        | Metric catalog plus QE abstract bases, scope discriminators, owner projections, admitted-metric traits, metric request contracts, and attached constraint contracts. Required for bootstrap and Quota/Policy writes; deliberately absent from the evaluation hot path.                                             | p1          |
 | Quota Manager metric-owner mapping      | Maps each metric to its owning Gear/projection so Quota Manager creates Quotas against the stable owner identity rather than a caller-specific type.                                                                                                                                                                | p1          |
 | Engine evaluator                        | Library backing the active Quota Resolution Engine. P1: a sandboxed CEL evaluator (mandatory for the built-in `cel` Engine). P2-or-later candidates: Starlark, Lua, Wasm runtimes. The `most-restrictive-wins` Engine has no external library dependency.                                                           | p1          |
-| `quota-enforcement-coordination-plugin` | TTL-bounded distributed locks for the sweeper singletons via `cpt-cf-quota-enforcement-contract-coordination-plugin`. Default impl piggybacks on the storage backend's locking primitives; operators may swap to an independent backend (etcd, Consul, Redis Redlock, k8s Lease) without touching QE-core. | p1          |
+| `cluster` (platform gear)               | Leader election for the sweeper singletons via `cpt-cf-quota-enforcement-contract-cluster-coordination`. The operator binds the `quota-enforcement` cluster profile to a backend in deployment YAML (standalone for one process, Postgres for multi-instance, further backends as cluster plugins land) without touching Quota Enforcement code. | p1          |
 
 ## 11. Assumptions
 

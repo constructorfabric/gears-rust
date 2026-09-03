@@ -19,16 +19,14 @@
   - [Authorized Operation Admission](#authorized-operation-admission)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Two-Phase PDP Scope Enforcement](#two-phase-pdp-scope-enforcement)
-  - [Coordination Lock Primitives and TTL Guarantee](#coordination-lock-primitives-and-ttl-guarantee)
   - [Bounded-Cardinality Telemetry Emission](#bounded-cardinality-telemetry-emission)
 - [4. States (CDSL)](#4-states-cdsl)
-  - [Coordination Lock State Machine](#coordination-lock-state-machine)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [SDK Contract Crate](#sdk-contract-crate)
   - [Reference Storage Plugin on toolkit-db](#reference-storage-plugin-on-toolkit-db)
   - [Gateway Admission and Tenant Isolation](#gateway-admission-and-tenant-isolation)
   - [Workspace and Crate Skeletons](#workspace-and-crate-skeletons)
-  - [Coordination Default Implementation](#coordination-default-implementation)
+  - [Cluster Coordination Adapter](#cluster-coordination-adapter)
   - [Telemetry Conventions](#telemetry-conventions)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Additional Context (optional)](#7-additional-context-optional)
@@ -39,9 +37,9 @@
 
 ### 1.1 Overview
 
-Stands up the `quota-enforcement` gear and SDK crates, the storage and coordination plugin contracts — with the
-complete coordination default implementation and the storage-plugin skeleton whose trait implementation completes as
-later features add their primitives — plus gear bootstrap, two-phase PDP authorization, tenant isolation, and the
+Stands up the `quota-enforcement` gear and SDK crates, the storage plugin contract with the storage-plugin skeleton
+whose trait implementation completes as later features add their primitives, the coordination adapter over the
+platform `cluster` gear's leader election, plus gear bootstrap, two-phase PDP authorization, tenant isolation, and the
 telemetry conventions every later feature emits through.
 
 ### 1.2 Purpose
@@ -50,13 +48,14 @@ Every other Quota Enforcement feature calls a storage primitive, runs behind the
 tenant-scoped rows, or emits telemetry. This feature delivers those seams once, as contracts, so later features add
 behavior without renegotiating infrastructure.
 
-**Scope**: the two SDK plugin contracts, the complete coordination default implementation, the storage-plugin crate
-skeleton and its foundation-table functions, gear bootstrap with idempotent seeding and fail-fast probes, two-phase PDP
-admission, tenant isolation at both layers, and the telemetry conventions.
+**Scope**: the storage SDK plugin contract, the `cluster-sdk` dependency with the typed `quota-enforcement` profile
+and the coordination adapter, the storage-plugin crate skeleton and its foundation-table functions, gear bootstrap
+with idempotent seeding and startup validation, two-phase PDP admission, tenant isolation at both layers, and the
+telemetry conventions.
 
 **Out of scope**: projection-catalogue publication and its consistency checks (projection-contracts feature), every
 evaluation/lease/notification behavior and the storage primitives they add (their owning features), and the
-`LeaseSweeper`/`RetentionSweeper` singletons that consume the coordination contract delivered here, and the
+`LeaseSweeper`/`RetentionSweeper` singletons that consume the coordination adapter delivered here, and the
 notification dispatch that runs under the `toolkit-db` Outbox lease instead.
 
 **Requirements**: `cpt-cf-quota-enforcement-fr-pluggable-storage`, `cpt-cf-quota-enforcement-fr-authorization`,
@@ -98,7 +97,8 @@ consumption-operations feature)
 
 **Error Scenarios**:
 - Incompatible storage schema fails readiness with `SchemaVersionMismatch`
-- No storage plugin resolves, or the coordination probe fails: the gear refuses to serve
+- No storage plugin resolves, or the `quota-enforcement` cluster profile is unbound or lacks a linearizable
+  election: the gear refuses to serve
 - PDP unreachable at startup: readiness fails (fail-closed)
 
 **Steps**:
@@ -107,9 +107,10 @@ consumption-operations feature)
 3. [ ] - `p1` - **IF** schema version is incompatible - `inst-boot-schema-if`
    1. [ ] - `p1` - Abort readiness with `SchemaVersionMismatch`; serve nothing - `inst-boot-schema-abort`
 4. [ ] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing - `inst-boot-seed-config`
-5. [ ] - `p1` - API: probe `CoordinationPluginV1` with `try_lock` + `release` on each `LockScope` value - `inst-boot-coord-probe`
+5. [ ] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the
+   linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
 6. [ ] - `p1` - API: verify `authz-resolver` reachability via the platform health check - `inst-boot-pdp-probe`
-7. [ ] - `p1` - **IF** any probe fails - `inst-boot-probe-if`
+7. [ ] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
    1. [ ] - `p1` - Fail readiness and surface the failing dependency in the health endpoint - `inst-boot-probe-abort`
 8. [ ] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
 9. [ ] - `p1` - **RETURN** ready; later features extend this bootstrap hook with their own steps (the
@@ -164,25 +165,6 @@ consumption-operations feature)
    construction - `inst-pdp-execute`
 5. [ ] - `p1` - **RETURN** the filtered result; cross-tenant rows never leave the storage layer - `inst-pdp-return`
 
-### Coordination Lock Primitives and TTL Guarantee
-
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-coordination-lock`
-
-**Input**: `LockScope` (closed enum), configured TTL
-
-**Output**: Lock primitive outcomes with the plugin-guaranteed TTL auto-release
-
-**Steps**:
-1. [ ] - `p1` - API: `try_lock(scope, ttl)` grants the scope to exactly one holder or returns `Conflict` - `inst-lock-try`
-2. [ ] - `p1` - API: `renew(lock)` extends a live hold; a hold past its TTL answers `LockExpired` and is treated as gone - `inst-lock-renew`
-3. [ ] - `p1` - Auto-release at TTL expiry is the plugin's inviolable guarantee; it holds even when the holder process
-   crashed silently - `inst-lock-ttl`
-4. [ ] - `p1` - API: `release(lock)` is a best-effort handoff hint; TTL expiry remains the authoritative cleanup - `inst-lock-release`
-5. [ ] - `p1` - **RETURN** primitive semantics only; acquisition loops, renewal cadence (at or before TTL/3), follower
-   fallback, and jittered re-acquisition are owned by the consuming sweeper features (lease-operations and
-   consumption-operations; the notification dispatcher is fenced by the `toolkit-db` Outbox lease and consumes no
-   coordination lock) - `inst-lock-return`
-
 ### Bounded-Cardinality Telemetry Emission
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-telemetry-emission`
@@ -204,25 +186,8 @@ consumption-operations feature)
 
 ## 4. States (CDSL)
 
-### Coordination Lock State Machine
-
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-state-coordination-lock`
-
-**States**: Available, Held, Expired, Released
-
-**Initial State**: Available
-
-**Transitions**:
-1. [ ] - `p1` - **FROM** Available **TO** Held **WHEN** `try_lock` succeeds for the scope - `inst-lockst-acquire`
-2. [ ] - `p1` - **FROM** Held **TO** Held **WHEN** `renew` succeeds before TTL expiry - `inst-lockst-renew`
-3. [ ] - `p1` - **FROM** Held **TO** Expired **WHEN** the TTL elapses without renewal, including holder crash - `inst-lockst-expire`
-4. [ ] - `p1` - **FROM** Held **TO** Released **WHEN** the holder releases at shutdown - `inst-lockst-release`
-5. [ ] - `p1` - **FROM** Expired **TO** Held **WHEN** any caller acquires after expiry; acquirability within one TTL
-   bounds `cpt-cf-quota-enforcement-nfr-recovery` - `inst-lockst-reacquire`
-6. [ ] - `p1` - **FROM** Released **TO** Held **WHEN** any caller re-acquires without waiting for the TTL - `inst-lockst-handoff`
-
-Holder-side orchestration (renewal cadence, follower mode, backoff) belongs to the two consuming sweeper features
-(lease-operations and consumption-operations); this machine is the lifecycle the plugin itself guarantees.
+Not applicable: the leadership states (`Leader`, `Follower`, `Lost`) belong to the cluster gear's leader election.
+The sweeper features consume them through the coordination adapter's run-while-leader semantics.
 
 ## 5. Definitions of Done
 
@@ -231,8 +196,9 @@ Holder-side orchestration (renewal cadence, follower mode, backoff) belongs to t
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sdk-contracts`
 
 The system **MUST** ship a `quota-enforcement-sdk` crate defining `QuotaEnforcementStoragePluginV1` with its closed
-`StorageError` enum, `CoordinationPluginV1` with `LockScope`, `Lock`, and `CoordinationError`, and the domain types and
-closed enums those contracts reference, so plugin authors implement against a single dependency.
+`StorageError` enum and the domain types and closed enums that contract references, so plugin authors implement
+against a single dependency. The SDK defines no coordination contract; coordination is consumed from the platform
+`cluster` gear (see the Cluster Coordination Adapter DoD).
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-gear-bootstrap`
@@ -241,7 +207,7 @@ closed enums those contracts reference, so plugin authors implement against a si
 `cpt-cf-quota-enforcement-constraint-single-storage-plugin`
 
 **Touches**:
-- API: `QuotaEnforcementStoragePluginV1`, `CoordinationPluginV1` (SDK traits)
+- API: `QuotaEnforcementStoragePluginV1` (SDK trait)
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `MutationResult`
 
@@ -293,10 +259,14 @@ in-process SDK entry, and stamp the PDP-authorized target `tenant_id` on every p
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-workspace-crates`
 
-The system **MUST** register the `quota-enforcement`, `quota-enforcement-sdk`, and storage/coordination plugin crates
-in the workspace so every crate compiles with only foundation behavior present. Bootstrap and readiness are exercised
-in tests against a complete `QuotaEnforcementStoragePluginV1` test double; production plugin registration happens only
-once every trait primitive exists (per the storage-plugin DoD), so no partial trait implementation is ever wired. The
+The system **MUST** register the `quota-enforcement`, `quota-enforcement-sdk`, and storage plugin crates in the
+workspace so every crate compiles with only foundation behavior present. The gear **MUST** depend on `cluster-sdk`
+only and **MUST NOT** declare `deps = [cluster]` (cluster DESIGN §3.17.7): the embedded binary links the `cluster`
+gear, a provider plugin, and the mandatory `grpc-hub`; the remote image enables QE's forwarding Cargo feature and
+links none of them. Start ordering comes from the cluster `system` tier and readiness gating from the SDK-submitted
+consumer registration. Bootstrap and readiness are exercised in tests against a complete
+`QuotaEnforcementStoragePluginV1` test double; production plugin registration happens only once every trait primitive
+exists (per the storage-plugin DoD), so no partial trait implementation is ever wired. The
 gear **MUST** declare the stateful lifecycle capability and host its background tasks under ToolKit's `WithLifecycle`
 model (docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md): the lifecycle entry owns the background tasks and
 hands each a child `CancellationToken`, and graceful shutdown cancels them within the configured stop timeout.
@@ -310,24 +280,33 @@ hands each a child `CancellationToken`, and graceful shutdown cancels them withi
 - API: workspace `Cargo.toml` membership
 - Entities: crate skeletons
 
-### Coordination Default Implementation
+### Cluster Coordination Adapter
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-coordination-default`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-coordination-adapter`
 
-The system **MUST** provide the default `CoordinationPluginV1` implementation piggybacking on the storage backend's
-locking primitives, honoring TTL-bounded auto-release independent of holder liveness, and validating reachability at
-bootstrap via a `try_lock` + `release` probe per `LockScope` value.
+The system **MUST** provide the `CoordinationAdapter` (`cpt-cf-quota-enforcement-component-coordination-plugin`) over
+the platform `cluster` gear's leader election per `cpt-cf-quota-enforcement-adr-coordination-plugin`. The adapter
+**MUST** define the typed cluster profile `QuotaEnforcementProfile` (name `quota-enforcement`), resolve the
+leader-election facade in the gear's lifecycle `start` with the `Linearizable` requirement, scope every election name
+under the `qe` prefix, and map the closed `SingletonScope` enum (`LeaseSweeper`, `RetentionSweeper`) to the election
+names `lease-sweeper` and `retention-sweeper`. It **MUST** implement the domain port `SingletonCoordinator` with
+run-while-leader semantics: the work starts on election with a child `CancellationToken`, is cancelled on leadership
+loss, is aborted after the configured stop timeout, and restarts on re-election; the resolved cluster backend renews
+the claim.
+The adapter **MUST** drive the election watch itself and keep ownership of it, because the SDK's `run_while_leader`
+consumes the watch and a dropped watch performs no resign. On graceful shutdown the adapter **MUST** cancel the work
+and then resign every held election. A `CapabilityNotMet` or `ProfileNotBound` outcome **MUST** fail startup
+(embedded profile) or readiness (deployed profile) and name `cluster` in the health endpoint. No QE-owned
+coordination contract, plugin crate, or bootstrap probe ships.
 
 **Implements**:
-- `cpt-cf-quota-enforcement-algo-coordination-lock`
-- `cpt-cf-quota-enforcement-state-coordination-lock`
+- `cpt-cf-quota-enforcement-flow-gear-bootstrap`
 
 **Constraints**: `cpt-cf-quota-enforcement-constraint-toolkit`
 
 **Touches**:
-- API: `CoordinationPluginV1` (`try_lock`, `renew`, `release`)
-- DB: `cpt-cf-quota-enforcement-db-schema`
-- Entities: `Lock`, `LockScope`
+- API: `cluster-sdk` leader-election facade (`LeaderElectionV1`), `SingletonCoordinator` port
+- Entities: `SingletonScope`, `QuotaEnforcementProfile`
 
 ### Telemetry Conventions
 
@@ -353,12 +332,16 @@ ever used as a label value.
   (fail-closed verified by chaos test)
 - [ ] A service supplying a tenant or subject outside its authorized scope receives canonical `PermissionDenied`; no
   storage operation runs (adversarial integration test)
-- [ ] Bootstrap fails readiness on: incompatible schema version, missing storage plugin, failed coordination probe on
-  any `LockScope`, or unreachable PDP — and serves no operation in that state
+- [ ] Bootstrap fails readiness on: incompatible schema version, missing storage plugin, unbound `quota-enforcement`
+  cluster profile or unmet linearizable-election requirement, or unreachable PDP — and serves no operation in that
+  state
+- [ ] Binding the `quota-enforcement` profile to an eventually consistent cache double fails startup with
+  `CapabilityNotMet` naming the primitive, the capability, and the provider
 - [ ] The three config-table default rows exist after first bootstrap and are not duplicated by repeated bootstraps
   (idempotent seeding; the `global` Policy is seeded by the resolution-policy-engine bootstrap extension)
-- [ ] Killing the coordination-lock holder makes the lock acquirable by a survivor within one TTL (recovery input
-  consumed by the lease-operations feature, which owns the end-to-end RTO drill)
+- [ ] Killing the elected sweeper replica makes a survivor leader within one election TTL plus observation lag; a
+  graceful stop resigns and hands over within one round trip; both hold on the standalone and the Postgres cluster
+  backends (recovery input consumed by the lease-operations feature, which owns the end-to-end RTO drill)
 - [ ] A committed write to the foundation-owned tables (config rows, schema metadata) survives a storage-backend
   restart with zero data loss — the durable-commit contract input consumed by the consumption-operations end-to-end
   RPO drill
@@ -375,7 +358,7 @@ ever used as a label value.
 - **Rollout / rollback**: the Gateway is stateless and multi-replica; ordinary rollout is a rolling update. Rollback is
   redeploying the previous binary against the same schema major version — schema migrations within a major are
   additive, and an incompatible schema is refused at bootstrap (`SchemaVersionMismatch`) rather than partially served.
-- **Test layering**: algorithm units (`AccessScope` pass-through, lock TTL semantics, label-catalogue conformance)
+- **Test layering**: algorithm units (`AccessScope` pass-through, scope-to-election-name mapping, label-catalogue conformance)
   get unit tests; PDP fail-closed, anonymous rejection, and forged-tenant behavior get adversarial integration tests;
   durability and failover claims are verified by the drills named in §6, not by unit tests.
 - **Compile-time gates**: the domain-layer dependency rule is enforced by the repository Dylint lints; bounded label
