@@ -18,7 +18,7 @@ use graph_storage_sdk::models::{
     Subject, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+    EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -812,6 +812,37 @@ impl GraphStoreV1 for FakeGraphStore {
                     .iter()
                     .find(|n| &n.key == key && !n.deleted)
                     .map(|n| (key.clone(), n.id))
+            })
+            .collect())
+    }
+
+    async fn embedding_state(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[NodeKey],
+    ) -> Result<Vec<Option<EmbeddingState>>, GraphStoreError> {
+        if !scope_admits(ctx.scope, ctx.tenant) {
+            return Ok(keys.iter().map(|_| None).collect());
+        }
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let Some(tenant) = tenants.get(&ctx.tenant) else {
+            return Ok(keys.iter().map(|_| None).collect());
+        };
+        let (nodes, _, _) = visible(tenant, ctx);
+        Ok(keys
+            .iter()
+            .map(|key| {
+                nodes
+                    .iter()
+                    .find(|n| &n.key == key && !n.deleted)
+                    .map(|n| EmbeddingState {
+                        input_hash: n.embedding_input_hash.clone(),
+                        vector_epoch: if n.embedding.is_some() {
+                            n.embedding_epoch
+                        } else {
+                            None
+                        },
+                    })
             })
             .collect())
     }

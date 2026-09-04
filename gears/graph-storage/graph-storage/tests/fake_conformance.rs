@@ -57,6 +57,11 @@ async fn an_identical_batch_converges_without_moving_the_revision() {
 }
 
 #[tokio::test]
+async fn an_unchanged_re_ingest_embeds_nothing() {
+    conformance::an_unchanged_re_ingest_embeds_nothing(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn colliding_node_keys_stay_inside_their_tenants() {
     conformance::tenant_isolation(&store(), Uuid::now_v7(), Uuid::now_v7()).await;
 }

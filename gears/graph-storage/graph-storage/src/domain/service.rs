@@ -226,15 +226,25 @@ impl GraphServices {
         let records = self.validate_batch(&store_ctx, &request).await?;
 
         // Composed and embedded *before* the transaction, as DESIGN's ingest
-        // sequence has it (step 5, ahead of step 6). It costs no extra round
-        // trip: validation already resolved every type record, so each node's
-        // `vector_search` trait is in hand.
+        // sequence has it (step 5, ahead of step 6). It costs one extra read:
+        // what the store already holds of each node's vector, so a node whose
+        // text has not changed is not embedded again (D-027). Validation
+        // already resolved every type record, so each node's `vector_search`
+        // trait is in hand.
+        let embed = request.options.embed.unwrap_or(true);
+        let current = if embed && self.embedding.active_epoch().is_some() {
+            let keys: Vec<String> = request.nodes.iter().map(|n| n.node_key.clone()).collect();
+            self.store.embedding_state(&store_ctx, &keys).await?
+        } else {
+            Vec::new()
+        };
         let plan = self
             .embedding
             .plan(
                 &request.nodes,
-                request.options.embed.unwrap_or(true),
+                embed,
                 |node| embedding::declared_paths(&records, node),
+                &current,
                 store_ctx.budget,
                 store_ctx.cancel.clone(),
             )

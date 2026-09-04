@@ -103,11 +103,39 @@ async fn plan_for(
             records.insert(node.type_id.clone(), record);
         }
     }
-    let nodes = coordinator()
+    plan_with(store, ctx, request, &coordinator()).await
+}
+
+/// `plan_for` with a caller-supplied coordinator, so a case can watch what its
+/// provider is asked to embed.
+async fn plan_with(
+    store: &(impl GraphStoreV1 + ?Sized),
+    ctx: &StoreCtx<'_>,
+    request: &IngestRequest,
+    coordinator: &EmbeddingCoordinator,
+) -> EmbeddingPlan {
+    let mut records: std::collections::BTreeMap<String, graph_storage_sdk::models::TypeRecord> =
+        std::collections::BTreeMap::new();
+    for node in &request.nodes {
+        if !records.contains_key(&node.type_id)
+            && let Ok(record) = store.get_type(ctx, &node.type_id).await
+        {
+            records.insert(node.type_id.clone(), record);
+        }
+    }
+    // What the store already holds, read as the domain service reads it, so
+    // the skip decision is exercised against both implementations.
+    let keys: Vec<String> = request.nodes.iter().map(|n| n.node_key.clone()).collect();
+    let current = store
+        .embedding_state(ctx, &keys)
+        .await
+        .expect("embedding state is readable");
+    let nodes = coordinator
         .plan(
             &request.nodes,
             request.options.embed.unwrap_or(true),
             |node| graph_storage::domain::embedding::declared_paths(&records, node),
+            &current,
             RemainingBudget::starting_now(Duration::from_secs(30)),
             CancellationToken::new(),
         )
@@ -117,6 +145,138 @@ async fn plan_for(
         epoch: Some(EPOCH),
         nodes,
     }
+}
+
+/// The deterministic provider, counting what it is asked to embed.
+pub struct CountingProvider {
+    inner: FakeEmbeddingProvider,
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+impl CountingProvider {
+    pub fn new() -> Self {
+        Self {
+            inner: FakeEmbeddingProvider::new(DIMENSION),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every batch of inputs the provider was handed, in order.
+    pub fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+}
+
+impl Default for CountingProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl graph_storage_sdk::plugin_api::EmbeddingProviderV1 for CountingProvider {
+    fn embedding_space(&self) -> &graph_storage_sdk::models::EmbeddingSpaceId {
+        self.inner.embedding_space()
+    }
+
+    fn dimension(&self) -> u32 {
+        self.inner.dimension()
+    }
+
+    async fn embed(
+        &self,
+        req: graph_storage_sdk::plugin_api::EmbedRequest,
+    ) -> Result<
+        graph_storage_sdk::plugin_api::EmbedResponse,
+        graph_storage_sdk::plugin_api::EmbeddingProviderError,
+    > {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(req.inputs.clone());
+        }
+        self.inner.embed(req).await
+    }
+
+    async fn health(&self) -> Result<(), graph_storage_sdk::plugin_api::EmbeddingProviderError> {
+        self.inner.health().await
+    }
+}
+
+/// D-027: a re-ingest embeds only what changed. The first batch embeds every
+/// node; an identical second batch reaches the provider with nothing; a third
+/// batch that changes one node's text embeds that node alone — and the
+/// untouched node still ranks, because the store preserved its vector.
+///
+/// Asserted through the store's own `embedding_state`, so a store that
+/// reported the wrong hash or epoch would show up here as extra provider
+/// calls rather than as a silently slower sync.
+pub async fn an_unchanged_re_ingest_embeds_nothing(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    let provider = std::sync::Arc::new(CountingProvider::new());
+    let coordinator = EmbeddingCoordinator::new(
+        std::sync::Arc::clone(&provider)
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::EmbeddingProviderV1>,
+        SpaceState::Active { epoch: EPOCH },
+        8 * 1024,
+    );
+    let run = |nodes: Vec<NodeSpec>| async {
+        let request = batch(nodes, Vec::new());
+        let plan = plan_with(store, &ctx, &request, &coordinator).await;
+        store
+            .ingest(&ctx, request, plan)
+            .await
+            .expect("the batch commits")
+    };
+
+    let first = run(vec![
+        summarized("same", "Same", "text that stays"),
+        summarized("moves", "Moves", "text before the change"),
+    ])
+    .await;
+    assert_eq!(first.counts.nodes_inserted, 2);
+    assert_eq!(provider.calls().len(), 1, "one call for the first batch");
+    assert_eq!(provider.calls()[0].len(), 2, "both nodes embedded");
+
+    let second = run(vec![
+        summarized("same", "Same", "text that stays"),
+        summarized("moves", "Moves", "text before the change"),
+    ])
+    .await;
+    assert_eq!(
+        second.counts.nodes_unchanged, 2,
+        "an identical batch converges"
+    );
+    assert_eq!(
+        provider.calls().len(),
+        1,
+        "an unchanged batch must not reach the provider: {:?}",
+        provider.calls()
+    );
+
+    let third = run(vec![
+        summarized("same", "Same", "text that stays"),
+        summarized("moves", "Moves", "text after the change"),
+    ])
+    .await;
+    assert_eq!(third.counts.nodes_updated, 1);
+    assert_eq!(third.counts.nodes_unchanged, 1);
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 2, "only the changed node embeds: {calls:?}");
+    assert_eq!(calls[1].len(), 1, "one input, not the batch: {calls:?}");
+    assert!(
+        calls[1][0].contains("text after the change"),
+        "the changed text is what embeds: {calls:?}"
+    );
+
+    // The preserved vector still ranks, and the new one describes the new text.
+    let hits = search_vector(store, &ctx, "Same text that stays", EPOCH).await;
+    assert_eq!(hits.first().map(String::as_str), Some("same"), "{hits:?}");
+    let hits = search_vector(store, &ctx, "Moves text after the change", EPOCH).await;
+    assert_eq!(hits.first().map(String::as_str), Some("moves"), "{hits:?}");
 }
 
 /// The registration batch every case starts from: the base ontology plus one

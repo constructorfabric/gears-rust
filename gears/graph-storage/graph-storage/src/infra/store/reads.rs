@@ -11,7 +11,7 @@ use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, ElementEnvelope, GraphRevision, NodeId, NodeKey, NodeRow,
     NodeView, ProjectionRequest, ReadSnapshot, Subject,
 };
-use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
+use graph_storage_sdk::plugin_api::{EmbeddingState, GraphStoreError, StoreCtx};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
@@ -141,6 +141,45 @@ pub async fn resolve_node_ids(
         .await
         .map_err(map_scope_err)?;
     Ok(rows.into_iter().map(|r| (r.node_key, r.id)).collect())
+}
+
+/// What the store holds of each key's vector, index-aligned with `keys`.
+///
+/// Scoped like every read: a key outside the caller's scope reads as unknown,
+/// so the coordinator embeds it and the write path then refuses it — nothing
+/// about another tenant's rows leaks through the skip decision.
+pub async fn embedding_state(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    keys: &[NodeKey],
+) -> Result<Vec<Option<EmbeddingState>>, GraphStoreError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let rows = node::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .all(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    let by_key: BTreeMap<String, EmbeddingState> = rows
+        .into_iter()
+        .map(|r| {
+            let has_vector = r.embedding.is_some();
+            (
+                r.node_key,
+                EmbeddingState {
+                    input_hash: r.embedding_input_hash,
+                    // A vector without an epoch is stale; no vector, no epoch.
+                    vector_epoch: if has_vector { r.embedding_epoch } else { None },
+                },
+            )
+        })
+        .collect();
+    Ok(keys.iter().map(|key| by_key.get(key).cloned()).collect())
 }
 
 async fn type_names(

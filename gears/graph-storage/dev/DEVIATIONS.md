@@ -281,9 +281,13 @@ D-103 deferred the remote plugin with the reason that *"building the plugin with
 
 The nine base schemas lived under `docs/schemas/` and reached the binary through `include_str!("../../../docs/schemas/...")`. That compiles from a checkout and fails to package: a crate's archive contains only its own directory, so the first `cargo publish` — or the first consumer building the gear as a git dependency — would have found no schemas. They now live in `gears/graph-storage/graph-storage/schemas/` (with the `acme` examples beside them) and DESIGN points there. The gear registers the same bytes; only the path changed.
 
-## D-027 [impl-gap] Unchanged nodes are re-embedded on every ingest
+## D-027 [was impl-gap, now built] Unchanged nodes were re-embedded on every ingest
 
-`EmbeddingCoordinator::plan` composes and embeds every node of a batch before `decide_vector` compares the input hash with the stored one, so the *preserved* state is decided correctly but paid for as if it were *embedded*: a byte-identical re-sync of an 824-node repository through the reference consumer took 25 s with the in-process ONNX provider and changed nothing. Reading the stored `embedding_input_hash` for the batch's keys first — one indexed query — and embedding only the inputs whose hash differs would make a no-op re-sync cost what it changes. Found on the studio-web stand; the same run showed the synchronous importer exceeding a 30 s gateway deadline for the same reason.
+`EmbeddingCoordinator::plan` composed and embedded every node of a batch before `decide_vector` compared the input hash with the stored one, so the *preserved* state was decided correctly but paid for as if it were *embedded*: a byte-identical re-sync of an 824-node repository through the reference consumer took 25 s with the in-process ONNX provider and changed nothing.
+
+**Built.** `GraphStoreV1` gains `embedding_state(keys)` — the stored input hash and the epoch the stored vector is current under, index-aligned, unknown and unauthorized keys reading alike as `None`. The domain service reads it before planning and the coordinator embeds only the inputs whose hash or epoch differs, in one provider call; the rest are planned as `skipped`, which the store's `decide_vector` resolves to *preserved* as before. Covered three ways: unit tests on the coordinator with a counting provider, a conformance case (`an_unchanged_re_ingest_embeds_nothing`) run against both stores, and the studio-web stand.
+
+**What the read outside the transaction costs.** A node changed by a concurrent writer between the state read and the write is planned as skipped and lands *stale* (vector kept, not rankable) until the next ingest touches it — the same state `embed: false` produces on purpose. The alternative, embedding inside the transaction, would hold row locks across a provider round trip. Accepted for the prototype; the readiness surface (D-109) should count stale rows when it exists.
 
 ## D-028 [impl-gap] Lexical search cannot find identifiers inside file names
 

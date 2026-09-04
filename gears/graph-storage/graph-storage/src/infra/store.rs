@@ -22,7 +22,7 @@ use graph_storage_sdk::models::{
     TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+    EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
 };
 use toolkit_db::secure::{Db, ScopeError};
 
@@ -293,6 +293,14 @@ impl GraphStoreV1 for PgGraphStore {
         keys: &[NodeKey],
     ) -> Result<Vec<(NodeKey, NodeId)>, GraphStoreError> {
         reads::resolve_node_ids(self, ctx, keys).await
+    }
+
+    async fn embedding_state(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[NodeKey],
+    ) -> Result<Vec<Option<EmbeddingState>>, GraphStoreError> {
+        reads::embedding_state(self, ctx, keys).await
     }
 }
 

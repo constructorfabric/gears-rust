@@ -231,6 +231,10 @@ pg_case!(
 );
 
 pg_case!(an_identical_batch_converges, conformance::convergent_replay);
+pg_case!(
+    an_unchanged_re_ingest_embeds_nothing,
+    conformance::an_unchanged_re_ingest_embeds_nothing
+);
 
 pg_case!(
     tombstoned_rows_are_invisible,

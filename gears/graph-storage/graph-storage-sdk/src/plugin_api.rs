@@ -238,6 +238,36 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         keys: &[NodeKey],
     ) -> Result<Vec<(NodeKey, NodeId)>, GraphStoreError>;
+
+    // --- embeddings -------------------------------------------------------
+    /// What this store already holds of each key's vector, index-aligned with
+    /// `keys`: `None` for a key that is unknown, tombstoned or outside the
+    /// caller's scope (anti-enumeration, as `resolve_node_ids`).
+    ///
+    /// The coordinator reads this *before* embedding a batch so a node whose
+    /// text has not changed is not embedded again — the difference between a
+    /// re-sync that costs what it changes and one that costs a full import.
+    /// Read outside the write transaction on purpose: it is an optimization,
+    /// and the transaction's own `decide_vector` still settles every state.
+    async fn embedding_state(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[NodeKey],
+    ) -> Result<Vec<Option<EmbeddingState>>, GraphStoreError>;
+}
+
+/// What a store holds of one node's vector, for the coordinator's skip
+/// decision. Two facts, because both are needed: a vector is worth keeping
+/// only if it was made from the node's *current* text (`input_hash`) and is
+/// rankable under the *current* space (`vector_epoch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingState {
+    /// Hash of the text the stored vector was made from, when a vector is
+    /// stored; the hash of the current input otherwise.
+    pub input_hash: Option<String>,
+    /// The epoch the stored vector is current under. `None` when there is no
+    /// vector, or when it is stale.
+    pub vector_epoch: Option<i64>,
 }
 
 /// Engine-side failure vocabulary.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use aws_lc_rs::digest::{SHA256, digest as sha256};
 use graph_storage_sdk::models::{EmbeddingSpaceId, NodeSpec, RemainingBudget, TypeRecord};
 use graph_storage_sdk::plugin_api::{
-    EmbedRequest, EmbeddingProviderError, EmbeddingProviderV1, NodeEmbedding,
+    EmbedRequest, EmbeddingProviderError, EmbeddingProviderV1, EmbeddingState, NodeEmbedding,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +79,13 @@ impl EmbeddingCoordinator {
     /// whose type resolves no paths still embed their name: a node with a name
     /// and no vectorizable attributes is a legitimate, searchable thing.
     ///
+    /// `current` is what the store already holds for each node, index-aligned
+    /// (an empty slice means "nothing known"). A node whose stored vector was
+    /// made from the same text and is current under the active epoch is **not
+    /// embedded again**: its entry is `skipped`, which the store's
+    /// `decide_vector` resolves to *preserved*. Only the changed inputs reach
+    /// the provider, in one call, so a re-sync costs what it changes.
+    ///
     /// # Errors
     ///
     /// A provider failure fails the whole batch. It is never downgraded to an
@@ -89,6 +96,7 @@ impl EmbeddingCoordinator {
         nodes: &'a [NodeSpec],
         embed: bool,
         paths_for: F,
+        current: &[Option<EmbeddingState>],
         budget: RemainingBudget,
         cancel: CancellationToken,
     ) -> Result<Vec<NodeEmbedding>, DomainError>
@@ -104,15 +112,56 @@ impl EmbeddingCoordinator {
         // Blocked is not an ingest failure: writes continue, they simply
         // record no vector. Refusing the write would take the whole gear down
         // over an arm nobody may have asked for.
-        if !embed || self.state == SpaceState::Blocked {
+        let SpaceState::Active { epoch } = self.state else {
+            return Ok(hashes.into_iter().map(NodeEmbedding::skipped).collect());
+        };
+        if !embed {
             return Ok(hashes.into_iter().map(NodeEmbedding::skipped).collect());
         }
 
-        let vectors = self.embed(inputs, budget, cancel).await?;
-        Ok(vectors
+        // Which nodes actually need the provider: those without a stored
+        // vector made from this very text under this very epoch.
+        let needs_embedding: Vec<bool> = hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                !current
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|stored| {
+                        stored.vector_epoch == Some(epoch)
+                            && stored.input_hash.as_deref() == Some(hash.as_str())
+                    })
+            })
+            .collect();
+
+        let pending: Vec<String> = inputs
+            .iter()
+            .zip(&needs_embedding)
+            .filter(|(_, needed)| **needed)
+            .map(|(input, _)| input.clone())
+            .collect();
+        let mut vectors = if pending.is_empty() {
+            Vec::new()
+        } else {
+            self.embed(pending, budget, cancel).await?
+        }
+        .into_iter();
+
+        Ok(hashes
             .into_iter()
-            .zip(hashes)
-            .map(|(vector, hash)| NodeEmbedding::computed(vector, hash))
+            .zip(needs_embedding)
+            .map(|(hash, needed)| {
+                if needed {
+                    // `embed` refused a short answer, so a vector is here.
+                    vectors.next().map_or_else(
+                        || NodeEmbedding::skipped(hash.clone()),
+                        |vector| NodeEmbedding::computed(vector, hash.clone()),
+                    )
+                } else {
+                    NodeEmbedding::skipped(hash)
+                }
+            })
             .collect())
     }
 
@@ -522,5 +571,176 @@ mod tests {
     fn the_hash_follows_the_text_and_nothing_else() {
         assert_eq!(input_hash("same"), input_hash("same"));
         assert_ne!(input_hash("same"), input_hash("other"));
+    }
+
+    /// A provider that counts what it was asked to embed, so the test can see
+    /// that unchanged nodes never reach it.
+    struct CountingProvider {
+        inner: crate::infra::embedding::fake::FakeEmbeddingProvider,
+        inputs: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CountingProvider {
+        fn new() -> Self {
+            Self {
+                inner: crate::infra::embedding::fake::FakeEmbeddingProvider::new(8),
+                inputs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.inputs.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProviderV1 for CountingProvider {
+        fn embedding_space(&self) -> &EmbeddingSpaceId {
+            self.inner.embedding_space()
+        }
+
+        fn dimension(&self) -> u32 {
+            self.inner.dimension()
+        }
+
+        async fn embed(
+            &self,
+            req: EmbedRequest,
+        ) -> Result<graph_storage_sdk::plugin_api::EmbedResponse, EmbeddingProviderError> {
+            if let Ok(mut calls) = self.inputs.lock() {
+                calls.push(req.inputs.clone());
+            }
+            self.inner.embed(req).await
+        }
+
+        async fn health(&self) -> Result<(), EmbeddingProviderError> {
+            Ok(())
+        }
+    }
+
+    fn keyed(key: &str, name: &str) -> NodeSpec {
+        NodeSpec {
+            node_key: key.to_owned(),
+            type_id: "t".to_owned(),
+            name: Some(name.to_owned()),
+            payload: None,
+            expected_version: None,
+        }
+    }
+
+    async fn plan_with(
+        coordinator: &EmbeddingCoordinator,
+        nodes: &[NodeSpec],
+        current: &[Option<EmbeddingState>],
+    ) -> Vec<NodeEmbedding> {
+        coordinator
+            .plan(
+                nodes,
+                true,
+                |_| &[],
+                current,
+                RemainingBudget::starting_now(std::time::Duration::from_secs(5)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the fake always embeds: {e}"))
+    }
+
+    #[tokio::test]
+    async fn only_nodes_whose_text_changed_reach_the_provider() {
+        let provider = Arc::new(CountingProvider::new());
+        let coordinator = EmbeddingCoordinator::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProviderV1>,
+            SpaceState::Active { epoch: 7 },
+            1024,
+        );
+        let nodes = [keyed("a", "alpha"), keyed("b", "beta"), keyed("c", "gamma")];
+
+        // First pass: nothing stored, every node embeds, in one call.
+        let first = plan_with(&coordinator, &nodes, &[]).await;
+        assert!(first.iter().all(|n| n.vector.is_some()));
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(provider.calls()[0].len(), 3);
+
+        // Second pass: the store holds current vectors for a and b, b's text
+        // changed, c was never stored. Only b and c embed, aligned to their
+        // positions, and a is skipped so the store preserves it.
+        let current = vec![
+            Some(EmbeddingState {
+                input_hash: Some(first[0].input_hash.clone()),
+                vector_epoch: Some(7),
+            }),
+            Some(EmbeddingState {
+                input_hash: Some("another-text".to_owned()),
+                vector_epoch: Some(7),
+            }),
+            None,
+        ];
+        let second = plan_with(&coordinator, &nodes, &current).await;
+        assert!(second[0].vector.is_none(), "unchanged a is not re-embedded");
+        assert!(second[1].vector.is_some(), "changed b is embedded");
+        assert!(second[2].vector.is_some(), "unknown c is embedded");
+        assert_eq!(second[1].vector, first[1].vector, "b lands in its own slot");
+        assert_eq!(provider.calls().len(), 2);
+        assert_eq!(
+            provider.calls()[1],
+            vec!["beta".to_owned(), "gamma".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vector_of_another_epoch_is_embedded_again() {
+        let provider = Arc::new(CountingProvider::new());
+        let coordinator = EmbeddingCoordinator::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProviderV1>,
+            SpaceState::Active { epoch: 7 },
+            1024,
+        );
+        let nodes = [keyed("a", "alpha")];
+        let first = plan_with(&coordinator, &nodes, &[]).await;
+        let stale_epoch = vec![Some(EmbeddingState {
+            input_hash: Some(first[0].input_hash.clone()),
+            vector_epoch: Some(6),
+        })];
+        let again = plan_with(&coordinator, &nodes, &stale_epoch).await;
+        assert!(
+            again[0].vector.is_some(),
+            "a vector from another epoch is not current"
+        );
+        let no_epoch = vec![Some(EmbeddingState {
+            input_hash: Some(first[0].input_hash.clone()),
+            vector_epoch: None,
+        })];
+        let again = plan_with(&coordinator, &nodes, &no_epoch).await;
+        assert!(again[0].vector.is_some(), "a stale vector is not current");
+        assert_eq!(provider.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_entirely_unchanged_batch_never_calls_the_provider() {
+        let provider = Arc::new(CountingProvider::new());
+        let coordinator = EmbeddingCoordinator::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProviderV1>,
+            SpaceState::Active { epoch: 7 },
+            1024,
+        );
+        let nodes = [keyed("a", "alpha"), keyed("b", "beta")];
+        let first = plan_with(&coordinator, &nodes, &[]).await;
+        let current: Vec<Option<EmbeddingState>> = first
+            .iter()
+            .map(|n| {
+                Some(EmbeddingState {
+                    input_hash: Some(n.input_hash.clone()),
+                    vector_epoch: Some(7),
+                })
+            })
+            .collect();
+        let second = plan_with(&coordinator, &nodes, &current).await;
+        assert!(second.iter().all(|n| n.vector.is_none()));
+        assert_eq!(
+            second.iter().map(|n| &n.input_hash).collect::<Vec<_>>(),
+            first.iter().map(|n| &n.input_hash).collect::<Vec<_>>()
+        );
+        assert_eq!(provider.calls().len(), 1, "no second provider call");
     }
 }
