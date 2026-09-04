@@ -2999,6 +2999,13 @@
       "CreateFileReq": {
         "description": "Request to create a file (`POST /files`).",
         "properties": {
+          "bind": {
+            "description": "Bind mode for the first content: `\"auto\"` (default — the upload\nitself binds: single-part on the sidecar's finalize under a\n`content_id IS NULL` CAS, multipart inside `complete`) or `\"manual\"`\n(staged pre-redesign behaviour: an explicit `POST /files/{id}/bind`\nafterwards).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "custom_metadata": {
             "items": {
               "$ref": "#/components/schemas/MetadataEntryDto"
@@ -3009,7 +3016,7 @@
             "type": "string"
           },
           "idempotency_key": {
-            "description": "Optional idempotency key for deduplication of retried requests.\nWithin the same `(owner_kind, owner_id)`, a retry with the same key\nreturns the original response without creating a new file.\n\n@cpt-cf-file-storage-fr-upload-idempotency",
+            "description": "Optional idempotency key for deduplication of retried requests.\nWithin the same `(owner_kind, owner_id)`, a retry with the same key\nreturns the original response without creating a new file.\nNot supported together with `multipart` (rejected with 400).",
             "type": [
               "string",
               "null"
@@ -3017,6 +3024,17 @@
           },
           "mime_type": {
             "type": "string"
+          },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateMultipartIntentDto",
+                "description": "Optional multipart intent (upload-flow redesign). When present and the\nserver-computed plan has **two or more parts**, the response carries\nthe full parts plan (`UploadTicketDto::multipart`) instead of a\nsingle-part `upload_url` — no separate initiate call needed. A plan\nthat collapses to one part falls back to the ordinary single-part\n`upload_url` path."
+              }
+            ]
           },
           "name": {
             "type": "string"
@@ -3081,6 +3099,39 @@
         "required": [
           "type",
           "name"
+        ],
+        "type": "object"
+      },
+      "CreateMultipartIntentDto": {
+        "description": "Multipart intent block on `POST /files` (upload-flow redesign): ask the\ncreate call to open the multipart session and return the parts plan in\nthe same response, saving the separate `POST /files/{id}/multipart`\nround-trip (and the orphan single-part pending version the old flow\npre-registered and then abandoned).",
+        "properties": {
+          "concurrency": {
+            "description": "Advisory upload-concurrency hint; does not change the plan.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "declared_size": {
+            "description": "Declared total file size in bytes (validated against policy/quota at\ncreate time, exactly like `POST /files/{id}/multipart`).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preferred_part_size": {
+            "description": "Client hint for the preferred part size in bytes; the server-computed\nplan is authoritative (5 MiB..5 GiB, see `InitiateMultipartReq`).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "declared_size"
         ],
         "type": "object"
       },
@@ -4687,7 +4738,7 @@
         "type": "object"
       },
       "EffectivePolicyDto": {
-        "description": "Effective policy response: the most-restrictive combination of tenant ⊕ user.\n\n@cpt-cf-file-storage-usecase-configure-policy",
+        "description": "Effective policy response: the most-restrictive combination of tenant ⊕ user.",
         "properties": {
           "allowed_mime_types": {
             "description": "Intersection of allowed mime types from all levels (`null` = all types permitted).",
@@ -6592,7 +6643,7 @@
         "type": "object"
       },
       "InitiateMultipartReq": {
-        "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server returns a server-authoritative parts plan with one signed sidecar\nURL per part (FEATURE §3, §4; DESIGN §4.6).\n\n@cpt-cf-file-storage-fr-multipart-upload\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+        "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server returns a server-authoritative parts plan with one signed sidecar\nURL per part (FEATURE §3, §4; DESIGN §4.6).",
         "properties": {
           "concurrency": {
             "description": "Advisory hint for upload concurrency; does not change the parts plan\n(FEATURE §3).",
@@ -6608,7 +6659,7 @@
             "type": "string"
           },
           "declared_size": {
-            "description": "Declared total file size in bytes.\n\n**Required** (per DESIGN §4.6 \"server-authoritative\" model). The control\nplane validates this value against the effective policy size limit and the\nstorage quota at initiate time — exactly as single-part upload does — so\nthat an oversized upload is rejected before any bytes are transferred.\n\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+            "description": "Declared total file size in bytes.\n\n**Required** (per DESIGN §4.6 \"server-authoritative\" model). The control\nplane validates this value against the effective policy size limit and the\nstorage quota at initiate time — exactly as single-part upload does — so\nthat an oversized upload is rejected before any bytes are transferred.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -7985,7 +8036,7 @@
         "type": "object"
       },
       "MigrateBackendReq": {
-        "description": "Request to migrate a file's content to a different storage backend.\n\n@cpt-cf-file-storage-fr-backend-migration",
+        "description": "Request to migrate a file's content to a different storage backend.",
         "properties": {
           "target_backend_id": {
             "description": "The id of the target backend to migrate the file's content to.",
@@ -8299,7 +8350,7 @@
         "type": "object"
       },
       "MissingPartDto": {
-        "description": "One part not yet uploaded (item 3.4).\n\n`upload_url` is present only while the session is still `in_progress` and\nunexpired; a terminal or expired session omits it.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One part not yet uploaded (item 3.4).\n\n`upload_url` is present only while the session is still `in_progress` and\nunexpired; a terminal or expired session omits it.",
         "properties": {
           "offset": {
             "format": "int64",
@@ -8410,23 +8461,44 @@
         "type": "object"
       },
       "MultipartCompleteDto": {
-        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete` (item 3.3).\n\nCarries everything the ADR-0006 assembly step already computes — the\nbound version id, its size, and the composite content hash — instead of\nthe previous bare `204 No Content`. `manifest` lets a client independently\nre-verify the composite hash (`docs/features/content-hash-modes.md`\n§\"Client-Side Manifest Re-Verification\") without a second round-trip.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete` (item 3.3).\n\nCarries everything the ADR-0006 assembly step already computes — the\nbound version id, its size, and the composite content hash — instead of\nthe previous bare `204 No Content`. `manifest` lets a client independently\nre-verify the composite hash (`docs/features/content-hash-modes.md`\n§\"Client-Side Manifest Re-Verification\") without a second round-trip.",
         "properties": {
-          "content_hash": {
-            "description": "Hex-encoded ADR-0006 composite root (`sha256(manifest)`).",
+          "bind_state": {
+            "description": "Bind outcome (upload-flow redesign) — ONE state model shared with the\nsingle-part path's `X-FS-Bound` header: `\"bound\"` (this complete made\nthe version the file's current content; `etag` carries the new\ncontent `ETag`), `\"conflict\"` (an auto-bind lost its CAS — the upload\nitself succeeded, `current_etag` carries the If-Match a manual rebind\nneeds, no re-upload), or `\"manual\"` (`bind: \"manual\"` / standalone\ninitiate — the client binds explicitly).",
             "type": "string"
+          },
+          "content_hash": {
+            "description": "Hex-encoded content hash: the ADR-0006 composite root\n(`sha256(manifest)`) for a plan of two or more parts, or plain\n`sha256(object bytes)` for the degenerate one-part plan (ADR-0006\nsingle-part amendment).",
+            "type": "string"
+          },
+          "current_etag": {
+            "description": "The file's CURRENT content `ETag` when the bind CAS was lost\n(`bind_state == \"conflict\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "The file's content `ETag` after a successful bind (`bind_state ==\n\"bound\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "hash_algorithm": {
             "description": "Always `\"SHA-256\"`.",
             "type": "string"
           },
           "hash_mode": {
-            "description": "Always `\"multipart-composite-sha256\"` for this endpoint.",
+            "description": "`\"multipart-composite-sha256\"` for a plan of two or more parts;\n`\"whole-sha256\"` for a one-part plan (single-part amendment — the one\npart's digest IS the whole-object digest, so no composite applies).",
             "type": "string"
           },
           "manifest": {
-            "description": "Wire-format manifest text (`Manifest::to_wire_string`).",
-            "type": "string"
+            "description": "Wire-format manifest text (`Manifest::to_wire_string`). Omitted\n(`null`) for a one-part plan — a `whole-sha256` version has no\nmanifest (mirrors [`VersionDto::manifest`]).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "part_count": {
             "format": "int32",
@@ -8448,12 +8520,31 @@
           "content_hash",
           "hash_mode",
           "part_count",
-          "manifest"
+          "bind_state"
+        ],
+        "type": "object"
+      },
+      "MultipartCompletingDto": {
+        "description": "`202 Accepted` body of `POST .../complete` while another caller holds the\ncompletion lease (upload-flow redesign). The client polls by re-issuing\nthe same idempotent `complete` after `retry_after_secs`.",
+        "properties": {
+          "retry_after_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "description": "Always `\"completing\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "retry_after_secs"
         ],
         "type": "object"
       },
       "MultipartPartPlanDto": {
-        "description": "One part in the server-authoritative parts plan.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One part in the server-authoritative parts plan.",
         "properties": {
           "offset": {
             "description": "Byte offset of this part within the final assembled object.",
@@ -8487,7 +8578,7 @@
         "type": "object"
       },
       "MultipartPlanDto": {
-        "description": "Server-authoritative parts plan returned by `POST /files/{id}/multipart`.\n\nThe client `PUT`s each part's bytes to its `upload_url`; the sidecar\nenforces the `size` claim before writing any bytes (FEATURE §4).\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Server-authoritative parts plan returned by `POST /files/{id}/multipart`.\n\nThe client `PUT`s each part's bytes to its `upload_url`; the sidecar\nenforces the `size` claim before writing any bytes (FEATURE §4).",
         "properties": {
           "expires_at": {
             "description": "Expiry of all per-part URLs (RFC 3339).",
@@ -8531,7 +8622,7 @@
         "type": "object"
       },
       "MultipartStatusDto": {
-        "description": "Response of `GET /files/{id}/multipart/{upload_id}` — introspect/resume\n(item 3.4).\n\nMirrors [`crate::domain::multipart::MultipartUploadStatus`]. `received`\ncovers parts already reported by the sidecar; `missing` covers the rest,\neach carrying a fresh resume `upload_url` when the session can still be\nresumed (`in_progress` and unexpired) — a terminal or expired session\nreports state and part accounting only, with no URLs to act on.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Response of `GET /files/{id}/multipart/{upload_id}` — introspect/resume\n(item 3.4).\n\nMirrors [`crate::domain::multipart::MultipartUploadStatus`]. `received`\ncovers parts already reported by the sidecar; `missing` covers the rest,\neach carrying a fresh resume `upload_url` when the session can still be\nresumed (`in_progress` and unexpired) — a terminal or expired session\nreports state and part accounting only, with no URLs to act on.",
         "properties": {
           "created_at": {
             "format": "date-time",
@@ -11538,7 +11629,7 @@
         "type": "object"
       },
       "PolicyBodyDto": {
-        "description": "Policy body in requests and responses.\n\n@cpt-cf-file-storage-fr-allowed-types-policy\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-metadata-limits",
+        "description": "Policy body in requests and responses.",
         "properties": {
           "allowed_mime_types": {
             "description": "Allowed MIME types for upload (empty = all types permitted at this level).",
@@ -13259,7 +13350,7 @@
         "type": "object"
       },
       "ReceivedPartDto": {
-        "description": "One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`, item 3.4).\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`, item 3.4).",
         "properties": {
           "part_number": {
             "format": "int32",
@@ -14841,7 +14932,7 @@
         "type": "object"
       },
       "RetentionRuleBodyDto": {
-        "description": "Retention rule body in requests and responses.\n\n@cpt-cf-file-storage-fr-retention-policies",
+        "description": "Retention rule body in requests and responses.",
         "properties": {
           "age": {
             "oneOf": [
@@ -17615,7 +17706,7 @@
         "type": "string"
       },
       "TransferOwnershipReq": {
-        "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).\n\n@cpt-cf-file-storage-fr-ownership-transfer",
+        "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).",
         "properties": {
           "new_owner_id": {
             "description": "New owner UUID.",
@@ -18108,14 +18199,29 @@
         "type": "object"
       },
       "UploadTicketDto": {
-        "description": "Result of create / presign: identity + the signed upload URL.",
+        "description": "Result of create / presign: identity plus EITHER a single-part signed\nupload URL OR a full multipart parts plan (upload-flow redesign — exactly\none of `upload_url`/`multipart` is present; `multipart` only when\n`CreateFileReq::multipart` was given and the plan has ≥2 parts).",
         "properties": {
           "file_id": {
             "format": "uuid",
             "type": "string"
           },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MultipartPlanDto",
+                "description": "Server-authoritative multipart plan (absent on the single-part path).\nSame shape as `POST /files/{id}/multipart`'s response, including the\nsession `upload_id` for introspect/resume and the per-part-URL\n`expires_at`."
+              }
+            ]
+          },
           "upload_url": {
-            "type": "string"
+            "description": "Single-part signed sidecar URL (absent when `multipart` is present).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "version_id": {
             "format": "uuid",
@@ -18124,8 +18230,7 @@
         },
         "required": [
           "file_id",
-          "version_id",
-          "upload_url"
+          "version_id"
         ],
         "type": "object"
       },
@@ -18528,7 +18633,7 @@
         "type": "object"
       },
       "VersionDto": {
-        "description": "One content version (`GET /files/{id}/versions`).\n\nWire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`\nfields, ADR-0006).\n\n@cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-docs:p2",
+        "description": "One content version (`GET /files/{id}/versions`).\n\nWire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`\nfields, ADR-0006).",
         "properties": {
           "created_at": {
             "format": "date-time",
@@ -18546,6 +18651,13 @@
           },
           "is_current": {
             "type": "boolean"
+          },
+          "manifest": {
+            "description": "Canonical offset-manifest wire text (`Manifest::to_wire_string`,\nADR-0006 §3) for a `multipart-composite-sha256` version — the same\ntext `POST .../multipart/{upload_id}/complete` returns, re-served here\nfrom `version_hash_manifest` so a client can re-verify `hash` for an\nalready-existing version without keeping the complete response around.\nOmitted (`null`) for `whole-sha256` versions.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mime_type": {
             "type": "string"
@@ -23441,6 +23553,16 @@
             },
             "description": "Forbidden"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -23457,7 +23579,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Create a file and presign its first content upload",
+        "summary": "Create a file and presign its first content upload (single-part URL, or the multipart parts plan with the `multipart` block)",
         "tags": [
           "File Storage"
         ]
@@ -23498,6 +23620,16 @@
             },
             "description": "Version finalized"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -23517,6 +23649,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -23588,6 +23730,16 @@
             },
             "description": "Part reported"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -23607,6 +23759,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -24480,7 +24642,7 @@
     },
     "/api/file-storage/v1/files/{id}/multipart/{upload_id}/complete": {
       "post": {
-        "description": "Returns the bound version id, size, and ADR-0006 composite hash/manifest (item 3.3). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400.",
+        "description": "Returns the version id, size, ADR-0006 hash (composite root + manifest for plans of two or more parts; plain whole-sha256 with no manifest for a one-part plan), and the bind outcome (`bind_state`: bound/conflict/manual — auto-bind sessions bind here, in the same transaction as the finalize). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400. Idempotent: a retry of an already-completed session replays the stored result; while another caller holds the completion lease the response is `202 completing` (poll by re-issuing the same call).",
         "operationId": "file_storage.complete_multipart",
         "parameters": [
           {
@@ -24511,7 +24673,17 @@
                 }
               }
             },
-            "description": "Completed — version id, size, composite hash, manifest"
+            "description": "Completed — version id, size, composite hash, manifest, bind outcome"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MultipartCompletingDto"
+                }
+              }
+            },
+            "description": "Another caller is completing — poll by re-issuing the same complete"
           },
           "400": {
             "content": {
@@ -24579,7 +24751,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Finalize a multipart upload (assemble all parts)",
+        "summary": "Finalize a multipart upload (assemble all parts; idempotent)",
         "tags": [
           "File Storage"
         ]
@@ -24801,6 +24973,16 @@
               }
             },
             "description": "Presigned"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {

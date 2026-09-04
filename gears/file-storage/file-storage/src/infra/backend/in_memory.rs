@@ -1,13 +1,14 @@
 //! In-memory storage backend — a real backend *type* for tests and ephemeral
 //! deployments. Content lives in a `Mutex<HashMap>` keyed by path.
 //!
-//! P2-M3: implements multipart upload natively (`multipart_native: true`).
+//! Implements multipart upload natively (`multipart_native: true`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use file_storage_sdk::ByteRange;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use uuid::Uuid;
@@ -17,7 +18,8 @@ use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root,
 };
 
 /// In-progress multipart state per handle: (blob path, ordered parts).
@@ -102,6 +104,44 @@ impl StorageBackend for InMemoryBackend {
         Ok((bytes_written, digest))
     }
 
+    /// Create-exclusive publish. The existence check and the insert happen
+    /// under the same `blobs` lock guard, so no concurrent
+    /// `publish_exclusive`/`put` call can interleave between them — unlike
+    /// the trait's default TOCTOU fallback. See
+    /// [`StorageBackend::publish_exclusive`] for the full contract.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        mut stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if max_size.is_some_and(|m| buf.len() as u64 > m) {
+                return Err(DomainError::validation("size", "exceeds max_size"));
+            }
+        }
+        let bytes_written = buf.len() as u64;
+        let digest = hash::digest_to_array(hash::sha256(&buf));
+
+        let mut blobs = self.lock_blobs()?;
+        if blobs.contains_key(path) {
+            return Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: false,
+            });
+        }
+        blobs.insert(path.to_owned(), Bytes::from(buf));
+        Ok(PublishOutcome {
+            bytes_written,
+            digest,
+            created: true,
+        })
+    }
+
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
         self.lock_blobs()?
             .get(path)
@@ -117,8 +157,24 @@ impl StorageBackend for InMemoryBackend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
+
+    /// Yields the resolved range as a single chunk — same non-hardening
+    /// rationale as `get_stream`'s override: this backend is explicitly
+    /// non-durable, in-process storage for tests/dev deployments, so a
+    /// one-chunk stream (via the trait's own `get_range` for the actual
+    /// slicing) is enough to let the shared backend contract tests exercise
+    /// `get_range_stream` against every backend, not just
+    /// `LocalFsBackend`/`S3Backend`.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let bytes = self.get_range(path, range).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 
@@ -129,6 +185,14 @@ impl StorageBackend for InMemoryBackend {
 
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         Ok(self.lock_blobs()?.contains_key(path))
+    }
+
+    /// Native combined stat: one lock acquisition instead of the
+    /// default's `exists` (lock + lookup) followed by `size` (another lock +
+    /// `get`, which for this backend would otherwise clone the whole blob
+    /// just to measure it).
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        Ok(self.lock_blobs()?.get(path).map(|b| b.len() as u64))
     }
 
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
@@ -146,9 +210,7 @@ impl StorageBackend for InMemoryBackend {
         _part_offset: u64,
         data: Bytes,
     ) -> Result<(String, Vec<u8>), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-hash
         let hash_bytes = hash::sha256(&data);
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-hash
         let etag = hex::encode(&hash_bytes);
 
         let mut mp = self.lock_multipart()?;
@@ -190,7 +252,6 @@ impl StorageBackend for InMemoryBackend {
         self.lock_blobs()?
             .insert(final_path, Bytes::from(assembled));
 
-        // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest
         build_manifest_and_root(parts)
     }
 
@@ -200,8 +261,6 @@ impl StorageBackend for InMemoryBackend {
     }
 
     /// Returns all blob paths currently in the store.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         let paths = self.lock_blobs()?.keys().cloned().collect();
         Ok(paths)

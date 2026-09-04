@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -24,9 +24,20 @@ use file_storage::infra::metrics::NoopMetrics;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 use super::{
-    DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    write_multipart_part_native, write_multipart_part_offset_object,
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, SidecarState, build_router,
+    finalize_with_control_plane, parse_optional, write_multipart_part_native,
+    write_multipart_part_offset_object,
 };
+
+/// A part-upload concurrency semaphore sized at the production default
+/// -- every `SidecarState` literal below needs this field, and most
+/// tests don't care about its value, only the concurrency-limiter tests
+/// further down do (they build their own with a size of `1`).
+fn test_part_upload_semaphore() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        DEFAULT_MAX_CONCURRENT_PART_UPLOADS,
+    ))
+}
 
 fn test_state() -> SidecarState {
     let issuer = Issuer::generate(60).expect("issuer generation");
@@ -42,6 +53,7 @@ fn test_state() -> SidecarState {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     }
 }
 
@@ -79,6 +91,7 @@ async fn sidecar_readyz_returns_200_when_backends_ready() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     };
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -123,6 +136,7 @@ async fn sidecar_readyz_returns_503_when_backend_root_missing() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     };
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -327,6 +341,7 @@ fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     };
     (state, issuer, backend)
 }
@@ -361,6 +376,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -479,6 +495,50 @@ async fn download_unsatisfiable_range_returns_416_with_content_range() {
         .to_str()
         .expect("valid header value");
     assert_eq!(content_range, "bytes */11");
+    // api.md: "every download response includes Accept-Ranges" — 416 is not
+    // an exception.
+    let accept_ranges = response
+        .headers()
+        .get(header::ACCEPT_RANGES)
+        .expect("Accept-Ranges header present on 416")
+        .to_str()
+        .expect("valid header value");
+    assert_eq!(accept_ranges, "bytes");
+}
+
+/// RFC 9110 §14.1.1: `bytes=5-2` (last-byte-pos < first-byte-pos) is
+/// syntactically invalid, not merely unsatisfiable — it MUST be ignored by
+/// the recipient, i.e. served as a full-body `200`, never a `416`.
+#[tokio::test]
+async fn download_inverted_range_is_ignored_and_returns_full_body() {
+    let (state, issuer, backend) = test_download_state();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    backend
+        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
+        .await
+        .expect("seed blob");
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::get(format!(
+                "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .header(header::RANGE, "bytes=5-2")
+            .body(Body::empty())
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(&body[..], b"hello world");
 }
 
 /// P2 1.11: a whole-file (`200`) download response must echo the
@@ -829,6 +889,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -867,6 +928,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -899,6 +961,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     };
 
     let file_id = Uuid::now_v7();
@@ -1076,6 +1139,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -1112,6 +1176,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1122,6 +1187,88 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         err.status(),
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
+    );
+}
+
+/// P2 remediation (replay-`PUT` overwrite fix, HIGH-severity immutability
+/// bug): a valid signed `PUT` token stays usable until `exp`, but replaying
+/// it after the backend object already exists must never overwrite the
+/// live bytes. The sidecar's backend publish is create-exclusive, so the
+/// second `PUT` (even with completely different bytes, using the SAME
+/// still-valid token) must be rejected with `409 Conflict` — not silently
+/// accepted with `200`, and not a `502`, which would misleadingly suggest a
+/// transient failure rather than "this write never took effect". This test
+/// runs in the sidecar's dev/no-control-plane mode (`control_base_url`
+/// empty), which is the conservative branch: with no control plane to
+/// consult, a rejected publish always reports `409` (see `upload`'s doc
+/// comment for the full decision table covering a real control plane too).
+#[tokio::test]
+async fn upload_replay_after_publish_is_rejected_with_409() {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let backend = Arc::new(InMemoryBackend::new("test"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+        "test",
+    )
+    .expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
+    };
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let token = upload_token(&issuer, file_id, version_id, "test", &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"original-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first PUT to a fresh backend path must publish successfully"
+    );
+
+    // Replay the SAME still-valid token with DIFFERENT bytes.
+    let second = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"replayed-different-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "a replayed PUT against an already-published path must be rejected with 409, \
+         never overwrite it"
+    );
+
+    // The backend must still hold the FIRST attempt's bytes, untouched.
+    let stored = backend.get(&path).await.expect("blob must still exist");
+    assert_eq!(
+        &stored[..],
+        b"original-bytes",
+        "a replayed PUT must never overwrite the already-published content"
     );
 }
 
@@ -1151,6 +1298,7 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
     };
 
     let file_id_a = Uuid::now_v7();
@@ -1221,4 +1369,397 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         .await
         .expect("get from other backend");
     assert_eq!(&got_b[..], b"bytes-for-other");
+}
+
+// ── `parse_optional` env-var parsing (fail-fast on typos) ───────────────────
+
+/// Unset (`raw = None`) must fall back to the default without error.
+#[test]
+fn parse_optional_unset_uses_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", None, 10).expect("unset uses default");
+    assert_eq!(value, 10);
+}
+
+/// A well-formed value overrides the default.
+#[test]
+fn parse_optional_valid_value_overrides_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", Some("42".to_owned()), 10)
+        .expect("valid value parses");
+    assert_eq!(value, 42);
+}
+
+/// A malformed value (e.g. `"5GB"` for a byte count, or any non-numeric
+/// typo) must fail fast with an error naming the variable, NOT silently fall
+/// back to the default — that used to be exactly how a typo like
+/// `FS_SIDECAR_MAX_BODY_BYTES=5GB` disappeared without a trace.
+#[test]
+fn parse_optional_invalid_value_errors() {
+    let err = parse_optional::<u64>("FS_SIDECAR_MAX_BODY_BYTES", Some("5GB".to_owned()), 10)
+        .expect_err("malformed value must fail fast, not fall back to the default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FS_SIDECAR_MAX_BODY_BYTES"),
+        "error should name the offending variable: {msg}"
+    );
+    assert!(
+        msg.contains("5GB"),
+        "error should include the offending value: {msg}"
+    );
+}
+
+/// An empty string is also not a valid `u64` and must error, not silently
+/// become the default.
+#[test]
+fn parse_optional_empty_string_errors() {
+    parse_optional::<u64>("FS_SIDECAR_TEST_VAR", Some(String::new()), 10)
+        .expect_err("empty string is not a valid u64");
+}
+
+// -- HEAD download ---------------------------------------------------------
+
+/// `HEAD` on an existing object must answer `200` with
+/// `Content-Length`/`Accept-Ranges`/`Content-Type` set from the token's
+/// claims and the backend's stat, and an EMPTY body -- `download_head` must
+/// never stream any content, only stat it.
+#[tokio::test]
+async fn download_head_existing_object_returns_200_with_empty_body() {
+    let (state, issuer, backend) = test_download_state();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    backend
+        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
+        .await
+        .expect("seed blob");
+    let token = download_token_with_meta(
+        &issuer,
+        file_id,
+        version_id,
+        &path,
+        "text/plain",
+        "\"etag123\"",
+    );
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri(format!(
+                    "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+                ))
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .expect("Content-Length header present")
+            .to_str()
+            .expect("valid header value"),
+        "11"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCEPT_RANGES)
+            .expect("Accept-Ranges header present")
+            .to_str()
+            .expect("valid header value"),
+        "bytes"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("Content-Type header present")
+            .to_str()
+            .expect("valid header value"),
+        "text/plain"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert!(
+        body.is_empty(),
+        "HEAD response body must be empty, got {} byte(s)",
+        body.len()
+    );
+}
+
+/// `HEAD` on a missing object must be `404`, same as `GET`.
+#[tokio::test]
+async fn download_head_missing_object_returns_404() {
+    let (state, issuer, _backend) = test_download_state();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}"); // never written
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri(format!(
+                    "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+                ))
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// -- part-upload concurrency limiter ---------------------------------------
+
+/// Build a `SidecarState` wired to a fresh `InMemoryBackend` (`multipart_native`,
+/// so `write_multipart_part` takes the permit-guarded branch) with its
+/// `part_upload_semaphore` sized at `limit` -- used by the concurrency
+/// tests below, which need a small, explicit limit rather than the
+/// production default.
+fn test_multipart_state_with_limit(limit: usize) -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let backend = Arc::new(InMemoryBackend::new("mem"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&backend) as Arc<dyn StorageBackend>], "mem")
+            .expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+    };
+    (state, issuer, backend)
+}
+
+/// With `part_upload_semaphore` exhausted (limit `1`, and
+/// the single permit held externally for the duration of this request), a
+/// `multipart_native` part-upload request must fail with `503` and a
+/// `Retry-After` header rather than hang or silently proceed unbounded.
+#[tokio::test]
+async fn upload_multipart_part_returns_503_when_semaphore_exhausted() {
+    let (state, issuer, backend) = test_multipart_state_with_limit(1);
+    let semaphore = Arc::clone(&state.part_upload_semaphore);
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+    let part = b"exhausted-slot-part".to_vec();
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "mem",
+        &backend_path,
+        Uuid::now_v7(),
+        1,
+        0,
+        part.len() as u64,
+        &backend_handle,
+    );
+
+    // Hold the only permit so the request below can never acquire one --
+    // exercises the `PART_UPLOAD_ACQUIRE_TIMEOUT` bounded-wait-then-503 path.
+    let held_permit = Arc::clone(&semaphore)
+        .try_acquire_owned()
+        .expect("acquire the single permit for the test to hold");
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from(part))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header present on 503")
+            .to_str()
+            .expect("valid header value"),
+        "1"
+    );
+
+    drop(held_permit);
+}
+
+/// Once a `multipart_native` part write completes, its
+/// permit must be released before the handler returns -- a second part
+/// upload against a `part_upload_semaphore` sized at `1` must succeed right
+/// after the first, not wait out `PART_UPLOAD_ACQUIRE_TIMEOUT` and fail.
+#[tokio::test]
+async fn upload_multipart_part_releases_permit_after_write() {
+    let (state, issuer, backend) = test_multipart_state_with_limit(1);
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let upload_id = Uuid::now_v7();
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+
+    let part1 = b"first-part".to_vec();
+    let part2 = b"second-part".to_vec();
+    let token1 = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "mem",
+        &backend_path,
+        upload_id,
+        1,
+        0,
+        part1.len() as u64,
+        &backend_handle,
+    );
+    let token2 = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "mem",
+        &backend_path,
+        upload_id,
+        2,
+        part1.len() as u64,
+        part2.len() as u64,
+        &backend_handle,
+    );
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+    let resp1 = router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token1}"
+            ))
+            .body(Body::from(part1))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        resp1.status(),
+        StatusCode::OK,
+        "first part upload must succeed"
+    );
+
+    // With the semaphore still sized at 1, this only succeeds immediately if
+    // the first write's permit was actually released rather than leaked.
+    let resp2 = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/2?fs-token={token2}"
+            ))
+            .body(Body::from(part2))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        resp2.status(),
+        StatusCode::OK,
+        "second part upload must succeed once the first write released its permit"
+    );
+}
+
+// -- post-validation cleanup on a rejected PUT ------------------------------
+
+/// Immutable-path-poisoning fix (`reject_upload_bad_content`): a
+/// `PUT` whose streamed bytes fail the post-publish `exact_size` check must
+/// answer `400` AND must delete the object it just created --
+/// `publish_exclusive` already landed those bytes before the mismatch could
+/// be detected, and leaving them in place would permanently poison this
+/// immutable path (a corrected retry would itself be rejected as
+/// `created: false`).
+#[tokio::test]
+async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let backend = Arc::new(InMemoryBackend::new("test"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+        "test",
+    )
+    .expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+        part_upload_semaphore: test_part_upload_semaphore(),
+    };
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let claims = Claims {
+        op: Op::Put,
+        file_id,
+        version_id,
+        backend_id: "test".to_owned(),
+        backend_path: path.clone(),
+        exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
+        upload: UploadConstraints {
+            exact_size: Some(999), // deliberately wrong: the body below is 11 bytes
+            ..UploadConstraints::default()
+        },
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, OffsetDateTime::now_utc())
+        .expect("issue upload token");
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"hello world".to_vec())) // 11 bytes, not the claimed 999
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let exists = backend
+        .exists(&path)
+        .await
+        .expect("backend exists check succeeds");
+    assert!(
+        !exists,
+        "the object this request itself created must be cleaned up after a \
+         post-validation failure, not left poisoning the immutable path"
+    );
 }

@@ -13,16 +13,13 @@
 //! they are persistence concerns (which scope to use when querying each table),
 //! not authorization decisions (those stay in `FileService`).
 //!
-//! P2-M1 adds policy store intent-level methods (`get_policy`, `upsert_policy`,
+//! Policy store intent-level methods (`get_policy`, `upsert_policy`,
 //! `list_retention_rules`, `get_retention_rule`, `insert_retention_rule`,
-//! `delete_retention_rule`).
+//! `delete_retention_rule`) live alongside the rest.
 //!
-//! P2-M4 adds transactional audit recording. Every mutating method that runs
-//! (or wraps) a DB transaction inserts an [`AuditEntry`] row in the **same**
-//! transaction, guaranteeing 100% coverage with no silent drops.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
+//! Every mutating method that runs (or wraps) a DB transaction inserts an
+//! [`AuditEntry`] row in the **same** transaction, guaranteeing 100% coverage
+//! with no silent drops.
 //!
 //! ## Accepted Henry-Kafura hub (do not fragment further)
 //!
@@ -92,7 +89,7 @@ pub struct IdempotencyInsert {
     pub key: String,
     /// The authenticated subject (`ctx.subject_id()`) creating this record —
     /// verified against on replay so one caller's key can never surface
-    /// another caller's ticket (P2 remediation 0.10).
+    /// another caller's ticket.
     pub subject_id: Uuid,
     pub response_status: i32,
     pub response_body: String,
@@ -100,7 +97,7 @@ pub struct IdempotencyInsert {
     /// SHA-256 over `domain::idempotency::compute_request_hash`'s
     /// canonicalized encoding of the request — compared against on replay so
     /// a caller can never surface a stored ticket for a materially different
-    /// request body (P2 remediation 2.1).
+    /// request body.
     pub request_hash: Vec<u8>,
     pub expires_at: OffsetDateTime,
 }
@@ -148,9 +145,6 @@ impl Store {
     /// computation is confined here because this module already owns the
     /// SHA-256 allow-list usage (see `hash.rs` docs), keeping `FileService`
     /// free of a direct `hash` import.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
-    /// @cpt-cf-file-storage-algo-content-hash-modes-verify
     pub fn verify_content_hash(
         blob: &[u8],
         hash_mode: HashMode,
@@ -159,7 +153,6 @@ impl Store {
     ) -> Result<(), crate::domain::error::DomainError> {
         use crate::domain::error::DomainError;
         match hash_mode {
-            // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-whole
             HashMode::WholeSha256 => {
                 if manifest.is_some() {
                     return Err(DomainError::validation(
@@ -176,7 +169,6 @@ impl Store {
                 }
                 Ok(())
             }
-            // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-whole
             HashMode::MultipartCompositeSha256 => {
                 let manifest = manifest.ok_or_else(|| {
                     DomainError::validation(
@@ -200,13 +192,10 @@ impl Store {
         use crate::domain::error::DomainError;
         use crate::infra::content::hash_mode::{Manifest, ManifestEntry};
 
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-parse-manifest
         let parsed = Manifest::from_wire_string(manifest)?;
         let entries = parsed.entries();
         let blob_len = blob.len() as u64;
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-parse-manifest
 
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-per-part
         let mut rebuilt = Vec::with_capacity(entries.len());
         for (i, entry) in entries.iter().enumerate() {
             // Each part spans [offset, next_offset) — the final part runs to
@@ -237,22 +226,15 @@ impl Store {
                 digest,
             });
         }
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-per-part
 
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-reserialize
         let rebuilt_root = Manifest::new(rebuilt)?.root();
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-reserialize
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-root-compare
         if rebuilt_root.as_slice() != root {
             return Err(DomainError::hash_mismatch(
                 hex::encode(root),
                 hex::encode(rebuilt_root),
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-root-compare
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-return
     }
 }
 

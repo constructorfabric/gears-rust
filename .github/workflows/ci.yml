@@ -402,6 +402,13 @@ jobs:
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
 
+      - name: Test file-storage (pg concurrency, integration)
+        # Fail if Docker is unreachable instead of letting the suite skip itself
+        # into a green step that asserted nothing.
+        env:
+          FS_PG_REQUIRE_DOCKER: "1"
+        run: make test-fs-pg
+
   test-fips:
     name: FIPS verification (${{ matrix.os }})
     needs: changes

@@ -72,6 +72,26 @@ impl FileDto {
     }
 }
 
+/// Multipart intent block on `POST /files` (upload-flow redesign): ask the
+/// create call to open the multipart session and return the parts plan in
+/// the same response, saving the separate `POST /files/{id}/multipart`
+/// round-trip (and the orphan single-part pending version the old flow
+/// pre-registered and then abandoned).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct CreateMultipartIntentDto {
+    /// Declared total file size in bytes (validated against policy/quota at
+    /// create time, exactly like `POST /files/{id}/multipart`).
+    pub declared_size: u64,
+    /// Client hint for the preferred part size in bytes; the server-computed
+    /// plan is authoritative (5 MiB..5 GiB, see `InitiateMultipartReq`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_part_size: Option<u64>,
+    /// Advisory upload-concurrency hint; does not change the plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+}
+
 /// Request to create a file (`POST /files`).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -87,10 +107,24 @@ pub struct CreateFileReq {
     /// Optional idempotency key for deduplication of retried requests.
     /// Within the same `(owner_kind, owner_id)`, a retry with the same key
     /// returns the original response without creating a new file.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
+    /// Not supported together with `multipart` (rejected with 400).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Optional multipart intent (upload-flow redesign). When present and the
+    /// server-computed plan has **two or more parts**, the response carries
+    /// the full parts plan (`UploadTicketDto::multipart`) instead of a
+    /// single-part `upload_url` — no separate initiate call needed. A plan
+    /// that collapses to one part falls back to the ordinary single-part
+    /// `upload_url` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<CreateMultipartIntentDto>,
+    /// Bind mode for the first content: `"auto"` (default — the upload
+    /// itself binds: single-part on the sidecar's finalize under a
+    /// `content_id IS NULL` CAS, multipart inside `complete`) or `"manual"`
+    /// (staged pre-redesign behaviour: an explicit `POST /files/{id}/bind`
+    /// afterwards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
 }
 
 impl CreateFileReq {
@@ -101,13 +135,24 @@ impl CreateFileReq {
     }
 }
 
-/// Result of create / presign: identity + the signed upload URL.
+/// Result of create / presign: identity plus EITHER a single-part signed
+/// upload URL OR a full multipart parts plan (upload-flow redesign — exactly
+/// one of `upload_url`/`multipart` is present; `multipart` only when
+/// `CreateFileReq::multipart` was given and the plan has ≥2 parts).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UploadTicketDto {
     pub file_id: Uuid,
     pub version_id: Uuid,
-    pub upload_url: String,
+    /// Single-part signed sidecar URL (absent when `multipart` is present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_url: Option<String>,
+    /// Server-authoritative multipart plan (absent on the single-part path).
+    /// Same shape as `POST /files/{id}/multipart`'s response, including the
+    /// session `upload_id` for introspect/resume and the per-part-URL
+    /// `expires_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<MultipartPlanDto>,
 }
 
 /// Result of `GET /files/{id}/download-url`.
@@ -139,8 +184,6 @@ pub struct UpdateMetadataReq {
 ///
 /// Wire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`
 /// fields, ADR-0006).
-///
-/// @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-docs:p2
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct VersionDto {
@@ -157,14 +200,26 @@ pub struct VersionDto {
     /// (`null`) for `whole-sha256`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part_count: Option<i32>,
+    /// Canonical offset-manifest wire text (`Manifest::to_wire_string`,
+    /// ADR-0006 §3) for a `multipart-composite-sha256` version — the same
+    /// text `POST .../multipart/{upload_id}/complete` returns, re-served here
+    /// from `version_hash_manifest` so a client can re-verify `hash` for an
+    /// already-existing version without keeping the complete response around.
+    /// Omitted (`null`) for `whole-sha256` versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
     pub status: String,
     pub is_current: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
-impl From<FileVersion> for VersionDto {
-    fn from(v: FileVersion) -> Self {
+impl VersionDto {
+    /// Build the DTO from the version row plus its (optional) stored
+    /// offset-manifest text — `Some` only for `multipart-composite-sha256`
+    /// versions, fetched in batch by `handlers::list_versions`.
+    #[must_use]
+    pub fn from_parts(v: FileVersion, manifest: Option<String>) -> Self {
         Self {
             version_id: v.version_id,
             mime_type: v.mime_type,
@@ -173,10 +228,17 @@ impl From<FileVersion> for VersionDto {
             hash: hex::encode(&v.hash_value),
             hash_mode: v.hash_mode,
             part_count: v.part_count,
+            manifest,
             status: v.status.as_str().to_owned(),
             is_current: v.is_current,
             created_at: v.created_at,
         }
+    }
+}
+
+impl From<FileVersion> for VersionDto {
+    fn from(v: FileVersion) -> Self {
+        Self::from_parts(v, None)
     }
 }
 
@@ -350,10 +412,6 @@ impl From<MetadataLimitsDto> for MetadataLimits {
 }
 
 /// Policy body in requests and responses.
-///
-/// @cpt-cf-file-storage-fr-allowed-types-policy
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-metadata-limits
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
 pub struct PolicyBodyDto {
@@ -425,8 +483,6 @@ impl From<StoredPolicy> for PolicyDto {
 }
 
 /// Effective policy response: the most-restrictive combination of tenant ⊕ user.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EffectivePolicyDto {
@@ -541,8 +597,6 @@ impl From<MetadataRetentionDto> for MetadataRetention {
 }
 
 /// Retention rule body in requests and responses.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
 pub struct RetentionRuleBodyDto {
@@ -630,10 +684,6 @@ pub struct CreateRetentionRuleReq {
 ///
 /// The server returns a server-authoritative parts plan with one signed sidecar
 /// URL per part (FEATURE §3, §4; DESIGN §4.6).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-storage-quota
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct InitiateMultipartReq {
@@ -645,9 +695,6 @@ pub struct InitiateMultipartReq {
     /// plane validates this value against the effective policy size limit and the
     /// storage quota at initiate time — exactly as single-part upload does — so
     /// that an oversized upload is rejected before any bytes are transferred.
-    ///
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-storage-quota
     pub declared_size: u64,
     /// Client hint for the preferred part size in bytes. The server may override
     /// it to satisfy the backend's minimum part size requirements (FEATURE §3).
@@ -660,8 +707,6 @@ pub struct InitiateMultipartReq {
 }
 
 /// One part in the server-authoritative parts plan.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartPartPlanDto {
@@ -680,8 +725,6 @@ pub struct MultipartPartPlanDto {
 ///
 /// The client `PUT`s each part's bytes to its `upload_url`; the sidecar
 /// enforces the `size` claim before writing any bytes (FEATURE §4).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartPlanDto {
@@ -705,8 +748,6 @@ pub struct MultipartPlanDto {
 /// the previous bare `204 No Content`. `manifest` lets a client independently
 /// re-verify the composite hash (`docs/features/content-hash-modes.md`
 /// §"Client-Side Manifest Re-Verification") without a second round-trip.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartCompleteDto {
@@ -714,18 +755,51 @@ pub struct MultipartCompleteDto {
     pub size: i64,
     /// Always `"SHA-256"`.
     pub hash_algorithm: String,
-    /// Hex-encoded ADR-0006 composite root (`sha256(manifest)`).
+    /// Hex-encoded content hash: the ADR-0006 composite root
+    /// (`sha256(manifest)`) for a plan of two or more parts, or plain
+    /// `sha256(object bytes)` for the degenerate one-part plan (ADR-0006
+    /// single-part amendment).
     pub content_hash: String,
-    /// Always `"multipart-composite-sha256"` for this endpoint.
+    /// `"multipart-composite-sha256"` for a plan of two or more parts;
+    /// `"whole-sha256"` for a one-part plan (single-part amendment — the one
+    /// part's digest IS the whole-object digest, so no composite applies).
     pub hash_mode: String,
     pub part_count: i32,
-    /// Wire-format manifest text (`Manifest::to_wire_string`).
-    pub manifest: String,
+    /// Wire-format manifest text (`Manifest::to_wire_string`). Omitted
+    /// (`null`) for a one-part plan — a `whole-sha256` version has no
+    /// manifest (mirrors [`VersionDto::manifest`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Bind outcome (upload-flow redesign) — ONE state model shared with the
+    /// single-part path's `X-FS-Bound` header: `"bound"` (this complete made
+    /// the version the file's current content; `etag` carries the new
+    /// content `ETag`), `"conflict"` (an auto-bind lost its CAS — the upload
+    /// itself succeeded, `current_etag` carries the If-Match a manual rebind
+    /// needs, no re-upload), or `"manual"` (`bind: "manual"` / standalone
+    /// initiate — the client binds explicitly).
+    pub bind_state: String,
+    /// The file's content `ETag` after a successful bind (`bind_state ==
+    /// "bound"` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// The file's CURRENT content `ETag` when the bind CAS was lost
+    /// (`bind_state == "conflict"` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_etag: Option<String>,
+}
+
+/// `202 Accepted` body of `POST .../complete` while another caller holds the
+/// completion lease (upload-flow redesign). The client polls by re-issuing
+/// the same idempotent `complete` after `retry_after_secs`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct MultipartCompletingDto {
+    /// Always `"completing"`.
+    pub state: String,
+    pub retry_after_secs: u64,
 }
 
 /// One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`, item 3.4).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct ReceivedPartDto {
@@ -739,8 +813,6 @@ pub struct ReceivedPartDto {
 ///
 /// `upload_url` is present only while the session is still `in_progress` and
 /// unexpired; a terminal or expired session omits it.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MissingPartDto {
@@ -759,8 +831,6 @@ pub struct MissingPartDto {
 /// each carrying a fresh resume `upload_url` when the session can still be
 /// resumed (`in_progress` and unexpired) — a terminal or expired session
 /// reports state and part accounting only, with no URLs to act on.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartStatusDto {
@@ -782,8 +852,6 @@ pub struct MultipartStatusDto {
 // ── Backend migration DTOs (P2-M4) ─────────────────────────────────────────────
 
 /// Request to migrate a file's content to a different storage backend.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct MigrateBackendReq {
@@ -794,8 +862,6 @@ pub struct MigrateBackendReq {
 // ── Ownership transfer DTOs (P2-M5) ───────────────────────────────────────────
 
 /// Request to transfer ownership of a file (`POST /files/{id}/transfer`).
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct TransferOwnershipReq {

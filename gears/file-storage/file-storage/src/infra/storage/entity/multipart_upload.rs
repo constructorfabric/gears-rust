@@ -33,6 +33,27 @@ pub struct Model {
     /// lets `P2-5` (introspect) reconstitute the full parts plan without
     /// persisting every per-part planned row.
     pub part_size: i64,
+    /// Whether `complete` should bind the finalized version as the file's
+    /// current content itself (upload-flow redesign; set only by the merged
+    /// `POST /files` create+plan path with `bind: "auto"`). `FALSE` = the
+    /// pre-redesign staged behaviour (client binds manually).
+    ///
+    /// Added by `m20260722_000001_multipart_auto_bind`.
+    #[sea_orm(default_value = false)]
+    pub auto_bind: bool,
+    /// Completion-lease expiry (`state = 'completing'` only) — a later
+    /// `complete` takes over once this passes. Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub lease_until: Option<OffsetDateTime>,
+    /// Opaque id of the completer currently holding the lease (diagnostics +
+    /// scoped lease release). Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub lease_owner: Option<String>,
+    /// Persisted JSON of the successful complete response
+    /// (`domain::multipart::StoredCompleteResult`) once `state = 'completed'`.
+    /// Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub complete_result: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

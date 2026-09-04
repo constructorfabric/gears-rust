@@ -1,7 +1,7 @@
 //! Repository for the `files` table (logical file identity + content pointer).
 
 use sea_orm::ExprTrait;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -15,6 +15,9 @@ use file_storage_sdk::{File, OwnerFilter};
 use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::file::{ActiveModel, Column, Entity};
+use crate::infra::storage::entity::file_version::{
+    Column as VersionColumn, Entity as VersionEntity,
+};
 
 /// Repository over the `files` table.
 #[derive(Clone, Default)]
@@ -129,6 +132,16 @@ impl FileRepo {
     /// Bump `meta_version` and `last_modified_at` for a metadata-only write,
     /// optionally guarded by an `If-Match-Metadata` prepredicateition on the current
     /// `meta_version`. Returns `false` if the prepredicateition did not match.
+    /// Bump `meta_version` (and `last_modified_at`) under an optional
+    /// optimistic-concurrency guard. When `expected_meta_version` is `Some(v)`
+    /// the bump only lands if the current revision is exactly `v`; when it is
+    /// `None` the bump is unconditional.
+    ///
+    /// Returns the **committed** post-bump `meta_version` (`Some`), or `None`
+    /// if the guard matched no row (`If-Match-Metadata` conflict). The value is
+    /// read back from the row in the same transaction rather than derived as
+    /// `expected + 1`, because for an unconditional bump the pre-state is not
+    /// known to the caller and a concurrent bump can make `snapshot + 1` wrong.
     pub async fn touch_meta<C: DBRunner>(
         &self,
         conn: &C,
@@ -136,7 +149,7 @@ impl FileRepo {
         file_id: Uuid,
         expected_meta_version: Option<i64>,
         now: OffsetDateTime,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<Option<i64>, DomainError> {
         let mut predicate = Condition::all().add(Column::FileId.eq(file_id));
         if let Some(mv) = expected_meta_version {
             predicate = predicate.add(Column::MetaVersion.eq(mv));
@@ -151,7 +164,19 @@ impl FileRepo {
             .exec(conn)
             .await
             .map_err(db_err)?;
-        Ok(res.rows_affected > 0)
+        if res.rows_affected == 0 {
+            return Ok(None);
+        }
+
+        let row = Entity::find()
+            .filter(Column::FileId.eq(file_id))
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| DomainError::database("file row missing after meta_version bump"))?;
+        Ok(Some(row.meta_version))
     }
 
     /// Delete a file (FK cascade removes its versions and custom metadata).
@@ -172,6 +197,87 @@ impl FileRepo {
         Ok(res.rows_affected > 0)
     }
 
+    /// Delete a file row iff it is still a true orphan -- `content_id IS
+    /// NULL` **and** it has zero `file_versions` rows -- evaluated as a
+    /// single conditional `DELETE`, not as separate pre-checks.
+    ///
+    /// # Why this exists instead of `SELECT`-then-`DELETE`
+    ///
+    /// A `SELECT`-then-`DELETE` re-verification of the orphan condition, as
+    /// two plain `SELECT`s followed by an unconditional `Self::delete`, does
+    /// not hold under `READ COMMITTED`: each plain `SELECT` is its own
+    /// statement with its own snapshot, ordinary reads take no locks, and
+    /// `crate::infra::storage::store::Store::insert_pending_version` runs
+    /// autocommit on a separate connection. Nothing prevents a version from
+    /// being inserted and committed in the gap between the two `SELECT`s, or
+    /// between the second `SELECT` and the `DELETE` -- and once that DELETE
+    /// runs, the FK (`file_versions.file_id -> files.file_id ON DELETE
+    /// CASCADE`) silently removes the just-inserted version along with the
+    /// file. This is invisible on `SQLite`, whose single-writer model
+    /// serializes the interleaving away.
+    ///
+    /// Folding the whole guard into the `DELETE`'s own `WHERE` (`content_id
+    /// IS NULL` plus a `NOT EXISTS` subquery over `file_versions`) narrows
+    /// that window from "between two statements" to "inside one statement's
+    /// execution", and removes the `content_id` half of the race outright.
+    ///
+    /// It does **not** make the version half airtight on `PostgreSQL`. Under
+    /// `READ COMMITTED` the `NOT EXISTS` subquery is evaluated against the
+    /// snapshot taken when
+    /// this statement began. A concurrent `insert_pending_version` that
+    /// commits after that snapshot is invisible to the subquery; the FK it
+    /// takes on the parent row (`FOR KEY SHARE`) does make this `DELETE`
+    /// wait for it, but once the inserter commits the parent tuple is only
+    /// *locked*, not updated, so `PostgreSQL` resumes without an `EvalPlanQual`
+    /// re-check and the stale `NOT EXISTS` verdict stands. The `ON DELETE
+    /// CASCADE` then removes the freshly inserted version.
+    ///
+    /// Closing it properly needs the two sides to contend on the same parent
+    /// row: either a `SELECT ... FOR UPDATE` on `files` before the check
+    /// (`toolkit-db`'s secure ORM exposes no row-lock API today -- the
+    /// `DBRunner` traits are sealed), or `insert_pending_version` taking a
+    /// conflicting lock on the parent itself, which would add a write to the
+    /// hot upload path. Until one of those lands, this is a narrowed race,
+    /// not an eliminated one, and the residual loss is a pending version
+    /// created in the same instant an hour-old orphan is reclaimed.
+    ///
+    /// Returns the number of rows removed (0 or 1, keyed on `file_id`). `0`
+    /// means the file is already gone, has content bound, or has at least
+    /// one version row -- the caller cannot and does not need to distinguish
+    /// these from the count alone (mirrors
+    /// [`crate::infra::storage::repo::VersionRepo::delete`]'s "returns a
+    /// count, not a reason" shape).
+    pub async fn delete_if_orphan<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        // `EXISTS (SELECT 1 FROM file_versions WHERE file_id = ?)`, negated
+        // below -- same subquery shape as `VersionRepo::list_pending_older_than`'s
+        // `not_in_subquery` and `toolkit_db`'s own `scope_via_exists` helper.
+        let mut has_any_version = Query::select();
+        has_any_version
+            .expr(Expr::value(1))
+            .from(VersionEntity)
+            .and_where(VersionColumn::FileId.eq(file_id));
+        let no_versions_exist = Condition::all().add(Expr::exists(has_any_version)).not();
+
+        let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::ContentId.is_null())
+                    .add(no_versions_exist),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
+    }
+
     /// List files across all tenants for the retention sweep engine,
     /// **keyset-paginated by `file_id`** to bound sweep memory on large
     /// deployments. Returns up to `limit` files ordered by `file_id`, starting
@@ -179,8 +285,6 @@ impl FileRepo {
     /// advancing `after` to the last returned `file_id`, until it gets a short
     /// page. Keyset (not offset) paging is used so that deleting expired files
     /// mid-sweep does not shift the window and skip rows.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_for_sweep<C: DBRunner>(
         &self,
         conn: &C,
@@ -205,8 +309,6 @@ impl FileRepo {
 
     /// Update `owner_kind` and `owner_id` for a file row, and bump
     /// `last_modified_at`. Returns `true` if a row was found and updated.
-    ///
-    /// @cpt-cf-file-storage-fr-ownership-transfer
     pub async fn update_owner<C: DBRunner>(
         &self,
         conn: &C,

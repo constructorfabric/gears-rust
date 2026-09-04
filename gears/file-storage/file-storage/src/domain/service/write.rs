@@ -14,7 +14,8 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
-use crate::domain::service::{FileService, VersionRef};
+use crate::domain::ports::AutoBindOnFinalize;
+use crate::domain::service::{FileService, FinalizeByTokenOutcome, VersionRef};
 use crate::infra::backend::StorageBackend;
 use crate::infra::content::hash;
 use crate::infra::content::mime::{
@@ -112,8 +113,6 @@ impl FileService {
 
     /// Record an uploaded version's size+hash and mark it available. Called by
     /// the sidecar after streaming bytes to the backend (write action).
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn finalize_upload(
         &self,
@@ -123,10 +122,8 @@ impl FileService {
         size: i64,
         hash_value: Vec<u8>,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-actor-request
         // Entry point: the actor's write request (finalize is one of the
         // audited operations recorded by `cpt-cf-file-storage-flow-audit-trail-record-write`).
-        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-actor-request
         if size < 0 {
             return Err(DomainError::validation("size", "must be non-negative"));
         }
@@ -138,7 +135,6 @@ impl FileService {
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
 
-        // @cpt-cf-file-storage-fr-size-limits-policy
         // Defense-in-depth size check: re-enforce the policy size ceiling at
         // finalization time even though the sidecar already checked the
         // upload constraint in the signed URL.
@@ -162,18 +158,14 @@ impl FileService {
             &version_mime,
             backend.capabilities().max_size_bytes,
         );
-        // @cpt-begin:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-size-compare
         if let Some(limit) = effective_max
             && size > 0
             && size.cast_unsigned() > limit
         {
-            // @cpt-end:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-size-compare
-            // @cpt-begin:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-return
             return Err(DomainError::policy_size_exceeded(
                 limit,
                 "policy size limit",
             ));
-            // @cpt-end:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-return
         }
 
         // Never trust the caller's claimed size/hash: stream the blob
@@ -206,7 +198,6 @@ impl FileService {
         // constant's doc comment for why that is always sufficient. The
         // returned type is the sniffed/canonical one when the bytes carry a
         // recognizable signature, otherwise the declared type unchanged.
-        // @cpt-cf-file-storage-fr-content-type-validation
         let validated_mime = validate_and_resolve_mime(&version_mime, &mime_sniff_prefix)?;
         enforce_size_ceiling_for_validated_mime(
             &policy,
@@ -216,24 +207,16 @@ impl FileService {
             actual_size,
         )?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
-        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-build
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
-            // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-operation
             AuditOperation::FinalizeVersion,
-            // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-operation
-            // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-detail
             serde_json::json!({ "version_id": version_id, "size": size }),
-            // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-detail
         );
-        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-build
 
         // Persist the read-back-derived size and the verified hash, not the
         // caller's size claim. `validated_mime` is persisted in place of the
         // client's original declaration.
-        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-pass-through
         let ok = self
             .store
             .finalize_version(
@@ -248,9 +231,12 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                // No auto-bind on the user-facing (JWT-authorized) finalize
+                // path — binding stays an explicit `bind` call here.
+                None,
             )
-            .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-pass-through
+            .await?
+            .updated;
         if !ok {
             // Distinguish "already finalized" (409, using the `version`
             // snapshot read earlier in this call) from "row is gone" (404).
@@ -263,7 +249,6 @@ impl FileService {
             );
         }
 
-        // @cpt-cf-file-storage-fr-usage-reporting
         // Credit the read-back-derived bytes now that the version is durably
         // finalized. `create_file` already reported `+1 file` with `0 bytes`
         // (bytes are unknown at creation time), so `file_count_delta` here is
@@ -277,9 +262,7 @@ impl FileService {
         });
 
         self.metrics.record_operation("finalize_upload", "ok");
-        // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-return
     }
 
     /// `POST /files/{id}/bind`: swap the content pointer to `version_id` under
@@ -290,8 +273,6 @@ impl FileService {
     /// `if_match` is the opaque content ETag (or `*`, or `None` for the first
     /// bind). The server recomputes the current ETag and compares — it never
     /// reverses the ETag back to a `content_id`.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn bind(
         &self,
@@ -343,7 +324,6 @@ impl FileService {
             }
         }
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -351,7 +331,6 @@ impl FileService {
             serde_json::json!({ "version_id": version_id }),
         );
 
-        // @cpt-cf-file-storage-fr-file-events
         let event = Some(Self::make_file_event(
             file.tenant_id,
             file.owner_id,
@@ -418,7 +397,8 @@ impl FileService {
     /// `PATCH /files/{id}`: JSON-merge-patch the custom metadata and bump
     /// `meta_version`, optionally guarded by `If-Match-Metadata`.
     ///
-    /// @cpt-cf-file-storage-fr-audit-trail
+    /// A `PatchMetadata` audit row and a `file.metadata_updated` file event are
+    /// enqueued in the same transaction as the CAS + patch.
     pub async fn update_metadata(
         &self,
         ctx: &SecurityContext,
@@ -433,7 +413,6 @@ impl FileService {
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
 
-        // @cpt-cf-file-storage-fr-metadata-limits
         // Compute what the resulting metadata will look like after this patch,
         // then validate against the effective policy.
         let policy = self
@@ -456,13 +435,25 @@ impl FileService {
         let result_pairs: Vec<(String, String)> = merged.into_iter().collect();
         PolicyResolver::check_metadata_limits(&policy, &result_pairs)?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
             AuditOperation::PatchMetadata,
             serde_json::json!({ "expected_meta_version": expected_meta_version }),
         );
+
+        // The `meta_version` payload is left empty here and stamped with the
+        // authoritative committed revision inside `patch_metadata_atomic`'s
+        // transaction: an unconditional patch (`expected_meta_version = None`)
+        // that races another cannot know its post-bump revision from the
+        // pre-transaction snapshot, so the store fills it from the CAS result.
+        let event = Some(Self::make_file_event(
+            file.tenant_id,
+            file.owner_id,
+            file_id,
+            "file.metadata_updated",
+            serde_json::json!({}),
+        ));
 
         // Apply the meta-version CAS and the patch in ONE transaction. The CAS
         // runs first, so a stale `expected_meta_version` aborts before any row
@@ -473,7 +464,15 @@ impl FileService {
         let now = OffsetDateTime::now_utc();
         let bumped = self
             .store
-            .patch_metadata_atomic(&scope, file_id, expected_meta_version, patch, now, audit)
+            .patch_metadata_atomic(
+                &scope,
+                file_id,
+                expected_meta_version,
+                patch,
+                now,
+                audit,
+                event,
+            )
             .await?;
         if !bumped {
             return Err(DomainError::precondition_failed(
@@ -507,12 +506,6 @@ impl FileService {
     /// whether this action should require a distinct privileged-transfer
     /// grant rather than reusing the file WRITE grant — see 0.7's
     /// admin-scope decision).
-    ///
-    /// @cpt-cf-file-storage-fr-ownership-transfer
-    /// @cpt-cf-file-storage-fr-usage-reporting
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-dod:cpt-cf-file-storage-dod-ownership-transfer-endpoint:p1
     pub async fn transfer_ownership(
         &self,
         ctx: &SecurityContext,
@@ -520,31 +513,25 @@ impl FileService {
         new_owner_kind: file_storage_sdk::OwnerKind,
         new_owner_id: Uuid,
     ) -> Result<File, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-nil-check
         if new_owner_id.is_nil() {
             return Err(DomainError::validation(
                 "new_owner_id",
                 "must not be the nil UUID",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-nil-check
 
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-authz
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-authz
 
         let now = OffsetDateTime::now_utc();
         let tenant_id = file.tenant_id;
         let old_owner_id = file.owner_id;
         let new_owner_kind_str = new_owner_kind.as_str().to_owned();
 
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-build-audit-event
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -557,7 +544,6 @@ impl FileService {
             }),
         );
 
-        // @cpt-cf-file-storage-fr-file-events
         let event = Some(Self::make_file_event(
             tenant_id,
             new_owner_id,
@@ -570,9 +556,7 @@ impl FileService {
                 "to_owner_id": new_owner_id,
             }),
         ));
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-build-audit-event
 
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-atomic-update
         let updated = self
             .store
             .transfer_ownership_atomic(
@@ -585,18 +569,12 @@ impl FileService {
                 event,
             )
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-atomic-update
 
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-not-found
         if !updated {
             return Err(DomainError::file_not_found(file_id));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-not-found
 
-        // @cpt-cf-file-storage-fr-usage-reporting
-        // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-usage-rebalance
         // Debit old owner, credit new owner. Bytes are unchanged.
-        // @cpt-begin:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-sum
         let total_bytes: i64 = self
             .store
             .list_versions(file_id)
@@ -605,26 +583,36 @@ impl FileService {
             .filter(|v| v.status == file_storage_sdk::VersionStatus::Available)
             .map(|v| v.size)
             .sum();
-        // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-sum
-        // @cpt-begin:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-debit
         self.report_usage(UsageDelta {
             tenant_id,
             owner_id: old_owner_id,
             bytes_delta: -total_bytes,
             file_count_delta: -1,
         });
-        // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-debit
-        // @cpt-begin:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-credit
         self.report_usage(UsageDelta {
             tenant_id,
             owner_id: new_owner_id,
             bytes_delta: total_bytes,
             file_count_delta: 1,
         });
-        // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-credit
-        // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-usage-rebalance
 
-        self.store.require_file(&scope, file_id).await
+        // Return the file reflecting the just-committed owner swap, built
+        // from the pre-transfer row plus the exact fields
+        // `transfer_ownership_atomic`/`FileRepo::update_owner` mutate
+        // (`owner_kind`, `owner_id`, `last_modified_at` — see that repo
+        // method: `meta_version` is untouched by a transfer), rather than
+        // re-reading via `require_file` with the pre-transfer `scope`. The
+        // `files` entity declares `owner_col = "owner_id"`
+        // (`infra/storage/entity/file.rs`), so an owner-constrained
+        // `AccessScope` — one that only matches the *old* owner — would no
+        // longer match the row after a successful swap, and a re-read with
+        // that stale scope would incorrectly surface a 404 for a transfer
+        // that already committed (usage deltas and all).
+        let mut updated_file = file;
+        updated_file.owner_kind = new_owner_kind;
+        updated_file.owner_id = new_owner_id;
+        updated_file.last_modified_at = now;
+        Ok(updated_file)
     }
 
     /// Record an uploaded version's size+hash and mark it available, authorized
@@ -644,15 +632,18 @@ impl FileService {
     ///
     /// The actor in the audit row is recorded as `"sidecar"` with the `Uuid::nil`
     /// actor id, since no user identity is present in a sidecar callback.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
+    /// Returns the auto-bind outcome (upload-flow redesign): `bound` is
+    /// `true` only when the token carried `bind_on_finalize` and the
+    /// `content_id IS NULL` CAS won (first content of a brand-new file);
+    /// `etag` is the resulting content ETag in that case. The sidecar echoes
+    /// both to the uploading client as `X-FS-Bound`/`ETag` response headers.
     pub async fn finalize_upload_by_token(
         &self,
         claims: &Claims,
         size: i64,
         hash_value: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<FinalizeByTokenOutcome, DomainError> {
         if size < 0 {
             return Err(DomainError::validation("size", "must be non-negative"));
         }
@@ -670,12 +661,44 @@ impl FileService {
         // Defense-in-depth size check: re-enforce the policy size ceiling at
         // finalization time even though the sidecar already checked the upload
         // constraint in the signed URL.
-        // @cpt-cf-file-storage-fr-size-limits-policy
         let version = self
             .store
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+
+        // Idempotent PUT-retry convergence (upload-flow redesign; the
+        // dominant single-part case): the sidecar retries a `PUT` whose
+        // response was lost, `publish_exclusive` refuses the second write
+        // (replay-safe), and this finalize arrives for an ALREADY-available
+        // version. Converge to the same success the original got — never a
+        // 409 on an honest retry — but only when the retry reported the same
+        // bytes (size+hash match what was verified and stored); a mismatched
+        // replay stays rejected.
+        if version.status == file_storage_sdk::VersionStatus::Available && claims.bind_on_finalize {
+            if version.size != size || version.hash_value != hash_value {
+                return Err(DomainError::hash_mismatch(
+                    hex::encode(&hash_value),
+                    hex::encode(&version.hash_value),
+                ));
+            }
+            // Bind already decided by the original finalize's atomic CAS —
+            // report the current state, run no new CAS.
+            return Ok(if file.content_id == Some(version_id) {
+                FinalizeByTokenOutcome {
+                    bind_state: Some(crate::domain::multipart::BindState::Bound),
+                    etag: Some(etag::content_etag(file_id, version_id)),
+                    current_etag: None,
+                }
+            } else {
+                FinalizeByTokenOutcome {
+                    bind_state: Some(crate::domain::multipart::BindState::Conflict),
+                    etag: None,
+                    current_etag: etag::etag_for(&file),
+                }
+            });
+        }
+
         let version_mime = version.mime_type.clone();
         let backend_id = version.backend_id.clone();
         let policy = self
@@ -691,18 +714,14 @@ impl FileService {
             &version_mime,
             backend.capabilities().max_size_bytes,
         );
-        // @cpt-begin:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-size-compare
         if let Some(limit) = effective_max
             && size > 0
             && size.cast_unsigned() > limit
         {
-            // @cpt-end:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-size-compare
-            // @cpt-begin:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-return
             return Err(DomainError::policy_size_exceeded(
                 limit,
                 "policy size limit",
             ));
-            // @cpt-end:cpt-cf-file-storage-algo-enforce-policy-at-upload:p1:inst-enforce-return
         }
 
         // Never trust the caller's claimed size/hash: stream the blob
@@ -735,7 +754,6 @@ impl FileService {
         // constant's doc comment for why that is always sufficient. The
         // returned type is the sniffed/canonical one when the bytes carry a
         // recognizable signature, otherwise the declared type unchanged.
-        // @cpt-cf-file-storage-fr-content-type-validation
         let validated_mime = validate_and_resolve_mime(&version_mime, &mime_sniff_prefix)?;
         enforce_size_ceiling_for_validated_mime(
             &policy,
@@ -745,7 +763,6 @@ impl FileService {
             actual_size,
         )?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
         // Actor is "sidecar" with nil UUID — no user identity is available in
         // a token-authenticated callback.
         let audit = AuditEntry::success(
@@ -757,10 +774,39 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "size": size }),
         );
 
+        // Upload-flow redesign: a `bind_on_finalize` token additionally binds
+        // this version as the file's FIRST content, in the same transaction,
+        // under a strict `content_id IS NULL` CAS. Minted only by the
+        // new-file `create_file` path with `bind: "auto"` — this is a
+        // deliberate, narrow extension of the signed-URL delegated-authz
+        // model (DESIGN §3.6 amendment): the pointer swap happens under the
+        // authority of the token minted at create time, bounded by its `exp`,
+        // and can never replace existing content (a non-NULL pointer loses
+        // the CAS and the version simply stays available + unbound).
+        let auto_bind = claims.bind_on_finalize.then(|| AutoBindOnFinalize {
+            expected_content_id: None,
+            audit: AuditEntry::success(
+                file.tenant_id,
+                "sidecar",
+                Uuid::nil(),
+                Some(file_id),
+                AuditOperation::PatchContent,
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            ),
+            event: Some(Self::make_file_event(
+                file.tenant_id,
+                file.owner_id,
+                file_id,
+                "file.content_updated",
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            )),
+        });
+        let bind_attempted = auto_bind.is_some();
+
         // Persist the read-back-derived size and the verified hash, not the
         // caller's size claim. `validated_mime` is persisted in place of the
         // client's original declaration.
-        let ok = self
+        let outcome = self
             .store
             .finalize_version(
                 file_id,
@@ -774,9 +820,10 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                auto_bind,
             )
             .await?;
-        if !ok {
+        if !outcome.updated {
             // Distinguish "already finalized" (409, using the `version`
             // snapshot read earlier in this call) from "row is gone" (404).
             return Err(
@@ -788,7 +835,6 @@ impl FileService {
             );
         }
 
-        // @cpt-cf-file-storage-fr-usage-reporting
         // Same byte-crediting complement as `finalize_upload` (see its
         // comment) for the sidecar-callback / token-authenticated path.
         self.report_usage(UsageDelta {
@@ -800,7 +846,33 @@ impl FileService {
 
         self.metrics
             .record_operation("finalize_upload_by_token", "ok");
-        Ok(())
+        if !bind_attempted {
+            return Ok(FinalizeByTokenOutcome {
+                bind_state: None,
+                etag: None,
+                current_etag: None,
+            });
+        }
+        Ok(if outcome.bound {
+            FinalizeByTokenOutcome {
+                bind_state: Some(crate::domain::multipart::BindState::Bound),
+                etag: Some(etag::content_etag(file_id, version_id)),
+                current_etag: None,
+            }
+        } else {
+            // Lost the `content_id IS NULL` CAS (e.g. two create-tokens on
+            // the same new file — the first finalize bound). Report the
+            // pointer that won so the client can resolve with a manual bind.
+            let fresh = self
+                .store
+                .require_file(&AccessScope::allow_all(), file_id)
+                .await?;
+            FinalizeByTokenOutcome {
+                bind_state: Some(crate::domain::multipart::BindState::Conflict),
+                etag: None,
+                current_etag: etag::etag_for(&fresh),
+            }
+        })
     }
 
     /// Delete a backend blob, logging (not failing) on error. A failed delete

@@ -11,6 +11,8 @@
 //!
 //! `async-trait` is used to match the crate's existing `Authorizer` convention.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -24,6 +26,38 @@ use crate::domain::multipart::{MultipartPart, MultipartUploadSession};
 use crate::domain::policy::{
     PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope, StoredPolicy, StoredRetentionRule,
 };
+
+/// Instruction to bind a just-finalized version as the file's current content
+/// in the **same transaction** as the finalize itself (upload-flow redesign:
+/// single-part `bind=auto` finalize, and multipart `complete` on an
+/// `auto_bind` session).
+///
+/// `expected_content_id` is the optimistic-CAS precondition: the exact
+/// current pointer the bind may replace (`None` = the file must still have no
+/// content, i.e. `content_id IS NULL` — the first-content case). Semantically
+/// identical to the CAS a manual `POST /files/{id}/bind` performs under
+/// `If-Match` (PRD §5.10) — the precondition is resolved by the caller from
+/// the same validated state, only the transport differs.
+#[derive(Debug, Clone)]
+pub struct AutoBindOnFinalize {
+    /// CAS precondition: the exact `files.content_id` the swap may replace
+    /// (`None` = must be `NULL`).
+    pub expected_content_id: Option<Uuid>,
+    /// Audit row for the bind step (in addition to the finalize audit row).
+    pub audit: AuditEntry,
+    /// Optional `file.content_updated` event, enqueued only when the CAS wins.
+    pub event: Option<FileEvent>,
+}
+
+/// Result of [`MultipartStore::finalize_version`] / `Store::finalize_version`.
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeVersionOutcome {
+    /// The version row existed, was `pending`, and is now `available`.
+    pub updated: bool,
+    /// The auto-bind CAS was requested and won (always `false` when no
+    /// [`AutoBindOnFinalize`] was passed, or when `updated` is `false`).
+    pub bound: bool,
+}
 
 // ── CleanupStore ──────────────────────────────────────────────────────────────
 
@@ -102,6 +136,21 @@ pub trait CleanupStore: Send + Sync {
     /// List all custom-metadata entries for a file.
     async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError>;
 
+    /// Batched counterpart of [`Self::list_metadata`]: fetch the custom
+    /// metadata of many files in ONE query, keyed by `file_id`. Files with no
+    /// metadata are simply absent from the map.
+    ///
+    /// The retention sweep needs this to avoid a per-file query while walking
+    /// the whole `files` table: `sweep_retention_expiry` pages through every
+    /// file in the deployment, and any page whose files have a
+    /// metadata-criterion rule applied to them would otherwise cost one
+    /// `list_metadata` round trip per file, every `sweep_interval_secs`. The
+    /// same batching already backs `GET /files` on the read path.
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError>;
+
     /// List all versions of a file, newest first.
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError>;
 
@@ -179,7 +228,9 @@ pub trait MultipartStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<(), DomainError>;
 
-    /// Create a multipart upload session row.
+    /// Create a multipart upload session row. `auto_bind` records whether
+    /// `complete` should bind the finalized version itself (upload-flow
+    /// redesign; only the merged `POST /files` create+plan path sets it).
     #[allow(clippy::too_many_arguments)]
     async fn create_multipart_upload(
         &self,
@@ -190,6 +241,7 @@ pub trait MultipartStore: Send + Sync {
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError>;
@@ -206,6 +258,11 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
     ) -> Result<Option<FileVersion>, DomainError>;
+
+    /// Fetch the stored `version_hash_manifest` text for a version, if one
+    /// exists (`multipart-composite-sha256` versions only). Used by the
+    /// idempotent re-complete path to rebuild the original response.
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError>;
 
     /// Insert or replace a multipart upload part.
     #[allow(clippy::too_many_arguments)]
@@ -225,7 +282,8 @@ pub trait MultipartStore: Send + Sync {
         upload_id: Uuid,
     ) -> Result<Vec<MultipartPart>, DomainError>;
 
-    /// Record a version's size + hash and mark it `available`.
+    /// Record a version's size + hash and mark it `available`, optionally
+    /// binding it as the file's current content in the same transaction.
     ///
     /// `hash_mode`/`part_count`/`manifest` (ADR-0006) let the multipart
     /// completion persist the `multipart-composite-sha256` discriminator, its
@@ -238,6 +296,14 @@ pub trait MultipartStore: Send + Sync {
     /// the single-part `Store::finalize_version`'s `mime_type` parameter —
     /// `complete_multipart_upload` sniffs the assembled object's leading
     /// bytes before calling this, so it is always `Some` on that path.
+    ///
+    /// `auto_bind` (upload-flow redesign): when `Some`, the finalized version
+    /// is additionally bound as the file's current content under the same
+    /// optimistic CAS a manual `bind` uses — in the **same transaction** as
+    /// the finalize, so a crash can never leave "finalized because of the
+    /// bind intent, but not bound" ambiguity. A lost CAS is NOT an error:
+    /// `FinalizeVersionOutcome::bound` reports it, the version stays
+    /// `available` and manually rebindable without a re-upload.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_version(
         &self,
@@ -250,13 +316,35 @@ pub trait MultipartStore: Send + Sync {
         manifest: Option<String>,
         validated_mime: Option<String>,
         audit: AuditEntry,
-    ) -> Result<bool, DomainError>;
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError>;
 
-    /// Mark a multipart session as `completed` + audit in one transaction.
+    /// Terminal transition `completing → completed` + persist the response
+    /// snapshot (`result_json`) + audit, in one (fast) transaction.
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        result_json: &str,
         audit: AuditEntry,
+    ) -> Result<bool, DomainError>;
+
+    /// Acquire (or take over an expired) completion lease: one conditional
+    /// UPDATE `in_progress|expired-completing → completing(owner, until)`.
+    /// `false` = a live lease exists or the session is terminal.
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError>;
+
+    /// Release a held completion lease back to `in_progress` (assembly
+    /// failed) — scoped to `owner`.
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
     ) -> Result<bool, DomainError>;
 
     /// Mark a multipart session as `aborted` + audit in one transaction.

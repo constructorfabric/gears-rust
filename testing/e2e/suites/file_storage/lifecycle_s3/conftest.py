@@ -428,7 +428,12 @@ def lifecycle_s3_auth_headers() -> dict:
 @pytest.fixture
 def gts_file_type():
     """A syntactically valid GTS file type accepted at upload time."""
+    # Same type the sibling suites use (`../conftest.py`, `../lifecycle/`).
+    # `validate_gts_type` is purely syntactic (`GtsTypeId::try_new`), and
+    # `x.e2e.test.v1~` does not satisfy the grammar -- this suite never caught
+    # it because it skipped whenever `FS_E2E_S3_ENDPOINT` was unset, which was
+    # always, until CI started providing an S3 double.
     return os.getenv(
         "E2E_FS_GTS_TYPE",
-        "gts.cf.fstorage.file.type.v1~x.e2e.test.v1~",
+        "gts.cf.fstorage.file.type.v1~x.e2e.file.type.v1~",
     )

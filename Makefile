@@ -390,7 +390,7 @@ gts-docs:
 install-tools:
 	$(call print_target_banner)
 	@cargo gears tools check-version cargo-gears '>=$(CARGO_GEARS_MIN_VERSION)' >/dev/null 2>&1 \
-	|| (echo "Installing cargo-gears >= $(CARGO_GEARS_MIN_VERSION)..." && cargo install cargo-gears)
+	|| (echo "Installing cargo-gears >= $(CARGO_GEARS_MIN_VERSION)..." && cargo install --locked cargo-gears)
 	@cargo gears tools check-version cargo-nextest '>=$(NEXTEST_MIN_VERSION)' >/dev/null 2>&1 \
 	|| (echo "Installing cargo-nextest >= $(NEXTEST_MIN_VERSION)..." && cargo install --locked cargo-nextest)
 	@cargo gears tools check-version cargo-deny '>=$(DENY_MIN_VERSION)' >/dev/null 2>&1 \
@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-fs-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -714,6 +714,16 @@ test-db: test-sqlite test-pg test-mysql
 test-users-info-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p users-info --features "integration"
+
+## Run file-storage gear PostgreSQL concurrency tests (Docker required; spins
+## up its own postgres container via testcontainers -- see
+## gears/file-storage/file-storage/tests/pg_concurrency_test.rs). Skips
+## gracefully when Docker isn't reachable UNLESS FS_PG_REQUIRE_DOCKER=1 is
+## set in the environment (fail-closed), which CI's workflow does for this
+## target -- left unset here so a plain local `make test-fs-pg` without
+## Docker still skips instead of failing.
+test-fs-pg: install-tools
+	cargo nextest run -p cf-gears-file-storage --features integration
 
 ## Run TimescaleDB usage-collector plugin integration tests (Docker required;
 ## the suite spins up its own timescale/timescaledb container via testcontainers)

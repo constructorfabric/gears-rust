@@ -83,6 +83,13 @@ impl CleanupStore for Store {
         Store::list_metadata(self, file_id).await
     }
 
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        Store::list_metadata_for_files(self, file_ids).await
+    }
+
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         Store::list_versions(self, file_id).await
     }
@@ -172,6 +179,7 @@ impl MultipartStore for Store {
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -184,6 +192,7 @@ impl MultipartStore for Store {
             declared_mime,
             declared_size,
             part_size,
+            auto_bind,
             expires_at,
             now,
         )
@@ -203,6 +212,10 @@ impl MultipartStore for Store {
         version_id: Uuid,
     ) -> Result<Option<FileVersion>, DomainError> {
         Store::get_version(self, file_id, version_id).await
+    }
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError> {
+        Store::get_version_manifest(self, version_id).await
     }
 
     async fn upsert_multipart_part(
@@ -245,11 +258,12 @@ impl MultipartStore for Store {
         manifest: Option<String>,
         validated_mime: Option<String>,
         audit: crate::domain::audit::AuditEntry,
-    ) -> Result<bool, DomainError> {
+        auto_bind: Option<crate::domain::ports::AutoBindOnFinalize>,
+    ) -> Result<crate::domain::ports::FinalizeVersionOutcome, DomainError> {
         // `validated_mime` is the sniffed/canonical type computed by
         // `complete_multipart_upload` from the assembled object's leading
-        // bytes (P2 remediation item 1.10) — persisted in place of the
-        // client's declared type, mirroring the single-part finalize paths.
+        // bytes — persisted in place of the client's declared type,
+        // mirroring the single-part finalize paths.
         Store::finalize_version(
             self,
             file_id,
@@ -261,6 +275,7 @@ impl MultipartStore for Store {
             manifest,
             validated_mime,
             audit,
+            auto_bind,
         )
         .await
     }
@@ -268,9 +283,28 @@ impl MultipartStore for Store {
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        result_json: &str,
         audit: crate::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
-        Store::complete_multipart_upload(self, upload_id, audit).await
+        Store::complete_multipart_upload(self, upload_id, result_json, audit).await
+    }
+
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        Store::acquire_multipart_complete_lease(self, upload_id, owner, lease_until, now).await
+    }
+
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        Store::release_multipart_complete_lease(self, upload_id, owner).await
     }
 
     async fn abort_multipart_upload(
