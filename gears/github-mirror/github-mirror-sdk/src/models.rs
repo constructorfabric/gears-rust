@@ -6,6 +6,67 @@
 
 use toolkit_macros::domain_model;
 
+/// A GitHub account as it appears embedded in an issue, pull request or
+/// review — GitHub's `user` object.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    pub login: String,
+    /// GitHub's numeric account id; absent on rows mirrored before it was
+    /// stored.
+    pub id: Option<i64>,
+    pub node_id: Option<String>,
+    /// `User`, `Bot` or `Organization`.
+    pub account_type: Option<String>,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
+    pub site_admin: Option<bool>,
+}
+
+/// A label as GitHub embeds it in an issue or pull request.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRef {
+    pub id: Option<i64>,
+    pub node_id: Option<String>,
+    pub name: String,
+    /// The chip colour a client paints the label with.
+    pub color: Option<String>,
+    pub is_default: Option<bool>,
+    pub description: Option<String>,
+}
+
+/// A file attached to a release.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAsset {
+    pub id: Option<i64>,
+    pub node_id: Option<String>,
+    pub name: String,
+    pub label: Option<String>,
+    pub content_type: Option<String>,
+    pub size: Option<i64>,
+    pub download_count: Option<i64>,
+    pub browser_download_url: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One step of a workflow job.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub name: String,
+    /// `queued`, `in_progress` or `completed`.
+    pub status: Option<String>,
+    /// `success`, `failure`, `skipped`, ... — absent until completed.
+    pub conclusion: Option<String>,
+    /// Position in the job, 1-based.
+    pub number: Option<i64>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
 /// Runtime identity of the mirror gear.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +138,12 @@ pub struct Issue {
     pub html_url: Option<String>,
     /// Who opened it; GitHub's `user`.
     pub author_login: Option<String>,
-    /// The author as GitHub's own `user` object, JSON; `author_login` above
-    /// is the same person as an indexable identity.
-    pub author_json: Option<String>,
-    /// Assignee logins as a JSON array, and the labels it carries.
-    pub assignees_json: Option<String>,
-    pub labels_json: Option<String>,
+    /// The author as GitHub's own `user` object; `author_login` above is the
+    /// same person as an indexable identity.
+    pub author: Option<Actor>,
+    /// Who it is assigned to, and the labels it carries.
+    pub assignees: Vec<Actor>,
+    pub labels: Vec<LabelRef>,
     /// How many comments GitHub reports on it.
     pub comments_count: Option<i64>,
     pub locked: Option<bool>,
@@ -118,17 +179,17 @@ pub struct PullRequest {
     pub base_ref: Option<String>,
     /// Who opened it; GitHub's `user`.
     pub author_login: Option<String>,
-    /// The author as GitHub's own `user` object, JSON; `author_login` above
-    /// is the same person as an indexable identity.
-    pub author_json: Option<String>,
-    /// Assignee logins as a JSON array, and the labels it carries.
-    pub assignees_json: Option<String>,
-    pub labels_json: Option<String>,
+    /// The author as GitHub's own `user` object; `author_login` above is the
+    /// same person as an indexable identity.
+    pub author: Option<Actor>,
+    /// Who it is assigned to, and the labels it carries.
+    pub assignees: Vec<Actor>,
+    pub labels: Vec<LabelRef>,
     /// How many comments GitHub reports on it.
     pub comments_count: Option<i64>,
     pub locked: Option<bool>,
-    /// Reviewers requested on the pull request, as a JSON array.
-    pub requested_reviewers_json: Option<String>,
+    /// Reviewers requested on the pull request.
+    pub requested_reviewers: Vec<Actor>,
 }
 
 /// A mirrored GitHub commit (read-slice shape).
@@ -319,9 +380,8 @@ pub struct Release {
     /// Absent for drafts.
     pub published_at: Option<String>,
     pub html_url: Option<String>,
-    /// The release's assets as raw JSON (`name`, `browser_download_url`,
-    /// `size` per asset); `None` when the release has none.
-    pub assets_json: Option<String>,
+    /// The release's downloadable files; empty when it has none.
+    pub assets: Vec<ReleaseAsset>,
 }
 
 /// A mirrored GitHub branch head (read-slice shape).
@@ -676,7 +736,6 @@ pub struct WorkflowJob {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub html_url: Option<String>,
-    /// The job steps, kept as the raw GitHub JSON array: they have no ids
-    /// of their own and are only ever read back with their job.
-    pub steps_json: Option<String>,
+    /// The job's steps, in the order GitHub lists them.
+    pub steps: Vec<WorkflowStep>,
 }

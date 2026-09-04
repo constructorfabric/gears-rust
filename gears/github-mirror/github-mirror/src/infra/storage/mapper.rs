@@ -1,8 +1,8 @@
 use github_mirror_sdk::{
-    Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
-    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
-    PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, WorkflowJob, WorkflowRun,
+    Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
+    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef, Milestone,
+    PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo, Review,
+    ReviewComment, ReviewThread, Tag, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 
 use super::entity::{
@@ -11,6 +11,160 @@ use super::entity::{
     milestones, pull_request_commits, pull_request_files, pull_requests, releases, repositories,
     review_comments, review_threads, reviews, tags, workflow_jobs, workflow_runs,
 };
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredActor {
+    login: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(rename = "type", default)]
+    account_type: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    site_admin: Option<bool>,
+}
+
+impl From<StoredActor> for Actor {
+    fn from(a: StoredActor) -> Self {
+        Self {
+            login: a.login,
+            id: a.id,
+            node_id: a.node_id,
+            account_type: a.account_type,
+            avatar_url: a.avatar_url,
+            html_url: a.html_url,
+            site_admin: a.site_admin,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredLabel {
+    name: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(rename = "default", default)]
+    is_default: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl From<StoredLabel> for LabelRef {
+    fn from(l: StoredLabel) -> Self {
+        Self {
+            id: l.id,
+            node_id: l.node_id,
+            name: l.name,
+            color: l.color,
+            is_default: l.is_default,
+            description: l.description,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredAsset {
+    name: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    size: Option<i64>,
+    #[serde(default)]
+    download_count: Option<i64>,
+    #[serde(default)]
+    browser_download_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+impl From<StoredAsset> for ReleaseAsset {
+    fn from(a: StoredAsset) -> Self {
+        Self {
+            id: a.id,
+            node_id: a.node_id,
+            name: a.name,
+            label: a.label,
+            content_type: a.content_type,
+            size: a.size,
+            download_count: a.download_count,
+            browser_download_url: a.browser_download_url,
+            created_at: a.created_at,
+            updated_at: a.updated_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredStep {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    number: Option<i64>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+}
+
+impl From<StoredStep> for WorkflowStep {
+    fn from(st: StoredStep) -> Self {
+        Self {
+            name: st.name,
+            status: st.status,
+            conclusion: st.conclusion,
+            number: st.number,
+            started_at: st.started_at,
+            completed_at: st.completed_at,
+        }
+    }
+}
+
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(field: &str, raw: Option<&str>) -> Option<T> {
+    let raw = raw?;
+    match serde_json::from_str::<T>(raw) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                field,
+                error = %e,
+                bytes = raw.len(),
+                "stored JSON could not be decoded; serving the empty value"
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn decode_list<S, T>(field: &str, raw: Option<&str>) -> Vec<T>
+where
+    S: serde::de::DeserializeOwned + Into<T>,
+{
+    decode::<Vec<S>>(field, raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
 
 impl From<repositories::Model> for Repo {
     fn from(m: repositories::Model) -> Self {
@@ -47,9 +201,9 @@ impl From<issues::Model> for Issue {
             closed_at: m.closed_at,
             html_url: m.html_url,
             author_login: m.author_login,
-            author_json: m.author_json,
-            assignees_json: m.assignees_json,
-            labels_json: m.labels_json,
+            author: decode::<StoredActor>("author_json", m.author_json.as_deref()).map(Into::into),
+            assignees: decode_list::<StoredActor, _>("assignees_json", m.assignees_json.as_deref()),
+            labels: decode_list::<StoredLabel, _>("labels_json", m.labels_json.as_deref()),
             comments_count: m.comments_count,
             locked: m.locked,
         }
@@ -80,12 +234,15 @@ impl From<pull_requests::Model> for PullRequest {
             head_ref: m.head_ref,
             base_ref: m.base_ref,
             author_login: m.author_login,
-            author_json: m.author_json,
-            assignees_json: m.assignees_json,
-            labels_json: m.labels_json,
+            author: decode::<StoredActor>("author_json", m.author_json.as_deref()).map(Into::into),
+            assignees: decode_list::<StoredActor, _>("assignees_json", m.assignees_json.as_deref()),
+            labels: decode_list::<StoredLabel, _>("labels_json", m.labels_json.as_deref()),
             comments_count: m.comments_count,
             locked: m.locked,
-            requested_reviewers_json: m.requested_reviewers_json,
+            requested_reviewers: decode_list::<StoredActor, _>(
+                "requested_reviewers_json",
+                m.requested_reviewers_json.as_deref(),
+            ),
         }
     }
 }
@@ -213,7 +370,7 @@ impl From<releases::Model> for Release {
             created_at: m.created_at,
             published_at: m.published_at,
             html_url: m.html_url,
-            assets_json: m.assets_json,
+            assets: decode_list::<StoredAsset, _>("assets_json", m.assets_json.as_deref()),
         }
     }
 }
@@ -434,7 +591,7 @@ impl From<workflow_jobs::Model> for WorkflowJob {
             started_at: m.started_at,
             completed_at: m.completed_at,
             html_url: m.html_url,
-            steps_json: m.steps_json,
+            steps: decode_list::<StoredStep, _>("steps_json", m.steps_json.as_deref()),
         }
     }
 }

@@ -583,6 +583,9 @@ file-rotate = "0.8"
 # Time handling
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 
+# Enum helpers (variant iteration)
+strum = { version = "0.27", features = ["derive"] }
+
 # Kubernetes client (optional, for k8s feature gate)
 kube = { version = "3.0", default-features = false }
 k8s-openapi = { version = "0.27", default-features = false }

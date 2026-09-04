@@ -39,7 +39,8 @@ async fn init_then_register_rest_serves_health_with_configured_url() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["api_base_url"], "https://ghe.corp/api/v3");
+    assert_eq!(json["gear"], "github-mirror");
+    assert!(json.get("api_base_url").is_none());
 }
 
 #[tokio::test]

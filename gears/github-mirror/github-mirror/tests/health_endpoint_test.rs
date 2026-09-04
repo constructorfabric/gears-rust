@@ -33,7 +33,6 @@ async fn health_returns_200_with_gear_identity() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     assert_eq!(json["gear"], "github-mirror");
-    assert_eq!(json["api_base_url"], "https://api.github.com");
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
 }
 
@@ -49,7 +48,9 @@ async fn health_reflects_configured_base_url() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
-    assert_eq!(json["api_base_url"], "https://github.example.corp/api/v3");
+    // `/health` is anonymous, so the configured upstream host must not be in
+    // the body whatever it is set to.
+    assert!(json.get("api_base_url").is_none());
 }
 
 #[tokio::test]
