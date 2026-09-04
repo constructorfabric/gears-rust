@@ -1,33 +1,32 @@
 <!--
 Created:  2026-05-14 by Constructor Tech
-Updated:  2026-05-20 by Constructor Tech
+Updated:  2026-08-11 by Constructor Tech
 -->
 # Feature: Gear Scaffold
 
 
 <!-- toc -->
 
-- [Feature: Gear Scaffold](#feature-gear-scaffold)
-  - [Feature Status](#feature-status)
-  - [1. Feature Context](#1-feature-context)
-    - [1.1 Overview](#11-overview)
-    - [1.2 Purpose](#12-purpose)
-    - [1.3 Actors](#13-actors)
-    - [1.4 References](#14-references)
-  - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
-  - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
-    - [ToolKit Gear Registration](#toolkit-gear-registration)
-    - [Smoke Test — Gear Loads](#smoke-test--gear-loads)
-  - [4. States (CDSL)](#4-states-cdsl)
-  - [5. Definitions of Done](#5-definitions-of-done)
-    - [Cargo Crate Wired Into Workspace](#cargo-crate-wired-into-workspace)
-    - [ToolKit Gear Declaration](#toolkit-gear-declaration)
-    - [Layer Skeleton Directories](#layer-skeleton-directories)
-    - [Baseline DomainError Enum](#baseline-domainerror-enum)
-    - [Gear Registers In Example Server](#gear-registers-in-example-server)
-    - [Smoke Test](#smoke-test)
-  - [6. Acceptance Criteria](#6-acceptance-criteria)
-  - [7. Non-Functional Considerations](#7-non-functional-considerations)
+- [Feature Status](#feature-status)
+- [1. Feature Context](#1-feature-context)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose](#12-purpose)
+  - [1.3 Actors](#13-actors)
+  - [1.4 References](#14-references)
+- [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
+- [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
+  - [ToolKit Gear Registration](#toolkit-gear-registration)
+  - [Smoke Test — Gear Loads](#smoke-test--gear-loads)
+- [4. States (CDSL)](#4-states-cdsl)
+- [5. Definitions of Done](#5-definitions-of-done)
+  - [Cargo Crate Wired Into Workspace](#cargo-crate-wired-into-workspace)
+  - [ToolKit Gear Declaration](#toolkit-gear-declaration)
+  - [Layer Skeleton Directories](#layer-skeleton-directories)
+  - [Baseline DomainError Enum](#baseline-domainerror-enum)
+  - [Gear Registers In Example Server](#gear-registers-in-example-server)
+  - [Smoke Test](#smoke-test)
+- [6. Acceptance Criteria](#6-acceptance-criteria)
+- [7. Non-Functional Considerations](#7-non-functional-considerations)
 
 <!-- /toc -->
 
@@ -112,7 +111,9 @@ Not applicable — the scaffold itself has no entity lifecycle. Gear lifecycle i
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-dod-gear-scaffold-cargo-wired`
 
-The system **MUST** add `gears/serverless-runtime/serverless-runtime/Cargo.toml` as a member of the root Cargo workspace, with the crate name `serverless-runtime` and dependencies limited to ToolKit core, the SDK crate (`serverless-runtime-sdk`), and any other crates already required by the ToolKit `#[toolkit::gear]` macro. **MUST NOT** depend on any plugin crate at compile time (per `cpt-cf-serverless-runtime-adr-thin-host`).
+The system **MUST** add `gears/serverless-runtime/serverless-runtime/Cargo.toml` as a member of the root Cargo workspace, with the crate name `serverless-runtime` and dependencies limited to ToolKit core and any other crates the ToolKit `#[toolkit::gear]` macro already requires. **MUST NOT** depend on any plugin crate at compile time (per `cpt-cf-serverless-runtime-adr-thin-host`).
+
+Both contract crates are deferred: the consumer SDK until its trait is implemented, and the plugin SDK until F-04.
 
 **Implements**:
 - `cpt-cf-serverless-runtime-algo-gear-scaffold-toolkit-registration`
@@ -190,5 +191,5 @@ The system **MUST** include an integration smoke test that boots a test instance
 
 - **KISS** (per project `CLAUDE.md`): keep the scaffold minimal — no premature abstractions, no anticipated extension points beyond the three layer directories. Subsequent features add what they need when they need it.
 - **`cpt-cf-serverless-runtime-nfr-composition-deps`**: This feature is the foundation for the NFR — wiring the host crate into the workspace without coupling it to plugins or downstream gears establishes the composition pattern that later features must preserve.
-- **Cross-crate boundary**: The SDK crate (`serverless-runtime-sdk`, docs at `gears/serverless-runtime/serverless-sdk/`) is the only external dependency the scaffold pulls in at the gear level. Plugin crates are forbidden at compile time per `cpt-cf-serverless-runtime-adr-thin-host`.
+- **Cross-crate boundary**: The scaffold uses neither contract crate. Later features add the consumer SDK when its trait is implemented and the plugin SDK in F-04; plugin implementation crates remain forbidden.
 - **Not in scope here** (covered by later features): REST endpoints (F-03), SeaORM entities (F-02/F-03), plugin dispatch (F-04), audit / error mapping (F-08), tenant policy (F-07). The scaffold deliberately ships with none of those.

@@ -155,10 +155,11 @@ Per ADR `cpt-cf-serverless-runtime-adr-thin-host`, the serverless-runtime capabi
 
 #### 1.4.1 Gear Structure
 
-The capability lives at `gears/serverless-runtime/` with three crate roles:
+The capability lives at `gears/serverless-runtime/` with four crate roles, split by audience:
 
-- **`serverless-runtime-sdk/`** — contract crate. Domain types, the plugin trait, the host trait (public CRUD + thin event port), the SDK error taxonomy, and plugin-conformance harness hooks.
-- **`serverless-runtime/`** — host implementation crate (`#[toolkit::gear]`, `[db, rest]`). Owns Function Registry, Tenant Policy, plugin dispatch, REST façade, GTS validation, audit aggregation, and the lightweight invocation index.
+- **`serverless-runtime-sdk/`** — consumer contract crate. The consumer-facing client trait, the invocation value types it exchanges, and its error taxonomy. Depended on by any gear that invokes a callable in process. Carries nothing plugin-facing, so a consuming gear never compiles plugin machinery.
+- **`serverless-runtime-plugin-sdk/`** — plugin contract crate. The plugin trait, the notification-only plugin → host event port, handler-authoring types, and the plugin-conformance harness hooks used by every plugin's test suite.
+- **`serverless-runtime/`** — host implementation crate (`#[toolkit::gear]`, `[db, rest]`). Owns Function Registry, Tenant Policy, plugin dispatch, REST façade, GTS validation, audit aggregation, and the lightweight invocation index. Implements the consumer trait and depends on both contract crates.
 - **`plugins/<backend>-plugin/`** — one self-contained plugin crate per backend (Temporal, Lambda, Starlark, …), each owning its invocation engine, scheduler, and event-trigger handling using the backend's native primitives.
 
 Plugin crates are **siblings** of the SDK and impl crates under `gears/serverless-runtime/plugins/` (mirroring `gears/system/tenant-resolver/plugins/`), never nested inside the impl crate's `src/`. The host crate has no compile-time dependency on any plugin crate; plugins are resolved at runtime through `ClientHub` scoped registration keyed by plugin GTS type. Internal file layout for each crate follows the canonical DDD-light layout in [Gear Layout and SDK Pattern](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md) — not restated here.
@@ -167,24 +168,31 @@ Plugin crates are **siblings** of the SDK and impl crates under `gears/serverles
 
 Each runtime backend (Temporal, Lambda, the planned Starlark in-process runner, etc.) is implemented as a **standalone plugin crate** under `gears/serverless-runtime/plugins/<backend>-plugin/`. Per ADR `cpt-cf-serverless-runtime-adr-thin-host`, the host crate does not depend on any plugin crate at compile time; plugins are resolved at runtime through ClientHub scoped registration keyed by plugin GTS type. Every plugin is self-contained — there is no capability flag carving up the plugin contract into different dispatch tiers, because no such tiering exists.
 
-**Dispatch.** The host's plugin-dispatch component reads the function definition's `implementation.adapter` GTS type ID, looks up the registered plugin via `ClientHub` scoped resolution keyed by that GTS ID, and forwards the request through the SDK plugin trait declared in `serverless-runtime-sdk`. Plugins register themselves during their own ToolKit `init()` against the same GTS types-registry mechanism used elsewhere in the platform; the host treats each registered plugin as opaque.
+**Dispatch.** The host's plugin-dispatch component reads the function definition's `implementation.adapter` GTS type ID, looks up the registered plugin via `ClientHub` scoped resolution keyed by that GTS ID, and forwards the request through the SDK plugin trait declared in `serverless-runtime-plugin-sdk`. Plugins register themselves during their own ToolKit `init()` against the same GTS types-registry mechanism used elsewhere in the platform; the host treats each registered plugin as opaque.
 
 **Backend ownership.** Each plugin owns its invocation engine, scheduler, and event-trigger handling using its backend's native primitives — Temporal Schedule API and signals, EventBridge Scheduler with SQS for Lambda, Azure Durable native timers, and so on. The host owns no backend-side execution machinery: orchestration primitives — durability, scheduling, event matching, retries, compensation — live entirely inside each plugin. In-process runtimes that lack native durability obtain those primitives from a shared Rust helper crate consumed at the plugin level, scoping that complexity to the plugins that need it.
 
 **Invocation record split.** Invocation records use a host-indexed, plugin-detailed split. The host persists a lightweight, queryable index — `id`, `function_id`, `adapter`, `tenant`, `owner`, `status`, timestamps, and an `error_summary` — populated entirely from plugin-emitted events. The plugin owns the full invocation record, the timeline, and any internal execution state. Aggregate queries and tenant-wide listings read the host index for low-latency, cross-tenant answers; deep fetches (full timeline, stored payloads) are delegated to the plugin through the SDK plugin trait.
 
-**Plugin → host event port.** Plugins emit index updates back to the host through a thin event port on the host trait — status-update and timeline-event notifications used by plugins to populate the host invocation index. This port is a **notification surface only** — it is not a general-purpose callback API and replaces the prior request/response callback design.
+**Plugin → host event port.** Plugins emit index updates back to the host through a thin event port declared in `serverless-runtime-plugin-sdk` — status-update and timeline-event notifications used by plugins to populate the host invocation index. It is a plugin-side concern and is deliberately absent from the consumer SDK. This port is a **notification surface only** — it is not a general-purpose callback API and replaces the prior request/response callback design.
 
 **Plugin error isolation.** Each plugin owns a private plugin-specific error enum that captures backend-native failures (e.g. Temporal `ApplicationError`, Lambda invoke errors, EventBridge dispatch failures). Every plugin trait method converts those backend errors into the SDK error type before returning, so the host never observes backend-specific error types. Information not preserved by the SDK taxonomy — raw stack traces, backend retry counters, vendor error codes — stays inside the plugin and is surfaced through the plugin's timeline-retrieval method rather than crossing the host boundary. Errors flowing into the host's domain layer follow the canonical toolkit three-layer pattern (`DomainError` → SDK error → `Problem`) without any serverless-runtime-specific deviation; see `docs/toolkit_unified_system/05_errors_rfc9457.md` and `02_gear_layout_and_sdk_pattern.md` for the canonical layering.
 
-#### 1.4.3 SDK Crate
+#### 1.4.3 SDK Crates
 
-The contract crate `serverless-runtime-sdk` exports two traits, the domain types they reference, the error taxonomy they raise, and plugin-conformance harness hooks used by every plugin's test suite:
+Two contract crates, one per audience. Neither depends on the other.
 
-- **Host-implemented trait** — the host's `ClientHub` interface for the serverless-runtime gear. Carries public CRUD over host-owned resources (functions, the invocation index, host-side schedule and trigger metadata, tenant policy) plus a thin notification-only event port that plugins use to populate the host invocation index. Consumers and plugins reach the host through this trait rather than HTTP.
-- **Plugin-implemented trait** — the contract every backend plugin satisfies. The host dispatches to it via `dyn` after `ClientHub` resolution keyed by plugin GTS type. Covers backend-side identity, lifecycle, invocation, scheduling, and event-trigger handling using the backend's native primitives.
+**`serverless-runtime-sdk`** — the consumer contract. Exports one trait, the value types it exchanges, and its error taxonomy:
 
-Specific trait names, method surfaces, the SDK error type, conformance hooks, and version policy live in the SDK crate's own design and are intentionally not restated here.
+- **Host-implemented consumer trait** — the host's `ClientHub` interface for gears that invoke callables. Scoped to **invocation and observation only**: start a callable, read one invocation, query invocations, apply a lifecycle control action, and replay a finished invocation. Reads are answered from the host invocation index, so an in-process call never forces a plugin round-trip.
+- Management of functions, schedules, triggers and tenant policy is **not** on this trait. Those are administrative operations with human or external-adapter callers, served by the REST façade; no consuming gear has asked for them in process, and per ADR `cpt-cf-serverless-runtime-adr-thin-host` YAGNI is binding. They are added if and when a real in-process caller needs them.
+
+**`serverless-runtime-plugin-sdk`** — the plugin contract. Exports the plugin trait, the event port, and the conformance hooks:
+
+- **Plugin-implemented trait** — the contract every backend plugin satisfies. The host dispatches to it via `dyn` after `ClientHub` resolution keyed by plugin GTS type. Covers backend-side identity, lifecycle, invocation, scheduling, and event-trigger handling using the backend's native primitives, plus the deep fetches (full invocation record, timeline) the host delegates rather than indexes.
+- **Plugin → host event port** — the notification-only surface plugins use to populate the host invocation index.
+
+Specific trait names, method surfaces, the SDK error types, conformance hooks, and version policy live in each SDK crate's own design and are intentionally not restated here.
 
 #### 1.4.4 Gear Lifecycle
 
@@ -255,7 +263,7 @@ This design draws from several industry workflow/serverless platforms. Per ADR `
 
 #### The Plugin Contract
 
-The SDK exposes two traits — host-implemented (public CRUD plus a thin event port for plugin → host index updates) and plugin-implemented (identity, lifecycle, invocation, scheduling, event-trigger). Both are declared in `serverless-runtime-sdk`; specific names and method surfaces live in the SDK crate's own design. The plugin conformance test suite in the SDK is the load-bearing mechanism for keeping user-visible semantics uniform across plugins (status transitions, retry contract, compensation triggering, suspension / resume visibility, error taxonomy).
+Two SDK crates, one trait each. `serverless-runtime-sdk` declares the host-implemented consumer trait (invocation and observation only — start, read, query, control, replay). `serverless-runtime-plugin-sdk` declares the plugin-implemented trait (identity, lifecycle, invocation, scheduling, event-trigger) together with the thin event port plugins use for host index updates. Specific names and method surfaces live in each SDK crate's own design. The plugin conformance test suite in the plugin SDK is the load-bearing mechanism for keeping user-visible semantics uniform across plugins (status transitions, retry contract, compensation triggering, suspension / resume visibility, error taxonomy).
 
 ## 3. Technical Architecture
 
@@ -367,7 +375,7 @@ A failed invocation is retried only when **all** of the following hold:
 
 `non_retryable_errors` takes precedence over the category — listing a GTS error type ID there opts it out of retries even if its category is otherwise retryable. This lets function authors suppress retries for specific error types in a specific context (e.g., a normally-retryable upstream timeout that's known to be unrecoverable in this caller's flow) without touching the error source.
 
-Non-retryable categories (resource limits, timeouts, cancellation, and any other non-retryable classification) are never retried, regardless of `non_retryable_errors`. The exact category set is defined by the SDK error taxonomy (see SDK design); the plugin conformance harness in `serverless-runtime-sdk` enforces this contract uniformly across every plugin per ADR `cpt-cf-serverless-runtime-adr-thin-host`.
+Non-retryable categories (resource limits, timeouts, cancellation, and any other non-retryable classification) are never retried, regardless of `non_retryable_errors`. The exact category set is defined by the SDK error taxonomy (see SDK design); the plugin conformance harness in `serverless-runtime-plugin-sdk` enforces this contract uniformly across every plugin per ADR `cpt-cf-serverless-runtime-adr-thin-host`.
 
 > Schema: [`gts.cf.core.sless.retry_policy.v1~`](DESIGN_GTS_SCHEMAS.md#retrypolicy)
 
@@ -650,7 +658,7 @@ A function that does not declare `workflow_traits` has none of these capabilitie
 1. **Execute without durable overhead** — if the workflow can complete within the sync timeout without requiring suspension or event waiting, the runtime executes it as a plain function call. Checkpointing is skipped (not silently — the invocation record explicitly notes `mode: sync`), and the result is returned directly. This is appropriate for short-lived workflows where durability adds cost without value.
 2. **Reject the request** — if the workflow requires capabilities that are incompatible with synchronous execution (suspension, event waiting, long-running steps that exceed the sync timeout), the runtime MUST return an explicit error directing the client to use asynchronous invocation. The runtime MUST NOT silently degrade behavior.
 
-A workflow's `workflow_traits` SHOULD declare whether it is async-only. Workflows that require suspension or event waiting MUST be marked async-only and will be rejected on sync invocation. Workflows that do not require these capabilities may be invoked in either mode. If a workflow does not declare async-only but reaches a suspension point during synchronous execution, the runtime MUST fail the request with error type `gts.cf.core.sless.err.v1~cf.core.sless.err.sync_suspension.v1~` (409) rather than blocking indefinitely or silently dropping the suspension.
+A workflow's `workflow_traits` SHOULD declare whether it is async-only. Workflows that require suspension or event waiting MUST be marked async-only and will be rejected on sync invocation. Workflows that do not require these capabilities may be invoked in either mode. If a workflow does not declare async-only but reaches a suspension point during synchronous execution, the runtime MUST fail the request with error type `gts.cf.core.sless.err.v1~cf.core.sless.err.sync_suspension.v1~` (409) rather than blocking indefinitely or silently dropping the suspension. What fails is the **request**, not the invocation: the run transitions to `suspended` as it would under any other suspension point, and from there follows the ordinary rules for that state — it can be resumed or cancelled, and is failed by the runtime once `max_suspension_days` elapses. The error therefore carries the invocation id, so the caller that started the run can still reach it.
 
 **Short-timeout guidance:** synchronous operations should have short timeouts. Clients requiring long-running or durable execution should use asynchronous invocation (jobs), which returns an invocation ID that can be used to poll status, receive callbacks, or reconnect to a resumed execution.
 
@@ -749,7 +757,7 @@ Full-instance examples (Function and Workflow) live in [DESIGN_GTS_SCHEMAS.md](D
 
 ### 3.2 Component Model
 
-> **Owner labels.** Per ADR `cpt-cf-serverless-runtime-adr-thin-host`, every component below is owned by exactly one of: **host** (the `serverless-runtime` ToolKit gear — Function Registry, Tenant Policy, REST façade, GTS validation, audit aggregation, plugin dispatch, lightweight invocation index), **SDK contract** (behaviour defined in `serverless-runtime-sdk` and binding on every plugin; no host implementation), or **Runtime Plugin** (a backend-specific plugin crate under `gears/serverless-runtime/plugins/<backend>-plugin/` that implements the SDK-contract behaviour using the backend's native primitives).
+> **Owner labels.** Per ADR `cpt-cf-serverless-runtime-adr-thin-host`, every component below is owned by exactly one of: **host** (the `serverless-runtime` ToolKit gear — Function Registry, Tenant Policy, REST façade, GTS validation, audit aggregation, plugin dispatch, lightweight invocation index), **SDK contract** (behaviour defined in `serverless-runtime-plugin-sdk` and binding on every plugin; no host implementation), or **Runtime Plugin** (a backend-specific plugin crate under `gears/serverless-runtime/plugins/<backend>-plugin/` that implements the SDK-contract behaviour using the backend's native primitives).
 
 The Serverless Runtime is composed of the following logical components. Each component has a defined responsibility scope and interacts with other components through the domain model types defined in [section 3.1](#31-domain-model).
 
@@ -870,7 +878,7 @@ The Function Registry exposes CRUD over `Function` and `Workflow` entities at `/
 
 ##### Invocation Control Actions (Generic)
 
-The `:control` endpoint handles **platform-level lifecycle actions** that work across all plugins. The host executes these directly — they never reach the plugin.
+The `:control` endpoint handles **platform-level lifecycle actions** that work across all plugins. The host validates the action against the invocation's current state and the callable's kind, then routes it to the plugin that owns the run — invocation lifecycle belongs to the plugin per ADR `cpt-cf-serverless-runtime-adr-thin-host`. "Platform-level" describes the verbs being uniform across backends, not the host applying them itself.
 
 ```json
 {
