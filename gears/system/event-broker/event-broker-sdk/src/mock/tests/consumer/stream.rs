@@ -32,7 +32,7 @@ async fn s1_01_positive_stream_multipart_frames() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     h.set_heartbeat_interval(Duration::from_millis(20)).await;
     let c = ctx();
-    // Three events → offsets 1, 2, 3 (1-based).
+    // Three events → sequences 1, 2, 3 (1-based).
     for _ in 0..3 {
         broker
             .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
@@ -64,14 +64,14 @@ async fn s1_01_positive_stream_multipart_frames() {
         "first frame must be the topology baseline"
     );
 
-    // Next three event frames carry offsets 0, 1, 2 in strict order.
-    let mut offsets = Vec::new();
+    // Next three event frames carry sequences 0, 1, 2 in strict order.
+    let mut sequences = Vec::new();
     let mut saw_heartbeat = false;
     for _ in 0..20 {
         match next_frame(&mut s).await {
-            Some(Ok(WireFrame::Event(e))) => offsets.push(e.offset),
+            Some(Ok(WireFrame::Event(e))) => sequences.push(e.sequence),
             Some(Ok(WireFrame::Heartbeat { .. })) => {
-                if offsets.len() == 3 {
+                if sequences.len() == 3 {
                     saw_heartbeat = true;
                     break;
                 }
@@ -81,7 +81,7 @@ async fn s1_01_positive_stream_multipart_frames() {
         }
     }
     assert_eq!(
-        offsets,
+        sequences,
         vec![1, 2, 3],
         "events delivered in offset-monotonic order (1-based)"
     );

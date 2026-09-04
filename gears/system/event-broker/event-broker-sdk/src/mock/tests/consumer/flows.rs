@@ -187,7 +187,7 @@ async fn s1_02_flow_positions_not_set_recovery() {
         match next_frame(&mut s).await {
             Some(Ok(WireFrame::Event(e))) => {
                 assert_eq!(
-                    e.offset, 1,
+                    e.sequence, 1,
                     "emission begins at the seeded floor (1-based; Earliest→cursor 0, emit from 1)"
                 );
                 got_event = true;
@@ -249,11 +249,11 @@ async fn s1_03_flow_path_a_consumer_with_db() {
     // Exchange 4 - stream delivers from the seeked offset (mock: inclusive → 510).
     let mut s = broker.stream(&c, sub.subscription_id).await.unwrap();
     let _ = next_frame(&mut s).await; // baseline
-    let mut first_event_offset = None;
+    let mut first_event_sequence = None;
     for _ in 0..10 {
         match next_frame(&mut s).await {
             Some(Ok(WireFrame::Event(e))) => {
-                first_event_offset = Some(e.offset);
+                first_event_sequence = Some(e.sequence);
                 break;
             }
             Some(Ok(_)) => {}
@@ -261,7 +261,7 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         }
     }
     assert_eq!(
-        first_event_offset,
+        first_event_sequence,
         Some(511),
         "emit from cursor+1: SEEK 510 (last-processed) → first delivered is 511"
     );
@@ -285,11 +285,11 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         .unwrap();
     let mut s2 = broker.stream(&c, sub2.subscription_id).await.unwrap();
     let _ = next_frame(&mut s2).await; // baseline
-    let mut resume_offset = None;
+    let mut resume_sequence = None;
     for _ in 0..10 {
         match next_frame(&mut s2).await {
             Some(Ok(WireFrame::Event(e))) => {
-                resume_offset = Some(e.offset);
+                resume_sequence = Some(e.sequence);
                 break;
             }
             Some(Ok(_)) => {}
@@ -297,7 +297,7 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         }
     }
     assert_eq!(
-        resume_offset,
+        resume_sequence,
         Some(512),
         "after reconnect, resumes from cursor+1 (SEEK 511 → first delivered 512)"
     );

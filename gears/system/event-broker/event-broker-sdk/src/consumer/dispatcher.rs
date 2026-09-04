@@ -658,7 +658,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -683,7 +683,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await
@@ -1555,7 +1555,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -1580,7 +1580,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await

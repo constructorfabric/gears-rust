@@ -244,7 +244,14 @@ pub fn data_contract(resolved: &serde_json::Value) -> serde_json::Value {
 ///
 /// Test fixtures and the mock register event types through this rather than
 /// storing a bare payload schema, so what they hold is the same shape
-/// `types-registry` provisions.
+/// `types-registry` provisions - which means the shape it will actually admit.
+///
+/// A `data_schema` with no constraints of its own is rendered as the base's own
+/// `["object", "null"]` rather than passed through as an empty schema. An empty
+/// schema admits any JSON value, which is *wider* than the base's member, and a
+/// derived type may only narrow: registration refuses the document with
+/// "Schema at '$.data' changes type incompatibly". A caller stating no
+/// constraints means "whatever the base allows", and that is what this writes.
 #[must_use]
 pub fn derived_event_type_schema(
     type_id: &str,
@@ -263,7 +270,36 @@ pub fn derived_event_type_schema(
         "type": "object",
         "allOf": [
             { "$ref": toolkit_gts::gts_uri!("cf.core.events.event.v1~") },
-            { "type": "object", "properties": { "data": data_schema } },
+            {
+                "type": "object",
+                "properties": {
+                    "data": if data_schema
+                        .as_object()
+                        .is_some_and(serde_json::Map::is_empty)
+                    {
+                        serde_json::json!({ "type": ["object", "null"] })
+                    } else {
+                        data_schema
+                    },
+                },
+            },
         ],
     })
 }
+
+/// Consumer-group resource type - PEP/error matching only, no schema
+/// generation (no `types-registry` inventory entry).
+pub const CONSUMER_GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.events.consumer_group.v1~");
+/// Event-type resource type - PEP/error matching only. The GTS type it names
+/// no longer exists as a registered type (an event type is a derived schema of
+/// `EventV1` now), but authorization and error payloads still identify the
+/// event-type resource by this id, and like its siblings here it has no
+/// `types-registry` inventory entry to disagree with.
+pub const EVENT_TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.events.event_type.v1~");
+/// Subscription resource type - PEP/error matching only.
+pub const SUBSCRIPTION_RESOURCE_TYPE: &str = gts_id!("cf.core.events.subscription.v1~");
+/// Producer resource type - PEP/error matching only.
+pub const PRODUCER_RESOURCE_TYPE: &str = gts_id!("cf.core.events.producer.v1~");
+/// Generic fallback resource type for errors not tied to one entity kind
+/// (mirrors `api/rest/error.rs::EventBrokerResourceError`'s own fallback).
+pub const REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.events.request.v1~");

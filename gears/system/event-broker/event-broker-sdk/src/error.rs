@@ -562,7 +562,12 @@ fn expected_previous_from_detail(detail: &str) -> i64 {
 impl From<StorageBackendError> for CanonicalError {
     fn from(err: StorageBackendError) -> Self {
         match err {
-            StorageBackendError::Unavailable { .. } => {
+            StorageBackendError::Unavailable { .. }
+            // Unreachable in practice: a retention pass answers no request, so
+            // its failure has no client to be mapped for. Mapped alongside
+            // `Unavailable` rather than left to a catch-all so that adding a
+            // variant stays a compile error here.
+            | StorageBackendError::RetentionFailed { .. } => {
                 CanonicalError::service_unavailable().create()
             }
             StorageBackendError::InvalidConfig { detail, .. } => {
@@ -664,6 +669,17 @@ pub enum StorageBackendError {
 
     #[error("read failed: {reason}")]
     ReadFailed {
+        reason: String,
+        detail: String,
+        instance: String,
+    },
+
+    /// A retention pass could not be applied. Distinct from `PersistFailed`
+    /// because nothing a caller did produced it: retention runs on the broker's
+    /// own tick, so this never answers a request and never reaches a consumer.
+    /// A failed pass removes nothing and the next one has the same work to do.
+    #[error("retention pass failed: {reason}")]
+    RetentionFailed {
         reason: String,
         detail: String,
         instance: String,
