@@ -5,6 +5,7 @@ use file_storage_sdk::ByteRange;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 
+use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
 use super::*;
@@ -23,6 +24,25 @@ fn unique_root() -> std::path::PathBuf {
 /// to keep that function's own cognitive complexity down.
 async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str, expected: &[u8]) {
     let mut stream = backend.get_stream(path).await.unwrap();
+    let mut streamed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        streamed.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(streamed, expected);
+}
+
+/// Assert that `backend.get_range_stream(path, range)`'s concatenated chunks
+/// are byte-for-byte equal to `expected` -- the `get_range_stream` contract
+/// every `StorageBackend` implementation (default-fallback or a true
+/// native override) must satisfy, mirroring `assert_get_stream_matches_get`
+/// for the ranged case.
+async fn assert_get_range_stream_matches_slice(
+    backend: &dyn StorageBackend,
+    path: &str,
+    range: ByteRange,
+    expected: &[u8],
+) {
+    let mut stream = backend.get_range_stream(path, range).await.unwrap();
     let mut streamed = Vec::new();
     while let Some(chunk) = stream.next().await {
         streamed.extend_from_slice(&chunk.unwrap());
@@ -57,6 +77,17 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     // fallback with a true chunked read.
     assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
 
+    // The remaining groups live in their own functions so each stays under
+    // the crate's cognitive-complexity ceiling; all of them run for every
+    // backend the contract is asserted against.
+    assert_range_and_delete_contract(backend).await;
+    assert_stat_contract(backend).await;
+    assert_range_stream_contract(backend).await;
+}
+
+/// The buffered-`get_range`, `delete` and `exists` groups of
+/// [`assert_backend_contract`].
+async fn assert_range_and_delete_contract(backend: &dyn StorageBackend) {
     // get_range: Inclusive and Suffix variants.
     backend
         .put("contract/range", Bytes::from_static(b"0123456789"))
@@ -84,6 +115,123 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
 
     // exists distinguishes present from missing.
     assert!(!backend.exists("contract/never-existed").await.unwrap());
+}
+
+/// The `stat` and `get_range_stream` half of [`assert_backend_contract`].
+///
+/// Kept separate purely for readability and lint budget -- callers should use
+/// `assert_backend_contract`, which runs both halves.
+/// The `stat` half of [`assert_backend_contract`]: `Some(len)` for a present
+/// object (including an empty one), `Ok(None)` for an absent one, and
+/// agreement with the `exists` + `size` composition the trait's default
+/// implementation is built from.
+async fn assert_stat_contract(backend: &dyn StorageBackend) {
+    // stat: an existing non-empty object returns Some(len) matching the
+    // actual byte length written.
+    backend
+        .put(
+            "contract/stat-nonempty",
+            Bytes::from_static(b"twelve bytes"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.stat("contract/stat-nonempty").await.unwrap(),
+        Some(12),
+        "stat of an existing object must report its real byte length"
+    );
+
+    // stat: an existing EMPTY object still returns Some(0), never None --
+    // "present with zero bytes" and "absent" must not collapse together.
+    backend
+        .put("contract/stat-empty", Bytes::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.stat("contract/stat-empty").await.unwrap(),
+        Some(0),
+        "stat of an empty object must report Some(0), not None"
+    );
+
+    // stat: a missing object returns Ok(None), never an Err.
+    assert_eq!(
+        backend.stat("contract/stat-never-existed").await.unwrap(),
+        None,
+        "stat of a missing object must be Ok(None), not an error"
+    );
+
+    // stat must agree with the exists()+size() combination for both a
+    // present and an absent path -- the exact contract the default
+    // (exists-then-size) implementation defines and every native override
+    // must preserve.
+    for path in [
+        "contract/stat-nonempty",
+        "contract/stat-empty",
+        "contract/stat-never-existed",
+    ] {
+        let composed = if backend.exists(path).await.unwrap() {
+            Some(backend.size(path).await.unwrap())
+        } else {
+            None
+        };
+        assert_eq!(
+            backend.stat(path).await.unwrap(),
+            composed,
+            "stat must agree with exists()+size() for path {path}"
+        );
+    }
+}
+
+/// The `get_range_stream` half of [`assert_backend_contract`]: every
+/// `ByteRange` variant streams exactly the requested slice, and an
+/// unsatisfiable range is refused rather than silently truncated.
+async fn assert_range_stream_contract(backend: &dyn StorageBackend) {
+    // get_range_stream: Inclusive (narrow), OpenEnded (tail), and Suffix
+    // variants must each stream exactly the bytes get_range resolves for the
+    // same ByteRange.
+    backend
+        .put("contract/range-stream", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::Inclusive { start: 2, end: 4 },
+        b"234",
+    )
+    .await;
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::OpenEnded { start: 7 },
+        b"789",
+    )
+    .await;
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::Suffix { length: 4 },
+        b"6789",
+    )
+    .await;
+
+    // An unsatisfiable range must surface a validation error, not panic or
+    // silently truncate.
+    // `expect_err` is not available here: the `Ok` variant is a boxed stream,
+    // which does not implement `Debug`. Match the result instead.
+    let range_result = backend
+        .get_range_stream(
+            "contract/range-stream",
+            ByteRange::Inclusive { start: 20, end: 30 },
+        )
+        .await;
+    match range_result {
+        Ok(_) => panic!("an out-of-bounds range must be rejected, not silently resolved"),
+        Err(err) => assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "an unsatisfiable range must produce a Validation error, got {err:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -409,6 +557,58 @@ async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
         Bytes::from_static(b"first"),
         "an already-published blob must never be overwritten by publish_exclusive"
     );
+}
+
+/// Simulates a file truncated on disk between `get_stream`'s open (which
+/// observes the length via `file.metadata()`) and the stream actually being
+/// read: `LocalFsBackend` must surface `UnexpectedEof` on the resulting short
+/// read rather than silently ending the body short of the length it already
+/// committed to. No race here: a second, independent file handle truncates
+/// the file while the stream's own handle is untouched, so its later read
+/// deterministically lands past the new end-of-file.
+#[tokio::test]
+async fn local_fs_get_stream_errors_on_truncation_after_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+
+    // Open the stream: this observes the current (100-byte) length.
+    let mut stream = b.get_stream("fid/vid").await.unwrap();
+
+    // Truncate the underlying file via a separate handle, after the stream
+    // was opened but before anything is read from it.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(10).unwrap();
+    drop(file);
+
+    let mut collected = Vec::new();
+    let mut saw_eof_error = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => collected.extend_from_slice(&bytes),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+                saw_eof_error = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_eof_error,
+        "a file truncated after get_stream opened it must error, not end silently short"
+    );
+    assert_eq!(
+        collected.len(),
+        10,
+        "bytes actually readable before the truncated end must still be yielded"
+    );
+
+    drop(tokio::fs::remove_dir_all(&root).await);
 }
 
 #[tokio::test]
