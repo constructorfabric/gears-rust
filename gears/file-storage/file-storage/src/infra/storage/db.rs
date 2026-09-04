@@ -292,10 +292,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use sea_orm::{DbBackend, DbErr, RuntimeErr};
     use toolkit_db::secure::ScopeError;
 
-    use super::{conflict_on_unique_violation, db_err, is_retryable_domain_error};
+    use super::{
+        TX_RETRY_ATTEMPTS, conflict_on_unique_violation, db_err, is_retryable_domain_error,
+        transaction_with_bounded_retry,
+    };
     use crate::domain::error::DomainError;
 
     // -- conflict_on_unique_violation ------------------------------------
@@ -390,5 +396,124 @@ mod tests {
         // never be treated as retryable no matter what text it carries.
         let domain_err = DomainError::conflict("target version no longer exists (40P01)");
         assert!(!is_retryable_domain_error(&domain_err, DbBackend::Postgres));
+    }
+
+    // -- transaction_with_bounded_retry -------------------------------------
+    //
+    // Builds a real in-memory SQLite `Db` via `toolkit_db::connect_db` --
+    // the same public entry point `tests/common/mod.rs::test_db()` uses --
+    // rather than mocking `Db`/`DbTx`, both of which have no public
+    // constructor outside `toolkit_db` itself. No migrations run: the
+    // transaction bodies below never touch a table, only the retry
+    // bookkeeping around `Db::transaction_ref_mapped`.
+
+    async fn retry_test_db() -> toolkit_db::secure::Db {
+        let opts = toolkit_db::ConnectOpts {
+            max_conns: Some(1),
+            min_conns: Some(1),
+            ..Default::default()
+        };
+        toolkit_db::connect_db("sqlite::memory:", opts)
+            .await
+            .expect("connect to in-memory SQLite")
+    }
+
+    /// A message shape `is_sqlite_busy` (`toolkit_db::contention`) recognizes
+    /// for the `Sqlite` backend our test `Db` reports via `db.backend()`:
+    /// needs both the busy status code and the locked-database text.
+    const RETRYABLE_SQLITE_MSG: &str = "(code: 5) database is locked";
+
+    #[tokio::test]
+    async fn bounded_retry_succeeds_after_transient_failures_within_budget() {
+        let db = retry_test_db().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_body = Arc::clone(&calls);
+
+        let result: Result<usize, DomainError> = transaction_with_bounded_retry(&db, move |_tx| {
+            let calls = Arc::clone(&calls_for_body);
+            Box::pin(async move {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < TX_RETRY_ATTEMPTS as usize {
+                    Err(DomainError::database(RETRYABLE_SQLITE_MSG))
+                } else {
+                    Ok(attempt)
+                }
+            })
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("must succeed once the body stops failing"),
+            TX_RETRY_ATTEMPTS as usize,
+            "the successful attempt must be exactly the last one in the budget"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TX_RETRY_ATTEMPTS as usize,
+            "body must be invoked exactly once per attempt, no more"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_exhausts_budget_and_returns_last_error_unchanged() {
+        let db = retry_test_db().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_body = Arc::clone(&calls);
+
+        let result: Result<(), DomainError> = transaction_with_bounded_retry(&db, move |_tx| {
+            let calls = Arc::clone(&calls_for_body);
+            Box::pin(async move {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                // Distinct message per attempt so the final returned error
+                // can be checked to be the LAST attempt's, not the first.
+                Err(DomainError::database(format!(
+                    "{RETRYABLE_SQLITE_MSG} (attempt {attempt})"
+                )))
+            })
+        })
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TX_RETRY_ATTEMPTS as usize,
+            "must stop retrying once the attempt budget is exhausted, not loop forever"
+        );
+        match result {
+            Err(DomainError::Database { message }) => {
+                assert!(
+                    message.contains(&format!("attempt {TX_RETRY_ATTEMPTS}")),
+                    "expected the LAST attempt's error to be returned unchanged, got: {message}"
+                );
+            }
+            other => panic!("expected a Database error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_never_retries_a_nonretryable_error() {
+        let db = retry_test_db().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_body = Arc::clone(&calls);
+
+        let result: Result<(), DomainError> = transaction_with_bounded_retry(&db, move |_tx| {
+            let calls = Arc::clone(&calls_for_body);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // A domain decision (CAS lost), not a database error -- must
+                // never be retried no matter how many attempts remain.
+                Err(DomainError::conflict("target version no longer exists"))
+            })
+        })
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must stop the loop after the first attempt"
+        );
+        assert!(
+            matches!(result, Err(DomainError::Conflict { .. })),
+            "expected the original Conflict error to pass through unchanged, got {result:?}"
+        );
     }
 }
