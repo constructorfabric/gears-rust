@@ -763,11 +763,11 @@ The load-bearing per-`(change_set_id, subscriber, key)` state. Created at publis
 
 #### Authorization model
 
-Mirrors the Settings Service model (design DESIGN.md §4.8); enforced server-side via `PolicyEnforcer` over the AuthZ Resolver (fail-closed). Activation is part of the Settings Service, so its control-plane resources sit under `gts.cf.toolkit.settings.*`.
+Mirrors the Settings Service model (design DESIGN.md §4.8); enforced server-side via `PolicyEnforcer` over the AuthZ Resolver (fail-closed). Activation is part of the Settings gear, so its gear-owned control-plane resources sit under `gts.cf.core.settings.*`.
 
 | Operation | Required permission | Scope | Unauthorized |
 |-----------|---------------------|-------|--------------|
-| Read activation facet / responses (`GET /settings-service/v1/change-sets/{change_set_id}/activation`, `…/responses`) | `read` on `gts.cf.toolkit.settings.change_set.v1~` | The change set's tenant subtree | `404` if not visible |
+| Read activation facet / responses (`GET /settings-service/v1/change-sets/{change_set_id}/activation`, `…/responses`) | `read` on `gts.cf.core.settings.change_set.v1~` | The change set's tenant subtree | `404` if not visible |
 | Emit back-response (SDK `report_outcome` → `activation_success`/`activation_failed` broker event — **not REST**) | **Trusted subscriber** — attributed to the subscriber identity, **not** independently verified (DESIGN.md §6); valid within the deployment trust boundary | — | — |
 
 - **AuthN:** the two read endpoints (§4.3) take an ordinary user/session bearer, gated by RBAC as above. There are **no internal REST endpoints** and **no effects/ack REST** — the publisher publishes in-process (`cache_invalidate` inline; `change_notification` from await-records, §4.2 *Change Set Publisher*/§4.2 *Event Broker Client*), and delivery + acknowledgement are Event-Broker events (§4.2 *Change Set Publisher*/§4.2 *Cache Invalidation Broadcast*), so this design introduces **no platform service-token surface**.
