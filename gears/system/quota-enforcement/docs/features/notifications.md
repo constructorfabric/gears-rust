@@ -52,13 +52,13 @@ payloads and discriminators, threshold upward-transition semantics, the retry po
 duplicates, and dispatch telemetry.
 
 **Out of scope**: producing events (each mutating feature enqueues its own, same-tx via the storage contract), the
-outbox tables and I11 guarantee (foundation, via the `toolkit-db` Outbox), `CoordinationPluginV1` (sweeper singletons
-only — the dispatcher is fenced by the Outbox lease), EventBus routing (P2 per PRD §13), and any QE-side subscription
+outbox tables and I11 guarantee (foundation, via the `toolkit-db` Outbox), the cluster coordination adapter (sweeper
+singletons only — the dispatcher is fenced by the Outbox lease), EventBus routing (P2 per PRD §13), and any QE-side subscription
 primitive (P2; P1 sinks filter on `event.tenant_id` themselves).
 
 **Requirements**: `cpt-cf-quota-enforcement-fr-notification-plugin`
 
-**Principles**: None introduced; delivery rides foundation's storage and coordination contracts.
+**Principles**: None introduced; delivery rides foundation's storage contract and coordination adapter.
 
 ### 1.3 Actors
 

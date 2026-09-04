@@ -56,16 +56,16 @@ and its failure modes deterministic and observable.
 **Scope**: the `LeaseManager` state machine (`Active` to `Committed` / `Released` / `AutoReleased` /
 `ResolvedByDeactivation`); atomic multi-Quota hold acquisition in lexicographic `quota_id` order (ADR-0002); TTL
 bounds without clamping; cross-period and cross-validity commit attribution to the acquisition period (I5); lazy
-semantic release on every read and write path (I4); `LeaseSweeper` physical reclamation under a
-`CoordinationPluginV1` lock with `LockScope::LeaseSweeper`; the acquisition contention timeout (I8) and the
+semantic release on every read and write path (I4); `LeaseSweeper` physical reclamation under the
+`lease-sweeper` cluster election (`SingletonScope::LeaseSweeper`); the acquisition contention timeout (I8) and the
 active-lease cap (I7) with their telemetry; the recovery NFR verification.
 
 **Out of scope**: the lease-resolution behavior of Quota deactivation (the quota-lifecycle feature,
 `cpt-cf-quota-enforcement-flow-quota-deactivate`; this document only records the resulting state transition), the
 evaluation pipeline and the idempotency machinery (established by the consumption-operations feature as
 `cpt-cf-quota-enforcement-algo-evaluation-pipeline` and `cpt-cf-quota-enforcement-algo-idempotency-replay` and
-consumed here unchanged), the coordination lock primitives and TTL guarantee (the foundation feature,
-`cpt-cf-quota-enforcement-algo-coordination-lock`; this feature owns only the sweeper consumer loop), notification
+consumed here unchanged), the cluster coordination adapter (the foundation feature,
+`cpt-cf-quota-enforcement-dod-coordination-adapter`; this feature owns only the sweep body), notification
 dispatch and the shared threshold-emission routine (the notifications feature,
 `cpt-cf-quota-enforcement-algo-threshold-emission`; this feature only enqueues events in the same transaction as its
 state mutation, invariant I11), and the settlement machinery of period rollover (the consumption-operations feature,
@@ -90,18 +90,18 @@ state mutation, invariant I11), and the settlement machinery of period rollover 
 - **PRD**: [PRD.md](../PRD.md) (§5.6 lease and two-phase operations, §5.8 idempotency, §3.4 Decision contract,
   §5.16 telemetry, §6.1 gear NFRs)
 - **Design**: [DESIGN.md](../DESIGN.md) (`LeaseManager`, `LeaseSweeper`, storage-plugin lease group and invariants
-  I1/I4/I5/I7/I8/I9/I11, `CoordinationPluginV1` trait, §3.6 sequences, §1.2 NFR allocation and §3.8 deployment
+  I1/I4/I5/I7/I8/I9/I11, §3.3 Cluster Coordination, §3.6 sequences, §1.2 NFR allocation and §3.8 deployment
   topology for sweeper coordination and recovery)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.6)
 - **ADR**: [ADR-0002 Acquisition ordering](../ADR/0002-cpt-cf-quota-enforcement-adr-acquisition-ordering.md),
   [ADR-0004 Settlement window emit](../ADR/0004-cpt-cf-quota-enforcement-adr-settlement-window-emit.md),
-  [ADR-0006 Coordination plugin](../ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md)
+  [ADR-0006 Coordination via the cluster gear](../ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-consumption-operations` (the `EvaluationOrchestrator` pipeline
   the acquire path runs through, the idempotency scope and replay machinery, and the period-rollover settlement that
   waits on lease resolution), plus transitively `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (the
   Decision and Debit Plan a lease holds against), `cpt-cf-quota-enforcement-feature-projection-contracts` (ingress
   validation and subject resolution), and `cpt-cf-quota-enforcement-feature-foundation` (storage plugin, admission,
-  coordination lock primitives, telemetry conventions)
+  coordination adapter, telemetry conventions)
 
 ## 2. Actor Flows (CDSL)
 
@@ -298,19 +298,19 @@ Realises `cpt-cf-quota-enforcement-seq-lease-release` (the symmetric inverse of
 
 Realises `cpt-cf-quota-enforcement-seq-lease-auto-release`.
 
-**Input**: the periodic tick (operator-configurable interval, default 60 s), `CoordinationPluginV1`, the
-operator-configurable batch size (P1 reference default 1000)
+**Input**: the periodic tick (operator-configurable interval, default 60 s), the coordination adapter's
+`lease-sweeper` election, the operator-configurable batch size (P1 reference default 1000)
 
 **Output**: expired lease rows transitioned to `AutoReleased`, their capacity returned, and exactly one
 `lease-auto-released` event enqueued per lease
 
 **Steps**:
-1. [ ] - `p1` - API: on each tick the `LeaseSweeper` attempts
-   `CoordinationPluginV1::try_lock(LockScope::LeaseSweeper, ttl)`; on `Conflict` it stays in follower mode and does
-   nothing this cycle (the foundation `cpt-cf-quota-enforcement-algo-coordination-lock` owns the primitive
-   semantics) - `inst-swp-lock`
-2. [ ] - `p1` - The leader renews the lock at or before TTL/3; on lock loss it drops to follower mode immediately and
-   re-acquires through jittered backoff - `inst-swp-renew`
+1. [ ] - `p1` - API: the `LeaseSweeper` hands its sweep body to the coordination adapter for
+   `SingletonScope::LeaseSweeper`; while this replica is a follower no sweep body runs (the foundation
+   `cpt-cf-quota-enforcement-dod-coordination-adapter` owns the election semantics) - `inst-swp-elect`
+2. [ ] - `p1` - The elected replica runs the tick loop on the child `CancellationToken` it received; the resolved
+   cluster backend renews the claim; on leadership loss the token is cancelled, the loop stops before its next batch,
+   and the replica is a follower again until re-election, which is automatic - `inst-swp-lost`
 3. [ ] - `p1` - DB: `reclaim_expired_leases(batch_size, before = now())`; **FOR EACH** batch, one transaction:
    transition every lease with `expiry_at <= now() AND state = 'active'` to `AutoReleased`, decrement the
    active-lease counter per row, return each hold's `held_amount` to its acquisition period's counter (I5), and
@@ -470,18 +470,16 @@ lifecycle event of the reclamation tier; the gateway never checks sweeper state 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-lease-sweeper`
 
 The system **MUST** deliver `LeaseSweeper` (`cpt-cf-quota-enforcement-component-lease-sweeper`) as a single-leader
-background task (default tick 60 s) under `CoordinationPluginV1::try_lock(LockScope::LeaseSweeper, ttl)` with renewal
-at or before TTL/3, follower fallback on lock loss, and jittered re-acquisition, consuming the foundation lock
-primitives without re-specifying them. Each cycle invokes `reclaim_expired_leases` in operator-configurable batches
+background task (default tick 60 s) under the `lease-sweeper` cluster election (`SingletonScope::LeaseSweeper`)
+through the foundation coordination adapter, consuming its run-while-leader semantics without re-specifying them. Each cycle invokes `reclaim_expired_leases` in operator-configurable batches
 (P1 reference default 1000): per batch one transaction transitions expired `Active` leases to `AutoReleased`, returns
 held capacity to acquisition-period counters, decrements `lease_capacity_counters`, and enqueues exactly one
 `lease-auto-released` event per lease same-tx (I11). Reclamation **MUST** complete within the operator-configured
 interval after expiry (default 1 hour); rows **MAY** be deleted after a grace period. The sweeper **MUST** surface
 the `lease_unreclaimed_expired` gauge by canonical registered `metric`. Sweeper liveness **MUST NOT** gate correctness. The
 sweeper **MUST** run as a lifecycle-managed background task per the ToolKit lifecycle model: it receives a child
-`CancellationToken`, its tick, renewal, and batch loop are cancellation-aware, and on graceful shutdown it stops
-starting new batches and releases the coordination lock so a successor does not wait out the TTL (ADR-0006 graceful
-release).
+`CancellationToken`, its tick and batch loop are cancellation-aware, and on graceful shutdown it stops
+starting new batches while the adapter resigns the election so a successor does not wait out the TTL (ADR-0006).
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-lease-sweep`
@@ -490,7 +488,7 @@ release).
 `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: `CoordinationPluginV1` (`try_lock`, `renew`, `release`)
+- API: `SingletonCoordinator` port (`SingletonScope::LeaseSweeper`)
 - DB: `cpt-cf-quota-enforcement-db-schema` (`leases`, `lease_holds`, `lease_capacity_counters`,
   `notification_outbox`)
 - Entities: `Lease`, `LeaseCapacityCounter`, `NotificationOutboxEvent`
@@ -503,8 +501,8 @@ The system **MUST** verify `cpt-cf-quota-enforcement-nfr-recovery` (RTO of at mo
 recovery) through the DESIGN disaster-recovery drill: a full restart of the gear and its storage backend, verifying
 that evaluation operations resume within 15 minutes. The mechanisms under test are those the DESIGN allocates: gateway
 auto-reconnect, automatic lease re-claim through lazy expiry (I4, no lease-recovery procedure exists or is needed),
-and the sweeper re-acquiring its `CoordinationPluginV1` lock after restart, with the leadership gap bounded by one
-lock TTL. No promise beyond the PRD threshold is added.
+and the sweeper rejoining its `lease-sweeper` cluster election after restart, with the leadership gap bounded by one
+election TTL plus observation lag. No promise beyond the PRD threshold is added.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-lazy-expiry`
@@ -553,10 +551,13 @@ lock TTL. No promise beyond the PRD threshold is added.
 - [ ] The sweeper reclaims expired lease rows within the operator-configured interval after expiry (default at most
   1 hour) and enqueues exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject
   context, held amount, affected Quotas, and expiry timestamp, in the same transaction as the state transition
-- [ ] Exactly one `LeaseSweeper` leader runs at a time across replicas; killing the holder makes
-  `LockScope::LeaseSweeper` acquirable within one lock TTL, and the survivor resumes reclamation
+- [ ] One `LeaseSweeper` leader runs at a time across replicas in steady state; killing the leader makes a survivor
+  the leader of `SingletonScope::LeaseSweeper` within one election TTL plus observation lag, and the survivor resumes
+  reclamation
+- [ ] Two sweep bodies forced to run at once over the same expired leases (advisory overlap) produce exactly one
+  state transition, one capacity reversal, and one `lease-auto-released` event per lease
 - [ ] The disaster-recovery drill (full restart of gear and storage backend) shows evaluation and lease operations
-  resuming within 15 minutes, with no manual lease recovery step and the sweeper lock re-acquired automatically
+  resuming within 15 minutes, with no manual lease recovery step and the sweeper election rejoined automatically
 - [ ] Metrics scrape shows the four lease instruments labelled by canonical registered `metric`, with no `tenant_id`,
   `subject_id`, `quota_id`, `idempotency_key`, `lease_token`, projection-type, caller, or raw/unregistered metric label
 
@@ -568,8 +569,8 @@ lock TTL. No promise beyond the PRD threshold is added.
   machine is executed by the quota-lifecycle cascade; only the resulting `ResolvedByDeactivation` state is recorded
   here. Event dispatch, per-sink behavior, and the threshold-emission routine belong to the notifications feature;
   this feature enqueues its events same-tx (I11) and invokes the shared routine at its mutation call sites. The
-  coordination lock primitives and the TTL auto-release guarantee are the foundation's; this feature owns the
-  sweeper's consumer loop (tick, batch, renew cadence, follower fallback).
+  cluster coordination adapter and its run-while-leader semantics are the foundation's; this feature owns the
+  sweep body (tick and batch loop on the adapter's cancellation token).
 - **Upstream alignment items (tracked upstream prerequisites)**: the DESIGN sequence names a
   `system:quota-enforcement-sweeper` identity for the sweeper, but `SecurityContext` carries
   no service-identity field; this document treats the sweeper as an internal background task and leaves the identity
@@ -581,12 +582,12 @@ lock TTL. No promise beyond the PRD threshold is added.
   catalogue. This preserves both complete-projection coverage and stable follow-up replay scope.
 - **Rust contract notes**: `LeaseManager` and the sweeper call the async Tokio-based storage plugin; the sweeper is a
   single Tokio task whose leadership state is process-local, so no shared mutable state crosses tasks without the
-  storage plugin or the coordination lock as the synchronization owner. Commit and release hold no in-process lock
+  storage plugin or the cluster election as the synchronization owner. Commit and release hold no in-process lock
   across an await point; row serialization is delegated to the storage plugin (I9). The sweeper's reclamation
   transaction is idempotent by predicate (`state = 'active' AND expiry_at <= now()`), so a repeated cycle after a
   crash re-processes only still-unreclaimed rows.
-- **Rollout / rollback**: the endpoints are stateless above the storage plugin; the sweeper hands leadership over
-  within one lock TTL, so rollout is a rolling update under the same schema major version. Lease rows carry a closed
+- **Rollout / rollback**: the endpoints are stateless above the storage plugin; the sweeper resigns its election on shutdown and a
+  successor is elected within one round trip, so rollout is a rolling update under the same schema major version. Lease rows carry a closed
   state enum, and terminal rows are retained as ledger entries within operation-log retention, so a binary rollback
   re-reads the same rows without migration.
 - **Test layering**: fail-fast ordering, TTL bounds, cap arithmetic, state transitions, and period attribution get

@@ -122,7 +122,8 @@ to the contract.
   major-version bumps of `QuotaEnforcementStoragePluginV1`; backwards-compatible additive changes are allowed within a
   major.
 - Sweeper singleton coordination is **out of scope** of this contract; it lives in
-  `cpt-cf-quota-enforcement-adr-coordination-plugin`. Storage and coordination plugins evolve independently.
+  `cpt-cf-quota-enforcement-adr-coordination-plugin`, which consumes the platform `cluster` gear. Storage and
+  coordination evolve independently.
 
 ### Confirmation
 
@@ -187,5 +188,5 @@ This decision directly addresses:
 - `cpt-cf-quota-enforcement-nfr-throughput` — throughput is a capability obligation; per-impl realisation varies.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-acquisition-ordering` — deterministic acquisition ordering as a capability;
   every plugin must respect it.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin` — singleton coordination is a separate plugin contract;
-  storage and coordination evolve independently.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin`: singleton coordination comes from the platform
+  `cluster` gear; storage and coordination evolve independently.

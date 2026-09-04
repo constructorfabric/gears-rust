@@ -343,8 +343,8 @@ counter mutation
 9. [ ] - `p1` - Emit the pipeline stage spans (`subject_resolution`, `applicable_quotas_fetch`, `policy_lookup`,
    `engine_evaluate`, `invariant_check`, `storage.apply_debit_plan`, `notification.enqueue`) per DESIGN §4.1 through
    the foundation telemetry conventions - `inst-pipe-spans`
-10. [ ] - `p1` - **RETURN** the committed Decision; orchestrator instances are not singletons, consume no
-    `CoordinationPluginV1`, and delegate all synchronization between concurrent instances to the storage plugin's
+10. [ ] - `p1` - **RETURN** the committed Decision; orchestrator instances are not singletons, join no
+    cluster election, and delegate all synchronization between concurrent instances to the storage plugin's
     serialization of row mutations (I9) - `inst-pipe-return`
 
 ### Idempotency Lookup and Replay
@@ -428,15 +428,15 @@ period
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-retention-sweep`
 
 **Input**: the `idempotency_retention_config` table (default 24 h, per-`(tenant, metric)` overrides), the
-operation-log retention setting (default 30 days), `CoordinationPluginV1`
+operation-log retention setting (default 30 days), the coordination adapter's `retention-sweeper` election
 
 **Output**: physically reclaimed expired `idempotency_records` and `operation_log` rows
 
 **Steps**:
-1. [ ] - `p1` - API: `RetentionSweeper` acquires single-leader execution via
-   `CoordinationPluginV1::try_lock(LockScope::RetentionSweeper, ttl)`; the holder renews at or before TTL/3, drops to
-   follower mode on lock loss, and re-acquires through jittered backoff (foundation
-   `cpt-cf-quota-enforcement-algo-coordination-lock` owns the primitive semantics) - `inst-ret-lock`
+1. [ ] - `p1` - API: `RetentionSweeper` hands its reclamation body to the coordination adapter for
+   `SingletonScope::RetentionSweeper`; the body runs only while this replica is elected, on a child
+   `CancellationToken` that leadership loss cancels; the resolved cluster backend renews the claim and re-election is
+   automatic (foundation `cpt-cf-quota-enforcement-dod-coordination-adapter` owns the election semantics) - `inst-ret-elect`
 2. [ ] - `p1` - DB: `reclaim_expired_idempotency` in operator-configured batches, honoring the per-`(tenant, metric)`
    retention window from `idempotency_retention_config`; the window bounds the replay guarantee of
    `cpt-cf-quota-enforcement-fr-idempotency` - `inst-ret-idem`
@@ -535,7 +535,7 @@ feature and invoke the Engine boundary of the resolution-policy-engine feature w
 **MUST** capture `EvaluationContext` metadata at the locked-read step (ADR-0003), apply Debit Plans through
 `apply_debit_plan` under the ADR-0002 lexicographic acquisition ordering, forward the `AccessScope` unmodified into
 every storage call for `SecureConn` compilation, and emit the DESIGN §4.1 stage spans. The orchestrator **MUST NOT**
-call the PDP, hold a `TypesRegistryClient`, or consume `CoordinationPluginV1`; synchronization between concurrent
+call the PDP, hold a `TypesRegistryClient`, or join a cluster election; synchronization between concurrent
 instances is delegated to the storage plugin (I9).
 
 **Implements**:
@@ -612,13 +612,13 @@ dispatch belong to the notifications feature.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-retention-sweeper`
 
 The system **MUST** deliver `RetentionSweeper` (`cpt-cf-quota-enforcement-component-retention-sweeper`) as a
-single-leader background task under `CoordinationPluginV1::try_lock(LockScope::RetentionSweeper, ttl)` with TTL/3
-renewal, follower fallback, and jittered re-acquisition, invoking `reclaim_expired_idempotency` per the
+single-leader background task under the `retention-sweeper` cluster election (`SingletonScope::RetentionSweeper`)
+through the foundation coordination adapter, invoking `reclaim_expired_idempotency` per the
 `idempotency_retention_config` windows (default 24 h) and `reclaim_operation_log` under the 30-day default, with
 operator-configurable batch size and frequency. Sweeper liveness **MUST NOT** affect counter correctness. The
 sweeper **MUST** run as a lifecycle-managed background task per the ToolKit lifecycle model: it receives a child
 `CancellationToken`, its reclamation loop is cancellation-aware, and on graceful shutdown it stops starting new
-batches and releases the coordination lock (ADR-0006 graceful release).
+batches while the adapter resigns the election (ADR-0006).
 Counter-partition retention stays with the storage plugin's partition reclamation, and policy-version reclamation is
 not delivered here (see section 7).
 
@@ -628,7 +628,7 @@ not delivered here (see section 7).
 **Constraints**: `cpt-cf-quota-enforcement-constraint-toolkit`
 
 **Touches**:
-- API: `CoordinationPluginV1` (`try_lock`, `renew`, `release`)
+- API: `SingletonCoordinator` port (`SingletonScope::RetentionSweeper`)
 - DB: `cpt-cf-quota-enforcement-db-schema` (`idempotency_records`, `operation_log`, `idempotency_retention_config`)
 - Entities: `IdempotencyRecord`, `OperationLog`
 
@@ -696,9 +696,12 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   strictly after the last commit attributed to the closing period
 - [ ] A write or preview against a Quota on a `Direct`-classified metric fails with `METRIC_NOT_QUOTA_GATED` and
   persists nothing
-- [ ] Exactly one `RetentionSweeper` runs at a time; killing the holder makes the lock acquirable within one TTL;
-  expired idempotency and operation-log rows are physically reclaimed per their configured windows, and sweeper
-  downtime changes no counter outcome
+- [ ] One `RetentionSweeper` leader runs at a time in steady state; killing the leader makes a survivor the leader
+  of `SingletonScope::RetentionSweeper` within one election TTL plus observation lag; expired idempotency and
+  operation-log rows are physically reclaimed per their configured windows, and sweeper downtime changes no counter
+  outcome
+- [ ] Two retention sweep bodies forced to run at once (advisory overlap) complete without error, and each expired
+  row is deleted exactly once
 - [ ] The Criterion CI gate holds p95 <= 100 ms for single-Quota debit at 10 000 ops/s sustained; the 100 M-subject
   and 10-Quota-density benchmarks hold the same latency threshold
 - [ ] The retry storm at 10x normal RPS with 5% retry rate produces zero double-count events; the RPO = 0 drill loses
@@ -737,9 +740,9 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   synchronization to storage serialization (I9), so instances are freely replicated. `IdempotencyRecord` and the
   cached Decision blobs cross task boundaries and are `Send + Sync` compatible plain data.
 - **Rollout / rollback**: all components here are stateless above the storage plugin except the sweeper leadership,
-  which hands over within one lock TTL; rollout is a rolling update under the same schema major version. Counter
-  rows, idempotency records, and the operation log are forward-compatible via the schema-versioned `decision_blob`
-  and additive table evolution.
+  which resigns its election on shutdown and hands over within one round trip; rollout is a rolling update under the
+  same schema major version. Counter rows, idempotency records, and the operation log are forward-compatible via the
+  schema-versioned `decision_blob` and additive table evolution.
 - **Test layering**: pipeline ordering, `INVALID_AMOUNT` fail-fast, counter floors, period attribution, and the
   state machines get unit tests; replay, payload mismatch, credit/rollback rejection arms, and the trust boundary
   get integration and adversarial tests against the storage plugin; atomicity, the retry storm, the RPO drill, and
