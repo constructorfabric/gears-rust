@@ -50304,15 +50304,7 @@
                 }
               }
             },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Suggested delay in seconds before repeating the submission under the same Idempotency-Key; present where the family-lock budget expired",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
+            "description": "Service Unavailable"
           }
         },
         "security": [

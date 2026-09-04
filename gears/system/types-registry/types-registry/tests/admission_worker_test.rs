@@ -21,7 +21,7 @@ use uuid::Uuid;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::unit::{commit_creation, evaluate};
-use types_registry::domain::admission::worker::WorkerError;
+use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::artifacts::resolution_fingerprint;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -37,7 +37,7 @@ use types_registry::infra::storage::entity::{
 use types_registry::infra::storage::repo::{EntityRepo, OperationRepo, TypeSchemaRepo};
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -75,6 +75,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -114,6 +115,11 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -239,6 +245,11 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&first_db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -269,6 +280,11 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&second_db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -318,6 +334,7 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
         &item.gts_id,
         &payload,
         item.id,
+        common::limits().activation_write_set,
     )
     .await
     .expect("evaluation")
@@ -352,7 +369,15 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
             let unit = unit.clone();
             let stores = Arc::clone(&stores);
             Box::pin(async move {
-                commit_creation(stores.as_ref(), tx, &allow_all(), &unit, LATER).await
+                commit_creation(
+                    stores.as_ref(),
+                    tx,
+                    &allow_all(),
+                    &unit,
+                    common::limits().activation_write_set,
+                    LATER,
+                )
+                .await
             })
         })
         .await;
@@ -407,9 +432,20 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
 async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
     let db = test_db().await;
     let first = submit(&db, "k1", CF_TYPE, schema(CF_TYPE)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A second operation for the same identifier fails with `already_exists`.
     let mut body = schema(CF_TYPE);
@@ -419,6 +455,11 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -431,6 +472,11 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -481,6 +527,11 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -532,9 +583,20 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
 async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revision() {
     let db = test_db().await;
     let first = submit(&db, "k1", CF_TYPE, schema(CF_TYPE)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A second *operation* for the same identifier: a different idempotency key and
     // a different body, so acceptance treats it as a fresh request.
@@ -546,6 +608,11 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -590,6 +657,11 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -625,9 +697,20 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
     let db = test_db().await;
     let base = gts_id!("cf.core.base.type.v1~");
     let first = submit(&db, "k1", base, schema(base)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A candidate that can only resolve if the first admission is visible.
     let derived = gts_id!("cf.core.base.type.v1~cf.core.ns.premium.v1~");
@@ -644,11 +727,16 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
     // Inverted at T10: the base is reachable through `GtsId::chain_ids()` with the
     // edge table still empty, so the old comment blaming T13's missing rows was half
     // wrong. The `$ref` here points at the base, which the chain supplies;
-    // `a_ref_outside_the_chain_still_fails` pins what T13 still owns.
+    // `a_ref_outside_the_chain_is_admitted` covers the half T13 owned.
     let outcome = run_operation(
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -688,6 +776,11 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -699,6 +792,11 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -735,6 +833,11 @@ async fn an_unknown_operation_is_an_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         Uuid::new_v4(),
         LATER,
     )
@@ -764,6 +867,11 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -813,19 +921,27 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
     assert_eq!(ops[0].status, storage_enums::OperationStatus::Completed);
 }
 
-/// The T13 boundary. A `$ref` **outside** the candidate's own `~`-chain is genuinely
-/// edge-derived, so nothing supplies it until T13 writes `dependency` rows. Fails on
-/// content, not infrastructure: retrying would change nothing.
 #[tokio::test]
-async fn a_ref_outside_the_chain_still_fails() {
+async fn a_ref_outside_the_chain_is_admitted() {
     let db = test_db().await;
 
     // A committed type that is *not* an ancestor of the candidate.
     let unrelated = gts_id!("cf.core.other.type.v1~");
     let first = submit(&db, "k1", unrelated, schema(unrelated)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("the unrelated type admits");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        first,
+        LATER,
+    )
+    .await
+    .expect("the unrelated type admits");
 
     let candidate = gts_id!("cf.core.base.type.v1~");
     let body = json!({
@@ -840,6 +956,11 @@ async fn a_ref_outside_the_chain_still_fails() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -848,13 +969,8 @@ async fn a_ref_outside_the_chain_still_fails() {
     let item = &outcome.items[0];
     assert_eq!(
         item.status,
-        domain_enums::OperationItemStatus::Failed,
-        "a cross-chain $ref needs T13's edges: {:?}",
+        domain_enums::OperationItemStatus::Succeeded,
+        "a cross-chain $ref to a committed schema must resolve: {:?}",
         item.failure,
-    );
-    assert_eq!(
-        item.failure.as_ref().map(|f| f.reason.as_ref()),
-        Some("invalid_schema"),
-        "an unresolvable reference is a content failure, not a retryable one",
     );
 }

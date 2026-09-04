@@ -30,7 +30,9 @@ use uuid::Uuid;
 
 use types_registry::config::{PolicyEntry, TypesRegistryConfig};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError};
+use types_registry::domain::admission::worker::{
+    OperationOutcome, Tuning, WorkerError, run_operation,
+};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -40,7 +42,7 @@ use types_registry::infra::storage::entity::{
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -101,6 +103,7 @@ async fn submit_with(
         &AcceptanceContext {
             policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -136,9 +139,20 @@ async fn admit(
     let op = submit_with(db, &policy, key, gts_id, content, expected_resource_version)
         .await
         .expect("accepted");
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail")
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
 }
 
 /// Every `type_schema_revision` row of one entity, in revision order.
@@ -512,9 +526,20 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
     )
     .await
     .expect("the open policy admits the creation");
-    run_operation(&stores(), &worker(&db), &allow_all(), created, LATER)
-        .await
-        .expect("admission");
+    run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        created,
+        LATER,
+    )
+    .await
+    .expect("admission");
 
     // The region is closed from here on.
     let outcome = {
@@ -528,9 +553,20 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
         )
         .await
         .expect("a revision bypasses the policy gate");
-        run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-            .await
-            .expect("admission")
+        run_operation(
+            &stores(),
+            &worker(&db),
+            &allow_all(),
+            Tuning {
+                limits: &common::limits(),
+                worker: &common::worker_settings(),
+                metrics: &common::metrics(),
+            },
+            op,
+            LATER,
+        )
+        .await
+        .expect("admission")
     };
     assert_eq!(
         outcome.items[0].status,

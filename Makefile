@@ -724,8 +724,9 @@ test-usage-collector-pg: install-tools
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 test-types-registry-db: install-tools
+	$(call print_target_banner)
 	cargo nextest run -p cf-gears-types-registry --features integration \
-	  --test migration_backends_test --test repo_backends_test
+	  -E 'binary(/_backends_test$$/)'
 
 ## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;

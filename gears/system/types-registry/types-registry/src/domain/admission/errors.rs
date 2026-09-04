@@ -8,6 +8,7 @@ use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use super::drift::VectorDrift;
 use crate::domain::gts_store::StoreBuildError;
 
 /// An infrastructure failure. Retryable by construction: nothing here is a
@@ -40,7 +41,7 @@ pub enum WorkerError {
     /// yet. A terminal failure would make the outcome depend on the order two
     /// unrelated submissions reached the worker; a redelivery re-reads and succeeds.
     /// Until T21 there is no outbox, so this condition surfaces inline as an
-    /// opaque `500`; lock contention is the separate retryable `503` case.
+    /// opaque `500`; write contention likewise surfaces as a storage error.
     #[error("instance '{gts_id}' conforms to '{type_id}', which has no current revision")]
     ConformingTypeAbsent { gts_id: String, type_id: String },
     /// An entity row exists with no matching current-state row, or with one of the
@@ -57,14 +58,9 @@ pub enum WorkerError {
     /// projection is missing behind an entity that is still there.
     #[error("entity '{gts_id}' (id {entity_id}) vanished mid-transaction")]
     EntityVanished { gts_id: String, entity_id: i64 },
-    /// The family lock a creation serializes on could not be taken within its wait
-    /// budget. Contention, not a statement about the candidate: a redelivery takes
-    /// the lock and admits.
-    #[error("could not acquire the version-family lock for '{family_key}' in time")]
-    FamilyLockUnavailable {
-        family_key: String,
-        retry_after_seconds: u64,
-    },
+    /// A resolved edge target disappeared before commit.
+    #[error("dependency target '{gts_id}' vanished before its edge was committed")]
+    DependencyTargetAbsent { gts_id: String },
     /// The entity version is a monotonic persisted identity and cannot be
     /// advanced beyond the storage type's ceiling.
     #[error("entity '{gts_id}' cannot advance resource_version after i64::MAX")]
@@ -74,6 +70,12 @@ pub enum WorkerError {
     /// rolls the already-executed resource-version CAS back on this error.
     #[error("entity '{gts_id}' cannot allocate a revision after i32::MAX")]
     RevisionNumberExhausted { gts_id: String },
+    /// A candidate refusal discovered after the commit transaction began writing.
+    #[error("the revision was refused after its writes began: {0}")]
+    RefusedAfterWrite(ItemFailure),
+    /// Commit-time revision-vector drift (D4, SPEC §8.1 step 4.3).
+    #[error("the evaluation is stale and must be redone: {0}")]
+    RevalidationRequired(VectorDrift),
     #[error("storage failure during admission: {0}")]
     Storage(#[from] ScopeError),
     #[error("database failure during admission: {0}")]
@@ -94,6 +96,13 @@ pub struct ItemFailure {
     /// `&'static str`.
     pub reason: Cow<'static, str>,
     pub message: String,
+}
+
+impl std::fmt::Display for ItemFailure {
+    /// Format as the operator-facing `reason: message` pair.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.message)
+    }
 }
 
 impl ItemFailure {
