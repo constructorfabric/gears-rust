@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -701,13 +701,26 @@ test-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 
+## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
+## secure graph builder and its tests compile only there), the PostgreSQL 19
+## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
+## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
+## every PG18 Docker suite `make test-pg` just ran; the filter keeps only what
+## this lane adds. The PG19 suite skips itself while the pre-GA image is
+## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
+## failure — do the same locally once the image is expected to be present.
+test-pgq: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
+		-E 'kind(lib) | binary(mod) | binary(ui)'
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features mysql,integration
 
 # Run all database integration tests
-test-db: test-sqlite test-pg test-mysql
+test-db: test-sqlite test-pg test-pgq test-mysql
 	$(call print_target_banner)
 
 ## Run users-info gear integration tests

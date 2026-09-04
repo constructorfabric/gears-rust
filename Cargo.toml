@@ -57,6 +57,7 @@ members = [
     "libs/toolkit-macros",
     "libs/toolkit-macros-tests",
     "libs/test-containers",
+    "libs/toolkit-sea-orm-pgq",
     "libs/toolkit-db",
     "libs/toolkit-db-macros",
     "libs/toolkit-auth",
@@ -303,6 +304,9 @@ toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-
 toolkit-db = { package = "cf-gears-toolkit-db", version = "0.14.0", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.6.4", path = "libs/toolkit-db-macros" }
 toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.4", path = "libs/toolkit-gts" }
+# SQL/PGQ AST + renderer (docs/arch/secure-orm/ADR/0002). Security-agnostic:
+# toolkit-db owns the scope injection, this crate only knows the syntax.
+toolkit-sea-orm-pgq = { package = "cf-gears-toolkit-sea-orm-pgq", version = "0.1.0", path = "libs/toolkit-sea-orm-pgq" }
 toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.1.3", path = "libs/toolkit-gts-macros" }
 toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.5", path = "libs/toolkit-macros" }
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.6.6", path = "libs/toolkit-node-info" }

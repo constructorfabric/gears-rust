@@ -3530,6 +3530,7 @@ dependencies = [
  "cf-gears-test-containers",
  "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-sea-orm-pgq",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "chrono",
@@ -3778,6 +3779,14 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "cf-gears-toolkit-sea-orm-pgq"
+version = "0.1.0"
+dependencies = [
+ "sea-orm",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
