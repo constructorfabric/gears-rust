@@ -84,7 +84,14 @@ and adds the resulting `gts_type_id` condition to the membership subquery. This
 is required because `resource_group_membership` is shared by all member types
 and external resource IDs are only unique within a type. The AuthZ resource name
 must not be used as an implicit replacement: a gear may deliberately use a
-different GTS path for policy matching.
+different GTS path for policy matching. The configured value MUST be a member
+type actually registered in RG's type registry (a `gts.cf.core.rg.type.v1~`-prefixed
+code accepted by `validate_type_code`, whose resolved `gts_type_id` is stored
+on membership rows) — a value that never resolves through `gts_type` makes
+every native group predicate silently match zero rows. Resource groups themselves have no member-handle type:
+group nesting is hierarchy (`parent_id`/`resource_group_closure`), not
+membership, so RG's own group resource descriptor deliberately carries no
+mapping.
 
 A resource descriptor without the mapping suppresses configured group
 capabilities for that request. The PEP also rejects a native group predicate

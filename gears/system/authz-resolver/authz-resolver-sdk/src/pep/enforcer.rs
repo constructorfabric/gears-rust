@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext};
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
 
 use super::IntoPropertyValue;
 use uuid::Uuid;
@@ -347,8 +347,25 @@ impl PolicyEnforcer {
     }
 
     /// Set PEP capabilities advertised to the PDP.
+    ///
+    /// The advertised set is re-validated per request against the resource
+    /// descriptor: `GroupMembership`/`GroupHierarchy` are suppressed when the
+    /// resource lacks a `group_membership_type` mapping or does not support
+    /// the `id` property, and `GroupHierarchy` is additionally suppressed
+    /// unless `GroupMembership` is advertised alongside it (`InGroupSubtree`
+    /// compilation requires both). The incoherent hierarchy-without-membership
+    /// combination is warned about here, once, rather than on every request.
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        if capabilities.contains(&Capability::GroupHierarchy)
+            && !capabilities.contains(&Capability::GroupMembership)
+        {
+            tracing::warn!(
+                "GroupHierarchy configured without GroupMembership; the \
+                 hierarchy capability will be suppressed on every request \
+                 (InGroupSubtree requires both)"
+            );
+        }
         self.capabilities = capabilities;
         self
     }
@@ -412,18 +429,43 @@ impl PolicyEnforcer {
 
         // Native group predicates are only executable when the resource
         // descriptor supplies the RG member-handle type needed to qualify
-        // `resource_group_membership.gts_type_id`. Suppress group capabilities
-        // for untyped resources so the PDP takes its degraded expansion path
-        // instead of returning a predicate that must fail compilation.
-        let capabilities = self
+        // `resource_group_membership.gts_type_id`, and only against the `id`
+        // property (the compiler hard-rejects any other property). Suppress
+        // group capabilities whenever either prerequisite is missing so the
+        // PDP takes its degraded expansion path instead of returning a
+        // predicate that must fail compilation. `GroupHierarchy` is
+        // additionally not independently executable — `InGroupSubtree`
+        // compilation requires `GroupMembership` too — which
+        // `with_capabilities` already warned about once at configuration
+        // time.
+        let group_predicates_executable = resource.group_membership_type.is_some()
+            && resource
+                .supported_properties
+                .contains(&pep_properties::RESOURCE_ID);
+        let has_group_capability = self.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::GroupMembership | Capability::GroupHierarchy
+            )
+        });
+        if has_group_capability
+            && resource.group_membership_type.is_some()
+            && !group_predicates_executable
+        {
+            tracing::warn!(
+                resource = %resource.name,
+                "group membership type is mapped but the resource does not \
+                 support the 'id' property; suppressing group capabilities"
+            );
+        }
+        let has_group_membership = self.capabilities.contains(&Capability::GroupMembership);
+        let capabilities: Vec<Capability> = self
             .capabilities
             .iter()
-            .filter(|capability| {
-                resource.group_membership_type.is_some()
-                    || !matches!(
-                        capability,
-                        Capability::GroupMembership | Capability::GroupHierarchy
-                    )
+            .filter(|capability| match capability {
+                Capability::GroupMembership => group_predicates_executable,
+                Capability::GroupHierarchy => group_predicates_executable && has_group_membership,
+                Capability::TenantHierarchy => true,
             })
             .cloned()
             .collect();

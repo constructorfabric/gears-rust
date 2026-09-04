@@ -286,6 +286,10 @@ impl InGroupScopeFilter {
     /// This source-compatible constructor cannot safely qualify RG membership
     /// rows and therefore compiles to deny-all. New callers should use
     /// [`Self::new_typed`].
+    #[deprecated(
+        since = "0.8.2",
+        note = "untyped group filters compile to deny-all; use `new_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn new(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
         Self {
@@ -349,6 +353,10 @@ impl InGroupSubtreeScopeFilter {
     /// This source-compatible constructor cannot safely qualify RG membership
     /// rows and therefore compiles to deny-all. New callers should use
     /// [`Self::new_typed`].
+    #[deprecated(
+        since = "0.8.2",
+        note = "untyped group filters compile to deny-all; use `new_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn new(property: impl Into<String>, ancestor_ids: Vec<ScopeValue>) -> Self {
         Self {
@@ -529,8 +537,13 @@ impl ScopeFilter {
     ///
     /// Retained for source compatibility. New callers should use
     /// [`Self::in_group_typed`] so membership rows can be safely qualified.
+    #[deprecated(
+        since = "0.8.2",
+        note = "untyped group filters compile to deny-all; use `in_group_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn in_group(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
+        #[allow(deprecated)]
         Self::InGroup(InGroupScopeFilter::new(property, group_ids))
     }
 
@@ -553,8 +566,13 @@ impl ScopeFilter {
     /// Retained for source compatibility. New callers should use
     /// [`Self::in_group_subtree_typed`] so membership rows can be safely
     /// qualified.
+    #[deprecated(
+        since = "0.8.2",
+        note = "untyped group filters compile to deny-all; use `in_group_subtree_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn in_group_subtree(property: impl Into<String>, ancestor_ids: Vec<ScopeValue>) -> Self {
+        #[allow(deprecated)]
         Self::InGroupSubtree(InGroupSubtreeScopeFilter::new(property, ancestor_ids))
     }
 
@@ -1356,6 +1374,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn legacy_in_group_constructor_is_untyped() {
         let f = ScopeFilter::in_group(
             pep_properties::OWNER_TENANT_ID,
@@ -1386,6 +1405,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn legacy_in_group_subtree_constructor_is_untyped() {
         let f = ScopeFilter::in_group_subtree(
             pep_properties::OWNER_TENANT_ID,

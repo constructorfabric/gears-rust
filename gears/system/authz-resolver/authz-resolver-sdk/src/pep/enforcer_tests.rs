@@ -347,6 +347,43 @@ fn build_request_preserves_group_capabilities_for_typed_resource() {
 }
 
 #[test]
+fn build_request_suppresses_group_hierarchy_without_group_membership() {
+    // `InGroupSubtree` compilation requires BOTH group capabilities, so a
+    // lone `GroupHierarchy` advertisement is a dead capability the PDP could
+    // only act on with predicates destined to fail — it must be suppressed.
+    let e = enforcer(AllowAllMock).with_capabilities(vec![
+        Capability::TenantHierarchy,
+        Capability::GroupHierarchy,
+    ]);
+
+    let req = e.build_request(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, vec![Capability::TenantHierarchy]);
+}
+
+#[test]
+fn build_request_suppresses_group_capabilities_without_resource_id_property() {
+    // Native group predicates are hard-restricted to the `id` property; a
+    // typed resource that does not support `id` can never execute one, so
+    // its group capabilities must be suppressed despite the mapping.
+    const NO_ID_GROUP_TYPED_RESOURCE: ResourceType = ResourceType::from_static(
+        gts_id!("cf.core.users.user.v1~"),
+        &[pep_properties::OWNER_TENANT_ID],
+    )
+    .with_group_membership_type(GROUP_MEMBERSHIP_TYPE);
+
+    let e = enforcer(AllowAllMock).with_capabilities(vec![
+        Capability::TenantHierarchy,
+        Capability::GroupMembership,
+        Capability::GroupHierarchy,
+    ]);
+
+    let req = e.build_request(&test_ctx(), &NO_ID_GROUP_TYPED_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, vec![Capability::TenantHierarchy]);
+}
+
+#[test]
 fn build_request_with_overrides_tenant() {
     let custom_tenant = uuid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     let e = enforcer(AllowAllMock);
@@ -439,12 +476,15 @@ async fn access_scope_rejects_unadvertised_native_group_predicate() {
         .await
         .expect_err("a native group predicate must have been advertised");
 
-    let EnforcerError::CompileFailed(ConstraintCompileError::AllConstraintsFailed { reason }) =
-        error
+    let EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+        predicate,
+        missing,
+    }) = error
     else {
-        panic!("expected fail-closed compilation error, got: {error:?}");
+        panic!("expected typed unadvertised-capability error, got: {error:?}");
     };
-    assert!(reason.contains("unadvertised capabilities: group_membership"));
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
 }
 
 #[tokio::test]
@@ -455,15 +495,18 @@ async fn access_scope_rejects_group_predicate_after_suppressing_untyped_capabili
         .await
         .expect_err("an untyped resource must not accept an unsolicited group predicate");
 
-    let EnforcerError::CompileFailed(ConstraintCompileError::AllConstraintsFailed { reason }) =
-        error
+    let EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+        predicate,
+        missing,
+    }) = error
     else {
-        panic!("expected fail-closed compilation error, got: {error:?}");
+        panic!(
+            "the resource mapping must suppress the configured capability before evaluation, \
+             got: {error:?}"
+        );
     };
-    assert!(
-        reason.contains("unadvertised capabilities: group_membership"),
-        "the resource mapping must suppress the configured capability before evaluation: {reason}"
-    );
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
 }
 
 #[tokio::test]

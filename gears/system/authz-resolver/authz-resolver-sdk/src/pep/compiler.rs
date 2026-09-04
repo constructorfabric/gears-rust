@@ -40,7 +40,13 @@ use crate::constraints::{Constraint, Predicate};
 use crate::models::{BarrierMode, Capability, EvaluationResponse};
 
 /// Error during constraint compilation.
+///
+/// Marked `#[non_exhaustive]`: variants have been added before (most recently
+/// `UnadvertisedCapabilities`), and downstream crates consume this enum
+/// through a pinned toolkit, so exhaustive matches there must not break on a
+/// cargo-compatible patch release.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConstraintCompileError {
     /// Constraints were required but the PDP returned none.
     ///
@@ -52,6 +58,69 @@ pub enum ConstraintCompileError {
     /// All constraints contained unknown predicates (fail-closed).
     #[error("all constraints failed compilation (fail-closed): {reason}")]
     AllConstraintsFailed { reason: String },
+
+    /// Every constraint carried a predicate whose native SQL capability was
+    /// never advertised in the evaluation request (fail-closed).
+    ///
+    /// Per the capability negotiation contract a PDP must not emit
+    /// `in_group`/`in_group_subtree`/`in_tenant_subtree` predicates unless the
+    /// corresponding capability was advertised; a PDP that cannot expand a
+    /// scope to explicit `in` predicates must deny instead. This typed variant
+    /// lets enforcing services map that specific contract violation to a
+    /// domain-level denial rather than a generic internal error, while other
+    /// compile failures keep signalling infrastructure faults.
+    #[error(
+        "{predicate} predicate requires unadvertised capabilities: {} (fail-closed)",
+        missing.join(", ")
+    )]
+    UnadvertisedCapabilities {
+        /// Name of the offending predicate (for example `InTenantSubtree`).
+        predicate: &'static str,
+        /// Snake-case capability names missing from the negotiated set.
+        missing: Vec<&'static str>,
+    },
+}
+
+/// Per-constraint compilation failure.
+///
+/// Distinguishes capability-negotiation violations from structural failures
+/// (unknown property, malformed value, missing membership type) so the
+/// aggregated [`ConstraintCompileError`] can stay typed when every constraint
+/// fails for the same negotiation reason.
+enum ConstraintFailure {
+    /// The predicate requires capabilities absent from the negotiated set.
+    UnadvertisedCapabilities {
+        predicate: &'static str,
+        missing: Vec<&'static str>,
+    },
+    /// Any other fail-closed reason.
+    Other(String),
+}
+
+impl std::fmt::Display for ConstraintFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Render through the public variant so the warn-log text and the
+            // surfaced error text come from one format string and cannot
+            // drift.
+            Self::UnadvertisedCapabilities { predicate, missing } => {
+                ConstraintCompileError::UnadvertisedCapabilities {
+                    predicate,
+                    missing: missing.clone(),
+                }
+                .fmt(f)
+            }
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+// Lets the string-producing conversion helpers keep using `?` inside
+// `compile_constraint` without wrapping every call site.
+impl From<String> for ConstraintFailure {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
 }
 
 /// Compile constraints from an evaluation response into an `AccessScope`.
@@ -162,7 +231,7 @@ fn compile_to_access_scope_impl(
 
     // Step 2: Compile each constraint
     let mut constraints = Vec::new();
-    let mut fail_reasons: Vec<String> = Vec::new();
+    let mut failures: Vec<ConstraintFailure> = Vec::new();
 
     for constraint in &response.context.constraints {
         match compile_constraint(
@@ -172,20 +241,39 @@ fn compile_to_access_scope_impl(
             negotiated_capabilities,
         ) {
             Ok(sc) => constraints.push(sc),
-            Err(reason) => {
+            Err(failure) => {
                 tracing::warn!(
-                    reason = %reason,
+                    reason = %failure,
                     "constraint compilation failed (fail-closed), possible PDP contract violation",
                 );
-                fail_reasons.push(reason);
+                failures.push(failure);
             }
         }
     }
 
-    // If no constraint compiled successfully, fail-closed
+    // If no constraint compiled successfully, fail-closed. When every failure
+    // is a capability-negotiation violation, surface the typed variant so
+    // callers can map it to a domain-level denial; any structural failure in
+    // the mix keeps the aggregate as a generic compile error. Several
+    // constraints can fail with different unadvertised predicates — surfacing
+    // only the first is intentional, the per-constraint warn above records
+    // the rest.
     if constraints.is_empty() {
-        return Err(ConstraintCompileError::AllConstraintsFailed {
-            reason: fail_reasons.join("; "),
+        let all_unadvertised = failures
+            .iter()
+            .all(|f| matches!(f, ConstraintFailure::UnadvertisedCapabilities { .. }));
+        let reason = failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(match failures.into_iter().next() {
+            Some(ConstraintFailure::UnadvertisedCapabilities { predicate, missing })
+                if all_unadvertised =>
+            {
+                ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }
+            }
+            _ => ConstraintCompileError::AllConstraintsFailed { reason },
         });
     }
 
@@ -206,7 +294,32 @@ fn compile_constraint(
     supported_properties: &[&str],
     group_membership_type: Option<&str>,
     negotiated_capabilities: Option<&[Capability]>,
-) -> Result<ScopeConstraint, String> {
+) -> Result<ScopeConstraint, ConstraintFailure> {
+    // Capability negotiation is checked for every predicate BEFORE any shape
+    // validation, so a predicate that is both unadvertised and malformed
+    // still classifies as the typed negotiation violation — the highest-
+    // priority failure class, which enforcing services map to a denial.
+    for predicate in &constraint.predicates {
+        match predicate {
+            Predicate::InGroup(_) => require_negotiated_capabilities(
+                negotiated_capabilities,
+                &[Capability::GroupMembership],
+                "InGroup",
+            )?,
+            Predicate::InGroupSubtree(_) => require_negotiated_capabilities(
+                negotiated_capabilities,
+                &[Capability::GroupMembership, Capability::GroupHierarchy],
+                "InGroupSubtree",
+            )?,
+            Predicate::InTenantSubtree(_) => require_negotiated_capabilities(
+                negotiated_capabilities,
+                &[Capability::TenantHierarchy],
+                "InTenantSubtree",
+            )?,
+            Predicate::Eq(_) | Predicate::In(_) => {}
+        }
+    }
+
     let has_group_predicate = constraint.predicates.iter().any(|predicate| {
         matches!(
             predicate,
@@ -214,10 +327,10 @@ fn compile_constraint(
         )
     });
     if has_group_predicate && !has_tenant_scope_predicate(constraint) {
-        return Err(
+        return Err(ConstraintFailure::Other(
             "native group predicates require an owner_tenant_id predicate in the same constraint (fail-closed)"
                 .to_owned(),
-        );
+        ));
     }
 
     let mut filters = Vec::new();
@@ -245,23 +358,20 @@ fn compile_constraint(
                     return Err(format!(
                         "In predicate on '{}' has empty value list (fail-closed)",
                         p.property
-                    ));
+                    )
+                    .into());
                 }
                 (p.property.as_str(), ScopeFilter::r#in(&p.property, values))
             }
             Predicate::InGroup(p) => {
                 require_resource_id_group_property("InGroup", &p.property)?;
-                require_negotiated_capabilities(
-                    negotiated_capabilities,
-                    &[Capability::GroupMembership],
-                    "InGroup",
-                )?;
                 let group_ids = json_values_to_uuid_scope_values(&p.group_ids, "group_ids")?;
                 if group_ids.is_empty() {
                     return Err(format!(
                         "InGroup predicate on '{}' has empty group_ids (fail-closed)",
                         p.property
-                    ));
+                    )
+                    .into());
                 }
                 let membership_type =
                     required_group_membership_type(group_membership_type, "InGroup", &p.property)?;
@@ -272,18 +382,14 @@ fn compile_constraint(
             }
             Predicate::InGroupSubtree(p) => {
                 require_resource_id_group_property("InGroupSubtree", &p.property)?;
-                require_negotiated_capabilities(
-                    negotiated_capabilities,
-                    &[Capability::GroupMembership, Capability::GroupHierarchy],
-                    "InGroupSubtree",
-                )?;
                 let ancestor_ids =
                     json_values_to_uuid_scope_values(&p.ancestor_ids, "ancestor_ids")?;
                 if ancestor_ids.is_empty() {
                     return Err(format!(
                         "InGroupSubtree predicate on '{}' has empty ancestor_ids (fail-closed)",
                         p.property
-                    ));
+                    )
+                    .into());
                 }
                 let membership_type = required_group_membership_type(
                     group_membership_type,
@@ -296,11 +402,6 @@ fn compile_constraint(
                 )
             }
             Predicate::InTenantSubtree(p) => {
-                require_negotiated_capabilities(
-                    negotiated_capabilities,
-                    &[Capability::TenantHierarchy],
-                    "InTenantSubtree",
-                )?;
                 let root_tenant_id = json_to_uuid_scope_value(&p.root_tenant_id, "root_tenant_id")
                     .map_err(|e| {
                         format!(
@@ -337,7 +438,7 @@ fn compile_constraint(
         };
 
         if !supported_properties.contains(&property) {
-            return Err(format!("unsupported property: {property}"));
+            return Err(format!("unsupported property: {property}").into());
         }
 
         filters.push(filter);
@@ -381,8 +482,8 @@ fn require_resource_id_group_property(predicate: &str, property: &str) -> Result
 fn require_negotiated_capabilities(
     negotiated_capabilities: Option<&[Capability]>,
     required: &[Capability],
-    predicate: &str,
-) -> Result<(), String> {
+    predicate: &'static str,
+) -> Result<(), ConstraintFailure> {
     let Some(negotiated_capabilities) = negotiated_capabilities else {
         return Ok(());
     };
@@ -398,10 +499,7 @@ fn require_negotiated_capabilities(
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "{predicate} predicate requires unadvertised capabilities: {} (fail-closed)",
-            missing.join(", ")
-        ))
+        Err(ConstraintFailure::UnadvertisedCapabilities { predicate, missing })
     }
 }
 

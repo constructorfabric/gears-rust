@@ -178,10 +178,13 @@ pub const USER: ResourceType = ResourceType::from_static(
 This value is not inferred from the AuthZ resource name: gears may use different
 GTS paths for policy matching and RG membership storage. `PolicyEnforcer`
 suppresses `GroupMembership` and `GroupHierarchy` capabilities for resource
-descriptors without this mapping, causing the PDP to use its degraded explicit
-`In` path. The querying database must also contain or project
-`resource_group_membership`, `resource_group_closure`, and RG's `gts_type`
-registry before the enforcer is configured with those capabilities.
+descriptors without this mapping, asking the PDP to expand the group scope to
+explicit resource-ID `in` predicates; a PDP that cannot expand must deny (the
+bundled plugins deny — neither implements expansion today). The querying database must also contain or project the tables each
+predicate executes against before the enforcer is configured with the
+corresponding capability: native `in_group` needs `resource_group_membership`
+and RG's `gts_type` registry; native `in_group_subtree` additionally needs
+`resource_group_closure`.
 
 ### Defining actions
 

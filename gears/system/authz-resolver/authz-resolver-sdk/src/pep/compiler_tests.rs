@@ -577,10 +577,12 @@ fn unadvertised_native_group_predicate_fails_closed() {
         Some(GROUP_MEMBERSHIP_TYPE),
         &[Capability::TenantHierarchy],
     );
-    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+    let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
+    else {
         panic!("unadvertised group predicate must fail closed: {result:?}");
     };
-    assert!(reason.contains("unadvertised capabilities: group_membership"));
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
 }
 
 #[test]
@@ -609,10 +611,121 @@ fn unadvertised_tenant_subtree_predicate_fails_closed() {
         None,
         &[],
     );
-    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+    let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
+    else {
         panic!("unadvertised tenant subtree must fail closed: {result:?}");
     };
-    assert!(reason.contains("unadvertised capabilities: tenant_hierarchy"));
+    assert_eq!(predicate, "InTenantSubtree");
+    assert_eq!(missing, vec!["tenant_hierarchy"]);
+}
+
+/// A capability-negotiation failure mixed with a structural failure must
+/// aggregate to the generic `AllConstraintsFailed` (joined reasons), not the
+/// typed variant — the typed error is reserved for the case where every
+/// failed constraint is a negotiation violation.
+#[test]
+fn mixed_unadvertised_and_structural_failures_aggregate_generic() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![
+                // Fails on capability negotiation.
+                Constraint {
+                    predicates: vec![
+                        Predicate::In(InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            [uuid(T1)],
+                        )),
+                        Predicate::InGroup(InGroupPredicate::new(
+                            pep_properties::RESOURCE_ID,
+                            [uuid(R1)],
+                        )),
+                    ],
+                },
+                // Fails structurally (unsupported property).
+                Constraint {
+                    predicates: vec![Predicate::Eq(EqPredicate::new(
+                        "no_such_property",
+                        uuid(T1),
+                    ))],
+                },
+            ],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope_with_negotiated_capabilities(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        Some(GROUP_MEMBERSHIP_TYPE),
+        &[Capability::TenantHierarchy],
+    );
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("mixed failures must aggregate to AllConstraintsFailed: {result:?}");
+    };
+    assert!(reason.contains("unadvertised capabilities: group_membership"));
+    assert!(reason.contains("unsupported property: no_such_property"));
+}
+
+/// `InGroupSubtree` requires both group capabilities; with only
+/// `GroupMembership` negotiated the typed error must name the one missing
+/// capability, and with neither negotiated it must render both, exercising
+/// the multi-element `missing` list.
+#[test]
+fn in_group_subtree_reports_missing_capability_set() {
+    use crate::constraints::InGroupSubtreePredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [uuid(T1)],
+                    )),
+                    Predicate::InGroupSubtree(InGroupSubtreePredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        [uuid(R1)],
+                    )),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope_with_negotiated_capabilities(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        Some(GROUP_MEMBERSHIP_TYPE),
+        &[Capability::GroupMembership],
+    );
+    let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
+    else {
+        panic!("subtree without GroupHierarchy must fail closed: {result:?}");
+    };
+    assert_eq!(predicate, "InGroupSubtree");
+    assert_eq!(missing, vec!["group_hierarchy"]);
+
+    let result = compile_to_access_scope_with_negotiated_capabilities(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        Some(GROUP_MEMBERSHIP_TYPE),
+        &[],
+    );
+    let Err(error @ ConstraintCompileError::UnadvertisedCapabilities { .. }) = result else {
+        panic!("subtree without either capability must fail closed: {result:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "InGroupSubtree predicate requires unadvertised capabilities: \
+         group_membership, group_hierarchy (fail-closed)"
+    );
 }
 
 #[test]

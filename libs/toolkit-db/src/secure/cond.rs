@@ -60,6 +60,21 @@ enum GroupSelection {
     Subtree(Box<SelectStatement>),
 }
 
+/// Log a group filter that was compiled to a deny-all condition.
+///
+/// Fail-closed group filters are otherwise silent: the query simply returns
+/// zero rows, which in production is indistinguishable from "the caller's
+/// group grants match nothing". Only the predicate shape, property name, and
+/// cause are logged — never group IDs or other filter values.
+fn warn_group_filter_denied(predicate: &'static str, property: &str, cause: &'static str) {
+    tracing::warn!(
+        predicate,
+        property,
+        cause,
+        "group scope filter compiled to deny-all"
+    );
+}
+
 /// Resolve an external member-handle GTS schema ID to RG-local `gts_type.id` values.
 fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
     let member_type = Alias::new("member_type");
@@ -205,6 +220,22 @@ where
         ) && filter.property() != pep_properties::RESOURCE_ID
     });
     if has_group_filter && (!has_tenant_filter || has_group_filter_on_non_resource_property) {
+        let cause = if has_group_filter_on_non_resource_property {
+            "group filter on a property other than the resource id"
+        } else {
+            "group filter without an owner_tenant_id filter in the same constraint"
+        };
+        let offending_property = constraint
+            .filters()
+            .iter()
+            .find(|filter| {
+                matches!(
+                    filter,
+                    ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+                )
+            })
+            .map_or("", ScopeFilter::property);
+        warn_group_filter_denied("InGroup/InGroupSubtree", offending_property, cause);
         return None;
     }
 
@@ -222,6 +253,7 @@ where
             }
             ScopeFilter::InGroup(gf) => {
                 let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
+                    warn_group_filter_denied("InGroup", gf.property(), "non-UUID group_ids");
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
@@ -230,6 +262,11 @@ where
                     gf.membership_resource_type(),
                     GroupSelection::Direct(group_values),
                 ) else {
+                    warn_group_filter_denied(
+                        "InGroup",
+                        gf.property(),
+                        "empty membership resource type (untyped filter)",
+                    );
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
@@ -238,6 +275,11 @@ where
             ScopeFilter::InGroupSubtree(sf) => {
                 let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
                 else {
+                    warn_group_filter_denied(
+                        "InGroupSubtree",
+                        sf.property(),
+                        "non-UUID ancestor_ids",
+                    );
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
@@ -258,6 +300,11 @@ where
                     sf.membership_resource_type(),
                     GroupSelection::Subtree(Box::new(closure_subquery)),
                 ) else {
+                    warn_group_filter_denied(
+                        "InGroupSubtree",
+                        sf.property(),
+                        "empty membership resource type (untyped filter)",
+                    );
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
@@ -533,7 +580,47 @@ mod tests {
         );
     }
 
+    /// Unlike the legacy tests below (which deny earlier, at the
+    /// constraint-shape guard, because they lack a tenant filter), this scope
+    /// is well-formed apart from the missing membership type — so it reaches
+    /// `typed_membership_condition`'s empty-type arm and pins that THAT arm
+    /// denies, without ever emitting a membership subquery.
     #[test]
+    #[allow(deprecated)]
+    fn test_untyped_group_filter_with_tenant_denies_at_membership_arm() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_id = uuid::Uuid::new_v4();
+        let group_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+        let subtree_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+
+        for scope in [&group_scope, &subtree_scope] {
+            let cond = build_scope_condition::<custom_prop_entity::Entity>(scope);
+            let cond_str = format!("{cond:?}");
+            assert!(
+                cond_str.contains("Value(Bool(Some(false)))"),
+                "an untyped group filter must fail closed at the membership arm, got: {cond_str}"
+            );
+            assert!(
+                !cond_str.contains("resource_group_membership"),
+                "no membership subquery may be emitted for an untyped filter, got: {cond_str}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn test_legacy_untyped_in_group_filter_denies_all() {
         let group_id = uuid::Uuid::new_v4();
         let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group(
@@ -580,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_legacy_untyped_in_group_subtree_filter_denies_all() {
         let ancestor_id = uuid::Uuid::new_v4();
         let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_subtree(
