@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -807,6 +807,28 @@ test-coord-pg: install-tools
 ## consumer is the example server's release build, which never runs a test.
 test-fixtures-narrow: install-tools
 	cargo nextest run -p cf-gears-bss-fixtures --no-default-features --test production_surface
+
+## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
+## suites (Docker required; each spins up its own redis container via
+## testcontainers — see
+## gears/system/cluster/plugins/redis-cluster-plugin/docs/TESTING.md §7).
+##
+## Several container shapes run per PR, all single-node: a stock server (declares
+## EventuallyConsistent), an `--appendonly yes --appendfsync always` node (declares
+## Linearizable, which the leader-election conformance suite requires), and the
+## variants the declaration-and-environment scenarios need — no keyspace
+## notifications, an unsafe `maxmemory-policy`, a tiny `maxmemory` that forces real
+## eviction, `appendfsync everysec`, a `CONFIG`-denied ACL user, and one Redis 6.
+## The Sentinel and 3-node Cluster fixtures run here too — `RD-SPEC-002` on
+## Sentinel, `RD-SPEC-008/009/010` and `RD-LOCK-014` on the Cluster. A quorum or a
+## slot assignment costs tens of seconds, but nextest overlaps that startup with
+## the rest of the suite, so it is not wall clock the run as a whole pays.
+##
+## `--retries 1` for the same reason as test-cluster-pg: container setup is
+## load-sensitive on a busy host, and a genuine logic regression fails both
+## attempts, so this absorbs Docker churn without masking one.
+test-cluster-redis: install-tools
+	cargo nextest run -p cf-redis-cluster-plugin --features integration --retries 1
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
