@@ -27,8 +27,8 @@ date: 2026-05-07
 
 ## Context and Problem Statement
 
-Three QE background tasks — `LeaseSweeper`, `RetentionSweeper`, `NotificationDispatcher` — must run as cluster-wide
-singletons: only one replica may sweep expired leases / reclaim retention rows / drain the notification outbox at a
+Two QE background tasks — `LeaseSweeper`, `RetentionSweeper` — must run as cluster-wide
+singletons: only one replica may sweep expired leases / reclaim retention rows at a
 time, otherwise duplicate work and at-least-once-becomes-at-least-twice semantics emerge. The singleton property is not
 just a performance hint: it underpins `cpt-cf-quota-enforcement-nfr-recovery` (RTO ≤ 15 min — a dead leader's slot must
 be re-acquirable within at most one TTL by any survivor).
@@ -43,7 +43,8 @@ Question: where should this primitive live in the QE-core contract surface?
 
 ## Decision Drivers
 
-- **Sweeper / dispatcher singleton coordination** for `LeaseSweeper`, `RetentionSweeper`, `NotificationDispatcher`.
+- **Sweeper singleton coordination** for `LeaseSweeper` and `RetentionSweeper`. (The `NotificationDispatcher` was
+  later moved to the `toolkit-db` Outbox leased-handler model, whose DB lease provides its fencing — see DESIGN §3.2.)
 - **NFR recovery (RTO ≤ 15 min)** — a crashed leader's lock MUST become acquirable within at most one TTL
   (`cpt-cf-quota-enforcement-nfr-recovery`).
 - **Storage plugin contract minimality** — the storage trait already carries 13 invariants and ~20 methods; conflating
@@ -70,7 +71,7 @@ operator-deployment decision rather than a QE-core or storage-plugin code change
 orchestration dependency on small deployments.
 
 The trait surface is intentionally minimal: three methods (`try_lock`, `renew`, `release`), a closed `LockScope` enum
-(`LeaseSweeper` / `RetentionSweeper` / `NotificationDispatcher`), an opaque `Lock` holder token, and a closed
+(`LeaseSweeper` / `RetentionSweeper`), an opaque `Lock` holder token, and a closed
 `CoordinationError` enum. TTL-bounded auto-release is an inviolable contract property — a lock MUST NOT outlive its TTL
 even if the holder process crashes silently. Bootstrap-time reachability is validated via a `try_lock` + `release` probe
 on each `LockScope::*` value (DESIGN §3.7); the contract has no separate health-check method. Full surface in DESIGN
@@ -90,7 +91,8 @@ auto-release.
 ### Consequences
 
 - `quota-enforcement-coordination-plugin` ships as its own crate alongside `quota-enforcement-storage-plugin`. Both are
-  consumed by sweepers / dispatcher through ClientHub.
+  consumed through ClientHub; the coordination plugin's consumers are the two sweepers (the notification dispatcher is
+  fenced by the `toolkit-db` Outbox lease instead).
 - The trait travels in `quota-enforcement-sdk` so plugin authors implement against a single dependency (parallel to
   `QuotaEnforcementStoragePluginV1`, `QuotaResolutionEngineV1`, `QuotaNotificationSinkV1`).
 - Bootstrap MUST run a `try_lock` + `release` reachability probe for each `LockScope::*` value before the gear joins
@@ -154,7 +156,7 @@ the survivor acquires the lock within ≤ 1 TTL (RTO ≤ 15 min per `cpt-cf-quot
 
 - DESIGN §3.2 "Component model" — `CoordinationPlugin` component definition.
 - DESIGN §3.3 "Coordination Plugin Trait" — full trait surface, domain types, and semantic guarantees.
-- DESIGN §3.6 "Sequences" — sweeper / dispatcher acquire / renew / fallback flows.
+- DESIGN §3.6 "Sequences" — sweeper acquire / renew / fallback flows.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — defines the pluggable storage contract; the default
   coordination impl piggybacks on the deployed storage plugin's locking primitives (whichever backend the plugin uses).
 
@@ -171,7 +173,8 @@ This decision directly addresses:
   within at most one TTL.
 - `cpt-cf-quota-enforcement-fr-lease-timeout` — `LeaseSweeper` consumes the coordination contract for singleton
   execution.
-- `cpt-cf-quota-enforcement-fr-notification-plugin` — `NotificationDispatcher` consumes the coordination contract for
+- `cpt-cf-quota-enforcement-fr-notification-plugin` — the `NotificationDispatcher` is fenced by the `toolkit-db`
+  Outbox lease rather than this contract; retained here for the history of the
   singleton outbox draining.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — the default coordination impl piggybacks on the storage
   backend's locking primitives.

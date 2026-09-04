@@ -121,7 +121,7 @@ to the contract.
 - The capability contract (DESIGN §3.5 + I1–I13) is the single point of evolution. Changes to the contract are
   major-version bumps of `QuotaEnforcementStoragePluginV1`; backwards-compatible additive changes are allowed within a
   major.
-- Sweeper / dispatcher singleton coordination is **out of scope** of this contract; it lives in
+- Sweeper singleton coordination is **out of scope** of this contract; it lives in
   `cpt-cf-quota-enforcement-adr-coordination-plugin`. Storage and coordination plugins evolve independently.
 
 ### Confirmation
