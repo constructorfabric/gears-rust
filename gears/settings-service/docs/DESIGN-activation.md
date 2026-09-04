@@ -590,10 +590,22 @@ Most of this system is an in-process SDK contract. The **only** REST surface is 
 
 | Method | Endpoint | Description | Idempotency |
 |--------|----------|-------------|-------------|
-| `GET` | `/settings-service/v1/change-sets/{change_set_id}/activation` | Activation-facet state: `overall_status` (`awaiting`/`success`/`failed`/`superseded`/`cancelled`), `expected_records`, `succeeded_records`/`failed_records`/`superseded_records`/`cancelled_records`/awaiting counts, per-subscriber responses, per-setting confirmation | Yes |
-| `GET` | `/settings-service/v1/change-sets/{change_set_id}/activation/responses` | List all `BackResponse` entries for this change set (who responded, for which key, when, what status) | Yes |
+| `GET` | `/settings-service/v1/change-sets/{change_set_id}/activation` | Activation-facet state **over the members the caller may see** (*Reading a change set the caller sees only part of*, below): `overall_status` (`awaiting`/`success`/`failed`/`superseded`/`cancelled`), `expected_records`, `succeeded_records`/`failed_records`/`superseded_records`/`cancelled_records`/awaiting counts, per-subscriber responses, per-setting confirmation | Yes |
+| `GET` | `/settings-service/v1/change-sets/{change_set_id}/activation/responses` | `BackResponse` entries for this change set (who responded, for which key, when, what status), **for the settings the caller may see** | Yes |
 
 Both are `OperationBuilder` declarations like every other route in the gear — method, versioned `/settings-service/v1/…` path, `operation_id`, `.authenticated()`, licence posture, response schema and registered errors, collected by `OpenApiRegistry` (DESIGN.md §4.3). Neither is anonymous.
+
+**Reading a change set the caller sees only part of.** A change set is written by whoever performs the `set`, and a caller writing into a descendant tenant produces a change set inside **that** tenant's subtree — so an administrator may read a change set someone above them assembled, whose members include settings **hidden from them** (DESIGN.md §4.1 *TenantPermission*). The PRD's rule is that such a setting is absent from every administrative read path, and these two endpoints are administrative read paths.
+
+So the facet is served **over the members the caller may see**, and that is the definition of every field on it rather than a filter applied to a wider answer:
+
+- `/responses` lists entries for visible settings only; a hidden member contributes no row.
+- The counts — `expected_records`, `succeeded_records` and the rest — are computed over those same members.
+- `overall_status` is the status **of that set**. `success` means every member the caller can see was activated; it does not claim anything about members they cannot.
+
+**Consistency is the reason the counts are filtered too, not the counts themselves.** A count is weak on its own — it names nothing. But a truthful count beside a filtered list is worse than either: the reader sees `expected_records = 10` against seven rows and learns precisely what was withheld, including how much of it. Watched over time, the discrepancy also reports how often the ancestor changes settings the reader cannot see. One consistent view discloses neither, and it is the same rule the settings listing already follows (DESIGN.md §4.8 *Listing under a narrowed grant*: absent, not marked, and not counted in the total).
+
+**Nothing is hidden from anyone who could act on it.** A member the caller cannot see was written by an ancestor, and that ancestor — like the platform administrator — sees the whole change set, its keys and its failures. A hidden member that fails to activate is therefore visible to exactly the party able to diagnose it, while the caller is not shown an alarm they can neither explain nor clear.
 
 **Why activation is a resource of its own.** "Did the values commit" is answered by the `set` response itself, synchronously, per change (DESIGN.md §4.2 *Value Writer*). "Did the consumers activate" cannot be: the wait is unbounded (§3.1), so it needs a resource that outlives the request. This one is keyed by `change_set_id` — a **correlation id**, §4.7 — and the Settings Service stores nothing else under that id, so this facet owns its whole lifecycle. One gear serves both sides (Settings Activation is part of the Settings Service, §1).
 
@@ -767,7 +779,7 @@ Mirrors the Settings Service model (design DESIGN.md §4.8); enforced server-sid
 
 | Operation | Required permission | Scope | Unauthorized |
 |-----------|---------------------|-------|--------------|
-| Read activation facet / responses (`GET /settings-service/v1/change-sets/{change_set_id}/activation`, `…/responses`) | `read` on `gts.cf.core.settings.change_set.v1~` | The change set's tenant subtree | `404` if not visible |
+| Read activation facet / responses (`GET /settings-service/v1/change-sets/{change_set_id}/activation`, `…/responses`) | `read` on `gts.cf.core.settings.change_set.v1~`; the facet is then served over the **members the caller may see**, counts and `overall_status` included (§4.3 *Reading a change set the caller sees only part of*) | The change set's tenant subtree | `404` if not visible |
 | Emit back-response (SDK `report_outcome` → `activation_success`/`activation_failed` broker event — **not REST**) | **Trusted subscriber** — attributed to the subscriber identity, **not** independently verified (DESIGN.md §6); valid within the deployment trust boundary | — | — |
 
 - **AuthN:** the two read endpoints (§4.3) take an ordinary user/session bearer, gated by RBAC as above. There are **no internal REST endpoints** and **no effects/ack REST** — the publisher publishes in-process (`cache_invalidate` inline; `change_notification` from await-records, §4.2 *Change Set Publisher*/§4.2 *Event Broker Client*), and delivery + acknowledgement are Event-Broker events (§4.2 *Change Set Publisher*/§4.2 *Cache Invalidation Broadcast*), so this design introduces **no platform service-token surface**.
@@ -927,6 +939,8 @@ They are design anchors rather than SLAs: they size the delivery queue (`change_
 |---|---|---|
 | Activation status | `GET /settings-service/v1/change-sets/{change_set_id}/activation` | Correct `overall_status` + succeeded/failed/superseded/cancelled/awaiting record counts |
 | List responses | `GET /settings-service/v1/change-sets/{change_set_id}/activation/responses` | All back-responses for the change set (per subscriber/key) |
+| Partial visibility — hidden members are absent | a change set mixing a setting visible to the caller with one hidden from it, read by that caller | `/responses` carries the visible key only; `expected_records` and the other counts cover the visible member alone; `overall_status` reflects it and nothing else. The same read by the platform administrator carries both (§4.3 *Reading a change set the caller sees only part of*) |
+| Partial visibility — a hidden failure raises no alarm downstream | the hidden member fails to activate, the visible one succeeds | The caller sees `success`; the ancestor that wrote the change set sees the failure and the key |
 | AuthZ deny | `GET …/activation` + `DenyingAuthZClient` | 403 |
 | RFC 9457 errors | trigger each category | `type`/`title`/`status`/`detail` present |
 
