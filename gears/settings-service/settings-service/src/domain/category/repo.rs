@@ -183,9 +183,9 @@ pub trait CategoryRepository: Send + Sync {
     /// [`DomainError`] when the check fails. A failure denies the delete: the
     /// guard exists to prevent an orphan, and an unanswerable check is not a
     /// negative answer.
-    async fn has_referencing_declarations<C: DBRunner>(
+    async fn count_referencing_declarations<C: DBRunner>(
         &self,
         conn: &C,
         id: Uuid,
-    ) -> Result<bool, DomainError>;
+    ) -> Result<u64, DomainError>;
 }

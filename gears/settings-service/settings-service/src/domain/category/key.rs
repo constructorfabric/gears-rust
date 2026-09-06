@@ -2,10 +2,11 @@
 // @cpt-dod:cpt-cf-settings-service-dod-category-management-key-format:p1
 //! The category key value object.
 //!
-//! A category key is not a display label. It becomes the **category segment of
+//! A category key is not a display label. It becomes the **category token of
 //! every setting key declared under it** — the `network` in
-//! `acme.settings.network.enable_proxy.v1` — so its shape is constrained by the
-//! GTS instance-id grammar rather than by presentation.
+//! `…setting_type.v1~acme.settings.network.enable_proxy.v1~` — so its shape is
+//! constrained by the GTS grammar of the key's derived half rather than by
+//! presentation.
 //!
 //! That is why `/` is rejected. A key carrying a separator would suggest nesting
 //! the grammar cannot express: a setting key has exactly one category segment,

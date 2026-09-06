@@ -3,7 +3,7 @@
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 and DESIGN.md §4.3
 //! *Error Response Format* — every 4xx/5xx carries `type` as a `gts://` URI,
-//! `title`, `status`; every 422 carries field-level detail; an unrecognized
+//! `title`, `status`; every validation rejection carries field-level detail; an unrecognized
 //! error maps to 500 without leaking an internal message.
 //!
 //! `trace_id` is not asserted here: the platform takes it from the ambient
@@ -34,7 +34,7 @@ fn every_variant_carries_the_required_members() {
             detail: "already there".to_owned(),
         },
         DomainError::Unauthorized {
-            resource: "gts.cf.toolkit.settings.category.v1~",
+            resource: "gts.cf.core.settings.category.v1~",
         },
         DomainError::NotFound {
             resource: "declaration",
@@ -71,7 +71,7 @@ fn every_variant_carries_the_required_members() {
 
 #[test]
 fn a_validation_failure_carries_field_level_detail() {
-    // The 422 contract: a caller must be able to point at the offending field
+    // The validation contract: a caller must be able to point at the offending field
     // and dispatch on a stable code rather than parsing prose.
     let doc = problem(DomainError::Validation {
         field: "value".to_owned(),
@@ -112,10 +112,10 @@ fn a_denial_does_not_disclose_whether_the_target_exists() {
     // Two denials for different settings must be byte-identical, or a caller
     // without entitlement can enumerate the settings tree by diffing responses.
     let first = problem(DomainError::Unauthorized {
-        resource: "gts.cf.toolkit.settings.category.v1~",
+        resource: "gts.cf.core.settings.category.v1~",
     });
     let second = problem(DomainError::Unauthorized {
-        resource: "gts.cf.toolkit.settings.category.v1~",
+        resource: "gts.cf.core.settings.category.v1~",
     });
     assert_eq!(first, second);
 
@@ -145,7 +145,7 @@ fn the_conversion_is_total() {
     for case in [
         DomainError::validation("x"),
         DomainError::Unauthorized {
-            resource: "gts.cf.toolkit.settings.category.v1~",
+            resource: "gts.cf.core.settings.category.v1~",
         },
         DomainError::Internal {
             diagnostic: String::new(),

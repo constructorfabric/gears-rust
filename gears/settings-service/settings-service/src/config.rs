@@ -18,16 +18,21 @@
 //! Fields that carry a value fixed by the design, rather than by the deployment,
 //! may default — [`SettingsServiceConfig::cache_ttl_seconds`] is the only one.
 //!
-//! # Step-up configuration is not here
+//! # Step-up configuration is not here yet
 //!
-//! An earlier draft required a JWKS endpoint and a step-up freshness window.
-//! Neither traces to a PRD requirement, and the freshness window was actively
-//! harmful: `cpt-cf-settings-service-fr-apply-preview-stepup` requires
-//! credential re-verification before **every** Apply, unconditionally, so a
-//! deployment-tunable staleness allowance is a knob for weakening a requirement
-//! that has no carve-out. DESIGN.md §4.2 also assigns the step-up contract to
-//! the `authn-resolver` gear, which this service resolves rather than defines —
-//! so whatever configuration verification needs arrives with that contract.
+//! Step-up is gated per declaration (`requires_step_up`, default required —
+//! `cpt-cf-settings-service-fr-service-writes`) and enforced on interactive writes
+//! and behavior-affecting declaration actions (`cpt-cf-settings-service-fr-authn-role-gating`).
+//! DESIGN.md §4.2 *Value Writer* fixes the R1 check: the presented token's
+//! signature against the identity provider's JWKS, `sub` matching the session, and
+//! `auth_time` within the step-up freshness window — a binding behind a
+//! ClientHub-resolved `StepUpVerifier` port owned by this gear. Two values are
+//! deployment configuration and, per DESIGN.md §4.9, load at gear init: the
+//! provider's **JWKS endpoint**, and the **freshness window**, which
+//! `cpt-cf-settings-service-fr-validate-before-set` makes deployment-configured
+//! and DESIGN caps at five minutes. Both arrive with the verifier binding in
+//! DECOMPOSITION entry 2.8; declaring them before anything reads them would be
+//! configuration nobody can validate.
 
 use serde::Deserialize;
 

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use toolkit_db::secure::DBRunner;
 use toolkit_security::SecurityContext;
 
-use crate::audit::{AuditEmitter, AuditRecord, AuditScope, AuditValue};
+use crate::audit::{AuditEmitter, AuditRecord, AuditValue};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -20,30 +20,7 @@ use super::visibility::{self, DomainVisibility};
 use super::{Category, CategoryDraft, CategoryPatch, CategoryRepository};
 use crate::api::precondition::{self, ETag};
 use crate::domain::error::DomainError;
-
-/// Refuse query options this resource does not implement.
-///
-/// `$select` is parsed by the platform but not honoured here: supporting it
-/// means a response whose shape varies per request, and no caller has asked
-/// for it. Refusing is deliberate rather than ignoring — a caller whose
-/// projection was silently dropped receives every field believing it asked for
-/// two, which is the same failure the declared filter surface exists to
-/// prevent.
-///
-/// # Errors
-/// [`DomainError::Validation`] naming the unsupported option.
-fn reject_unsupported_options(query: &toolkit_odata::ODataQuery) -> Result<(), DomainError> {
-    if query.select.is_some() {
-        return Err(DomainError::Validation {
-            field: "$select".to_owned(),
-            code: crate::field::ODATA_UNSUPPORTED_OPTION,
-            message: "$select is not supported on categories; omit it to receive the full \
-                      representation"
-                .to_owned(),
-        });
-    }
-    Ok(())
-}
+use crate::domain::platform_scope::PlatformScope;
 
 /// Who performed a mutation and under which request.
 ///
@@ -78,6 +55,11 @@ fn snapshot(category: &Category) -> serde_json::Value {
 pub struct CategoryService<R> {
     repo: R,
     audit: Arc<dyn AuditEmitter>,
+    /// Where the root tenant's id comes from. Categories are platform-scoped,
+    /// and platform scope is that id rather than an absent tenant (DESIGN.md
+    /// §4.1) — asked for at the first mutation, since the Tenant Resolver is
+    /// fetched at first use and never during init (DESIGN.md §4.9).
+    scope: Arc<dyn PlatformScope>,
 }
 
 impl<R: CategoryRepository> CategoryService<R> {
@@ -87,8 +69,8 @@ impl<R: CategoryRepository> CategoryService<R> {
     /// "no audit configured" a supported state, and a mutation could then
     /// succeed leaving no trail — which is precisely what DESIGN.md §4.2's
     /// fail-closed rule forbids.
-    pub fn new(repo: R, audit: Arc<dyn AuditEmitter>) -> Self {
-        Self { repo, audit }
+    pub fn new(repo: R, audit: Arc<dyn AuditEmitter>, scope: Arc<dyn PlatformScope>) -> Self {
+        Self { repo, audit, scope }
     }
 
     /// Record a mutation, failing the operation if the trail cannot be written.
@@ -101,10 +83,12 @@ impl<R: CategoryRepository> CategoryService<R> {
         actor: Actor<'_>,
     ) -> Result<(), DomainError> {
         // Categories are platform-global -- the table has no tenant column --
-        // so their audit scope is the platform row rather than a tenant's.
+        // so their audit scope is the root tenant's, which is platform scope.
+        // A mutation that cannot name its scope does not proceed.
+        let tenant = self.scope.root_tenant().await?;
         let mut rec = AuditRecord::new(
             key.as_str(),
-            AuditScope::Platform,
+            tenant,
             actor.ctx.subject_id().to_string(),
             action,
             actor.request_id,
@@ -177,7 +161,7 @@ impl<R: CategoryRepository> CategoryService<R> {
         scope: &AccessScope,
         query: &toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<Category>, DomainError> {
-        reject_unsupported_options(query)?;
+        crate::domain::odata::reject_unsupported_options(query, "categories")?;
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-6
         let visible = visibility::domain_visibility(scope);
         // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-6
@@ -301,6 +285,7 @@ impl<R: CategoryRepository> CategoryService<R> {
         // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-6
 
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-8
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-4
         // Advisory, by design. The foreign key's `ON DELETE RESTRICT` is the
         // authoritative guard and catches a declaration created between this
         // check and the delete; what this adds is a specific message instead of
@@ -308,15 +293,23 @@ impl<R: CategoryRepository> CategoryService<R> {
         //
         // The check answering `Err` still denies: the guard exists to prevent an
         // orphan, and an unanswerable question is not a negative answer.
-        let referenced = self.repo.has_referencing_declarations(conn, id).await?;
+        let referencing = self.repo.count_referencing_declarations(conn, id).await?;
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-4
         // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-8
 
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-9
-        if referenced {
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-3
+        // The count travels into the message: an administrator who must clear
+        // the category first is told how much is in the way, not merely that
+        // something is.
+        if referencing > 0 {
             return Err(DomainError::Conflict {
-                detail: "the category still has declarations referencing it".to_owned(),
+                detail: format!(
+                    "the category still has {referencing} declaration(s) referencing it"
+                ),
             });
         }
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-3
         // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-9
 
         self.repo.delete(conn, scope, id).await?;

@@ -1,5 +1,5 @@
 // Created: 2026-08-13 by Constructor Tech
-//! A tracing-backed stand-in for the platform audit destination.
+//! A tracing-backed interim for the gear-local audit store.
 
 use async_trait::async_trait;
 use tracing::info;
@@ -9,18 +9,19 @@ use crate::domain::error::DomainError;
 
 /// Records audit entries to structured tracing.
 ///
-/// # This is not the platform Audit Subsystem
+/// # This is not the audit store
 ///
-/// DESIGN.md §4.2 requires a **synchronous, fail-closed** write to the
-/// platform's immutable external Audit Subsystem, and §4.3 serves per-`(setting,
-/// scope)` history by querying it on the canonical resource id. A log line is
-/// neither immutable nor queryable that way, so this does not satisfy
-/// `cpt-cf-settings-service-dod-category-management-audit`, which stays open.
+/// DESIGN.md §4.2 *Audit Emitter* requires, in R1, a **gear-local sink** that
+/// writes the record inside the mutation's own transaction, fail-closed, into the
+/// `audit_records` table this gear owns; §4.3 serves per-`(setting, scope)`
+/// history from that table on the canonical resource id. The platform Audit
+/// Subsystem is R2, reached through the platform outbox. A log line is neither
+/// transactional nor queryable, so this does not satisfy
+/// `cpt-cf-settings-service-dod-category-management-audit`, which stays open
+/// until the table and its emitter land.
 ///
-/// It exists because no audit client exists anywhere in the workspace — the
-/// subsystem is external (`Container_Ext` in the C4 model) and nothing binds to
-/// it. Without an emitter the mutation endpoints could not be exercised at all,
-/// and an endpoint nobody can call is not one anybody has verified.
+/// It exists so the mutation endpoints can be exercised before then — an
+/// endpoint nobody can call is not one anybody has verified.
 ///
 /// # Confidentiality is weaker here than in the real destination
 ///

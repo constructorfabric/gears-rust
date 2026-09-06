@@ -13,13 +13,13 @@ use super::{SettingsError, not_found_resource};
 use crate::gts::{CATEGORY_SCHEMA, DECLARATION_SCHEMA, VALUE_SCHEMA};
 use crate::precondition::SETTING_RETIRED;
 
-#[resource_error("gts.cf.toolkit.settings.declaration.v1~")]
+#[resource_error("gts.cf.core.settings.declaration.v1~")]
 struct DeclarationScope;
 
-#[resource_error("gts.cf.toolkit.settings.value.v1~")]
+#[resource_error("gts.cf.core.settings.value.v1~")]
 struct ValueScope;
 
-#[resource_error("gts.cf.toolkit.settings.category.v1~")]
+#[resource_error("gts.cf.core.settings.category.v1~")]
 struct CategoryScope;
 
 fn problem_json(err: CanonicalError) -> serde_json::Value {

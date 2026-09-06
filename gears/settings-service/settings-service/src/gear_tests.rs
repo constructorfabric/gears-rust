@@ -58,6 +58,15 @@ fn the_gear_hands_its_migrations_to_the_capability() {
 }
 
 #[test]
+fn an_uninitialized_gear_refuses_to_hand_out_the_types_registry() {
+    // The registry is the one client resolved at init -- the one `deps` entry
+    // -- because a read that reached the database before discovering the
+    // registry is missing has already spent the authorization and the query.
+    let gear = SettingsService::default();
+    assert!(gear.types().is_err());
+}
+
+#[test]
 fn an_uninitialized_gear_refuses_to_hand_out_the_enforcer() {
     // Handing back a permissive default here would turn every unenforced
     // handler into an allow. There is no default to hand back.

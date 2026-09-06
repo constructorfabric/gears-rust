@@ -2,58 +2,72 @@
 // @cpt-algo:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1
 //! The setting key value object.
 //!
-//! A setting key is a GTS instance identifier made of exactly two segments:
-//! `<value-type>~<setting-instance-id>`. The first segment is a curated value
-//! type terminated by `~`; the second is the setting's own instance id and
-//! carries no trailing `~`.
+//! A setting key is a GTS **type** identifier made of exactly two segments: the
+//! abstract base type every setting derives from, then the setting's own derived
+//! half. Both segments are types and both end with `~`.
 //!
 //! ```text
-//! gts.cf.settings.types.bool_flag.v1~acme.settings.network.enable_proxy.v1
-//!  seg1 vendor=cf   package=settings ns=types   type=bool_flag
-//!                        seg2 vendor=acme package=settings ns=network type=enable_proxy
+//! gts.cf.core.settings.setting_type.v1~acme.settings.network.enable_proxy.v1~
+//! └────── base type, owned by this gear ─────┘└─ derived half: vendor.package.category.name ─┘
 //! ```
+//!
+//! The derived half carries exactly four name tokens before its version, with
+//! **the category always third**. An admin-authored setting is composed as
+//! `<vendor>.settings.<category>.<name>.v1`; a module supplies its own half and
+//! the category is read from the same position. The trailing `~` is what makes
+//! the key a type rather than an instance — and a type is what a policy can name
+//! as its resource, which an instance identifier could not be (ADR-002).
+//!
+//! The value's **shape** is not in the key. It is a separate curated catalog type
+//! (`gts.cf.toolkit.settings.type_*~`) named by the declaration's `value_type_id`,
+//! so a value-shape change is an evolution of the same setting, not a new key.
 //!
 //! Grammar validation is delegated to `gts-id`, the platform's single source of
 //! truth for GTS identifiers. This module adds only the rules `gts-id` cannot
-//! know about: that a setting key is exactly a type followed by an instance,
-//! and where the category and leaf name sit within the instance segment.
-//!
-//! Catalog membership of the value type — that it comes from
-//! `gts.cf.settings.types.*~` — is deliberately not checked here. Resolving it
-//! requires the types registry, so it belongs to declaration creation.
+//! know about: that a setting key is exactly the base followed by one derived
+//! type, and where the category and leaf name sit within the derived half.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use crate::gts::SETTING_TYPE_BASE;
+
 /// Terminator that marks the end of a GTS **type** segment.
 pub const TYPE_TERMINATOR: char = '~';
 
-/// Number of segments a setting key must have: a value type and an instance.
+/// Number of segments a setting key must have: the base type and the derived half.
 const SETTING_KEY_SEGMENTS: usize = 2;
 
 /// Why a candidate setting key was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SettingKeyError {
-    /// The identifier is not a value type followed by an instance id.
+    /// The identifier is not the base type followed by exactly one derived half.
     #[error(
-        "a setting key must be a value type followed by an instance id ({SETTING_KEY_SEGMENTS} segments), got {count}"
+        "a setting key is the setting base type followed by one derived half ({SETTING_KEY_SEGMENTS} segments), got {count}"
     )]
     SegmentCount {
         /// How many GTS segments the identifier actually had.
         count: usize,
     },
 
-    /// The first segment is not a GTS type.
-    #[error("the value-type half must be a GTS type, so it must end with `{TYPE_TERMINATOR}`")]
-    ValueTypeNotAType,
+    /// The first segment is not the setting base type this gear owns.
+    #[error("a setting key derives from `{SETTING_TYPE_BASE}`, not from `{found}`")]
+    WrongBaseType {
+        /// The base segment the candidate actually carried.
+        found: String,
+    },
 
-    /// The second segment ends with `~`, making it a type rather than an instance.
+    /// The derived half does not end with `~`, so it is an instance, not a type.
+    ///
+    /// A setting is a GTS *type* on purpose: a policy names one setting as its
+    /// resource, and only a type can be a policy resource. An instance-shaped
+    /// half would silently produce a key nothing can be authorized against.
     #[error(
-        "the instance half must not end with `{TYPE_TERMINATOR}`; a trailing terminator marks a GTS type"
+        "the derived half must end with `{TYPE_TERMINATOR}`: a setting is a GTS type so that a policy can name it"
     )]
-    TrailingSeparator,
+    DerivedNotAType,
 
     /// The identifier as a whole is not a valid GTS id.
     #[error("invalid GTS identifier: {cause}")]
@@ -75,13 +89,13 @@ pub enum SettingKeyError {
         cause: String,
     },
 
-    /// The instance half is an anonymous UUID rather than an authored name.
+    /// The derived half carries no authored category and leaf name.
     ///
-    /// GTS allows a trailing UUID tail for machine-generated instances. A
-    /// setting is not one: its category and leaf name are what an administrator
-    /// browses and a module author writes down, and a UUID supplies neither.
-    #[error("a setting key names its instance; an anonymous UUID instance has no category or leaf")]
-    AnonymousInstance,
+    /// GTS allows a UUID tail for machine-generated identifiers. A setting is not
+    /// one: its category and leaf name are what an administrator browses and a
+    /// module author writes down, and a UUID supplies neither.
+    #[error("a setting key names its category and leaf; an anonymous derived half has neither")]
+    AnonymousDerivedHalf,
 
     /// The candidate carries leading or trailing whitespace.
     ///
@@ -125,11 +139,11 @@ impl From<gts_id::GtsIdError> for SettingKeyError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SettingKey {
     raw: String,
-    /// Byte index of the `~` that terminates the value-type segment.
+    /// Byte index of the `~` that terminates the base-type segment.
     separator: usize,
-    /// Namespace token of the instance segment: the owning category's slug.
+    /// Namespace token of the derived half: the owning category's slug.
     category: String,
-    /// Type token of the instance segment: the setting's own leaf name.
+    /// Type token of the derived half: the setting's own leaf name.
     leaf: String,
 }
 
@@ -139,7 +153,8 @@ impl SettingKey {
     /// # Errors
     ///
     /// Returns [`SettingKeyError`] when the candidate is not a valid GTS
-    /// identifier, or is valid but is not a value type followed by an instance.
+    /// identifier, or is valid but is not the setting base type followed by one
+    /// derived type.
     pub fn parse(raw: &str) -> Result<Self, SettingKeyError> {
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-1
         // Wildcards are a pattern-matching feature; a concrete setting key never has one.
@@ -156,7 +171,7 @@ impl SettingKey {
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-1
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-3
-        let [value_type, instance] = segments.as_slice() else {
+        let [base, derived] = segments.as_slice() else {
             return Err(SettingKeyError::SegmentCount {
                 count: segments.len(),
             });
@@ -164,45 +179,49 @@ impl SettingKey {
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-3
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-4
-        if !value_type.is_type() {
-            return Err(SettingKeyError::ValueTypeNotAType);
+        // The base is fixed, not merely "some type": every setting derives from
+        // the one abstract type this gear registers at init, and a key rooted
+        // anywhere else is not a setting whatever else it may be.
+        //
+        // Compared on the candidate's own bytes rather than on the parsed
+        // segment: `gts-id` renders a segment without its `gts.` prefix, and the
+        // constant is the wire form a caller can read off a policy or an audit
+        // record.
+        let separator = raw
+            .find(TYPE_TERMINATOR)
+            .ok_or(SettingKeyError::DerivedNotAType)?;
+        let found = &raw[..=separator];
+        if found != SETTING_TYPE_BASE {
+            return Err(SettingKeyError::WrongBaseType {
+                found: found.to_owned(),
+            });
         }
+        debug_assert!(base.is_type(), "the base compared equal to a type");
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-4
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-5
-        if instance.is_type() {
-            return Err(SettingKeyError::TrailingSeparator);
+        if !derived.is_type() {
+            return Err(SettingKeyError::DerivedNotAType);
         }
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-5
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-6
-        // The instance segment's namespace token is the owning category and its
-        // type token is the leaf name, for admin and module authors alike.
+        // The derived half's namespace token is the owning category and its type
+        // token is the leaf name, for admin and module authors alike.
         //
-        // An anonymous-instance UUID tail carries neither: `namespace()` and
-        // `type_name()` answer `""` for it, so accepting one would produce a key
-        // with an empty category and leaf that still compared equal to itself.
-        // A setting is named by its author, never generated.
+        // A UUID tail carries neither: `namespace()` and `type_name()` answer
+        // `""` for it, so accepting one would produce a key with an empty
+        // category and leaf that still compared equal to itself. A setting is
+        // named by its author, never generated.
         let (Some(category), Some(leaf)) = (
-            non_empty(instance.namespace()),
-            non_empty(instance.type_name()),
+            non_empty(derived.namespace()),
+            non_empty(derived.type_name()),
         ) else {
-            return Err(SettingKeyError::AnonymousInstance);
+            return Err(SettingKeyError::AnonymousDerivedHalf);
         };
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-6
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1:inst-gf-key-7
-        // The value-type segment ends with its terminator, and the checks above
-        // established there are exactly two segments of which the first is the
-        // type — so the first terminator in the candidate is the split point.
-        //
-        // Located in the candidate rather than derived from segment lengths:
-        // `gts-id` reports segment #1 without the `gts.` prefix, and any future
-        // change to how a segment renders itself would silently shift an
-        // arithmetic offset while this stays correct.
-        let separator = raw
-            .find(TYPE_TERMINATOR)
-            .ok_or(SettingKeyError::ValueTypeNotAType)?;
         Ok(Self {
             raw: raw.to_owned(),
             separator,
@@ -214,27 +233,45 @@ impl SettingKey {
 
     /// Compose an admin-authored key.
     ///
-    /// Builds the instance id as `<vendor>.settings.<category>.<name>.v1` and
-    /// joins it to `value_type`, which must already end with `~`.
+    /// Builds the derived half as `<vendor>.settings.<category>.<name>.v1~` and
+    /// roots it under the setting base type. The value type is **not** an input:
+    /// the value's shape is a separate catalog type named by the declaration's
+    /// `value_type_id`, so the same key survives a value-shape change.
+    ///
+    /// The category slug sits **inside** the key, which makes the key a function
+    /// of its category: moving a setting to another category, or renaming the
+    /// category itself, re-keys the setting, and no alias to the old key is
+    /// retained. That is why a category key is refused on update rather than
+    /// merely discouraged — an in-place change would re-key every declaration
+    /// filed under it with nothing left pointing at the old name.
     ///
     /// # Errors
     ///
-    /// Returns [`SettingKeyError`] when `value_type` is not a GTS type, or when
-    /// the composed key is not a valid setting key.
-    pub fn compose(
-        value_type: &str,
-        vendor: &str,
-        category: &str,
-        name: &str,
-    ) -> Result<Self, SettingKeyError> {
-        // Checked before splicing so the error names the caller's own input
-        // rather than a position inside the joined string.
-        if !value_type.ends_with(TYPE_TERMINATOR) {
-            return Err(SettingKeyError::ValueTypeNotAType);
-        }
-        Self::parse(&format!(
-            "{value_type}{vendor}.settings.{category}.{name}.v1"
-        ))
+    /// Returns [`SettingKeyError`] when the composed key is not a valid setting
+    /// key — an uppercase vendor, a `/` in a slug, a name that is not a GTS token.
+    pub fn compose(vendor: &str, category: &str, name: &str) -> Result<Self, SettingKeyError> {
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-3
+        // The `settings` package is fixed rather than supplied: an admin-authored
+        // derived half always sits at `<vendor>.settings.<category>.<name>.v1~`,
+        // the trailing terminator making it a type.
+        let derived = format!("{vendor}.settings.{category}.{name}.v1{TYPE_TERMINATOR}");
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-3
+
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-4
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-1
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-2
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-5
+        // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-6
+        // Grammar validation, the segment-level rejection, the leaf slug and the
+        // embedded category slug all come from one parse of the composed
+        // candidate. Validating the parts separately would let a composed key and
+        // a parsed one disagree about any of them.
+        Self::parse(&format!("{SETTING_TYPE_BASE}{derived}"))
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-6
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-5
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-2
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-1
+        // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-4
     }
 
     /// The full key, byte-identical to what was parsed.
@@ -243,21 +280,24 @@ impl SettingKey {
         &self.raw
     }
 
-    /// The value-type half, including its trailing `~`.
+    /// The base-type half, including its trailing `~`.
+    ///
+    /// Always [`SETTING_TYPE_BASE`]; exposed so a caller can slice the key
+    /// without re-deriving the split.
     #[must_use]
-    pub fn value_type(&self) -> &str {
+    pub fn base_type(&self) -> &str {
         &self.raw[..=self.separator]
     }
 
-    /// The instance-id half, without a trailing `~`.
+    /// The derived half — the setting's own type, including its trailing `~`.
     #[must_use]
-    pub fn instance_id(&self) -> &str {
+    pub fn derived_half(&self) -> &str {
         &self.raw[self.separator + TYPE_TERMINATOR.len_utf8()..]
     }
 
     /// The owning category's slug.
     ///
-    /// Always present: the GTS grammar guarantees the instance segment carries a
+    /// Always present: the GTS grammar guarantees the derived half carries a
     /// namespace token, and that position is the category for both authoring
     /// parties — an admin key puts it there by construction, and the reconciler
     /// reads a module's category from the same position.

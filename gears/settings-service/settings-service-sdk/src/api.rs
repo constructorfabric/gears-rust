@@ -11,20 +11,15 @@
 //! For flat typed dispatch see [`crate::SettingsError`], an opt-in projection
 //! that lives beside these traits rather than inside them.
 //!
-//! # `watch` is deliberately absent
+//! # There is no `watch`
 //!
-//! The reader trait is specified with a fourth method, `watch`, for consumers
-//! that have already *materialized* a value — a connection pool, a listening
-//! socket — and will never re-read it unless told it changed. It is not
-//! declared here yet.
-//!
-//! Declaring it means fixing the notification and acknowledgement payloads, and
-//! those belong to Settings Activation, whose consumer-activation requirement is
-//! still an open design gap: registration of interest, identifier-only payloads,
-//! delivery-until-confirmed, and the per-apply account of who confirmed are all
-//! unspecified. Types invented here would be redefined when that design lands —
-//! which breaks implementors exactly as adding the method later would, only
-//! silently, by changing what the payloads mean rather than failing to compile.
+//! Change notification is not a reader-trait method. A consumer that must
+//! actively re-apply a setting -- a connection pool, a listening socket --
+//! subscribes through [`crate::activation`]: `subscribe(keys, handler)` plus
+//! `report_outcome(...)`, specified by DESIGN-activation §4.5 *In-Process SDK —
+//! Consumer Activation*. An earlier draft listed a `watch` change stream on this
+//! trait; it named the same capability twice, and its shape could not carry the
+//! per-setting acknowledgement the activation contract requires.
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;

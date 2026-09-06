@@ -25,6 +25,7 @@ toolkit-odata = { workspace = true }
 async-trait = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-security = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

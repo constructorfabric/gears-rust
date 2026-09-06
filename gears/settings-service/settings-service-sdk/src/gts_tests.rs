@@ -23,12 +23,12 @@ fn every_constant_round_trips_through_the_typed_view() {
 fn an_unmodelled_resource_is_preserved_not_discarded() {
     // A resource type this SDK does not know must survive intact, so a consumer
     // can still report it and a later version can model it without data loss.
-    let typed = Resource::from_wire("gts.cf.toolkit.settings.apply_bundle.v1~");
+    let typed = Resource::from_wire("gts.cf.core.settings.change_set.v1~");
     assert_eq!(
         typed,
-        Resource::Unknown("gts.cf.toolkit.settings.apply_bundle.v1~".to_owned())
+        Resource::Unknown("gts.cf.core.settings.change_set.v1~".to_owned())
     );
-    assert_eq!(typed.as_wire(), "gts.cf.toolkit.settings.apply_bundle.v1~");
+    assert_eq!(typed.as_wire(), "gts.cf.core.settings.change_set.v1~");
 }
 
 #[test]

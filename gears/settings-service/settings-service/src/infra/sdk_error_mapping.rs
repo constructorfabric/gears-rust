@@ -15,15 +15,15 @@ use crate::domain::error::DomainError;
 use crate::precondition;
 
 /// The resource this gear attributes its errors to.
-#[resource_error("gts.cf.toolkit.settings.declaration.v1~")]
+#[resource_error("gts.cf.core.settings.declaration.v1~")]
 struct SettingsResource;
 
 /// Errors attributed to a category.
-#[resource_error("gts.cf.toolkit.settings.category.v1~")]
+#[resource_error("gts.cf.core.settings.category.v1~")]
 struct CategoryResource;
 
 /// Errors attributed to a stored setting value.
-#[resource_error("gts.cf.toolkit.settings.value.v1~")]
+#[resource_error("gts.cf.core.settings.value.v1~")]
 struct ValueResource;
 
 /// Build a denial attributed to the resource actually enforced.
@@ -53,7 +53,7 @@ impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-1
         match err {
-            // 422 — the only path that carries field-level detail.
+            // Validation — the only path that carries field-level detail; canonical invalid-argument renders as 400.
             DomainError::Validation {
                 field,
                 code,

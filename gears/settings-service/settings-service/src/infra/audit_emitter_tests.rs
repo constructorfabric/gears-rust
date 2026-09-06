@@ -8,10 +8,10 @@
 use settings_service_sdk::SettingKey;
 
 use super::{TracingAuditEmitter, render};
-use crate::audit::{AuditEmitter, AuditRecord, AuditScope, AuditValue};
+use crate::audit::{AuditEmitter, AuditRecord, AuditValue};
 
 fn key() -> SettingKey {
-    SettingKey::parse("gts.cf.settings.types.bool_flag.v1~acme.settings.network.enable_proxy.v1")
+    SettingKey::parse("gts.cf.core.settings.setting_type.v1~acme.settings.network.enable_proxy.v1~")
         .expect("fixture key parses")
 }
 
@@ -48,7 +48,7 @@ async fn recording_succeeds_and_keeps_the_fallible_signature() {
     // propagates the error.
     let record = AuditRecord::new(
         key().as_str(),
-        AuditScope::Platform,
+        uuid::Uuid::nil(),
         "admin",
         "category.create",
         "req-1",

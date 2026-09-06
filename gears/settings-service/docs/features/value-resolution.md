@@ -57,7 +57,7 @@ Three properties matter more than the walk itself.
 
 **Not-found is deliberately two different things.** A retired declaration resolves as a distinct positive fact, so a gear reading through its own upgrade window can tell "the platform withdrew this setting" from "this key was never declared" and drop the dependency rather than retry. A genuinely absent declaration conflates two sub-cases the service cannot distinguish — the owning gear has not registered yet, or the key never existed — and it must not guess between them.
 
-**Requirements**: `cpt-cf-settings-service-fr-cascading-inheritance`, `cpt-cf-settings-service-fr-defaults-revert`, `cpt-cf-settings-service-nfr-performance-read-cache`, `cpt-cf-settings-service-nfr-efficiency-live-read`
+**Requirements**: `cpt-cf-settings-service-fr-cascading-inheritance`, `cpt-cf-settings-service-fr-defaults-revert`, `cpt-cf-settings-service-fr-bulk-effective-read`, `cpt-cf-settings-service-nfr-performance-read-cache`, `cpt-cf-settings-service-nfr-efficiency-live-read`
 
 **Principles**: `cpt-cf-settings-service-principle-single-ancestry-source`, `cpt-cf-settings-service-principle-fail-closed`
 
@@ -77,7 +77,7 @@ Three properties matter more than the walk itself.
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.5
 - **Dependencies**: entry 2.4 typed value validation, since the resolution chain terminates in a validated Schema Default and every value it walks is a validated typed value; entry 2.3 for the declaration model and its scope class; entry 2.1 for persistence, the reader trait, and the error taxonomy.
 - **Sequences**: `cpt-cf-settings-service-seq-effective-value-read`
-- **Not applicable**: The cross-replica cache-invalidation broadcast and its bounded-staleness guarantee are apply-side and belong to a later wave. Tenant override writes, the cascading-impact warning, staging, and Apply are out of scope. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a staged value change; only the resolution semantics of defaults are here.
+- **Not applicable**: The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee ship with R2, when several replicas become the normal case. Tenant override writes, the cascading-impact report, and the validate-before-set check belong to the Value Writer of entry 2.8. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a value write like any other; only the resolution semantics of defaults are here.
 
 ## 2. Actor Flows (CDSL)
 
@@ -164,12 +164,12 @@ Three properties matter more than the walk itself.
 
 **Steps**:
 1. [ ] - `p1` - **IF** the declaration's scope class is `global` - `inst-vr-disp-1`
-   1. [ ] - `p1` - DB: SELECT the platform-scope row for the declaration, identified by a null tenant - `inst-vr-disp-2`
-   2. [ ] - `p1` - **IF** the request comes from a tenant scope → serve the platform value read-only, and only when the declaration is tenant-visible - `inst-vr-disp-3`
+   1. [ ] - `p1` - DB: SELECT the platform-scope row for the declaration, identified by the root tenant's id - `inst-vr-disp-2`
+   2. [ ] - `p1` - **IF** the request comes from a tenant scope → serve the platform value read-only, and only when the setting is visible to that tenant, its effective access being other than `hidden` - `inst-vr-disp-3`
    3. [ ] - `p1` - **IF** no platform row exists → **RETURN** the Schema Default with the default source - `inst-vr-disp-4`
 2. [ ] - `p1` - **IF** the declaration's scope class is `cascading` - `inst-vr-disp-5`
    1. [ ] - `p1` - Ask the tenant resolver for the requested tenant's ancestor ids, ordered root to self - `inst-vr-disp-6`
-   2. [ ] - `p1` - DB: SELECT value rows for the declaration where the tenant is null or within the ancestor id set, as one exact-match set query with no prefix or pattern scan - `inst-vr-disp-7`
+   2. [ ] - `p1` - DB: SELECT value rows for the declaration where the tenant is within the ancestor id set, which begins at the root tenant and so includes platform scope, as one exact-match set query with no prefix or pattern scan - `inst-vr-disp-7`
    3. [ ] - `p1` - Prefer the deepest matching scope, applying needs-review fallthrough as each candidate is considered - `inst-vr-disp-8`
    4. [ ] - `p1` - **IF** the deepest valid match is the requested tenant → set the source to own override - `inst-vr-disp-9`
    5. [ ] - `p1` - **ELSE IF** a valid ancestor match exists → set the source to inherited and record its scope - `inst-vr-disp-10`
@@ -220,9 +220,9 @@ Three properties matter more than the walk itself.
 **Steps**:
 1. [ ] - `p1` - **IF** a specific scope is named → evict the entry for that key and scope on this instance - `inst-vr-inv-1`
 2. [ ] - `p1` - **IF** the affected declaration is `cascading` → evict every cached scope for that key, because an ancestor change alters descendants' effective values and they must re-resolve lazily on next read - `inst-vr-inv-2`
-3. [ ] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no apply need be involved - `inst-vr-inv-3`
+3. [ ] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no value write need be involved - `inst-vr-inv-3`
 4. [ ] - `p1` - Record that the tenant resolver publishes no such hierarchy signal today, so until it does the time-to-live is the only backstop and the post-re-parent staleness window equals it - `inst-vr-inv-4`
-5. [ ] - `p1` - **RETURN** having evicted locally only; converging peer replicas is apply-side and out of scope here - `inst-vr-inv-5`
+5. [ ] - `p1` - **RETURN** having evicted locally only; converging peer replicas is the R2 `cache_invalidate` broadcast and out of scope here - `inst-vr-inv-5`
 
 ## 4. States (CDSL)
 
@@ -360,9 +360,9 @@ The cache **MUST** evict the affected subtree's cascading entries on a tenant hi
 
 ## 6. Acceptance Criteria
 
-- [ ] A `global` setting with a platform row resolves to that row's value with a platform source scope
-- [ ] A `global` setting with no platform row resolves to its Schema Default
-- [ ] A `global` setting is served to a tenant read-only when tenant-visible, and is not served when it is not
+- [ ] A `global` setting with a root-tenant row resolves to that row's value with the root tenant as its source scope
+- [ ] A `global` setting with no root-tenant row resolves to its Schema Default
+- [ ] A `global` setting is served to a tenant read-only when the setting is visible to it, and is not served when its effective access is `hidden`
 - [ ] A `cascading` setting with an override at the requested tenant resolves as an own override
 - [ ] A `cascading` setting with no own override but an ancestor override resolves as inherited and names the ancestor scope
 - [ ] A `cascading` setting with overrides at two ancestors resolves to the deeper of the two

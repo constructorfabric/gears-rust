@@ -3115,9 +3115,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-settings-service-sdk",
+ "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
@@ -3125,6 +3125,8 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
  "http",
  "inventory",
  "sea-orm",
@@ -3153,6 +3155,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

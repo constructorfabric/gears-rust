@@ -15,6 +15,7 @@ use sea_orm_migration::prelude::*;
 
 mod m20260812_000001_initial;
 mod m20260813_000001_categories;
+mod m20260825_000001_setting_declarations;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260812_000001_initial::Migration),
             Box::new(m20260813_000001_categories::Migration),
+            Box::new(m20260825_000001_setting_declarations::Migration),
         ]
     }
 }

@@ -40,17 +40,17 @@
 
 ### 1.1 Overview
 
-Delivers the Type Validator: structural validation of a setting value against the GTS value type named by the left half of its key, trait-driven rules enforced as hard checks rather than advisories, the size and numeric-canonicality guards that bound what a value may be, and the resolved trait set consumers use for rendering. Also establishes the `SettingValue` entity and the `setting_values` table that effective-value resolution reads.
+Delivers the Type Validator: structural validation of a setting value against the GTS value type its declaration names by `value_type_id`, trait-driven rules enforced as hard checks rather than advisories, the size and numeric-canonicality guards that bound what a value may be, and the resolved trait set consumers use for rendering. Also establishes the `SettingValue` entity and the `setting_values` table that effective-value resolution reads.
 
 ### 1.2 Purpose
 
 The service consumes GTS types and never authors them; the types registry owns that. What this feature owns is the decision to treat trait rules as **hard** checks. A cron expression that does not parse, a regex that does not compile, an entity reference that does not resolve, or an enum member outside its dynamic source are all rejected at validation time rather than passed through with a warning, because a setting value that fails at consumption time fails inside whichever gear read it, far from the administrator who set it.
 
-Two guards exist for reasons that are easy to miss and expensive to discover later. The 64 KiB cap on a serialized value keeps the hot read cache, audit pre-images and post-images, and apply-preview payloads bounded — a settings value is a configuration datum, not a blob. The IEEE-754 round-trip check rejects integers beyond the double-precision integer range and decimals finer than a double resolves, because activation compares values through a canonical encoding that cannot carry them; a setting needing more range or precision declares a string type instead.
+Two guards exist for reasons that are easy to miss and expensive to discover later. The 64 KiB cap on a serialized value keeps the hot read cache, audit pre-images and post-images, and validate-before-set report payloads bounded — a settings value is a configuration datum, not a blob. The IEEE-754 round-trip check rejects integers beyond the double-precision integer range and decimals finer than a double resolves, because activation compares values through a canonical encoding that cannot carry them; a setting needing more range or precision declares a string type instead.
 
 The `setting_values` schema carries two invariants worth reading carefully before writing migrations. Exactly one of `value` and `secret_ref` is set, so a row can be neither doubly-valued nor valueless. And SQL `NULL` in the `value` column means *no inline value here*, which is not the JSON value `null` — a setting whose type admits `null` stores a non-`NULL` column holding JSON `null`, so the exactly-one check reads it as a value like any other.
 
-**Requirements**: `cpt-cf-settings-service-fr-typed-value-validation`
+**Requirements**: `cpt-cf-settings-service-fr-typed-value-validation`, `cpt-cf-settings-service-fr-subject-scoped-values`
 
 **Principles**: `cpt-cf-settings-service-principle-consume-gts`, `cpt-cf-settings-service-principle-fail-closed`
 
@@ -67,12 +67,12 @@ The `setting_values` schema carries two invariants worth reading carefully befor
 - **PRD**: [PRD.md](../PRD.md) — §5.2 Typed Values and Validation
 - **Design**: [DESIGN.md](../DESIGN.md) — §4.1 (Entity `SettingValue`), §4.2 (Component: Type Validator), §4.7 (Table `setting_values`)
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.4
-- **Dependencies**: entry 2.3 setting declarations, since the value type is the left half of a declaration key and there is nothing to validate against without one; entry 2.1 gear foundation for persistence, the `TypeValidator` trait declaration, and Problem mapping. Declaration creation in 2.3 calls this validator for its Schema Default, so the two meet at that trait.
-- **Not applicable**: GTS type authoring and the schema registry are owned by the `types-registry` gear. Secret value storage and masking are owned by the Secret Manager in a later wave; this feature only records that a value is held by reference. No administrative write path for values exists in this wave, because values are set through staged changes, so `setting_values` is populated only by seeded rows and tests until staging lands. Apply-time re-validation is deliberately absent by design: a staged change carries the already-validated value.
+- **Dependencies**: entry 2.3 setting declarations, since the value type is named by a declaration's `value_type_id` and there is nothing to validate against without one; entry 2.1 gear foundation for persistence, the `TypeValidator` trait declaration, and Problem mapping. Declaration creation in 2.3 calls this validator for its Schema Default, so the two meet at that trait.
+- **Not applicable**: GTS type authoring and the schema registry are owned by the `types-registry` gear. Secret value storage and masking are owned by the Secret Manager in a later wave; this feature only records that a value is held by reference. No administrative write path for values exists in this wave: the Value Writer of entry 2.8 is what sets, reverts, removes and clones values, so `setting_values` is populated only by seeded rows and tests until it lands. This validator runs inside every set; the read-only validate-before-set report is optional and stores nothing.
 
 ## 2. Actor Flows (CDSL)
 
-Not applicable. Validation is an internal service invoked by other features rather than a user-facing interaction: declaration creation in entry 2.3 calls it for a Schema Default, and staging calls it for an override in a later wave. The administrator-visible outcome is the field-level error array returned on the calling feature's own endpoint.
+Not applicable. Validation is an internal service invoked by other features rather than a user-facing interaction: declaration creation in entry 2.3 calls it for a Schema Default, and the Value Writer of entry 2.8 calls it for every set and for the read-only validate-before-set report. The administrator-visible outcome is the field-level error array returned on the calling feature's own endpoint.
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -155,9 +155,9 @@ Not applicable. Validation is an internal service invoked by other features rath
 
 **Transitions**:
 1. [ ] - `p2` - **FROM** `valid` **TO** `needs_review` **WHEN** an invalidating value-type upgrade means the stored value no longer validates against the current type - `inst-tvv-state-1`
-2. [ ] - `p2` - **FROM** `needs_review` **TO** `valid` **WHEN** a valid value is re-staged and applied at that scope, or the override is reverted - `inst-tvv-state-2`
+2. [ ] - `p2` - **FROM** `needs_review` **TO** `valid` **WHEN** a valid value is set at that scope, or the override is reverted - `inst-tvv-state-2`
 
-This wave delivers the `needs_review` and `needs_review_detail` columns, the partial index supporting the administrator's needs-review listing, and the guarantee that a flagged value is excluded from resolution. Both transitions are driven by later features: the flagging side by the Contribution Reconciler on a type upgrade, the clearing side by staging and Apply.
+This wave delivers the `needs_review` and `needs_review_detail` columns, the partial index supporting the administrator's needs-review listing, and the guarantee that a flagged value is excluded from resolution. Both transitions are driven by later features: the flagging side by the Contribution Reconciler on a type upgrade, the clearing side by the Value Writer.
 
 ## 5. Definitions of Done
 
@@ -228,7 +228,7 @@ The system **MUST** resolve and expose a type's trait set covering the secret ma
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-value-schema`
 
-The system **MUST** persist applied overrides in a `setting_values` table with a `declaration_id` foreign key declared `ON DELETE CASCADE`, a nullable `tenant_id` where `NULL` denotes platform scope, nullable `value` and `secret_ref`, a denormalized `data_classification`, the `needs_review` pair, and audit columns. A check **MUST** enforce that exactly one of `value` and `secret_ref` is set, and a second check **MUST** tie which one is set to the `secret` classification.
+The system **MUST** persist set overrides in a `setting_values` table with a `declaration_id` foreign key declared `ON DELETE CASCADE`, a **non-null** `tenant_id` holding a tenant id — the root tenant's id for platform scope, never `NULL` and never a path — the nullable `subject_type`/`subject_id` pair that names a subject by both halves or by neither, nullable `value` and `secret_ref`, a denormalized `data_classification`, the `needs_review` pair, and audit columns. A check **MUST** enforce that exactly one of `value` and `secret_ref` is set, and a second check **MUST** tie which one is set to the `secret` classification.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-typed-value-validation-classification-sync`
@@ -243,7 +243,7 @@ The system **MUST** persist applied overrides in a `setting_values` table with a
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-scope-invariants`
 
-Uniqueness **MUST** be expressed as two partial unique indexes rather than one plain index, because `NULL` marks platform scope and Postgres treats `NULL`s as distinct: at most one override per tenant per declaration, and at most one platform row per declaration. `tenant_id` **MUST** hold an id and never a path, so ancestry is never derived from this column, and it **MUST NOT** be a database foreign key because tenants live outside this schema.
+Uniqueness **MUST** be expressed as two partial unique indexes, one per scope shape — `uq_value_scope` on `(declaration_id, tenant_id)` where no subject is named, and `uq_value_scope_subject` on `(declaration_id, tenant_id, subject_type, subject_id)` where one is — because only the subject halves may be `NULL` and Postgres treats `NULL`s as distinct: at most one override per declaration per tenant, the root tenant's id being platform scope, and at most one per subject at a tenant. `tenant_id` **MUST** hold an id and never a path, so ancestry is never derived from this column, and it **MUST NOT** be a database foreign key because tenants live outside this schema.
 
 **Touches**:
 - DB Table: `setting_values`
@@ -295,9 +295,10 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [ ] A `setting_values` row with neither `value` nor `secret_ref` set is rejected by the same check
 - [ ] A setting whose type admits `null` stores JSON `null` in a non-`NULL` column and satisfies the exactly-one check
 - [ ] A row whose `data_classification` is `secret` but whose `secret_ref` is absent is rejected
-- [ ] Two platform-scope rows for one declaration are rejected by the partial unique index on the platform scope
-- [ ] Two rows for the same declaration and tenant are rejected by the partial unique index on tenant scope
-- [ ] A platform row and a tenant row for the same declaration coexist
+- [ ] Two rows for one declaration at the root tenant are rejected by `uq_value_scope`, exactly as two rows for the same declaration and any other tenant are
+- [ ] Two subject-scoped rows for the same declaration, tenant, and subject pair are rejected by `uq_value_scope_subject`
+- [ ] A root-tenant row and a tenant row for the same declaration coexist, as do a tenant row and a subject-scoped row at that tenant
+- [ ] A row naming `subject_type` without `subject_id`, or the reverse, is rejected by the both-or-neither check
 - [ ] Deleting a declaration cascades to its value rows
 - [ ] Changing a declaration's classification re-syncs every value row in the same transaction, leaving no window where the two disagree
 - [ ] A value flagged `needs_review` carries a detail string, and clearing the flag clears the detail

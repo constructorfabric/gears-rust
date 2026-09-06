@@ -1,4 +1,5 @@
 // Created: 2026-08-13 by Constructor Tech
+// @cpt-dod:cpt-cf-settings-service-dod-category-management-no-orphan:p1
 //! SeaORM-backed category persistence.
 
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ use crate::domain::category::{
 };
 use crate::domain::error::DomainError;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
+use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::odata_mapper::CategoryODataMapper;
 use settings_service_sdk::odata::CategoryFilterField;
 
@@ -88,6 +90,7 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
 /// check runs first for a better message, but a declaration created between
 /// that check and this delete is caught only here. Reporting it as an internal
 /// error would turn a correct refusal into a 500.
+// @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
 fn map_delete_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
     let is_fk_violation = matches!(
         err,
@@ -104,6 +107,7 @@ fn map_delete_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
         map_write_error(err)
     }
 }
+// @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
 
 fn now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
@@ -348,21 +352,37 @@ impl CategoryRepository for CategoryRepo {
         })
     }
 
-    async fn has_referencing_declarations<C: DBRunner>(
+    async fn count_referencing_declarations<C: DBRunner>(
         &self,
-        _conn: &C,
-        _id: Uuid,
-    ) -> Result<bool, DomainError> {
-        // `setting_declarations` does not exist until entry 2.3, so there is
-        // nothing that can reference a category yet and the honest answer is
-        // "no". This is not the guard being disabled: the service still calls
-        // it and still refuses a delete when it answers yes, which is what the
-        // service-level tests exercise against a stub.
+        conn: &C,
+        id: Uuid,
+    ) -> Result<u64, DomainError> {
+        // Deliberately unscoped. The question is whether the *database* still
+        // holds a reference, not whether this caller may see one: a declaration
+        // outside their visibility would otherwise answer "no" here while the
+        // foreign key answers "yes", turning a clean `409` into a constraint
+        // error the caller cannot act on.
         //
-        // DECOMPOSITION 2.2 records the consequence — the no-orphan rule cannot
-        // be verified end to end until 2.3 creates the table and the foreign
-        // key. Replacing this body is that entry's job, and the signature it
-        // must satisfy is already fixed here.
-        Ok(false)
+        // Every status counts, `retired` included. Retirement is a soft delete
+        // that keeps the declaration filed under its category, so the row would
+        // be orphaned by the delete exactly as an active one would.
+        //
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-1
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-2
+        // No `status` predicate, and that is the whole of step 2: retirement is
+        // a soft delete that keeps the declaration filed under its category, so
+        // a retired row would be orphaned by the delete exactly as an active one
+        // would.
+        DeclarationEntity::find()
+            .filter(declaration::Column::CategoryId.eq(id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .count(conn)
+            .await
+            .map_err(|err| DomainError::Internal {
+                diagnostic: err.to_string(),
+            })
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-2
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-1
     }
 }

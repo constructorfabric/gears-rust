@@ -9,6 +9,8 @@
 //! pool.
 
 pub mod category_repo;
+pub mod declaration_odata_mapper;
+pub mod declaration_repo;
 pub mod entity;
 pub mod migrations;
 pub mod odata_mapper;

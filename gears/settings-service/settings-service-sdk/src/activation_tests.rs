@@ -17,7 +17,7 @@ use crate::key::SettingKey;
 
 fn key(instance: &str) -> SettingKey {
     SettingKey::parse(&format!(
-        "gts.cf.settings.types.bool_flag.v1~acme.settings.network.{instance}.v1"
+        "gts.cf.core.settings.setting_type.v1~acme.settings.network.{instance}.v1~"
     ))
     .expect("fixture key parses")
 }
@@ -44,8 +44,8 @@ async fn a_handler_accounts_for_every_notified_key() {
     // The apply's await-record stays open until each notified key is accounted
     // for, so one outcome per changed key is the handler's whole obligation.
     let notification = SettingChangeNotification {
-        apply_id: "apply-1".to_owned(),
-        tenant: Some("acme".to_owned()),
+        change_set_id: "cs-1".to_owned(),
+        tenant: "acme".to_owned(),
         changed_keys: vec![key("enable_proxy"), key("enable_ipv6")],
     };
     let expected = notification.changed_keys.clone();
@@ -71,8 +71,8 @@ fn a_notification_carries_no_value_and_no_secret() {
     // under their own identity. A value field here would put tenant data — and
     // eventually a secret — into every subscriber's broker feed.
     let notification = SettingChangeNotification {
-        apply_id: "apply-1".to_owned(),
-        tenant: Some("acme".to_owned()),
+        change_set_id: "cs-1".to_owned(),
+        tenant: "acme".to_owned(),
         changed_keys: vec![key("enable_proxy")],
     };
     let json = serde_json::to_value(&notification).expect("serializes");
@@ -85,21 +85,24 @@ fn a_notification_carries_no_value_and_no_secret() {
     fields.sort_unstable();
     assert_eq!(
         fields,
-        ["applyId", "changedKeys", "tenant"],
+        ["changeSetId", "changedKeys", "tenant"],
         "the notification gained a field; if it carries a value the \
          identifier-only guarantee is gone"
     );
 }
 
 #[test]
-fn an_absent_tenant_means_platform_wide() {
+fn the_tenant_is_never_absent() {
+    // Platform scope is the root tenant's id, not a missing tenant: a
+    // notification always says which tenant changed, so a consumer never has to
+    // infer "platform-wide" from an absence.
     let notification = SettingChangeNotification {
-        apply_id: "apply-1".to_owned(),
-        tenant: None,
+        change_set_id: "cs-1".to_owned(),
+        tenant: "00000000-0000-0000-0000-000000000001".to_owned(),
         changed_keys: vec![key("enable_proxy")],
     };
     let json = serde_json::to_value(&notification).expect("serializes");
-    assert!(json["tenant"].is_null());
+    assert!(json["tenant"].is_string());
 }
 
 #[test]

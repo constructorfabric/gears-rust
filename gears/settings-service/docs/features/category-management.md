@@ -47,7 +47,7 @@ Category Management provides the flat taxonomy every setting declaration is file
 
 Categories are the first domain entity in the Settings Service and the only one with no upstream domain dependency, which is why they come immediately after the gear foundation. A setting declaration carries a non-null `category_id`, so categories must exist before any declaration can.
 
-The category `key` is load-bearing well beyond grouping. It becomes the `<category>` segment of an admin-authored setting's instance id, so it is validated against the reserved path separator at create time rather than treated as free text. That coupling has a consequence worth stating up front: renaming or moving a category re-keys every setting inside it, and the stale key then resolves as not-found with no alias and no key history. The `key` is therefore immutable after creation, and only the display `name` may change.
+The category `key` is load-bearing well beyond grouping. It becomes the `<category>` token of every setting key declared under it — the third segment of the key's derived half, for admin-authored and module-contributed settings alike ([ADR-002](../ADR/ADR-002-setting-key-gts-type-id.md)) — so it is validated against the reserved path separator at create time rather than treated as free text. That coupling has a consequence worth stating up front: renaming or moving a category re-keys every setting inside it, and the stale key then resolves as not-found with no alias and no key history. The `key` is therefore immutable after creation, and only the display `name` may change.
 
 The no-orphan rule protects the invariant that no declaration is ever left pointing at a missing category. It is enforced twice deliberately: an explicit pre-check that returns a meaningful conflict, and the declaration-to-category foreign key `ON DELETE RESTRICT`, which is the authoritative guard and holds even when the only referencing declaration is `retired`.
 
@@ -69,7 +69,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - **Design**: [DESIGN.md](../DESIGN.md) — §4.1 (Entity `Category`), §4.2 (Component: Category Management), §4.3 (REST API — Categories, Error Response Format), §4.7 (Table `categories`), §4.8 (Security and Authorization)
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.2
 - **Dependencies**: entry 2.1 gear foundation, which supplies the persistence adapter, the RFC-9457 Problem mapping, the shared `If-Match` precondition helper returning `428` and `412`, the `PolicyEnforcer` PEP and `AccessScope` derivation, and the Audit Emitter. This feature consumes those rather than restating them.
-- **Not applicable**: No PRD use case maps directly to category administration; the four defined use cases concern setting configuration, value resolution, staging, and audit review. Feature and licence entitlement gating is not part of this wave and lands with the licensing feature, so the entitlement consultation named in the DESIGN component's dependency list is wired through the foundation's authorization path here without its own fail-closed licence policy. Frontend presentation is owned by a future frontend DESIGN. Performance targets are set at the system level in the PRD NFR section.
+- **Not applicable**: No PRD use case maps directly to category administration; the four defined use cases concern setting configuration, value resolution, validate-and-set, and audit review. Feature and licence entitlement gating is R2 — the `license-resolver` gear is documentation only, and the platform gates at base-licence level — so the entitlement consultation named in the DESIGN component's dependency list is wired through the foundation's authorization path here without its own fail-closed licence policy. Frontend presentation is owned by a future frontend DESIGN. Performance targets are set at the system level in the PRD NFR section.
 
 ## 2. Actor Flows (CDSL)
 
@@ -90,8 +90,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Duplicate `key` or duplicate `name`
 
 **Steps**:
-1. [x] - `p1` - Actor sends POST /v1/categories with `key`, `name`, optional `description`, optional `domain_affinity`, `sort_order`, optional `icon` - `inst-cat-create-1`
-2. [x] - `p1` - Authorize `create` on `gts.cf.toolkit.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-create-2`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/categories with `key`, `name`, optional `description`, optional `domain_affinity`, `sort_order`, optional `icon` - `inst-cat-create-1`
+2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-create-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-create-3`
 4. [x] - `p1` - Invoke category key validation on the supplied `key` - `inst-cat-create-4`
 5. [x] - `p1` - **IF** key validation fails → **RETURN** `400` with a field-level error naming `key` - `inst-cat-create-5`
@@ -120,8 +120,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Updated `name` collides with an existing category
 
 **Steps**:
-1. [x] - `p1` - Actor sends PATCH /v1/categories/{id} with `If-Match` and any of `name`, `description`, `domain_affinity`, `sort_order`, `icon` - `inst-cat-update-1`
-2. [x] - `p1` - Authorize `update` on `gts.cf.toolkit.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-update-2`
+1. [x] - `p1` - Actor sends PATCH /settings-service/v1/categories/{id} with `If-Match` and any of `name`, `description`, `domain_affinity`, `sort_order`, `icon` - `inst-cat-update-1`
+2. [x] - `p1` - Authorize `update` on `gts.cf.core.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-update-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-update-3`
 4. [x] - `p1` - **IF** the request body carries `key` → **RETURN** `400`, because `key` is immutable once settings are keyed through it - `inst-cat-update-4`
 5. [x] - `p1` - DB: SELECT the category row WHERE id = {id} - `inst-cat-update-5`
@@ -138,7 +138,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 
 ### Delete Category
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-category-management-delete`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-category-management-delete`
 
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
@@ -152,8 +152,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Category still contains one or more declarations, active or retired
 
 **Steps**:
-1. [x] - `p1` - Actor sends DELETE /v1/categories/{id} with `If-Match` - `inst-cat-delete-1`
-2. [x] - `p1` - Authorize `delete` on `gts.cf.toolkit.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-delete-2`
+1. [x] - `p1` - Actor sends DELETE /settings-service/v1/categories/{id} with `If-Match` - `inst-cat-delete-1`
+2. [x] - `p1` - Authorize `delete` on `gts.cf.core.settings.category.v1~` through the `PolicyEnforcer` PEP - `inst-cat-delete-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-delete-3`
 4. [x] - `p1` - DB: SELECT the category row WHERE id = {id} - `inst-cat-delete-4`
 5. [x] - `p1` - **IF** category not found → **RETURN** `404` - `inst-cat-delete-5`
@@ -162,7 +162,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 8. [x] - `p1` - Invoke the no-orphan deletion guard for this category - `inst-cat-delete-8`
 9. [x] - `p1` - **IF** the guard reports referencing declarations → **RETURN** `409 CategoryNotEmpty` - `inst-cat-delete-9`
 10. [x] - `p1` - DB: DELETE FROM categories WHERE id = {id} - `inst-cat-delete-10`
-11. [ ] - `p1` - **IF** the declaration foreign key `ON DELETE RESTRICT` rejects the delete → **RETURN** `409 CategoryNotEmpty`, covering a declaration inserted between the guard and the delete - `inst-cat-delete-11`
+11. [x] - `p1` - **IF** the declaration foreign key `ON DELETE RESTRICT` rejects the delete → **RETURN** `409 CategoryNotEmpty`, covering a declaration inserted between the guard and the delete - `inst-cat-delete-11`
 12. [x] - `p1` - Emit a category-deleted audit record carrying the pre-image - `inst-cat-delete-12`
 13. [x] - `p1` - **RETURN** `204` - `inst-cat-delete-13`
 
@@ -179,8 +179,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Category does not exist, or exists but falls outside the caller's domain or visibility scope
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /v1/categories/{id} - `inst-cat-get-1`
-2. [x] - `p1` - Authorize `read` on `gts.cf.toolkit.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-get-2`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/categories/{id} - `inst-cat-get-1`
+2. [x] - `p1` - Authorize `read` on `gts.cf.core.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-get-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-get-3`
 4. [x] - `p1` - DB: SELECT the category row WHERE id = {id} - `inst-cat-get-4`
 5. [x] - `p1` - **IF** category not found → **RETURN** `404` - `inst-cat-get-5`
@@ -202,8 +202,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Malformed or expired pagination cursor
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /v1/categories with optional OData `$filter`, `$orderby`, `$select`, and a pagination cursor - `inst-cat-list-1`
-2. [x] - `p1` - Authorize `read` on `gts.cf.toolkit.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-list-2`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/categories with optional OData `$filter`, `$orderby`, `$select`, and a pagination cursor - `inst-cat-list-1`
+2. [x] - `p1` - Authorize `read` on `gts.cf.core.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-list-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-list-3`
 4. [x] - `p1` - Parse the OData expressions against the category field mapping - `inst-cat-list-4`
 5. [x] - `p1` - **IF** an expression references an unmapped field or an unsupported operator → **RETURN** `400` - `inst-cat-list-5`
@@ -230,17 +230,17 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 
 ### No-Orphan Deletion Guard
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-category-management-no-orphan-guard`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-category-management-no-orphan-guard`
 
 **Input**: Category identifier
 
 **Output**: Empty verdict, or a non-empty verdict carrying the referencing declaration count
 
 **Steps**:
-1. [ ] - `p1` - DB: SELECT the count of rows FROM setting_declarations WHERE category_id = {id} - `inst-cat-orphan-1`
-2. [ ] - `p1` - Count declarations of every `status`, because a retired declaration still occupies its category and its values are retained - `inst-cat-orphan-2`
-3. [ ] - `p1` - **IF** the count is greater than zero → **RETURN** non-empty verdict carrying the count - `inst-cat-orphan-3`
-4. [ ] - `p1` - **RETURN** empty verdict, treating it as advisory only: the foreign key `ON DELETE RESTRICT` remains the authoritative guard at delete time - `inst-cat-orphan-4`
+1. [x] - `p1` - DB: SELECT the count of rows FROM setting_declarations WHERE category_id = {id} - `inst-cat-orphan-1`
+2. [x] - `p1` - Count declarations of every `status`, because a retired declaration still occupies its category and its values are retained - `inst-cat-orphan-2`
+3. [x] - `p1` - **IF** the count is greater than zero → **RETURN** non-empty verdict carrying the count - `inst-cat-orphan-3`
+4. [x] - `p1` - **RETURN** empty verdict, treating it as advisory only: the foreign key `ON DELETE RESTRICT` remains the authoritative guard at delete time - `inst-cat-orphan-4`
 
 ### Category Visibility and Domain Filter
 
@@ -290,16 +290,16 @@ The system **MUST** expose create, get, list, update, and delete over categories
 - `cpt-cf-settings-service-flow-category-management-delete`
 
 **Touches**:
-- API: `POST /v1/categories`
-- API: `GET /v1/categories`
-- API: `GET /v1/categories/{id}`
-- API: `PATCH /v1/categories/{id}`
-- API: `DELETE /v1/categories/{id}`
+- API: `POST /settings-service/v1/categories`
+- API: `GET /settings-service/v1/categories`
+- API: `GET /settings-service/v1/categories/{id}`
+- API: `PATCH /settings-service/v1/categories/{id}`
+- API: `DELETE /settings-service/v1/categories/{id}`
 - Entities: `Category`
 
 ### No-Orphan Deletion Rule
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-no-orphan`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-no-orphan`
 
 The system **MUST** refuse to delete a category while any setting declaration references it, returning `409 CategoryNotEmpty`, and **MUST** apply that refusal regardless of the referencing declaration's `status`, including `retired`. The declaration-to-category foreign key **MUST** be declared `ON DELETE RESTRICT` so the database enforces the rule independently, and the handler **MUST** translate that database rejection into the same `409` so a declaration inserted between the guard and the delete cannot produce a `500`.
 
@@ -308,7 +308,7 @@ The system **MUST** refuse to delete a category while any setting declaration re
 - `cpt-cf-settings-service-algo-category-management-no-orphan-guard`
 
 **Touches**:
-- API: `DELETE /v1/categories/{id}`
+- API: `DELETE /settings-service/v1/categories/{id}`
 - DB Table: `categories`, `setting_declarations`
 - Entities: `Category`
 
@@ -322,14 +322,14 @@ The system **MUST** reject a category `key` that is empty, exceeds 128 character
 - `cpt-cf-settings-service-algo-category-management-key-validation`
 
 **Touches**:
-- API: `POST /v1/categories`
+- API: `POST /settings-service/v1/categories`
 - Entities: `Category`
 
 ### Authorization on Category Operations
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-authorization`
 
-The system **MUST** authorize every category operation as per-resource-type CRUD on `gts.cf.toolkit.settings.category.v1~` through the `PolicyEnforcer` PEP, **MUST** apply the caller's `AccessScope` domain constraints inside the query rather than as a post-filter, and **MUST** deny when a decision cannot be obtained. A category filtered out by the visibility gate **MUST** be reported as absent rather than as forbidden.
+The system **MUST** authorize every category operation as per-resource-type CRUD on `gts.cf.core.settings.category.v1~` through the `PolicyEnforcer` PEP, **MUST** apply the caller's `AccessScope` domain constraints inside the query rather than as a post-filter, and **MUST** deny when a decision cannot be obtained. A category filtered out by the visibility gate **MUST** be reported as absent rather than as forbidden.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-category-management-visibility-filter`
@@ -338,8 +338,8 @@ The system **MUST** authorize every category operation as per-resource-type CRUD
 **Constraints**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
 
 **Touches**:
-- API: `GET /v1/categories`
-- API: `GET /v1/categories/{id}`
+- API: `GET /settings-service/v1/categories`
+- API: `GET /settings-service/v1/categories/{id}`
 - Entities: `Category`
 
 ### Optimistic Concurrency on Mutations
@@ -355,8 +355,8 @@ The system **MUST** require `If-Match` on `PATCH` and `DELETE`, returning `428` 
 **Constraints**: `cpt-cf-settings-service-constraint-optimistic-concurrency`
 
 **Touches**:
-- API: `PATCH /v1/categories/{id}`
-- API: `DELETE /v1/categories/{id}`
+- API: `PATCH /settings-service/v1/categories/{id}`
+- API: `DELETE /settings-service/v1/categories/{id}`
 - Entities: `Category`
 
 ### Category Mutation Audit
@@ -373,9 +373,9 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 **Constraints**: `cpt-cf-settings-service-constraint-audit-and-events`
 
 **Touches**:
-- API: `POST /v1/categories`
-- API: `PATCH /v1/categories/{id}`
-- API: `DELETE /v1/categories/{id}`
+- API: `POST /settings-service/v1/categories`
+- API: `PATCH /settings-service/v1/categories/{id}`
+- API: `DELETE /settings-service/v1/categories/{id}`
 - Entities: `Category`
 
 ## 6. Acceptance Criteria

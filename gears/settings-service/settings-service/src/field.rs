@@ -1,5 +1,5 @@
 // Created: 2026-08-12 by Constructor Tech
-//! Field-violation vocabulary for `422` responses.
+//! Field-violation vocabulary for validation rejections — canonical invalid-argument, rendered as `400`.
 //!
 //! ADR 0005 keeps these constants beside the code that emits them so the wire
 //! string and its meaning cannot drift apart. Each is the `code` a consumer sees

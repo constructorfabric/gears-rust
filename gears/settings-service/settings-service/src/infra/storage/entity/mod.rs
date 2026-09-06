@@ -2,3 +2,4 @@
 //! `SeaORM` entities.
 
 pub mod category;
+pub mod declaration;

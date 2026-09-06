@@ -22,7 +22,7 @@
 
 pub mod resource_id;
 
-pub use resource_id::AuditScope;
+pub use resource_id::AuditTenant;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::error::DomainError;
@@ -97,7 +97,7 @@ impl AuditRecord {
     #[must_use]
     pub fn new(
         resource: impl Into<String>,
-        scope: AuditScope,
+        scope: AuditTenant,
         actor: impl Into<String>,
         action: impl Into<String>,
         request_id: impl Into<String>,

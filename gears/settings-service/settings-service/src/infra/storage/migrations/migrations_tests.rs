@@ -29,6 +29,7 @@ fn the_harness_declares_its_migrations_in_order() {
         vec![
             "m20260812_000001_initial".to_owned(),
             "m20260813_000001_categories".to_owned(),
+            "m20260825_000001_setting_declarations".to_owned(),
         ]
     );
 }

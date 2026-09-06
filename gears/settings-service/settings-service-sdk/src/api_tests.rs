@@ -19,10 +19,10 @@ use super::{BulkOutcome, BulkSelector, SettingsReaderClient};
 use crate::models::{EffectiveSource, EffectiveValueResponse, GetEffectiveRequest};
 use crate::{SecretHandle, SettingKey};
 
-const BOOL_TYPE: &str = "gts.cf.settings.types.bool_flag.v1~";
+const BASE: &str = "gts.cf.core.settings.setting_type.v1~";
 
 fn key(name: &str) -> SettingKey {
-    SettingKey::parse(&format!("{BOOL_TYPE}acme.settings.network.{name}.v1")).expect("fixture key")
+    SettingKey::parse(&format!("{BASE}acme.settings.network.{name}.v1~")).expect("fixture key")
 }
 
 fn value_for(key: &SettingKey, source: EffectiveSource) -> EffectiveValueResponse {

@@ -7,17 +7,17 @@
 
 use settings_service_sdk::SettingKey;
 
-use super::{AuditOutcome, AuditRecord, AuditScope, AuditValue};
+use super::{AuditOutcome, AuditRecord, AuditValue};
 
 fn key() -> SettingKey {
-    SettingKey::parse("gts.cf.settings.types.bool_flag.v1~acme.settings.network.enable_proxy.v1")
+    SettingKey::parse("gts.cf.core.settings.setting_type.v1~acme.settings.network.enable_proxy.v1~")
         .expect("fixture key parses")
 }
 
 fn record() -> AuditRecord {
     AuditRecord::new(
         key().as_str(),
-        AuditScope::Platform,
+        uuid::Uuid::nil(),
         "admin@acme",
         "change",
         "req-1",
@@ -94,6 +94,6 @@ fn the_record_uses_the_shared_resource_formatter() {
     // history read path computes for the same setting and scope.
     assert_eq!(
         record().resource,
-        super::resource_id::format(&key(), AuditScope::Platform)
+        super::resource_id::format(&key(), uuid::Uuid::nil())
     );
 }

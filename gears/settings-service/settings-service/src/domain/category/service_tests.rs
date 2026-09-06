@@ -27,7 +27,7 @@ fn select_is_refused_rather_than_ignored() {
         select: Some(vec!["key".to_owned(), "name".to_owned()]),
         ..Default::default()
     };
-    match super::reject_unsupported_options(&query) {
+    match crate::domain::odata::reject_unsupported_options(&query, "categories") {
         Err(DomainError::Validation { field, code, .. }) => {
             assert_eq!(field, "$select");
             assert_eq!(code, crate::field::ODATA_UNSUPPORTED_OPTION);
@@ -39,5 +39,5 @@ fn select_is_refused_rather_than_ignored() {
 #[test]
 fn a_query_without_select_is_accepted() {
     let query = toolkit_odata::ODataQuery::default();
-    assert!(super::reject_unsupported_options(&query).is_ok());
+    assert!(crate::domain::odata::reject_unsupported_options(&query, "categories").is_ok());
 }

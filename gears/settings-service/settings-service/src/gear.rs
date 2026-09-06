@@ -8,12 +8,13 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use authz_resolver_sdk::PolicyEnforcer;
 use sea_orm_migration::MigrationTrait;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::{DBProvider, DbError};
 use tracing::info;
+use types_registry_sdk::TypesRegistryClient;
 
 use crate::config::SettingsServiceConfig;
 
@@ -21,15 +22,34 @@ use crate::config::SettingsServiceConfig;
 ///
 /// Holds what initialization resolves, so later phases can hang services off it
 /// without changing the startup contract.
-#[toolkit::gear(name = "settings-service", deps = [authz_resolver], capabilities = [db, rest])]
+///
+/// `deps` names the one gear this service calls during its **own** init — the
+/// types registry — because a `deps` entry is an ordering claim that a gear
+/// reading settings during *its* init could turn into an unsortable cycle
+/// (DESIGN.md §4.9). Everything else is consumed: the authorization resolver is
+/// declared below and wired by the runtime's proxy-wiring phase after init, so
+/// the enforcer fetches it from the hub on first use; the tenant resolver is
+/// fetched the same way (see [`crate::infra::platform_scope`]) — its SDK has no
+/// REST projection yet, so it cannot carry a `consumes` declaration until it
+/// does, and in the Embedded profile R1 is limited to the two paths coincide.
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
+#[toolkit::gear(name = "settings-service", deps = [types_registry], capabilities = [db, rest])]
 pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
+    types: OnceLock<Arc<dyn TypesRegistryClient>>,
     categories: OnceLock<
         Arc<
             crate::domain::category::CategoryService<
                 crate::infra::storage::category_repo::CategoryRepo,
+            >,
+        >,
+    >,
+    declarations: OnceLock<
+        Arc<
+            crate::domain::declaration::DeclarationService<
+                crate::infra::storage::declaration_repo::DeclarationRepo,
             >,
         >,
     >,
@@ -41,7 +61,9 @@ impl Default for SettingsService {
             config: OnceLock::new(),
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
+            types: OnceLock::new(),
             categories: OnceLock::new(),
+            declarations: OnceLock::new(),
         }
     }
 }
@@ -74,11 +96,31 @@ impl SettingsService {
     /// Every handler obtains its `AccessScope` through this rather than
     /// consulting the decision point directly, so the fail-closed projection in
     /// [`crate::api::authz`] cannot be bypassed by a handler that forgets it.
+    /// The enforcer itself resolves the decision point lazily from the hub: the
+    /// resolver is a consumed client, wired after init (DESIGN.md §4.9), and a
+    /// decision it cannot obtain is a denial, not an allow.
     ///
     /// # Errors
     /// Returns an error when called before [`Gear::init`].
     pub fn enforcer(&self) -> anyhow::Result<Arc<PolicyEnforcer>> {
         self.enforcer
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
+    /// The GTS types registry, once initialization has run.
+    ///
+    /// A declaration's value type lives in the registry, not here: the read
+    /// surface resolves its trait set for rendering, and declaration creation
+    /// checks the type is a real catalogue entry. `has_secret_trait` is
+    /// denormalised onto the row for masking precisely so that hot path does
+    /// *not* come back through this client.
+    ///
+    /// # Errors
+    /// Returns an error when called before [`Gear::init`].
+    pub fn types(&self) -> anyhow::Result<Arc<dyn TypesRegistryClient>> {
+        self.types
             .get()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
@@ -111,29 +153,53 @@ impl Gear for SettingsService {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
-        // Resolved at init, not per request: a decision point that cannot be
-        // resolved must stop the gear coming up, rather than surfacing later as
-        // a request-time denial indistinguishable from a real policy decision.
-        let authz = ctx
+        // The one client called during our own init, and therefore the one
+        // `deps` entry: registering the settings GTS schemas is a real call into
+        // the registry, so it must already be up. A registry that is absent must
+        // not first be discovered by a read that has already passed
+        // authorization and reached the database.
+        let types = ctx
             .client_hub()
-            .get::<dyn AuthZResolverApi>()
-            .map_err(|e| anyhow::anyhow!("failed to resolve the AuthZ resolver: {e}"))?;
-        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
-
-        self.enforcer
-            .set(Arc::new(PolicyEnforcer::new(authz)))
+            .get::<dyn TypesRegistryClient>()
+            .map_err(|e| anyhow::anyhow!("failed to resolve the types registry: {e}"))?;
+        self.types
+            .set(types)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // Consumed, not depended on. The authorization resolver is declared with
+        // `#[toolkit::consumes]` on the struct and wired by the proxy-wiring
+        // phase *after* init, so resolving it here would fail by construction;
+        // the enforcer fetches it from the hub per call and denies when it
+        // cannot. The tenant resolver is fetched the same way, on the first
+        // platform-scoped mutation that needs the root tenant's id. Neither is
+        // an ordering claim on the rest of the platform (DESIGN.md §4.9).
+        let hub = ctx.client_hub();
+        self.enforcer
+            .set(Arc::new(PolicyEnforcer::from_hub(Arc::clone(&hub))))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        let platform_scope = Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
 
         self.categories
             .set(Arc::new(crate::domain::category::CategoryService::new(
                 crate::infra::storage::category_repo::CategoryRepo,
                 Arc::new(crate::infra::audit_emitter::TracingAuditEmitter),
+                platform_scope,
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
+        self.declarations
+            .set(Arc::new(
+                crate::domain::declaration::DeclarationService::new(
+                    crate::infra::storage::declaration_repo::DeclarationRepo,
+                    self.types()?,
+                ),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-11
         info!("Settings Service gear initialized");
-        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-11
 
         Ok(())
     }
@@ -151,10 +217,22 @@ impl RestApiCapability for SettingsService {
             .get()
             .ok_or_else(|| anyhow::anyhow!("category service not initialized"))?
             .clone();
-        Ok(crate::api::rest::routes::register_routes(
+        let declarations = self
+            .declarations
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("declaration service not initialized"))?
+            .clone();
+        let router = crate::api::rest::routes::register_routes(
             router,
             openapi,
             service,
+            self.db()?,
+            self.enforcer()?,
+        );
+        Ok(crate::api::rest::declaration_routes::register_routes(
+            router,
+            openapi,
+            declarations,
             self.db()?,
             self.enforcer()?,
         ))

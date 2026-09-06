@@ -12,13 +12,13 @@
 //! # The obligation is mutual
 //!
 //! Delivery is **acknowledged**. A notification is redelivered until the
-//! consumer accounts for every key in it, and the originating apply does not
-//! settle until that account arrives — an administrator watching an apply is
+//! consumer accounts for every key in it, and the originating change set does
+//! not settle until that account arrives — an administrator watching a change set is
 //! waiting on these outcomes. So a consumer that subscribes takes on a duty to
 //! answer, and [`SettingChangeHandler::on_change`] returns the outcomes rather
 //! than offering a separate call it could forget to make.
 //!
-//! Delivery is also **at-least-once**: the same `(apply_id, key)` may arrive
+//! Delivery is also **at-least-once**: the same `(change_set_id, key)` may arrive
 //! more than once, so reacting must be idempotent. Re-reading the effective
 //! value and converging to it already is.
 
@@ -37,19 +37,22 @@ use crate::SettingKey;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingChangeNotification {
-    /// The apply this notification belongs to. Every outcome reported for it is
-    /// accounted against this apply.
-    pub apply_id: String,
+    /// The change set this notification belongs to. Every outcome reported for
+    /// it is accounted against this change set.
+    pub change_set_id: String,
 
-    /// The tenant whose values changed; absent means platform-wide.
+    /// The tenant whose values changed.
+    ///
+    /// Always present: platform scope is the **root tenant's** id, never an
+    /// absent tenant (DESIGN.md §4.1).
     ///
     /// The notification carries the tenant precisely because a subscription
     /// does not: a consumer watching a key is notified of that key's change in
     /// any tenant, and reads which one from here.
-    pub tenant: Option<String>,
+    pub tenant: String,
 
     /// Only this subscriber's **own** subscribed keys that changed — never the
-    /// full apply, so a subscriber cannot learn what changed elsewhere.
+    /// full change set, so a subscriber cannot learn what changed elsewhere.
     pub changed_keys: Vec<SettingKey>,
 }
 
@@ -68,7 +71,7 @@ pub enum ActivationOutcome {
         /// The setting that was applied.
         key: SettingKey,
         /// The value actually applied, echoed so the service can verify it
-        /// against the value snapshotted at apply time — a success carrying a
+        /// against the value the change set stored — a success carrying a
         /// value that does not match is treated as a failure.
         ///
         /// For a secret-valued setting this is a **hash**: the plaintext never
@@ -149,8 +152,8 @@ pub trait SettingsActivationClient: Send + Sync {
     async fn report_outcome(
         &self,
         ctx: &SecurityContext,
-        apply_id: String,
-        tenant: Option<String>,
+        change_set_id: String,
+        tenant: String,
         outcome: ActivationOutcome,
     ) -> Result<(), CanonicalError>;
 }

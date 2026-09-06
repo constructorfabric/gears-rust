@@ -2,7 +2,7 @@
 //! Settings Service gear
 //!
 //! The service that owns platform settings: declaration registry, scoped value
-//! resolution, and staged apply. Its public contract lives in
+//! resolution, and validate-then-set writes. Its public contract lives in
 //! `cf-gears-settings-service-sdk`; this crate is the implementation.
 //!
 //! # What is here so far

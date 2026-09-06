@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::operation_builder::{
+    OperationBuilderODataExt, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
+};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_db::{DBProvider, DbError};
 
@@ -19,6 +22,7 @@ use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::handlers;
 use crate::domain::category::CategoryService;
 use crate::infra::storage::category_repo::CategoryRepo;
+use settings_service_sdk::odata::CategoryFilterField;
 
 /// `OpenAPI` grouping for these operations.
 const TAG: &str = "settings-categories";
@@ -43,7 +47,7 @@ pub fn register_routes(
         .description(
             "List categories visible to the caller, ordered by sort order then name. \
              Supports OData `$filter` and `$orderby` over `key`, `name` and \
-             `domainAffinity`, with cursor pagination. `$select` is not supported and \
+             `domain_affinity`, with cursor pagination. `$select` is not supported and \
              is rejected rather than ignored.",
         )
         .tag(TAG)
@@ -53,12 +57,18 @@ pub fn register_routes(
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-2
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
         .no_license_required()
+        .query_param_typed("limit", false, "Page size", "integer")
+        .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_categories::<CategoryRepo>)
         .json_response_with_schema::<toolkit_odata::Page<CategoryDto>>(
             openapi,
             StatusCode::OK,
             "A page of categories with its pagination cursors",
         )
+        // The declared surface is the rejection rule made visible: a field
+        // absent from `x-odata-filter` is refused with 400, never ignored.
+        .with_odata_filter::<CategoryFilterField>()
+        .with_odata_orderby::<CategoryFilterField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -84,12 +94,14 @@ pub fn register_routes(
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-2
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
         .no_license_required()
+        .path_param("id", "Category UUID")
         .handler(handlers::get_category::<CategoryRepo>)
         .json_response_with_schema::<CategoryDto>(
             openapi,
             StatusCode::OK,
             "The category, with its ETag",
         )
+        .response_header(etag_header())
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
@@ -123,6 +135,12 @@ pub fn register_routes(
             StatusCode::CREATED,
             "The created category, with its ETag and Location",
         )
+        .response_header(ResponseHeaderSpec::new(
+            "Location",
+            "URL of the created category",
+            ResponseHeaderType::String,
+        ))
+        .response_header(etag_header())
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -148,6 +166,8 @@ pub fn register_routes(
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-2
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
         .no_license_required()
+        .path_param("id", "Category UUID")
+        .param(if_match_param())
         .json_request::<crate::api::rest::dto::UpdateCategoryRequest>(
             openapi,
             "The replacement representation",
@@ -158,6 +178,7 @@ pub fn register_routes(
             StatusCode::OK,
             "The updated category, with its refreshed ETag",
         )
+        .response_header(etag_header())
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -194,6 +215,8 @@ pub fn register_routes(
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-2
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
         .no_license_required()
+        .path_param("id", "Category UUID")
+        .param(if_match_param())
         .handler(handlers::delete_category::<CategoryRepo>)
         .no_content_response(StatusCode::NO_CONTENT, "The category was deleted")
         .error_401(openapi)
@@ -219,6 +242,35 @@ pub fn register_routes(
         .layer(axum::Extension(service))
         .layer(axum::Extension(db))
         .layer(axum::Extension(enforcer))
+}
+
+/// The `If-Match` precondition every category mutation demands.
+///
+/// One definition for `PATCH` and `DELETE`, so the two cannot describe the
+/// header differently -- and so a generated client sends it on both.
+fn if_match_param() -> ParamSpec {
+    ParamSpec {
+        name: "If-Match".to_owned(),
+        location: ParamLocation::Header,
+        required: true,
+        description: Some(
+            "The `ETag` from the caller's last read of this category. Absent -> 428; \
+             stale -> 412. The write happens only against the representation the \
+             caller saw."
+                .to_owned(),
+        ),
+        param_type: "string".to_owned(),
+        array: false,
+    }
+}
+
+/// The `ETag` every category representation carries.
+fn etag_header() -> ResponseHeaderSpec {
+    ResponseHeaderSpec::new(
+        "ETag",
+        "Tag of the returned representation; send it back as `If-Match` on PATCH and DELETE",
+        ResponseHeaderType::String,
+    )
 }
 
 #[cfg(test)]

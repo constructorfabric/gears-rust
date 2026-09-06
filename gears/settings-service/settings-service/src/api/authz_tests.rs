@@ -124,12 +124,12 @@ fn the_resource_vocabulary_is_the_gts_type_ids() {
     // policy decision point rather than an internal naming choice.
     assert_eq!(
         resource::DECLARATION.name(),
-        "gts.cf.toolkit.settings.declaration.v1~"
+        "gts.cf.core.settings.declaration.v1~"
     );
-    assert_eq!(resource::VALUE.name(), "gts.cf.toolkit.settings.value.v1~");
+    assert_eq!(resource::VALUE.name(), "gts.cf.core.settings.value.v1~");
     assert_eq!(
         resource::CATEGORY.name(),
-        "gts.cf.toolkit.settings.category.v1~"
+        "gts.cf.core.settings.category.v1~"
     );
 }
 

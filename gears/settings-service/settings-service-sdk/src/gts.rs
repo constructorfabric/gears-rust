@@ -9,13 +9,19 @@
 //! placeholder to its backend believing it to be a credential.
 
 /// A setting declaration — the record of what a setting *is*.
-pub const DECLARATION_SCHEMA: &str = "gts.cf.toolkit.settings.declaration.v1~";
+/// The abstract base every setting key derives from.
+///
+/// Owned and registered by this gear at init; a setting key is
+/// `SETTING_TYPE_BASE` followed by the setting's own derived type (ADR-002).
+pub const SETTING_TYPE_BASE: &str = "gts.cf.core.settings.setting_type.v1~";
+
+pub const DECLARATION_SCHEMA: &str = "gts.cf.core.settings.declaration.v1~";
 
 /// A stored setting value at some scope — what a setting currently *holds*.
-pub const VALUE_SCHEMA: &str = "gts.cf.toolkit.settings.value.v1~";
+pub const VALUE_SCHEMA: &str = "gts.cf.core.settings.value.v1~";
 
 /// A settings category.
-pub const CATEGORY_SCHEMA: &str = "gts.cf.toolkit.settings.category.v1~";
+pub const CATEGORY_SCHEMA: &str = "gts.cf.core.settings.category.v1~";
 
 /// Typed view of the wire `resource_type` strings above.
 #[derive(Debug, Clone, PartialEq, Eq)]

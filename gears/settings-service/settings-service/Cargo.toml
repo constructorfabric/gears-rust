@@ -19,8 +19,12 @@ workspace = true
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 settings-service-sdk = { workspace = true }
-authz-resolver-sdk = { workspace = true }
-authz-resolver = { workspace = true }
+# `rest-client`: `#[toolkit::consumes]` needs the directory-resolving client to
+# exist, even though R1 binds the co-located provider (DESIGN.md §4.9).
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
+types-registry-sdk = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
+types-registry = { workspace = true }
 uuid = { workspace = true }
 
 anyhow = { workspace = true }

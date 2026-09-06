@@ -15,7 +15,7 @@
 //! DESIGN.md §4.3 names concrete failures — `CategoryNotEmpty`,
 //! `DeclarationKeyConflict`, `ValueTooLarge`. Those belong to the features that
 //! raise them. What lives here is the set of **shapes** every feature reuses:
-//! the 422 with field-level detail, the 412 that guards a conditional write, the
+//! the 400 with field-level detail, the 412 that guards a conditional write, the
 //! 409 for a state conflict, and the denial that must not disclose existence.
 //!
 //! A feature adds its own variant, or supplies its own `code` to
@@ -27,7 +27,7 @@ use crate::field;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DomainError {
-    /// A request field failed validation. Renders as `422` with a field-level
+    /// A request field failed validation. Renders as `400` with a field-level
     /// entry carrying `field`, `code`, and `message`.
     #[error("validation failed on `{field}`: {message}")]
     Validation {

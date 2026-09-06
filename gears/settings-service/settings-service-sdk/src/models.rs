@@ -111,7 +111,7 @@ pub struct EffectiveValueResponse {
 pub struct ContributedDeclaration {
     /// The setting key the module supplies.
     pub key: SettingKey,
-    /// The Schema Default, validated against the key's value type.
+    /// The Schema Default, validated against the declaration's `value_type_id`.
     pub default_value: serde_json::Value,
 }
 

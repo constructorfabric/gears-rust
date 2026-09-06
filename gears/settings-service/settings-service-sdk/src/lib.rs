@@ -11,22 +11,24 @@
 //!
 //! # Setting key shape
 //!
-//! A setting's key is a GTS **instance** identifier of the form
-//! `<value-type>~<setting-instance-id>`:
+//! A setting's key is a GTS **type** identifier: the abstract base this gear
+//! owns, then the setting's own derived half. Both end with `~`.
 //!
 //! ```text
-//! gts.cf.settings.types.bool_flag.v1~acme.settings.network.enable_proxy.v1
-//! └────── value type, ends `~` ─────┘└──── instance id, no trailing `~` ───┘
+//! gts.cf.core.settings.setting_type.v1~acme.settings.network.enable_proxy.v1~
+//! └──────── base type, owned by this gear ────────┘└── derived half, a type ──┘
 //! ```
 //!
-//! The left half is a curated value type from the `gts.cf.settings.types.*~`
-//! catalog and is the **only** part registered in GTS. The setting itself is an
-//! unregistered GTS instance living in the Settings DB.
+//! The derived half carries four name tokens with the **category third**; an
+//! admin key is composed as `<vendor>.settings.<category>.<name>.v1~`, a module
+//! supplies its own. The value's shape is *not* in the key: it is a separate
+//! curated catalog type (`gts.cf.toolkit.settings.type_*~`) named by the
+//! declaration's `value_type_id`. Registered when the declaration is created
+//! (ADR-002).
 //!
 //! Only the first segment carries the `gts.` prefix, and each segment holds
 //! exactly four name tokens before its version — that grammar is enforced by
 //! `gts-id`, not re-implemented here.
-
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
