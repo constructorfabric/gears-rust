@@ -73,3 +73,11 @@ fn an_uninitialized_gear_refuses_to_hand_out_the_enforcer() {
     let gear = SettingsService::default();
     assert!(gear.enforcer().is_err());
 }
+
+#[test]
+fn an_uninitialized_gear_refuses_to_hand_out_the_validator() {
+    // A default validator that accepted everything would be the vacuous pass
+    // the fail-closed rule exists to prevent.
+    let gear = SettingsService::default();
+    assert!(gear.validator().is_err());
+}

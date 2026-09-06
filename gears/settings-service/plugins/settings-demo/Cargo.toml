@@ -1,0 +1,39 @@
+# Created: 2026-09-06 by Constructor Tech
+[package]
+name = "cf-gears-settings-demo"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Demo gear that contributes a sample settings catalogue to the Settings Service at init"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "settings-service"]
+categories = ["web-programming"]
+publish = false
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "settings_demo"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The provider: named in `deps` so the Settings Service initializes first and
+# its contribution client is in `ClientHub` when this gear asks for it.
+settings-service = { workspace = true }
+settings-service-sdk = { workspace = true }
+
+# ToolKit
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# Required by the toolkit::gear macro
+inventory = { workspace = true }

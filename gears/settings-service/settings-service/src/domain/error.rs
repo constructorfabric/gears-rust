@@ -119,3 +119,15 @@ impl DomainError {
         }
     }
 }
+
+impl From<toolkit_db::DbError> for DomainError {
+    /// A transaction that could not begin or commit.
+    ///
+    /// Needed so a domain error can travel through `Db::transaction_ref_mapped`,
+    /// which maps begin/commit failures into the closure's error type.
+    fn from(err: toolkit_db::DbError) -> Self {
+        Self::Internal {
+            diagnostic: format!("database transaction: {err}"),
+        }
+    }
+}

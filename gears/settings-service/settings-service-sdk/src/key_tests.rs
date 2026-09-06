@@ -284,3 +284,54 @@ fn a_padded_key_never_becomes_a_second_spelling_of_a_valid_one() {
     assert!(SettingKey::parse(VALID_KEY).is_ok());
     assert!(SettingKey::parse(&padded).is_err());
 }
+
+fn major(n: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(n).expect("non-zero")
+}
+
+#[test]
+fn a_contributed_key_carries_the_module_package_and_major() {
+    // A module names its own vendor and package, unlike the admin path where
+    // the package is fixed to `settings`; the major is the setting's own.
+    let key = SettingKey::contributed("cf", "settings_demo", "network", "proxy_enabled", major(2))
+        .expect("a well-formed contributed key");
+    assert_eq!(
+        key.as_str(),
+        "gts.cf.core.settings.setting_type.v1~cf.settings_demo.network.proxy_enabled.v2~"
+    );
+    assert_eq!(key.category_slug(), "network");
+    assert_eq!(key.leaf_slug(), "proxy_enabled");
+    assert_eq!(key.major(), 2);
+    assert_eq!(
+        key.version_stripped_path(),
+        "cf.settings_demo.network.proxy_enabled"
+    );
+}
+
+#[test]
+fn two_majors_of_one_setting_share_a_version_stripped_path() {
+    // Succession is derived from the keys and never stored: the same path with
+    // a higher major is the successor.
+    let v1 = SettingKey::contributed("cf", "toolkit", "cat", "sett1", major(1)).expect("v1");
+    let v2 = SettingKey::contributed("cf", "toolkit", "cat", "sett1", major(2)).expect("v2");
+    assert_ne!(v1, v2);
+    assert_eq!(v1.version_stripped_path(), v2.version_stripped_path());
+    assert_eq!((v1.major(), v2.major()), (1, 2));
+}
+
+#[test]
+fn a_contributed_key_is_refused_on_the_same_grammar_as_a_parsed_one() {
+    // A zero major cannot even be asked for: the parameter is `NonZeroU32`.
+    assert!(SettingKey::contributed("Cf", "settings_demo", "network", "x", major(1)).is_err());
+    assert!(SettingKey::contributed("cf", "settings_demo", "net/work", "x", major(1)).is_err());
+}
+
+#[test]
+fn an_admin_composed_key_has_major_one_and_a_stripped_path_too() {
+    let key = SettingKey::compose("acme", "network", "enable_proxy").expect("composes");
+    assert_eq!(key.major(), 1);
+    assert_eq!(
+        key.version_stripped_path(),
+        "acme.settings.network.enable_proxy"
+    );
+}

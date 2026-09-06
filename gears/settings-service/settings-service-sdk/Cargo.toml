@@ -20,6 +20,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 gts-id = { workspace = true }
+# The abstract `setting_type` base and the starter value-type catalogue are
+# submitted to the link-time schema inventory the types registry drains at init.
+toolkit-gts = { workspace = true }
 toolkit-odata-macros = { workspace = true }
 toolkit-odata = { workspace = true }
 async-trait = { workspace = true }
@@ -28,4 +31,5 @@ toolkit-security = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

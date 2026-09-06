@@ -40,3 +40,41 @@ fn declaration_and_value_are_different_resources() {
         Resource::from_wire(VALUE_SCHEMA)
     );
 }
+
+#[test]
+fn the_base_schema_is_identified_by_the_wire_constant() {
+    // Two spellings of one identifier: the constant callers read off policies
+    // and audit records, and the `$id` the registry holds. If they drift, keys
+    // parse against a base that is not the one registered.
+    use super::{SETTING_TYPE_BASE, setting_type_base_schema};
+    let schema = setting_type_base_schema();
+    assert_eq!(
+        schema["$id"],
+        serde_json::json!(format!("gts://{SETTING_TYPE_BASE}"))
+    );
+    assert_eq!(schema["x-gts-abstract"], serde_json::json!(true));
+    assert_eq!(
+        schema["properties"]["payload"],
+        serde_json::json!({}),
+        "a derived type may narrow the payload to any shape"
+    );
+    assert!(
+        schema.get("default").is_none(),
+        "the Schema Default lives on the declaration, never in the type"
+    );
+}
+
+#[test]
+fn the_base_is_submitted_to_the_inventory() {
+    // What the types registry drains at its init. Absent from the inventory,
+    // no declaration could ever register a derived type.
+    use super::SETTING_TYPE_BASE;
+    let wanted = serde_json::json!(format!("gts://{SETTING_TYPE_BASE}"));
+    assert!(
+        toolkit_gts::all_inventory_type_schemas()
+            .expect("inventory renders")
+            .into_iter()
+            .any(|schema| schema["$id"] == wanted),
+        "the setting base is in the link-time inventory"
+    );
+}

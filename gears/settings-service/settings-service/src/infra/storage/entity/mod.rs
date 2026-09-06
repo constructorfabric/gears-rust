@@ -3,3 +3,4 @@
 
 pub mod category;
 pub mod declaration;
+pub mod setting_value;

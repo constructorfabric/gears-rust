@@ -26,6 +26,9 @@ types-registry-sdk = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
 types-registry = { workspace = true }
 uuid = { workspace = true }
+# Type Validator: structural + `format` assertions, and the regex trait check.
+jsonschema = { workspace = true }
+regex = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

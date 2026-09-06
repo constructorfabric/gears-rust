@@ -33,5 +33,8 @@ pub mod gear;
 pub mod infra;
 pub mod precondition;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use config::SettingsServiceConfig;
 pub use gear::SettingsService;

@@ -16,6 +16,10 @@ use toolkit_db::{DBProvider, DbError};
 use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
+use crate::domain::platform_scope::PlatformScope;
+use crate::domain::validation::TypeValidator;
+use settings_service_sdk::api::SettingsContributionClient;
+
 use crate::config::SettingsServiceConfig;
 
 /// The Settings Service gear.
@@ -39,6 +43,7 @@ pub struct SettingsService {
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
     types: OnceLock<Arc<dyn TypesRegistryClient>>,
+    validator: OnceLock<Arc<dyn TypeValidator>>,
     categories: OnceLock<
         Arc<
             crate::domain::category::CategoryService<
@@ -62,6 +67,7 @@ impl Default for SettingsService {
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
             types: OnceLock::new(),
+            validator: OnceLock::new(),
             categories: OnceLock::new(),
             declarations: OnceLock::new(),
         }
@@ -125,6 +131,20 @@ impl SettingsService {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
     }
+    /// The Type Validator, once initialization has run.
+    ///
+    /// Generic over any GTS type id; for a setting the id passed is the
+    /// declaration's `value_type_id`. Every rule it enforces is hard, and a type
+    /// it cannot resolve is a rejection rather than a vacuous pass.
+    ///
+    /// # Errors
+    /// Returns an error when called before [`Gear::init`].
+    pub fn validator(&self) -> anyhow::Result<Arc<dyn TypeValidator>> {
+        self.validator
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
 }
 
 #[async_trait]
@@ -165,6 +185,14 @@ impl Gear for SettingsService {
         self.types
             .set(types)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // Built over the registry client above: validation of a value against
+        // its type is the one path that consults the registry per call, and it
+        // fails closed on a type the registry does not know.
+        self.validator
+            .set(Arc::new(
+                crate::infra::type_validator::GtsTypeValidator::new(self.types()?),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // Consumed, not depended on. The authorization resolver is declared with
         // `#[toolkit::consumes]` on the struct and wired by the proxy-wiring
@@ -177,16 +205,39 @@ impl Gear for SettingsService {
         self.enforcer
             .set(Arc::new(PolicyEnforcer::from_hub(Arc::clone(&hub))))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        let platform_scope = Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
+        let platform_scope: Arc<dyn PlatformScope> =
+            Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
 
+        let audit: Arc<dyn crate::audit::AuditEmitter> =
+            Arc::new(crate::infra::audit_emitter::TracingAuditEmitter);
         self.categories
             .set(Arc::new(crate::domain::category::CategoryService::new(
                 crate::infra::storage::category_repo::CategoryRepo,
-                Arc::new(crate::infra::audit_emitter::TracingAuditEmitter),
-                platform_scope,
+                Arc::clone(&audit),
+                Arc::clone(&platform_scope),
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // The contribution door: gears register their declarations through this
+        // trait from their own init, so it is bound into the hub here and each
+        // caller names `settings-service` in its `deps` to initialize after us.
+        let contributions = Arc::new(crate::domain::contribution::ContributionService::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::category_repo::CategoryRepo,
+            crate::infra::storage::value_repo::ValueRepo,
+            self.validator()?,
+            Arc::new(
+                crate::infra::setting_type_registrar::TypesRegistryRegistrar::new(self.types()?),
+            ),
+            audit,
+            platform_scope,
+        ));
+        let contribution_client: Arc<dyn SettingsContributionClient> = Arc::new(
+            crate::infra::contribution_client::ContributionClient::new(self.db()?, contributions),
+        );
+        ctx.client_hub()
+            .register::<dyn SettingsContributionClient>(contribution_client);
 
         self.declarations
             .set(Arc::new(
@@ -197,9 +248,9 @@ impl Gear for SettingsService {
             ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-11
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-12
         info!("Settings Service gear initialized");
-        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-11
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-12
 
         Ok(())
     }

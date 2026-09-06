@@ -4,5 +4,5 @@
 pub mod repo;
 pub mod service;
 
-pub use repo::{Declaration, DeclarationRepository};
+pub use repo::{Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository};
 pub use service::DeclarationService;

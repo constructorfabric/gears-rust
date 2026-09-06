@@ -68,3 +68,58 @@ fn secret_handle_debug_redacts_the_token() {
     );
     assert_eq!(rendered, "SecretHandle(<redacted>)");
 }
+
+#[test]
+fn a_contributed_declaration_carries_only_what_the_module_stated() {
+    // Optional fields absent on the wire mean the declaration's defaults —
+    // `standard`, `public`, step-up required, not exposable — decided by the
+    // service, not invented by the SDK.
+    use super::{ContributedDeclaration, ScopeClass};
+    let key = crate::SettingKey::contributed(
+        "cf",
+        "settings_demo",
+        "network",
+        "proxy_enabled",
+        std::num::NonZeroU32::new(1).expect("non-zero"),
+    )
+    .expect("key");
+    let decl = ContributedDeclaration::new(
+        key,
+        "gts.cf.toolkit.settings.type_bool_flag.v1~",
+        serde_json::json!(false),
+        ScopeClass::Cascading,
+    );
+    let wire = serde_json::to_value(&decl).expect("serializes");
+    assert_eq!(
+        wire,
+        serde_json::json!({
+            "key": "gts.cf.core.settings.setting_type.v1~cf.settings_demo.network.proxy_enabled.v1~",
+            "valueTypeId": "gts.cf.toolkit.settings.type_bool_flag.v1~",
+            "defaultValue": false,
+            "scopeClass": "cascading"
+        })
+    );
+    let back: ContributedDeclaration = serde_json::from_value(wire).expect("round-trips");
+    assert_eq!(back.scope_class, ScopeClass::Cascading);
+    assert!(back.requires_step_up.is_none());
+}
+
+#[test]
+fn a_reconcile_result_reports_refusals_per_key() {
+    use super::{ContributionError, ReconcileResult};
+    let result = ReconcileResult {
+        registered: 2,
+        errors: vec![ContributionError {
+            key: "gts.cf.core.settings.setting_type.v1~cf.x.y.z.v1~".to_owned(),
+            code: "value_type_unknown".to_owned(),
+            message: "no such type".to_owned(),
+        }],
+        ..ReconcileResult::default()
+    };
+    let wire = serde_json::to_value(&result).expect("serializes");
+    assert_eq!(wire["registered"], 2);
+    assert_eq!(wire["errors"][0]["code"], "value_type_unknown");
+    // A set that changed nothing serializes without an `errors` key at all.
+    let quiet = serde_json::to_value(ReconcileResult::default()).expect("serializes");
+    assert!(quiet.get("errors").is_none());
+}

@@ -14,3 +14,4 @@ pub mod declaration_repo;
 pub mod entity;
 pub mod migrations;
 pub mod odata_mapper;
+pub mod value_repo;

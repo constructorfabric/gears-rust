@@ -34,6 +34,7 @@
 
 pub mod activation;
 pub mod api;
+pub mod catalogue;
 pub mod error;
 pub mod gts;
 pub mod key;

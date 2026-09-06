@@ -23,6 +23,12 @@ fn rendered(traits: serde_json::Value) -> RenderedDeclaration {
             licence_feature: None,
             owner_module: None,
             description: None,
+            default_value: json!(true),
+            has_secret_trait: false,
+            data_classification: "public".to_owned(),
+            requires_step_up: true,
+            anonymous_exposable: false,
+            source: "admin_authored".to_owned(),
         },
         traits,
     }

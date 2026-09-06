@@ -42,3 +42,18 @@ pub const ODATA_QUERY: &str = "odata_query";
 
 /// A request used an `OData` option this resource does not implement.
 pub const ODATA_UNSUPPORTED_OPTION: &str = "odata_unsupported_option";
+
+/// The named value type is not registered in the types registry.
+pub const VALUE_TYPE_UNKNOWN: &str = "value_type_unknown";
+
+/// The value violates its type's JSON Schema at the named path.
+pub const VALUE_SCHEMA: &str = "value_schema";
+
+/// The value violates a `format` keyword its type declares.
+pub const VALUE_FORMAT: &str = "value_format";
+
+/// A regex-bearing value does not compile.
+pub const VALUE_REGEX_INVALID: &str = "value_regex_invalid";
+
+/// An entity-reference value does not resolve to a registered instance.
+pub const VALUE_REFERENCE_UNRESOLVED: &str = "value_reference_unresolved";

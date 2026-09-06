@@ -28,6 +28,7 @@
 //! type, and where the category and leaf name sit within the derived half.
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -272,6 +273,53 @@ impl SettingKey {
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-2
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-1
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-4
+    }
+
+    /// Compose a module-contributed key.
+    ///
+    /// A contributed derived half is `<vendor>.<package>.<category>.<name>.v<major>~`:
+    /// the module names its own vendor and package, the category is the slug
+    /// its settings file under, and the major is the setting's own version —
+    /// bumped when a behavior-affecting field changes, so that `…retry_policy.v1~`
+    /// and `…retry_policy.v2~` are two declarations on one version-stripped
+    /// path. The value type is not an input, exactly as for [`Self::compose`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingKeyError`] when the composed key is not a valid setting
+    /// key — an uppercase segment, a `/`, a token the GTS grammar refuses. A
+    /// major of zero cannot be asked for: the parameter is non-zero by type.
+    pub fn contributed(
+        vendor: &str,
+        package: &str,
+        category: &str,
+        name: &str,
+        major: NonZeroU32,
+    ) -> Result<Self, SettingKeyError> {
+        let derived = format!("{vendor}.{package}.{category}.{name}.v{major}{TYPE_TERMINATOR}");
+        Self::parse(&format!("{SETTING_TYPE_BASE}{derived}"))
+    }
+
+    /// The setting's major version — the `N` of the derived half's `.vN~`.
+    #[must_use]
+    pub fn major(&self) -> u32 {
+        let derived = self.derived_half().trim_end_matches(TYPE_TERMINATOR);
+        derived
+            .rsplit_once(".v")
+            .and_then(|(_, digits)| digits.parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// The derived half without its version — what "the same setting across
+    /// versions" means.
+    ///
+    /// `gts.cf.core.settings.setting_type.v1~cf.toolkit.cat.sett1.v2~` yields
+    /// `cf.toolkit.cat.sett1`; every major of one setting shares this path, and
+    /// succession between them is derived from it rather than stored.
+    #[must_use]
+    pub fn version_stripped_path(&self) -> &str {
+        let derived = self.derived_half().trim_end_matches(TYPE_TERMINATOR);
+        derived.rsplit_once(".v").map_or(derived, |(path, _)| path)
     }
 
     /// The full key, byte-identical to what was parsed.

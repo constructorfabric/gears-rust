@@ -29,6 +29,8 @@ use resource_group as _;
 use simple_user_settings as _;
 #[cfg(feature = "settings-service")]
 use settings_service as _;
+#[cfg(feature = "settings-demo")]
+use settings_demo as _;
 use tenant_resolver as _;
 use types_registry as _;
 
