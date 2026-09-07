@@ -60,7 +60,9 @@ pub async fn get_declaration<R: DeclarationRepository>(
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-7
 
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
-    Ok(Json(DeclarationDto::from(declaration)))
+    let dto = DeclarationDto::from(declaration);
+    let etag = dto.etag.clone();
+    Ok(([(axum::http::header::ETAG, etag)], Json(dto)))
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
 }
 

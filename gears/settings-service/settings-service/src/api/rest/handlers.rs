@@ -16,13 +16,16 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::dto::CategoryDto;
+use crate::audit::AuditSink;
 use crate::domain::category::service::Actor;
 use crate::domain::category::{CategoryRepository, CategoryService};
 use crate::domain::error::DomainError;
 
 /// The concrete service the routes carry.
-pub type ConcreteCategoryService =
-    CategoryService<crate::infra::storage::category_repo::CategoryRepo>;
+pub type ConcreteCategoryService = CategoryService<
+    crate::infra::storage::category_repo::CategoryRepo,
+    crate::infra::storage::audit_store::AuditStore,
+>;
 
 /// The action names authorization decisions are made against.
 const READ: &str = "read";
@@ -35,9 +38,9 @@ const DELETE: &str = "delete";
 /// # Errors
 /// `403` when the caller is not entitled to read categories, `404` when no such
 /// category exists **or** it falls outside the caller's administrative domain.
-pub async fn get_category<R: CategoryRepository>(
+pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<CategoryService<R>>>,
+    Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Path(id): Path<Uuid>,
@@ -79,9 +82,9 @@ pub async fn get_category<R: CategoryRepository>(
 /// `403` when the caller is not entitled, `400` when the query names an
 /// unmapped field, uses an unsupported option, or carries an undecodable
 /// cursor.
-pub async fn list_categories<R: CategoryRepository>(
+pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<CategoryService<R>>>,
+    Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     OData(query): OData,
@@ -136,9 +139,9 @@ fn request_id(headers: &axum::http::HeaderMap) -> String {
 /// # Errors
 /// `400` on a malformed key, `403` when not entitled, `409` when the key or
 /// name is taken.
-pub async fn create_category<R: CategoryRepository>(
+pub async fn create_category<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<CategoryService<R>>>,
+    Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     headers: axum::http::HeaderMap,
@@ -155,19 +158,25 @@ pub async fn create_category<R: CategoryRepository>(
     // Validated before anything is authorized against it or written.
     let draft = body.into_draft()?;
 
-    let conn = db.conn().map_err(|err| DomainError::Internal {
-        diagnostic: err.to_string(),
-    })?;
-    let created = svc
-        .create(
-            &conn,
-            &scope,
-            draft,
-            Actor {
-                ctx: &ctx,
-                request_id: &request_id(&headers),
-            },
-        )
+    // One transaction for the row and its audit record: the future owns its
+    // inputs because the transaction lifetime is the database's to pick.
+    let request_id = request_id(&headers);
+    let created = db
+        .db()
+        .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
+            Box::pin(async move {
+                svc.create(
+                    tx,
+                    &scope,
+                    draft,
+                    Actor {
+                        ctx: &ctx,
+                        request_id: &request_id,
+                    },
+                )
+                .await
+            })
+        })
         .await?;
 
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-create:p1:inst-cat-create-12
@@ -192,9 +201,9 @@ pub async fn create_category<R: CategoryRepository>(
 /// `400` on a malformed key, `403` when not entitled, `404` when not visible,
 /// `409` on a key or name collision, `412` on a stale `If-Match`, `428` when
 /// the header is absent.
-pub async fn update_category<R: CategoryRepository>(
+pub async fn update_category<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<CategoryService<R>>>,
+    Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Path(id): Path<Uuid>,
@@ -208,21 +217,26 @@ pub async fn update_category<R: CategoryRepository>(
     // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-2
     let patch = body.into_patch()?;
 
-    let conn = db.conn().map_err(|err| DomainError::Internal {
-        diagnostic: err.to_string(),
-    })?;
-    let updated = svc
-        .update(
-            &conn,
-            &scope,
-            id,
-            if_match(&headers),
-            patch,
-            Actor {
-                ctx: &ctx,
-                request_id: &request_id(&headers),
-            },
-        )
+    let request_id = request_id(&headers);
+    let if_match = if_match(&headers).map(str::to_owned);
+    let updated = db
+        .db()
+        .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
+            Box::pin(async move {
+                svc.update(
+                    tx,
+                    &scope,
+                    id,
+                    if_match.as_deref(),
+                    patch,
+                    Actor {
+                        ctx: &ctx,
+                        request_id: &request_id,
+                    },
+                )
+                .await
+            })
+        })
         .await?;
 
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-15
@@ -239,9 +253,9 @@ pub async fn update_category<R: CategoryRepository>(
 /// # Errors
 /// `403` when not entitled, `404` when not visible, `409` while any declaration
 /// references it, `412` on a stale `If-Match`, `428` when the header is absent.
-pub async fn delete_category<R: CategoryRepository>(
+pub async fn delete_category<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<CategoryService<R>>>,
+    Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Path(id): Path<Uuid>,
@@ -253,20 +267,25 @@ pub async fn delete_category<R: CategoryRepository>(
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-2
 
-    let conn = db.conn().map_err(|err| DomainError::Internal {
-        diagnostic: err.to_string(),
-    })?;
-    svc.delete(
-        &conn,
-        &scope,
-        id,
-        if_match(&headers),
-        Actor {
-            ctx: &ctx,
-            request_id: &request_id(&headers),
-        },
-    )
-    .await?;
+    let request_id = request_id(&headers);
+    let if_match = if_match(&headers).map(str::to_owned);
+    db.db()
+        .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
+            Box::pin(async move {
+                svc.delete(
+                    tx,
+                    &scope,
+                    id,
+                    if_match.as_deref(),
+                    Actor {
+                        ctx: &ctx,
+                        request_id: &request_id,
+                    },
+                )
+                .await
+            })
+        })
+        .await?;
 
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-13
     Ok(StatusCode::NO_CONTENT)

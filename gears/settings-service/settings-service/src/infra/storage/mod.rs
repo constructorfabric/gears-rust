@@ -8,6 +8,8 @@
 //! database through the `SecureConn` the gear acquires at init rather than a raw
 //! pool.
 
+pub mod access_repo;
+pub mod audit_store;
 pub mod category_repo;
 pub mod declaration_odata_mapper;
 pub mod declaration_repo;

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use toolkit_db::secure::DBRunner;
 use toolkit_security::SecurityContext;
 
-use crate::audit::{AuditEmitter, AuditRecord, AuditValue};
+use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -52,9 +52,9 @@ fn snapshot(category: &Category) -> serde_json::Value {
 }
 
 /// Category create, read, update and delete.
-pub struct CategoryService<R> {
+pub struct CategoryService<R, S> {
     repo: R,
-    audit: Arc<dyn AuditEmitter>,
+    sink: S,
     /// Where the root tenant's id comes from. Categories are platform-scoped,
     /// and platform scope is that id rather than an absent tenant (DESIGN.md
     /// §4.1) — asked for at the first mutation, since the Tenant Resolver is
@@ -62,22 +62,28 @@ pub struct CategoryService<R> {
     scope: Arc<dyn PlatformScope>,
 }
 
-impl<R: CategoryRepository> CategoryService<R> {
-    /// Build the service over a repository and an audit destination.
+impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
+    /// Build the service over a repository and an audit sink.
     ///
-    /// The emitter is required, not optional. An `Option` here would make
+    /// The sink is required, not optional. An `Option` here would make
     /// "no audit configured" a supported state, and a mutation could then
     /// succeed leaving no trail — which is precisely what DESIGN.md §4.2's
     /// fail-closed rule forbids.
-    pub fn new(repo: R, audit: Arc<dyn AuditEmitter>, scope: Arc<dyn PlatformScope>) -> Self {
-        Self { repo, audit, scope }
+    pub fn new(repo: R, sink: S, scope: Arc<dyn PlatformScope>) -> Self {
+        Self { repo, sink, scope }
     }
 
     /// Record a mutation, failing the operation if the trail cannot be written.
-    async fn record(
+    // The record's inputs are the mutation's own facts; bundling them would add
+    // a struct that exists only to be unpacked here.
+    // @cpt-dod:cpt-cf-settings-service-dod-category-management-audit:p1
+    #[allow(clippy::too_many_arguments)]
+    async fn record<C: DBRunner>(
         &self,
+        conn: &C,
+        access: &AccessScope,
         key: &super::CategoryKey,
-        action: &'static str,
+        operation: AuditOperation,
         pre: Option<AuditValue>,
         post: Option<AuditValue>,
         actor: Actor<'_>,
@@ -90,7 +96,7 @@ impl<R: CategoryRepository> CategoryService<R> {
             key.as_str(),
             tenant,
             actor.ctx.subject_id().to_string(),
-            action,
+            operation,
             actor.request_id,
         );
         if let Some(pre) = pre {
@@ -99,7 +105,9 @@ impl<R: CategoryRepository> CategoryService<R> {
         if let Some(post) = post {
             rec = rec.with_post_image(post);
         }
-        self.audit.audit(rec).await
+        // Last step of the mutation's transaction: the record commits with the
+        // change or rolls back with it.
+        self.sink.append(conn, access, rec).await
     }
 
     /// Fetch one category.
@@ -202,8 +210,10 @@ impl<R: CategoryRepository> CategoryService<R> {
         // record describes what exists rather than what was attempted.
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-create:p1:inst-cat-create-11
         self.record(
+            conn,
+            scope,
             &created.key,
-            "category.create",
+            AuditOperation::Create,
             None,
             Some(AuditValue::record(snapshot(&created), false)),
             actor,
@@ -248,8 +258,10 @@ impl<R: CategoryRepository> CategoryService<R> {
         let updated = self.repo.update(conn, scope, id, patch).await?;
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-14
         self.record(
+            conn,
+            scope,
             &updated.key,
-            "category.update",
+            AuditOperation::Change,
             Some(AuditValue::record(snapshot(&current), false)),
             Some(AuditValue::record(snapshot(&updated), false)),
             actor,
@@ -319,8 +331,10 @@ impl<R: CategoryRepository> CategoryService<R> {
         // removed.
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-12
         self.record(
+            conn,
+            scope,
             &current.key,
-            "category.delete",
+            AuditOperation::Remove,
             Some(AuditValue::record(snapshot(&current), false)),
             None,
             actor,

@@ -52,6 +52,8 @@ fn to_domain(model: declaration::Model) -> Declaration {
         requires_step_up: model.requires_step_up,
         anonymous_exposable: model.anonymous_exposable,
         source: model.source,
+        last_change_at: model.last_change_at,
+        updated_at: model.updated_at,
     }
 }
 
@@ -262,6 +264,22 @@ impl DeclarationRepository for DeclarationRepo {
             })?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
         Ok(found.map(to_domain))
+    }
+
+    async fn find_by_category<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+    ) -> Result<Vec<Declaration>, DomainError> {
+        let rows = DeclarationEntity::find()
+            .filter(declaration::Column::CategoryId.eq(category_id))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
     }
 
     async fn list<C: DBRunner>(

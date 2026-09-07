@@ -34,6 +34,10 @@ fn declare(
         scope,
     );
     d.description = Some(description.to_owned());
+    // Demo settings are written from the example server, which has no identity
+    // provider to re-authenticate against, so they opt out of step-up; the
+    // secret below keeps it, as a real deployment's settings would by default.
+    d.requires_step_up = Some(false);
     Ok(d)
 }
 
@@ -162,14 +166,16 @@ pub fn declarations() -> Result<Vec<ContributedDeclaration>, SettingKeyError> {
 
     // A secret: the default is the empty placeholder; the credential is set as
     // a value at a scope and never lives in a declaration.
-    all.push(declare(
+    let mut token = declare(
         "security",
         "api_token",
         catalogue::SECRET_STRING,
         json!(""),
         ScopeClass::Cascading,
         "The token the demo service presents to its upstream.",
-    )?);
+    )?;
+    token.requires_step_up = Some(true);
+    all.push(token);
 
     // Advanced mode: hidden from the standard settings view.
     let mut flags = declare(

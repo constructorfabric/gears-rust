@@ -72,7 +72,7 @@ Two things about the record itself are fixed before it is written. Masking happe
 
 ### Read Setting History
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-audit-store-history`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-audit-store-history`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
@@ -86,61 +86,61 @@ Two things about the record itself are fixed before it is written. Masking happe
 - The setting is hidden from the target tenant, reported as absent rather than forbidden
 
 **Steps**:
-1. [ ] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/history with optional `tenant`, `cursor` and `limit`; `tenant` omitted means the caller's own tenant, which for a platform administrator is the root tenant and therefore platform scope - `inst-as-hist-1`
-2. [ ] - `p1` - Authorize `read` on the setting's key through the `PolicyEnforcer` PEP and obtain the `AccessScope` constraints - `inst-as-hist-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-as-hist-3`
-4. [ ] - `p1` - Confirm through the tenant resolver that the target tenant is the caller's own or a descendant, and not a standalone descendant; **IF** it is neither → **RETURN** `403`, since a caller that cannot read a tenant's values cannot read their history either - `inst-as-hist-4`
-5. [ ] - `p1` - DB: SELECT the declaration by key; **IF** none → **RETURN** `404`; a retired declaration keeps its history and is read like an active one - `inst-as-hist-5`
-6. [ ] - `p1` - Evaluate the caller's effective tenant access for the setting; **IF** `hidden` → **RETURN** `404` rather than `403`, so a hidden setting's existence is not disclosed through its history - `inst-as-hist-6`
-7. [ ] - `p1` - Compose the canonical audit resource id for the key and the target tenant with the shared formatter, and DB: SELECT audit_records WHERE declaration_key = {key} AND tenant_id = {tenant} ORDER BY occurred_at DESC through `idx_audit_scoped`, cursor-paginated, on the caller's `AccessScope` - `inst-as-hist-7`
-8. [ ] - `p1` - **FOR EACH** record → **IF** its actor classification is `pii` **AND** the caller is not authorized for unmasked PII → mask the actor; **IF** a recorded value is `pii`-classified under the same condition → mask it; a `secret` value needs no decision here, since it was never recorded in plaintext - `inst-as-hist-8`
-9. [ ] - `p1` - **RETURN** `200` with the page of records — `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — and its pagination cursors; an empty page is `200` with no items, never an error - `inst-as-hist-9`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/history with optional `tenant`, `cursor` and `limit`; `tenant` omitted means the caller's own tenant, which for a platform administrator is the root tenant and therefore platform scope - `inst-as-hist-1`
+2. [x] - `p1` - Authorize `read` on the setting's key through the `PolicyEnforcer` PEP and obtain the `AccessScope` constraints - `inst-as-hist-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-as-hist-3`
+4. [x] - `p1` - Confirm through the tenant resolver that the target tenant is the caller's own or a descendant, and not a standalone descendant; **IF** it is neither → **RETURN** `403`, since a caller that cannot read a tenant's values cannot read their history either - `inst-as-hist-4`
+5. [x] - `p1` - DB: SELECT the declaration by key; **IF** none → **RETURN** `404`; a retired declaration keeps its history and is read like an active one - `inst-as-hist-5`
+6. [x] - `p1` - Evaluate the caller's effective tenant access for the setting; **IF** `hidden` → **RETURN** `404` rather than `403`, so a hidden setting's existence is not disclosed through its history - `inst-as-hist-6`
+7. [x] - `p1` - Compose the canonical audit resource id for the key and the target tenant with the shared formatter, and DB: SELECT audit_records WHERE declaration_key = {key} AND tenant_id = {tenant} ORDER BY occurred_at DESC through `idx_audit_scoped`, cursor-paginated, on the caller's `AccessScope` - `inst-as-hist-7`
+8. [x] - `p1` - **FOR EACH** record → **IF** its actor classification is `pii` **AND** the caller is not authorized for unmasked PII → mask the actor; **IF** a recorded value is `pii`-classified under the same condition → mask it; a `secret` value needs no decision here, since it was never recorded in plaintext - `inst-as-hist-8`
+9. [x] - `p1` - **RETURN** `200` with the page of records — `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — and its pagination cursors; an empty page is `200` with no items, never an error - `inst-as-hist-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Transactional Append
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-append`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-append`
 
 **Input**: The mutation's open transaction, the caller's `AccessScope`, and the audit record draft — resource key and tenant, operation, actor, pre-image, post-image, outcome, request id, optional change set id
 
 **Output**: The record committed together with the mutation, or the mutation rejected
 
 **Steps**:
-1. [ ] - `p1` - Mask the pre-image and post-image by the declaration's classification before the record exists: a `secret` value is replaced by the mask token and never enters the record; a `pii` or `public` value is recorded as is, the read side masking `pii` for callers without the entitlement - `inst-as-append-1`
-2. [ ] - `p1` - Stamp the actor and the actor's own `public` or `pii` classification onto the record, so the read side can honour it without re-deriving who the actor was - `inst-as-append-2`
-3. [ ] - `p1` - Compose the `resource` field with the shared formatter, and set `declaration_key` and `tenant_id` from the same two inputs, so the scoped query is an index lookup that can never disagree with the resource id - `inst-as-append-3`
-4. [ ] - `p1` - Set `occurred_at` to the transaction's clock, `retain_until` to the value supplied or `NULL` for the configured default, and `change_set_id` when the mutation was produced under one - `inst-as-append-4`
-5. [ ] - `p1` - DB: INSERT INTO audit_records inside the caller's transaction as its last step before commit, on the same `AccessScope`-scoped path as every other write, so a record is never visible outside its tenant - `inst-as-append-5`
-6. [ ] - `p1` - **IF** the insert fails → the transaction is rolled back and the mutation is rejected as unavailable, `503`; the platform never applies a change it could not record - `inst-as-append-6`
-7. [ ] - `p1` - **RETURN** with nothing further to do: the record commits with the change or rolls back with it, and no delivery state is tracked here, since shipping belongs to the R2 outbox - `inst-as-append-7`
+1. [x] - `p1` - Mask the pre-image and post-image by the declaration's classification before the record exists: a `secret` value is replaced by the mask token and never enters the record; a `pii` or `public` value is recorded as is, the read side masking `pii` for callers without the entitlement - `inst-as-append-1`
+2. [x] - `p1` - Stamp the actor and the actor's own `public` or `pii` classification onto the record, so the read side can honour it without re-deriving who the actor was - `inst-as-append-2`
+3. [x] - `p1` - Compose the `resource` field with the shared formatter, and set `declaration_key` and `tenant_id` from the same two inputs, so the scoped query is an index lookup that can never disagree with the resource id - `inst-as-append-3`
+4. [x] - `p1` - Set `occurred_at` to the transaction's clock, `retain_until` to the value supplied or `NULL` for the configured default, and `change_set_id` when the mutation was produced under one - `inst-as-append-4`
+5. [x] - `p1` - DB: INSERT INTO audit_records inside the caller's transaction as its last step before commit, on the same `AccessScope`-scoped path as every other write, so a record is never visible outside its tenant - `inst-as-append-5`
+6. [x] - `p1` - **IF** the insert fails → the transaction is rolled back and the mutation is rejected as unavailable, `503`; the platform never applies a change it could not record - `inst-as-append-6`
+7. [x] - `p1` - **RETURN** with nothing further to do: the record commits with the change or rolls back with it, and no delivery state is tracked here, since shipping belongs to the R2 outbox - `inst-as-append-7`
 
 ### Canonical Audit Resource Id
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-resource-id`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-resource-id`
 
 **Input**: A setting key and the tenant id that is the record's scope
 
 **Output**: The resource id string both the write and the history read use
 
 **Steps**:
-1. [ ] - `p1` - Format `cf.settings:{key}@{tenant_id}` — the key verbatim, since it is immutable for the life of the declaration and so keeps a setting's history continuous through every metadata edit - `inst-as-rid-1`
-2. [ ] - `p1` - Use the flat tenant UUID for every scope, the root tenant's id being platform scope, and never a tenant path, which is derived state that a re-parent or rename would invalidate under every historical record - `inst-as-rid-2`
-3. [ ] - `p1` - **RETURN** the id, which maps one `(setting, scope)` pair to exactly one string, so per-scope history is a single exact-match query and never a prefix or wildcard search - `inst-as-rid-3`
+1. [x] - `p1` - Format `cf.settings:{key}@{tenant_id}` — the key verbatim, since it is immutable for the life of the declaration and so keeps a setting's history continuous through every metadata edit - `inst-as-rid-1`
+2. [x] - `p1` - Use the flat tenant UUID for every scope, the root tenant's id being platform scope, and never a tenant path, which is derived state that a re-parent or rename would invalidate under every historical record - `inst-as-rid-2`
+3. [x] - `p1` - **RETURN** the id, which maps one `(setting, scope)` pair to exactly one string, so per-scope history is a single exact-match query and never a prefix or wildcard search - `inst-as-rid-3`
 
 ### Retention Horizon
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-retention`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-audit-store-retention`
 
 **Input**: A record's `retain_until`, and the store's configured default retention
 
 **Output**: Whether the record is inside its online window
 
 **Steps**:
-1. [ ] - `p1` - **IF** the record carries `retain_until` → its horizon is that instant - `inst-as-ret-1`
-2. [ ] - `p1` - **ELSE** its horizon is `occurred_at` plus the configured default, which **MUST NOT** be shorter than twelve months - `inst-as-ret-2`
-3. [ ] - `p1` - Pruning deletes only records past their horizon, located through the partial `idx_audit_retention`; no other `DELETE` and no `UPDATE` is ever issued against the table - `inst-as-ret-3`
-4. [ ] - `p1` - **RETURN** the horizon; R2 shipping copies a record onward but changes nothing about its online window here - `inst-as-ret-4`
+1. [x] - `p1` - **IF** the record carries `retain_until` → its horizon is that instant - `inst-as-ret-1`
+2. [x] - `p1` - **ELSE** its horizon is `occurred_at` plus the configured default, which **MUST NOT** be shorter than twelve months - `inst-as-ret-2`
+3. [x] - `p1` - Pruning deletes only records past their horizon, located through the partial `idx_audit_retention`; no other `DELETE` and no `UPDATE` is ever issued against the table - `inst-as-ret-3`
+4. [x] - `p1` - **RETURN** the horizon; R2 shipping copies a record onward but changes nothing about its online window here - `inst-as-ret-4`
 
 ## 4. States (CDSL)
 
@@ -150,7 +150,7 @@ Not applicable. An audit record is appended once and never transitions; its only
 
 ### Audit Records Table
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-table`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-table`
 
 The system **MUST** persist audit records in an `audit_records` table carrying `resource`, `declaration_key`, a non-null `tenant_id`, `operation`, `actor`, `actor_classification`, masked `pre_value` and `post_value`, `outcome`, `request_id`, a nullable `change_set_id`, `occurred_at` and a nullable `retain_until`, with check constraints on the `operation` and `outcome` vocabularies, `idx_audit_scoped` on `(declaration_key, tenant_id, occurred_at DESC)` and the partial `idx_audit_retention`. The table **MUST** be append-only: no code path issues an `UPDATE`, and the only `DELETE` is retention pruning.
 
@@ -165,7 +165,7 @@ The system **MUST** persist audit records in an `audit_records` table carrying `
 
 ### Transactional Audit Sink
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-transactional-sink`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-transactional-sink`
 
 The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` — to the `audit_records` table so that every mutation commits its record in its own transaction, as the last step before commit, and is rejected as unavailable when the record cannot be written. Category and declaration mutations **MUST** be moved onto this sink and the tracing stand-in retired. The port **MUST** stay the only way a record is written, so the R2 outbox binding can be added behind it without touching a call site.
 
@@ -180,7 +180,7 @@ The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` �
 
 ### One Resource Id for Write and Read
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-resource-id`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-resource-id`
 
 The system **MUST** form every record's `resource` as `cf.settings:{key}@{tenant_id}` through one formatter shared by the write side and the history read, keyed by the flat tenant UUID with the root tenant's id as platform scope and never by a tenant path, so that a `(setting, scope)` pair maps to exactly one id and its history is a single exact-match query.
 
@@ -192,7 +192,7 @@ The system **MUST** form every record's `resource` as `cf.settings:{key}@{tenant
 
 ### Masking and Actor Classification
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-masking-classification`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-masking-classification`
 
 A `secret`-classified value **MUST** be masked before the record is built and **MUST NOT** appear in plaintext in any record. Every record **MUST** carry the actor's `public` or `pii` classification, and the history read **MUST** mask a `pii` actor, and any `pii`-classified recorded value, for a caller not authorized for unmasked PII. The read **MUST NOT** apply a second masking implementation to secrets, since none were recorded.
 
@@ -208,7 +208,7 @@ A `secret`-classified value **MUST** be masked before the record is built and **
 
 ### History Read
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-history-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-history-read`
 
 The system **MUST** serve `GET /settings-service/v1/settings/{key}/history` from the gear's own `audit_records` table, newest first and cursor-paginated, authorized by `read` on the setting's key, confined to the caller's own tenant or a descendant that is not standalone, and reporting a hidden setting as absent rather than forbidden. The query **MUST** be an index lookup on `(declaration_key, tenant_id)`, and an empty history **MUST** be an empty page rather than an error.
 
@@ -223,7 +223,7 @@ The system **MUST** serve `GET /settings-service/v1/settings/{key}/history` from
 
 ### Retention
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-retention`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-retention`
 
 Every record **MUST** carry `retain_until` or fall under the store's configured default, which **MUST** be configurable and **MUST NOT** default below twelve months. Pruning **MUST** locate expired records through `idx_audit_retention` and **MUST** be the only path that deletes from the table.
 
@@ -235,17 +235,17 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 
 ## 6. Acceptance Criteria
 
-- [ ] A category mutation, a declaration mutation, and a value write each leave exactly one audit record, committed in the same transaction as the change
-- [ ] A fault injected between the mutation's write and the record's insert leaves neither behind: no changed row, no record
-- [ ] When the record cannot be inserted, the mutation is rejected as unavailable and the caller sees no change
-- [ ] A `secret`-classified value appears in no record; its pre-image and post-image carry the mask token
-- [ ] A record's `resource` equals the shared formatter's output for the same key and tenant, and the history read finds it by that pair
-- [ ] The platform-scope record of a category or a platform-level value carries the root tenant's id, never a sentinel
-- [ ] History for one setting at one scope returns only that pair's records, newest first, and a second page follows the cursor without duplicates
-- [ ] A `pii`-classified actor is masked for a caller without the PII entitlement and unmasked for one with it
-- [ ] History of a hidden setting returns `404`, and history of a setting for a tenant outside the caller's subtree, or for a standalone descendant, returns `403`
+- [x] A category mutation, a declaration mutation, and a value write each leave exactly one audit record, committed in the same transaction as the change
+- [x] A fault injected between the mutation's write and the record's insert leaves neither behind: no changed row, no record
+- [x] When the record cannot be inserted, the mutation is rejected as unavailable and the caller sees no change
+- [x] A `secret`-classified value appears in no record; its pre-image and post-image carry the mask token
+- [x] A record's `resource` equals the shared formatter's output for the same key and tenant, and the history read finds it by that pair
+- [x] The platform-scope record of a category or a platform-level value carries the root tenant's id, never a sentinel
+- [x] History for one setting at one scope returns only that pair's records, newest first, and a second page follows the cursor without duplicates
+- [x] A `pii`-classified actor is masked for a caller without the PII entitlement and unmasked for one with it
+- [x] History of a hidden setting returns `404`, and history of a setting for a tenant outside the caller's subtree, or for a standalone descendant, returns `403`
 - [ ] History of a retired declaration is readable
-- [ ] A setting with no history returns `200` with an empty page
-- [ ] A record inserted with no `retain_until` is pruned only after the configured default horizon, and one with an explicit `retain_until` only after that instant
-- [ ] No code path issues an `UPDATE` against `audit_records`, and the only `DELETE` is pruning
-- [ ] A record produced under a change set carries its `change_set_id`, and records of one change set are retrievable together
+- [x] A setting with no history returns `200` with an empty page
+- [x] A record inserted with no `retain_until` is pruned only after the configured default horizon, and one with an explicit `retain_until` only after that instant
+- [x] No code path issues an `UPDATE` against `audit_records`, and the only `DELETE` is pruning
+- [x] A record produced under a change set carries its `change_set_id`, and records of one change set are retrievable together

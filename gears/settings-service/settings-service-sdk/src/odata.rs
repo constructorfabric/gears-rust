@@ -83,3 +83,42 @@ pub struct DeclarationQuery {
 
 /// The generated filter-field enum for declarations.
 pub use DeclarationQueryFilterField as DeclarationFilterField;
+
+/// The browse surface over effective values: `GET /settings-service/v1/settings`.
+///
+/// Written by hand rather than derived because `needs_review` is a boolean and
+/// the derive knows only strings and UUIDs. The three fields are the whole
+/// vocabulary: `category_id` and `key` select declarations — `key in (…)` is
+/// the bulk read by key set — and `needs_review eq true` switches the listing
+/// to the flagged override rows in the caller's subtree. `tenant` is resolution
+/// context and deliberately not a field here: it is a query parameter, so a
+/// filter on it is refused as unknown rather than silently narrowing a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingFilterField {
+    /// The full setting key.
+    Key,
+    /// The owning category.
+    CategoryId,
+    /// Whether an override at a scope is flagged for review.
+    NeedsReview,
+}
+
+impl toolkit_odata::filter::FilterField for SettingFilterField {
+    const FIELDS: &'static [Self] = &[Self::Key, Self::CategoryId, Self::NeedsReview];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::CategoryId => "category_id",
+            Self::NeedsReview => "needs_review",
+        }
+    }
+
+    fn kind(&self) -> toolkit_odata::filter::FieldKind {
+        match self {
+            Self::Key => toolkit_odata::filter::FieldKind::String,
+            Self::CategoryId => toolkit_odata::filter::FieldKind::Uuid,
+            Self::NeedsReview => toolkit_odata::filter::FieldKind::Bool,
+        }
+    }
+}

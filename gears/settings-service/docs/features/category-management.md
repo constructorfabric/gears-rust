@@ -361,7 +361,7 @@ The system **MUST** require `If-Match` on `PATCH` and `DELETE`, returning `428` 
 
 ### Category Mutation Audit
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-audit`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-audit`
 
 The system **MUST** emit an audit record through the Audit Emitter for every successful category create, update, and delete. The update record **MUST** identify the changed field set with pre-image and post-image, and the delete record **MUST** carry the pre-image.
 

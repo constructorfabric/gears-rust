@@ -87,7 +87,7 @@ Three properties matter more than the walk itself.
 
 ### Resolve Effective Value
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-resolve`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-resolve`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -100,22 +100,22 @@ Three properties matter more than the walk itself.
 - The value could not be resolved because a dependency was unavailable
 
 **Steps**:
-1. [ ] - `p1` - Caller requests the effective value for a setting key at a scope - `inst-vr-resolve-1`
-2. [ ] - `p1` - Consult the cache for the `(key, scope)` entry - `inst-vr-resolve-2`
-3. [ ] - `p1` - **IF** a live entry is present → **RETURN** it without touching the database - `inst-vr-resolve-3`
-4. [ ] - `p1` - DB: SELECT the declaration for the key - `inst-vr-resolve-4`
-5. [ ] - `p1` - **IF** no declaration row exists → **RETURN** the not-found outcome, without guessing whether the owning gear has yet to register or the key never existed - `inst-vr-resolve-5`
-6. [ ] - `p1` - **IF** the declaration's status is retired → **RETURN** the distinct retired outcome, and do not return its retained values - `inst-vr-resolve-6`
-7. [ ] - `p1` - Invoke scope-class resolution dispatch for the declaration and the requested scope - `inst-vr-resolve-7`
-8. [ ] - `p1` - **IF** a dependency needed for the walk is unavailable → **RETURN** the unavailable outcome rather than substituting the Schema Default, which lives in the same database and is equally unreachable - `inst-vr-resolve-8`
-9. [ ] - `p1` - Resolve the declaration's trait set for rendering metadata - `inst-vr-resolve-9`
-10. [ ] - `p1` - **IF** the setting is secret-backed → return the value in its masked handle form, never plaintext - `inst-vr-resolve-10`
-11. [ ] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace - `inst-vr-resolve-11`
-12. [ ] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, and the inheritance trail - `inst-vr-resolve-12`
+1. [x] - `p1` - Caller requests the effective value for a setting key at a scope - `inst-vr-resolve-1`
+2. [x] - `p1` - Consult the cache for the `(key, scope)` entry - `inst-vr-resolve-2`
+3. [x] - `p1` - **IF** a live entry is present → **RETURN** it without touching the database - `inst-vr-resolve-3`
+4. [x] - `p1` - DB: SELECT the declaration for the key - `inst-vr-resolve-4`
+5. [x] - `p1` - **IF** no declaration row exists → **RETURN** the not-found outcome, without guessing whether the owning gear has yet to register or the key never existed - `inst-vr-resolve-5`
+6. [x] - `p1` - **IF** the declaration's status is retired → **RETURN** the distinct retired outcome, and do not return its retained values - `inst-vr-resolve-6`
+7. [x] - `p1` - Invoke scope-class resolution dispatch for the declaration and the requested scope - `inst-vr-resolve-7`
+8. [x] - `p1` - **IF** a dependency needed for the walk is unavailable → **RETURN** the unavailable outcome rather than substituting the Schema Default, which lives in the same database and is equally unreachable - `inst-vr-resolve-8`
+9. [x] - `p1` - Resolve the declaration's trait set for rendering metadata - `inst-vr-resolve-9`
+10. [x] - `p1` - **IF** the setting is secret-backed → return the value in its masked handle form, never plaintext - `inst-vr-resolve-10`
+11. [x] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace - `inst-vr-resolve-11`
+12. [x] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, and the inheritance trail - `inst-vr-resolve-12`
 
 ### Resolve Effective Values in Bulk
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-resolve-bulk`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-resolve-bulk`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -126,16 +126,16 @@ Three properties matter more than the walk itself.
 - Individual keys fail without failing the batch
 
 **Steps**:
-1. [ ] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope - `inst-vr-bulk-1`
-2. [ ] - `p1` - Obtain the ancestor chain for the scope once and share it across every key in the batch - `inst-vr-bulk-2`
-3. [ ] - `p1` - **FOR EACH** requested key - `inst-vr-bulk-3`
-   1. [ ] - `p1` - Resolve it independently, reusing the shared ancestry - `inst-vr-bulk-4`
-   2. [ ] - `p1` - Record either the resolved effective value or that key's own failure outcome - `inst-vr-bulk-5`
-4. [ ] - `p1` - **RETURN** one outcome per key, never collapsing the batch to a single failure because one key failed - `inst-vr-bulk-6`
+1. [x] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope - `inst-vr-bulk-1`
+2. [x] - `p1` - Obtain the ancestor chain for the scope once and share it across every key in the batch - `inst-vr-bulk-2`
+3. [x] - `p1` - **FOR EACH** requested key - `inst-vr-bulk-3`
+   1. [x] - `p1` - Resolve it independently, reusing the shared ancestry - `inst-vr-bulk-4`
+   2. [x] - `p1` - Record either the resolved effective value or that key's own failure outcome - `inst-vr-bulk-5`
+4. [x] - `p1` - **RETURN** one outcome per key, never collapsing the batch to a single failure because one key failed - `inst-vr-bulk-6`
 
 ### Read Effective Source Trail
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-source-trail`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-source-trail`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
@@ -146,19 +146,19 @@ Three properties matter more than the walk itself.
 - A request for a scope outside the caller's own subtree
 
 **Steps**:
-1. [ ] - `p1` - Actor requests the effective source and trail for a key at a scope - `inst-vr-trail-1`
-2. [ ] - `p1` - Authorize the read and confirm the requested scope lies within the caller's own subtree - `inst-vr-trail-2`
-3. [ ] - `p1` - **IF** the scope lies outside that subtree → **RETURN** a denial - `inst-vr-trail-3`
-4. [ ] - `p1` - Perform the resolution walk, recording each scope inspected in order - `inst-vr-trail-4`
-5. [ ] - `p1` - Limit the trail to the caller's own ancestor chain from root to self, never including a sibling or descendant scope - `inst-vr-trail-5`
-6. [ ] - `p1` - **IF** the caller is an administrative reader → include the per-entry setter identity and timestamp - `inst-vr-trail-6`
-7. [ ] - `p1` - **ELSE** omit setter identity, so an ancestor's setter is not exposed to a subordinate tenant through the consumer path - `inst-vr-trail-7`
-8. [ ] - `p1` - Derive the value arm of the recency indicator from the resolved row alone, never as a maximum across sibling or descendant scopes - `inst-vr-trail-8`
-9. [ ] - `p1` - **RETURN** the source, the scope that provided the value, and the trail - `inst-vr-trail-9`
+1. [x] - `p1` - Actor requests the effective source and trail for a key at a scope - `inst-vr-trail-1`
+2. [x] - `p1` - Authorize the read and confirm the requested scope lies within the caller's own subtree - `inst-vr-trail-2`
+3. [x] - `p1` - **IF** the scope lies outside that subtree → **RETURN** a denial - `inst-vr-trail-3`
+4. [x] - `p1` - Perform the resolution walk, recording each scope inspected in order - `inst-vr-trail-4`
+5. [x] - `p1` - Limit the trail to the caller's own ancestor chain from root to self, never including a sibling or descendant scope - `inst-vr-trail-5`
+6. [x] - `p1` - **IF** the caller is an administrative reader → include the per-entry setter identity and timestamp - `inst-vr-trail-6`
+7. [x] - `p1` - **ELSE** omit setter identity, so an ancestor's setter is not exposed to a subordinate tenant through the consumer path - `inst-vr-trail-7`
+8. [x] - `p1` - Derive the value arm of the recency indicator from the resolved row alone, never as a maximum across sibling or descendant scopes - `inst-vr-trail-8`
+9. [x] - `p1` - **RETURN** the source, the scope that provided the value, and the trail - `inst-vr-trail-9`
 
 ### Read an Effective Value Administratively
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-admin-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-admin-read`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
@@ -171,22 +171,22 @@ Three properties matter more than the walk itself.
 - The declaration is retired, reported as the distinct retired outcome
 
 **Steps**:
-1. [ ] - `p1` - Actor sends GET /settings-service/v1/settings/{key} with optional `tenant`; omitted, it is the caller's own tenant, which for a platform administrator is the root tenant and therefore platform scope - `inst-vr-aread-1`
-2. [ ] - `p1` - Authorize `read` on the setting's key through the `PolicyEnforcer` PEP and obtain the `AccessScope` constraints - `inst-vr-aread-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-vr-aread-3`
-4. [ ] - `p1` - Confirm through the tenant resolver that the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-vr-aread-4`
-5. [ ] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's effective tenant access for it is `hidden` → **RETURN** `404`, never `403`, so existence is not disclosed - `inst-vr-aread-5`
-6. [ ] - `p1` - **IF** the declaration is retired → **RETURN** the distinct retired outcome without its retained values - `inst-vr-aread-6`
-7. [ ] - `p1` - Resolve the effective value at the target through the resolver, cache first, recording the trail - `inst-vr-aread-7`
-8. [ ] - `p1` - Compute `last_change_at` as the greater of the declaration's own `last_change_at` and the **resolved** row's — never a maximum over sibling or descendant scopes, so the timestamp reveals nothing the caller could not already read - `inst-vr-aread-8`
-9. [ ] - `p1` - **IF** the target's **own** override is flagged for review → include `needs_review` and `needs_review_detail` beside the fallthrough value the resolver served, so the administrator sees both - `inst-vr-aread-9`
-10. [ ] - `p1` - Mask the value by classification: `secret` as the mask token always; `pii` unless the caller is authorized for unmasked PII; `public` as is - `inst-vr-aread-10`
-11. [ ] - `p1` - Include the per-entry setter identity and timestamp on the trail, which is the administrative read and not the consumer path - `inst-vr-aread-11`
-12. [ ] - `p1` - **RETURN** `200` with `value`, `source`, `source_scope`, `traits`, `inheritance_trail`, `last_change_at`, and the review pair when present, carrying in `ETag` the value state tag of the requested scope's own row or absent state — the tag a write at that scope must present, distinct from the recency in the body - `inst-vr-aread-12`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key} with optional `tenant`; omitted, it is the caller's own tenant, which for a platform administrator is the root tenant and therefore platform scope - `inst-vr-aread-1`
+2. [x] - `p1` - Authorize `read` on the setting's key through the `PolicyEnforcer` PEP and obtain the `AccessScope` constraints - `inst-vr-aread-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-vr-aread-3`
+4. [x] - `p1` - Confirm through the tenant resolver that the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-vr-aread-4`
+5. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's effective tenant access for it is `hidden` → **RETURN** `404`, never `403`, so existence is not disclosed - `inst-vr-aread-5`
+6. [x] - `p1` - **IF** the declaration is retired → **RETURN** the distinct retired outcome without its retained values - `inst-vr-aread-6`
+7. [x] - `p1` - Resolve the effective value at the target through the resolver, cache first, recording the trail - `inst-vr-aread-7`
+8. [x] - `p1` - Compute `last_change_at` as the greater of the declaration's own `last_change_at` and the **resolved** row's — never a maximum over sibling or descendant scopes, so the timestamp reveals nothing the caller could not already read - `inst-vr-aread-8`
+9. [x] - `p1` - **IF** the target's **own** override is flagged for review → include `needs_review` and `needs_review_detail` beside the fallthrough value the resolver served, so the administrator sees both - `inst-vr-aread-9`
+10. [x] - `p1` - Mask the value by classification: `secret` as the mask token always; `pii` unless the caller is authorized for unmasked PII; `public` as is - `inst-vr-aread-10`
+11. [x] - `p1` - Include the per-entry setter identity and timestamp on the trail, which is the administrative read and not the consumer path - `inst-vr-aread-11`
+12. [x] - `p1` - **RETURN** `200` with `value`, `source`, `source_scope`, `traits`, `inheritance_trail`, `last_change_at`, and the review pair when present, carrying in `ETag` the value state tag of the requested scope's own row or absent state — the tag a write at that scope must present, distinct from the recency in the body - `inst-vr-aread-12`
 
 ### Browse Effective Values
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-admin-browse`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-admin-browse`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
@@ -199,73 +199,73 @@ Three properties matter more than the walk itself.
 - The target outside the caller's subtree
 
 **Steps**:
-1. [ ] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby`, and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
-2. [ ] - `p1` - Authorize `read` once on the settings base type; **IF** allowed → the caller's grant covers every setting and no further decision is needed for the page - `inst-vr-browse-2`
-3. [ ] - `p1` - **ELSE** assemble the page under the narrowed grant: fetch a candidate batch wider than the page, evaluate the candidates in one batch decision, keep what is allowed, and refill until the page is full or the candidates run out; a setting the caller may not read is absent from the page and the count, never marked - `inst-vr-browse-3`
-4. [ ] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vr-browse-4`
-5. [ ] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it - `inst-vr-browse-5`
-6. [ ] - `p1` - Exclude every setting whose effective tenant access for the target is `hidden`, silently and from the count - `inst-vr-browse-6`
-7. [ ] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, and return them with their detail; this lists rows, not resolved values - `inst-vr-browse-7`
-8. [ ] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value by classification - `inst-vr-browse-8`
-9. [ ] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
-10. [ ] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby`, and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
+2. [x] - `p1` - Authorize `read` once on the settings base type; **IF** allowed → the caller's grant covers every setting and no further decision is needed for the page - `inst-vr-browse-2`
+3. [x] - `p1` - **ELSE** assemble the page under the narrowed grant: fetch a candidate batch wider than the page, evaluate the candidates in one batch decision, keep what is allowed, and refill until the page is full or the candidates run out; a setting the caller may not read is absent from the page and the count, never marked - `inst-vr-browse-3`
+4. [x] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vr-browse-4`
+5. [x] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it - `inst-vr-browse-5`
+6. [x] - `p1` - Exclude every setting whose effective tenant access for the caller is `hidden`, silently and from the count; an administrator above the target still sees what it restricted - `inst-vr-browse-6`
+7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, and return them with their detail; this lists rows, not resolved values - `inst-vr-browse-7`
+8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value by classification - `inst-vr-browse-8`
+9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
+10. [x] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Scope Class Resolution Dispatch
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-dispatch`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-dispatch`
 
 **Input**: A declaration and a requested scope
 
 **Output**: The resolved value with its source and source scope
 
 **Steps**:
-1. [ ] - `p1` - **IF** the declaration's scope class is `global` - `inst-vr-disp-1`
-   1. [ ] - `p1` - DB: SELECT the platform-scope row for the declaration, identified by the root tenant's id - `inst-vr-disp-2`
-   2. [ ] - `p1` - **IF** the request comes from a tenant scope → serve the platform value read-only, and only when the setting is visible to that tenant, its effective access being other than `hidden` - `inst-vr-disp-3`
-   3. [ ] - `p1` - **IF** no platform row exists → **RETURN** the Schema Default with the default source - `inst-vr-disp-4`
-2. [ ] - `p1` - **IF** the declaration's scope class is `cascading` - `inst-vr-disp-5`
-   1. [ ] - `p1` - Ask the tenant resolver for the requested tenant's ancestor ids, ordered root to self - `inst-vr-disp-6`
-   2. [ ] - `p1` - DB: SELECT value rows for the declaration where the tenant is within the ancestor id set, which begins at the root tenant and so includes platform scope, as one exact-match set query with no prefix or pattern scan - `inst-vr-disp-7`
-   3. [ ] - `p1` - Prefer the deepest matching scope, applying needs-review fallthrough as each candidate is considered - `inst-vr-disp-8`
-   4. [ ] - `p1` - **IF** the deepest valid match is the requested tenant → set the source to own override - `inst-vr-disp-9`
-   5. [ ] - `p1` - **ELSE IF** a valid ancestor match exists → set the source to inherited and record its scope - `inst-vr-disp-10`
-   6. [ ] - `p1` - **ELSE** **RETURN** the Schema Default with the default source and a null source scope - `inst-vr-disp-11`
-3. [ ] - `p1` - **IF** the declaration's scope class is `local` - `inst-vr-disp-12`
-   1. [ ] - `p1` - DB: SELECT only the row for the requested tenant, performing no ancestor walk - `inst-vr-disp-13`
-   2. [ ] - `p1` - **IF** absent or flagged → **RETURN** the Schema Default, since a local setting is never inherited - `inst-vr-disp-14`
-4. [ ] - `p1` - **RETURN** the resolved value, its source, and its source scope - `inst-vr-disp-15`
+1. [x] - `p1` - **IF** the declaration's scope class is `global` - `inst-vr-disp-1`
+   1. [x] - `p1` - DB: SELECT the platform-scope row for the declaration, identified by the root tenant's id - `inst-vr-disp-2`
+   2. [x] - `p1` - **IF** the request comes from a tenant scope → serve the platform value read-only, and only when the setting is visible to that tenant, its effective access being other than `hidden` - `inst-vr-disp-3`
+   3. [x] - `p1` - **IF** no platform row exists → **RETURN** the Schema Default with the default source - `inst-vr-disp-4`
+2. [x] - `p1` - **IF** the declaration's scope class is `cascading` - `inst-vr-disp-5`
+   1. [x] - `p1` - Ask the tenant resolver for the requested tenant's ancestor ids, ordered root to self - `inst-vr-disp-6`
+   2. [x] - `p1` - DB: SELECT value rows for the declaration where the tenant is within the ancestor id set, which begins at the root tenant and so includes platform scope, as one exact-match set query with no prefix or pattern scan - `inst-vr-disp-7`
+   3. [x] - `p1` - Prefer the deepest matching scope, applying needs-review fallthrough as each candidate is considered - `inst-vr-disp-8`
+   4. [x] - `p1` - **IF** the deepest valid match is the requested tenant → set the source to own override - `inst-vr-disp-9`
+   5. [x] - `p1` - **ELSE IF** a valid ancestor match exists → set the source to inherited and record its scope - `inst-vr-disp-10`
+   6. [x] - `p1` - **ELSE** **RETURN** the Schema Default with the default source and a null source scope - `inst-vr-disp-11`
+3. [x] - `p1` - **IF** the declaration's scope class is `local` - `inst-vr-disp-12`
+   1. [x] - `p1` - DB: SELECT only the row for the requested tenant, performing no ancestor walk - `inst-vr-disp-13`
+   2. [x] - `p1` - **IF** absent or flagged → **RETURN** the Schema Default, since a local setting is never inherited - `inst-vr-disp-14`
+4. [x] - `p1` - **RETURN** the resolved value, its source, and its source scope - `inst-vr-disp-15`
 
 ### Needs-Review Fallthrough
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough`
 
 **Input**: A candidate override row under consideration during resolution
 
 **Output**: Accept the candidate, or skip it and continue the walk
 
 **Steps**:
-1. [ ] - `p1` - **IF** the candidate is not flagged for review → accept it as the resolved value - `inst-vr-nrf-1`
-2. [ ] - `p1` - **IF** the candidate is flagged → skip it without serving it and without raising an error to the consumer - `inst-vr-nrf-2`
-3. [ ] - `p1` - **IF** the scope class is `cascading` → continue to the next nearest valid ancestor override - `inst-vr-nrf-3`
-4. [ ] - `p1` - **IF** the scope class is `local` or `global`, or no valid ancestor remains → fall through to the Schema Default - `inst-vr-nrf-4`
-5. [ ] - `p1` - Leave the flagged row in place, excluded from resolution until corrected and visible on the administrative listing - `inst-vr-nrf-5`
-6. [ ] - `p1` - **RETURN** the accepted value, having never surfaced review state as a consumer-facing error - `inst-vr-nrf-6`
+1. [x] - `p1` - **IF** the candidate is not flagged for review → accept it as the resolved value - `inst-vr-nrf-1`
+2. [x] - `p1` - **IF** the candidate is flagged → skip it without serving it and without raising an error to the consumer - `inst-vr-nrf-2`
+3. [x] - `p1` - **IF** the scope class is `cascading` → continue to the next nearest valid ancestor override - `inst-vr-nrf-3`
+4. [x] - `p1` - **IF** the scope class is `local` or `global`, or no valid ancestor remains → fall through to the Schema Default - `inst-vr-nrf-4`
+5. [x] - `p1` - Leave the flagged row in place, excluded from resolution until corrected and visible on the administrative listing - `inst-vr-nrf-5`
+6. [x] - `p1` - **RETURN** the accepted value, having never surfaced review state as a consumer-facing error - `inst-vr-nrf-6`
 
 ### Cache Lookup and Population
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-cache-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-cache-read`
 
 **Input**: A setting key and a scope
 
 **Output**: A cached effective value, or a miss that the resolver then populates
 
 **Steps**:
-1. [ ] - `p1` - Look up the entry keyed by the pair of setting key and scope - `inst-vr-cache-1`
-2. [ ] - `p1` - **IF** no entry exists → **RETURN** a miss - `inst-vr-cache-2`
-3. [ ] - `p1` - **IF** the entry is older than the configured time-to-live → evict it and **RETURN** a miss, so a missed invalidation self-heals within that bound - `inst-vr-cache-3`
-4. [ ] - `p1` - **RETURN** the entry together with the source trace it was stored with - `inst-vr-cache-4`
+1. [x] - `p1` - Look up the entry keyed by the pair of setting key and scope - `inst-vr-cache-1`
+2. [x] - `p1` - **IF** no entry exists → **RETURN** a miss - `inst-vr-cache-2`
+3. [x] - `p1` - **IF** the entry is older than the configured time-to-live → evict it and **RETURN** a miss, so a missed invalidation self-heals within that bound - `inst-vr-cache-3`
+4. [x] - `p1` - **RETURN** the entry together with the source trace it was stored with - `inst-vr-cache-4`
 
 ### Cache Invalidation
 
@@ -276,11 +276,11 @@ Three properties matter more than the walk itself.
 **Output**: Evicted cache entries
 
 **Steps**:
-1. [ ] - `p1` - **IF** a specific scope is named → evict the entry for that key and scope on this instance - `inst-vr-inv-1`
-2. [ ] - `p1` - **IF** the affected declaration is `cascading` → evict every cached scope for that key, because an ancestor change alters descendants' effective values and they must re-resolve lazily on next read - `inst-vr-inv-2`
+1. [x] - `p1` - **IF** a specific scope is named → evict the entry for that key and scope on this instance - `inst-vr-inv-1`
+2. [x] - `p1` - **IF** the affected declaration is `cascading` → evict every cached scope for that key, because an ancestor change alters descendants' effective values and they must re-resolve lazily on next read - `inst-vr-inv-2`
 3. [ ] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no value write need be involved - `inst-vr-inv-3`
-4. [ ] - `p1` - Record that the tenant resolver publishes no such hierarchy signal today, so until it does the time-to-live is the only backstop and the post-re-parent staleness window equals it - `inst-vr-inv-4`
-5. [ ] - `p1` - **RETURN** having evicted locally only; converging peer replicas is the R2 `cache_invalidate` broadcast and out of scope here - `inst-vr-inv-5`
+4. [x] - `p1` - Record that the tenant resolver publishes no such hierarchy signal today, so until it does the time-to-live is the only backstop and the post-re-parent staleness window equals it - `inst-vr-inv-4`
+5. [x] - `p1` - **RETURN** having evicted locally only; converging peer replicas is the R2 `cache_invalidate` broadcast and out of scope here - `inst-vr-inv-5`
 
 ## 4. States (CDSL)
 
@@ -290,7 +290,7 @@ Not applicable. `EffectiveValue` is computed on each read and never persisted, s
 
 ### Resolver Operations
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-operations`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-operations`
 
 The system **MUST** expose single-key resolution, bulk resolution, and effective-source inspection. Bulk resolution **MUST** share one ancestry walk per scope and **MUST** return an independent outcome per key so that one failing key never fails the batch.
 
@@ -304,7 +304,7 @@ The system **MUST** expose single-key resolution, bulk resolution, and effective
 
 ### Scope Class Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-scope-class`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-scope-class`
 
 Resolution **MUST** dispatch on the declaration's scope class: a `global` setting reads its platform row or the Schema Default and is exposed to tenants read-only under visibility alone; a `cascading` setting resolves nearest-first over its ancestor chain preferring the deepest match; a `local` setting reads only its own scope with no ancestor walk. Every path **MUST** terminate in the Schema Default so a successful read always carries a value.
 
@@ -317,7 +317,7 @@ Resolution **MUST** dispatch on the declaration's scope class: a `global` settin
 
 ### Single Source of Ancestry
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-ancestry`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-ancestry`
 
 The cascading walk **MUST** obtain ancestry from the tenant resolver and **MUST NOT** reconstruct the hierarchy from stored scope values. The value row's scope column **MUST** be read as an id, never parsed as a path, and the query **MUST** be an exact-match set lookup rather than a prefix or pattern scan, so a tenant re-parent requires no stored-scope rewrite.
 
@@ -330,7 +330,7 @@ The cascading walk **MUST** obtain ancestry from the tenant resolver and **MUST 
 
 ### Effective Value Shape and Inheritance Trail
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-shape`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-shape`
 
 The resolved result **MUST** carry the key, the requested scope, the value, the source, the scope that supplied it, the resolved trait set, and the inheritance trail. The trail **MUST** be limited to the caller's own ancestor chain and **MUST NOT** include a sibling or descendant scope. Per-entry setter identity and timestamp **MUST** appear only on the administrative read and never on the consumer path. The recency indicator's value arm **MUST** derive from the resolved row alone.
 
@@ -342,7 +342,7 @@ The resolved result **MUST** carry the key, the requested scope, the value, the 
 
 ### Defaults and Revert Semantics
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-defaults`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-defaults`
 
 The Schema Default **MUST** terminate every resolution chain, **MUST** remain independent of any override, and **MUST** survive an override being set and later removed. A consumer distinguishing a configured value from an untouched one **MUST** be able to do so from the source alone, because a type admitting `null` makes the value itself unable to carry that signal.
 
@@ -354,7 +354,7 @@ The Schema Default **MUST** terminate every resolution chain, **MUST** remain in
 
 ### Flagged Override Is Never Served
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-fallthrough`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-fallthrough`
 
 A value flagged for review **MUST NOT** be served and **MUST NOT** produce a consumer-facing error. Resolution **MUST** continue past it to the nearest valid ancestor override or the Schema Default, and the flagged row **MUST** remain in place, excluded from resolution and visible to administrators.
 
@@ -367,7 +367,7 @@ A value flagged for review **MUST NOT** be served and **MUST NOT** produce a con
 
 ### Distinct Resolution Outcomes
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-outcomes`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-outcomes`
 
 A retired declaration **MUST** resolve as a distinct retired outcome rather than as not-found, and its retained values **MUST NOT** be returned. A key with no declaration row **MUST** resolve as not-found without the service guessing whether the owning gear has yet to register or the key never existed. A key made stale by a category rename **MUST** be indistinguishable from one that never existed, since no alias or key history is retained. An unresolvable dependency **MUST** surface as unavailable rather than as a substituted default.
 
@@ -381,7 +381,7 @@ A retired declaration **MUST** resolve as a distinct retired outcome rather than
 
 ### Read-Path Cache
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-cache`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-cache`
 
 The system **MUST** provide a local in-process cache keyed by setting key and scope, storing the resolved value with its source trace, consulted before any database read and populated on miss. Eviction **MUST** be key-wide for a cascading declaration so descendants re-resolve lazily.
 
@@ -394,7 +394,7 @@ The system **MUST** provide a local in-process cache keyed by setting key and sc
 
 ### Cache Time-to-Live Backstop
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-cache-ttl`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-cache-ttl`
 
 The cache **MUST** own a configurable time-to-live and **MUST** evict entries older than it as a backstop, so a missed invalidation self-heals within that bound rather than persisting indefinitely. This cache is the definition site for that knob; other components reference it rather than defining their own.
 
@@ -418,7 +418,7 @@ The cache **MUST** evict the affected subtree's cascading entries on a tenant hi
 
 ### Administrative Read Surface
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-rest-read-surface`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-rest-read-surface`
 
 The system **MUST** serve `GET /settings-service/v1/settings/{key}` and `GET /settings-service/v1/settings` on the resolver, authorized by `read` on the setting's key — one decision on the base type where the grant covers everything, batch evaluation of candidates under a narrowed grant — confined to the caller's own tenant or a non-standalone descendant, with a hidden setting reported as absent and excluded from listings and counts. The single read **MUST** carry `value`, `source`, `source_scope`, `traits`, the inheritance trail with setter identity, a leak-safe `last_change_at`, the scope's own review flag, and the value state tag in `ETag`; values **MUST** be masked by classification. The browse **MUST** support selection by category and by key set with per-key outcomes, and the needs-review listing over the caller's subtree.
 
@@ -450,41 +450,41 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 
 ## 6. Acceptance Criteria
 
-- [ ] A `global` setting with a root-tenant row resolves to that row's value with the root tenant as its source scope
-- [ ] A `global` setting with no root-tenant row resolves to its Schema Default
-- [ ] A `global` setting is served to a tenant read-only when the setting is visible to it, and is not served when its effective access is `hidden`
-- [ ] A `cascading` setting with an override at the requested tenant resolves as an own override
-- [ ] A `cascading` setting with no own override but an ancestor override resolves as inherited and names the ancestor scope
-- [ ] A `cascading` setting with overrides at two ancestors resolves to the deeper of the two
-- [ ] A `cascading` setting with no override anywhere resolves to its Schema Default with a null source scope
-- [ ] A `local` setting resolves only from its own scope and never inherits from an ancestor
-- [ ] A `local` setting with no own value resolves to its Schema Default
-- [ ] Resolution issues an exact-match set query over ancestor ids, with no prefix or pattern scan against the scope column
-- [ ] Ancestry comes from the tenant resolver, and no code path reconstructs the hierarchy from stored scope values
-- [ ] A flagged override at the requested scope is skipped and the nearest valid ancestor value is served instead
-- [ ] A flagged override with no valid ancestor falls through to the Schema Default
-- [ ] A flagged override is never returned to a consumer and never produces a consumer-facing error
+- [x] A `global` setting with a root-tenant row resolves to that row's value with the root tenant as its source scope
+- [x] A `global` setting with no root-tenant row resolves to its Schema Default
+- [x] A `global` setting is served to a tenant read-only when the setting is visible to it, and is not served when its effective access is `hidden`
+- [x] A `cascading` setting with an override at the requested tenant resolves as an own override
+- [x] A `cascading` setting with no own override but an ancestor override resolves as inherited and names the ancestor scope
+- [x] A `cascading` setting with overrides at two ancestors resolves to the deeper of the two
+- [x] A `cascading` setting with no override anywhere resolves to its Schema Default with a null source scope
+- [x] A `local` setting resolves only from its own scope and never inherits from an ancestor
+- [x] A `local` setting with no own value resolves to its Schema Default
+- [x] Resolution issues an exact-match set query over ancestor ids, with no prefix or pattern scan against the scope column
+- [x] Ancestry comes from the tenant resolver, and no code path reconstructs the hierarchy from stored scope values
+- [x] A flagged override at the requested scope is skipped and the nearest valid ancestor value is served instead
+- [x] A flagged override with no valid ancestor falls through to the Schema Default
+- [x] A flagged override is never returned to a consumer and never produces a consumer-facing error
 - [ ] A flagged override remains present in storage and appears on the administrative listing
-- [ ] A retired declaration resolves as the retired outcome, distinct from not-found, and its retained values are not returned
-- [ ] A key with no declaration resolves as not-found, and the response does not assert which sub-case applies
+- [x] A retired declaration resolves as the retired outcome, distinct from not-found, and its retained values are not returned
+- [x] A key with no declaration resolves as not-found, and the response does not assert which sub-case applies
 - [ ] A key made stale by a category rename is indistinguishable from a key that never existed
-- [ ] An unreachable dependency yields the unavailable outcome rather than a substituted Schema Default
-- [ ] A setting whose type admits `null` and is explicitly set to `null` is distinguishable from an unset one by source alone
-- [ ] A bulk read returns one outcome per key, and a single failing key leaves the other results intact
-- [ ] A bulk read performs one ancestry lookup per scope rather than one per key
-- [ ] A second read of the same key and scope is served from cache without a database query
-- [ ] Writing a value of a cascading declaration evicts every cached scope for that key
-- [ ] A cache entry older than the configured time-to-live is treated as a miss and re-resolved
-- [ ] The inheritance trail contains only the caller's own ancestor chain, and never a sibling or descendant scope
-- [ ] Setter identity appears on the administrative trail and is absent from the consumer result
-- [ ] A tenant admin requesting a trail for a scope outside its subtree is denied
-- [ ] `GET /settings-service/v1/settings/{key}` returns `value`, `source`, `source_scope`, `traits`, the trail with setter identity, `last_change_at`, and an `ETag` equal to the scope's own value state tag
-- [ ] The read's `last_change_at` never exceeds the greater of the declaration's and the resolved row's timestamps, and a sibling's later write leaves it unchanged
-- [ ] A read whose own override is flagged returns the fallthrough value together with `needs_review` and its detail
-- [ ] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
-- [ ] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
-- [ ] `GET /settings-service/v1/settings?$filter=key in (…)` returns one entry per key, a hidden or non-existent key carrying its own outcome
+- [x] An unreachable dependency yields the unavailable outcome rather than a substituted Schema Default
+- [x] A setting whose type admits `null` and is explicitly set to `null` is distinguishable from an unset one by source alone
+- [x] A bulk read returns one outcome per key, and a single failing key leaves the other results intact
+- [x] A bulk read performs one ancestry lookup per scope rather than one per key
+- [x] A second read of the same key and scope is served from cache without a database query
+- [x] Writing a value of a cascading declaration evicts every cached scope for that key
+- [x] A cache entry older than the configured time-to-live is treated as a miss and re-resolved
+- [x] The inheritance trail contains only the caller's own ancestor chain, and never a sibling or descendant scope
+- [x] Setter identity appears on the administrative trail and is absent from the consumer result
+- [x] A tenant admin requesting a trail for a scope outside its subtree is denied
+- [x] `GET /settings-service/v1/settings/{key}` returns `value`, `source`, `source_scope`, `traits`, the trail with setter identity, `last_change_at`, and an `ETag` equal to the scope's own value state tag
+- [x] The read's `last_change_at` never exceeds the greater of the declaration's and the resolved row's timestamps, and a sibling's later write leaves it unchanged
+- [x] A read whose own override is flagged returns the fallthrough value together with `needs_review` and its detail
+- [x] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
+- [x] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
+- [x] `GET /settings-service/v1/settings?$filter=key in (…)` returns one entry per key, a hidden or non-existent key carrying its own outcome
 - [ ] `GET /settings-service/v1/settings?$filter=needs_review eq true` lists the flagged overrides in the caller's subtree with their detail and none from a standalone descendant
 - [ ] Under a base-type grant a page costs one authorization decision; under a narrowed grant denied settings are absent from the page and the count and the page comes back full
-- [ ] An OData expression on an unmapped field returns `400` rather than an unfiltered page
+- [x] An OData expression on an unmapped field returns `400` rather than an unfiltered page
 - [ ] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup

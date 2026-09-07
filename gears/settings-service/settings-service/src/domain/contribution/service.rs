@@ -14,7 +14,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{SettingTypeRegistrar, reason};
-use crate::audit::{AuditEmitter, AuditRecord, AuditValue};
+use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
 use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
@@ -65,13 +65,13 @@ fn refused(code: &'static str, message: impl Into<String>) -> ItemError {
 }
 
 /// The reconciler.
-pub struct ContributionService<D, Cat, V> {
+pub struct ContributionService<D, Cat, V, S> {
     declarations: D,
     categories: Cat,
     values: V,
     validator: Arc<dyn TypeValidator>,
     registrar: Arc<dyn SettingTypeRegistrar>,
-    audit: Arc<dyn AuditEmitter>,
+    sink: S,
     scope: Arc<dyn PlatformScope>,
 }
 
@@ -184,11 +184,12 @@ fn admit(key: &SettingKey) -> Result<Admitted<'_>, ItemError> {
     // @cpt-end:cpt-cf-settings-service-algo-module-contributions-key:p1:inst-mc-key-3
 }
 
-impl<D, Cat, V> ContributionService<D, Cat, V>
+impl<D, Cat, V, S> ContributionService<D, Cat, V, S>
 where
     D: DeclarationRepository,
     Cat: CategoryRepository,
     V: ValueRepository,
+    S: AuditSink,
 {
     /// Build the reconciler over its repositories and ports.
     pub fn new(
@@ -197,7 +198,7 @@ where
         values: V,
         validator: Arc<dyn TypeValidator>,
         registrar: Arc<dyn SettingTypeRegistrar>,
-        audit: Arc<dyn AuditEmitter>,
+        sink: S,
         scope: Arc<dyn PlatformScope>,
     ) -> Self {
         Self {
@@ -206,7 +207,7 @@ where
             values,
             validator,
             registrar,
-            audit,
+            sink,
             scope,
         }
     }
@@ -339,10 +340,11 @@ where
             .await?;
         let retired = self.reload(conn, &scope, key).await?;
         self.record(
+            conn,
             key,
             owner_module,
             request_id,
-            "declaration.retire",
+            AuditOperation::Remove,
             Some(snapshot(&existing)),
             Some(snapshot(&retired)),
         )
@@ -492,10 +494,11 @@ where
         };
         let inserted = self.declarations.insert(conn, scope, draft).await?;
         self.record(
+            conn,
             key,
             owner_module,
             request_id,
-            "declaration.register",
+            AuditOperation::Create,
             None,
             Some(snapshot(&inserted)),
         )
@@ -570,10 +573,11 @@ where
             }
             let revived = self.reload(conn, scope, key).await?;
             self.record(
+                conn,
                 key,
                 owner_module,
                 request_id,
-                "declaration.reactivate",
+                AuditOperation::Change,
                 Some(snapshot(&existing)),
                 Some(snapshot(&revived)),
             )
@@ -600,10 +604,11 @@ where
         }
         let updated = self.reload(conn, scope, key).await?;
         self.record(
+            conn,
             key,
             owner_module,
             request_id,
-            "declaration.update",
+            AuditOperation::Change,
             Some(snapshot(&existing)),
             Some(snapshot(&updated)),
         )
@@ -672,24 +677,29 @@ where
 
     /// One audit record per changed row, at platform scope, with the module as
     /// the actor.
-    async fn record(
+    #[allow(clippy::too_many_arguments)]
+    async fn record<C: DBRunner>(
         &self,
+        conn: &C,
         key: &SettingKey,
         owner_module: &str,
         request_id: &str,
-        action: &'static str,
+        operation: AuditOperation,
         pre: Option<Value>,
         post: Option<Value>,
     ) -> Result<(), DomainError> {
         let tenant = self.scope.root_tenant().await?;
-        let mut rec = AuditRecord::new(key.as_str(), tenant, owner_module, action, request_id);
+        let mut rec =
+            AuditRecord::new(key.as_str(), tenant, owner_module, operation, request_id).by_module();
         if let Some(pre) = pre {
             rec = rec.with_pre_image(AuditValue::record(pre, false));
         }
         if let Some(post) = post {
             rec = rec.with_post_image(AuditValue::record(post, false));
         }
-        self.audit.audit(rec).await
+        // Declarations have no tenant of their own; the record is written on
+        // the same unscoped path as the row it audits, inside its transaction.
+        self.sink.append(conn, &AccessScope::allow_all(), rec).await
     }
 }
 

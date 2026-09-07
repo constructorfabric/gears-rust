@@ -15,6 +15,9 @@ use crate::domain::declaration::service::RenderedDeclaration;
 /// is a separate fact of the declaration, not a half of its name.
 // `Eq` is absent because `traits` is a `serde_json::Value`, which is only
 // `PartialEq` -- JSON numbers have no total equality.
+// The flags mirror the declaration's: separate facts an administrator reads
+// one by one.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 #[toolkit_macros::api_dto(response)]
 pub struct DeclarationDto {
@@ -52,12 +55,40 @@ pub struct DeclarationDto {
     /// An empty object when the registry could not answer. Always present so a
     /// client renders the same shape either way rather than branching on
     /// absence.
+    /// The Schema Default every resolution chain ends in.
+    pub default_value: Value,
+    /// `public`, `pii` or `secret`; `secret` is derived from the value type.
+    pub data_classification: String,
+    /// Whether the value type carries the `secret` trait.
+    pub has_secret_trait: bool,
+    /// Whether a value write needs a fresh re-authentication.
+    pub requires_step_up: bool,
+    /// Whether the anonymous surface may show the value.
+    pub anonymous_exposable: bool,
+    /// `admin_authored` or `module_contributed`.
+    pub source: String,
+    /// When the definition last changed, RFC 3339.
+    pub last_change_at: String,
+    /// The declaration's state tag, also sent as the `ETag` header.
+    pub etag: String,
     pub traits: Value,
+}
+
+/// The declaration's state tag: its normalized UTC `updated_at`, as every
+/// other tag in this service.
+#[must_use]
+pub fn declaration_etag(declaration: &crate::domain::declaration::Declaration) -> String {
+    declaration.updated_at.unix_timestamp_nanos().to_string()
 }
 
 impl From<RenderedDeclaration> for DeclarationDto {
     fn from(rendered: RenderedDeclaration) -> Self {
         let d = rendered.declaration;
+        let etag = declaration_etag(&d);
+        let last_change_at = d
+            .last_change_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| d.last_change_at.to_string());
         Self {
             id: d.id,
             key: d.key,
@@ -71,6 +102,14 @@ impl From<RenderedDeclaration> for DeclarationDto {
             licence_feature: d.licence_feature,
             owner_module: d.owner_module,
             description: d.description,
+            default_value: d.default_value,
+            data_classification: d.data_classification,
+            has_secret_trait: d.has_secret_trait,
+            requires_step_up: d.requires_step_up,
+            anonymous_exposable: d.anonymous_exposable,
+            source: d.source,
+            last_change_at,
+            etag,
             traits: rendered.traits,
         }
     }

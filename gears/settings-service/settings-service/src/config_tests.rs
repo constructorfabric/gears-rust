@@ -62,3 +62,28 @@ fn a_wrong_typed_value_is_refused_rather_than_coerced() {
     // start the service with a staleness bound nobody chose.
     assert!(parse(serde_json::json!({ "cache_ttl_seconds": "thirty" })).is_err());
 }
+
+#[test]
+fn the_audit_retention_defaults_to_twelve_months() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.audit_retention_days, 365);
+    let cfg = parse(serde_json::json!({ "audit_retention_days": 730 })).expect("parses");
+    assert_eq!(cfg.audit_retention_days, 730);
+}
+
+#[test]
+fn the_step_up_section_is_optional_and_defaults_its_window_to_five_minutes() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert!(cfg.step_up.is_none(), "absent means no verifier is bound");
+    let cfg = parse(serde_json::json!({
+        "step_up": { "jwks_uri": "https://idp.example/keys" }
+    }))
+    .expect("parses");
+    let step_up = cfg.step_up.expect("present");
+    assert_eq!(step_up.max_age_seconds, 300);
+    assert!(step_up.acr_values.is_empty());
+    assert!(
+        parse(serde_json::json!({ "step_up": { "max_age_seconds": 60 } })).is_err(),
+        "the JWKS endpoint is required"
+    );
+}

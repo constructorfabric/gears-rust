@@ -18,27 +18,27 @@
 //! Fields that carry a value fixed by the design, rather than by the deployment,
 //! may default — [`SettingsServiceConfig::cache_ttl_seconds`] is the only one.
 //!
-//! # Step-up configuration is not here yet
+//! # Step-up configuration
 //!
 //! Step-up is gated per declaration (`requires_step_up`, default required —
 //! `cpt-cf-settings-service-fr-service-writes`) and enforced on interactive writes
-//! and behavior-affecting declaration actions (`cpt-cf-settings-service-fr-authn-role-gating`).
-//! DESIGN.md §4.2 *Value Writer* fixes the R1 check: the presented token's
-//! signature against the identity provider's JWKS, `sub` matching the session, and
-//! `auth_time` within the step-up freshness window — a binding behind a
-//! ClientHub-resolved `StepUpVerifier` port owned by this gear. Two values are
-//! deployment configuration and, per DESIGN.md §4.9, load at gear init: the
-//! provider's **JWKS endpoint**, and the **freshness window**, which
+//! (`cpt-cf-settings-service-fr-authn-role-gating`). DESIGN.md §4.2 *Value
+//! Writer* fixes the R1 check: the presented token's signature against the
+//! identity provider's JWKS, `sub` matching the session, `auth_time` within the
+//! freshness window, and the required `acr`/`amr` — the default binding behind
+//! the gear's `StepUpVerifier` port. The [`StepUpConfig`] section carries the
+//! provider's JWKS endpoint and the window, which
 //! `cpt-cf-settings-service-fr-validate-before-set` makes deployment-configured
-//! and DESIGN caps at five minutes. Both arrive with the verifier binding in
-//! DECOMPOSITION entry 2.8; declaring them before anything reads them would be
-//! configuration nobody can validate.
+//! and DESIGN caps at five minutes. With the section absent nothing is bound:
+//! every write to a declaration that requires step-up refuses, reads keep
+//! serving, and there is no bypass to configure.
 
 use serde::Deserialize;
 
 /// The cache backstop that bounds staleness when an invalidation broadcast is
 /// missed. Fixed by DESIGN.md §4.2 *Cache & Invalidation*, not by the operator.
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 30;
+const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 365;
 
 /// Bootstrap configuration, read once at gear init.
 ///
@@ -56,10 +56,60 @@ pub struct SettingsServiceConfig {
     /// of a guess.
     #[serde(default = "default_cache_ttl_seconds")]
     pub cache_ttl_seconds: u64,
+
+    /// How long an audit record without an explicit `retain_until` stays in the
+    /// online window. Twelve months by default, and never configurable below
+    /// that: init refuses a shorter value.
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+
+    /// The step-up verifier binding. Absent, no verifier is bound.
+    #[serde(default)]
+    pub step_up: Option<StepUpConfig>,
+}
+
+/// The OIDC/JWKS step-up binding's deployment values.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpConfig {
+    /// The identity provider's JWKS endpoint, fetched and cached in the
+    /// background; never called on the write path.
+    pub jwks_uri: String,
+
+    /// The freshness window for `auth_time`, in seconds. Five minutes by
+    /// default and never above it: init refuses a longer window.
+    #[serde(default = "default_step_up_max_age_seconds")]
+    pub max_age_seconds: u64,
+
+    /// The issuer the token must carry, when the deployment pins one.
+    #[serde(default)]
+    pub issuer: Option<String>,
+
+    /// The audience the token must carry, when the deployment pins one.
+    #[serde(default)]
+    pub audience: Option<String>,
+
+    /// Authentication context class references that satisfy the requirement.
+    #[serde(default)]
+    pub acr_values: Vec<String>,
+
+    /// Authentication methods that satisfy the requirement.
+    #[serde(default)]
+    pub amr_values: Vec<String>,
+}
+
+const DEFAULT_STEP_UP_MAX_AGE_SECONDS: u64 = 300;
+
+const fn default_step_up_max_age_seconds() -> u64 {
+    DEFAULT_STEP_UP_MAX_AGE_SECONDS
 }
 
 const fn default_cache_ttl_seconds() -> u64 {
     DEFAULT_CACHE_TTL_SECONDS
+}
+
+const fn default_audit_retention_days() -> u32 {
+    DEFAULT_AUDIT_RETENTION_DAYS
 }
 
 #[cfg(test)]

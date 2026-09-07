@@ -41,3 +41,134 @@ fn a_query_without_select_is_accepted() {
     let query = toolkit_odata::ODataQuery::default();
     assert!(crate::domain::odata::reject_unsupported_options(&query, "categories").is_ok());
 }
+
+mod transactional {
+    //! The mutation and its record share one commit, over a real database.
+
+    use std::sync::Arc;
+
+    use toolkit_odata::ODataQuery;
+    use toolkit_security::{AccessScope, SecurityContext};
+    use uuid::Uuid;
+
+    use crate::audit::AuditOperation;
+    use crate::domain::category::service::Actor;
+    use crate::domain::category::{
+        CategoryDraft, CategoryKey, CategoryRepository, CategoryService,
+    };
+    use crate::domain::error::DomainError;
+    use crate::infra::storage::audit_store::AuditStore;
+    use crate::infra::storage::category_repo::CategoryRepo;
+    use crate::test_support::{FailingSink, FixedScope, sqlite_provider};
+
+    fn draft(slug: &str) -> CategoryDraft {
+        CategoryDraft {
+            key: CategoryKey::parse(slug).expect("slug"),
+            name: slug.to_owned(),
+            description: None,
+            domain_affinity: None,
+            sort_order: 0,
+            icon: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_category_mutation_leaves_exactly_one_record_in_the_same_commit() {
+        let db = sqlite_provider().await;
+        let root = Uuid::new_v4();
+        let svc = Arc::new(CategoryService::new(
+            CategoryRepo,
+            AuditStore,
+            Arc::new(FixedScope(root)),
+        ));
+        let ctx = SecurityContext::anonymous();
+        let created = db
+            .db()
+            .transaction_ref_mapped::<_, _, DomainError>(|tx| {
+                let svc = Arc::clone(&svc);
+                let ctx = ctx.clone();
+                Box::pin(async move {
+                    svc.create(
+                        tx,
+                        &AccessScope::allow_all(),
+                        draft("network"),
+                        Actor {
+                            ctx: &ctx,
+                            request_id: "req-1",
+                        },
+                    )
+                    .await
+                })
+            })
+            .await
+            .expect("creates");
+
+        let conn = db.conn().expect("connection");
+        let page = AuditStore
+            .history(
+                &conn,
+                &AccessScope::allow_all(),
+                created.key.as_str(),
+                root,
+                &ODataQuery::default(),
+            )
+            .await
+            .expect("history");
+        assert_eq!(page.items.len(), 1);
+        let record = &page.items[0];
+        assert_eq!(record.operation, AuditOperation::Create);
+        assert_eq!(
+            record.tenant_id, root,
+            "platform scope is the root tenant's id"
+        );
+        assert_eq!(record.request_id, "req-1");
+        assert!(record.pre_image.is_none() && record.post_image.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_written_rolls_the_mutation_back() {
+        let db = sqlite_provider().await;
+        let svc = Arc::new(CategoryService::new(
+            CategoryRepo,
+            FailingSink,
+            Arc::new(FixedScope(Uuid::new_v4())),
+        ));
+        let ctx = SecurityContext::anonymous();
+        let outcome = db
+            .db()
+            .transaction_ref_mapped::<_, _, DomainError>(|tx| {
+                let svc = Arc::clone(&svc);
+                let ctx = ctx.clone();
+                Box::pin(async move {
+                    svc.create(
+                        tx,
+                        &AccessScope::allow_all(),
+                        draft("network"),
+                        Actor {
+                            ctx: &ctx,
+                            request_id: "req-2",
+                        },
+                    )
+                    .await
+                })
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(DomainError::Unavailable { .. })),
+            "{outcome:?}"
+        );
+
+        // Neither the row nor the record: the change the platform could not
+        // record never took effect.
+        let conn = db.conn().expect("connection");
+        let found = CategoryRepo
+            .find_by_key(
+                &conn,
+                &AccessScope::allow_all(),
+                &CategoryKey::parse("network").expect("slug"),
+            )
+            .await
+            .expect("lookup");
+        assert!(found.is_none());
+    }
+}

@@ -88,6 +88,27 @@ pub struct GetEffectiveRequest {
     pub scope: String,
 }
 
+/// One scope the resolver inspected, as a consumer sees it.
+///
+/// The trail is the caller's own ancestor chain from the platform root down to
+/// the requested scope — never a sibling or a descendant. It carries no setter
+/// identity and no timestamp: an ancestor's administrator is not exposed to a
+/// subordinate tenant through the consumer path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrailEntry {
+    /// The scope inspected: `/` or `/tenants/{id}`.
+    pub scope: String,
+    /// Whether an override row exists at this scope.
+    pub has_override: bool,
+    /// Whether this scope supplied the effective value.
+    pub provided_value: bool,
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// A resolved effective value with the trace of where it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +124,12 @@ pub struct EffectiveValueResponse {
     pub source: EffectiveSource,
     /// The scope that supplied the value; absent for a Schema Default.
     pub source_scope: Option<String>,
+    /// The value type's resolved trait set, for rendering and pre-validation.
+    #[serde(default = "empty_object")]
+    pub traits: serde_json::Value,
+    /// The scopes inspected, root to self.
+    #[serde(default)]
+    pub inheritance_trail: Vec<TrailEntry>,
 }
 
 /// Where a setting's values may exist, and how they are inherited.

@@ -18,7 +18,7 @@ use types_registry_sdk::TypesRegistryClient;
 
 use crate::domain::platform_scope::PlatformScope;
 use crate::domain::validation::TypeValidator;
-use settings_service_sdk::api::SettingsContributionClient;
+use settings_service_sdk::api::{SettingsContributionClient, SettingsReaderClient};
 
 use crate::config::SettingsServiceConfig;
 
@@ -36,6 +36,14 @@ use crate::config::SettingsServiceConfig;
 /// fetched the same way (see [`crate::infra::platform_scope`]) — its SDK has no
 /// REST projection yet, so it cannot carry a `consumes` declaration until it
 /// does, and in the Embedded profile R1 is limited to the two paths coincide.
+/// The resolver over the concrete repositories, as the gear and its REST
+/// surface share it.
+pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
+    crate::infra::storage::declaration_repo::DeclarationRepo,
+    crate::infra::storage::value_repo::ValueRepo,
+    crate::infra::storage::access_repo::AccessRepo,
+>;
+
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(name = "settings-service", deps = [types_registry], capabilities = [db, rest])]
 pub struct SettingsService {
@@ -48,9 +56,14 @@ pub struct SettingsService {
         Arc<
             crate::domain::category::CategoryService<
                 crate::infra::storage::category_repo::CategoryRepo,
+                crate::infra::storage::audit_store::AuditStore,
             >,
         >,
     >,
+    resolver: OnceLock<Arc<ConcreteResolver>>,
+    writes: OnceLock<Arc<crate::infra::value_writes::WriteCoordinator>>,
+    access: OnceLock<Arc<crate::api::rest::access_handlers::ConcreteAccessService>>,
+    hierarchy: OnceLock<Arc<dyn crate::domain::resolution::TenantHierarchy>>,
     declarations: OnceLock<
         Arc<
             crate::domain::declaration::DeclarationService<
@@ -69,6 +82,10 @@ impl Default for SettingsService {
             types: OnceLock::new(),
             validator: OnceLock::new(),
             categories: OnceLock::new(),
+            resolver: OnceLock::new(),
+            writes: OnceLock::new(),
+            access: OnceLock::new(),
+            hierarchy: OnceLock::new(),
             declarations: OnceLock::new(),
         }
     }
@@ -145,6 +162,52 @@ impl SettingsService {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
     }
+
+    /// The Value Resolver, once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn resolver(&self) -> anyhow::Result<Arc<ConcreteResolver>> {
+        self.resolver
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} resolver not initialized", Self::MODULE_NAME))
+    }
+
+    /// The write coordinator, once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn writes(&self) -> anyhow::Result<Arc<crate::infra::value_writes::WriteCoordinator>> {
+        self.writes
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} writes not initialized", Self::MODULE_NAME))
+    }
+
+    /// The tenant access service, once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn access(
+        &self,
+    ) -> anyhow::Result<Arc<crate::api::rest::access_handlers::ConcreteAccessService>> {
+        self.access
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} access not initialized", Self::MODULE_NAME))
+    }
+
+    /// The tenant hierarchy port, once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn hierarchy(&self) -> anyhow::Result<Arc<dyn crate::domain::resolution::TenantHierarchy>> {
+        self.hierarchy
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} hierarchy not initialized", Self::MODULE_NAME))
+    }
 }
 
 #[async_trait]
@@ -209,12 +272,23 @@ impl Gear for SettingsService {
             Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
 
-        let audit: Arc<dyn crate::audit::AuditEmitter> =
-            Arc::new(crate::infra::audit_emitter::TracingAuditEmitter);
+        // The audit sink: the gear's own table, written in each mutation's
+        // transaction. The retention default is validated here because a store
+        // configured below twelve months would prune what the platform must keep.
+        let config = self.config()?;
+        if config.audit_retention_days < crate::audit::MIN_RETENTION_DAYS {
+            anyhow::bail!(
+                "{}: audit_retention_days is {} but must not be below {}",
+                Self::MODULE_NAME,
+                config.audit_retention_days,
+                crate::audit::MIN_RETENTION_DAYS
+            );
+        }
+        let audit = crate::infra::storage::audit_store::AuditStore;
         self.categories
             .set(Arc::new(crate::domain::category::CategoryService::new(
                 crate::infra::storage::category_repo::CategoryRepo,
-                Arc::clone(&audit),
+                audit,
                 Arc::clone(&platform_scope),
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
@@ -222,6 +296,79 @@ impl Gear for SettingsService {
         // The contribution door: gears register their declarations through this
         // trait from their own init, so it is bound into the hub here and each
         // caller names `settings-service` in its `deps` to initialize after us.
+        // The read path: the local effective-value cache — this gear's
+        // `cache_ttl_seconds` is its knob — the tenant hierarchy port over the
+        // tenant resolver, the resolver over both repositories, and the
+        // in-process reader bound into the hub for every consuming gear.
+        let cache = Arc::new(crate::domain::resolution::EffectiveCache::new(
+            std::time::Duration::from_secs(self.config()?.cache_ttl_seconds),
+        ));
+        let hierarchy: Arc<dyn crate::domain::resolution::TenantHierarchy> = Arc::new(
+            crate::infra::tenant_hierarchy::HubTenantHierarchy::new(ctx.client_hub()),
+        );
+        self.hierarchy
+            .set(Arc::clone(&hierarchy))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        let hierarchy_for_access = Arc::clone(&hierarchy);
+        let resolver = Arc::new(crate::domain::resolution::ValueResolver::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::value_repo::ValueRepo,
+            crate::infra::storage::access_repo::AccessRepo,
+            hierarchy,
+            Arc::clone(&platform_scope),
+            self.validator()?,
+            Arc::clone(&cache),
+        ));
+        self.resolver
+            .set(Arc::clone(&resolver))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // Tenant access restrictions: set, clear, read and list, each mutation in
+        // its own transaction with its record, evicting the restricted subtree.
+        self.access
+            .set(Arc::new(crate::domain::access::AccessService::new(
+                crate::infra::storage::declaration_repo::DeclarationRepo,
+                crate::infra::storage::access_repo::AccessRepo,
+                crate::infra::storage::audit_store::AuditStore,
+                Arc::clone(&hierarchy_for_access),
+                Arc::clone(&platform_scope),
+                Arc::clone(&cache),
+            )))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // The write path: the step-up verifier from configuration — the OIDC/JWKS
+        // binding when a section is present, otherwise the binding that refuses
+        // every write needing step-up while reads keep serving — over the same
+        // resolver, audit store, and the ports whose real bindings come later.
+        let step_up: Arc<dyn crate::domain::stepup::StepUpVerifier> = match &config.step_up {
+            Some(section) => Arc::new(crate::infra::step_up::OidcStepUpVerifier::from_config(
+                section,
+            )?),
+            None => Arc::new(crate::domain::stepup::NoStepUpVerifier::default()),
+        };
+        let writer = Arc::new(crate::domain::writes::ValueWriter::new(
+            crate::infra::storage::value_repo::ValueRepo,
+            Arc::clone(&resolver),
+            self.validator()?,
+            crate::infra::storage::audit_store::AuditStore,
+            step_up,
+            Arc::new(crate::domain::ports::NoSecretManager),
+            Arc::new(crate::infra::write_metrics::LoggingPublisher),
+            Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
+        ));
+        self.writes
+            .set(Arc::new(crate::infra::value_writes::WriteCoordinator::new(
+                self.db()?,
+                writer,
+            )))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-7
+        let reader: Arc<dyn SettingsReaderClient> = Arc::new(
+            crate::infra::reader_client::ReaderClient::new(self.db()?, Arc::clone(&resolver)),
+        );
+        ctx.client_hub()
+            .register::<dyn SettingsReaderClient>(reader);
+
         let contributions = Arc::new(crate::domain::contribution::ContributionService::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,
             crate::infra::storage::category_repo::CategoryRepo,
@@ -233,11 +380,15 @@ impl Gear for SettingsService {
             audit,
             platform_scope,
         ));
-        let contribution_client: Arc<dyn SettingsContributionClient> = Arc::new(
-            crate::infra::contribution_client::ContributionClient::new(self.db()?, contributions),
-        );
+        let contribution_client: Arc<dyn SettingsContributionClient> =
+            Arc::new(crate::infra::contribution_client::ContributionClient::new(
+                self.db()?,
+                contributions,
+                cache,
+            ));
         ctx.client_hub()
             .register::<dyn SettingsContributionClient>(contribution_client);
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-7
 
         self.declarations
             .set(Arc::new(
@@ -280,10 +431,30 @@ impl RestApiCapability for SettingsService {
             self.db()?,
             self.enforcer()?,
         );
-        Ok(crate::api::rest::declaration_routes::register_routes(
+        let router = crate::api::rest::declaration_routes::register_routes(
             router,
             openapi,
             declarations,
+            self.db()?,
+            self.enforcer()?,
+        );
+        let router = crate::api::rest::setting_routes::register_routes(
+            router,
+            openapi,
+            self.resolver()?,
+            self.db()?,
+            self.enforcer()?,
+        );
+        let router = crate::api::rest::value_routes::register_routes(
+            router,
+            openapi,
+            self.writes()?,
+            self.enforcer()?,
+        );
+        Ok(crate::api::rest::access_routes::register_routes(
+            router,
+            openapi,
+            self.access()?,
             self.db()?,
             self.enforcer()?,
         ))

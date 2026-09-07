@@ -4,7 +4,8 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use settings_service_sdk::SettingsContributionClient;
+use settings_service_sdk::models::GetEffectiveRequest;
+use settings_service_sdk::{SettingsContributionClient, SettingsReaderClient};
 use toolkit::client_hub::ClientHub;
 use toolkit::contracts::SystemCapability;
 use toolkit::{Gear, GearCtx};
@@ -74,6 +75,35 @@ impl SystemCapability for SettingsDemo {
             refused = result.errors.len(),
             "settings-demo declarations reconciled"
         );
+
+        // Read one setting back the way a consuming gear would, so a boot log
+        // shows the in-process read path answering at platform scope.
+        let reader = hub.get::<dyn SettingsReaderClient>()?;
+        let key = catalog::declarations()?
+            .into_iter()
+            .next()
+            .map(|d| d.key)
+            .ok_or_else(|| anyhow::anyhow!("the demo catalogue is empty"))?;
+        match reader
+            .get_effective(
+                &SecurityContext::anonymous(),
+                GetEffectiveRequest {
+                    key: key.clone(),
+                    scope: "/".to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(effective) => info!(
+                key = %key,
+                value = %effective.value,
+                source = ?effective.source,
+                "settings-demo read its first setting back"
+            ),
+            Err(error) => {
+                warn!(key = %key, %error, "settings-demo could not read its setting back");
+            }
+        }
         Ok(())
     }
 }

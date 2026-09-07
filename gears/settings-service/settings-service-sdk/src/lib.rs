@@ -49,4 +49,4 @@ pub use activation::{
 pub use api::{BulkOutcome, BulkSelector, SettingsContributionClient, SettingsReaderClient};
 pub use error::SettingsError;
 pub use key::{SettingKey, SettingKeyError};
-pub use models::{EffectiveSource, SecretHandle};
+pub use models::{EffectiveSource, SecretHandle, TrailEntry};

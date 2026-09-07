@@ -83,6 +83,13 @@ pub struct Declaration {
 
     /// `admin_authored` or `module_contributed`.
     pub source: String,
+
+    /// When the declaration's definition last changed — the definition arm of
+    /// the recency indicator, never an aggregate over the setting's values.
+    pub last_change_at: time::OffsetDateTime,
+
+    /// Row version, refreshed by every write including metadata edits.
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// A declaration about to be inserted, every column decided.
@@ -214,6 +221,17 @@ pub trait DeclarationRepository: Send + Sync {
         visibility: &DomainVisibility,
         id: Uuid,
     ) -> Result<Option<Declaration>, DomainError>;
+
+    /// Every declaration filed under a category, whatever its status.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_by_category<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+    ) -> Result<Vec<Declaration>, DomainError>;
 
     /// List declarations for the caller.
     ///

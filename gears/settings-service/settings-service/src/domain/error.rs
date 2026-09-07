@@ -82,6 +82,27 @@ pub enum DomainError {
     },
 
     /// No such resource. Renders as `404`.
+    /// The declaration exists and is retired: a positive fact, distinct from
+    /// not-found, so a consumer still reading the key during its own upgrade
+    /// window can drop the dependency rather than retry a transient miss.
+    #[error("setting `{key}` is retired")]
+    Retired {
+        /// The retired setting's key.
+        key: String,
+    },
+
+    /// The write needs a person's fresh re-authentication and did not get one.
+    /// Carries the challenge the response must present.
+    #[error("step-up required: {reason}")]
+    StepUpRequired {
+        /// Why the presented proof did not do: a short stable code.
+        reason: &'static str,
+        /// The freshness window the deployment requires.
+        max_age_seconds: u64,
+        /// The assurance levels that satisfy it, if any.
+        acr_values: Vec<String>,
+    },
+
     #[error("{resource} not found")]
     NotFound {
         /// The kind of thing that was not found — never the caller's identifier

@@ -21,6 +21,7 @@ use toolkit_db::{DBProvider, DbError};
 use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::handlers;
 use crate::domain::category::CategoryService;
+use crate::infra::storage::audit_store::AuditStore;
 use crate::infra::storage::category_repo::CategoryRepo;
 use settings_service_sdk::odata::CategoryFilterField;
 
@@ -36,7 +37,7 @@ const TAG: &str = "settings-categories";
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
-    service: Arc<CategoryService<CategoryRepo>>,
+    service: Arc<CategoryService<CategoryRepo, AuditStore>>,
     db: Arc<DBProvider<DbError>>,
     enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
 ) -> Router {
@@ -59,7 +60,7 @@ pub fn register_routes(
         .no_license_required()
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
-        .handler(handlers::list_categories::<CategoryRepo>)
+        .handler(handlers::list_categories::<CategoryRepo, AuditStore>)
         .json_response_with_schema::<toolkit_odata::Page<CategoryDto>>(
             openapi,
             StatusCode::OK,
@@ -95,7 +96,7 @@ pub fn register_routes(
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
         .no_license_required()
         .path_param("id", "Category UUID")
-        .handler(handlers::get_category::<CategoryRepo>)
+        .handler(handlers::get_category::<CategoryRepo, AuditStore>)
         .json_response_with_schema::<CategoryDto>(
             openapi,
             StatusCode::OK,
@@ -129,7 +130,7 @@ pub fn register_routes(
             openapi,
             "The category to create",
         )
-        .handler(handlers::create_category::<CategoryRepo>)
+        .handler(handlers::create_category::<CategoryRepo, AuditStore>)
         .json_response_with_schema::<CategoryDto>(
             openapi,
             StatusCode::CREATED,
@@ -172,7 +173,7 @@ pub fn register_routes(
             openapi,
             "The replacement representation",
         )
-        .handler(handlers::update_category::<CategoryRepo>)
+        .handler(handlers::update_category::<CategoryRepo, AuditStore>)
         .json_response_with_schema::<CategoryDto>(
             openapi,
             StatusCode::OK,
@@ -217,7 +218,7 @@ pub fn register_routes(
         .no_license_required()
         .path_param("id", "Category UUID")
         .param(if_match_param())
-        .handler(handlers::delete_category::<CategoryRepo>)
+        .handler(handlers::delete_category::<CategoryRepo, AuditStore>)
         .no_content_response(StatusCode::NO_CONTENT, "The category was deleted")
         .error_401(openapi)
         .error_403(openapi)

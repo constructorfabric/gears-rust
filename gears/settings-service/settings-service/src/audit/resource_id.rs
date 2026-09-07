@@ -16,6 +16,7 @@ use uuid::Uuid;
 use settings_service_sdk::SettingKey;
 
 /// Prefix marking an audit resource owned by this service.
+// @cpt-dod:cpt-cf-settings-service-dod-audit-store-resource-id:p1
 const PREFIX: &str = "cf.settings:";
 
 /// Separator between the setting key and its scope.
@@ -51,12 +52,22 @@ pub fn format(key: &SettingKey, tenant: AuditTenant) -> String {
 /// spelling would split a resource's history in half.
 #[must_use]
 pub fn format_raw(id: &str, tenant: AuditTenant) -> String {
+    // @cpt-begin:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-1
+    // @cpt-begin:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-2
+    // @cpt-begin:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-3
+    // The key verbatim — immutable for the life of the declaration, so the
+    // history stays continuous through every metadata edit — and the flat
+    // tenant UUID, never a path a re-parent would invalidate. One pair, one
+    // string: per-scope history is an exact match, never a prefix search.
     let mut out = String::with_capacity(PREFIX.len() + id.len() + 40);
     out.push_str(PREFIX);
     out.push_str(id);
     out.push(SCOPE_SEPARATOR);
     out.push_str(&tenant.to_string());
     out
+    // @cpt-end:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-3
+    // @cpt-end:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-2
+    // @cpt-end:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-1
 }
 
 #[cfg(test)]

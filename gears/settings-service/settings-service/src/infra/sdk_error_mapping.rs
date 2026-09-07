@@ -92,6 +92,18 @@ impl From<DomainError> for CanonicalError {
                 .create(),
 
             // 409 — the request conflicts with current state.
+            // No canonical category means "retired", so it rides a failed
+            // precondition whose violation type the SDK projects to `Retired`.
+            // 410: the declaration is a positive fact that will not come back
+            // at this key, which is neither a missing resource nor a conflict.
+            DomainError::Retired { key } => SettingsResource::failed_precondition()
+                .with_precondition_violation(
+                    "setting",
+                    format!("setting `{key}` is retired"),
+                    settings_service_sdk::precondition::SETTING_RETIRED,
+                )
+                .with_override(Http::status_code(410))
+                .create(),
             DomainError::Conflict { detail } => SettingsResource::already_exists(detail)
                 .with_resource("setting")
                 .create(),
@@ -101,6 +113,11 @@ impl From<DomainError> for CanonicalError {
             // that exists is byte-identical to one for a setting that does not.
             // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
             DomainError::Unauthorized { resource } => permission_denied_for(resource),
+            // The reason code rides the RFC 9470 challenge the handler adds as a
+            // header; the body's reason is the stable one clients key on.
+            DomainError::StepUpRequired { .. } => CanonicalError::unauthenticated()
+                .with_reason("INSUFFICIENT_USER_AUTHENTICATION")
+                .create(),
             // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
 
             // 404 — names the kind of resource, never the caller's identifier.

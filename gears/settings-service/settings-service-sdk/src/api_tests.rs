@@ -35,6 +35,8 @@ fn value_for(key: &SettingKey, source: EffectiveSource) -> EffectiveValueRespons
             EffectiveSource::SchemaDefault => None,
             _ => Some("tenant-a".to_owned()),
         },
+        traits: serde_json::json!({}),
+        inheritance_trail: Vec::new(),
     }
 }
 

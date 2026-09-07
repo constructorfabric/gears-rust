@@ -56,7 +56,7 @@ fn catalogue() -> FakeSource {
 
 struct Harness {
     db: Arc<DBProvider<DbError>>,
-    client: ContributionClient<DeclarationRepo, CategoryRepo, ValueRepo>,
+    client: ContributionClient<DeclarationRepo, CategoryRepo, ValueRepo, Arc<RecordingAudit>>,
     audit: Arc<RecordingAudit>,
     registrar: Arc<RecordingRegistrar>,
 }
@@ -76,10 +76,16 @@ impl Harness {
             ValueRepo,
             Arc::new(GtsTypeValidator::new(catalogue())),
             Arc::clone(&registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
-            Arc::clone(&audit) as Arc<dyn crate::audit::AuditEmitter>,
+            Arc::clone(&audit),
             Arc::new(FixedScope(Uuid::nil())),
         ));
-        let client = ContributionClient::new(Arc::clone(&db), service);
+        let client = ContributionClient::new(
+            Arc::clone(&db),
+            service,
+            Arc::new(crate::domain::resolution::EffectiveCache::new(
+                std::time::Duration::from_secs(30),
+            )),
+        );
         Self {
             db,
             client,
@@ -209,7 +215,7 @@ async fn a_fresh_set_registers_every_declaration_and_its_categories() {
             .any(|(k, t)| k == key("network", "listen_port", 1).as_str() && t == PORT)
     );
     // One record per changed row, with the module as the actor.
-    assert_eq!(h.audit.actions(), vec!["declaration.register"; 3]);
+    assert_eq!(h.audit.operations(), vec!["create"; 3]);
     let stored = h
         .stored(&key("network", "proxy_enabled", 1))
         .await
@@ -250,7 +256,7 @@ async fn a_second_boot_with_the_same_set_changes_nothing() {
     assert!(result.errors.is_empty());
     assert_eq!(h.stored(&key("network", "listen_port", 1)).await, before);
     assert_eq!(
-        h.audit.actions().len(),
+        h.audit.operations().len(),
         2,
         "no record for a boot that changed nothing"
     );
@@ -278,10 +284,7 @@ async fn changed_metadata_is_updated_in_place() {
     );
     assert_eq!(stored.mode, "advanced");
     assert!(!stored.requires_step_up);
-    assert_eq!(
-        h.audit.actions().last().map(String::as_str),
-        Some("declaration.update")
-    );
+    assert_eq!(h.audit.operations().last().copied(), Some("change"));
 }
 
 #[tokio::test]
@@ -491,14 +494,7 @@ async fn retire_then_re_register_revives_the_same_row() {
         .expect("row");
     assert_eq!(revived.id, original.id, "revived in place, not re-minted");
     assert_eq!(revived.status, "active");
-    assert_eq!(
-        h.audit.actions(),
-        vec![
-            "declaration.register",
-            "declaration.retire",
-            "declaration.reactivate"
-        ]
-    );
+    assert_eq!(h.audit.operations(), vec!["create", "remove", "change"]);
     // Type registration happened once: the retirement left the type in place.
     assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
 }
@@ -616,5 +612,5 @@ async fn a_registry_failure_rolls_the_item_back() {
     );
     // The category was vivified in the same transaction, so it is gone too.
     assert!(!h.category_exists("network").await);
-    assert!(h.audit.actions().is_empty());
+    assert!(h.audit.operations().is_empty());
 }

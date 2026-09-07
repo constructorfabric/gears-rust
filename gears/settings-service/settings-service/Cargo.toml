@@ -49,10 +49,20 @@ axum = { workspace = true }
 http = { workspace = true }
 toolkit = { workspace = true }
 toolkit-db = { workspace = true }
+# Step-up: the default OIDC/JWKS `StepUpVerifier` binding verifies the presented
+# token locally against the provider's published keys.
+toolkit-auth = { workspace = true }
+# Write-path counters.
+opentelemetry = { workspace = true }
+# Reading the session token's `sub` (unverified, for subject binding only).
+base64 = { workspace = true }
+secrecy = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+# Step-up verifier tests build a bare JWT header for the fake key provider.
+jsonwebtoken = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }

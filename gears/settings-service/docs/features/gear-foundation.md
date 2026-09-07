@@ -93,7 +93,7 @@ Not applicable. This feature delivers SDK contracts and gear infrastructure with
 4. [x] - `p1` - Run outstanding schema migrations to completion - `inst-gf-init-4`
 5. [x] - `p1` - **IF** a migration fails → **RETURN** startup failure without serving traffic, so no request observes a partially migrated schema - `inst-gf-init-5`
 6. [x] - `p1` - Resolve the `TypesRegistryClient` through `ClientHub` — the one client this gear calls during its own init, and therefore the only entry in `deps`; every consumed client — authorization resolver, tenant resolver, and later the credential store and event broker — is fetched at first use on the request path, never eagerly, so a gear that reads settings during its own init can never close a dependency cycle through this one, and is declared with `#[toolkit::consumes]` so the out-of-process profiles can wire it — for the tenant resolver, whose SDK carries no REST projection yet, the hub lookup at first use stands in until it does - `inst-gf-init-6`
-7. [ ] - `p1` - Register the gear's own `SettingsReaderClient` and `SettingsContributionClient` implementations into `ClientHub` - `inst-gf-init-7`
+7. [x] - `p1` - Register the gear's own `SettingsReaderClient` and `SettingsContributionClient` implementations into `ClientHub` - `inst-gf-init-7`
 8. [ ] - `p1` - Bind each registered trait according to the active deployment profile — the in-process implementation when co-located, the same trait over REST when out of process — and, while the release is Embedded-only, **RETURN** startup failure when configuration asks for a remote binding, so in-process-only is a check rather than a promise - `inst-gf-init-8`
 9. [x] - `p1` - Declare the abstract `setting_type` base every setting key derives from in the SDK through the platform's link-time schema inventory, which the types registry drains when *it* initializes — before this gear, which names it in `deps` — so the base exists before any declaration path composes a derived type from it, with nothing to call and nothing to retry here - `inst-gf-init-9`
 10. [ ] - `p1` - Register the gear's remaining GTS control-plane schemas — category, declaration, value, effective value, change set, and the event schemas — the same way, so they are resolvable before the first row is written - `inst-gf-init-10`
@@ -152,7 +152,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 
 ### Authorization Enforcement and Credential Step-Up
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-gear-foundation-authz-stepup`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-gear-foundation-authz-stepup`
 
 **Input**: Authenticated request context, the target GTS resource type, the required action, and whether the action demands step-up — a behavior-affecting declaration action, or an interactive value write to a declaration that requires elevated confirmation
 
@@ -164,8 +164,8 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 3. [x] - `p1` - Ask the Policy Decision client for a decision on the action against the target GTS resource type - `inst-gf-authz-3`
 4. [x] - `p1` - **IF** the decision cannot be obtained → **RETURN** denial, failing closed rather than proceeding on an unknown verdict - `inst-gf-authz-4`
 5. [x] - `p1` - **IF** the decision is deny → **RETURN** denial - `inst-gf-authz-5`
-6. [ ] - `p1` - **IF** the action demands step-up → require a fresh step-up token established at the identity provider, verified locally through the gear's `StepUpVerifier` port: signature against the provider's JWKS, `sub` bound to this principal, `auth_time` within the freshness window of at most five minutes, and the required `acr`/`amr` - `inst-gf-authz-6`
-7. [ ] - `p1` - **IF** the token is absent, outside the window, or not bound to this principal → **RETURN** denial carrying the RFC 9470 challenge, `401` with `insufficient_user_authentication`, so the client learns what to ask the provider for; a service principal writing to such a declaration is refused outright, since no ceremony a machine performs proves a person is present - `inst-gf-authz-7`
+6. [x] - `p1` - **IF** the action demands step-up → require a fresh step-up token established at the identity provider, verified locally through the gear's `StepUpVerifier` port: signature against the provider's JWKS, `sub` bound to this principal, `auth_time` within the freshness window of at most five minutes, and the required `acr`/`amr` - `inst-gf-authz-6`
+7. [x] - `p1` - **IF** the token is absent, outside the window, or not bound to this principal → **RETURN** denial carrying the RFC 9470 challenge, `401` with `insufficient_user_authentication`, so the client learns what to ask the provider for; a service principal writing to such a declaration is refused outright, since no ceremony a machine performs proves a person is present - `inst-gf-authz-7`
 8. [x] - `p1` - Build the `AccessScope` from the decision's constraints - `inst-gf-authz-8`
 9. [x] - `p1` - **RETURN** the `AccessScope` for the handler to apply as a query and visibility predicate - `inst-gf-authz-9`
 
@@ -313,7 +313,7 @@ The system **MUST** provide shared `OperationBuilder` wiring, OData `$filter`, `
 
 ### Policy Enforcement Point and Step-Up Gate
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-authz-stepup`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-authz-stepup`
 
 The system **MUST** enforce authorization through the `PolicyEnforcer` PEP against the target GTS resource type, **MUST** derive an `AccessScope` from the decision's constraints for handlers to apply as a query and visibility predicate, and **MUST** verify a fresh step-up token established at the identity provider before any behavior-affecting declaration action and before an interactive value write to a declaration that requires elevated confirmation. Verification **MUST** go through the gear's own `StepUpVerifier` port, whose default binding is the local OIDC/JWKS claims check of DESIGN.md §4.2 *Value Writer*; a binding that cannot fail is not a binding. Authorization **MUST** be decided before step-up is consulted, and an authorization or entitlement decision that cannot be obtained **MUST** deny.
 
@@ -327,7 +327,7 @@ The system **MUST** enforce authorization through the `PolicyEnforcer` PEP again
 
 ### Audit Emitter
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-audit-emitter`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-audit-emitter`
 
 The system **MUST** provide the shared Audit Emitter through which every mutating feature publishes its audit records and domain events, supporting pre-image and post-image capture so later features can audit a mutation's before and after state. Its sink **MUST** be a port taking the mutation's own transaction and `AccessScope` — `AuditSink::append(txn, scope, record)` — so that the gear-local `audit_records` binding delivered in entry 2.6 commits the record with the change it audits or rolls back with it. The tracing stand-in the tree carries until then exercises the emitter's callers and satisfies none of this.
 
