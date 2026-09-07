@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-graph-storage"
-version = "0.1.1"
+version = "0.1.2"
 publish = false
 edition.workspace = true
 license.workspace = true

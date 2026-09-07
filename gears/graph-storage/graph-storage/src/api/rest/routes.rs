@@ -175,7 +175,12 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("Tabular projection")
         .description(
             "Binds the five accepted OData system query options; any other \
-             option is rejected rather than ignored",
+             option is rejected rather than ignored. `$filter` and `$orderby` \
+             accept the four column fields and, when `type_pattern` selects \
+             types, any payload path every selected type declares in its \
+             `index` trait, spelled as an OData path (`payload/severity`, \
+             `payload/loc/line`); an undeclared path is refused naming the \
+             declared alternatives",
         )
         .tag(API_TAG)
         .authenticated()

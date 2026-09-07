@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
-use crate::domain::{identity, ontology};
+use crate::domain::{identity, ontology, projection};
 
 #[derive(Clone)]
 struct FakeNode {
@@ -122,6 +122,10 @@ struct Receipt {
 #[derive(Default)]
 struct Tenant {
     types: BTreeMap<String, TypeRecord>,
+    /// The resolved `index` kinds per registered type, what the projection
+    /// admits payload paths against (mirrors `gts_type.effective_traits`'s
+    /// `index_kinds` on the built-in store).
+    index_kinds: BTreeMap<String, BTreeMap<String, ontology::ScalarKind>>,
     nodes: Vec<FakeNode>,
     edges: Vec<FakeEdge>,
     revision: i64,
@@ -141,10 +145,18 @@ struct TenantData {
     revision: i64,
 }
 
-#[derive(Default)]
 pub struct FakeGraphStore {
     epoch: i64,
     tenants: Mutex<BTreeMap<Uuid, Tenant>>,
+    /// Longest admitted derivation chain, in segments; the platform posture
+    /// (3) unless a test raises it, exactly like `ontology_max_chain_depth`.
+    max_chain_depth: usize,
+}
+
+impl Default for FakeGraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeGraphStore {
@@ -153,7 +165,16 @@ impl FakeGraphStore {
         Self {
             epoch: 1,
             tenants: Mutex::new(BTreeMap::new()),
+            max_chain_depth: 3,
         }
+    }
+
+    /// Admit chains up to `depth` segments, as a deployment raising
+    /// `ontology_max_chain_depth` would.
+    #[must_use]
+    pub fn with_max_chain_depth(mut self, depth: usize) -> Self {
+        self.max_chain_depth = depth;
+        self
     }
 
     fn revision_of(&self, tenant: &Tenant) -> GraphRevision {
@@ -245,16 +266,21 @@ impl GraphStoreV1 for FakeGraphStore {
                 ancestors.push(schema);
             }
             let refs: Vec<&serde_json::Value> = ancestors.iter().collect();
-            let descriptor = ontology::analyze(&registration.type_id, &registration.schema, &refs)
-                .map_err(|error| GraphStoreError::Validation {
-                    items: vec![ItemError {
-                        index: 0,
-                        family: ItemFamily::Node,
-                        gts_type: Some(registration.type_id.clone()),
-                        pointer: None,
-                        message: error.to_string(),
-                    }],
-                })?;
+            let descriptor = ontology::analyze(
+                &registration.type_id,
+                &registration.schema,
+                &refs,
+                self.max_chain_depth,
+            )
+            .map_err(|error| GraphStoreError::Validation {
+                items: vec![ItemError {
+                    index: 0,
+                    family: ItemFamily::Node,
+                    gts_type: Some(registration.type_id.clone()),
+                    pointer: None,
+                    message: error.to_string(),
+                }],
+            })?;
 
             if let Some(existing) = tenant.types.get(&descriptor.type_id)
                 && existing.schema != descriptor.schema
@@ -266,24 +292,36 @@ impl GraphStoreV1 for FakeGraphStore {
                     ),
                 });
             }
-            prepared.push(TypeRecord {
-                type_id: descriptor.type_id,
-                type_uuid: descriptor.type_uuid,
-                kind: descriptor.kind,
-                is_abstract: descriptor.is_abstract,
-                schema: descriptor.schema,
-                effective_traits: descriptor.effective_traits,
-                created_at: OffsetDateTime::now_utc(),
-            });
+            let kinds: BTreeMap<String, ontology::ScalarKind> = descriptor
+                .index_paths
+                .iter()
+                .map(|p| (p.pointer.clone(), p.kind))
+                .collect();
+            prepared.push((
+                TypeRecord {
+                    type_id: descriptor.type_id,
+                    type_uuid: descriptor.type_uuid,
+                    kind: descriptor.kind,
+                    is_abstract: descriptor.is_abstract,
+                    schema: descriptor.schema,
+                    effective_traits: descriptor.effective_traits,
+                    created_at: OffsetDateTime::now_utc(),
+                },
+                kinds,
+            ));
         }
 
-        for record in &prepared {
+        for (record, kinds) in &prepared {
             tenant
                 .types
                 .entry(record.type_id.clone())
                 .or_insert_with(|| record.clone());
+            tenant
+                .index_kinds
+                .entry(record.type_id.clone())
+                .or_insert_with(|| kinds.clone());
         }
-        Ok(prepared)
+        Ok(prepared.into_iter().map(|(record, _)| record).collect())
     }
 
     async fn get_type(
@@ -747,10 +785,8 @@ impl GraphStoreV1 for FakeGraphStore {
             return Err(GraphStoreError::NotFound);
         };
         let (nodes, _, revision) = visible(tenant, ctx);
-        // Filter and ordering are the platform's on the real store; the fake
-        // answers the unfiltered page, which is all the obligations need.
         let limit = req.query.limit.unwrap_or(200);
-        let items = nodes
+        let selected: Vec<&FakeNode> = nodes
             .iter()
             .filter(|n| !n.deleted)
             .filter(|n| {
@@ -758,6 +794,41 @@ impl GraphStoreV1 for FakeGraphStore {
                     .as_ref()
                     .is_none_or(|set| set.contains(&n.type_id))
             })
+            .collect();
+
+        // Column-only filter and ordering are the platform's on the real
+        // store, and the fake answers the unfiltered page for them. A payload
+        // path is this gear's own rule, so the fake evaluates the shared plan
+        // -- the admissibility check and the semantics it implies are then
+        // asserted against both implementations (DEVIATIONS D-104).
+        let selected: Vec<&FakeNode> = if projection::mentions_payload(&req.query) {
+            let admitted = req.type_set.as_ref().map(|set| {
+                let kinds: Vec<BTreeMap<String, ontology::ScalarKind>> = set
+                    .0
+                    .iter()
+                    .map(|type_id| tenant.index_kinds.get(type_id).cloned().unwrap_or_default())
+                    .collect();
+                projection::admitted_paths(&kinds)
+            });
+            let plan = projection::plan(&req.query, admitted.as_ref())
+                .map_err(|error| GraphStoreError::InvalidQuery { what: error.0 })?;
+            if req.query.cursor.is_some() {
+                return Err(GraphStoreError::InvalidQuery {
+                    what: "the in-memory store does not page a payload projection".to_owned(),
+                });
+            }
+            let mut rows: Vec<&FakeNode> = selected
+                .into_iter()
+                .filter(|n| plan.filter.as_ref().is_none_or(|p| eval::holds(p, n)))
+                .collect();
+            rows.sort_by(|a, b| eval::order(&plan, a, b));
+            rows
+        } else {
+            selected
+        };
+
+        let items = selected
+            .into_iter()
             .take(usize::try_from(limit).unwrap_or(usize::MAX))
             .map(|n| NodeRow {
                 envelope: n.audit.envelope(
@@ -1516,4 +1587,131 @@ fn fuse_arms(
     });
     hits.truncate(limit);
     hits
+}
+
+/// In-memory evaluation of a projection plan over fake nodes.
+mod eval {
+    use std::cmp::Ordering;
+
+    use toolkit_odata::SortDir;
+
+    use super::FakeNode;
+    use crate::domain::ontology::ScalarKind;
+    use crate::domain::projection::{CmpOp, FieldRef, Plan, Predicate, Scalar, TextOp};
+
+    /// One field's value on one row, in the field's kind.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Cell {
+        Null,
+        Text(String),
+        Num(f64),
+        Bool(bool),
+    }
+
+    fn cell(field: &FieldRef, node: &FakeNode) -> Cell {
+        match field {
+            FieldRef::NodeKey => Cell::Text(node.key.clone()),
+            FieldRef::Name => Cell::Text(node.name.clone().unwrap_or_default()),
+            FieldRef::CreatedAt => rfc3339(node.audit.created_at),
+            FieldRef::UpdatedAt => rfc3339(node.audit.updated_at),
+            FieldRef::Payload { pointer, kind } => {
+                let inner = pointer.strip_prefix("/payload").unwrap_or(pointer);
+                let Some(value) = node.payload.as_ref().and_then(|p| p.pointer(inner)) else {
+                    return Cell::Null;
+                };
+                match (kind, value) {
+                    (ScalarKind::String | ScalarKind::DateTime, serde_json::Value::String(s)) => {
+                        Cell::Text(s.clone())
+                    }
+                    (ScalarKind::Number | ScalarKind::Integer, serde_json::Value::Number(n)) => {
+                        n.as_f64().map_or(Cell::Null, Cell::Num)
+                    }
+                    (ScalarKind::Boolean, serde_json::Value::Bool(b)) => Cell::Bool(*b),
+                    _ => Cell::Null,
+                }
+            }
+        }
+    }
+
+    fn rfc3339(at: time::OffsetDateTime) -> Cell {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .map_or(Cell::Null, Cell::Text)
+    }
+
+    fn literal(value: &Scalar) -> Cell {
+        match value {
+            Scalar::Str(s) | Scalar::DateTime(s) => Cell::Text(s.clone()),
+            Scalar::Num(n) => n.parse::<f64>().map_or(Cell::Null, Cell::Num),
+            Scalar::Bool(b) => Cell::Bool(*b),
+        }
+    }
+
+    /// SQL three-valued comparison collapsed to "holds": a NULL never holds.
+    fn compare(a: &Cell, b: &Cell) -> Option<Ordering> {
+        match (a, b) {
+            (Cell::Text(x), Cell::Text(y)) => Some(x.cmp(y)),
+            (Cell::Num(x), Cell::Num(y)) => x.partial_cmp(y),
+            (Cell::Bool(x), Cell::Bool(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn holds(predicate: &Predicate, node: &FakeNode) -> bool {
+        match predicate {
+            Predicate::Compare { field, op, value } => {
+                let Some(ordering) = compare(&cell(field, node), &literal(value)) else {
+                    return false;
+                };
+                match op {
+                    CmpOp::Eq => ordering == Ordering::Equal,
+                    CmpOp::Ne => ordering != Ordering::Equal,
+                    CmpOp::Gt => ordering == Ordering::Greater,
+                    CmpOp::Ge => ordering != Ordering::Less,
+                    CmpOp::Lt => ordering == Ordering::Less,
+                    CmpOp::Le => ordering != Ordering::Greater,
+                }
+            }
+            Predicate::In { field, values } => {
+                let actual = cell(field, node);
+                values
+                    .iter()
+                    .any(|v| compare(&actual, &literal(v)) == Some(Ordering::Equal))
+            }
+            Predicate::Text { field, op, needle } => match cell(field, node) {
+                Cell::Text(text) => match op {
+                    TextOp::Contains => text.contains(needle.as_str()),
+                    TextOp::StartsWith => text.starts_with(needle.as_str()),
+                    TextOp::EndsWith => text.ends_with(needle.as_str()),
+                },
+                _ => false,
+            },
+            Predicate::And(children) => children.iter().all(|c| holds(c, node)),
+            Predicate::Or(children) => children.iter().any(|c| holds(c, node)),
+            Predicate::Not(inner) => !holds(inner, node),
+        }
+    }
+
+    /// The plan's order, nulls last in either direction -- the same rule the
+    /// built-in store renders.
+    pub(super) fn order(plan: &Plan, a: &FakeNode, b: &FakeNode) -> Ordering {
+        for term in &plan.order {
+            let (x, y) = (cell(&term.field, a), cell(&term.field, b));
+            let ordering = match (&x, &y) {
+                (Cell::Null, Cell::Null) => Ordering::Equal,
+                (Cell::Null, _) => Ordering::Greater,
+                (_, Cell::Null) => Ordering::Less,
+                _ => {
+                    let natural = compare(&x, &y).unwrap_or(Ordering::Equal);
+                    match term.dir {
+                        SortDir::Asc => natural,
+                        SortDir::Desc => natural.reverse(),
+                    }
+                }
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    }
 }

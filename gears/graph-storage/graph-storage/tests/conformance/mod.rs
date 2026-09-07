@@ -1428,3 +1428,392 @@ async fn envelope_of(
         .expect("the node reads")
         .envelope
 }
+
+// ---------------------------------------------------------------------------
+// Payload projection: the `index` trait reaching `$filter` / `$orderby`
+// ---------------------------------------------------------------------------
+
+/// A producer type declaring three payload paths -- a string, a number and a
+/// nested integer -- as filterable and orderable.
+pub const INDEXED: &str =
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.ticket.v1~";
+
+fn indexed_type() -> TypeRegistration {
+    TypeRegistration {
+        type_id: INDEXED.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{INDEXED}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": {
+                "index": ["/payload/severity", "/payload/score", "/payload/loc/line"],
+                "full_text_search": ["/name"]
+            },
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" },
+                { "type": "object", "properties": { "payload": {
+                    "type": "object",
+                    "properties": {
+                        "severity": { "type": "string", "enum": ["low", "high"] },
+                        "score": { "type": "number" },
+                        "loc": { "type": "object", "properties": {
+                            "line": { "type": "integer" } } },
+                        "meta": { "type": "object" }
+                    }
+                } } }
+            ]
+        }),
+    }
+}
+
+fn ticket(key: &str, severity: &str, score: Option<f64>, line: i64) -> NodeSpec {
+    let mut payload = serde_json::json!({
+        "severity": severity,
+        "loc": { "line": line }
+    });
+    if let Some(score) = score {
+        payload["score"] = serde_json::json!(score);
+    }
+    NodeSpec {
+        node_key: key.to_owned(),
+        type_id: INDEXED.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(payload),
+        ..NodeSpec::default()
+    }
+}
+
+/// The five tickets every payload case starts from.
+async fn seed_tickets(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    let mut batch_types = ontology_batch();
+    batch_types.push(indexed_type());
+    store
+        .register_types(ctx, batch_types)
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        ctx,
+        batch(
+            vec![
+                ticket("t1", "high", Some(9.5), 10),
+                ticket("t2", "low", Some(3.0), 20),
+                ticket("t3", "high", Some(1.0), 30),
+                ticket("t4", "high", None, 40),
+                ticket("t5", "low", Some(7.0), 50),
+            ],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+}
+
+pub fn projection(
+    types: &[&str],
+    filter: &str,
+    order: &[(&str, toolkit_odata::SortDir)],
+) -> ProjectionRequest {
+    let mut query = toolkit_odata::ODataQuery::new();
+    if !filter.is_empty() {
+        let parsed = toolkit_odata::parse_filter_string(filter).expect("filter parses");
+        query = query.with_filter(parsed.into_expr());
+    }
+    query = query.with_order(toolkit_odata::ODataOrderBy(
+        order
+            .iter()
+            .map(|(field, dir)| toolkit_odata::OrderKey {
+                field: (*field).to_owned(),
+                dir: *dir,
+            })
+            .collect(),
+    ));
+    ProjectionRequest {
+        type_set: (!types.is_empty()).then(|| {
+            graph_storage_sdk::models::TypeIdSet(types.iter().map(|t| (*t).to_owned()).collect())
+        }),
+        query,
+    }
+}
+
+fn keys(page: &toolkit_odata::Page<graph_storage_sdk::models::NodeRow>) -> Vec<String> {
+    page.items.iter().map(|row| row.node_key.clone()).collect()
+}
+
+/// A path the selected type declares in its `index` trait filters and orders
+/// the projection, with the kind its schema gives it: strings compare as
+/// text, numbers as numbers, a nested pointer reaches its leaf, and a row
+/// missing the ordered attribute sorts last in either direction.
+pub async fn a_declared_payload_path_filters_and_orders_the_projection(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    use toolkit_odata::SortDir;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_tickets(store, &ctx).await;
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(
+                &[INDEXED],
+                "payload/severity eq 'high'",
+                &[("payload/score", SortDir::Desc)],
+            ),
+        )
+        .await
+        .expect("projection succeeds");
+    assert_eq!(
+        keys(&page),
+        vec!["t1", "t3", "t4"],
+        "high tickets by score descending, the scoreless one last"
+    );
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(
+                &[INDEXED],
+                "payload/score gt 2",
+                &[("payload/score", SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect("projection succeeds");
+    assert_eq!(
+        keys(&page),
+        vec!["t2", "t5", "t1"],
+        "a numeric comparison, not a textual one ('9.5' < '3.0' as text)"
+    );
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(
+                &[INDEXED],
+                "payload/loc/line ge 30 and payload/severity in ('low', 'high')",
+                &[("payload/loc/line", SortDir::Desc)],
+            ),
+        )
+        .await
+        .expect("projection succeeds");
+    assert_eq!(
+        keys(&page),
+        vec!["t5", "t4", "t3"],
+        "a nested path, ordered"
+    );
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(&[INDEXED], "", &[("payload/score", SortDir::Asc)]),
+        )
+        .await
+        .expect("projection succeeds");
+    assert_eq!(
+        keys(&page),
+        vec!["t3", "t2", "t5", "t1", "t4"],
+        "ascending too puts the missing attribute last"
+    );
+}
+
+/// A payload path nobody declared is refused with the alternatives named,
+/// and a payload path without a type set is refused because there is nothing
+/// to read the declarations from.
+pub async fn an_undeclared_payload_path_is_refused_naming_the_alternatives(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_tickets(store, &ctx).await;
+
+    let error = store
+        .project_table(&ctx, projection(&[INDEXED], "payload/nope eq 'x'", &[]))
+        .await
+        .expect_err("an undeclared path is refused");
+    let GraphStoreError::InvalidQuery { what } = &error else {
+        panic!("expected InvalidQuery, got {error:?}");
+    };
+    assert!(what.contains("payload/nope"), "{what}");
+    assert!(
+        what.contains("payload/severity"),
+        "names the alternatives: {what}"
+    );
+
+    let error = store
+        .project_table(&ctx, projection(&[], "payload/severity eq 'high'", &[]))
+        .await
+        .expect_err("a payload path without a type set is refused");
+    let GraphStoreError::InvalidQuery { what } = &error else {
+        panic!("expected InvalidQuery, got {error:?}");
+    };
+    assert!(what.contains("type_pattern"), "{what}");
+
+    let error = store
+        .project_table(&ctx, projection(&[INDEXED], "payload/score eq 'high'", &[]))
+        .await
+        .expect_err("a literal of the wrong kind is refused");
+    assert!(
+        matches!(error, GraphStoreError::InvalidQuery { .. }),
+        "{error:?}"
+    );
+}
+
+/// An `index` path that lands on an object, or nowhere, fails registration:
+/// there is no scalar to compare, so an index over it would serve no query.
+pub async fn an_index_path_onto_a_non_scalar_is_refused_at_registration(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    let mut doomed = indexed_type();
+    doomed.schema["x-gts-traits"]["index"] = serde_json::json!(["/payload/meta"]);
+    let error = store
+        .register_types(&ctx, vec![doomed])
+        .await
+        .expect_err("an object path is refused");
+    let GraphStoreError::Validation { items } = &error else {
+        panic!("expected Validation, got {error:?}");
+    };
+    assert!(
+        items[0].message.contains("not a scalar"),
+        "{}",
+        items[0].message
+    );
+}
+
+/// A domain hierarchy mirrored into the chain, on a store that admits it: the
+/// intermediate types register, a pattern on the intermediate selects the
+/// leaf, and an `index` declared on the intermediate admits a filter over the
+/// leaf's rows.
+pub async fn a_deeper_chain_registers_and_its_ancestor_admits_the_leaf(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+
+    let managed = format!("{OWNED_FAMILY}test.dm.core.managed_object.v1~");
+    let document = format!("{managed}test.dm.core.document.v1~");
+    let requirement = format!("{document}test.dm.sdlc.requirement.v1~");
+
+    let intermediate = |id: &str,
+                        parent: &str,
+                        abstract_: bool,
+                        traits: serde_json::Value,
+                        props: serde_json::Value| {
+        let mut schema = serde_json::json!({
+            "$id": format!("gts://{id}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": traits,
+            "type": "object",
+            "allOf": [
+                { "$ref": format!("gts://{parent}") },
+                { "type": "object", "properties": { "payload": {
+                    "type": "object", "properties": props } } }
+            ]
+        });
+        if abstract_ {
+            schema["x-gts-abstract"] = serde_json::json!(true);
+        }
+        TypeRegistration {
+            type_id: id.to_owned(),
+            schema,
+        }
+    };
+
+    let mut batch_types = ontology_batch();
+    batch_types.push(intermediate(
+        &managed,
+        OWNED_FAMILY,
+        true,
+        serde_json::json!({ "index": ["/payload/status"], "full_text_search": ["/name"] }),
+        serde_json::json!({ "status": { "type": "string" } }),
+    ));
+    batch_types.push(intermediate(
+        &document,
+        &managed,
+        true,
+        serde_json::json!({}),
+        serde_json::json!({ "url": { "type": "string" } }),
+    ));
+    batch_types.push(intermediate(
+        &requirement,
+        &document,
+        false,
+        serde_json::json!({}),
+        serde_json::json!({ "priority": { "type": "integer" } }),
+    ));
+    let records = store
+        .register_types(&ctx, batch_types)
+        .await
+        .expect("a five-segment chain registers when the deployment admits it");
+    let leaf = records
+        .iter()
+        .find(|r| r.type_id == requirement)
+        .expect("the leaf is registered");
+    assert_eq!(leaf.effective_traits.family.as_deref(), Some("owned"));
+    assert_eq!(leaf.effective_traits.index, vec!["/payload/status"]);
+
+    let selected = store
+        .resolve_type_set(&ctx, &[format!("{managed}*")])
+        .await
+        .expect("patterns resolve");
+    assert!(selected.contains(&requirement), "{selected:?}");
+    assert!(selected.contains(&document), "{selected:?}");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![
+                NodeSpec {
+                    node_key: "r1".to_owned(),
+                    type_id: requirement.clone(),
+                    name: Some("r1".to_owned()),
+                    payload: Some(serde_json::json!({ "status": "approved", "priority": 1 })),
+                    ..NodeSpec::default()
+                },
+                NodeSpec {
+                    node_key: "r2".to_owned(),
+                    type_id: requirement.clone(),
+                    name: Some("r2".to_owned()),
+                    payload: Some(serde_json::json!({ "status": "draft", "priority": 2 })),
+                    ..NodeSpec::default()
+                },
+            ],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(&[requirement.as_str()], "payload/status eq 'approved'", &[]),
+        )
+        .await
+        .expect("a path inherited from the intermediate filters the leaf");
+    assert_eq!(keys(&page), vec!["r1"]);
+}
+
+/// Seed the tickets and hand back a projection over them — for the cases
+/// that only one implementation can run.
+#[allow(dead_code)]
+pub async fn projection_seeded(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    order: &[(&str, toolkit_odata::SortDir)],
+) -> ProjectionRequest {
+    seed_tickets(store, ctx).await;
+    projection(&[INDEXED], "", order)
+}

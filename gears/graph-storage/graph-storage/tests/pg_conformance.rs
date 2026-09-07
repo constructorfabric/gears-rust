@@ -137,6 +137,10 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
 
     let config = GraphStorageConfig {
         traversal_hop: hop,
+        // A deployment mirroring a domain hierarchy raises the chain ceiling;
+        // the suite's deep-chain case needs the raised posture, and nothing
+        // else in the suite is sensitive to it.
+        ontology_max_chain_depth: 8,
         ..GraphStorageConfig::default()
     };
     let db = Arc::new(db);
@@ -260,6 +264,77 @@ pg_case!(
     a_projection_row_carries_the_envelope,
     conformance::a_projection_row_carries_the_envelope
 );
+
+// --- payload projection (DEVIATIONS D-104) ----------------------------------
+
+pg_case!(
+    a_declared_payload_path_filters_and_orders_the_projection,
+    conformance::a_declared_payload_path_filters_and_orders_the_projection
+);
+pg_case!(
+    an_undeclared_payload_path_is_refused_naming_the_alternatives,
+    conformance::an_undeclared_payload_path_is_refused_naming_the_alternatives
+);
+pg_case!(
+    an_index_path_onto_a_non_scalar_is_refused_at_registration,
+    conformance::an_index_path_onto_a_non_scalar_is_refused_at_registration
+);
+pg_case!(
+    a_deeper_chain_registers_and_its_ancestor_admits_the_leaf,
+    conformance::a_deeper_chain_registers_and_its_ancestor_admits_the_leaf
+);
+
+/// Keyset paging over a payload ordering, which only the built-in store
+/// serves: every page continues where the last one ended, the ordered walk
+/// is the same as the one-page answer, and the rows missing the attribute
+/// come last.
+#[tokio::test]
+async fn a_payload_ordered_projection_pages_by_keyset() {
+    use toolkit_odata::SortDir;
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let store = stand.store.as_ref();
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    let whole = store
+        .project_table(
+            &ctx,
+            conformance::projection_seeded(store, &ctx, &[("payload/score", SortDir::Desc)]).await,
+        )
+        .await
+        .expect("projection succeeds");
+    let expected: Vec<String> = whole.items.iter().map(|r| r.node_key.clone()).collect();
+    assert_eq!(expected, vec!["t1", "t5", "t2", "t3", "t4"]);
+
+    let mut walked = Vec::new();
+    let mut request = conformance::projection(
+        &[conformance::INDEXED],
+        "",
+        &[("payload/score", SortDir::Desc)],
+    );
+    request.query = request.query.with_limit(2);
+    loop {
+        let page = store
+            .project_table(&ctx, request.clone())
+            .await
+            .expect("a page is served");
+        assert!(page.items.len() <= 2, "the page honours its limit");
+        walked.extend(page.items.iter().map(|r| r.node_key.clone()));
+        let Some(token) = page.page_info.next_cursor else {
+            break;
+        };
+        let cursor = toolkit_odata::CursorV1::decode(&token).expect("a CursorV1 token");
+        assert_eq!(cursor.s, "-payload/score,+node_key");
+        request.query = toolkit_odata::ODataQuery::new()
+            .with_limit(2)
+            .with_cursor(cursor);
+        assert!(walked.len() <= 5, "the walk terminates");
+    }
+    assert_eq!(walked, expected, "pages concatenate to the one-page answer");
+}
 
 #[tokio::test]
 async fn colliding_node_keys_stay_inside_their_tenants() {

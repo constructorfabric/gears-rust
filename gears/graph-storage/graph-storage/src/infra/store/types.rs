@@ -69,6 +69,24 @@ pub(crate) fn traits_from_json(value: &serde_json::Value) -> EffectiveTraits {
     }
 }
 
+/// The resolved `index` kinds stored beside the traits (`index_kinds`), as the
+/// projection needs them: pointer -> scalar kind.
+pub(crate) fn index_kinds_from_json(
+    value: &serde_json::Value,
+) -> std::collections::BTreeMap<String, ontology::ScalarKind> {
+    value
+        .get("index_kinds")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(pointer, kind)| {
+            kind.as_str()
+                .and_then(ontology::ScalarKind::parse)
+                .map(|kind| (pointer.clone(), kind))
+        })
+        .collect()
+}
+
 fn to_record(model: gts_type::Model) -> Result<TypeRecord, GraphStoreError> {
     let effective_traits = traits_from_json(&model.effective_traits);
     let is_abstract = model
@@ -89,8 +107,20 @@ fn to_record(model: gts_type::Model) -> Result<TypeRecord, GraphStoreError> {
 
 /// Traits are stored as their resolved JSON so the shape the SDK reads and
 /// the shape the column holds cannot drift.
-fn traits_to_json(traits: &EffectiveTraits) -> serde_json::Value {
+fn traits_to_json(descriptor: &ontology::TypeDescriptor) -> serde_json::Value {
+    let traits = &descriptor.effective_traits;
+    let index_kinds: serde_json::Map<String, serde_json::Value> = descriptor
+        .index_paths
+        .iter()
+        .map(|p| {
+            (
+                p.pointer.clone(),
+                serde_json::Value::String(p.kind.as_str().to_owned()),
+            )
+        })
+        .collect();
     serde_json::json!({
+        "index_kinds": index_kinds,
         "family": traits.family,
         "scope_managed": traits.scope_managed,
         "emit_events": traits.emit_events,
@@ -110,13 +140,14 @@ pub async fn register_types(
     // The batch commits atomically: a partway failure leaves nothing.
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
+    let max_chain_depth = usize::from(store.config().ontology_max_chain_depth);
     store
         .db()
         .transaction_ref_mapped::<_, Vec<TypeRecord>, TxStoreError>(move |tx| {
             let batch = batch.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                register_in_tx(tenant, &scope, tx, batch)
+                register_in_tx(tenant, &scope, tx, batch, max_chain_depth)
                     .await
                     .map_err(TxStoreError::from)
             })
@@ -130,6 +161,7 @@ async fn register_in_tx(
     scope: &toolkit_security::AccessScope,
     tx: &impl toolkit_db::secure::DBRunner,
     batch: Vec<TypeRegistration>,
+    max_chain_depth: usize,
 ) -> Result<Vec<TypeRecord>, GraphStoreError> {
     {
         let mut out = Vec::with_capacity(batch.len());
@@ -162,17 +194,21 @@ async fn register_in_tx(
                 }
             }
             let ancestor_refs: Vec<&serde_json::Value> = ancestor_values.iter().collect();
-            let descriptor =
-                ontology::analyze(&registration.type_id, &registration.schema, &ancestor_refs)
-                    .map_err(|error| GraphStoreError::Validation {
-                        items: vec![graph_storage_sdk::models::ItemError {
-                            index: 0,
-                            family: graph_storage_sdk::models::ItemFamily::Node,
-                            gts_type: Some(registration.type_id.clone()),
-                            pointer: None,
-                            message: error.to_string(),
-                        }],
-                    })?;
+            let descriptor = ontology::analyze(
+                &registration.type_id,
+                &registration.schema,
+                &ancestor_refs,
+                max_chain_depth,
+            )
+            .map_err(|error| GraphStoreError::Validation {
+                items: vec![graph_storage_sdk::models::ItemError {
+                    index: 0,
+                    family: graph_storage_sdk::models::ItemFamily::Node,
+                    gts_type: Some(registration.type_id.clone()),
+                    pointer: None,
+                    message: error.to_string(),
+                }],
+            })?;
 
             let existing = gts_type::Entity::find()
                 .secure()
@@ -207,7 +243,7 @@ async fn register_in_tx(
                 gts_type_id: ActiveValue::Set(descriptor.type_id.clone()),
                 kind: ActiveValue::Set(kind_to_str(descriptor.kind).to_owned()),
                 type_schema: ActiveValue::Set(descriptor.schema.clone()),
-                effective_traits: ActiveValue::Set(traits_to_json(&descriptor.effective_traits)),
+                effective_traits: ActiveValue::Set(traits_to_json(&descriptor)),
                 created_at: ActiveValue::Set(time::OffsetDateTime::now_utc()),
             };
             // scope_unchecked: an INSERT cannot subtree-clamp a row

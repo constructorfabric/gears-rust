@@ -99,6 +99,16 @@ pub struct GraphStorageConfig {
     pub deadline_interactive_secs: u64,
     /// Idempotency receipt retention, days.
     pub idempotency_retention_days: u32,
+
+    /// Longest derivation chain a registered type may have, counted in
+    /// segments (`base ~ family ~ producer` is 3). The platform GTS guideline
+    /// recommends two derivations, and 3 keeps that posture by default; a
+    /// deployment whose ontology mirrors a deeper domain hierarchy (a domain
+    /// model with `managed_object ~ document ~ requirement` under the family)
+    /// raises it. Nothing in the gear depends on the depth: chain walking,
+    /// trait resolution, chain validation and pattern matching all work on
+    /// any length, so this is a policy knob rather than a capability.
+    pub ontology_max_chain_depth: u8,
 }
 
 impl Default for GraphStorageConfig {
@@ -129,6 +139,7 @@ impl Default for GraphStorageConfig {
             projection_max_page: 200,
             deadline_interactive_secs: 10,
             idempotency_retention_days: 7,
+            ontology_max_chain_depth: 3,
         }
     }
 }
@@ -178,6 +189,7 @@ impl GraphStorageConfig {
         check_range!(errors, self, projection_max_page, 1u32, 1_000u32);
         check_range!(errors, self, deadline_interactive_secs, 1u64, 300u64);
         check_range!(errors, self, idempotency_retention_days, 1u32, 365u32);
+        check_range!(errors, self, ontology_max_chain_depth, 3u8, 16u8);
         if errors.is_empty() {
             Ok(())
         } else {

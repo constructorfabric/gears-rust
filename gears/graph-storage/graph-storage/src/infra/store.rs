@@ -7,6 +7,7 @@
 //! module.
 
 pub mod ingest;
+pub mod projection;
 pub mod reads;
 pub mod search;
 pub mod spaces;

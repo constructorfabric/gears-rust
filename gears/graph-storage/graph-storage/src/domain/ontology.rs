@@ -93,7 +93,197 @@ pub struct TypeDescriptor {
     pub kind: TypeKind,
     pub is_abstract: bool,
     pub effective_traits: EffectiveTraits,
+    /// The `index` trait resolved against the chain's schemas: each declared
+    /// pointer with the scalar kind the schema gives it. Registration refuses
+    /// a pointer that lands nowhere or on a non-scalar, so a projection can
+    /// trust that every admitted path has a kind (DEVIATIONS D-104).
+    pub index_paths: Vec<IndexedPath>,
     pub schema: Value,
+}
+
+/// The scalar type of one declared `index` path, taken from the type's own
+/// schema. The extraction expression, the comparison semantics and the cursor
+/// codec all depend on it: `'10' < '9'` as text, `10 > 9` as a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarKind {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    /// A `string` with `format: date-time`. Compared as text in this
+    /// iteration, which is exact for RFC 3339 timestamps in one offset and
+    /// approximate across offsets (see D-104).
+    DateTime,
+}
+
+impl ScalarKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Integer => "integer",
+            Self::Boolean => "boolean",
+            Self::DateTime => "date-time",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "string" => Some(Self::String),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "boolean" => Some(Self::Boolean),
+            "date-time" => Some(Self::DateTime),
+            _ => None,
+        }
+    }
+}
+
+/// One declared `index` path with its resolved kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedPath {
+    /// JSON pointer from the node document root, e.g. `/payload/severity`.
+    pub pointer: String,
+    pub kind: ScalarKind,
+}
+
+/// The characters a pointer token may use. Declared paths are rendered into
+/// SQL text (an extraction expression has to match its index expression
+/// byte for byte), so the alphabet is closed here rather than escaped there.
+fn token_is_plain(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Resolve every `index` pointer of a type against the chain's schemas.
+///
+/// The walk descends `properties` from the document root, leaf schema first
+/// (a derived type's refinement is the authority on its own members), then
+/// each ancestor; `allOf` branches of one schema are searched as well. The
+/// first `type` found decides. A pointer that resolves nowhere, or to an
+/// object or array, is refused: an index over it would serve no query.
+pub fn resolve_index_paths(
+    type_id: &str,
+    chain_schemas: &[&Value],
+    pointers: &[String],
+) -> Result<Vec<IndexedPath>, DomainError> {
+    let mut out = Vec::with_capacity(pointers.len());
+    for pointer in pointers {
+        let Some(rest) = pointer.strip_prefix("/payload/") else {
+            return Err(invalid_type(
+                type_id,
+                format!("index path `{pointer}` must point below `/payload`"),
+            ));
+        };
+        let tokens: Vec<&str> = rest.split('/').collect();
+        if tokens.iter().any(|t| !token_is_plain(t)) {
+            return Err(invalid_type(
+                type_id,
+                format!(
+                    "index path `{pointer}` has a token outside `[A-Za-z0-9_.-]`; \
+                     declared paths are rendered into index expressions"
+                ),
+            ));
+        }
+        let mut found = None;
+        for schema in chain_schemas.iter().rev() {
+            if let Some(kind) = scalar_kind_at(schema, &["payload"], &tokens) {
+                found = Some(kind);
+                break;
+            }
+        }
+        match found {
+            Some(Ok(kind)) => out.push(IndexedPath {
+                pointer: pointer.clone(),
+                kind,
+            }),
+            Some(Err(seen)) => {
+                return Err(invalid_type(
+                    type_id,
+                    format!("index path `{pointer}` resolves to `{seen}`, not a scalar"),
+                ));
+            }
+            None => {
+                return Err(invalid_type(
+                    type_id,
+                    format!(
+                        "index path `{pointer}` does not resolve to a declared property in the \
+                         type's schema chain"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Walk `schema` along `prefix ++ tokens` through `properties` (and `allOf`
+/// branches), returning the scalar kind of the property reached, `Err` with
+/// the non-scalar type name, or `None` when the path is not declared here.
+fn scalar_kind_at(
+    schema: &Value,
+    prefix: &[&str],
+    tokens: &[&str],
+) -> Option<Result<ScalarKind, String>> {
+    let mut path: Vec<&str> = prefix.to_vec();
+    path.extend_from_slice(tokens);
+    property_at(schema, &path).map(kind_of_property)
+}
+
+fn property_at<'a>(schema: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let Some((head, tail)) = path.split_first() else {
+        return Some(schema);
+    };
+    if let Some(next) = schema
+        .get("properties")
+        .and_then(|p| p.get(head))
+        .and_then(|next| property_at(next, tail))
+    {
+        return Some(next);
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|branch| property_at(branch, path))
+}
+
+fn kind_of_property(property: &Value) -> Result<ScalarKind, String> {
+    let declared = match property.get("type") {
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(Value::Array(types)) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|t| *t != "null"),
+        _ => None,
+    };
+    let declared = declared.or_else(|| {
+        // An `enum` of strings without an explicit `type` is a string.
+        property
+            .get("enum")
+            .and_then(Value::as_array)
+            .filter(|values| values.iter().all(Value::is_string))
+            .map(|_| "string")
+    });
+    match declared {
+        Some("string") => {
+            if property.get("format").and_then(Value::as_str) == Some("date-time") {
+                Ok(ScalarKind::DateTime)
+            } else {
+                Ok(ScalarKind::String)
+            }
+        }
+        Some("number") => Ok(ScalarKind::Number),
+        Some("integer") => Ok(ScalarKind::Integer),
+        Some("boolean") => Ok(ScalarKind::Boolean),
+        Some(other) => Err(other.to_owned()),
+        None => Err("an untyped schema".to_owned()),
+    }
 }
 
 /// The derivation chain of a GTS identifier, outermost base first, the
@@ -206,6 +396,7 @@ pub fn analyze(
     type_id: &str,
     schema: &Value,
     ancestor_schemas: &[&Value],
+    max_chain_depth: usize,
 ) -> Result<TypeDescriptor, DomainError> {
     let parsed = GtsId::try_new(type_id)
         .map_err(|error| invalid_type(type_id, format!("not a valid GTS identifier: {error}")))?;
@@ -218,12 +409,17 @@ pub fn analyze(
     })?;
 
     let chain = ancestors(type_id);
-    // base -> family -> producer type: two derivations at most (GTS.md § 9).
-    if chain.len() > 3 {
+    // The platform guideline (GTS.md § 9) recommends two derivations, which
+    // is 3 segments (base -> family -> producer type) and the default. It is
+    // a design recommendation, not a capability of the type system: nothing
+    // below depends on the length, so a deployment mirroring a deeper domain
+    // hierarchy raises `ontology_max_chain_depth` (DEVIATIONS D-029).
+    if chain.len() > max_chain_depth {
         return Err(invalid_type(
             type_id,
             format!(
-                "derivation chain has {} segments; base -> family -> producer type is the maximum",
+                "derivation chain has {} segments; this deployment admits at most {max_chain_depth} \
+                 (`ontology_max_chain_depth`)",
                 chain.len()
             ),
         ));
@@ -298,6 +494,11 @@ pub fn analyze(
     let mut chain_schemas: Vec<&Value> = ancestor_schemas.to_vec();
     chain_schemas.push(schema);
     let effective_traits = resolve_traits(&chain_schemas);
+    let index_paths = if kind == TypeKind::Node {
+        resolve_index_paths(type_id, &chain_schemas, &effective_traits.index)?
+    } else {
+        Vec::new()
+    };
 
     let is_abstract = schema.get("x-gts-abstract").and_then(Value::as_bool) == Some(true);
     if !is_abstract && kind != TypeKind::Attribute && effective_traits.family.is_none() {
@@ -313,6 +514,7 @@ pub fn analyze(
         kind,
         is_abstract,
         effective_traits,
+        index_paths,
         schema: schema.clone(),
     })
 }
@@ -394,6 +596,189 @@ impl ChainValidator {
 mod tests {
     use super::*;
 
+    /// The platform posture: base -> family -> producer type.
+    const DEFAULT_DEPTH: usize = 3;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn owned_leaf(leaf: &str, traits: Value, payload_properties: Value) -> (String, Value) {
+        let id = format!("{}{leaf}", graph_storage_sdk::gts::OWNED_NODE_TYPE);
+        let schema = serde_json::json!({
+            "$id": format!("gts://{id}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": traits,
+            "type": "object",
+            "allOf": [
+                { "$ref": format!("gts://{}", graph_storage_sdk::gts::OWNED_NODE_TYPE) },
+                { "type": "object", "properties": { "payload": {
+                    "type": "object", "properties": payload_properties } } }
+            ]
+        });
+        (id, schema)
+    }
+
+    fn owned_ancestors() -> Vec<Value> {
+        vec![
+            base_schema(graph_storage_sdk::gts::NODE_BASE_TYPE),
+            base_schema(graph_storage_sdk::gts::OWNED_NODE_TYPE),
+        ]
+    }
+
+    #[test]
+    fn an_index_path_resolves_its_scalar_kind_from_the_schema() {
+        let (id, schema) = owned_leaf(
+            "acme.dm._.finding.v1~",
+            serde_json::json!({ "index": [
+                "/payload/severity", "/payload/score", "/payload/count",
+                "/payload/open", "/payload/seen_at", "/payload/loc/line" ] }),
+            serde_json::json!({
+                "severity": { "enum": ["low", "high"] },
+                "score": { "type": "number" },
+                "count": { "type": ["integer", "null"] },
+                "open": { "type": "boolean" },
+                "seen_at": { "type": "string", "format": "date-time" },
+                "loc": { "type": "object", "properties": { "line": { "type": "integer" } } }
+            }),
+        );
+        let ancestors = owned_ancestors();
+        let refs: Vec<&Value> = ancestors.iter().collect();
+        let descriptor =
+            analyze(&id, &schema, &refs, DEFAULT_DEPTH).unwrap_or_else(|e| panic!("{e}"));
+        let kinds: Vec<(&str, ScalarKind)> = descriptor
+            .index_paths
+            .iter()
+            .map(|p| (p.pointer.as_str(), p.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("/payload/severity", ScalarKind::String),
+                ("/payload/score", ScalarKind::Number),
+                ("/payload/count", ScalarKind::Integer),
+                ("/payload/open", ScalarKind::Boolean),
+                ("/payload/seen_at", ScalarKind::DateTime),
+                ("/payload/loc/line", ScalarKind::Integer),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_index_path_onto_an_object_or_nowhere_is_refused() {
+        let ancestors = owned_ancestors();
+        let refs: Vec<&Value> = ancestors.iter().collect();
+
+        let (id, schema) = owned_leaf(
+            "acme.dm._.thing.v1~",
+            serde_json::json!({ "index": ["/payload/meta"] }),
+            serde_json::json!({ "meta": { "type": "object" } }),
+        );
+        let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("object refused");
+        assert!(error.to_string().contains("not a scalar"), "{error}");
+
+        let (id, schema) = owned_leaf(
+            "acme.dm._.other.v1~",
+            serde_json::json!({ "index": ["/payload/ghost"] }),
+            serde_json::json!({ "real": { "type": "string" } }),
+        );
+        let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("undeclared refused");
+        assert!(error.to_string().contains("does not resolve"), "{error}");
+
+        let (id, schema) = owned_leaf(
+            "acme.dm._.third.v1~",
+            serde_json::json!({ "index": ["/name"] }),
+            serde_json::json!({}),
+        );
+        let error =
+            analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("outside payload refused");
+        assert!(error.to_string().contains("below `/payload`"), "{error}");
+    }
+
+    /// A domain hierarchy mirrored into the chain: family -> managed object
+    /// -> document -> requirement. The default depth refuses it, a raised one
+    /// admits it, an ancestor pattern selects it, and a trait declared on the
+    /// intermediate type reaches the leaf.
+    #[test]
+    fn a_deeper_chain_is_a_policy_decision_not_a_capability() {
+        let family = graph_storage_sdk::gts::OWNED_NODE_TYPE;
+        let managed = format!("{family}acme.dm.core.managed_object.v1~");
+        let document = format!("{managed}acme.dm.core.document.v1~");
+        let requirement = format!("{document}acme.dm.sdlc.requirement.v1~");
+
+        let intermediate = |id: &str, parent: &str, traits: Value, props: Value| {
+            serde_json::json!({
+                "$id": format!("gts://{id}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "x-gts-abstract": true,
+                "x-gts-traits": traits,
+                "type": "object",
+                "allOf": [
+                    { "$ref": format!("gts://{parent}") },
+                    { "type": "object", "properties": { "payload": {
+                        "type": "object", "properties": props } } }
+                ]
+            })
+        };
+        let managed_schema = intermediate(
+            &managed,
+            family,
+            serde_json::json!({ "index": ["/payload/status"], "full_text_search": ["/name", "/payload/title"] }),
+            serde_json::json!({ "status": { "type": "string" }, "title": { "type": "string" } }),
+        );
+        let document_schema = intermediate(
+            &document,
+            &managed,
+            serde_json::json!({}),
+            serde_json::json!({ "url": { "type": "string" } }),
+        );
+        let mut requirement_schema = intermediate(
+            &requirement,
+            &document,
+            serde_json::json!({}),
+            serde_json::json!({ "priority": { "type": "integer" } }),
+        );
+        requirement_schema
+            .as_object_mut()
+            .and_then(|o| o.remove("x-gts-abstract"));
+
+        let mut chain = owned_ancestors();
+        chain.push(managed_schema);
+        chain.push(document_schema);
+        let refs: Vec<&Value> = chain.iter().collect();
+
+        let error = analyze(&requirement, &requirement_schema, &refs, DEFAULT_DEPTH)
+            .expect_err("the platform posture refuses five segments");
+        assert!(
+            error.to_string().contains("ontology_max_chain_depth"),
+            "{error}"
+        );
+
+        let descriptor =
+            analyze(&requirement, &requirement_schema, &refs, 8).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(descriptor.effective_traits.family.as_deref(), Some("owned"));
+        assert_eq!(descriptor.effective_traits.index, vec!["/payload/status"]);
+        assert_eq!(
+            descriptor.index_paths,
+            vec![IndexedPath {
+                pointer: "/payload/status".into(),
+                kind: ScalarKind::String
+            }]
+        );
+        assert!(!descriptor.is_abstract);
+
+        assert_eq!(
+            matches_any_pattern(&requirement, &[format!("{managed}*")]).ok(),
+            Some(true),
+            "an ancestor pattern selects the whole subtree"
+        );
+        assert_eq!(
+            matches_any_pattern(&requirement, &[format!("{document}*")]).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            matches_any_pattern(&requirement, &[format!("{family}acme.dm.core.other.v1~*")]).ok(),
+            Some(false)
+        );
+    }
+
     /// The endpoint check is only safe because of how the platform matcher
     /// reads a pattern: a base identifier admits everything derived from it.
     ///
@@ -440,7 +825,7 @@ mod tests {
                 .map(|a| base_schema(a))
                 .collect();
             let ancestor_refs: Vec<&Value> = ancestor_values.iter().collect();
-            let descriptor = analyze(type_id, &schema, &ancestor_refs)
+            let descriptor = analyze(type_id, &schema, &ancestor_refs, DEFAULT_DEPTH)
                 .unwrap_or_else(|e| panic!("{type_id}: {e}"));
             // The three bases and the node/edge families are abstract. The
             // two concrete ones are deliberate: the phantom type, which the
@@ -459,8 +844,13 @@ mod tests {
     fn family_types_resolve_their_family() {
         let schema = base_schema(graph_storage_sdk::gts::OWNED_NODE_TYPE);
         let base = base_schema(graph_storage_sdk::gts::NODE_BASE_TYPE);
-        let descriptor = analyze(graph_storage_sdk::gts::OWNED_NODE_TYPE, &schema, &[&base])
-            .unwrap_or_else(|e| panic!("{e}"));
+        let descriptor = analyze(
+            graph_storage_sdk::gts::OWNED_NODE_TYPE,
+            &schema,
+            &[&base],
+            DEFAULT_DEPTH,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(descriptor.effective_traits.family.as_deref(), Some("owned"));
         assert!(descriptor.effective_traits.scope_managed);
         assert_eq!(descriptor.kind, TypeKind::Node);
@@ -473,8 +863,13 @@ mod tests {
             .as_object_mut()
             .and_then(|o| o.insert("x-gts-indexed".into(), serde_json::json!(["/payload/x"])));
         let base = base_schema(graph_storage_sdk::gts::NODE_BASE_TYPE);
-        let error = analyze(graph_storage_sdk::gts::OWNED_NODE_TYPE, &schema, &[&base])
-            .expect_err("unknown extension must be rejected");
+        let error = analyze(
+            graph_storage_sdk::gts::OWNED_NODE_TYPE,
+            &schema,
+            &[&base],
+            DEFAULT_DEPTH,
+        )
+        .expect_err("unknown extension must be rejected");
         assert!(error.to_string().contains("x-gts-indexed"), "{error}");
     }
 

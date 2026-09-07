@@ -144,7 +144,12 @@ impl GraphServices {
                 }
             }
             let ancestor_refs: Vec<&serde_json::Value> = ancestor_values.iter().collect();
-            ontology::analyze(&registration.type_id, &registration.schema, &ancestor_refs)?;
+            ontology::analyze(
+                &registration.type_id,
+                &registration.schema,
+                &ancestor_refs,
+                usize::from(self.config.ontology_max_chain_depth),
+            )?;
         }
 
         Ok(self.store.register_types(&store_ctx, batch).await?)

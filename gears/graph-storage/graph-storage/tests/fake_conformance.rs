@@ -182,3 +182,41 @@ async fn the_envelope_records_the_subject_of_each_verb() {
 async fn a_projection_row_carries_the_envelope() {
     conformance::a_projection_row_carries_the_envelope(&store(), Uuid::now_v7()).await;
 }
+
+// --- payload projection (DEVIATIONS D-104) ----------------------------------
+
+#[tokio::test]
+async fn a_declared_payload_path_filters_and_orders_the_projection() {
+    conformance::a_declared_payload_path_filters_and_orders_the_projection(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_undeclared_payload_path_is_refused_naming_the_alternatives() {
+    conformance::an_undeclared_payload_path_is_refused_naming_the_alternatives(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_index_path_onto_a_non_scalar_is_refused_at_registration() {
+    conformance::an_index_path_onto_a_non_scalar_is_refused_at_registration(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_deeper_chain_registers_and_its_ancestor_admits_the_leaf() {
+    conformance::a_deeper_chain_registers_and_its_ancestor_admits_the_leaf(
+        &store().with_max_chain_depth(8),
+        Uuid::now_v7(),
+    )
+    .await;
+}

@@ -9,5 +9,6 @@ pub mod error;
 pub mod identity;
 pub mod local_client;
 pub mod ontology;
+pub mod projection;
 pub mod service;
 pub mod traversal;

@@ -50,11 +50,15 @@ fn map_odata_err(error: toolkit_odata::Error) -> GraphStoreError {
 /// schema declares them.
 fn declared_fields() -> String {
     use toolkit_odata::filter::FilterField as _;
-    Field::FIELDS
+    let columns = Field::FIELDS
         .iter()
         .map(|f| f.name().to_owned())
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    format!(
+        "{columns}, and `payload/<path>` for the paths the selected types declare in their \
+         `index` trait"
+    )
 }
 
 /// The per-tenant revision and the deployment epoch, read together.
@@ -428,19 +432,33 @@ pub async fn project_table(
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()));
 
+    // The selected types, with the payload paths each declares: the interned
+    // ids narrow the statement, the declarations decide what `$filter` and
+    // `$orderby` may name (DEVIATIONS D-104).
+    let mut declared_kinds: Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>> = Vec::new();
     if let Some(set) = &req.type_set {
         let names: Vec<String> = set.0.iter().cloned().collect();
-        let ids = gts_type::Entity::find()
+        let types = gts_type::Entity::find()
             .secure()
             .scope_with(ctx.scope)
             .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
             .all(&conn)
             .await
-            .map_err(map_scope_err)?
-            .into_iter()
-            .map(|t| t.id)
-            .collect::<Vec<_>>();
+            .map_err(map_scope_err)?;
+        let ids: Vec<i32> = types.iter().map(|t| t.id).collect();
+        declared_kinds = types
+            .iter()
+            .map(|t| super::types::index_kinds_from_json(&t.effective_traits))
+            .collect();
         select = select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids)));
+    }
+
+    if crate::domain::projection::mentions_payload(&req.query) {
+        let admitted = req
+            .type_set
+            .as_ref()
+            .map(|_| crate::domain::projection::admitted_paths(&declared_kinds));
+        return project_over_payload(store, ctx, &conn, select, &req, admitted.as_ref()).await;
     }
 
     // Interned type ids are not carried on the row, so the names are resolved
@@ -459,20 +477,115 @@ pub async fn project_table(
     .await
     .map_err(map_odata_err)?;
 
+    rows_to_page(ctx, &conn, page.items, page.page_info).await
+}
+
+/// The projection when a payload path is named: the shared plan rendered by
+/// `store::projection`, in the platform pager's statement shape.
+async fn project_over_payload(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    conn: &impl DBRunner,
+    select: toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped>,
+    req: &ProjectionRequest,
+    admitted: Option<&BTreeMap<String, crate::domain::ontology::ScalarKind>>,
+) -> Result<OdataPage<NodeRow>, GraphStoreError> {
+    use crate::domain::projection as plan;
+    use crate::infra::store::projection as sql;
+
+    let invalid = |what: String| GraphStoreError::InvalidQuery { what };
+
+    let plan = plan::plan(&req.query, admitted).map_err(|error| invalid(error.0))?;
+
+    let max = u64::from(store.config().projection_max_page);
+    let limit = req.query.limit.unwrap_or(max).clamp(1, max);
+
+    if let Some(cursor) = &req.query.cursor {
+        if cursor.d == "bwd" {
+            return Err(invalid(
+                "backward paging is not available over a payload ordering".to_owned(),
+            ));
+        }
+        if let (Some(hash), Some(recorded)) =
+            (req.query.filter_hash.as_deref(), cursor.f.as_deref())
+            && hash != recorded
+        {
+            return Err(invalid(
+                "the cursor was minted under a different $filter".to_owned(),
+            ));
+        }
+    }
+
+    let mut statement = select;
+    if let Some(predicate) = &plan.filter {
+        statement = statement.filter(sql::condition(predicate));
+    }
+    if let Some(cursor) = &req.query.cursor {
+        statement = statement.filter(sql::keyset(&plan, cursor).map_err(invalid)?);
+    }
+    for (expr, order) in sql::order_terms(&plan) {
+        statement = statement.order_by(expr, order);
+    }
+    statement = statement.limit(limit + 1);
+
+    let mut rows = statement.all(conn).await.map_err(map_scope_err)?;
+    let has_more = rows.len() as u64 > limit;
+    if has_more {
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+
+    let next_cursor = match (has_more, rows.last()) {
+        (true, Some(last)) => {
+            let keys = sql::cursor_keys(last, &plan)
+                .map_err(|error| GraphStoreError::Corrupt { reason: error })?;
+            let cursor = toolkit_odata::CursorV1 {
+                k: keys,
+                o: plan.order.first().map_or(SortDir::Asc, |t| t.dir),
+                s: sql::signed_tokens(&plan),
+                f: req.query.filter_hash.clone(),
+                d: "fwd".to_owned(),
+            };
+            Some(cursor.encode().map_err(|error| GraphStoreError::Corrupt {
+                reason: format!("cannot encode the continuation token: {error}"),
+            })?)
+        }
+        _ => None,
+    };
+
+    rows_to_page(
+        ctx,
+        conn,
+        rows,
+        toolkit_odata::page::PageInfo {
+            next_cursor,
+            prev_cursor: None,
+            limit,
+        },
+    )
+    .await
+}
+
+/// Rows to the page the SDK reports, with type names resolved once per page
+/// and the observed revision on every envelope.
+async fn rows_to_page(
+    ctx: &StoreCtx<'_>,
+    conn: &impl DBRunner,
+    rows: Vec<node::Model>,
+    page_info: toolkit_odata::page::PageInfo,
+) -> Result<OdataPage<NodeRow>, GraphStoreError> {
     // The page wrapper is the platform's `toolkit_odata::Page`, which carries
     // items and cursors and nothing else -- so the revision this projection
     // observed rides on each row's envelope or is not reported at all
     // (PRD § fr-tabular-projection).
-    let revision = observed_revision(ctx, &conn).await?;
+    let revision = observed_revision(ctx, conn).await?;
 
-    let mut type_ids: Vec<i32> = page.items.iter().map(|m| m.gts_node_type_id).collect();
+    let mut type_ids: Vec<i32> = rows.iter().map(|m| m.gts_node_type_id).collect();
     type_ids.sort_unstable();
     type_ids.dedup();
-    let names = type_names(ctx, &conn, &type_ids).await?;
+    let names = type_names(ctx, conn, &type_ids).await?;
 
     Ok(OdataPage {
-        items: page
-            .items
+        items: rows
             .into_iter()
             .map(|m| NodeRow {
                 type_id: names.get(&m.gts_node_type_id).cloned().unwrap_or_default(),
@@ -482,6 +595,6 @@ pub async fn project_table(
                 payload: Some(m.payload),
             })
             .collect(),
-        page_info: page.page_info,
+        page_info,
     })
 }

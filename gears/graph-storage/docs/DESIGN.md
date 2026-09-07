@@ -455,7 +455,7 @@ key, which is the behaviour reference nodes exist for.
 | `family` | required, no default | `owned` / `reference` / `phantom`. Drives which node model applies (ADR-0002). |
 | `scope_managed` | `true` | Whether rows of this type are deleted by producer-scoped replacement when absent from the submitted batch. |
 | `emit_events` | `false` | Whether CREATE/UPDATE/DELETE events are published for this type. |
-| `index` | `[]` | Payload paths backed by a B-tree over the path's extraction expression, and therefore admissible in `$filter` and `$orderby`. Each pointer must resolve to a scalar in the type's own schema; one that does not is rejected at registration (ADR-0003). |
+| `index` | `[]` | Payload paths admissible in `$filter` and `$orderby`. Each pointer must resolve to a scalar in the type's own schema; one that does not is rejected at registration, and the resolved kind is stored with the type (ADR-0003). Equality is served by the payload GIN in containment form; range and order read the extraction expression — a B-tree per path needs DDL the platform does not yet let a gear run (DEVIATIONS D-030). |
 | `full_text_search` | `[]` | Paths composed into the node tsvector. |
 | `vector_search` | `[]` | Paths composed into the embedding input. |
 
@@ -801,9 +801,14 @@ none of them fails until registration is attempted:
   searchable (`full_text_search`) and the gear composes the text from them, so
   the producer moves that logic into the type and drops the field.
 
-Two derivations is the ceiling (`guidelines/GTS.md` §9), and the family already
-spends one — so a producer type is always the third segment and can never
-introduce a hierarchy of its own beneath it.
+The chain ceiling is a deployment policy, `ontology_max_chain_depth`: the
+default 3 keeps the GTS guideline's posture (`guidelines/GTS.md` §9 recommends
+two derivations, and the family spends one), and a deployment mirroring a
+deeper domain hierarchy raises it. Nothing in the gear depends on the depth —
+chain walking, trait resolution, chain validation and pattern matching work on
+any length. Two rules follow for intermediate types: they may not close
+`payload` (rule 3 above), and trait values replace along the chain rather than
+accumulate, so a leaf restating `index` restates all of it (DEVIATIONS D-029).
 
 ##### What the gear enforces beyond JSON Schema
 
