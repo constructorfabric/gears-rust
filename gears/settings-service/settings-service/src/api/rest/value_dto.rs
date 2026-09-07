@@ -90,7 +90,11 @@ pub struct SetResultDto {
 /// Render a committed change, masking by classification.
 #[must_use]
 pub fn render_committed(committed: &Committed, may_read_pii: bool) -> SetResultDto {
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-9
+    // A secret's images are the reference on the way in and the mask token on
+    // the way out: the response never echoes what was sent.
     let render = |v: &Value| mask(v, &committed.data_classification, may_read_pii);
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-9
     let old = committed.old_value.as_ref().map(render);
     let new = committed.new_value.as_ref().map(render);
     let masked = old.as_ref().is_some_and(|(_, m)| *m) || new.as_ref().is_some_and(|(_, m)| *m);

@@ -29,7 +29,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde_json::json;
-use toolkit_security::AccessScope;
+use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
 use crate::domain::declaration::{DeclarationDraft, DeclarationRepository};
@@ -609,5 +609,144 @@ impl crate::domain::stepup::StepUpVerifier for FixedStepUp {
 
     fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
         &self.requirement
+    }
+}
+
+/// A Secret Manager that keeps plaintext in memory under deterministic
+/// references and remembers what it was asked to release.
+#[derive(Default)]
+pub struct RecordingSecrets {
+    pub entries: Mutex<HashMap<String, String>>,
+    pub deleted: Mutex<Vec<String>>,
+    pub unavailable: std::sync::atomic::AtomicBool,
+    pub stores: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingSecrets {
+    /// The references currently held, sorted.
+    pub fn held(&self) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .entries
+            .lock()
+            .expect("secrets lock")
+            .keys()
+            .cloned()
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    /// Seed an entry the way a completed store would have left it.
+    pub fn seed(&self, reference: &str, plaintext: &str) {
+        self.entries
+            .lock()
+            .expect("secrets lock")
+            .insert(reference.to_owned(), plaintext.to_owned());
+    }
+
+    /// Make every operation fail as unavailable from now on.
+    pub fn go_down(&self) {
+        self.unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check(&self) -> Result<(), DomainError> {
+        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable {
+                detail: "the fake store is down".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::domain::ports::SecretManager for RecordingSecrets {
+    async fn store_secret(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        plaintext: &Value,
+    ) -> Result<String, DomainError> {
+        self.check()?;
+        let n = self
+            .stores
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let reference = format!("fake-{}-{tenant}-{n}", key.len());
+        let text = match plaintext {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        self.seed(&reference, &text);
+        Ok(reference)
+    }
+
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<String, DomainError> {
+        self.check()?;
+        self.entries
+            .lock()
+            .expect("secrets lock")
+            .get(secret_ref)
+            .cloned()
+            .ok_or(DomainError::NotFound {
+                resource: settings_service_sdk::gts::VALUE_SCHEMA,
+            })
+    }
+
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        self.check()?;
+        self.entries
+            .lock()
+            .expect("secrets lock")
+            .remove(secret_ref);
+        self.deleted
+            .lock()
+            .expect("secrets lock")
+            .push(secret_ref.to_owned());
+        Ok(())
+    }
+}
+
+/// A gate that lets every caller resolve every setting.
+pub struct AllowAllGate;
+
+#[async_trait]
+impl crate::domain::ports::SecretResolveGate for AllowAllGate {
+    async fn may_resolve(
+        &self,
+        _ctx: &SecurityContext,
+        _declaration_id: Uuid,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+/// A gate that refuses every caller and counts the refusals.
+#[derive(Default)]
+pub struct DenyAllGate {
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::domain::ports::SecretResolveGate for DenyAllGate {
+    async fn may_resolve(
+        &self,
+        _ctx: &SecurityContext,
+        _declaration_id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(DomainError::Unauthorized {
+            resource: settings_service_sdk::gts::VALUE_SCHEMA,
+        })
     }
 }

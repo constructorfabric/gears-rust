@@ -20,7 +20,7 @@ resource-group = ["dep:resource_group"]
 grpc-hub = ["dep:grpc_hub"]
 oagw = ["dep:api_egress"]
 credstore = ["dep:credstore"]
-settings-service = ["dep:settings_service"]
+settings-service = ["dep:settings_service", "credstore"]
 # Demo contributor: sample declarations registered through the SDK at init.
 settings-demo = ["settings-service", "dep:settings_demo"]
 # FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all cryptographic operations

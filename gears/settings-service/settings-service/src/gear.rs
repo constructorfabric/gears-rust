@@ -45,7 +45,7 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
 >;
 
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
-#[toolkit::gear(name = "settings-service", deps = [types_registry], capabilities = [db, rest])]
+#[toolkit::gear(name = "settings-service", deps = [types_registry, credstore], capabilities = [db, rest])]
 pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
@@ -345,13 +345,22 @@ impl Gear for SettingsService {
             )?),
             None => Arc::new(crate::domain::stepup::NoStepUpVerifier::default()),
         };
+        // The Secret Manager over the Credential Store: `credstore` is a system
+        // gear, so its client is in the hub before this init runs.
+        let credstore = ctx
+            .client_hub()
+            .get::<dyn credstore_sdk::CredStoreClientV1>()
+            .map_err(|e| anyhow::anyhow!("{}: credstore client: {e}", Self::MODULE_NAME))?;
+        let secrets: Arc<dyn crate::domain::ports::SecretManager> = Arc::new(
+            crate::infra::secret_manager::CredStoreSecretManager::new(credstore),
+        );
         let writer = Arc::new(crate::domain::writes::ValueWriter::new(
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),
             self.validator()?,
             crate::infra::storage::audit_store::AuditStore,
             step_up,
-            Arc::new(crate::domain::ports::NoSecretManager),
+            Arc::clone(&secrets),
             Arc::new(crate::infra::write_metrics::LoggingPublisher),
             Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
         ));
@@ -363,9 +372,22 @@ impl Gear for SettingsService {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-7
-        let reader: Arc<dyn SettingsReaderClient> = Arc::new(
-            crate::infra::reader_client::ReaderClient::new(self.db()?, Arc::clone(&resolver)),
-        );
+        // The machine-only plaintext path behind the reader: per-setting PEP
+        // gate, the Secret Manager, and the audit store for `secret_use`.
+        let secret_resolver = Arc::new(crate::domain::secrets::SecretResolver::new(
+            Arc::clone(&resolver),
+            Arc::clone(&secrets),
+            Arc::new(crate::infra::secret_manager::PepSecretGate::new(
+                self.enforcer()?,
+            )),
+            crate::infra::storage::audit_store::AuditStore,
+        ));
+        let reader: Arc<dyn SettingsReaderClient> =
+            Arc::new(crate::infra::reader_client::ReaderClient::new(
+                self.db()?,
+                Arc::clone(&resolver),
+                secret_resolver,
+            ));
         ctx.client_hub()
             .register::<dyn SettingsReaderClient>(reader);
 

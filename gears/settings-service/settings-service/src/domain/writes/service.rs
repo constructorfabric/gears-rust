@@ -86,6 +86,26 @@ pub enum Change {
     Remove,
 }
 
+/// A change after staging: validated, and with a secret already in the store.
+///
+/// The Credential Store cannot join the row's transaction, so a secret is
+/// stored before it opens, under a reference unique to this write. What the
+/// transaction then persists is the reference; the plaintext is gone from here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Staged {
+    /// A value to store: inline, or as the reference of an entry just created.
+    Set {
+        /// The inline value; `None` for a secret.
+        inline: Option<Value>,
+        /// The reference of the entry created for this write; `None` inline.
+        secret_ref: Option<String>,
+    },
+    /// Fall back to the inherited value.
+    Revert,
+    /// Remove the override.
+    Remove,
+}
+
 /// Whether step-up still has to be verified for this change, or was verified
 /// once for the whole request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +152,9 @@ pub struct Committed {
     pub operation: AuditOperation,
     /// The change set it belongs to.
     pub change_set_id: Uuid,
+    /// The store reference a removed or reverted secret row carried, released
+    /// after the commit; `None` when nothing left the store's care.
+    pub released_secret: Option<String>,
 }
 
 /// The read-only report of `validate`.
@@ -445,33 +468,97 @@ where
         declarations.iter().any(|d| d.requires_step_up)
     }
 
-    /// Commit one change inside the caller's transaction.
+    /// Stage a change: validate the value and, for a secret, put the plaintext
+    /// in the store. Runs before the transaction, which the store cannot join.
     ///
     /// # Errors
-    /// [`DomainError::Validation`] for an invalid value, nothing stored;
-    /// [`DomainError::PreconditionRequired`] or [`DomainError::PreconditionFailed`]
-    /// on the tag; [`DomainError::NotFound`] when a revert or remove finds no
-    /// row; [`DomainError::Unavailable`] when the Secret Manager or the audit
-    /// sink cannot answer — the caller's transaction rolls back.
+    /// [`DomainError::Validation`] for an invalid value;
+    /// [`DomainError::Unavailable`] when the store cannot answer, in which case
+    /// nothing was stored anywhere.
+    pub async fn stage(&self, gated: &Gated, change: Change) -> Result<Staged, DomainError> {
+        let declaration = &gated.declaration;
+        let value = match change {
+            Change::Set(value) => value,
+            Change::Revert => return Ok(Staged::Revert),
+            Change::Remove => return Ok(Staged::Remove),
+        };
+        // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-1
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-2
+        // A secret is still a typed value: validated like any other, before
+        // anything is stored anywhere.
+        self.validator
+            .validate_value(&declaration.value_type_id, &value)
+            .await?
+            .into_result()?;
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-2
+        // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
+        // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
+        // Plaintext never reaches `value` for a secret: the Secret Manager
+        // takes it and hands back a reference unique to this write, and with
+        // nothing bound the write is unavailable rather than stored in clear.
+        // The store cannot join the row's transaction, so this runs before it;
+        // a transaction that then fails releases the entry again.
+        if declaration.has_secret_trait {
+            let secret_ref = self
+                .secrets
+                .store_secret(&declaration.key, gated.tenant_id, &value)
+                .await?;
+            return Ok(Staged::Set {
+                inline: None,
+                secret_ref: Some(secret_ref),
+            });
+        }
+        Ok(Staged::Set {
+            inline: Some(value),
+            secret_ref: None,
+        })
+        // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-1
+    }
+
+    /// Release the entry a staged secret created, when its transaction did not
+    /// commit. Logged, never failed: the refusal already stands.
+    pub async fn discard(&self, gated: &Gated, staged: &Staged) {
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-7
+        if let Staged::Set {
+            secret_ref: Some(reference),
+            ..
+        } = staged
+            && let Err(err) = self
+                .secrets
+                .delete_secret(&gated.declaration.key, gated.tenant_id, reference)
+                .await
+        {
+            tracing::warn!(
+                key = %gated.declaration.key,
+                tenant = %gated.tenant_id,
+                %err,
+                "secret entry of a refused write not released; the reference is orphaned"
+            );
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-7
+    }
+
+    /// Commit a staged change inside the caller's transaction: the tag check,
+    /// the row, and its audit record.
+    ///
+    /// # Errors
+    /// [`DomainError::PreconditionRequired`] / [`DomainError::PreconditionFailed`]
+    /// on the tag, [`DomainError::NotFound`] removing a row that is not there,
+    /// [`DomainError::Unavailable`] when the database or the audit sink cannot
+    /// answer — the caller's transaction rolls back.
     pub async fn commit_in<C: DBRunner>(
         &self,
         conn: &C,
         gated: &Gated,
-        change: Change,
+        staged: &Staged,
         if_match: Option<&str>,
         actor: &WriteActor,
         change_set_id: Uuid,
     ) -> Result<Committed, DomainError> {
         let declaration = &gated.declaration;
         let scope = AccessScope::allow_all();
-        // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
-        if let Change::Set(value) = &change {
-            self.validator
-                .validate_value(&declaration.value_type_id, value)
-                .await?
-                .into_result()?;
-        }
-        // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-3
         // Inside the caller's transaction, which spans this change alone. The
@@ -485,22 +572,22 @@ where
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-3
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-2
         let old_value = current.as_ref().map(image_of);
-        let (stored, operation) = match change {
-            Change::Set(value) => {
-                // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
-                // Plaintext never reaches `value` for a secret: the Secret
-                // Manager takes it and hands back a reference, and with nothing
-                // bound the write is unavailable rather than stored in clear.
-                let (inline, secret_ref) = if declaration.has_secret_trait {
-                    let reference = self
-                        .secrets
-                        .store_secret(&declaration.key, gated.tenant_id, &value)
-                        .await?;
-                    (None, Some(reference))
-                } else {
-                    (Some(value), None)
-                };
-                // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
+        let mut released_secret = None;
+        let (stored, operation) = match staged {
+            Staged::Set { inline, secret_ref } => {
+                // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-6
+                // @cpt-dod:cpt-cf-settings-service-dod-secret-values-reference-only:p1
+                // The row takes the reference of the entry created for this
+                // write; the entry it held before is released after the commit,
+                // once nothing can point at it any more.
+                if let Some(previous) = current.as_ref().and_then(|row| row.secret_ref.as_deref())
+                    && secret_ref.as_deref() != Some(previous)
+                {
+                    released_secret = Some(previous.to_owned());
+                }
+                let inline = inline.clone();
+                let secret_ref = secret_ref.clone();
+                // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-6
                 // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-5
                 // A valid re-set clears `needs_review`; the unique index guards
                 // the first insert so two first writers cannot both land.
@@ -539,14 +626,23 @@ where
                 }
                 // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-5
             }
-            Change::Revert | Change::Remove => {
-                if current.is_none() {
+            Staged::Revert | Staged::Remove => {
+                let Some(row) = &current else {
                     return Err(DomainError::NotFound { resource: "value" });
+                };
+                // @cpt-begin:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-1
+                // @cpt-begin:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-2
+                // The reference leaves the transaction with the outcome; the
+                // store is touched only once the row is durably gone.
+                if declaration.has_secret_trait {
+                    released_secret = row.secret_ref.clone();
                 }
+                // @cpt-end:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-2
+                // @cpt-end:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-1
                 self.values
                     .delete(conn, &scope, declaration.id, gated.tenant_id)
                     .await?;
-                let operation = if matches!(change, Change::Revert) {
+                let operation = if matches!(staged, Staged::Revert) {
                     AuditOperation::Revert
                 } else {
                     AuditOperation::Remove
@@ -596,6 +692,7 @@ where
             etag: value_state_tag(stored.as_ref()).as_str().to_owned(),
             operation,
             change_set_id,
+            released_secret,
         })
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-10
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-7
@@ -621,6 +718,27 @@ where
             .await;
         self.metrics.value_write("committed");
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-9
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-3
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-8
+        // @cpt-dod:cpt-cf-settings-service-dod-secret-values-cleanup:p1
+        // The committed row is the truth; an entry the store will not release
+        // is an orphan to log, never a reason to fail a change that happened.
+        // Removed, reverted or superseded: the same release.
+        if let Some(reference) = &committed.released_secret
+            && let Err(err) = self
+                .secrets
+                .delete_secret(&committed.key, committed.tenant_id, reference)
+                .await
+        {
+            tracing::warn!(
+                key = %committed.key,
+                tenant = %committed.tenant_id,
+                %err,
+                "secret entry not released after the change; the reference is orphaned"
+            );
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-8
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-3
     }
 
     /// What follows a rejection: a durable notification and a count.

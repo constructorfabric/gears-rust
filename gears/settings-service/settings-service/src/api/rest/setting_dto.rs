@@ -24,13 +24,18 @@ fn rfc3339(at: OffsetDateTime) -> String {
 /// entitled to unmasked PII; `public` passes through. Returns the value and
 /// whether it was masked.
 #[must_use]
+// @cpt-dod:cpt-cf-settings-service-dod-secret-values-no-reveal:p1
 pub fn mask(value: &Value, data_classification: &str, may_read_pii: bool) -> (Value, bool) {
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-10
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-1
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-2
     match data_classification {
         "secret" => (Value::String(MASK_TOKEN.to_owned()), true),
         "pii" if !may_read_pii => (Value::String(MASK_TOKEN.to_owned()), true),
         _ => (value.clone(), false),
     }
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-2
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-1
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-10
 }
 

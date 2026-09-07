@@ -378,6 +378,7 @@ where
                      cannot be declared `pii`",
                 ));
             }
+            // @cpt-dod:cpt-cf-settings-service-dod-secret-values-placeholder:p1
             if !is_empty_placeholder(&contributed.default_value) {
                 return Err(refused(
                     reason::SECRET_DEFAULT_NOT_EMPTY,

@@ -67,3 +67,9 @@ pub const TENANT_PARAM: &str = "tenant_param";
 /// A clone of a secret-classified setting, which would couple the target to
 /// the source credential's lifecycle.
 pub const SECRET_NOT_CLONEABLE: &str = "secret_not_cloneable";
+
+/// A secret handle that does not decode; the token itself is never echoed.
+pub const SECRET_HANDLE_MALFORMED: &str = "secret_handle_malformed";
+
+/// A secret handle naming a setting that is not secret-classified.
+pub const NOT_A_SECRET: &str = "not_a_secret";

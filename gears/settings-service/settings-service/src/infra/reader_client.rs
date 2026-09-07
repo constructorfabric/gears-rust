@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use settings_service_sdk::api::{BulkOutcome, BulkSelector, SettingsReaderClient};
 use settings_service_sdk::models::{EffectiveValueResponse, GetEffectiveRequest, TrailEntry};
 use settings_service_sdk::{SecretHandle, SettingKey};
@@ -18,21 +19,33 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
+use crate::audit::AuditSink;
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver};
+use crate::domain::secrets::{SecretResolver, issue_handle};
 use crate::domain::value::ValueRepository;
 
-/// The SDK trait over the resolver and the database.
-pub struct ReaderClient<D, V, A> {
+/// The SDK trait over the resolver, the database and the machine-only
+/// plaintext path.
+pub struct ReaderClient<D, V, A, S> {
     db: Arc<DBProvider<DbError>>,
     resolver: Arc<ValueResolver<D, V, A>>,
+    secrets: Arc<SecretResolver<D, V, A, S>>,
 }
 
-impl<D, V, A> ReaderClient<D, V, A> {
-    /// Serve the contract over this database and resolver.
-    pub fn new(db: Arc<DBProvider<DbError>>, resolver: Arc<ValueResolver<D, V, A>>) -> Self {
-        Self { db, resolver }
+impl<D, V, A, S> ReaderClient<D, V, A, S> {
+    /// Serve the contract over this database, resolver and secret path.
+    pub fn new(
+        db: Arc<DBProvider<DbError>>,
+        resolver: Arc<ValueResolver<D, V, A>>,
+        secrets: Arc<SecretResolver<D, V, A, S>>,
+    ) -> Self {
+        Self {
+            db,
+            resolver,
+            secrets,
+        }
     }
 }
 
@@ -58,10 +71,20 @@ fn project(
             diagnostic: format!("stored key `{}` does not parse: {e}", value.key),
         })
     })?;
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-3
+    // A secret-classified value goes out as the handle for the requested scope,
+    // configured or not: the shape does not disclose which, and the reference
+    // the resolver holds never leaves.
+    let projected = if value.data_classification == "secret" {
+        Value::String(issue_handle(&value.key, &scope).as_token().to_owned())
+    } else {
+        value.value.clone()
+    };
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-admin-read:p1:inst-sv-aread-3
     Ok(EffectiveValueResponse {
         key,
         scope,
-        value: value.value.clone(),
+        value: projected,
         source: value.source,
         source_scope: value.source_scope.clone(),
         traits: value.traits.clone(),
@@ -76,11 +99,12 @@ fn conn_error(err: &DbError) -> CanonicalError {
 }
 
 #[async_trait]
-impl<D, V, A> SettingsReaderClient for ReaderClient<D, V, A>
+impl<D, V, A, S> SettingsReaderClient for ReaderClient<D, V, A, S>
 where
     D: DeclarationRepository + 'static,
     V: ValueRepository + 'static,
     A: crate::domain::access::AccessRepository + 'static,
+    S: AuditSink + 'static,
 {
     async fn get_effective(
         &self,
@@ -149,22 +173,27 @@ where
 
     async fn resolve_secret(
         &self,
-        _ctx: &SecurityContext,
-        _handle: SecretHandle,
+        ctx: &SecurityContext,
+        handle: SecretHandle,
     ) -> Result<String, CanonicalError> {
-        // The machine-only plaintext path belongs to the Secret Manager, which
-        // is not built yet; until then no handle resolves.
-        Err(CanonicalError::from(DomainError::Unavailable {
-            detail: "secret resolution is not available in this release".to_owned(),
-        }))
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-1
+        // The one plaintext path. The domain decides; this adapter only
+        // supplies the connection and projects the outcome.
+        let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        self.secrets
+            .resolve(&conn, ctx, &handle)
+            .await
+            .map_err(CanonicalError::from)
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-1
     }
 }
 
-impl<D, V, A> ReaderClient<D, V, A>
+impl<D, V, A, S> ReaderClient<D, V, A, S>
 where
     D: DeclarationRepository,
     V: ValueRepository,
     A: crate::domain::access::AccessRepository,
+    S: AuditSink,
 {
     async fn keys_in_category(&self, category: &str) -> Result<Vec<SettingKey>, CanonicalError> {
         let category_id = Uuid::parse_str(category).map_err(|_| {

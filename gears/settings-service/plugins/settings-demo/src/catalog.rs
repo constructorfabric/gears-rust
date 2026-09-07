@@ -177,6 +177,17 @@ pub fn declarations() -> Result<Vec<ContributedDeclaration>, SettingKeyError> {
     token.requires_step_up = Some(true);
     all.push(token);
 
+    // A secret without step-up: what the credential path looks like when the
+    // declaration does not also demand a fresh authentication.
+    all.push(declare(
+        "security",
+        "webhook_secret",
+        catalogue::SECRET_STRING,
+        json!(""),
+        ScopeClass::Cascading,
+        "The shared secret the demo service signs outbound webhooks with.",
+    )?);
+
     // Advanced mode: hidden from the standard settings view.
     let mut flags = declare(
         "limits",

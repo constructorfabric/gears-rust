@@ -9,8 +9,9 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 
 /// Holds `secret`-trait plaintext outside this service and hands back a
-/// reference. Nothing is bound in this release: a write to a secret setting
-/// is refused as unavailable rather than stored in plaintext.
+/// reference. The real binding is the Credential Store; with nothing bound a
+/// write to a secret setting is refused as unavailable rather than stored in
+/// plaintext, and no handle resolves.
 #[async_trait]
 pub trait SecretManager: Send + Sync {
     /// Store `plaintext` for the setting at `tenant`, returning its reference.
@@ -23,10 +24,35 @@ pub trait SecretManager: Send + Sync {
         tenant: Uuid,
         plaintext: &Value,
     ) -> Result<String, DomainError>;
+
+    /// The plaintext behind `secret_ref`, stored for the setting at `tenant`.
+    ///
+    /// # Errors
+    /// [`DomainError::NotFound`] on the value when the store holds no entry,
+    /// [`DomainError::Unavailable`] when it cannot answer.
+    async fn resolve_plaintext(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<String, DomainError>;
+
+    /// Release the entry behind `secret_ref`; an absent entry is already done.
+    ///
+    /// # Errors
+    /// [`DomainError::Unavailable`] when the store cannot answer.
+    async fn delete_secret(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<(), DomainError>;
 }
 
-/// The binding while the Secret Manager is not built.
+/// The binding while no Credential Store is available.
 pub struct NoSecretManager;
+
+const NO_STORE: &str = "secret values are not supported: no Secret Manager is bound";
 
 #[async_trait]
 impl SecretManager for NoSecretManager {
@@ -37,9 +63,50 @@ impl SecretManager for NoSecretManager {
         _plaintext: &Value,
     ) -> Result<String, DomainError> {
         Err(DomainError::Unavailable {
-            detail: "secret values are not supported yet: no Secret Manager is bound".to_owned(),
+            detail: NO_STORE.to_owned(),
         })
     }
+
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<String, DomainError> {
+        Err(DomainError::Unavailable {
+            detail: NO_STORE.to_owned(),
+        })
+    }
+
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::Unavailable {
+            detail: NO_STORE.to_owned(),
+        })
+    }
+}
+
+/// Decides whether a machine caller may resolve one setting's plaintext.
+///
+/// The decision is per setting: the resource is the value type and the
+/// declaration is its id, so a service is granted the secrets it needs one at
+/// a time or by a wider grant, never by holding the reader.
+#[async_trait]
+pub trait SecretResolveGate: Send + Sync {
+    /// Refuse or permit `ctx` to resolve the declaration's plaintext.
+    ///
+    /// # Errors
+    /// [`DomainError::Unauthorized`] on the value when the decision is deny or
+    /// cannot be obtained.
+    async fn may_resolve(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        declaration_id: Uuid,
+    ) -> Result<(), DomainError>;
 }
 
 /// What the write path publishes after a change is durably committed, or

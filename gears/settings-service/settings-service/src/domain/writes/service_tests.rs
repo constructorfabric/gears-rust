@@ -9,10 +9,10 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{Change, Committed, Gated, StepUpPolicy, ValueWriter, WriteActor};
-use crate::audit::AuditOperation;
+use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
 use crate::domain::error::DomainError;
-use crate::domain::ports::{NoMetrics, NoSecretManager, ValueEvent};
+use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
 use crate::domain::resolution::{ScopeTarget, scope_class};
 use crate::domain::stepup::{NoStepUpVerifier, StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
@@ -21,7 +21,7 @@ use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    FixedStepUp, RecordingAudit, RecordingPublisher, ResolutionHarness, SECRET,
+    FixedStepUp, RecordingAudit, RecordingPublisher, RecordingSecrets, ResolutionHarness, SECRET,
     resolution_catalogue,
 };
 
@@ -40,6 +40,22 @@ impl WriteHarness {
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
+        Self::build(step_up, Arc::new(NoSecretManager)).await
+    }
+
+    /// A harness whose Secret Manager keeps plaintext in memory and remembers
+    /// what it released.
+    async fn with_secrets() -> (Self, Arc<RecordingSecrets>) {
+        let secrets = Arc::new(RecordingSecrets::default());
+        let harness = Self::build(
+            Arc::new(NoStepUpVerifier::default()),
+            Arc::clone(&secrets) as Arc<dyn SecretManager>,
+        )
+        .await;
+        (harness, secrets)
+    }
+
+    async fn build(step_up: Arc<dyn StepUpVerifier>, secrets: Arc<dyn SecretManager>) -> Self {
         let base = ResolutionHarness::new().await;
         let audit = Arc::new(RecordingAudit::default());
         let published = Arc::new(RecordingPublisher::default());
@@ -49,7 +65,7 @@ impl WriteHarness {
             Arc::new(GtsTypeValidator::new(resolution_catalogue())),
             Arc::clone(&audit),
             step_up,
-            Arc::new(NoSecretManager),
+            secrets,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
         ));
@@ -151,10 +167,15 @@ impl WriteHarness {
         if_match: Option<&str>,
     ) -> Result<Committed, DomainError> {
         let gated = self.gate(actor, name, target).await?;
+        // The coordinator's sequence: stage outside, commit inside, discard on
+        // a refusal so a staged secret never outlives its write.
+        let staged = self.writer.stage(&gated, change).await?;
         let writer = Arc::clone(&self.writer);
         let actor_owned = actor.clone();
         let if_match = if_match.map(str::to_owned);
-        let committed = self
+        let gated_owned = gated.clone();
+        let staged_owned = staged.clone();
+        let outcome = self
             .base
             .db
             .db()
@@ -163,8 +184,8 @@ impl WriteHarness {
                     writer
                         .commit_in(
                             tx,
-                            &gated,
-                            change,
+                            &gated_owned,
+                            &staged_owned,
                             if_match.as_deref(),
                             &actor_owned,
                             Uuid::new_v4(),
@@ -172,7 +193,14 @@ impl WriteHarness {
                         .await
                 })
             })
-            .await?;
+            .await;
+        let committed = match outcome {
+            Ok(committed) => committed,
+            Err(err) => {
+                self.writer.discard(&gated, &staged).await;
+                return Err(err);
+            }
+        };
         self.writer.after_commit(&committed, actor).await;
         Ok(committed)
     }
@@ -721,23 +749,21 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
         )
         .await
         .expect("gated");
+    let staged = writer
+        .stage(&gated, Change::Set(json!(true)))
+        .await
+        .expect("staged");
     let outcome = base
         .db
         .db()
         .transaction_ref_mapped::<_, Committed, DomainError>(|tx| {
             let writer = Arc::clone(&writer);
             let gated = gated.clone();
+            let staged = staged.clone();
             let actor = actor.clone();
             Box::pin(async move {
                 writer
-                    .commit_in(
-                        tx,
-                        &gated,
-                        Change::Set(json!(true)),
-                        Some("absent"),
-                        &actor,
-                        Uuid::new_v4(),
-                    )
+                    .commit_in(tx, &gated, &staged, Some("absent"), &actor, Uuid::new_v4())
                     .await
             })
         })
@@ -754,4 +780,277 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
             .is_none(),
         "the value rolled back with its record"
     );
+}
+
+async fn declare_secret(h: &WriteHarness) -> Uuid {
+    let d = h
+        .base
+        .declare_typed(
+            "api_token",
+            scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    h.clear_step_up_as(d, "secret").await;
+    d
+}
+
+#[tokio::test]
+async fn a_secret_write_stores_only_the_reference_and_masks_both_images() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    let d = declare_secret(&h).await;
+    let root = h.base.tree.root;
+    let committed = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await
+        .expect("stored");
+    assert!(committed.released_secret.is_none());
+
+    let conn = h.base.db.conn().expect("connection");
+    let row = ValueRepo
+        .find_one(&conn, &AccessScope::allow_all(), d, root)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert!(row.value.is_none());
+    let reference = row.secret_ref.clone().expect("the row holds the reference");
+    assert_eq!(committed.new_value, Some(json!(reference)));
+    assert_eq!(
+        secrets
+            .entries
+            .lock()
+            .expect("lock")
+            .get(&reference)
+            .map(String::as_str),
+        Some("hunter2")
+    );
+    {
+        let records = h.audit.records.lock().expect("lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].post_image, Some(AuditValue::Masked));
+        assert!(
+            !serde_json::to_string(&*records)
+                .expect("json")
+                .contains("hunter2")
+        );
+    }
+
+    // A second set creates a new entry, points the row at it, and releases the
+    // superseded one after the commit: one row, one live entry.
+    let again = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter3")),
+            Some(&committed.etag),
+        )
+        .await
+        .expect("re-set");
+    let newer = again
+        .new_value
+        .as_ref()
+        .and_then(Value::as_str)
+        .expect("a reference")
+        .to_owned();
+    assert_ne!(newer, reference);
+    assert_eq!(again.released_secret.as_deref(), Some(reference.as_str()));
+    assert_eq!(secrets.held(), vec![newer.clone()]);
+    assert_eq!(
+        secrets
+            .entries
+            .lock()
+            .expect("lock")
+            .get(&newer)
+            .map(String::as_str),
+        Some("hunter3")
+    );
+    assert_eq!(*secrets.deleted.lock().expect("lock"), vec![reference]);
+}
+
+#[tokio::test]
+async fn a_set_refused_on_its_tag_releases_the_entry_it_created_and_keeps_the_live_one() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    declare_secret(&h).await;
+    let root = h.base.tree.root;
+    let live = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await
+        .expect("stored");
+    let live_ref = live
+        .new_value
+        .as_ref()
+        .and_then(Value::as_str)
+        .expect("a reference")
+        .to_owned();
+
+    // Stale tag: the plaintext already went to the store, so the refusal
+    // releases that entry and the live one is untouched.
+    let refused = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("intruder")),
+            Some("absent"),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DomainError::PreconditionFailed { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(secrets.held(), vec![live_ref.clone()]);
+    assert_eq!(
+        secrets
+            .entries
+            .lock()
+            .expect("lock")
+            .get(&live_ref)
+            .map(String::as_str),
+        Some("hunter2")
+    );
+    let deleted = secrets.deleted.lock().expect("lock");
+    assert_eq!(deleted.len(), 1);
+    assert_ne!(deleted[0], live_ref);
+}
+
+#[tokio::test]
+async fn removing_a_secret_releases_its_entry_after_the_commit() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    declare_secret(&h).await;
+    let root = h.base.tree.root;
+    let set = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await
+        .expect("stored");
+    let reference = set
+        .new_value
+        .as_ref()
+        .and_then(Value::as_str)
+        .expect("a reference")
+        .to_owned();
+
+    let removed = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Remove,
+            Some(&set.etag),
+        )
+        .await
+        .expect("removed");
+    assert_eq!(removed.released_secret.as_deref(), Some(reference.as_str()));
+    assert_eq!(
+        *secrets.deleted.lock().expect("lock"),
+        vec![reference.clone()]
+    );
+    assert!(
+        !secrets
+            .entries
+            .lock()
+            .expect("lock")
+            .contains_key(&reference)
+    );
+
+    // Set again afterwards: the entry is created anew under the same reference.
+    h.write(
+        &actor(root),
+        "api_token",
+        None,
+        Change::Set(json!("fresh")),
+        Some("absent"),
+    )
+    .await
+    .expect("set again");
+    assert_eq!(secrets.held().len(), 1);
+    assert!(!secrets.held().contains(&reference));
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_answer_refuses_the_write_and_nothing_lands() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    let d = declare_secret(&h).await;
+    let root = h.base.tree.root;
+    secrets.go_down();
+    let refused = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DomainError::Unavailable { .. })),
+        "{refused:?}"
+    );
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_one(&conn, &AccessScope::allow_all(), d, root)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(h.audit.records.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_release_does_not_fail_the_removal() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    let d = declare_secret(&h).await;
+    let root = h.base.tree.root;
+    let set = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await
+        .expect("stored");
+    secrets.go_down();
+    let removed = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Remove,
+            Some(&set.etag),
+        )
+        .await
+        .expect("the removal stands");
+    assert!(removed.released_secret.is_some());
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_one(&conn, &AccessScope::allow_all(), d, root)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(secrets.deleted.lock().expect("lock").is_empty());
 }

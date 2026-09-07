@@ -11,16 +11,38 @@ use toolkit_security::SecurityContext;
 
 use super::ReaderClient;
 use crate::domain::resolution::scope_class;
-use crate::test_support::ResolutionHarness;
+use crate::domain::secrets::SecretResolver;
+use crate::test_support::{
+    AllowAllGate, RecordingAudit, RecordingSecrets, ResolutionHarness, SECRET,
+};
 
-fn reader(
-    h: &ResolutionHarness,
-) -> ReaderClient<
+type Reader = ReaderClient<
     crate::infra::storage::declaration_repo::DeclarationRepo,
     crate::infra::storage::value_repo::ValueRepo,
     crate::infra::storage::access_repo::AccessRepo,
-> {
-    ReaderClient::new(Arc::clone(&h.db), Arc::clone(&h.resolver))
+    Arc<RecordingAudit>,
+>;
+
+/// The reader over the harness, with a fake store and an open gate; the
+/// store and the audit sink come back for inspection.
+fn reader_with(h: &ResolutionHarness) -> (Reader, Arc<RecordingSecrets>, Arc<RecordingAudit>) {
+    let secrets = Arc::new(RecordingSecrets::default());
+    let audit = Arc::new(RecordingAudit::default());
+    let resolver = Arc::new(SecretResolver::new(
+        Arc::clone(&h.resolver),
+        Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::new(AllowAllGate),
+        Arc::clone(&audit),
+    ));
+    (
+        ReaderClient::new(Arc::clone(&h.db), Arc::clone(&h.resolver), resolver),
+        secrets,
+        audit,
+    )
+}
+
+fn reader(h: &ResolutionHarness) -> Reader {
+    reader_with(h).0
 }
 
 fn scope_of(tenant: uuid::Uuid) -> String {
@@ -248,7 +270,82 @@ async fn a_category_selector_resolves_every_declaration_filed_under_it() {
 }
 
 #[tokio::test]
-async fn secret_resolution_is_not_available_yet() {
+async fn a_secret_setting_reads_as_an_opaque_handle_that_resolves_only_through_the_reader() {
+    let h = ResolutionHarness::new().await;
+    let (reader, secrets, audit) = reader_with(&h);
+    let d = h
+        .declare_typed(
+            "api_token",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    let key = h.key("api_token");
+    let scope = scope_of(h.tree.b);
+
+    // Unconfigured: still a handle, `source=schema_default`, and resolving it
+    // is `SecretNotConfigured`, never the placeholder.
+    let unconfigured = reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            GetEffectiveRequest {
+                key: key.clone(),
+                scope: scope.clone(),
+            },
+        )
+        .await
+        .expect("resolves");
+    assert_eq!(unconfigured.source, EffectiveSource::SchemaDefault);
+    let token = unconfigured.value.as_str().expect("a handle string");
+    assert!(token.starts_with("sh1."));
+    let err = reader
+        .resolve_secret(
+            &SecurityContext::anonymous(),
+            settings_service_sdk::SecretHandle::new(token),
+        )
+        .await
+        .expect_err("unconfigured");
+    assert!(matches!(
+        SettingsError::from(err),
+        SettingsError::SecretNotConfigured { .. }
+    ));
+
+    // Configured at `a`: the handle for `b` is the same shape, carries neither
+    // the reference nor `a`, and resolves to the plaintext with one record.
+    let reference = "seeded-at-a".to_owned();
+    secrets.seed(&reference, "hunter2");
+    h.set_secret(d, h.tree.a, &reference).await;
+    // The harness writes the row directly, so it evicts by hand what a
+    // committed write would have evicted.
+    h.cache.invalidate_key(key.as_str());
+    let configured = reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            GetEffectiveRequest {
+                key: key.clone(),
+                scope: scope.clone(),
+            },
+        )
+        .await
+        .expect("resolves");
+    assert_eq!(configured.source, EffectiveSource::Inherited);
+    let token = configured.value.as_str().expect("a handle string");
+    assert!(!token.contains(&reference) && !token.contains(&h.tree.a.to_string()));
+    let plaintext = reader
+        .resolve_secret(
+            &SecurityContext::anonymous(),
+            settings_service_sdk::SecretHandle::new(token),
+        )
+        .await
+        .expect("resolved");
+    assert_eq!(plaintext, "hunter2");
+    assert_eq!(audit.operations(), vec!["secret_use"]);
+}
+
+#[tokio::test]
+async fn a_malformed_handle_projects_to_an_invalid_argument() {
     let h = ResolutionHarness::new().await;
     let err = reader(&h)
         .resolve_secret(
@@ -256,9 +353,9 @@ async fn secret_resolution_is_not_available_yet() {
             settings_service_sdk::SecretHandle::new("x"),
         )
         .await
-        .expect_err("not built");
+        .expect_err("malformed");
     assert!(matches!(
         SettingsError::from(err),
-        SettingsError::Unavailable { .. }
+        SettingsError::Other { .. }
     ));
 }

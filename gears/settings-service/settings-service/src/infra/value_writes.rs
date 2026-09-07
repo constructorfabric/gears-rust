@@ -128,9 +128,23 @@ impl WriteCoordinator {
     ) -> Result<Committed, DomainError> {
         let key = gated.declaration.key.clone();
         let tenant_id = gated.tenant_id;
+        // Validation and the store leg come first, outside the transaction: the
+        // Credential Store cannot join it, and toolkit-db refuses a fresh
+        // connection while one is open on this task.
+        let staged = match self.writer.stage(&gated, change).await {
+            Ok(staged) => staged,
+            Err(err) => {
+                self.writer
+                    .after_rejection(&key, tenant_id, actor, &err)
+                    .await;
+                return Err(err);
+            }
+        };
         let writer = Arc::clone(&self.writer);
         let actor_owned = actor.clone();
         let if_match = if_match.map(str::to_owned);
+        let gated_owned = gated.clone();
+        let staged_owned = staged.clone();
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-3
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-4
         let outcome = self
@@ -141,8 +155,8 @@ impl WriteCoordinator {
                     writer
                         .commit_in(
                             tx,
-                            &gated,
-                            change,
+                            &gated_owned,
+                            &staged_owned,
                             if_match.as_deref(),
                             &actor_owned,
                             change_set_id,
@@ -157,6 +171,7 @@ impl WriteCoordinator {
                 Ok(committed)
             }
             Err(err) => {
+                self.writer.discard(&gated, &staged).await;
                 self.writer
                     .after_rejection(&key, tenant_id, actor, &err)
                     .await;

@@ -3134,6 +3134,8 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "cf-gears-authz-resolver-sdk",
+ "cf-gears-credstore",
+ "cf-gears-credstore-sdk",
  "cf-gears-settings-service-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",

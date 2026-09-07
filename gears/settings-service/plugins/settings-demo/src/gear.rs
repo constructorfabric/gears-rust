@@ -104,6 +104,33 @@ impl SystemCapability for SettingsDemo {
                 warn!(key = %key, %error, "settings-demo could not read its setting back");
             }
         }
+
+        // The machine path for the demo's secret, the way a consuming gear takes
+        // it: the value comes back as an opaque handle, and resolving it is
+        // authorized per setting and audited. The plaintext itself is never
+        // logged; an unconfigured secret answers `SecretNotConfigured`.
+        if let Some(secret) = catalog::declarations()?
+            .into_iter()
+            .find(|d| d.key.as_str().contains("api_token"))
+        {
+            let ctx = SecurityContext::anonymous();
+            let request = GetEffectiveRequest {
+                key: secret.key.clone(),
+                scope: "/".to_owned(),
+            };
+            let outcome = match reader.get_effective(&ctx, request).await {
+                Ok(effective) => match effective.value.as_str() {
+                    Some(token) => reader
+                        .resolve_secret(&ctx, settings_service_sdk::SecretHandle::new(token))
+                        .await
+                        .map(|plaintext| format!("plaintext of {} bytes", plaintext.len()))
+                        .map_err(|e| settings_service_sdk::SettingsError::from(e).to_string()),
+                    None => Err("the effective value carries no handle".to_owned()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            info!(key = %secret.key, ?outcome, "settings-demo took the machine path for its secret");
+        }
         Ok(())
     }
 }

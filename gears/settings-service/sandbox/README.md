@@ -1,7 +1,7 @@
 # Settings Service sandbox
 
 A local environment for building a frontend against the Settings Service:
-the example server with fifteen demo declarations in four categories, a set of
+the example server with sixteen demo declarations in four categories, a set of
 test identities, and a throwaway page that drives every endpoint so the
 request flows can be watched raw.
 
@@ -144,6 +144,14 @@ Declarations carry `default_value`, `data_classification`, `has_secret_trait`,
 `requires_step_up`, `anonymous_exposable`, `source`, `last_change_at` and
 `etag`; `GET /settings-service/v1/declarations/{id}` sets the `ETag` header.
 
+Secret settings: a declaration whose value type carries the `secret` trait
+(`has_secret_trait`, `data_classification: "secret"`) is written like any
+other value, but the plaintext goes to the credential store and the row keeps
+only a reference. Every read, browse, write response and history entry shows
+the mask token `********`; there is no way to read a secret back. Recovering
+a lost secret means setting it again. A consuming gear resolves the plaintext
+through the SDK reader, never through REST.
+
 | Status | When |
 |---|---|
 | 400 | malformed key or `tenant`, invalid value (with `violations`), unsupported OData, over 500 batch changes |
@@ -154,14 +162,16 @@ Declarations carry `default_value`, `data_classification`, `has_secret_trait`,
 | 410 | the declaration is retired |
 | 412 | `If-Match` stale: the value moved since it was read |
 | 428 | `If-Match` missing |
-| 503 | a dependency cannot answer; a write to a secret setting, since no secret store is bound yet |
+| 503 | a dependency cannot answer, the credential store included |
 
 ## What is not there yet
 
 - Administrative creation of declarations: they come from gears through the
   SDK. The demo gear is the only contributor.
-- Secret values cannot be set (503) until the Secret Manager lands; render
-  secret settings read-only.
+- Secret values live in the `credstore` gear; the sandbox binds its static
+  plugin, which keeps entries in memory only. After a server restart a secret
+  setting still shows its masked row, but the credential behind it is gone
+  and the machine path answers `SecretNotConfigured` until it is set again.
 - Step-up needs an identity provider configured under `step_up` in the gear's
   config; the sandbox has none, so any declaration with `requires_step_up`
   answers 401 on write. The demo declarations opt out, except `api_token`.

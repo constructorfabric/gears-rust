@@ -25,6 +25,10 @@ authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 types-registry-sdk = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
 types-registry = { workspace = true }
+# The Credential Store behind the Secret Manager: plaintext lives there, the
+# settings row holds the reference (DESIGN.md §4.2 *Secret Manager*).
+credstore-sdk = { workspace = true }
+credstore = { workspace = true }
 uuid = { workspace = true }
 # Type Validator: structural + `format` assertions, and the regex trait check.
 jsonschema = { workspace = true }

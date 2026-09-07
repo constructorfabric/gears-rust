@@ -10,6 +10,7 @@ pub mod odata;
 pub mod platform_scope;
 pub mod ports;
 pub mod resolution;
+pub mod secrets;
 pub mod stepup;
 pub mod validation;
 pub mod value;

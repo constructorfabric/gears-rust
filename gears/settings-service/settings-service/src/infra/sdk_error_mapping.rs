@@ -121,6 +121,16 @@ impl From<DomainError> for CanonicalError {
             // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
 
             // 404 — names the kind of resource, never the caller's identifier.
+            // On the value type it means "no credential is configured", which
+            // the SDK projects to `SecretNotConfigured`; a consumer must never
+            // mistake it for a missing declaration.
+            DomainError::NotFound { resource }
+                if resource == settings_service_sdk::gts::VALUE_SCHEMA =>
+            {
+                ValueResource::not_found("no credential is configured at any scope")
+                    .with_resource(resource)
+                    .create()
+            }
             DomainError::NotFound { resource } => {
                 SettingsResource::not_found(format!("no such {resource}"))
                     .with_resource(resource)
