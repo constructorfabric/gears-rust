@@ -175,6 +175,15 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
 .row .ask{font-size:1.2cqw; color:var(--ink-2); line-height:1.35; border-left:2px solid var(--green); padding-left:1.1cqw}
 .row .ask b{color:var(--green); font-weight:600}
 
+.take{
+  flex:none; margin:0; display:flex; align-items:baseline; gap:1cqw;
+  font-size:1.2cqw; line-height:1.4; color:var(--ink); max-width:84cqw;
+  border-top:1px solid var(--line); padding-top:.9cqw;
+}
+.take b{font-family:'IBM Plex Mono',monospace; font-size:.95cqw; letter-spacing:.12em; text-transform:uppercase; color:var(--blue); font-weight:500; flex:none}
+.cover .take{border-top:0; padding-top:0; margin-top:1.4cqw; max-width:60cqw}
+.slide{gap:1.7cqw}
+.s-foot{font-size:1.22cqw}
 .pageno{position:absolute; right:2.6cqw; bottom:2.2cqw; font-family:'IBM Plex Mono',monospace; font-size:1cqw; color:var(--ink-3); letter-spacing:.08em}
 
 /* nav */
@@ -212,6 +221,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
       <div class="by">
         <span>Graph Storage gear · prototype v0.1.2</span><span>·</span><span>studio-internal / domain-model-ui tools</span><span>·</span><span>2026-09-07 → 09</span>
       </div>
+    
+      <p class="take"><b>Takeaway</b>Three days, two repositories, one question: can the model itself be the API?</p>
     </section>
 
     <!-- 2 idea -->
@@ -249,6 +260,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
         </figure>
       </div>
       <p class="s-foot"><b>The architect's asks:</b> generate properties and links for free, register them in GTS, load the graph, count objects and find explosion points, and filter or sort any field through the API.</p>
+    
+      <p class="take"><b>Takeaway</b>The model is the configuration; the graph is the service. No code per type.</p>
     </section>
 
     <!-- 3 what we built -->
@@ -277,6 +290,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
         </div>
       </div>
       <p class="s-foot">Everything runs against the studio-web compose stand; the model's own <span class="mono">npm test</span> stays green.</p>
+    
+      <p class="take"><b>Takeaway</b>Two small gear changes and two dependency-free scripts were enough to test the idea end to end.</p>
     </section>
 
     <!-- 4 simple example -->
@@ -331,6 +346,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
         </div>
       </div>
       <p class="s-foot">The relation becomes an edge type, <span class="mono">…static_edge.v1~cf.studio.rel.implemented_by.v1~</span>, whose <span class="mono">src_types</span>/<span class="mono">dst_types</span> traits name the admissible endpoints. The gear validates every ingested payload against this chain.</p>
+    
+      <p class="take"><b>Takeaway</b>Nothing of the model's meaning is lost in translation, and every payload is validated against it.</p>
     </section>
 
     <!-- 5 GTS chain -->
@@ -370,6 +387,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
           <figcaption>Up to five segments. The GTS guideline recommends three; the gear's <span class="mono">ontology_max_chain_depth</span> (default 3, Studio 8) makes it a deployment choice, and nothing in the gear depends on the depth.</figcaption>
         </figure>
       </div>
+    
+      <p class="take"><b>Takeaway</b>Inheritance in the identifier turns the model's hierarchy into a query language.</p>
     </section>
 
     <!-- 6 queries -->
@@ -398,6 +417,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </table>
       </div>
       <p class="s-foot">Kinds come from the schema: numbers compare as numbers, enums as text, dates as RFC 3339 text. Rows missing the attribute sort last. Equality is served by a GIN over the payload; range and order read the attribute, see the index slide.</p>
+    
+      <p class="take"><b>Takeaway</b>Filter and sort by any declared field, nested or not, through the platform's own OData surface.</p>
     </section>
 
     <!-- 7 load metrics -->
@@ -422,6 +443,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </table>
       </div>
       <p class="s-foot">Embedding off during load (vectors cost more than everything else together; only content types need them). Scale 0.2 is the PRD's benchmark size, 100k nodes / 500k edges. Compose stand on WSL2, PostgreSQL 19.</p>
+    
+      <p class="take"><b>Takeaway</b>PRD-scale volumes load in minutes on a laptop; the volume profile behind them is still a guess.</p>
     </section>
 
     <!-- 8 read metrics -->
@@ -445,6 +468,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </table>
       </div>
       <p class="s-foot"><b>Every query is bounded and says why it stopped.</b> Traversal hits the node budget and reports it instead of hanging; this is the answer to the worry about unpredictable graph queries.</p>
+    
+      <p class="take"><b>Takeaway</b>Every read is bounded and says why it stopped.</p>
     </section>
 
     <!-- 9 index experiment -->
@@ -466,6 +491,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
   WHERE deleted_at IS NULL;      <span class="c">-- built in 0.7 s, 34 MB for 250k rows</span></pre>
       </div>
       <p class="s-foot">The gear's statement already has the shape the index serves; it cannot create the index, because the platform's secure ORM exposes no DDL to a gear. Filed as <b>gears-rust #4721</b>. Detail learned: the DDL must render the same expressions as the query, or the planner ignores the index for ordering.</p>
+    
+      <p class="take"><b>Takeaway</b>Range and order cost exactly one missing index; the platform, not the gear, has to allow it.</p>
     </section>
 
     <!-- 10 explosion points -->
@@ -501,6 +528,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </div>
       </div>
       <p class="s-foot">The profile is a guess by bucket: at scale 1 it is 1.39 M nodes. <b>The model itself should carry the estimate</b> (a volume class per entity, a fan-out bound per relation), and an <span class="mono">analyze</span> pass can then warn before anything is loaded. The model already has Record and Link primitives for events and non-traversable hub edges; they are not used.</p>
+    
+      <p class="take"><b>Takeaway</b>Explosion points are visible before anything is loaded; volume estimates belong in the model.</p>
     </section>
 
     <!-- 11 conflicts -->
@@ -529,6 +558,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </div>
         <p class="s-foot" style="max-width:100%">A derived GTS type must accept a subset of its base, and <span class="mono">allOf</span> branches evaluate independently, so an instance with <span class="mono">version: "1.2.0"</span> fails the parent and <span class="mono">version: 3</span> fails the child: no instance satisfies both. The exporter keeps the ancestor's declaration and lists the conflicts; the same rule belongs in the model's own validator.</p>
       </div>
+    
+      <p class="take"><b>Takeaway</b>Typing the model found 26 defects in the model itself; the rule belongs in its validator.</p>
     </section>
 
     <!-- 12 evolution -->
@@ -552,6 +583,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </table>
       </div>
       <p class="s-foot">The gear registers a type once and refuses a changed schema under a known id. A revision per upload makes every edit a fresh, complete set: no conflict, validation intact, no gear change. The price: old objects stay on the old revision until re-ingested, and the catalogue grows per revision. The product answer is an in-place update for compatible changes.</p>
+    
+      <p class="take"><b>Takeaway</b>Edit, upload, repeat: now without conflicts or database resets, at the price of revisions.</p>
     </section>
 
     <!-- 13 strengths / weaknesses -->
@@ -584,6 +617,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
           </div>
         </div>
       </div>
+    
+      <p class="take"><b>Takeaway</b>Strengths are measured; each weakness has a known owner and a known next step.</p>
     </section>
 
     <!-- 14 next -->
@@ -612,6 +647,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
         </div>
       </div>
       <p class="s-foot">Then the two pillars this experiment did not touch: parameterised widgets that read a type's declared fields and query them, and change events from the graph for a serverless runtime (<span class="mono">emit_events</span> exists as a trait, publication does not).</p>
+    
+      <p class="take"><b>Takeaway</b>A product path exists and is split by owner: platform, gear, model.</p>
     </section>
 
   </div>
