@@ -130,6 +130,9 @@ figcaption{font-size:1.15cqw; color:var(--ink-3); text-align:center; line-height
 
 /* two columns */
 .cols{display:grid; grid-template-columns:1fr 1fr; gap:2.2cqw}
+.cols > *{min-width:0}
+.cols.code-pair{grid-template-columns:47fr 53fr; gap:1.8cqw}
+.cols.code-pair pre.code{font-size:1.02cqw; line-height:1.48; padding:1.1cqw 1.3cqw}
 .col h3{font-family:'IBM Plex Mono',monospace; font-size:1.1cqw; font-weight:500; letter-spacing:.1em; text-transform:uppercase; margin:0 0 1cqw}
 .col.ok h3{color:var(--green)} .col.no h3{color:var(--amber)}
 .chips{display:flex; flex-direction:column; gap:.55cqw; margin:0; padding:0; list-style:none}
@@ -142,7 +145,7 @@ figcaption{font-size:1.15cqw; color:var(--ink-3); text-align:center; line-height
 pre.code{
   margin:0; background:var(--panel); border:1px solid var(--line); border-radius:.7cqw;
   padding:1.3cqw 1.5cqw; font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:1.12cqw; line-height:1.5;
-  color:var(--ink); overflow:hidden; white-space:pre;
+  color:var(--ink); overflow:auto; white-space:pre;
 }
 pre.code .c{color:var(--ink-3)} pre.code .k{color:var(--blue)} pre.code .s{color:var(--green)} pre.code .h{color:var(--amber)}
 .code-title{font-family:'IBM Plex Mono',monospace; font-size:1cqw; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); margin:0 0 .6cqw}
@@ -283,7 +286,7 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
         <h2>One entity in, one typed schema out</h2>
       </header>
       <div class="s-body">
-        <div class="cols">
+        <div class="cols code-pair">
           <div>
             <p class="code-title">kits/sdlc-full/entities.json</p>
 <pre class="code">{
@@ -293,7 +296,8 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
     { <span class="k">"name"</span>: <span class="s">"key"</span>,       <span class="k">"type"</span>: <span class="s">"string"</span>, <span class="k">"required"</span>: true },
     { <span class="k">"name"</span>: <span class="s">"statement"</span>, <span class="k">"type"</span>: <span class="s">"TextContent"</span>, <span class="k">"required"</span>: true },
     { <span class="k">"name"</span>: <span class="s">"status"</span>,
-      <span class="k">"type"</span>: <span class="s">"proposed | approved | implemented | verified | retired"</span> },
+      <span class="k">"type"</span>: <span class="s">"proposed | approved | implemented |</span>
+<span class="s">               verified | retired"</span> },
     { <span class="k">"name"</span>: <span class="s">"implemented_by"</span>, <span class="k">"type"</span>: <span class="s">"WorkItem"</span>,
       <span class="k">"relation"</span>: <span class="s">"work-item"</span>, <span class="k">"relationType"</span>: <span class="s">"derives"</span> }
   ]
@@ -302,20 +306,25 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
           <div>
             <p class="code-title">out/types/…sdlc.requirement.v1~.schema.json</p>
 <pre class="code">{
-  <span class="k">"$id"</span>: <span class="s">"gts://…owned_node.v1~cf.studio.core.managed_object.v1~</span>
-<span class="s">          cf.studio.core.document.v1~cf.studio.sdlc.requirement.v1~"</span>,
+  <span class="k">"$id"</span>: <span class="s">"gts://…owned_node.v1~</span>
+<span class="s">          cf.studio.core.managed_object.v1~</span>
+<span class="s">          cf.studio.core.document.v1~</span>
+<span class="s">          cf.studio.sdlc.requirement.v1~"</span>,
   <span class="k">"x-gts-traits"</span>: {
-    <span class="k">"index"</span>: [<span class="s">"/payload/status"</span>, <span class="s">"/payload/priority"</span>, <span class="s">"/payload/key"</span>, <span class="c">…</span>],
-    <span class="k">"full_text_search"</span>: [<span class="s">"/name"</span>, <span class="s">"/payload/title"</span>, <span class="s">"/payload/statement"</span>],
+    <span class="k">"index"</span>: [<span class="s">"/payload/status"</span>, <span class="s">"/payload/priority"</span>, <span class="c">…</span>],
+    <span class="k">"full_text_search"</span>: [<span class="s">"/name"</span>, <span class="s">"/payload/statement"</span>, <span class="c">…</span>],
     <span class="k">"vector_search"</span>: [<span class="s">"/payload/title"</span>, <span class="s">"/payload/statement"</span>]
   },
   <span class="k">"allOf"</span>: [
-    { <span class="k">"$ref"</span>: <span class="s">"gts://…core.document.v1~"</span> },          <span class="c">← parent</span>
-    { <span class="k">"properties"</span>: { <span class="k">"payload"</span>: { <span class="k">"properties"</span>: {
-        <span class="k">"key"</span>: { <span class="k">"type"</span>: <span class="s">"string"</span> },
-        <span class="k">"statement"</span>: { <span class="k">"type"</span>: <span class="s">"string"</span> },
-        <span class="k">"status"</span>: { <span class="k">"enum"</span>: [<span class="s">"proposed"</span>, <span class="s">"approved"</span>, <span class="c">…</span>] } },
-      <span class="k">"required"</span>: [<span class="s">"key"</span>, <span class="s">"statement"</span>] } } }
+    { <span class="k">"$ref"</span>: <span class="s">"gts://…core.document.v1~"</span> },   <span class="c">← the parent</span>
+    { <span class="k">"properties"</span>: { <span class="k">"payload"</span>: {
+        <span class="k">"properties"</span>: {
+          <span class="k">"key"</span>:       { <span class="k">"type"</span>: <span class="s">"string"</span> },
+          <span class="k">"statement"</span>: { <span class="k">"type"</span>: <span class="s">"string"</span> },
+          <span class="k">"status"</span>:    { <span class="k">"enum"</span>: [<span class="s">"proposed"</span>, <span class="s">"approved"</span>, <span class="c">…</span>] }
+        },
+        <span class="k">"required"</span>: [<span class="s">"key"</span>, <span class="s">"statement"</span>]
+    } } }
   ]
 }</pre>
           </div>
