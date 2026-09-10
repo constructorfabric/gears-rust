@@ -1,7 +1,8 @@
 ---
-status: proposed
+status: accepted
 date: 2026-09-10
-decision-makers: Graph Storage design review
+decision-makers: V. Shandyba (Graph Storage gear owner and implementer of this change)
+review-evidence: conformance suite on both store implementations; stand rehearsal against the loaded Studio domain model (see Confirmation)
 ---
 
 # ADR-0006: A backward-compatible type change is admitted under the same identifier
@@ -25,6 +26,19 @@ decision-makers: Graph Storage design review
 <!-- /toc -->
 
 **ID**: `cpt-cf-graph-storage-adr-type-evolution`
+
+> **Accepted 2026-09-10 on the evidence under [Confirmation](#confirmation)**:
+> the decision is implemented, covered by seven conformance cases against both
+> store implementations, and rehearsed against a stand carrying the loaded
+> Studio domain model. Accepted by the gear owner rather than by a convened
+> design review, and recorded that way on purpose — this narrows a normative
+> MUST of the PRD, so a reader is entitled to know how wide the agreement
+> behind it is. Two follow-on decisions are deliberately **not** covered here
+> and want their own record: payload-rewriting migrations (§ 4.3 of
+> [`dev/type-update-plan.md`](../../dev/type-update-plan.md), unbuilt), and
+> closing the payload level in the exporter, which is a producer-visible
+> contract change even though DESIGN § 3.1's authoring rule 3 already sanctions
+> the shape.
 
 ## Context and Problem Statement
 

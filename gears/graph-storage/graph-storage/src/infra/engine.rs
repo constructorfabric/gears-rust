@@ -263,7 +263,7 @@ async fn edge_type_ids(
 
 /// One-statement hop through `GRAPH_TABLE`, anchored on the frontier.
 ///
-/// The pattern is a candidate producer (ADR-0006): it carries the caller's
+/// The pattern is a candidate producer (ADR-0005): it carries the caller's
 /// scope on every element, and the edge rows are then read back through an
 /// ordinary scoped query, which is where the tombstone and edge-type filters
 /// live — a column outside the element's `PROPERTIES` is invisible to

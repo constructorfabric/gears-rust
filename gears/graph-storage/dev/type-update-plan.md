@@ -235,7 +235,7 @@ in the API docs rather than smoothed over.
 | `infra/fake_store.rs` | Mirror update + migration in memory so the fake lane covers the same conformance cases. |
 | `api/rest/{dto,handlers,routes}.rs` | The new route, the option, the response shapes, the 409 body carrying diagnostics. |
 | `config.rs` | `type_update_max_rows` (default 100 000, range 1..=5 000 000), `type_update_batch` (default 2 000), `type_update_max_reported_rows` (default 50). |
-| `dev/DEVIATIONS.md`, `docs/ADR/0006-…-type-update.md`, `docs/api docs` | D-031 for what is built and what is not; an ADR because this is a contract decision, citing types-registry ADR-0003/0004/0005 rather than restating them. |
+| `dev/DEVIATIONS.md`, `docs/ADR/0006-…-type-evolution.md`, `docs/api docs` | D-031 for what is built and what is not; an ADR because this is a contract decision, citing types-registry ADR-0003/0004/0005 rather than restating them. |
 
 Authorization: a payload rewrite is a write over tenant data and must not ride
 on the registration action. New action `types.migrate` alongside
@@ -544,7 +544,8 @@ backward-compatible change preserves exactly that — plus the platform's own
 answer for the registry this table caches (types-registry ADR-0003/0004/0005).
 But a MUST is not amended by a deviations entry, so
 [`docs/ADR/0006`](../docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md)
-now carries the decision (status `proposed`), and each of the five places has an
+now carries the decision (`accepted` 2026-09-10, with the width of the agreement
+behind it stated in the ADR), and each of the five places has an
 amendment note pointing at it. Two smaller doc gaps closed at the same time: the
 REST table in § 3.3 was normative and lacked the new operation, and the
 `gts_type` table lacked `revision` and `updated_at`.

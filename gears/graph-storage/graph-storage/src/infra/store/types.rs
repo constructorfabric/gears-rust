@@ -9,7 +9,7 @@
 //!
 //! `ON CONFLICT DO NOTHING` skipping every row is **convergence, not
 //! failure** — reporting it as an error is the trap a re-registration hit in
-//! the prototype (ADR-0006 § Confirmation).
+//! the prototype (ADR-0005 § Confirmation).
 
 use graph_storage_sdk::models::{
     AdmissionBasis, EffectiveTraits, GtsTypeId, OnExisting, Page, RegisteredType, TraitChange,

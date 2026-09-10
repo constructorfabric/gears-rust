@@ -6,7 +6,7 @@
 //!
 //! Columns outside key ∪ scope (`deleted_at`, the interned type references)
 //! are therefore invisible inside a pattern. The hop treats the pattern as a
-//! candidate producer (gear ADR-0006): the pattern carries the scope and
+//! candidate producer (gear ADR-0005): the pattern carries the scope and
 //! proposes ids, and an ordinary scoped query re-authorizes them, applying
 //! tombstone and type filters the pattern cannot express.
 

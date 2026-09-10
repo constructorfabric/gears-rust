@@ -46,13 +46,17 @@ accepted scope cuts and need no documentation change.
 
 ---
 
-## D-001 [doc-gap] ADR-0006 is `proposed`, the implementation treats it as binding
+## D-001 [doc-gap] The SQL/PGQ ADR is `proposed`, the implementation treats it as binding
 
-- **Doc:** `docs/ADR/0006-cpt-cf-graph-storage-adr-sqlpgq-access.md`, `status: proposed` — the only non-accepted ADR; DESIGN already treats its consequences as normative.
-- **Implementation:** builds on the platform layer ADR-0006's ask #3 requested (`toolkit-sea-orm-pgq` + `toolkit_db::secure::pgq`, PR #4639), i.e. treats the ADR as accepted.
+*(Written when that ADR was numbered 0006. It has been `docs/ADR/0005-…` since
+the ADR set was normalized, and 0006 is now the type-evolution ADR, so the
+numbers below were corrected in place.)*
+
+- **Doc:** `docs/ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md`, `status: proposed` — the only non-accepted ADR; DESIGN already treats its consequences as normative.
+- **Implementation:** builds on the platform layer ADR-0005's ask #3 requested (`toolkit-sea-orm-pgq` + `toolkit_db::secure::pgq`, PR #4639), i.e. treats the ADR as accepted.
 - **Why:** the platform answer exists; waiting for the status flip blocks everything downstream.
-- **Proposal:** flip ADR-0006 to `accepted` in PR #4523 once #4639 merges, and rewrite its "development stand exception" paragraphs — the raw-SQL exception is gone.
-- **Folded into the docs:** ADR-0006 now records that its raw-SQL exception is spent and what using the platform layer changed. The `proposed` status stays: flipping it is the architect's call, not the implementer's.
+- **Proposal:** flip ADR-0005 to `accepted` in PR #4523 once #4639 merges, and rewrite its "development stand exception" paragraphs — the raw-SQL exception is gone.
+- **Folded into the docs:** ADR-0005 now records that its raw-SQL exception is spent and what using the platform layer changed. The `proposed` status stays: flipping it is the architect's call, not the implementer's.
 - **How it was checked:** **Verified** by inspection: no `Expr::cust` and no `GRAPH_TABLE` string anywhere in the engine — the pattern is built entirely by the platform builder, so the raw-SQL exception is genuinely unused.
 
 ## D-002 [doc-gap] PostgreSQL 18+ reports `ON DELETE RESTRICT` as SQLSTATE 23001
@@ -444,8 +448,9 @@ that whoever builds the lifecycle gates this path too.
 entry alone would not have been an outcome. Written and published with the
 implementation:
 [`docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md`](../docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md)
-(status `proposed`: it narrows a normative MUST, so it wants the design review's
-signature, not mine), plus amendment notes rather than silent rewrites at each
+(`accepted` 2026-09-10 by the gear owner on the conformance and stand evidence,
+with the width of that agreement stated in the ADR itself, because it narrows a
+normative MUST), plus amendment notes rather than silent rewrites at each
 place the old rule is stated — PRD `fr-type-registration` and the § 12 risk row,
 DESIGN § 2 traceability, § 3.3 (the new operation, the new option, and why
 asking is a separate operation from doing), § 3.7 `gts_type` (two columns, and
@@ -636,7 +641,7 @@ Checking this also found the rejection to be misclassified as `out_of_range`/`LI
 - *A declared path needs a B-tree over its extraction expression, not a GIN over the payload.* Both are "a JSONB index", which is why it is easy to miss. The projection orders and paginates by keyset, so `$filter`, `$orderby` and the cursor all need a total order over the filtered field; GIN answers containment and existence. One GIN covers equality over every path and ordering over none — so the v1 prototype's single GIN was not a cheaper form of the decision but a much weaker one, admitting `eq` and leaving every ordered projection to a full scan and a sort with nothing to say so.
 - *A declared path needs a resolved scalar type.* The trait is a list of pointers carrying no type, which is right — the pointer already points into the type's own schema. But the resolution must be explicit, because the index expression needs the cast (`->>` yields `text`), comparison needs the semantics (`'10' < '9'`), the cursor codec needs the field kind, and something must happen when a payload holds an object where the path was declared scalar. Registration should reject a path that does not land on a scalar rather than build an index nothing will use.
 
-- **Folded into the docs:** ADR-0003 now names the index kind in the decision itself, carries both findings as consequences marked "Found while building the prototype", and gains a "What payload filtering needs from the platform" section in the form ADR-0006 uses — two numbered asks, recorded as *unraised*, because the lifecycle they would serve is unimplemented and there is nothing yet to measure a proposed signature against. DESIGN's trait table row now says B-tree over the path expression, `$filter` **and** `$orderby`, scalar required. Published in `215380db9`.
+- **Folded into the docs:** ADR-0003 now names the index kind in the decision itself, carries both findings as consequences marked "Found while building the prototype", and gains a "What payload filtering needs from the platform" section in the form ADR-0005 uses — two numbered asks, recorded as *unraised*, because the lifecycle they would serve is unimplemented and there is nothing yet to measure a proposed signature against. DESIGN's trait table row now says B-tree over the path expression, `$filter` **and** `$orderby`, scalar required. Published in `215380db9`.
 - **Not changed, deliberately:** the `index` trait's own `description` in the base node schema still says "backed by a JSONB index and admissible in `$filter`". Correcting it is a base-schema edit, which has no delivery path on an existing database — see D-013.
 
 ## D-105 [deferred] Full admission layer (fairness, queues, reserved connections)
