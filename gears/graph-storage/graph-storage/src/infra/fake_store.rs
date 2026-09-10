@@ -285,6 +285,17 @@ impl GraphStoreV1 for FakeGraphStore {
                 )
             })?;
 
+            if let Some(spec) = options.migration_for(&descriptor.type_id)
+                && !tenant.types.contains_key(&descriptor.type_id)
+            {
+                return Err(GraphStoreError::InvalidQuery {
+                    what: format!(
+                        "the migration for `{}` has nothing to migrate: the type is not \
+                         registered yet, so it holds no rows",
+                        spec.type_id
+                    ),
+                });
+            }
             let decided = match tenant.types.get(&descriptor.type_id).cloned() {
                 None => Decided {
                     outcome: TypeOutcome::Created,
@@ -292,9 +303,10 @@ impl GraphStoreV1 for FakeGraphStore {
                     change: fresh_change(&descriptor.type_id),
                     revision: 1,
                     created_at: OffsetDateTime::now_utc(),
+                    rewrites: Vec::new(),
                 },
                 Some(existing) => {
-                    decide_existing(tenant, &existing, &descriptor, &ancestors, options)?
+                    decide_existing(tenant, &existing, &descriptor, &ancestors, &options)?
                 }
             };
 
@@ -324,6 +336,38 @@ impl GraphStoreV1 for FakeGraphStore {
             if !options.dry_run && decided.outcome != TypeOutcome::Unchanged {
                 tenant.types.insert(record.type_id.clone(), record.clone());
                 tenant.index_kinds.insert(record.type_id.clone(), kinds);
+                // Validated above, written here: a migrated payload lands with
+                // the same three marks the built-in store gives it — the new
+                // version, the acting subject, and a stale vector.
+                for rewrite in &decided.rewrites {
+                    match rewrite.family {
+                        ItemFamily::Node => {
+                            if let Some(node) =
+                                tenant.nodes.iter_mut().find(|n| n.key == rewrite.key)
+                            {
+                                node.payload = Some(rewrite.payload.clone());
+                                node.version += 1;
+                                // Only a type that composes its embedding
+                                // input from the payload can have been made
+                                // stale by rewriting it; clearing the epoch
+                                // otherwise would re-embed the whole type for
+                                // nothing.
+                                if !record.effective_traits.vector_search.is_empty() {
+                                    node.embedding_epoch = None;
+                                }
+                                node.audit.updated(&ctx.subject);
+                            }
+                        }
+                        ItemFamily::Edge => {
+                            if let Some(edge) =
+                                tenant.edges.iter_mut().find(|e| e.key == rewrite.key)
+                            {
+                                edge.payload = Some(rewrite.payload.clone());
+                                edge.audit.updated(&ctx.subject);
+                            }
+                        }
+                    }
+                }
                 if decided.outcome == TypeOutcome::Updated {
                     // What a read answers has changed, so the revision has to
                     // move — the same obligation a label attach carries
@@ -1083,6 +1127,17 @@ struct Decided {
     change: TypeChange,
     revision: i32,
     created_at: OffsetDateTime,
+    /// Payloads a migration produced, applied by the write loop — the fake
+    /// decides with an immutable borrow of the tenant and writes afterwards,
+    /// exactly as the built-in store validates before it writes.
+    rewrites: Vec<Rewrite>,
+}
+
+/// One migrated row, keyed the way a producer names it.
+struct Rewrite {
+    family: ItemFamily,
+    key: String,
+    payload: serde_json::Value,
 }
 
 fn fresh_change(type_id: &str) -> TypeChange {
@@ -1094,6 +1149,7 @@ fn fresh_change(type_id: &str) -> TypeChange {
         diagnostics: Vec::new(),
         traits_changed: Vec::new(),
         rows: None,
+        rows_rewritten: None,
         levels_not_evolvable_in_place: Vec::new(),
         migration_required: false,
         admissible: true,
@@ -1111,7 +1167,7 @@ fn decide_existing(
     existing: &TypeRecord,
     descriptor: &ontology::TypeDescriptor,
     ancestors: &[(String, serde_json::Value)],
-    options: TypeRegistrationOptions,
+    options: &TypeRegistrationOptions,
 ) -> Result<Decided, GraphStoreError> {
     let update = options.on_existing == OnExisting::Update;
     let traits_changed =
@@ -1127,18 +1183,29 @@ fn decide_existing(
             diagnostics: Vec::new(),
             traits_changed,
             rows: None,
+            rows_rewritten: None,
             levels_not_evolvable_in_place: Vec::new(),
             migration_required: false,
             admissible: true,
         },
         revision: existing.revision,
         created_at: existing.created_at,
+        rewrites: Vec::new(),
     };
 
     // Byte-identical re-registration converges. The fake stores the resolved
     // traits as a value rather than as JSON, so unlike the built-in store's
     // column it cannot go stale; the diff is still reported.
     if existing.schema == descriptor.schema {
+        if options.migration_for(&descriptor.type_id).is_some() {
+            return Err(GraphStoreError::InvalidQuery {
+                what: format!(
+                    "the migration for `{}` has nothing to migrate towards: the candidate \
+                     schema is byte-identical to the registered one",
+                    descriptor.type_id
+                ),
+            });
+        }
         return Ok(unchanged(traits_changed));
     }
 
@@ -1159,20 +1226,29 @@ fn decide_existing(
         diagnostics: comparison.diagnostics,
         traits_changed,
         rows: None,
+        rows_rewritten: None,
         levels_not_evolvable_in_place: comparison.levels_not_evolvable_in_place,
         migration_required: !matches!(state, TypeChangeState::Compatible),
         admissible: false,
     };
 
-    let accepted = |change: TypeChange, basis: AdmissionBasis| Decided {
+    let accepted = |change: TypeChange, basis: AdmissionBasis, rewrites: Vec<Rewrite>| Decided {
         outcome: TypeOutcome::Updated,
         basis: Some(basis),
         change,
         revision: existing.revision.saturating_add(1),
         created_at: existing.created_at,
+        rewrites,
     };
 
-    match evolution::decide(state, update, options.revalidate) {
+    let migration = options.migration_for(&descriptor.type_id);
+    match evolution::decide(
+        state,
+        evolution::Asked {
+            update,
+            offered: evolution::offered(migration.is_some(), options.revalidate),
+        },
+    ) {
         evolution::Decision::Refuse => {
             if options.dry_run {
                 return Ok(Decided {
@@ -1181,6 +1257,7 @@ fn decide_existing(
                     change,
                     revision: existing.revision,
                     created_at: existing.created_at,
+                    rewrites: Vec::new(),
                 });
             }
             Err(GraphStoreError::Conflict {
@@ -1201,7 +1278,59 @@ fn decide_existing(
         }
         evolution::Decision::Accept => {
             change.admissible = true;
-            Ok(accepted(change, AdmissionBasis::SchemaProved))
+            Ok(accepted(change, AdmissionBasis::SchemaProved, Vec::new()))
+        }
+        evolution::Decision::Migrate => {
+            let Some(spec) = migration else {
+                return Err(GraphStoreError::Internal(
+                    "the rule asked for a migration where none was declared".to_owned(),
+                ));
+            };
+            let plan = crate::domain::migration::compile(spec).map_err(|error| {
+                GraphStoreError::InvalidQuery {
+                    what: error.to_string(),
+                }
+            })?;
+            let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
+            chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
+            let validator = ontology::ChainValidator::compile(&descriptor.schema, chain)
+                .map_err(|error| {
+                    validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
+                })?;
+            let (scanned, rewrites, failures) =
+                migrate_fake(tenant, &descriptor.type_id, &plan, &validator);
+            change.rows = Some(scanned);
+            change.rows_rewritten = Some(rewrites.len() as u64);
+            if failures.is_empty() {
+                change.admissible = true;
+                let basis = AdmissionBasis::Migrated {
+                    rows_scanned: scanned,
+                    rows_rewritten: rewrites.len() as u64,
+                };
+                return Ok(accepted(
+                    change,
+                    basis,
+                    if options.dry_run { Vec::new() } else { rewrites },
+                ));
+            }
+            if !options.dry_run {
+                return Err(GraphStoreError::Validation { items: failures });
+            }
+            for failure in &failures {
+                change.diagnostics.push(SchemaDiagnostic {
+                    location: failure.pointer.clone().unwrap_or_default(),
+                    finding: "row_invalid_after_migration".to_owned(),
+                    message: failure.message.clone(),
+                });
+            }
+            Ok(Decided {
+                outcome: TypeOutcome::Unchanged,
+                basis: None,
+                change,
+                revision: existing.revision,
+                created_at: existing.created_at,
+                rewrites: Vec::new(),
+            })
         }
         evolution::Decision::Revalidate => {
             let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
@@ -1220,6 +1349,7 @@ fn decide_existing(
                     AdmissionBasis::DataBacked {
                         rows_validated: rows,
                     },
+                    Vec::new(),
                 ));
             }
             if !options.dry_run {
@@ -1238,6 +1368,7 @@ fn decide_existing(
                 change,
                 revision: existing.revision,
                 created_at: existing.created_at,
+                rewrites: Vec::new(),
             })
         }
     }
@@ -1256,6 +1387,112 @@ fn rows_of_type(tenant: &Tenant, type_id: &str) -> u64 {
         .filter(|edge| !edge.deleted && edge.type_id == type_id)
         .count();
     (nodes + edges) as u64
+}
+
+/// Apply the plan to every live row of the type in memory, validate the
+/// result, and report what would be written.
+///
+/// The fake carries the migration too, and not as a stub: a ground for
+/// admission only the `PostgreSQL` store applies is a ground the conformance
+/// suite cannot see.
+fn migrate_fake(
+    tenant: &Tenant,
+    type_id: &str,
+    plan: &crate::domain::migration::Plan,
+    validator: &ontology::ChainValidator,
+) -> (u64, Vec<Rewrite>, Vec<ItemError>) {
+    let mut scanned = 0u64;
+    let mut rewrites = Vec::new();
+    let mut failures = Vec::new();
+
+    for node in tenant
+        .nodes
+        .iter()
+        .filter(|node| !node.deleted && node.type_id == type_id)
+    {
+        scanned += 1;
+        let mut payload = node.payload.clone().unwrap_or(serde_json::Value::Null);
+        if payload.is_null() {
+            payload = serde_json::json!({});
+        }
+        let changed = plan.apply(&mut payload);
+        let mut instance = serde_json::json!({ "node_key": node.key, "type": type_id });
+        if let Some(name) = &node.name {
+            instance["name"] = serde_json::json!(name);
+        }
+        instance["payload"] = payload.clone();
+        let violations = validator.validate(&instance);
+        if !violations.is_empty() {
+            for (pointer, message) in violations {
+                failures.push(ItemError {
+                    index: usize::try_from(scanned - 1).unwrap_or(usize::MAX),
+                    family: ItemFamily::Node,
+                    gts_type: Some(type_id.to_owned()),
+                    pointer: Some(pointer),
+                    message: format!(
+                        "node `{}` does not satisfy the candidate after the migration: {message}",
+                        node.key
+                    ),
+                });
+            }
+            continue;
+        }
+        if changed {
+            rewrites.push(Rewrite {
+                family: ItemFamily::Node,
+                key: node.key.clone(),
+                payload,
+            });
+        }
+    }
+
+    for edge in tenant
+        .edges
+        .iter()
+        .filter(|edge| !edge.deleted && edge.type_id == type_id)
+    {
+        scanned += 1;
+        let mut payload = edge.payload.clone().unwrap_or(serde_json::json!({}));
+        let changed = plan.apply(&mut payload);
+        let key_of = |id: i64| {
+            tenant
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(String::new, |node| node.key.clone())
+        };
+        let mut instance = serde_json::json!({
+            "type": type_id,
+            "src_node_key": key_of(edge.src),
+            "dst_node_key": key_of(edge.dst),
+        });
+        instance["payload"] = payload.clone();
+        let violations = validator.validate(&instance);
+        if !violations.is_empty() {
+            for (pointer, message) in violations {
+                failures.push(ItemError {
+                    index: usize::try_from(scanned - 1).unwrap_or(usize::MAX),
+                    family: ItemFamily::Edge,
+                    gts_type: Some(type_id.to_owned()),
+                    pointer: Some(pointer),
+                    message: format!(
+                        "edge `{}` does not satisfy the candidate after the migration: {message}",
+                        edge.key
+                    ),
+                });
+            }
+            continue;
+        }
+        if changed {
+            rewrites.push(Rewrite {
+                family: ItemFamily::Edge,
+                key: edge.key.clone(),
+                payload,
+            });
+        }
+    }
+
+    (scanned, rewrites, failures)
 }
 
 /// Does every live row of the type validate against the candidate?

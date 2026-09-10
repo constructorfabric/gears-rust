@@ -120,6 +120,7 @@ impl GraphServices {
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
         revalidate: bool,
+        migrations: Vec<graph_storage_sdk::models::MigrationSpec>,
     ) -> Result<Vec<RegisteredType>, DomainError> {
         self.register_types_with(
             ctx,
@@ -128,6 +129,7 @@ impl GraphServices {
                 on_existing: OnExisting::Update,
                 revalidate,
                 dry_run: true,
+                migrations,
             },
         )
         .await
@@ -142,12 +144,12 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
             .await?;
-        // Re-validating a change reads the tenant's own rows, and a caller
-        // holding ontology administration does not thereby hold the data. The
-        // data decision is asked for separately and the call is served under
-        // its scope — the same scope ingest writes those rows with, which is
-        // what makes one scope reach both the catalogue and the rows.
-        let auth = if options.revalidate {
+        // Reading the tenant's rows — and a migration *writes* them — is not
+        // something ontology administration authorizes. The data decision is
+        // asked for separately and the call is served under its scope: the
+        // same scope ingest writes those rows with, which is what makes one
+        // scope reach both the catalogue and the rows.
+        let auth = if options.revalidate || !options.migrations.is_empty() {
             self.authorize(ctx, &authz::node_resource(), authz::actions::WRITE)
                 .await?
         } else {

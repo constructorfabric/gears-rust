@@ -30,6 +30,82 @@ fn idempotency_key(headers: &HeaderMap, body: Option<String>) -> Option<String> 
         .or(body)
 }
 
+/// One migration step, or a named refusal.
+///
+/// The fields a step does not use must be *absent*, not ignored: a `drop`
+/// carrying a `value` means the caller believes something will happen to it.
+fn migration_step(step: &dto::GraphMigrationStepDto) -> Result<m::MigrationStep, DomainError> {
+    let unexpected = |names: &[(&str, bool)]| -> Result<(), DomainError> {
+        for (name, present) in names {
+            if *present {
+                return Err(DomainError::invalid(format!(
+                    "a `{}` step takes no `{name}`",
+                    step.op
+                )));
+            }
+        }
+        Ok(())
+    };
+    let required = |name: &str, value: Option<String>| {
+        value.ok_or_else(|| {
+            DomainError::invalid(format!("a `{}` step needs `{name}`", step.op))
+        })
+    };
+    match step.op.as_str() {
+        "rename" => {
+            unexpected(&[("path", step.path.is_some()), ("value", step.value.is_some())])?;
+            Ok(m::MigrationStep::Rename {
+                from: required("from", step.from.clone())?,
+                to: required("to", step.to.clone())?,
+            })
+        }
+        "default" => {
+            unexpected(&[("from", step.from.is_some()), ("to", step.to.is_some())])?;
+            let path = required("path", step.path.clone())?;
+            let value = step.value.clone().ok_or_else(|| {
+                DomainError::invalid("a `default` step needs `value`".to_owned())
+            })?;
+            Ok(m::MigrationStep::Default { path, value })
+        }
+        "drop" => {
+            unexpected(&[
+                ("from", step.from.is_some()),
+                ("to", step.to.is_some()),
+                ("value", step.value.is_some()),
+            ])?;
+            Ok(m::MigrationStep::Drop {
+                path: required("path", step.path.clone())?,
+            })
+        }
+        other => Err(DomainError::invalid(format!(
+            "`{other}` is not a migration step; the set is `rename`, `default`, `drop`"
+        ))),
+    }
+}
+
+fn migrations(
+    declared: Option<Vec<dto::GraphTypeMigrationDto>>,
+) -> Result<Vec<m::MigrationSpec>, DomainError> {
+    let mut out: Vec<m::MigrationSpec> = Vec::new();
+    for migration in declared.unwrap_or_default() {
+        if out.iter().any(|m| m.type_id == migration.type_id) {
+            return Err(DomainError::invalid(format!(
+                "`{}` carries more than one migration; declare one plan per type",
+                migration.type_id
+            )));
+        }
+        let mut steps = Vec::with_capacity(migration.steps.len());
+        for step in &migration.steps {
+            steps.push(migration_step(step)?);
+        }
+        out.push(m::MigrationSpec {
+            type_id: migration.type_id,
+            steps,
+        });
+    }
+    Ok(out)
+}
+
 /// `options.on_existing` / `options.revalidate`, refusing an unknown mode
 /// rather than defaulting it: a caller who misspells `update` must not be
 /// silently served the rejecting behaviour they were trying to leave.
@@ -52,6 +128,7 @@ fn registration_options(
         on_existing,
         revalidate: options.revalidate.unwrap_or(false),
         dry_run: false,
+        migrations: Vec::new(),
     })
 }
 
@@ -61,7 +138,8 @@ pub async fn register_types(
     Extension(services): Extension<Arc<GraphServices>>,
     Json(request): Json<dto::GraphRegisterTypesRequest>,
 ) -> ApiResult<Json<Vec<dto::GraphRegisteredTypeDto>>> {
-    let options = registration_options(request.options)?;
+    let mut options = registration_options(request.options)?;
+    options.migrations = migrations(request.migrations)?;
     let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
     let registered = services.register_types_with(&ctx, batch, options).await?;
     Ok(Json(registered.into_iter().map(Into::into).collect()))
@@ -83,8 +161,13 @@ pub async fn type_compatibility(
         .as_ref()
         .and_then(|options| options.revalidate)
         .unwrap_or(true);
+    // A dry run takes migrations as well, and that is the point: "what would
+    // this plan do to my rows" is the question worth asking before it runs.
+    let plans = migrations(request.migrations)?;
     let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
-    let items = services.type_compatibility(&ctx, batch, revalidate).await?;
+    let items = services
+        .type_compatibility(&ctx, batch, revalidate, plans)
+        .await?;
     Ok(Json(dto::GraphTypeCompatibilityDto {
         items: items.into_iter().map(Into::into).collect(),
     }))

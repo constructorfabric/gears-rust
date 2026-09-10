@@ -1844,7 +1844,13 @@ fn requirement_revision(
         schema: serde_json::json!({
             "$id": format!("gts://{EVOLVING}"),
             "$schema": "http://json-schema.org/draft-07/schema#",
-            "x-gts-traits": { "index": index, "full_text_search": ["/name"] },
+            "x-gts-traits": {
+                "index": index,
+                "full_text_search": ["/name"],
+                // Declared so the migration cases can assert what a rewritten
+                // payload does to the vector composed from it.
+                "vector_search": ["/payload/statement"]
+            },
             "type": "object",
             "allOf": [
                 { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" },
@@ -1921,6 +1927,7 @@ fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: false,
         dry_run: false,
+        migrations: Vec::new(),
     }
 }
 
@@ -2068,6 +2075,7 @@ pub async fn a_dry_run_reports_every_verdict_and_writes_nothing(
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: true,
         dry_run: true,
+        migrations: Vec::new(),
     };
 
     let compatible = requirement_revision(
@@ -2076,7 +2084,7 @@ pub async fn a_dry_run_reports_every_verdict_and_writes_nothing(
         &["/payload/status"],
     );
     let reported = store
-        .register_types_with(&ctx, vec![compatible], dry)
+        .register_types_with(&ctx, vec![compatible], dry.clone())
         .await
         .expect("a dry run never fails on a refusal");
     let change = reported[0]
@@ -2147,6 +2155,7 @@ pub async fn a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit(
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: true,
         dry_run: false,
+        migrations: Vec::new(),
     };
     let registered = store
         .register_types_with(&ctx, vec![narrowed.clone()], options)
@@ -2203,6 +2212,7 @@ pub async fn a_change_the_stored_rows_contradict_is_refused_naming_them(
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: true,
         dry_run: false,
+        migrations: Vec::new(),
     };
     let error = store
         .register_types_with(&ctx, vec![narrowed], options)
@@ -2350,4 +2360,267 @@ pub async fn a_new_index_path_becomes_filterable_without_recreating_the_type(
         .await
         .expect("the newly declared path filters at once");
     assert_eq!(keys(&page), vec!["r0".to_owned(), "r1".to_owned()]);
+}
+
+// --- payload migrations ------------------------------------------------------
+
+fn migration(type_id: &str, steps: Vec<graph_storage_sdk::models::MigrationStep>) -> graph_storage_sdk::models::MigrationSpec {
+    graph_storage_sdk::models::MigrationSpec {
+        type_id: type_id.to_owned(),
+        steps,
+    }
+}
+
+fn migrating_options(
+    migrations: Vec<graph_storage_sdk::models::MigrationSpec>,
+) -> graph_storage_sdk::models::TypeRegistrationOptions {
+    graph_storage_sdk::models::TypeRegistrationOptions {
+        on_existing: graph_storage_sdk::models::OnExisting::Update,
+        revalidate: false,
+        dry_run: false,
+        migrations,
+    }
+}
+
+/// The deck's third edit, end to end: the rename that the compatibility check
+/// refuses on its own becomes one request that moves the type **and** the data.
+///
+/// The assertion that matters is the last one. A rename admitted without moving
+/// the data leaves every query on the new name returning nothing, which is the
+/// failure mode `data_backed` cannot see; here the projection over
+/// `payload/urgency` finds the rows.
+pub async fn a_migration_moves_the_data_with_the_type(store: &dyn GraphStoreV1, tenant: Uuid) {
+    use toolkit_odata::SortDir;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved", "proposed"]).await;
+
+    let renamed = requirement_revision(
+        &requirement_properties(&["proposed", "approved"], false, true),
+        &["key", "statement"],
+        &["/payload/status", "/payload/urgency"],
+    );
+    let registered = store
+        .register_types_with(
+            &ctx,
+            vec![renamed],
+            migrating_options(vec![migration(
+                EVOLVING,
+                vec![graph_storage_sdk::models::MigrationStep::Rename {
+                    from: "/payload/priority".to_owned(),
+                    to: "/payload/urgency".to_owned(),
+                }],
+            )]),
+        )
+        .await
+        .expect("a rename with a migration is admitted");
+
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == EVOLVING)
+        .expect("the migrated type is reported");
+    assert_eq!(
+        updated.outcome,
+        graph_storage_sdk::models::TypeOutcome::Updated
+    );
+    assert_eq!(
+        updated.basis,
+        Some(graph_storage_sdk::models::AdmissionBasis::Migrated {
+            rows_scanned: 3,
+            rows_rewritten: 3,
+        }),
+        "the report says what was read and what was changed, separately"
+    );
+
+    // The data moved, not just the schema.
+    let node = store
+        .get_node(&ctx, &"r0".to_owned(), 10)
+        .await
+        .expect("the migrated node reads");
+    let payload = node.payload.expect("the node has a payload");
+    assert_eq!(payload.get("urgency"), Some(&serde_json::json!("normal")));
+    assert!(
+        payload.get("priority").is_none(),
+        "the old property is gone, not duplicated: {payload}"
+    );
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(
+                &[EVOLVING],
+                "payload/urgency eq 'normal'",
+                &[("node_key", SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect("the renamed path filters");
+    assert_eq!(
+        keys(&page),
+        vec!["r0".to_owned(), "r1".to_owned(), "r2".to_owned()],
+        "a rename that moved the data answers queries on the new name"
+    );
+}
+
+/// A migration is only as good as its steps, and the gear checks them against
+/// the rows rather than taking the caller's word: the plan below renames into a
+/// property the candidate declares as an integer, so every row fails and
+/// nothing at all is written.
+pub async fn a_migration_that_leaves_rows_invalid_is_refused_naming_them(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved"]).await;
+
+    let mut properties = requirement_properties(&["proposed", "approved"], false, true);
+    properties["urgency"] = serde_json::json!({ "type": "integer" });
+    let retyped = requirement_revision(&properties, &["key", "statement"], &["/payload/status"]);
+
+    let error = store
+        .register_types_with(
+            &ctx,
+            vec![retyped],
+            migrating_options(vec![migration(
+                EVOLVING,
+                vec![graph_storage_sdk::models::MigrationStep::Rename {
+                    from: "/payload/priority".to_owned(),
+                    to: "/payload/urgency".to_owned(),
+                }],
+            )]),
+        )
+        .await
+        .expect_err("a plan whose result does not validate is refused");
+    let GraphStoreError::Validation { items } = error else {
+        panic!("an invalid row after a migration is a validation failure, not {error:?}");
+    };
+    assert!(
+        items.iter().any(|item| item.message.contains("r0")),
+        "the refusal names the row it could not migrate: {items:?}"
+    );
+
+    // Nothing was written: not the type, and not the rows.
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1);
+    let node = store
+        .get_node(&ctx, &"r0".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    let payload = node.payload.expect("the node has a payload");
+    assert_eq!(payload.get("priority"), Some(&serde_json::json!("normal")));
+}
+
+/// A migration needs a schema change to migrate towards. Without one this
+/// endpoint would be a payload-editing API wearing a type registration's
+/// clothes — a different feature, with a different authorization story.
+pub async fn a_migration_without_a_schema_change_is_refused(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed"]).await;
+
+    let error = store
+        .register_types_with(
+            &ctx,
+            vec![requirement_v1()],
+            migrating_options(vec![migration(
+                EVOLVING,
+                vec![graph_storage_sdk::models::MigrationStep::Drop {
+                    path: "/payload/priority".to_owned(),
+                }],
+            )]),
+        )
+        .await
+        .expect_err("a migration against an unchanged schema is refused");
+    assert!(
+        matches!(error, GraphStoreError::InvalidQuery { .. }),
+        "{error:?}"
+    );
+}
+
+/// Every write records who made it and moves the row's compare-and-set target;
+/// a migration is a write. Without the version bump a producer holding the
+/// pre-migration value would overwrite the migrated row and undo the migration
+/// in silence, and without the subject the row would claim its last writer was
+/// the producer.
+pub async fn a_migration_stamps_its_writer_and_moves_the_version(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let producer = ctx(tenant, &scope, None);
+    seed_requirements(store, &producer, &["proposed"]).await;
+
+    // The version is not on any read surface, so the property is asserted the
+    // way a producer would meet it: an ingest carrying the pre-migration
+    // version must be refused once the migration has moved the row.
+    let stale_cas = {
+        let mut spec = requirement("r0", "proposed");
+        spec.expected_version = Some(1);
+        spec
+    };
+
+    let migrator = ctx_as(tenant, &scope, None, editor());
+    let filled = requirement_revision(
+        &requirement_properties(&["proposed", "approved"], true, false),
+        &["key", "statement", "owner"],
+        &["/payload/status"],
+    );
+    store
+        .register_types_with(
+            &migrator,
+            vec![filled],
+            migrating_options(vec![migration(
+                EVOLVING,
+                vec![graph_storage_sdk::models::MigrationStep::Default {
+                    path: "/payload/owner".to_owned(),
+                    value: serde_json::json!("unassigned"),
+                }],
+            )]),
+        )
+        .await
+        .expect("a default fills the newly required field");
+
+    let after = store
+        .get_node(&producer, &"r0".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        after.payload.expect("payload")["owner"],
+        serde_json::json!("unassigned")
+    );
+    let error = ingest_batch(store, &producer, batch(vec![stale_cas], Vec::new()))
+        .await
+        .expect_err("the migration moved the row, so the producer's version is stale");
+    assert!(
+        matches!(error, GraphStoreError::Conflict { .. }),
+        "a stale expected_version after a migration is a conflict, not {error:?}"
+    );
+    assert_eq!(
+        after.envelope.updated_by,
+        editor(),
+        "the row records the subject that migrated it, not the producer"
+    );
+
+    // The stored vector was made from text this row no longer has, so it must
+    // stop ranking until something re-embeds it.
+    let state = store
+        .embedding_state(&producer, &["r0".to_owned()])
+        .await
+        .expect("the embedding state reads");
+    let state = state
+        .first()
+        .and_then(Clone::clone)
+        .expect("the row's embedding state is reported");
+    assert!(
+        state.vector_epoch.is_none(),
+        "the type composes its embedding input from the payload, so a rewritten \
+         payload leaves the vector stale rather than silently wrong: {state:?}"
+    );
 }

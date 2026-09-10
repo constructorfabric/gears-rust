@@ -66,12 +66,21 @@ fn item_error(index: usize, family: ItemFamily, type_id: &str, message: String) 
 
 /// Compose the vectorizable/lexical text from the type's declared paths.
 /// Names are always included; `full_text_search` adds payload paths.
-fn compose_search_text(node: &NodeSpec, paths: &[String]) -> String {
+///
+/// Takes the two fields rather than the spec so a migration can recompose the
+/// same text from a stored row: a rewritten payload whose lexical text still
+/// describes the old one is a row that answers searches by a value it no
+/// longer has.
+pub(crate) fn compose_search_text(
+    name: Option<&str>,
+    payload: Option<&serde_json::Value>,
+    paths: &[String],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(name) = &node.name {
-        parts.push(name.clone());
+    if let Some(name) = name {
+        parts.push(name.to_owned());
     }
-    if let Some(payload) = &node.payload {
+    if let Some(payload) = payload {
         for path in paths {
             if path == "/name" {
                 continue;
@@ -732,7 +741,11 @@ async fn upsert_node(
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
     let name = spec.name.clone().unwrap_or_default();
-    let search_text = compose_search_text(spec, &info.full_text_search);
+    let search_text = compose_search_text(
+        spec.name.as_deref(),
+        spec.payload.as_ref(),
+        &info.full_text_search,
+    );
     let vector = plan_vector(existing.as_ref(), planned);
     let now = OffsetDateTime::now_utc();
 

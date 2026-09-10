@@ -33,11 +33,43 @@ pub struct GraphTypeRegisterOptionsDto {
     pub revalidate: Option<bool>,
 }
 
+/// One step of a payload migration.
+///
+/// A closed set spelled as `op` plus that step's fields, rather than a JSON
+/// one-of: it is one `OpenAPI` object, and a misspelled `op` is refused by
+/// name instead of silently matching nothing.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GraphMigrationStepDto {
+    /// `rename` | `default` | `drop`.
+    pub op: String,
+    /// `rename`: the payload path to move the value from.
+    pub from: Option<String>,
+    /// `rename`: the payload path to move it to.
+    pub to: Option<String>,
+    /// `default` and `drop`: the payload path they act on.
+    pub path: Option<String>,
+    /// `default`: the value to set where nothing is there.
+    pub value: Option<serde_json::Value>,
+}
+
+/// What to do with one type's stored payloads so they satisfy the candidate.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GraphTypeMigrationDto {
+    pub type_id: String,
+    pub steps: Vec<GraphMigrationStepDto>,
+}
+
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
 pub struct GraphRegisterTypesRequest {
     pub types: Vec<GraphTypeRegistrationDto>,
     pub options: Option<GraphTypeRegisterOptionsDto>,
+    /// Payload migrations, at most one per type in `types`. A migration needs
+    /// `options.on_existing: "update"`, and it needs a schema change to
+    /// migrate towards.
+    pub migrations: Option<Vec<GraphTypeMigrationDto>>,
 }
 
 /// One reason a directional verdict does not hold, with the schema location
@@ -77,6 +109,8 @@ pub struct GraphTypeChangeDto {
     pub traits_changed: Vec<GraphTraitChangeDto>,
     /// Live rows of the type, when the operation needed to know.
     pub rows: Option<i64>,
+    /// Rows a migration changed, or would change in a dry run.
+    pub rows_rewritten: Option<i64>,
     /// Object levels where a *later* definition will not be able to add an
     /// optional property, so "your next edit is a major" is a warning now.
     pub levels_not_evolvable_in_place: Vec<String>,
@@ -103,8 +137,10 @@ pub struct GraphRegisteredTypeDto {
     /// the type's own rows were validated instead. Absent unless something
     /// was updated.
     pub admission_basis: Option<String>,
-    /// Rows validated for a `data_backed` admission.
+    /// Rows read for a `data_backed` or `migrated` admission.
     pub rows_validated: Option<i64>,
+    /// Rows a `migrated` admission actually changed.
+    pub rows_rewritten: Option<i64>,
     /// The verdict, present whenever the identifier was already registered,
     /// and always in a dry run.
     pub change: Option<GraphTypeChangeDto>,
@@ -499,6 +535,9 @@ impl From<m::TypeChange> for GraphTypeChangeDto {
             // A count crosses the boundary as a signed integer: `OpenAPI`
             // integers are signed, and a row count cannot approach the bound.
             rows: value.rows.and_then(|rows| i64::try_from(rows).ok()),
+            rows_rewritten: value
+                .rows_rewritten
+                .and_then(|rows| i64::try_from(rows).ok()),
             levels_not_evolvable_in_place: value.levels_not_evolvable_in_place,
             migration_required: value.migration_required,
             admissible: value.admissible,
@@ -508,12 +547,21 @@ impl From<m::TypeChange> for GraphTypeChangeDto {
 
 impl From<m::RegisteredType> for GraphRegisteredTypeDto {
     fn from(value: m::RegisteredType) -> Self {
-        let (admission_basis, rows_validated) = match value.basis {
-            None => (None, None),
-            Some(m::AdmissionBasis::SchemaProved) => (Some("schema_proved".to_owned()), None),
+        let (admission_basis, rows_validated, rows_rewritten) = match value.basis {
+            None => (None, None, None),
+            Some(m::AdmissionBasis::SchemaProved) => (Some("schema_proved".to_owned()), None, None),
             Some(m::AdmissionBasis::DataBacked { rows_validated }) => (
                 Some("data_backed".to_owned()),
                 i64::try_from(rows_validated).ok(),
+                None,
+            ),
+            Some(m::AdmissionBasis::Migrated {
+                rows_scanned,
+                rows_rewritten,
+            }) => (
+                Some("migrated".to_owned()),
+                i64::try_from(rows_scanned).ok(),
+                i64::try_from(rows_rewritten).ok(),
             ),
         };
         let record = value.record;
@@ -528,6 +576,7 @@ impl From<m::RegisteredType> for GraphRegisteredTypeDto {
             outcome: value.outcome.as_str().to_owned(),
             admission_basis,
             rows_validated,
+            rows_rewritten,
             change: value.change.map(Into::into),
         }
     }

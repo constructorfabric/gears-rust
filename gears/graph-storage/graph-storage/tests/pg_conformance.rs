@@ -311,6 +311,22 @@ pg_case!(
     conformance::a_change_the_stored_rows_contradict_is_refused_naming_them
 );
 pg_case!(
+    a_migration_moves_the_data_with_the_type,
+    conformance::a_migration_moves_the_data_with_the_type
+);
+pg_case!(
+    a_migration_that_leaves_rows_invalid_is_refused_naming_them,
+    conformance::a_migration_that_leaves_rows_invalid_is_refused_naming_them
+);
+pg_case!(
+    a_migration_without_a_schema_change_is_refused,
+    conformance::a_migration_without_a_schema_change_is_refused
+);
+pg_case!(
+    a_migration_stamps_its_writer_and_moves_the_version,
+    conformance::a_migration_stamps_its_writer_and_moves_the_version
+);
+pg_case!(
     an_accepted_type_update_advances_the_graph_revision,
     conformance::an_accepted_type_update_advances_the_graph_revision
 );

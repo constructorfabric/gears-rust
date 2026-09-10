@@ -74,25 +74,71 @@ pub enum Decision {
     /// Admit only if every live row of the type validates against the
     /// candidate.
     Revalidate,
+    /// Apply the caller's steps to every live row, validate the result, and
+    /// admit only if every row then passes.
+    Migrate,
     /// Refuse. The caller gets the diagnostics.
     Refuse,
 }
 
-/// Apply the rule to one comparison.
+/// What the caller put on the table besides the two schemas.
 ///
-/// `update` is `options.on_existing == Update`, `revalidate` is
-/// `options.revalidate`. Kept as two booleans rather than the options struct
-/// so this stays a function of the decision's actual inputs.
+/// Ordered by strength, and exclusive: a migration subsumes re-validation,
+/// since it validates the rows it has just changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offered {
+    /// Nothing: decide from the schemas or refuse.
+    Nothing,
+    /// The type's rows, to be validated against the candidate as they are.
+    Rows,
+    /// Steps to change the rows with, then validate.
+    Steps,
+}
+
+/// What the request asked for, as the decision's actual inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asked {
+    /// `options.on_existing == Update`.
+    pub update: bool,
+    pub offered: Offered,
+}
+
+/// What the request offered, from the two flags a caller sets.
 #[must_use]
-pub fn decide(state: TypeChangeState, update: bool, revalidate: bool) -> Decision {
+pub fn offered(migration: bool, revalidate: bool) -> Offered {
+    if migration {
+        Offered::Steps
+    } else if revalidate {
+        Offered::Rows
+    } else {
+        Offered::Nothing
+    }
+}
+
+/// Apply the rule to one comparison.
+#[must_use]
+pub fn decide(state: TypeChangeState, asked: Asked) -> Decision {
     match state {
-        TypeChangeState::New | TypeChangeState::Unchanged => Decision::Accept,
-        _ if !update => Decision::Refuse,
+        // A migration rewrites payloads. Offering one where the schema does
+        // not move would make this a data-editing endpoint wearing a type
+        // registration's clothes, so it is refused rather than run.
+        TypeChangeState::New | TypeChangeState::Unchanged => {
+            if asked.offered == Offered::Steps {
+                Decision::Refuse
+            } else {
+                Decision::Accept
+            }
+        }
+        _ if !asked.update => Decision::Refuse,
+        // Steps are honoured even against a compatible change: "widen the enum
+        // and fill the new field" is one intention, and splitting it into two
+        // requests would leave the rows behind in between.
+        _ if asked.offered == Offered::Steps => Decision::Migrate,
         TypeChangeState::Compatible => Decision::Accept,
         // ADR-0003 fails closed on both of these from the schemas alone. The
         // gear's own data is the only thing that can say more.
         TypeChangeState::Incompatible | TypeChangeState::Undecidable => {
-            if revalidate {
+            if asked.offered == Offered::Rows {
                 Decision::Revalidate
             } else {
                 Decision::Refuse
@@ -408,27 +454,61 @@ mod tests {
         assert!(comparison.forward.is_incompatible());
     }
 
+    fn asked(update: bool, revalidate: bool, migration: bool) -> Asked {
+        Asked {
+            update,
+            offered: if migration {
+                Offered::Steps
+            } else if revalidate {
+                Offered::Rows
+            } else {
+                Offered::Nothing
+            },
+        }
+    }
+
     #[test]
     fn the_rule_refuses_everything_it_cannot_prove_unless_asked_to_revalidate() {
         for state in [TypeChangeState::Incompatible, TypeChangeState::Undecidable] {
-            assert_eq!(decide(state, false, false), Decision::Refuse);
-            assert_eq!(decide(state, true, false), Decision::Refuse);
-            assert_eq!(decide(state, true, true), Decision::Revalidate);
+            assert_eq!(decide(state, asked(false, false, false)), Decision::Refuse);
+            assert_eq!(decide(state, asked(true, false, false)), Decision::Refuse);
+            assert_eq!(decide(state, asked(true, true, false)), Decision::Revalidate);
         }
         assert_eq!(
-            decide(TypeChangeState::Compatible, true, false),
+            decide(TypeChangeState::Compatible, asked(true, false, false)),
             Decision::Accept
         );
         // Reject mode is today's behaviour: even a provably compatible change
         // is a conflict, so no existing caller changes.
         assert_eq!(
-            decide(TypeChangeState::Compatible, false, false),
+            decide(TypeChangeState::Compatible, asked(false, false, false)),
             Decision::Refuse
         );
         assert_eq!(
-            decide(TypeChangeState::Unchanged, false, false),
+            decide(TypeChangeState::Unchanged, asked(false, false, false)),
             Decision::Accept
         );
+    }
+
+    #[test]
+    fn a_migration_takes_over_wherever_the_schema_moves() {
+        for state in [
+            TypeChangeState::Compatible,
+            TypeChangeState::Incompatible,
+            TypeChangeState::Undecidable,
+        ] {
+            assert_eq!(
+                decide(state, asked(true, false, true)),
+                Decision::Migrate,
+                "{state:?}"
+            );
+            // Still nothing without `update`: the mode is the door.
+            assert_eq!(decide(state, asked(false, false, true)), Decision::Refuse);
+        }
+        // Nothing to migrate towards is a refusal, not a data edit.
+        for state in [TypeChangeState::New, TypeChangeState::Unchanged] {
+            assert_eq!(decide(state, asked(true, true, true)), Decision::Refuse);
+        }
     }
 
     #[test]

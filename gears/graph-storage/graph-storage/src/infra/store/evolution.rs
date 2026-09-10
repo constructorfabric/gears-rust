@@ -13,9 +13,10 @@
 
 use graph_storage_sdk::models::{ItemError, ItemFamily, TypeKind};
 use graph_storage_sdk::plugin_api::GraphStoreError;
-use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use std::collections::BTreeMap;
-use toolkit_db::secure::{DBRunner, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
 
 use crate::domain::ontology::ChainValidator;
 use crate::infra::storage::entity::{edge, node};
@@ -48,6 +49,51 @@ fn still_within(bounds: ScanBounds) -> Result<(), GraphStoreError> {
         return Err(GraphStoreError::Deadline);
     }
     Ok(())
+}
+
+/// Producer keys of every endpoint in the batch.
+///
+/// An edge's validated document names its endpoints by producer key, not by
+/// internal id. One query per batch, never one per edge.
+async fn endpoint_keys(
+    scope: &toolkit_security::AccessScope,
+    tx: &impl DBRunner,
+    rows: &[edge::Model],
+) -> Result<BTreeMap<i64, String>, GraphStoreError> {
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .flat_map(|row| [row.src_node_id, row.dst_node_id])
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::Id.is_in(ids)))
+        .all(tx)
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .map(|model| (model.id, model.node_key))
+        .collect())
+}
+
+/// The instance an edge row presents for validation, as ingest composed it.
+fn edge_instance(
+    model: &edge::Model,
+    keys: &BTreeMap<i64, String>,
+    type_id: &str,
+) -> serde_json::Value {
+    let mut instance = serde_json::json!({
+        "type": type_id,
+        "src_node_key": keys.get(&model.src_node_id).cloned().unwrap_or_default(),
+        "dst_node_key": keys.get(&model.dst_node_id).cloned().unwrap_or_default(),
+    });
+    if let Some(discriminator) = &model.discriminator {
+        instance["discriminator"] = serde_json::Value::String(discriminator.clone());
+    }
+    instance["payload"] = model.payload.clone();
+    instance
 }
 
 /// Live rows of one interned type.
@@ -214,37 +260,11 @@ async fn revalidate_edges(
         if rows.is_empty() {
             return Ok(errors);
         }
-        // An edge's validated document names its endpoints by producer key,
-        // not by internal id, so the batch resolves the keys it needs. One
-        // query per batch, never one per edge.
-        let mut endpoint_ids: Vec<i64> = rows
-            .iter()
-            .flat_map(|row| [row.src_node_id, row.dst_node_id])
-            .collect();
-        endpoint_ids.sort_unstable();
-        endpoint_ids.dedup();
-        let keys: BTreeMap<i64, String> = node::Entity::find()
-            .secure()
-            .scope_with(scope)
-            .filter(Condition::all().add(node::Column::Id.is_in(endpoint_ids)))
-            .all(tx)
-            .await
-            .map_err(map_scope_err)?
-            .into_iter()
-            .map(|model| (model.id, model.node_key))
-            .collect();
+        let keys = endpoint_keys(scope, tx, &rows).await?;
 
         for model in &rows {
             after = model.id;
-            let mut instance = serde_json::json!({
-                "type": type_id,
-                "src_node_key": keys.get(&model.src_node_id).cloned().unwrap_or_default(),
-                "dst_node_key": keys.get(&model.dst_node_id).cloned().unwrap_or_default(),
-            });
-            if let Some(discriminator) = &model.discriminator {
-                instance["discriminator"] = serde_json::Value::String(discriminator.clone());
-            }
-            instance["payload"] = model.payload.clone();
+            let instance = edge_instance(model, &keys, type_id);
             for (pointer, message) in validator.validate(&instance) {
                 if errors.len() < bounds.max_reported {
                     errors.push(ItemError {
@@ -257,6 +277,269 @@ async fn revalidate_edges(
                 }
             }
             index += 1;
+        }
+    }
+}
+
+/// What a migration pass did, or would do.
+pub(crate) struct MigrationOutcome {
+    pub rows_scanned: u64,
+    pub rows_rewritten: u64,
+    /// Rows that do not satisfy the candidate even after the steps. Non-empty
+    /// means the whole operation is refused: the plan does not do what the
+    /// caller believes it does.
+    pub failures: Vec<ItemError>,
+}
+
+/// Apply `plan` to every live row of the type, validate the result against the
+/// candidate, and write it — or, in a dry run, count what would change.
+///
+/// Read-modify-write in memory rather than a rendered `jsonb` expression, and
+/// deliberately: the document that is validated has to be the document that is
+/// written, and a `jsonb_set` chain in SQL beside a step engine in Rust is two
+/// implementations of one migration. Every row is read anyway to validate it,
+/// so the only cost of doing it here is the cost we were paying regardless.
+///
+/// One statement per changed row. The row ceiling is what keeps that honest:
+/// a migration is bounded work inside one request, and a graph too large for
+/// that needs the asynchronous form the plan leaves out of scope.
+pub(crate) async fn migrate(
+    who: Migrator<'_>,
+    tx: &impl DBRunner,
+    what: Migrating<'_>,
+    bounds: ScanBounds,
+) -> Result<MigrationOutcome, GraphStoreError> {
+    match what.kind {
+        TypeKind::Node => migrate_nodes(who, tx, what, bounds).await,
+        TypeKind::Edge => migrate_edges(who, tx, what, bounds).await,
+        TypeKind::Attribute => Err(GraphStoreError::Unsupported {
+            what: "migrating an attribute type; it has no rows",
+        }),
+    }
+}
+
+/// The authority a migration writes under.
+#[derive(Clone, Copy)]
+pub(crate) struct Migrator<'a> {
+    pub scope: &'a toolkit_security::AccessScope,
+    /// Stamped on every rewritten row (`fr-audit-envelope`): a migration is a
+    /// write, and a write records who made it.
+    pub subject: &'a graph_storage_sdk::models::Subject,
+    /// A dry run reads and validates but writes nothing.
+    pub dry_run: bool,
+}
+
+/// The type being migrated, and what to migrate it with.
+#[derive(Clone, Copy)]
+pub(crate) struct Migrating<'a> {
+    pub type_id: &'a str,
+    pub kind: TypeKind,
+    pub interned: i32,
+    pub plan: &'a crate::domain::migration::Plan,
+    pub validator: &'a ChainValidator,
+    /// Declared `full_text_search` paths, to recompose the row's lexical text.
+    pub full_text_search: &'a [String],
+    /// Whether the type declares any `vector_search` path: if it does, a
+    /// changed payload makes the stored vector describe text the row no longer
+    /// has, so its epoch is cleared and the next ingest re-embeds it.
+    pub vectorized: bool,
+}
+
+async fn migrate_nodes(
+    who: Migrator<'_>,
+    tx: &impl DBRunner,
+    what: Migrating<'_>,
+    bounds: ScanBounds,
+) -> Result<MigrationOutcome, GraphStoreError> {
+    let mut out = MigrationOutcome {
+        rows_scanned: 0,
+        rows_rewritten: 0,
+        failures: Vec::new(),
+    };
+    let mut after: i64 = i64::MIN;
+    loop {
+        still_within(bounds)?;
+        let rows = node::Entity::find()
+            .secure()
+            .scope_with(who.scope)
+            .filter(
+                Condition::all()
+                    .add(node::Column::GtsNodeTypeId.eq(what.interned))
+                    .add(node::Column::DeletedAt.is_null())
+                    .add(node::Column::Id.gt(after)),
+            )
+            .order_by(node::Column::Id, sea_orm::Order::Asc)
+            .limit(bounds.batch)
+            .all(tx)
+            .await
+            .map_err(map_scope_err)?;
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        for model in &rows {
+            after = model.id;
+            out.rows_scanned += 1;
+            let mut payload = model.payload.clone();
+            let changed = what.plan.apply(&mut payload);
+
+            let mut instance = node_instance(model);
+            instance["type"] = serde_json::Value::String(what.type_id.to_owned());
+            instance["payload"] = payload.clone();
+            let violations = what.validator.validate(&instance);
+            if !violations.is_empty() {
+                for (pointer, message) in violations {
+                    if out.failures.len() < bounds.max_reported {
+                        out.failures.push(ItemError {
+                            index: usize::try_from(out.rows_scanned - 1)
+                                .unwrap_or(usize::MAX),
+                            family: ItemFamily::Node,
+                            gts_type: Some(what.type_id.to_owned()),
+                            pointer: Some(pointer),
+                            message: format!(
+                                "node `{}` does not satisfy the candidate after the migration: \
+                                 {message}",
+                                model.node_key
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
+            if !changed {
+                continue;
+            }
+            out.rows_rewritten += 1;
+            if who.dry_run {
+                continue;
+            }
+            let search_text = crate::infra::store::ingest::compose_search_text(
+                Some(model.name.as_str()),
+                Some(&payload),
+                what.full_text_search,
+            );
+            let mut update = node::Entity::update_many()
+                .col_expr(node::Column::Payload, Expr::value(payload))
+                .col_expr(node::Column::SearchText, Expr::value(search_text))
+                // The compare-and-set target moves with the row. Without this a
+                // producer holding the pre-migration version would overwrite the
+                // migrated row and undo the migration in silence.
+                .col_expr(node::Column::Version, Expr::value(model.version + 1))
+                .col_expr(
+                    node::Column::UpdatedAt,
+                    Expr::value(time::OffsetDateTime::now_utc()),
+                )
+                .col_expr(
+                    node::Column::UpdatedBySubjectId,
+                    Expr::value(who.subject.subject_id),
+                )
+                .col_expr(
+                    node::Column::UpdatedBySubjectType,
+                    Expr::value(who.subject.subject_type.clone()),
+                );
+            if what.vectorized {
+                update = update.col_expr(
+                    node::Column::EmbeddingEpoch,
+                    Expr::value(Option::<i64>::None),
+                );
+            }
+            update
+                .filter(Condition::all().add(node::Column::Id.eq(model.id)))
+                .secure()
+                .scope_with(who.scope)
+                .exec(tx)
+                .await
+                .map_err(map_scope_err)?;
+        }
+    }
+}
+
+async fn migrate_edges(
+    who: Migrator<'_>,
+    tx: &impl DBRunner,
+    what: Migrating<'_>,
+    bounds: ScanBounds,
+) -> Result<MigrationOutcome, GraphStoreError> {
+    let mut out = MigrationOutcome {
+        rows_scanned: 0,
+        rows_rewritten: 0,
+        failures: Vec::new(),
+    };
+    let mut after: i64 = i64::MIN;
+    loop {
+        still_within(bounds)?;
+        let rows = edge::Entity::find()
+            .secure()
+            .scope_with(who.scope)
+            .filter(
+                Condition::all()
+                    .add(edge::Column::GtsEdgeTypeId.eq(what.interned))
+                    .add(edge::Column::DeletedAt.is_null())
+                    .add(edge::Column::Id.gt(after)),
+            )
+            .order_by(edge::Column::Id, sea_orm::Order::Asc)
+            .limit(bounds.batch)
+            .all(tx)
+            .await
+            .map_err(map_scope_err)?;
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        let keys = endpoint_keys(who.scope, tx, &rows).await?;
+        for model in &rows {
+            after = model.id;
+            out.rows_scanned += 1;
+            let mut payload = model.payload.clone();
+            let changed = what.plan.apply(&mut payload);
+
+            let mut instance = edge_instance(model, &keys, what.type_id);
+            instance["payload"] = payload.clone();
+            let violations = what.validator.validate(&instance);
+            if !violations.is_empty() {
+                for (pointer, message) in violations {
+                    if out.failures.len() < bounds.max_reported {
+                        out.failures.push(ItemError {
+                            index: usize::try_from(out.rows_scanned - 1)
+                                .unwrap_or(usize::MAX),
+                            family: ItemFamily::Edge,
+                            gts_type: Some(what.type_id.to_owned()),
+                            pointer: Some(pointer),
+                            message: format!(
+                                "edge `{}` does not satisfy the candidate after the migration: \
+                                 {message}",
+                                model.edge_key
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
+            if !changed {
+                continue;
+            }
+            out.rows_rewritten += 1;
+            if who.dry_run {
+                continue;
+            }
+            edge::Entity::update_many()
+                .col_expr(edge::Column::Payload, Expr::value(payload))
+                .col_expr(
+                    edge::Column::UpdatedAt,
+                    Expr::value(time::OffsetDateTime::now_utc()),
+                )
+                .col_expr(
+                    edge::Column::UpdatedBySubjectId,
+                    Expr::value(who.subject.subject_id),
+                )
+                .col_expr(
+                    edge::Column::UpdatedBySubjectType,
+                    Expr::value(who.subject.subject_type.clone()),
+                )
+                .filter(Condition::all().add(edge::Column::Id.eq(model.id)))
+                .secure()
+                .scope_with(who.scope)
+                .exec(tx)
+                .await
+                .map_err(map_scope_err)?;
         }
     }
 }

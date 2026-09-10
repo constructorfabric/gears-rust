@@ -281,3 +281,30 @@ async fn a_new_index_path_becomes_filterable_without_recreating_the_type() {
     )
     .await;
 }
+
+// --- payload migrations ------------------------------------------------------
+
+#[tokio::test]
+async fn a_migration_moves_the_data_with_the_type() {
+    conformance::a_migration_moves_the_data_with_the_type(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_migration_that_leaves_rows_invalid_is_refused_naming_them() {
+    conformance::a_migration_that_leaves_rows_invalid_is_refused_naming_them(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_migration_without_a_schema_change_is_refused() {
+    conformance::a_migration_without_a_schema_change_is_refused(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_migration_stamps_its_writer_and_moves_the_version() {
+    conformance::a_migration_stamps_its_writer_and_moves_the_version(&store(), Uuid::now_v7())
+        .await;
+}

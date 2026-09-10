@@ -161,8 +161,47 @@ pub enum OnExisting {
     Update,
 }
 
+/// One step of a payload migration.
+///
+/// A closed set, not an expression language. Three steps covered every
+/// incompatible edit the Studio domain model produced in three days, and a
+/// closed set is what lets every path be a checked literal and every value a
+/// bound parameter.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MigrationStep {
+    /// Move a value to another path, if the source is present. An absent
+    /// source is a no-op: a migration fills gaps, it does not invent values.
+    Rename { from: String, to: String },
+    /// Set `path` when nothing is there. A present value is left alone —
+    /// otherwise a "default" would be an overwrite.
+    Default {
+        path: String,
+        value: serde_json::Value,
+    },
+    /// Remove `path` if present.
+    Drop { path: String },
+}
+
+impl MigrationStep {
+    /// The paths this step touches, for the overlap check.
+    #[must_use]
+    pub fn paths(&self) -> Vec<&str> {
+        match self {
+            Self::Rename { from, to } => vec![from.as_str(), to.as_str()],
+            Self::Default { path, .. } | Self::Drop { path } => vec![path.as_str()],
+        }
+    }
+}
+
+/// What to do with one type's stored payloads so they satisfy the candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationSpec {
+    pub type_id: GtsTypeId,
+    pub steps: Vec<MigrationStep>,
+}
+
 /// Per-batch registration options.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypeRegistrationOptions {
     pub on_existing: OnExisting,
     /// Admit a change the schemas cannot prove compatible when every stored
@@ -175,6 +214,23 @@ pub struct TypeRegistrationOptions {
     pub revalidate: bool,
     /// Compute and report every verdict, write nothing.
     pub dry_run: bool,
+    /// Payload migrations, at most one per type in the batch.
+    ///
+    /// A migration is the third ground for admitting a change, and the only one
+    /// that *changes* data: the steps are applied to every live row of the
+    /// type, the result is validated against the candidate, and nothing is
+    /// written unless every row passes. It requires a schema change to migrate
+    /// towards — a migration on an unchanged type would be a data-editing API
+    /// wearing a type endpoint's clothes.
+    pub migrations: Vec<MigrationSpec>,
+}
+
+impl TypeRegistrationOptions {
+    /// The migration declared for `type_id`, if any.
+    #[must_use]
+    pub fn migration_for(&self, type_id: &str) -> Option<&MigrationSpec> {
+        self.migrations.iter().find(|m| m.type_id == type_id)
+    }
 }
 
 /// How the candidate stands against the registered definition.
@@ -246,6 +302,8 @@ pub struct TypeChange {
     pub traits_changed: Vec<TraitChange>,
     /// Live rows of this type, when the operation needed to know.
     pub rows: Option<u64>,
+    /// Rows a migration changed (or would change, in a dry run).
+    pub rows_rewritten: Option<u64>,
     /// Object levels of the candidate where a *later* definition will not be
     /// able to add an optional property (`ContentModel::is_evolvable_in_place`).
     /// Reported so "your next edit will be a major" is a warning today rather
@@ -265,6 +323,13 @@ pub enum AdmissionBasis {
     /// The schemas do not prove it; every live row of the type was validated
     /// against the candidate instead. True of *these rows*, not of the type.
     DataBacked { rows_validated: u64 },
+    /// The rows did not satisfy the candidate, so they were *changed* to: the
+    /// declared steps were applied to every live row and the result validated
+    /// against the candidate before anything was written.
+    Migrated {
+        rows_scanned: u64,
+        rows_rewritten: u64,
+    },
 }
 
 /// What one registration did.
