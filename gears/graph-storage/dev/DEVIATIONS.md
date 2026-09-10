@@ -430,6 +430,30 @@ re-validating update additionally requires `write` on the node resource and is
 served under *that* scope: it reads the tenant's rows, and holding ontology
 administration is not holding the data.
 
+**A second door to an already-recorded gap.** ADR-0003 makes changing an
+annotation a type-version change with a durable index activation lifecycle
+(`requested -> building -> active`) and admits a filter only while the path's
+index is `active`; `fr-index-admission` demands capacity admission before index
+intent commits. Neither exists (D-104, D-105), which is why a declared path is
+filterable the moment it is declared. The in-place update does not create that
+gap, but it opens a second way in: a new `index` path can now appear under an
+*existing* identifier, with no lifecycle and no capacity check. Named here so
+that whoever builds the lifecycle gates this path too.
+
+**Folded into the docs.** The documentation said `MUST reject`, so a deviation
+entry alone would not have been an outcome. Written and published with the
+implementation:
+[`docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md`](../docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md)
+(status `proposed`: it narrows a normative MUST, so it wants the design review's
+signature, not mine), plus amendment notes rather than silent rewrites at each
+place the old rule is stated — PRD `fr-type-registration` and the § 12 risk row,
+DESIGN § 2 traceability, § 3.3 (the new operation, the new option, and why
+asking is a separate operation from doing), § 3.7 `gts_type` (two columns, and
+what "a row per minor version" now means), § 4 Ontology Registry
+responsibilities, and ADR-0003's annotation consequence. What is deliberately
+**not** amended: `fr-index-admission` and the activation lifecycle, which stay
+unimplemented deferrals rather than being redefined to match what is built.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here

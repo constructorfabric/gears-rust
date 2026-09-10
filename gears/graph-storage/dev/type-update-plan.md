@@ -206,7 +206,15 @@ valid — see §5.
    → clear `vector_epoch` on the type's nodes so the next ingest or a backfill
    re-embeds them; `full_text_search` changed → recompute the stored tsvector for
    the type's rows in the same batched pass.
-8. Report: verdict, diagnostics, rows scanned, rows rewritten, milliseconds.
+8. Every rewritten row carries the write, not only the new bytes: stamp
+   `updated_at` and `updated_by` with the migrating subject (`fr-audit-envelope`
+   is read-only on write surfaces but applies to *every* write), bump
+   `node.version` so a producer holding the pre-migration value cannot silently
+   undo the migration through `expected_version`, and advance the tenant's graph
+   revision once for the operation — a consumer holding a revision must not see
+   content move underneath it without a signal. Added after reading the docs
+   against this plan; see § Read against the gear's own documentation.
+9. Report: verdict, diagnostics, rows scanned, rows rewritten, milliseconds.
 
 Concurrency is deliberately simple: the operation runs under one snapshot, rows
 are locked per batch, and an ingest of the old shape that arrives after the
@@ -490,3 +498,85 @@ rehearsal: the scan did not consult the caller's deadline at all, so a raised
 ceiling could outlive the request that asked for it. It now checks the
 remaining budget between batches and answers `Deadline`; the row ceiling bounds
 the work, the budget bounds the wait.
+
+---
+
+# Read against the gear's own documentation, 2026-09-10
+
+Three checks, three different answers.
+
+## 1. Closing the payload at the leaf is the documented rule, not a deviation
+
+DESIGN § 3.1 § Authoring rules, rule 3, verbatim: *"`allOf` branches evaluate
+independently, so `additionalProperties: false` on `payload` is only safe when no
+ancestor contributes payload members. Finding may close its payload; a type
+derived from `reference_node` or `analysis_edge` may not, because that branch does
+not see the inherited `source` or `provenance` and rejects them. Such a type
+either leaves `payload` open or **restates the inherited members alongside its
+own**."*
+
+That is the exporter change, word for word, including the part the stand
+rehearsal discovered by failing: our leaves' ancestors *do* contribute payload
+members, so the naive close is the unsafe case the rule warns about and
+restating them is the documented remedy. Rule 2 ("derived types extend
+`payload`, nothing else") is untouched. The node base declares
+`payload: { "type": "object", "additionalProperties": true }` — a permission, not
+an obligation; DESIGN's own phantom family narrows the same level to
+`maxProperties: 0`.
+
+One consequence to state out loud rather than discover: on a closed type, ingest
+starts refusing an undeclared payload field. For a typed graph that is arguably
+the point, but it is a producer-visible contract change and belongs in the same
+decision as the exporter flag.
+
+## 2. The in-place update contradicts a normative MUST — deliberately, and now on paper
+
+PRD `fr-type-registration` says registration *"**MUST** reject re-registration of
+an existing identifier with a different schema (directing the caller to publish a
+new GTS version)"*, and the same rule is restated in DESIGN § 2's traceability
+row, in § 4's component responsibilities ("idempotent, conflict-rejecting"), in
+§ 3.7's note that each registered minor version is its own row, and in the § 12
+risk table. `update` mode narrows all five.
+
+The defence is in the requirement's own rationale — the registry is "the contract
+boundary that keeps one shared graph consistent across producers", and a
+backward-compatible change preserves exactly that — plus the platform's own
+answer for the registry this table caches (types-registry ADR-0003/0004/0005).
+But a MUST is not amended by a deviations entry, so
+[`docs/ADR/0006`](../docs/ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md)
+now carries the decision (status `proposed`), and each of the five places has an
+amendment note pointing at it. Two smaller doc gaps closed at the same time: the
+REST table in § 3.3 was normative and lacked the new operation, and the
+`gts_type` table lacked `revision` and `updated_at`.
+
+Not amended, on purpose: `fr-index-admission` and ADR-0003's index activation
+lifecycle. They are unimplemented (D-104, D-105) and an in-place update is a
+second door to that same gap, not a reason to redefine it.
+
+## 3. Migrations: the docs are silent about the rewrite and loud about three things around it
+
+Nothing forbids the gear writing payloads — ingest does it — but § 5 above omits
+three obligations that apply to *any* write of an element, and a migration is
+one:
+
+1. **The audit envelope** (`fr-audit-envelope`): every element carries the
+   subject and timestamp of its last update, read-only on every write surface.
+   A migration that rewrites payload must stamp `updated_at` / `updated_by` with
+   the subject that ran it, or the rows silently claim their last writer was the
+   producer.
+2. **The graph revision.** A delete "**MUST** increment the tenant's graph
+   revision", label attach/detach must too, and ingest advances it whenever
+   stored state actually changed — precisely so that "two reads at one revision
+   can never observe different content". A migration changes stored content, so
+   it must advance the revision; otherwise a consumer holding a revision sees the
+   graph move underneath it without a signal.
+3. **`node.version`.** It is the compare-and-set target a producer may pass as
+   `expected_version`. If a migration rewrites a payload without bumping it, a
+   producer holding the pre-migration version overwrites the migrated row and
+   the migration is silently undone. It must bump, which also means a migration
+   can legitimately break a concurrent producer's CAS — the right outcome, and
+   one the API documentation has to say.
+
+None of the three is hard; all three are the kind of thing that is cheap now and
+a data-integrity bug later. They are added to § 5 as steps of the migration
+pass.

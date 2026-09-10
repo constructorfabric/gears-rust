@@ -235,6 +235,20 @@ Several platform initiatives need to persist and query relationships between het
 
 The system **MUST** accept runtime registration of GTS types with kind `node`, `edge`, or `attribute`, each carrying a GTS identifier and a draft-07 JSON Schema. Registration **MUST** be idempotent for byte-identical schemas, **MUST** reject re-registration of an existing identifier with a different schema (directing the caller to publish a new GTS version), and **MUST** apply each registration batch atomically. The system **MUST** derive and store the deterministic UUIDv5 for every registered GTS identifier using the platform GTS derivation so identifiers are interoperable with other gears.
 
+> **Amended 2026-09-10 by [ADR-0006](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md).**
+> The rejection above is now the **default** rather than the only behaviour.
+> `POST /types` takes `options.on_existing: reject | update`; `reject` is the
+> default and is this requirement unchanged. With `update`, a candidate whose
+> backward verdict is `Compatible` (types-registry ADR-0003's strategy, computed
+> by GTS **OP#8**) replaces the stored definition under the same identifier —
+> because that is precisely the class of change that cannot invalidate a stored
+> instance or a derived type, which is this requirement's own rationale. An
+> incompatible or undecidable change is still refused, and still directed to a
+> new major, unless the caller offers the type's rows for re-validation
+> (`options.revalidate`), which is a weaker and separately reported claim. The
+> rest of this requirement — idempotence on identical bytes, batch atomicity,
+> UUIDv5 derivation — is untouched.
+
 - **Rationale**: Producers evolve independently; the type registry is the contract boundary that keeps one shared graph consistent across them.
 - **Actors**: `cpt-cf-graph-storage-actor-ontology-author`, `cpt-cf-graph-storage-actor-producer-gear`
 
@@ -930,7 +944,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 | Community detection and sampled betweenness differ from prototype outputs | Consumers expecting NetworkX-identical numbers are surprised | PRD explicitly waives numeric parity; determinism and ordering guarantees are documented per algorithm |
 | A single tenant's ingest load starves others | Platform-wide latency degradation | Batch size limits, per-tenant concurrency gates, operation-level permissions, observability of per-tenant load |
 | Analytics load starves the interactive path | Ingest and search miss latency targets | Analytics runs as its own gear with its own CPU, memory and connection budget (graph-analytics ADR-0002), so the two cannot share a pool |
-| Shared ontologies evolve incompatibly across producers | Ingest failures or semantic drift between producers | Immutable schemas per GTS version, conflict-rejecting registration, family patterns that keep older derived types valid |
+| Shared ontologies evolve incompatibly across producers | Ingest failures or semantic drift between producers | Conflict-rejecting registration by default; an in-place update only for a change proved backward compatible, which is the property that actually keeps older derived types valid (ADR-0006); family patterns; a new major for anything else |
 | PostgreSQL 19 GA slips, or a PG19 beta regression hits the pinned stack | The gear ships on a beta database longer than planned | The stack is pinned (beta image + pgvector revision) and validated by the PG19 spike and the prototype's full test suite; the iterative-CTE backend can serve the whole fixed-depth API if a PGQ-specific regression appears; re-pin to stock at GA |
 | SQL/PGQ variable-length paths arrive later than PG20 | The CTE backend carries variable-depth expansion longer | The traversal port isolates the split; consumers see no API difference; a dedicated traversal mirror remains the measured-bottleneck contingency (ADR-0001) |
 | The `toolkit-db` scoped single-statement API is not delivered | Single-statement traversal and single-statement hybrid composition stay unavailable; each hop costs an extra database round trip | Bounded traversal is implemented and verified without it (two scoped queries per hop, p95 0.37 ms per hop at reference scale), so delivery affects performance and expressiveness rather than viability. Measured against the candidate implementation, the single statement buys tail latency on wide frontiers — depth-3 p95 30.0 ms against 50.5 ms end to end — not correctness. Largely retired: the CTE half is merged (PR #4584) and the SQL/PGQ half is in review (PR #4639). What remains of the risk is the SQL/PGQ half not landing, which leaves the CTE backend serving traversal in full |

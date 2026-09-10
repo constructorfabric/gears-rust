@@ -38,6 +38,17 @@ decision-makers: Graph Storage design review
 > "vectorizable" into `full_text_search` and `vector_search`, which the single
 > annotation had conflated.
 
+> **Amendment 2026-09-10 ([ADR-0006](./0006-cpt-cf-graph-storage-adr-type-evolution.md)).**
+> One consequence below says "changing annotations is a type-version change".
+> A trait change that no instance can fail — declaring one more `index` path, for
+> example — is now admitted under the same identifier, because the two schemas
+> prove it cannot invalidate anything. What is unchanged is everything about the
+> index *work*: the activation lifecycle in that consequence, and the capacity
+> admission of `fr-index-admission`, still govern it and still do not exist
+> (DEVIATIONS D-104, D-105). An in-place update opens a second door to that gap
+> rather than creating it, and when the lifecycle lands it has to gate this path
+> too.
+
 ## Context and Problem Statement
 
 A shared graph accumulates payloads from many producers. If every attribute is indexed and embedded, indexes bloat and ingest slows; if none are, filters and vector search stop working; if payloads carry article bodies or raw logs, the graph becomes a slow blob store. The gear needs a defined partitioning of node metadata — what lives in dedicated columns, what is indexed inside JSONB, what feeds embeddings, and what must leave the graph entirely — and a defined authority for those choices per type.

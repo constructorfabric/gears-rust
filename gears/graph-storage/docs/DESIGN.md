@@ -54,7 +54,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 
 | Priority | Requirement | Design Response |
 |----------|-------------|-----------------|
-| `p1` | `cpt-cf-graph-storage-fr-type-registration` | Ontology Registry component validates draft-07 schemas, derives UUIDv5 identifiers via platform GTS, applies batches atomically, rejects conflicting re-registration |
+| `p1` | `cpt-cf-graph-storage-fr-type-registration` | Ontology Registry component validates draft-07 schemas, derives UUIDv5 identifiers via platform GTS, applies batches atomically, rejects conflicting re-registration by default and admits a proved-backward-compatible change under the same identifier when the caller asks for it (ADR-0006) |
 | `p1` | `cpt-cf-graph-storage-fr-type-constraints` | Registry enforces abstractness and edge endpoint patterns; Ingest Pipeline validates payloads across the full GTS derivation chain with JSON-pointer error reporting |
 | `p2` | `cpt-cf-graph-storage-fr-type-catalog` | Registry read endpoints list and fetch registered types with schemas, constraints, and derived UUIDs |
 | `p1` | `cpt-cf-graph-storage-fr-index-admission` | Type registration reserves estimated index footprint and passes per-tenant/global path caps before intent commits; accepted intents run through a bounded tenant-fair DDL queue at background priority (§ Capacity and Admission Contract, ADR-0003) |
@@ -857,7 +857,7 @@ Independent producers can only share one graph if a single component owns type r
 
 ##### Responsibility scope
 
-GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across the full derivation chain; resolution and persistence of the chain-effective trait object per registered type (family, scope management, endpoint constraints, index/full-text/vector paths, event emission — ADR-0003); rejection of a type that resolves no `family` or an out-of-enum trait value; idempotent, conflict-rejecting, batch-atomic registration; type catalog reads exposing effective traits; an in-memory validator cache per registered type chain.
+GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across the full derivation chain; resolution and persistence of the chain-effective trait object per registered type (family, scope management, endpoint constraints, index/full-text/vector paths, event emission — ADR-0003); rejection of a type that resolves no `family` or an out-of-enum trait value; idempotent, conflict-rejecting, batch-atomic registration, plus the in-place update of ADR-0006 (the backward verdict from GTS OP#8, and the re-validation of the type's rows when the caller offers them); type catalog reads exposing effective traits; an in-memory validator cache per registered type chain.
 
 ##### Responsibility boundaries
 
@@ -1100,7 +1100,8 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 
 | Method | Path | Description | Priority |
 |---|---|---|---|
-| `POST` | `/api/graph-storage/v1/types` | Register a type batch, atomically | p1 |
+| `POST` | `/api/graph-storage/v1/types` | Register a type batch, atomically; `options.on_existing` decides what a changed schema under a registered identifier means (ADR-0006) | p1 |
+| `POST` | `/api/graph-storage/v1/types/compatibility` | What registering this batch would do, without writing: per type the verdicts, the diagnostics with their schema locations, the moved traits, the row count (ADR-0006) | p1 |
 | `GET` | `/api/graph-storage/v1/types` | List types; `$filter` on kind and GTS pattern | p1 |
 | `GET` | `/api/graph-storage/v1/types/{gts_type_id}` | One type with its schema and effective traits | p1 |
 | `POST` | `/api/graph-storage/v1/ingest` | Nodes and edges in one transaction; options: skip-embedding, phantom control, replace scope | p1 |
@@ -1143,6 +1144,13 @@ because each was answerable more than one way:
 - **Adjacency on node read is bounded by a named parameter**, `adjacency_limit`,
   defaulting to `limits.node_read_max_adjacency`, with a truncation flag in the
   response.
+- **Asking what an edit costs is its own operation.** `POST /types/compatibility`
+  could have been a `dry_run` flag on `POST /types`, and was not, for two
+  reasons: a dry run is a *read* and should not need the permission a write
+  needs to be refused for, and a refusal is its normal answer rather than an
+  error — it returns `200` with per-type verdicts where the write path returns
+  `409`. It runs the identical admission path, so the two cannot disagree
+  (ADR-0006).
 
 **OData binding.** Tabular projection binds all five system query options the
 platform accepts (`$filter`, `$orderby`, `$select`, `$top`, `$skiptoken`, with
@@ -1825,6 +1833,8 @@ is a cache with a foreign identity, never a second source of truth.
 | type_schema | JSONB | The type's draft-07 JSON Schema |
 | effective_traits | JSONB | Trait values resolved across the derivation chain (Base Ontology GTS Schemas) |
 | created_at | TIMESTAMPTZ | Registration time |
+| revision | INTEGER | Which definition of this identifier is in force: `1` until the type is first updated in place, one more per admitted update (ADR-0006, types-registry ADR-0005) |
+| updated_at | TIMESTAMPTZ | When the definition last moved; equals `created_at` for a type that was never updated |
 
 **Naming rule.** The interned surrogate is referenced as `gts_<entity>_type_id`
 (`node.gts_node_type_id`, `edge.gts_edge_type_id`); the GTS identifier and its
@@ -1834,6 +1844,13 @@ node-type reference, `gts_type_id = 'gts.cf.…'` is an identifier. `INTEGER`
 rather than `SMALLINT` because each registered minor version is its own row, and
 32,767 types per tenant is not a ceiling worth discovering in production; at
 PostgreSQL row alignment the two are the same size in these tables anyway.
+
+**A row per identifier, revisions within it (ADR-0006).** "Each registered minor
+version is its own row" holds per *identifier*: a minor-bearing identifier is
+immutable and keeps its own row, while a major-only identifier names a mutable
+logical entity (types-registry ADR-0004) whose row carries successive
+definitions, counted by `revision`. The retained revisions themselves are not
+stored: this is the counter, not the history table ADR-0005 describes.
 
 #### Table: node
 
