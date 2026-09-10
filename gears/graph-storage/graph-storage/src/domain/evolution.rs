@@ -31,9 +31,7 @@
 //! to the exporter, and why re-validation exists for everything not emitted
 //! that way.
 
-use graph_storage_sdk::models::{
-    EffectiveTraits, SchemaDiagnostic, TraitChange, TypeChangeState,
-};
+use graph_storage_sdk::models::{EffectiveTraits, SchemaDiagnostic, TraitChange, TypeChangeState};
 use gts::schema_evolution::CompatibilityVerdict;
 use gts::store::GtsStore;
 use serde_json::Value;
@@ -170,9 +168,7 @@ pub fn compare(
         })?;
     }
     let comparison = store.compare_documents(old, new).map_err(|error| {
-        DomainError::invalid(format!(
-            "the two definitions cannot be compared: {error}"
-        ))
+        DomainError::invalid(format!("the two definitions cannot be compared: {error}"))
     })?;
 
     Ok(Comparison {
@@ -359,7 +355,11 @@ mod tests {
 
     #[test]
     fn an_added_optional_property_is_compatible_at_a_closed_level() {
-        let old = leaf(&json!({ "key": { "type": "string" } }), true, &json!(["key"]));
+        let old = leaf(
+            &json!({ "key": { "type": "string" } }),
+            true,
+            &json!(["key"]),
+        );
         let new = leaf(
             &json!({ "key": { "type": "string" }, "owner": { "type": "string" } }),
             true,
@@ -374,7 +374,11 @@ mod tests {
     /// model, this is 188 of 188 node types (see the module docs).
     #[test]
     fn the_same_property_added_at_an_open_level_is_incompatible() {
-        let old = leaf(&json!({ "key": { "type": "string" } }), false, &json!(["key"]));
+        let old = leaf(
+            &json!({ "key": { "type": "string" } }),
+            false,
+            &json!(["key"]),
+        );
         let new = leaf(
             &json!({ "key": { "type": "string" }, "owner": { "type": "string" } }),
             false,
@@ -408,8 +412,16 @@ mod tests {
     #[test]
     fn a_renamed_property_is_incompatible_in_both_shapes() {
         for closed in [true, false] {
-            let old = leaf(&json!({ "priority": { "type": "string" } }), closed, &json!([]));
-            let new = leaf(&json!({ "urgency": { "type": "string" } }), closed, &json!([]));
+            let old = leaf(
+                &json!({ "priority": { "type": "string" } }),
+                closed,
+                &json!([]),
+            );
+            let new = leaf(
+                &json!({ "urgency": { "type": "string" } }),
+                closed,
+                &json!([]),
+            );
             assert_eq!(
                 state_of(&old, &new),
                 TypeChangeState::Incompatible,
@@ -420,7 +432,11 @@ mod tests {
 
     #[test]
     fn a_new_required_property_is_incompatible() {
-        let old = leaf(&json!({ "key": { "type": "string" } }), true, &json!(["key"]));
+        let old = leaf(
+            &json!({ "key": { "type": "string" } }),
+            true,
+            &json!(["key"]),
+        );
         let new = leaf(
             &json!({ "key": { "type": "string" }, "owner": { "type": "string" } }),
             true,
@@ -472,7 +488,10 @@ mod tests {
         for state in [TypeChangeState::Incompatible, TypeChangeState::Undecidable] {
             assert_eq!(decide(state, asked(false, false, false)), Decision::Refuse);
             assert_eq!(decide(state, asked(true, false, false)), Decision::Refuse);
-            assert_eq!(decide(state, asked(true, true, false)), Decision::Revalidate);
+            assert_eq!(
+                decide(state, asked(true, true, false)),
+                Decision::Revalidate
+            );
         }
         assert_eq!(
             decide(TypeChangeState::Compatible, asked(true, false, false)),

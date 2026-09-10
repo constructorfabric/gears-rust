@@ -147,6 +147,7 @@ fn traits_to_json(descriptor: &ontology::TypeDescriptor) -> serde_json::Value {
 #[derive(Clone, Copy)]
 struct UpdateLimits {
     max_rows: u64,
+    max_migration_rows: u64,
     batch: u64,
     max_reported: usize,
     /// The call's absolute deadline, so a re-validating scan stops waiting
@@ -180,6 +181,7 @@ pub async fn register_types(
     let max_chain_depth = usize::from(config.ontology_max_chain_depth);
     let limits = UpdateLimits {
         max_rows: u64::from(config.type_update_max_rows),
+        max_migration_rows: u64::from(config.type_migration_max_rows),
         batch: u64::from(config.type_update_batch),
         max_reported: config.type_update_max_reported_rows as usize,
         budget: ctx.budget,
@@ -204,8 +206,8 @@ pub async fn register_types(
                     &options,
                     limits,
                 )
-                    .await
-                    .map_err(TxStoreError::from)
+                .await
+                .map_err(TxStoreError::from)
             })
         })
         .await
@@ -318,8 +320,7 @@ async fn register_in_tx(
     for registration in batch {
         // Resolve the chain from what is already registered plus what this
         // batch carries.
-        let ancestors =
-            ancestor_definitions(scope, tx, &registration.type_id, &in_batch).await?;
+        let ancestors = ancestor_definitions(scope, tx, &registration.type_id, &in_batch).await?;
         let ancestor_refs: Vec<&serde_json::Value> =
             ancestors.iter().map(|(_, schema)| schema).collect();
         let descriptor = ontology::analyze(
@@ -336,7 +337,9 @@ async fn register_in_tx(
         let existing = gts_type::Entity::find()
             .secure()
             .scope_with(scope)
-            .filter(Condition::all().add(gts_type::Column::GtsTypeId.eq(descriptor.type_id.clone())))
+            .filter(
+                Condition::all().add(gts_type::Column::GtsTypeId.eq(descriptor.type_id.clone())),
+            )
             .one(tx)
             .await
             .map_err(map_scope_err)?;
@@ -619,15 +622,11 @@ async fn admit(
             Ok(Some(AdmissionBasis::SchemaProved))
         }
         evolution::Decision::Revalidate | evolution::Decision::Migrate => {
-            let rows = super::evolution::count_live(
-                who.scope,
-                tx,
-                descriptor.kind,
-                candidate.interned,
-            )
-            .await?;
+            let rows =
+                super::evolution::count_live(who.scope, tx, descriptor.kind, candidate.interned)
+                    .await?;
             change.rows = Some(rows);
-            if let Some(refusal) = row_ceiling(&descriptor.type_id, rows, limits) {
+            if let Some(refusal) = row_ceiling(&descriptor.type_id, rows, limits.bound(decision)) {
                 if who.dry_run {
                     change.diagnostics.push(refusal.diagnostic);
                     return Ok(None);
@@ -677,10 +676,11 @@ async fn admit(
                     "the rule asked for a migration where none was declared".to_owned(),
                 ));
             };
-            let plan = crate::domain::migration::compile(spec)
-                .map_err(|error| GraphStoreError::InvalidQuery {
+            let plan = crate::domain::migration::compile(spec).map_err(|error| {
+                GraphStoreError::InvalidQuery {
                     what: error.to_string(),
-                })?;
+                }
+            })?;
             let outcome = super::evolution::migrate(
                 who,
                 tx,
@@ -738,18 +738,38 @@ struct Ceiling {
     diagnostic: graph_storage_sdk::models::SchemaDiagnostic,
 }
 
-/// `None` while the type fits inside the synchronous bound.
+impl UpdateLimits {
+    /// The bound this pass runs under, and the key that sets it.
+    ///
+    /// Two bounds rather than one because the passes run at different rates
+    /// and only one of them writes: re-validation reads ~19 000 rows/s, a
+    /// migration rewrites ~1 900 (one statement per changed row, measured on
+    /// a stand). Under a gateway that kills a synchronous request at 30 s, a
+    /// shared ceiling sized for the first admits a migration that does all of
+    /// its work and is then killed — the work rolls back, and the caller hears
+    /// about a timeout rather than about a bound.
+    fn bound(self, decision: evolution::Decision) -> (u64, &'static str) {
+        if decision == evolution::Decision::Migrate {
+            (self.max_migration_rows, "type_migration_max_rows")
+        } else {
+            (self.max_rows, "type_update_max_rows")
+        }
+    }
+}
+
+/// `None` while the type fits inside the synchronous bound for this pass.
 ///
 /// The bound is not the gear's own deadline: `api-gateway` kills a synchronous
 /// request at 30 s whatever this gear is configured with, so the ceiling is
 /// what keeps a row-reading update inside a request that can actually answer.
-fn row_ceiling(type_id: &str, rows: u64, limits: UpdateLimits) -> Option<Ceiling> {
-    if rows <= limits.max_rows {
+fn row_ceiling(type_id: &str, rows: u64, bound: (u64, &str)) -> Option<Ceiling> {
+    let (max_rows, key) = bound;
+    if rows <= max_rows {
         return None;
     }
     let what = format!(
-        "type `{type_id}` has {rows} live rows; a synchronous update reads at most {}          (`type_update_max_rows`)",
-        limits.max_rows
+        "type `{type_id}` has {rows} live rows; one synchronous pass handles at most \
+         {max_rows} (`{key}`)"
     );
     Some(Ceiling {
         error: GraphStoreError::LimitExceeded { what: what.clone() },
@@ -968,4 +988,70 @@ pub async fn count(store: &PgGraphStore, ctx: &StoreCtx<'_>) -> Result<u64, Grap
         .count(&conn)
         .await
         .map_err(map_scope_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> UpdateLimits {
+        UpdateLimits {
+            max_rows: 100_000,
+            max_migration_rows: 25_000,
+            batch: 2_000,
+            max_reported: 50,
+            budget: graph_storage_sdk::models::RemainingBudget::starting_now(
+                std::time::Duration::from_secs(10),
+            ),
+        }
+    }
+
+    /// The two passes run at different rates under one 30 s gateway cap, so
+    /// they cannot share a ceiling: at the measured ~1 900 rows/s a migration
+    /// of 100 000 rows would do 52 s of work and be killed. The refusal has to
+    /// name the key that actually applies, or an operator raises the wrong one.
+    #[test]
+    fn each_pass_is_bounded_by_its_own_ceiling_and_names_it() {
+        let migration = row_ceiling(
+            "gts.test.gs._.thing.v1~",
+            40_000,
+            limits().bound(evolution::Decision::Migrate),
+        )
+        .expect("40 000 rows is past the migration ceiling");
+        assert!(
+            migration
+                .diagnostic
+                .message
+                .contains("type_migration_max_rows"),
+            "{}",
+            migration.diagnostic.message
+        );
+        assert!(migration.diagnostic.message.contains("25000"));
+
+        // The same size is well inside the read-only pass.
+        assert!(
+            row_ceiling(
+                "gts.test.gs._.thing.v1~",
+                40_000,
+                limits().bound(evolution::Decision::Revalidate),
+            )
+            .is_none(),
+            "40 000 rows is ~2 s of re-validation"
+        );
+
+        let revalidation = row_ceiling(
+            "gts.test.gs._.thing.v1~",
+            250_000,
+            limits().bound(evolution::Decision::Revalidate),
+        )
+        .expect("250 000 rows is past the read ceiling too");
+        assert!(
+            revalidation
+                .diagnostic
+                .message
+                .contains("type_update_max_rows"),
+            "{}",
+            revalidation.diagnostic.message
+        );
+    }
 }

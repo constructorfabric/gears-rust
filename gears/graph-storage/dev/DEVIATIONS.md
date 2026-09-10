@@ -462,8 +462,17 @@ was a `400` (an undeclared path); after, it filters and orders, and
 unfinished: the revision counter says which definition is in force, no surface
 reads the history, and the trigger for building it is a consumer that needs the
 previous definition. Also open: a backfill that re-embeds what a migration
-marked stale (the marking is done, the worker is not, so vector search covers
-fewer rows until the next ingest touches them); an asynchronous migration for a
+marked stale. The marking is done and the worker is not, so vector search covers
+fewer rows until something touches them — and the remedy meanwhile is a plain
+**re-ingest of the type**, which producers do routinely: the epoch is cleared,
+so the coordinator re-embeds the row even when its text is unchanged. The count
+is in the migration's own report (`rows_rewritten`, for a type that declares
+`vector_search`). This is deliberately **not** scheduled as its own task: the
+PRD already requires a re-embedding lifecycle for the larger case (a provider or
+model change blocks the vector arm the same way, § fr-embedding-space and the
+tenant-offboarding and fairness requirements all name re-embedding jobs), none
+of it exists, and a backfill built for migrations alone would be one of three
+inputs to a mechanism nobody has written. an asynchronous migration for a
 type over the row ceiling; and the delegation of the verdict to types-registry
 over the wire. The call site is one function (`domain::evolution`) precisely so
 that last one can replace it without touching the store or the API.
@@ -493,6 +502,29 @@ for the same reason ("attach and detach **MUST** increment the tenant's graph
 revision, so two reads at one revision can never observe different labels"). A
 `created` type changes no existing read and still leaves the counter alone,
 which is what registration always did; the conformance case pins both halves.
+
+**Two row ceilings, because the two passes run at different rates
+(2026-09-11).** Measured on the stand: re-validation *reads* at ~19 000 rows/s
+(250 000 in 12.9 s, 1.1 M in 105 s), a migration *rewrites* at ~1 900 rows/s
+(10 000 in 5.1–6.3 s, three runs) — it is one statement per changed row. Under
+the gateway's 30 s that is the difference between a bound and a trap: at the
+shared `type_update_max_rows` of 100 000 a migration is admitted, does ~52 s of
+work, and is killed. `type_migration_max_rows` (default **25 000**, ~13 s at the
+measured rate) bounds the migration pass instead, and the refusal names the key
+that actually applies — an operator who is told the wrong key raises the wrong
+one. Verified on the stand from both sides: the 10 000-row `audit_entry` still
+migrates, and the 250 000-row `action_run` is refused with *"one synchronous
+pass handles at most 25000 (`type_migration_max_rows`)"*.
+
+The measured evidence that a timed-out request rolls back rather than half
+committing: the 866 000-row re-validation that returned `504` left nothing
+behind — the chunked run afterwards reported all 406 types as `updated`, not
+`unchanged`.
+
+**Neither ceiling exists in the fake store**, which carries no configuration;
+the conformance suite therefore covers the *grounds* on both implementations and
+the *bounds* on neither. The bound selection is a unit case over the pure
+function, and the numbers above come from the stand.
 
 **The row ceiling is set by the gateway, not by the gear's own deadline.**
 `api-gateway` kills any synchronous request at 30 s — `SYNC_TIMEOUT`, a

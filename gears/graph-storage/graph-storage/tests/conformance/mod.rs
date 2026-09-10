@@ -1865,7 +1865,11 @@ fn requirement_revision(
     }
 }
 
-fn requirement_properties(status_values: &[&str], with_owner: bool, urgency: bool) -> serde_json::Value {
+fn requirement_properties(
+    status_values: &[&str],
+    with_owner: bool,
+    urgency: bool,
+) -> serde_json::Value {
     let mut properties = serde_json::json!({
         "key": { "type": "string" },
         "statement": { "type": "string" },
@@ -2364,7 +2368,10 @@ pub async fn a_new_index_path_becomes_filterable_without_recreating_the_type(
 
 // --- payload migrations ------------------------------------------------------
 
-fn migration(type_id: &str, steps: Vec<graph_storage_sdk::models::MigrationStep>) -> graph_storage_sdk::models::MigrationSpec {
+fn migration(
+    type_id: &str,
+    steps: Vec<graph_storage_sdk::models::MigrationStep>,
+) -> graph_storage_sdk::models::MigrationSpec {
     graph_storage_sdk::models::MigrationSpec {
         type_id: type_id.to_owned(),
         steps,

@@ -150,12 +150,8 @@ pub(crate) async fn revalidate(
     bounds: ScanBounds,
 ) -> Result<Vec<ItemError>, GraphStoreError> {
     match kind {
-        TypeKind::Node => {
-            revalidate_nodes(scope, tx, type_id, interned, validator, bounds).await
-        }
-        TypeKind::Edge => {
-            revalidate_edges(scope, tx, type_id, interned, validator, bounds).await
-        }
+        TypeKind::Node => revalidate_nodes(scope, tx, type_id, interned, validator, bounds).await,
+        TypeKind::Edge => revalidate_edges(scope, tx, type_id, interned, validator, bounds).await,
         TypeKind::Attribute => Err(GraphStoreError::Unsupported {
             what: "re-validating an attribute type; it has no rows",
         }),
@@ -390,8 +386,7 @@ async fn migrate_nodes(
                 for (pointer, message) in violations {
                     if out.failures.len() < bounds.max_reported {
                         out.failures.push(ItemError {
-                            index: usize::try_from(out.rows_scanned - 1)
-                                .unwrap_or(usize::MAX),
+                            index: usize::try_from(out.rows_scanned - 1).unwrap_or(usize::MAX),
                             family: ItemFamily::Node,
                             gts_type: Some(what.type_id.to_owned()),
                             pointer: Some(pointer),
@@ -498,8 +493,7 @@ async fn migrate_edges(
                 for (pointer, message) in violations {
                     if out.failures.len() < bounds.max_reported {
                         out.failures.push(ItemError {
-                            index: usize::try_from(out.rows_scanned - 1)
-                                .unwrap_or(usize::MAX),
+                            index: usize::try_from(out.rows_scanned - 1).unwrap_or(usize::MAX),
                             family: ItemFamily::Edge,
                             gts_type: Some(what.type_id.to_owned()),
                             pointer: Some(pointer),

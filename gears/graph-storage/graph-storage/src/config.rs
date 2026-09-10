@@ -118,6 +118,18 @@ pub struct GraphStorageConfig {
     /// interactive request: above it the honest answer is an asynchronous
     /// migration with progress, which the gear does not have.
     pub type_update_max_rows: u32,
+    /// Live rows a synchronous *migration* may rewrite.
+    ///
+    /// A separate bound from `type_update_max_rows`, because the two passes run
+    /// at different rates and only one of them writes. Measured on a stand
+    /// (2026-09-11): re-validation reads ~19 000 rows/s, a migration rewrites
+    /// ~1 900 rows/s — it is one statement per changed row. Since `api-gateway`
+    /// kills any synchronous request at 30 s whatever this gear is configured
+    /// with, 100 000 rows is ~5 s of re-validation and ~52 s of migration: the
+    /// shared bound would admit a migration that does all of its work and is
+    /// then killed, rolling back. 25 000 is ~13 s at the measured rate, which
+    /// leaves the margin a bigger payload or a busier server needs.
+    pub type_migration_max_rows: u32,
     /// Rows per batch while re-validating a type.
     pub type_update_batch: u32,
     /// Offending node keys a refusal lists. Enough to see the pattern, not
@@ -155,6 +167,7 @@ impl Default for GraphStorageConfig {
             idempotency_retention_days: 7,
             ontology_max_chain_depth: 3,
             type_update_max_rows: 100_000,
+            type_migration_max_rows: 25_000,
             type_update_batch: 2_000,
             type_update_max_reported_rows: 50,
         }
@@ -226,6 +239,7 @@ impl GraphStorageConfig {
         check_range!(errors, self, idempotency_retention_days, 1u32, 365u32);
         check_range!(errors, self, ontology_max_chain_depth, 3u8, 16u8);
         check_range!(errors, self, type_update_max_rows, 1u32, 5_000_000u32);
+        check_range!(errors, self, type_migration_max_rows, 1u32, 1_000_000u32);
         check_range!(errors, self, type_update_batch, 100u32, 10_000u32);
         check_range!(errors, self, type_update_max_reported_rows, 1u32, 1_000u32);
     }

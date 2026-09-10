@@ -720,6 +720,44 @@ cheapest proof that a migration is reversible when its steps are.
   built (the vector epoch is cleared for a type whose embedding input comes
   from the payload); nothing re-embeds those rows until the next ingest touches
   them, so vector search silently covers fewer rows until it does.
-- **An asynchronous migration for a type above `type_update_max_rows`.** The
+- **An asynchronous migration for a type above `type_migration_max_rows`.** The
   refusal names the count and the key, which is honest but not an answer.
-  Bounded by the same 30 s gateway cap that sizes the ceiling.
+  Deferred with a named trigger (2026-09-11): the first real request to migrate
+  a type larger than the bound. It also wants the same thing the index-activation
+  lifecycle (D-104) and the re-embedding backfill want — a background worker with
+  progress, which the gear has for none of the three — so building it for one of
+  them is the expensive way to get it.
+
+---
+
+# The migration bound, measured 2026-09-11
+
+The ceiling was calibrated for the wrong pass. Both passes read every row, but
+only one writes, and the difference is an order of magnitude:
+
+| pass | rate | 100 000 rows |
+| --- | --- | --- |
+| re-validation (reads) | ~19 000 rows/s — 250 000 in 12.9 s, 1.1 M in 105 s | ~5 s |
+| migration (rewrites) | ~1 900 rows/s — 10 000 in 5.1–6.3 s over three runs | **~52 s** |
+
+`api-gateway` kills a synchronous request at 30 s. So under the shared
+`type_update_max_rows` of 100 000 a migration was *admitted*, did about 52 s of
+work, and was killed — the transaction rolls back (measured: the 866 000-row
+re-validation that returned `504` left nothing behind, since the chunked run
+afterwards reported every type as `updated` rather than `unchanged`), so the
+outcome was safe and entirely wasted, and the caller heard about a timeout
+rather than about a bound.
+
+**`type_migration_max_rows`, default 25 000** (~13 s at the measured rate, hard
+range 1..=1 000 000). The refusal names the key that applies to the pass being
+refused, because an operator told the wrong key raises the wrong one. Verified
+from both sides on the stand: the 10 000-row `audit_entry` migrates in 5.1 s,
+and the 250 000-row `action_run` is refused with *"one synchronous pass handles
+at most 25000 (`type_migration_max_rows`)"*.
+
+Two notes for whoever raises it. The rate is per *changed* row, so a plan that
+touches few rows of a large type is cheaper than the row count suggests — but
+the ceiling counts live rows, because that is what is known before the pass
+starts. And neither ceiling exists in the fake store, which has no
+configuration: the bound selection is covered by a unit case over the pure
+function, and the rates above come from the stand.

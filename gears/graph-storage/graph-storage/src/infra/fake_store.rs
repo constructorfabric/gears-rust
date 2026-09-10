@@ -12,13 +12,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, DeleteOutcome, DeleteRequest, ElementEnvelope,
-    GraphRevision, OnExisting,
-    GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment,
-    LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
-    ReadSnapshot, RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode, SearchRequest,
-    SearchResponse, StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange,
-    TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration,
-    TypeRegistrationOptions,
+    GraphRevision, GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily,
+    LabelAssignment, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView,
+    OnExisting, Page, ProjectionRequest, ReadSnapshot, RegisteredType, RevisionOutcome,
+    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, StoreCapabilities, Subject,
+    TopologyPage, TopologyRequest, TypeChange, TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery,
+    TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -1214,9 +1213,7 @@ fn decide_existing(
         &descriptor.schema,
         ancestors.iter().cloned(),
     )
-    .map_err(|error| {
-        validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
-    })?;
+    .map_err(|error| validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string()))?;
     let state = comparison.state();
     let mut change = TypeChange {
         type_id: descriptor.type_id.clone(),
@@ -1262,12 +1259,7 @@ fn decide_existing(
             }
             Err(GraphStoreError::Conflict {
                 reason: if update {
-                    evolution::refusal_reason(
-                        &descriptor.type_id,
-                        state,
-                        &change.diagnostics,
-                        5,
-                    )
+                    evolution::refusal_reason(&descriptor.type_id, state, &change.diagnostics, 5)
                 } else {
                     format!(
                         "type `{}` is already registered with a different schema",
@@ -1293,8 +1285,8 @@ fn decide_existing(
             })?;
             let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
             chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
-            let validator = ontology::ChainValidator::compile(&descriptor.schema, chain)
-                .map_err(|error| {
+            let validator =
+                ontology::ChainValidator::compile(&descriptor.schema, chain).map_err(|error| {
                     validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
                 })?;
             let (scanned, rewrites, failures) =
@@ -1310,7 +1302,11 @@ fn decide_existing(
                 return Ok(accepted(
                     change,
                     basis,
-                    if options.dry_run { Vec::new() } else { rewrites },
+                    if options.dry_run {
+                        Vec::new()
+                    } else {
+                        rewrites
+                    },
                 ));
             }
             if !options.dry_run {
@@ -1335,8 +1331,8 @@ fn decide_existing(
         evolution::Decision::Revalidate => {
             let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
             chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
-            let validator = ontology::ChainValidator::compile(&descriptor.schema, chain)
-                .map_err(|error| {
+            let validator =
+                ontology::ChainValidator::compile(&descriptor.schema, chain).map_err(|error| {
                     validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
                 })?;
             let rows = rows_of_type(tenant, &descriptor.type_id);

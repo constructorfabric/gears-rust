@@ -47,13 +47,14 @@ fn migration_step(step: &dto::GraphMigrationStepDto) -> Result<m::MigrationStep,
         Ok(())
     };
     let required = |name: &str, value: Option<String>| {
-        value.ok_or_else(|| {
-            DomainError::invalid(format!("a `{}` step needs `{name}`", step.op))
-        })
+        value.ok_or_else(|| DomainError::invalid(format!("a `{}` step needs `{name}`", step.op)))
     };
     match step.op.as_str() {
         "rename" => {
-            unexpected(&[("path", step.path.is_some()), ("value", step.value.is_some())])?;
+            unexpected(&[
+                ("path", step.path.is_some()),
+                ("value", step.value.is_some()),
+            ])?;
             Ok(m::MigrationStep::Rename {
                 from: required("from", step.from.clone())?,
                 to: required("to", step.to.clone())?,
@@ -62,9 +63,10 @@ fn migration_step(step: &dto::GraphMigrationStepDto) -> Result<m::MigrationStep,
         "default" => {
             unexpected(&[("from", step.from.is_some()), ("to", step.to.is_some())])?;
             let path = required("path", step.path.clone())?;
-            let value = step.value.clone().ok_or_else(|| {
-                DomainError::invalid("a `default` step needs `value`".to_owned())
-            })?;
+            let value = step
+                .value
+                .clone()
+                .ok_or_else(|| DomainError::invalid("a `default` step needs `value`".to_owned()))?;
             Ok(m::MigrationStep::Default { path, value })
         }
         "drop" => {

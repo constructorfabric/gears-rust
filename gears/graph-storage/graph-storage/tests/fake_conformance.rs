@@ -225,11 +225,8 @@ async fn a_deeper_chain_registers_and_its_ancestor_admits_the_leaf() {
 
 #[tokio::test]
 async fn a_backward_compatible_change_updates_the_type_in_place() {
-    conformance::a_backward_compatible_change_updates_the_type_in_place(
-        &store(),
-        Uuid::now_v7(),
-    )
-    .await;
+    conformance::a_backward_compatible_change_updates_the_type_in_place(&store(), Uuid::now_v7())
+        .await;
 }
 
 #[tokio::test]
@@ -245,8 +242,7 @@ async fn a_changed_schema_is_still_a_conflict_by_default() {
 
 #[tokio::test]
 async fn a_dry_run_reports_every_verdict_and_writes_nothing() {
-    conformance::a_dry_run_reports_every_verdict_and_writes_nothing(&store(), Uuid::now_v7())
-        .await;
+    conformance::a_dry_run_reports_every_verdict_and_writes_nothing(&store(), Uuid::now_v7()).await;
 }
 
 #[tokio::test]

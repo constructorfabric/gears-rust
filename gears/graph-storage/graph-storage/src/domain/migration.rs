@@ -303,13 +303,17 @@ mod tests {
 
     #[test]
     fn nested_paths_are_walked_and_created() {
-        let plan = compile(&spec(vec![
-            rename("/payload/loc/line", "/payload/position/line"),
-        ]))
+        let plan = compile(&spec(vec![rename(
+            "/payload/loc/line",
+            "/payload/position/line",
+        )]))
         .expect("the plan compiles");
         let mut payload = json!({ "loc": { "line": 10, "col": 3 } });
         assert!(plan.apply(&mut payload));
-        assert_eq!(payload, json!({ "loc": { "col": 3 }, "position": { "line": 10 } }));
+        assert_eq!(
+            payload,
+            json!({ "loc": { "col": 3 }, "position": { "line": 10 } })
+        );
     }
 
     #[test]
