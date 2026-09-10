@@ -123,6 +123,8 @@ figcaption{font-size:1.15cqw; color:var(--ink-3); text-align:center; line-height
 
 /* cards */
 .cards{display:grid; grid-template-columns:repeat(3,1fr); gap:1.8cqw}
+.cards.four{grid-template-columns:repeat(4,1fr); gap:1.4cqw}
+.cards.four .card{padding:1.4cqw} .cards.four .card h3{font-size:1.5cqw} .cards.four .card p{font-size:1.12cqw}
 .card{background:var(--panel); border:1px solid var(--line); border-radius:.8cqw; padding:1.7cqw; display:flex; flex-direction:column; gap:1cqw}
 .card h3{font-family:'Archivo',sans-serif; font-size:1.7cqw; font-weight:600; margin:0; letter-spacing:-.01em}
 .card p{margin:0; font-size:1.2cqw; line-height:1.45; color:var(--ink-2)}
@@ -150,6 +152,18 @@ pre.code{
 }
 pre.code .c{color:var(--ink-3)} pre.code .k{color:var(--blue)} pre.code .s{color:var(--green)} pre.code .h{color:var(--amber)}
 .code-title{font-family:'IBM Plex Mono',monospace; font-size:1cqw; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); margin:0 0 .6cqw}
+
+/* options of a decision */
+.opts{display:flex; flex-direction:column; gap:.7cqw}
+.opt{background:var(--panel); border:1px solid var(--line); border-left:.3cqw solid var(--line-2); border-radius:.55cqw; padding:.8cqw 1.1cqw}
+.opt h4{font-family:'IBM Plex Mono',monospace; font-size:1.08cqw; font-weight:500; margin:0 0 .35cqw; color:var(--ink)}
+.opt h4 span{color:var(--ink-3); font-weight:400; letter-spacing:.02em}
+.opt p{margin:0; font-size:1.1cqw; line-height:1.4; color:var(--ink-2)}
+.opt.pick{border-left-color:var(--green)} .opt.pick h4{color:var(--green)}
+.opt.mid{border-left-color:var(--blue)} .opt.mid h4{color:var(--blue)}
+.opt.now{border-left-color:var(--amber)} .opt.now h4{color:var(--amber)}
+.note{margin:.9cqw 0 0; font-size:1.1cqw; line-height:1.42; color:var(--ink-2)}
+.note b{color:var(--ink); font-weight:600}
 
 /* the edge type a relation becomes */
 .edge-strip{background:var(--panel); border:1px solid var(--line); border-left:.3cqw solid var(--violet); border-radius:.6cqw; padding:.95cqw 1.3cqw; display:flex; flex-direction:column; gap:.5cqw}
@@ -545,12 +559,56 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
           </div>
         </div>
       </div>
-      <p class="s-foot">The profile is a guess by bucket: at scale 1 it is 1.39 M nodes. <b>The model itself should carry the estimate</b> (a volume class per entity, a fan-out bound per relation), and an <span class="mono">analyze</span> pass can then warn before anything is loaded. The model already has Record and Link primitives for events and non-traversable hub edges; they are not used.</p>
+      <p class="s-foot">The profile is a guess by bucket: at scale 1 it is 1.39 M nodes. <b>The model itself should carry the estimate</b> (a volume class per entity, a fan-out bound per relation), and an <span class="mono">analyze</span> pass can then warn before anything is loaded. And the model already classifies this mass — 13 of the 23 XL entities are <span class="mono">record</span>, one is <span class="mono">link</span>; the next slide is what that costs.</p>
     
       <p class="take"><b>Takeaway</b>Explosion points are visible before anything is loaded; volume estimates belong in the model.</p>
     </section>
 
-    <!-- 11 conflicts -->
+    <!-- 11 the fork: records and links -->
+    <section class="slide">
+      <header class="s-head">
+        <p class="eyebrow">The fork</p>
+        <h2>Half the graph is not a graph</h2>
+      </header>
+      <div class="s-body">
+        <div class="cols">
+          <div>
+            <p class="code-title">what the model's own primitive says</p>
+            <table class="tb">
+              <thead><tr><th>system primitive</th><th>entities</th><th>nodes · scale 1</th></tr></thead>
+              <tbody>
+                <tr><td><span class="mono">node</span> — a graph node</td><td class="num">120</td><td class="num">619 665</td></tr>
+                <tr class="lo"><td><span class="mono">record</span> — <i>&ldquo;not a Knowledge Graph node&rdquo;</i></td><td class="num">69</td><td class="num">711 751</td></tr>
+                <tr class="lo"><td><span class="mono">link</span> — <i>&ldquo;non-traversable&rdquo;</i></td><td class="num">4</td><td class="num">55 200</td></tr>
+              </tbody>
+            </table>
+            <p class="note">13 of the 23 XL entities are <span class="mono">record</span>, one is <span class="mono">link</span>. Our exporter honoured only <span class="mono">projection</span> and <span class="mono">edge</span>, so every record became a node type — <b>55% of the 1.39 M is mass the model never called a graph.</b></p>
+          </div>
+          <div>
+            <p class="code-title">the decision: <span class="mono">--records=</span></p>
+            <div class="opts">
+              <div class="opt pick">
+                <h4>skip <span>· proposed default</span></h4>
+                <p>A record never becomes a node type; it lives in the gear that owns it — audit in the audit gear, usage in metering. Removes 55% of the nodes and the edges hanging off them.</p>
+              </div>
+              <div class="opt mid">
+                <h4>reference</h4>
+                <p>A record becomes a <span class="mono">reference</span>-family node: key plus its declared fields, not the whole payload. Traversable and queryable, at a fraction of the payload — the gear's own <i>reference, not replica</i>.</p>
+              </div>
+              <div class="opt now">
+                <h4>nodes <span>· what we measured</span></h4>
+                <p>Everything is a node. Every number in this deck was measured this way, so the price above is measured, not estimated.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="s-foot">The price of <b>skip</b> is honest: no traversal to a record and no graph API over it — you go to the owning gear; where an aggregate is needed (&ldquo;how many attempts&rdquo;, &ldquo;last transition&rdquo;) it becomes a counter on the parent or one summary node. A <span class="mono">link</span> stops being an edge and becomes an indexed payload field: filterable, invisible to traversal, no in-degree on the hubs. <b>The gear needs no change</b> — the <span class="mono">owned</span> / <span class="mono">reference</span> / <span class="mono">phantom</span> families already exist; this is half a day in the exporter and loader.</p>
+
+      <p class="take"><b>Takeaway</b>Whether records belong in the graph is an architecture decision, not a tooling one — and it now has a number attached: 55%.</p>
+    </section>
+
+    <!-- 12 conflicts -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">What the type system found</p>
@@ -580,7 +638,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
       <p class="take"><b>Takeaway</b>Typing the model found 26 defects in the model itself; the rule belongs in its validator.</p>
     </section>
 
-    <!-- 12 evolution -->
+    <!-- 13 evolution -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">The model changes ten times</p>
@@ -605,7 +663,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
       <p class="take"><b>Takeaway</b>Edit, upload, repeat: now without conflicts or database resets, at the price of revisions.</p>
     </section>
 
-    <!-- 13 strengths / weaknesses -->
+    <!-- 14 strengths / weaknesses -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">Assessment</p>
@@ -639,14 +697,14 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
       <p class="take"><b>Takeaway</b>Strengths are measured; each weakness has a known owner and a known next step.</p>
     </section>
 
-    <!-- 14 next -->
+    <!-- 15 next -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">Next</p>
         <h2>What would make it a product path</h2>
       </header>
       <div class="s-body">
-        <div class="cards">
+        <div class="cards four">
           <div class="card top-b">
             <span class="n">platform</span>
             <h3>DDL for declared paths</h3>
@@ -662,11 +720,16 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
             <h3>Volumes and hygiene in the model</h3>
             <p>A volume class per entity and a fan-out bound per relation, a validator rule that overrides must narrow, and the 26 conflicts fixed by their owners.</p>
           </div>
+          <div class="card top-a">
+            <span class="n">architecture</span>
+            <h3>Decide where records live</h3>
+            <p>Records and links are 55% of the mass and the model already says they are not graph nodes. Skip them, keep cheap <span class="mono">reference</span> nodes, or keep today's behaviour — the tooling follows in half a day either way.</p>
+          </div>
         </div>
       </div>
       <p class="s-foot">Then the two pillars this experiment did not touch: parameterised widgets that read a type's declared fields and query them, and change events from the graph for a serverless runtime (<span class="mono">emit_events</span> exists as a trait, publication does not).</p>
     
-      <p class="take"><b>Takeaway</b>A product path exists and is split by owner: platform, gear, model.</p>
+      <p class="take"><b>Takeaway</b>A product path exists and is split by owner: platform, gear, model, architecture.</p>
     </section>
 
   </div>
@@ -703,11 +766,12 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
     ["Metrics: load","<p>Registration of the whole model is a fraction of a second. Ingest runs at about 3.4k nodes and 2k edges per second on a laptop stand with embedding off.</p><p>Scale 0.2 is the PRD's benchmark size. The database is 771 MB, of which 110 MB is the payload GIN.</p><p>The volume profile behind these numbers is a guess by bucket; at scale 1 it would be 1.39 million nodes.</p>"],
     ["Metrics: read","<p>Reads at 277k nodes. Projection pages are tens of milliseconds. Traversal is bounded by a node budget and reports truncation explicitly, in a few hundred milliseconds.</p><p>That last point matters for the GraphQL worry raised at the meeting: no query in this API can run away. Every one has a bound and names the bound it hit.</p>"],
     ["Metrics: the missing index","<p>We grew one type to 250k rows and measured a range filter with ordering. Today it is 100 to 200 ms: the planner narrows by type and then reads every row.</p><p>With one expression index created by hand in psql, the same request is 10 ms — the API overhead itself. The index built in 0.7 s.</p><p>The gear cannot create it: the platform's secure ORM deliberately exposes no DDL to gears. We filed the ask with these numbers. One detail: the index expression must be written exactly as the query writes it, or PostgreSQL will not use it for ordering.</p>"],
-    ["Counting objects","<p>The second ask was to find where the graph explodes. The loader plans edges from the model's cardinalities and reports the heaviest pairs before loading anything.</p><p>The pattern is clear: event-class entities are the mass, and N:M relations between a mass entity and anything else multiply. Hubs like tenant and person collect edges from everything, which is what makes traversal from them expensive.</p><p>Our proposal: the model should carry a volume class per entity and a fan-out bound per relation, and use its own Record and Link primitives for events and non-traversable hub edges.</p>"],
+    ["Counting objects","<p>The second ask was to find where the graph explodes. The loader plans edges from the model's cardinalities and reports the heaviest pairs before loading anything.</p><p>The pattern is clear: event-class entities are the mass, and N:M relations between a mass entity and anything else multiply. Hubs like tenant and person collect edges from everything, which is what makes traversal from them expensive.</p><p>Our proposal: the model should carry a volume class per entity and a fan-out bound per relation, so an analyze pass can warn before anything is loaded.</p><p>One correction to make out loud: the model does not lack a classification for this mass — it already has one, and the next slide is about the fork that opens.</p>"],
+    ["The fork","<p>This slide exists because the experiment proved us wrong, not the model. We said the model has no answer for the event mass; it has one, and we ignored it.</p><p>The system layer of the model has seven primitives, and two of them are exactly about this: a <strong>record</strong> is defined as a typed entity that is <em>not</em> a Knowledge Graph node, a <strong>link</strong> as a non-traversable connection. 69 entities are records, 4 are links, and 13 of the 23 heaviest entities are records. Our exporter honoured only projection and edge, so all of them became graph node types.</p><p>So the mass we measured is not the model's mass — it is our reading of it. Three ways forward, and the middle one is probably where a real product lands: skip the records, keep a cheap reference node where traversal is genuinely needed, or keep everything as today.</p><p>What matters for the meeting: the gear needs no change and the tooling change is half a day, so this is not an engineering question. It is the architect's call, and the price of getting it wrong is 55% of the graph.</p>"],
     ["What the type system found","<p>A side effect of typing the model: 26 places where a child re-declares a parent's property with a type the parent does not accept.</p><p>The biggest is version: an integer row version on managed-object, a semantic version string on 21 descendants. GTS derivation rejects this by rule, and in practice no instance can satisfy both schemas.</p><p>The exporter keeps the parent's declaration and reports the conflicts. The rule 'an override must narrow' belongs in the model's own validator so it never reaches the graph.</p>"],
     ["The model changes ten times","<p>The architect's loop: edit the JSON, load, look, repeat. The gear registers a type once and returns 409 for a changed schema under a known id, and it has no update operation.</p><p>Our answer for the prototype is a model revision in the type id. Each upload is a fresh, complete set of types beside the previous one; objects carry the revision in their keys. On the stand: the edited model is a 409 without a revision and registers cleanly as m9.</p><p>The price is honest: old objects stay on the old revision until re-ingested, and the catalogue grows. The product answer is an in-place update for compatible changes, which is gear work.</p>"],
     ["Assessment","<p>Strong: the pipeline is real and measured; validation, filter, sort, subtree patterns, bounded queries; and the exercise surfaced defects in the model itself.</p><p>Weak: range and order are not index-backed until the platform exposes DDL; type changes are revisions rather than updates; edge types per predicate union their endpoint pairs; composite property types are opaque; the volumes are guesses; there is no UI and no change events.</p>"],
-    ["Next","<p>Three things would turn this into a product path: the DDL surface in the platform, an in-place type update in the gear, and volumes plus hygiene rules in the model itself.</p><p>Then the two pillars we did not touch: widgets that read a type's declared fields and query them, and change events for a serverless runtime.</p>"]
+    ["Next","<p>Four things would turn this into a product path: the DDL surface in the platform, an in-place type update in the gear, volumes plus hygiene rules in the model itself, and the architecture decision about records — the only one of the four that is a decision rather than an implementation.</p><p>Then the two pillars we did not touch: widgets that read a type's declared fields and query them, and change events for a serverless runtime.</p>"]
   ];
 
   slides.forEach(function(s, k){
