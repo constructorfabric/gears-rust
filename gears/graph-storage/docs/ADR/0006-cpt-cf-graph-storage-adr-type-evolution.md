@@ -132,10 +132,20 @@ claims.
    diagnostic with its schema location, which traits moved, the row count, the
    object levels a *later* edit will not be able to extend in place
    (`ContentModel::is_evolvable_in_place`), and whether the change is admissible.
-5. **Everything else stays a new major.** A rename, a narrowed enum, a retyped
-   or newly required property is refused unless the rows happen to satisfy it;
-   moving the data is a migration, which this decision does not build.
-6. **The verdict is computed locally with the same crate and the same
+5. **`migrated`.** A caller may also state what to do with the data, as a
+   closed set of steps (`rename`, `default`, `drop`) applied to every live row
+   of the type, validated against the candidate, and written only if every row
+   then passes. It is the third and strongest ground — the other two ask
+   whether the data fits, this one makes it fit — and it is the only one that
+   changes anything but the catalogue, so it carries every obligation a write
+   carries: the acting subject on each row, the row's compare-and-set target,
+   the graph revision, the recomposed lexical text, and a cleared vector epoch
+   where the embedding input came from the payload. It requires a schema change
+   to migrate towards; without one this endpoint would be a payload-editing API
+   wearing a type registration's clothes.
+6. **Everything else stays a new major.** A narrowed enum or a retyped property
+   that no step can reconcile is refused, and the answer is a new major.
+7. **The verdict is computed locally with the same crate and the same
    direction** as the registry, so the two answers cannot diverge, and the call
    site is one function (`domain::evolution`) so it can become a types-registry
    round trip without touching the store or the API.
@@ -154,7 +164,8 @@ claims.
   breaks". Over an open payload level a rename is admitted — nothing stored
   becomes invalid — while every filter on the new path returns nothing, because
   the data has not moved. The ground is exactly as strong as the shape it checks
-  against, which is one more reason a rename needs a migration.
+  against, which is why a rename wants `migrated` and why closing the payload
+  level matters.
 - **The trait side reaches production earlier than ADR-0003 intended.** That ADR
   makes changing an annotation a type-version change with a durable index
   activation lifecycle (`requested -> building -> active`), and admits filters

@@ -1,9 +1,10 @@
 # Updating a registered type in place — implementation plan
 
-Status: **slices 1 and 2 implemented 2026-09-10** on `feature/graph-storage-v2`
-(dry run, in-place update, trait recompute, refusals with locations, plus one
-ground this plan did not have — see the addendum at the end). Slices 3 and 4
-(payload-rewriting migrations, revision history) are still as written below.
+Status: **slices 1, 2 and 3 implemented 2026-09-10** on `feature/graph-storage-v2`
+(dry run, in-place update, trait recompute, refusals with locations, payload
+migrations, plus one ground this plan did not have — see the addenda at the
+end). Slice 4 (revision history, the re-embedding backfill) is still as written
+below.
 Written 2026-09-10 for `feature/graph-storage-v2`.
 
 The gear registers a type once and refuses a changed schema under a known id
@@ -631,3 +632,79 @@ the cost belongs to migrating a graph that is already loaded.
 That 30 s is also the number `type_update_max_rows` should be sized against,
 not the gear's own deadline. At ~19 000 rows/s in-gear the shipped default of
 100 000 is ~5 s, which is why it stays.
+
+---
+
+# Slice 3 as built, 2026-09-10
+
+Three steps, as designed: `rename`, `default`, `drop`. What changed from § 4.3
+and why.
+
+## The steps run in memory, not as `jsonb` expressions
+
+§ 4.3 said each step renders one `jsonb_set` / `#-` expression. It does not, and
+the reason is § 5's own requirement: apply, **validate**, then write. A step
+engine in Rust beside an expression chain in SQL is two implementations of one
+migration, and a row can pass the validation of one and be written by the other.
+Every row is read anyway in order to validate it, so read-modify-write costs
+nothing extra — and the document that was validated is, byte for byte, the
+document that is written.
+
+The cost is one statement per *changed* row instead of one statement per type.
+The row ceiling is what keeps that inside a request, and it is the same ceiling
+the gateway's 30 s already sizes.
+
+## Two refusals the plan did not name
+
+- **A migration needs a schema change to migrate towards.** Against a
+  byte-identical candidate it would be a payload-editing API reached through a
+  type registration, which is a different feature with a different
+  authorization story.
+- **A migration must name a type the batch registers.** Otherwise a typo in a
+  type id would silently migrate nothing and report success.
+
+## The step semantics, stated because each could have gone the other way
+
+| step | on a row that has the property | on a row that does not |
+| --- | --- | --- |
+| `rename` | moves the value, leaves nothing behind | **no-op** — a migration moves what is there; inventing a value is what `default` is for, and a plan may declare both |
+| `default` | leaves it alone (absent *and* `null` count as absent) | sets it |
+| `drop` | removes it | no-op |
+
+A row no step touched is not rewritten, so a type where half the rows already
+carry the new shape costs half the writes. Two steps on one path are refused
+rather than ordered for the caller.
+
+## What a migration owes because it is a write
+
+All three obligations the documentation read turned up (§ Read against the
+gear's own documentation) are honoured, plus two the same reasoning implies:
+the acting subject and `updated_at` on every rewritten row, `node.version`
+moved so a stale `expected_version` cannot undo the migration, the tenant's
+graph revision advanced, the lexical text recomposed from the new payload, and
+the vector epoch cleared — **only** for a type whose embedding input comes from
+the payload. That last clause is a divergence the conformance suite caught
+between the two stores: the fake cleared it for every type, which would
+re-embed a whole type for nothing.
+
+## Measured on the stand
+
+The rename that motivated the whole plan, against the 1 000-row `requirement`
+type with its payload closed:
+
+| | result |
+| --- | --- |
+| dry run with the plan | `basis: migrated`, 1 000 rows scanned, **949 would be rewritten**, 122 ms |
+| applied | same numbers, **791 ms**, type revision advanced |
+| the 51 rows not rewritten | never carried `priority`; a rename moves what is there |
+| `$filter=payload/urgency` before | `400` — an undeclared path |
+| `$filter=payload/urgency` + `$orderby` after | serves rows in 109 ms, and `requirement:1` carries under `urgency` the value it used to carry under `priority` |
+
+Renaming back with the mirror plan restored the stand, which is also the
+cheapest proof that a migration is reversible when its steps are.
+
+## What is still open
+
+Revision history and `GET /types/{id}/revisions` (slice 4), a backfill that
+re-embeds what a migration marked stale, and the asynchronous form for a type
+over the ceiling. Slice 4's estimate is unchanged.

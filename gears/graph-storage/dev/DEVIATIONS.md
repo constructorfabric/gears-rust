@@ -420,14 +420,49 @@ over.**
   to consult `StoreCtx::budget`, because it is the first whose duration scales
   with a tenant's data.
 
-**What is not built.** A migration that *rewrites* payloads (a closed grammar
-of `rename` / `default` / `drop` steps is designed in
-[`type-update-plan.md`](./type-update-plan.md) §4.3 and not implemented), the
-retained-revision history table and `GET /types/{id}/revisions`, re-embedding
-after a changed `vector_search` declaration, and the delegation of the verdict
-to types-registry over the wire. The call site is one function
-(`domain::evolution`) precisely so that last one can replace it without
-touching the store or the API.
+**A third ground, built 2026-09-10: the caller may move the data.**
+`POST /types` takes `migrations` — at most one plan per type — as a closed set
+of three steps: `rename` moves a value where the source is present, `default`
+fills what is absent or null and never overwrites, `drop` removes what is
+there. Reported as `admission_basis: "migrated"` with the rows scanned and the
+rows actually changed. Three properties worth stating because each was a
+decision:
+
+- *The steps run in Rust and the store writes what it validated.* The plan's
+  §4.3 sketched `jsonb_set` expressions; a step engine in Rust beside an
+  expression chain in SQL is two implementations of one migration, and a row
+  can pass one and fail the other. Every row is read anyway to validate it, so
+  read-modify-write costs what we were paying regardless. One statement per
+  *changed* row, which is what the row ceiling keeps honest.
+- *A migration needs a schema change to migrate towards.* Offered against a
+  byte-identical candidate it would be a payload-editing API wearing a type
+  registration's clothes — a different feature, with a different authorization
+  story — so it is refused, as is a migration naming a type the batch does not
+  register (a typo would otherwise do nothing at all).
+- *A migration is a write, and carries every obligation a write carries.*
+  `updated_at`/`updated_by` record the migrating subject, `node.version` moves
+  (a producer holding the pre-migration value would otherwise silently undo
+  the migration through `expected_version`), the graph revision advances, the
+  lexical text is recomposed from the new payload, and the vector epoch is
+  cleared — but only for a type that composes its embedding input from the
+  payload. That last clause is a divergence the conformance suite caught: the
+  fake was clearing it for every type, which would re-embed a whole type for
+  nothing.
+
+**Rehearsed on the stand.** The rename that motivated all of this, against the
+1 000-row `requirement` type: dry run 122 ms, applied in **791 ms**, 1 000 rows
+scanned and **949 rewritten** — the 51 that never carried `priority` are not
+touched, because a rename moves what is there. Before, `$filter=payload/urgency`
+was a `400` (an undeclared path); after, it filters and orders, and
+`requirement:1` carries under `urgency` the value it used to carry under
+`priority`. Renaming back restored the stand.
+
+**What is not built.** The retained-revision history table and
+`GET /types/{id}/revisions`; a backfill that re-embeds what a migration marked
+stale (the marking is done, the worker is not); an asynchronous migration for a
+type over the row ceiling; and the delegation of the verdict to types-registry
+over the wire. The call site is one function (`domain::evolution`) precisely so
+that last one can replace it without touching the store or the API.
 
 **Authorization.** Registration stays `admin` on the type resource. A
 re-validating update additionally requires `write` on the node resource and is
