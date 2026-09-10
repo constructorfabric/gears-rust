@@ -458,8 +458,12 @@ was a `400` (an undeclared path); after, it filters and orders, and
 `priority`. Renaming back restored the stand.
 
 **What is not built.** The retained-revision history table and
-`GET /types/{id}/revisions`; a backfill that re-embeds what a migration marked
-stale (the marking is done, the worker is not); an asynchronous migration for a
+`GET /types/{id}/revisions` — **deferred by decision (2026-09-11)** rather than
+unfinished: the revision counter says which definition is in force, no surface
+reads the history, and the trigger for building it is a consumer that needs the
+previous definition. Also open: a backfill that re-embeds what a migration
+marked stale (the marking is done, the worker is not, so vector search covers
+fewer rows until the next ingest touches them); an asynchronous migration for a
 type over the row ceiling; and the delegation of the verdict to types-registry
 over the wire. The call site is one function (`domain::evolution`) precisely so
 that last one can replace it without touching the store or the API.

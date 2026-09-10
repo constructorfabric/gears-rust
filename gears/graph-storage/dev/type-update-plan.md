@@ -3,8 +3,12 @@
 Status: **slices 1, 2 and 3 implemented 2026-09-10** on `feature/graph-storage-v2`
 (dry run, in-place update, trait recompute, refusals with locations, payload
 migrations, plus one ground this plan did not have — see the addenda at the
-end). Slice 4 (revision history, the re-embedding backfill) is still as written
-below.
+end). **Slice 4 is deferred by decision, 2026-09-11**: revision history is
+designed below and nothing needs it yet, so it waits for a consumer rather than
+for time. What is *not* deferred by the same token — because a migration
+already marks vectors stale and a type above the row ceiling already refuses —
+is the re-embedding backfill and the asynchronous migration; both are listed as
+open in D-031 and neither is scheduled.
 Written 2026-09-10 for `feature/graph-storage-v2`.
 
 The gear registers a type once and refuses a changed schema under a known id
@@ -705,6 +709,17 @@ cheapest proof that a migration is reversible when its steps are.
 
 ## What is still open
 
-Revision history and `GET /types/{id}/revisions` (slice 4), a backfill that
-re-embeds what a migration marked stale, and the asynchronous form for a type
-over the ceiling. Slice 4's estimate is unchanged.
+- **Revision history and `GET /types/{id}/revisions` — deferred by decision
+  (2026-09-11).** The counter on `gts_type` says which definition is in force;
+  the retained revisions ADR-0005 describes are not stored. Nothing asks for
+  them yet: no surface reads them, and the demo does not ask "what did this
+  type look like last week". The design below stands, the estimate (≈2 days)
+  stands, and the trigger is a consumer — an audit question, or a rollback that
+  needs the previous definition rather than a re-export.
+- **A backfill that re-embeds what a migration marked stale.** The marking is
+  built (the vector epoch is cleared for a type whose embedding input comes
+  from the payload); nothing re-embeds those rows until the next ingest touches
+  them, so vector search silently covers fewer rows until it does.
+- **An asynchronous migration for a type above `type_update_max_rows`.** The
+  refusal names the count and the key, which is honest but not an answer.
+  Bounded by the same 30 s gateway cap that sizes the ceiling.
