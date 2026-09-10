@@ -1817,3 +1817,477 @@ pub async fn projection_seeded(
     seed_tickets(store, ctx).await;
     projection(&[INDEXED], "", order)
 }
+
+// --- type evolution (registering a changed schema in place) -----------------
+
+/// The deck's worked example, as a registrable type: the `requirement` a PM
+/// edits four times in a week.
+pub const EVOLVING: &str =
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.requirement.v1~";
+
+/// One revision of that type.
+///
+/// The payload level is **closed**. That is the whole difference between a
+/// model whose optional-field edits are provably compatible and one whose are
+/// not: at an open level the previous definition already accepted any value
+/// under the new property's name, so declaring it narrows the accepted set
+/// (gts sec 4.4) and the checker reports `incompatible`. Measured over the
+/// Studio domain model as the exporter emits it today, that is 188 of 188 node
+/// types.
+fn requirement_revision(
+    properties: serde_json::Value,
+    required: &[&str],
+    index: &[&str],
+) -> TypeRegistration {
+    TypeRegistration {
+        type_id: EVOLVING.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{EVOLVING}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": { "index": index, "full_text_search": ["/name"] },
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" },
+                { "type": "object", "properties": { "payload": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": properties,
+                    "required": required
+                } } }
+            ]
+        }),
+    }
+}
+
+fn requirement_properties(status_values: &[&str], with_owner: bool, urgency: bool) -> serde_json::Value {
+    let mut properties = serde_json::json!({
+        "key": { "type": "string" },
+        "statement": { "type": "string" },
+        "status": { "type": "string", "enum": status_values }
+    });
+    properties[if urgency { "urgency" } else { "priority" }] = serde_json::json!({
+        "type": "string"
+    });
+    if with_owner {
+        properties["owner"] = serde_json::json!({ "type": "string" });
+    }
+    properties
+}
+
+/// Model v7: what the graph already holds 10 000 of.
+fn requirement_v1() -> TypeRegistration {
+    requirement_revision(
+        requirement_properties(&["proposed", "approved"], false, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    )
+}
+
+fn requirement(key: &str, status: &str) -> NodeSpec {
+    NodeSpec {
+        node_key: key.to_owned(),
+        type_id: EVOLVING.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(serde_json::json!({
+            "key": key,
+            "statement": format!("the system shall {key}"),
+            "status": status,
+            "priority": "normal"
+        })),
+        ..NodeSpec::default()
+    }
+}
+
+/// Register v1 and three requirements against it.
+async fn seed_requirements(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>, statuses: &[&str]) {
+    let mut types = ontology_batch();
+    types.push(requirement_v1());
+    store
+        .register_types(ctx, types)
+        .await
+        .expect("the ontology registers");
+    let nodes = statuses
+        .iter()
+        .enumerate()
+        .map(|(index, status)| requirement(&format!("r{index}"), status))
+        .collect();
+    ingest_batch(store, ctx, batch(nodes, Vec::new()))
+        .await
+        .expect("the requirements commit");
+}
+
+fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
+    graph_storage_sdk::models::TypeRegistrationOptions {
+        on_existing: graph_storage_sdk::models::OnExisting::Update,
+        revalidate: false,
+        dry_run: false,
+    }
+}
+
+/// Edits 1 and 2 of the deck's four: a new optional property and a widened
+/// enum. Both are proved compatible from the schemas alone, so the update
+/// reads no row, keeps the identifier, and the stored objects stay exactly
+/// where they were — which is the whole product complaint answered.
+pub async fn a_backward_compatible_change_updates_the_type_in_place(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved", "proposed"]).await;
+
+    let edited = requirement_revision(
+        requirement_properties(&["proposed", "approved", "blocked"], true, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let registered = store
+        .register_types_with(&ctx, vec![edited], update_options())
+        .await
+        .expect("a backward-compatible change is admitted in place");
+
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == EVOLVING)
+        .expect("the edited type is reported");
+    assert_eq!(
+        updated.outcome,
+        graph_storage_sdk::models::TypeOutcome::Updated
+    );
+    assert_eq!(
+        updated.basis,
+        Some(graph_storage_sdk::models::AdmissionBasis::SchemaProved),
+        "no row may be read for a change the schemas prove"
+    );
+    assert_eq!(updated.record.revision, 2, "the retained revision advances");
+    let change = updated.change.as_ref().expect("the verdict is reported");
+    assert_eq!(change.state.as_str(), "compatible");
+    assert_eq!(change.rows, None, "a proved change counts no rows");
+
+    // The identifier is the same one, so the objects are still there.
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is still registered under its own id");
+    assert_eq!(stored.revision, 2);
+    for key in ["r0", "r1", "r2"] {
+        store
+            .get_node(&ctx, &key.to_owned(), 10)
+            .await
+            .unwrap_or_else(|error| panic!("`{key}` must survive the type update: {error}"));
+    }
+
+    // And what the new definition admits, ingest now admits.
+    let mut blocked = requirement("r3", "blocked");
+    blocked.payload = Some(serde_json::json!({
+        "key": "r3",
+        "statement": "the system shall block",
+        "status": "blocked",
+        "priority": "normal",
+        "owner": "ada"
+    }));
+    ingest_batch(store, &ctx, batch(vec![blocked], Vec::new()))
+        .await
+        .expect("a payload the new definition admits ingests");
+}
+
+/// Edit 3, the rename. Refused — and the refusal says where.
+pub async fn an_incompatible_change_is_refused_with_its_location(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed"]).await;
+
+    let renamed = requirement_revision(
+        requirement_properties(&["proposed", "approved"], false, true),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let error = store
+        .register_types_with(&ctx, vec![renamed], update_options())
+        .await
+        .expect_err("a rename cannot be admitted in place");
+    let GraphStoreError::Conflict { reason } = error else {
+        panic!("a refused change is a conflict, not {error:?}");
+    };
+    assert!(
+        reason.contains("$.payload"),
+        "the refusal must name the offending schema location: {reason}"
+    );
+    assert!(
+        reason.contains("priority") || reason.contains("urgency"),
+        "and the property that moved: {reason}"
+    );
+
+    // Nothing was written.
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1);
+}
+
+/// Without `on_existing: update` the gear answers exactly what it always
+/// answered. A caller that does not ask for the new behaviour does not get it.
+pub async fn a_changed_schema_is_still_a_conflict_by_default(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed"]).await;
+
+    let compatible = requirement_revision(
+        requirement_properties(&["proposed", "approved"], true, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let error = store
+        .register_types(&ctx, vec![compatible])
+        .await
+        .expect_err("the default mode rejects any changed schema");
+    assert!(
+        matches!(error, GraphStoreError::Conflict { .. }),
+        "{error:?}"
+    );
+}
+
+/// The question the architect's loop actually asks: what would this edit cost?
+/// The dry run answers for a whole batch at once and writes nothing.
+pub async fn a_dry_run_reports_every_verdict_and_writes_nothing(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved"]).await;
+
+    let dry = graph_storage_sdk::models::TypeRegistrationOptions {
+        on_existing: graph_storage_sdk::models::OnExisting::Update,
+        revalidate: true,
+        dry_run: true,
+    };
+
+    let compatible = requirement_revision(
+        requirement_properties(&["proposed", "approved"], true, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let reported = store
+        .register_types_with(&ctx, vec![compatible], dry)
+        .await
+        .expect("a dry run never fails on a refusal");
+    let change = reported[0]
+        .change
+        .as_ref()
+        .expect("a dry run always reports the verdict");
+    assert_eq!(change.state.as_str(), "compatible");
+    assert!(change.admissible);
+    assert!(!change.migration_required);
+    assert_eq!(
+        change.forward, "incompatible",
+        "an added property is exactly where the two directions disagree, and a \
+         producer has to hear it"
+    );
+
+    let renamed = requirement_revision(
+        requirement_properties(&["proposed", "approved"], false, true),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let reported = store
+        .register_types_with(&ctx, vec![renamed], dry)
+        .await
+        .expect("a dry run reports a refusal rather than raising it");
+    let change = reported[0]
+        .change
+        .as_ref()
+        .expect("a dry run always reports the verdict");
+    assert_eq!(change.state.as_str(), "incompatible");
+    assert!(!change.admissible);
+    assert!(change.migration_required);
+    assert!(
+        change
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.location == "$.payload"),
+        "{:?}",
+        change.diagnostics
+    );
+
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1, "a dry run writes nothing");
+}
+
+/// A narrowed enum is not backward compatible — the old definition accepted
+/// `approved` and the new one does not. But if no stored row ever used it, the
+/// change is safe *for this graph*, and the gear holds the rows to prove it.
+///
+/// The two grounds are never conflated: this one reports `data_backed` with
+/// the number of rows it read.
+pub async fn a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "proposed", "proposed"]).await;
+
+    let narrowed = requirement_revision(
+        requirement_properties(&["proposed"], false, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let options = graph_storage_sdk::models::TypeRegistrationOptions {
+        on_existing: graph_storage_sdk::models::OnExisting::Update,
+        revalidate: true,
+        dry_run: false,
+    };
+    let registered = store
+        .register_types_with(&ctx, vec![narrowed.clone()], options)
+        .await
+        .expect("rows that all fit admit the change");
+    let updated = &registered[registered.len() - 1];
+    assert_eq!(
+        updated.basis,
+        Some(graph_storage_sdk::models::AdmissionBasis::DataBacked { rows_validated: 3 }),
+        "the admission is a claim about the rows, and says how many"
+    );
+    let change = updated.change.as_ref().expect("the verdict is reported");
+    assert_eq!(change.state.as_str(), "incompatible");
+    assert!(
+        change.admissible,
+        "not provable from the schemas, still admitted from the rows"
+    );
+
+    // Without the flag the same change is refused: the data-backed ground is
+    // opt-in, never a relaxation of the default.
+    let mut types = ontology_batch();
+    types.push(requirement_v1());
+    store
+        .register_types_with(&ctx, types, update_options())
+        .await
+        .expect("restoring the wider enum is itself compatible");
+    let error = store
+        .register_types_with(&ctx, vec![narrowed], update_options())
+        .await
+        .expect_err("without `revalidate` the gear fails closed");
+    assert!(
+        matches!(error, GraphStoreError::Conflict { .. }),
+        "{error:?}"
+    );
+}
+
+/// The same narrowing, with one row that contradicts it. Refused, naming the
+/// row — a caller fixes the data or writes a migration, and either way knows
+/// which objects are in the way.
+pub async fn a_change_the_stored_rows_contradict_is_refused_naming_them(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved"]).await;
+
+    let narrowed = requirement_revision(
+        requirement_properties(&["proposed"], false, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    let options = graph_storage_sdk::models::TypeRegistrationOptions {
+        on_existing: graph_storage_sdk::models::OnExisting::Update,
+        revalidate: true,
+        dry_run: false,
+    };
+    let error = store
+        .register_types_with(&ctx, vec![narrowed], options)
+        .await
+        .expect_err("a row that the candidate refuses refuses the candidate");
+    let GraphStoreError::Validation { items } = error else {
+        panic!("an offending row is a validation failure, not {error:?}");
+    };
+    assert!(
+        items.iter().any(|item| item.message.contains("r1")),
+        "the refusal must name the row in the way: {items:?}"
+    );
+
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1, "a refused update writes nothing");
+}
+
+/// Declaring a new `index` path changes no constraint on any instance, so the
+/// comparison proves it compatible and the path becomes filterable at once —
+/// without recreating the type, and without touching a row.
+///
+/// This is also the fix for a wart the prototype hit: before updates existed,
+/// a re-registration converged and left the *stored* trait resolution as it
+/// was, so a type registered by an older build kept a resolution without
+/// `index_kinds` and the only remedy was to recreate the database.
+pub async fn a_new_index_path_becomes_filterable_without_recreating_the_type(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    use toolkit_odata::SortDir;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed", "approved"]).await;
+
+    // `priority` is declared in the schema but not in the `index` trait, so
+    // the projection refuses it — the catalogue owes callers that refusal.
+    store
+        .project_table(
+            &ctx,
+            projection(
+                &[EVOLVING],
+                "payload/priority eq 'normal'",
+                &[("node_key", SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect_err("an undeclared path is refused before the update");
+
+    let widened = requirement_revision(
+        requirement_properties(&["proposed", "approved"], false, false),
+        &["key", "statement"],
+        &["/payload/status", "/payload/priority"],
+    );
+    let registered = store
+        .register_types_with(&ctx, vec![widened], update_options())
+        .await
+        .expect("declaring another index path constrains no instance");
+    let updated = &registered[registered.len() - 1];
+    assert_eq!(
+        updated.outcome,
+        graph_storage_sdk::models::TypeOutcome::Updated
+    );
+    let change = updated.change.as_ref().expect("the verdict is reported");
+    assert_eq!(change.state.as_str(), "compatible");
+    let index_change = change
+        .traits_changed
+        .iter()
+        .find(|change| change.trait_name == "index")
+        .expect("the moved trait is reported even though the schemas agree");
+    assert_eq!(index_change.added, vec!["/payload/priority".to_owned()]);
+    assert!(index_change.removed.is_empty());
+
+    let page = store
+        .project_table(
+            &ctx,
+            projection(
+                &[EVOLVING],
+                "payload/priority eq 'normal'",
+                &[("node_key", SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect("the newly declared path filters at once");
+    assert_eq!(keys(&page), vec!["r0".to_owned(), "r1".to_owned()]);
+}

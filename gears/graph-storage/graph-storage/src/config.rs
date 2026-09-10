@@ -109,6 +109,20 @@ pub struct GraphStorageConfig {
     /// trait resolution, chain validation and pattern matching all work on
     /// any length, so this is a policy knob rather than a capability.
     pub ontology_max_chain_depth: u8,
+
+    /// Live rows a synchronous type update may re-validate or rewrite.
+    ///
+    /// Only the paths that cannot be decided from the schemas read a row at
+    /// all; a provably backward-compatible change touches none, whatever this
+    /// says. The ceiling is what keeps a re-validating update inside one
+    /// interactive request: above it the honest answer is an asynchronous
+    /// migration with progress, which the gear does not have.
+    pub type_update_max_rows: u32,
+    /// Rows per batch while re-validating a type.
+    pub type_update_batch: u32,
+    /// Offending node keys a refusal lists. Enough to see the pattern, not
+    /// enough to make the refusal itself a data export.
+    pub type_update_max_reported_rows: u32,
 }
 
 impl Default for GraphStorageConfig {
@@ -140,6 +154,9 @@ impl Default for GraphStorageConfig {
             deadline_interactive_secs: 10,
             idempotency_retention_days: 7,
             ontology_max_chain_depth: 3,
+            type_update_max_rows: 100_000,
+            type_update_batch: 2_000,
+            type_update_max_reported_rows: 50,
         }
     }
 }
@@ -166,10 +183,28 @@ impl GraphStorageConfig {
     /// Enforce the hard ranges of the Capacity and Admission Contract.
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errors: Vec<String> = Vec::new();
+        self.check_embedding_ranges(&mut errors);
+        self.check_graph_ranges(&mut errors);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "invalid graph-storage configuration:\n  {}",
+                errors.join("\n  ")
+            )
+        }
+    }
+
+    /// The provider's own bounds.
+    fn check_embedding_ranges(&self, errors: &mut Vec<String>) {
         check_range!(errors, self, embedding_dimension, 1u32, 4_096u32);
         check_range!(errors, self, embedding_input_max_bytes, 64u32, 262_144u32);
         check_range!(errors, self, embedding_remote_batch_size, 1u32, 2_048u32);
         check_range!(errors, self, embedding_remote_timeout_secs, 1u64, 600u64);
+    }
+
+    /// Every bound on what one request may ask of the graph.
+    fn check_graph_ranges(&self, errors: &mut Vec<String>) {
         check_range!(errors, self, ingest_max_nodes, 1u32, 50_000u32);
         check_range!(errors, self, ingest_max_edges, 1u32, 100_000u32);
         check_range!(errors, self, payload_max_bytes, 1_024u32, 1_048_576u32);
@@ -190,14 +225,9 @@ impl GraphStorageConfig {
         check_range!(errors, self, deadline_interactive_secs, 1u64, 300u64);
         check_range!(errors, self, idempotency_retention_days, 1u32, 365u32);
         check_range!(errors, self, ontology_max_chain_depth, 3u8, 16u8);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "invalid graph-storage configuration:\n  {}",
-                errors.join("\n  ")
-            )
-        }
+        check_range!(errors, self, type_update_max_rows, 1u32, 5_000_000u32);
+        check_range!(errors, self, type_update_batch, 100u32, 10_000u32);
+        check_range!(errors, self, type_update_max_reported_rows, 1u32, 1_000u32);
     }
 
     /// The interactive deadline as a duration.

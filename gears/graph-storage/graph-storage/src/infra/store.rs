@@ -6,6 +6,7 @@
 //! a row that does not exist yet. There is no unscoped query API in this
 //! module.
 
+pub mod evolution;
 pub mod ingest;
 pub mod projection;
 pub mod reads;
@@ -19,8 +20,9 @@ use async_trait::async_trait;
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest, LabelId,
     LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
-    ReadSnapshot, RevisionOutcome, SearchRequest, SearchResponse, StoreCapabilities, TopologyPage,
-    TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    ReadSnapshot, RegisteredType, RevisionOutcome, SearchRequest, SearchResponse,
+    StoreCapabilities, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -155,12 +157,13 @@ impl GraphStoreV1 for PgGraphStore {
         }
     }
 
-    async fn register_types(
+    async fn register_types_with(
         &self,
         ctx: &StoreCtx<'_>,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, GraphStoreError> {
-        types::register_types(self, ctx, batch).await
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, GraphStoreError> {
+        types::register_types(self, ctx, batch, options).await
     }
 
     async fn get_type(

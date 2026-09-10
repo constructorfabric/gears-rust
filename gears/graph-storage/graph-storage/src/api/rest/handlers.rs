@@ -30,15 +30,64 @@ fn idempotency_key(headers: &HeaderMap, body: Option<String>) -> Option<String> 
         .or(body)
 }
 
+/// `options.on_existing` / `options.revalidate`, refusing an unknown mode
+/// rather than defaulting it: a caller who misspells `update` must not be
+/// silently served the rejecting behaviour they were trying to leave.
+fn registration_options(
+    options: Option<dto::GraphTypeRegisterOptionsDto>,
+) -> Result<m::TypeRegistrationOptions, DomainError> {
+    let Some(options) = options else {
+        return Ok(m::TypeRegistrationOptions::default());
+    };
+    let on_existing = match options.on_existing.as_deref() {
+        None | Some("reject") => m::OnExisting::Reject,
+        Some("update") => m::OnExisting::Update,
+        Some(other) => {
+            return Err(DomainError::invalid(format!(
+                "`{other}` is not an accepted value for `options.on_existing`; it takes                  `reject` or `update`"
+            )));
+        }
+    };
+    Ok(m::TypeRegistrationOptions {
+        on_existing,
+        revalidate: options.revalidate.unwrap_or(false),
+        dry_run: false,
+    })
+}
+
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
 pub async fn register_types(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
     Json(request): Json<dto::GraphRegisterTypesRequest>,
-) -> ApiResult<Json<Vec<dto::GraphTypeDto>>> {
+) -> ApiResult<Json<Vec<dto::GraphRegisteredTypeDto>>> {
+    let options = registration_options(request.options)?;
     let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
-    let records = services.register_types(&ctx, batch).await?;
-    Ok(Json(records.into_iter().map(Into::into).collect()))
+    let registered = services.register_types_with(&ctx, batch, options).await?;
+    Ok(Json(registered.into_iter().map(Into::into).collect()))
+}
+
+/// The dry run: every verdict, no write.
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn type_compatibility(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Json(request): Json<dto::GraphRegisterTypesRequest>,
+) -> ApiResult<Json<dto::GraphTypeCompatibilityDto>> {
+    // Re-validation defaults *on* here and off on the write path: the whole
+    // point of asking is to be told whether the change would go through, and
+    // a dry run that skipped the row check would answer a different question
+    // from the one the update will ask.
+    let revalidate = request
+        .options
+        .as_ref()
+        .and_then(|options| options.revalidate)
+        .unwrap_or(true);
+    let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
+    let items = services.type_compatibility(&ctx, batch, revalidate).await?;
+    Ok(Json(dto::GraphTypeCompatibilityDto {
+        items: items.into_iter().map(Into::into).collect(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

@@ -220,3 +220,58 @@ async fn a_deeper_chain_registers_and_its_ancestor_admits_the_leaf() {
     )
     .await;
 }
+
+// --- type evolution (registering a changed schema in place) -----------------
+
+#[tokio::test]
+async fn a_backward_compatible_change_updates_the_type_in_place() {
+    conformance::a_backward_compatible_change_updates_the_type_in_place(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_incompatible_change_is_refused_with_its_location() {
+    conformance::an_incompatible_change_is_refused_with_its_location(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_changed_schema_is_still_a_conflict_by_default() {
+    conformance::a_changed_schema_is_still_a_conflict_by_default(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_every_verdict_and_writes_nothing() {
+    conformance::a_dry_run_reports_every_verdict_and_writes_nothing(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit() {
+    conformance::a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_change_the_stored_rows_contradict_is_refused_naming_them() {
+    conformance::a_change_the_stored_rows_contradict_is_refused_naming_them(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_new_index_path_becomes_filterable_without_recreating_the_type() {
+    conformance::a_new_index_path_becomes_filterable_without_recreating_the_type(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

@@ -11,11 +11,14 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, DeleteOutcome, DeleteRequest, ElementEnvelope, GraphRevision,
+    AdjacencyEntry, AdjacencySide, AdmissionBasis, DeleteOutcome, DeleteRequest, ElementEnvelope,
+    GraphRevision, OnExisting,
     GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment,
     LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
-    ReadSnapshot, RevisionOutcome, SearchMode, SearchRequest, SearchResponse, StoreCapabilities,
-    Subject, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    ReadSnapshot, RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode, SearchRequest,
+    SearchResponse, StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange,
+    TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -24,7 +27,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
-use crate::domain::{identity, ontology, projection};
+use crate::domain::{evolution, identity, ontology, projection};
 
 #[derive(Clone)]
 struct FakeNode {
@@ -235,63 +238,66 @@ impl GraphStoreV1 for FakeGraphStore {
         }
     }
 
-    async fn register_types(
+    async fn register_types_with(
         &self,
         ctx: &StoreCtx<'_>,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, GraphStoreError> {
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, GraphStoreError> {
         let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let tenant = tenants.entry(ctx.tenant).or_default();
 
-        // Atomic: analyze everything before storing anything.
+        // Atomic: analyze and decide everything before storing anything.
         let mut prepared = Vec::new();
         for registration in &batch {
             let chain = ontology::ancestors(&registration.type_id);
-            let mut ancestors = Vec::new();
+            let mut ancestors: Vec<(String, serde_json::Value)> = Vec::new();
             for ancestor in &chain[..chain.len().saturating_sub(1)] {
                 let schema = batch
                     .iter()
                     .find(|r| &r.type_id == ancestor)
                     .map(|r| r.schema.clone())
                     .or_else(|| tenant.types.get(ancestor).map(|t| t.schema.clone()))
-                    .ok_or_else(|| GraphStoreError::Validation {
-                        items: vec![ItemError {
-                            index: 0,
-                            family: ItemFamily::Node,
-                            gts_type: Some(registration.type_id.clone()),
-                            pointer: None,
-                            message: format!("ancestor `{ancestor}` is not registered"),
-                        }],
+                    .ok_or_else(|| {
+                        validation(
+                            0,
+                            ItemFamily::Node,
+                            &registration.type_id,
+                            &format!("ancestor `{ancestor}` is not registered"),
+                        )
                     })?;
-                ancestors.push(schema);
+                ancestors.push((ancestor.clone(), schema));
             }
-            let refs: Vec<&serde_json::Value> = ancestors.iter().collect();
+            let refs: Vec<&serde_json::Value> =
+                ancestors.iter().map(|(_, schema)| schema).collect();
             let descriptor = ontology::analyze(
                 &registration.type_id,
                 &registration.schema,
                 &refs,
                 self.max_chain_depth,
             )
-            .map_err(|error| GraphStoreError::Validation {
-                items: vec![ItemError {
-                    index: 0,
-                    family: ItemFamily::Node,
-                    gts_type: Some(registration.type_id.clone()),
-                    pointer: None,
-                    message: error.to_string(),
-                }],
+            .map_err(|error| {
+                validation(
+                    0,
+                    ItemFamily::Node,
+                    &registration.type_id,
+                    &error.to_string(),
+                )
             })?;
 
-            if let Some(existing) = tenant.types.get(&descriptor.type_id)
-                && existing.schema != descriptor.schema
-            {
-                return Err(GraphStoreError::Conflict {
-                    reason: format!(
-                        "type `{}` is already registered with a different schema",
-                        descriptor.type_id
-                    ),
-                });
-            }
+            let decided = match tenant.types.get(&descriptor.type_id).cloned() {
+                None => Decided {
+                    outcome: TypeOutcome::Created,
+                    basis: None,
+                    change: fresh_change(&descriptor.type_id),
+                    revision: 1,
+                    created_at: OffsetDateTime::now_utc(),
+                },
+                Some(existing) => {
+                    decide_existing(tenant, &existing, &descriptor, &ancestors, options)?
+                }
+            };
+
             let kinds: BTreeMap<String, ontology::ScalarKind> = descriptor
                 .index_paths
                 .iter()
@@ -305,23 +311,28 @@ impl GraphStoreV1 for FakeGraphStore {
                     is_abstract: descriptor.is_abstract,
                     schema: descriptor.schema,
                     effective_traits: descriptor.effective_traits,
-                    created_at: OffsetDateTime::now_utc(),
+                    created_at: decided.created_at,
+                    revision: decided.revision,
                 },
                 kinds,
+                decided,
             ));
         }
 
-        for (record, kinds) in &prepared {
-            tenant
-                .types
-                .entry(record.type_id.clone())
-                .or_insert_with(|| record.clone());
-            tenant
-                .index_kinds
-                .entry(record.type_id.clone())
-                .or_insert_with(|| kinds.clone());
+        let mut out = Vec::with_capacity(prepared.len());
+        for (record, kinds, decided) in prepared {
+            if !options.dry_run && decided.outcome != TypeOutcome::Unchanged {
+                tenant.types.insert(record.type_id.clone(), record.clone());
+                tenant.index_kinds.insert(record.type_id.clone(), kinds);
+            }
+            out.push(RegisteredType {
+                record,
+                outcome: decided.outcome,
+                basis: decided.basis,
+                change: Some(decided.change),
+            });
         }
-        Ok(prepared.into_iter().map(|(record, _)| record).collect())
+        Ok(out)
     }
 
     async fn get_type(
@@ -1057,6 +1068,252 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
 
 fn poisoned() -> GraphStoreError {
     GraphStoreError::Internal("fake store lock is poisoned".into())
+}
+
+/// What the fake decided about one identifier that is already registered.
+struct Decided {
+    outcome: TypeOutcome,
+    basis: Option<AdmissionBasis>,
+    change: TypeChange,
+    revision: i32,
+    created_at: OffsetDateTime,
+}
+
+fn fresh_change(type_id: &str) -> TypeChange {
+    TypeChange {
+        type_id: type_id.to_owned(),
+        state: TypeChangeState::New,
+        backward: "compatible".to_owned(),
+        forward: "compatible".to_owned(),
+        diagnostics: Vec::new(),
+        traits_changed: Vec::new(),
+        rows: None,
+        levels_not_evolvable_in_place: Vec::new(),
+        migration_required: false,
+        admissible: true,
+    }
+}
+
+/// The same rule the built-in store applies, over in-memory rows.
+///
+/// The fake carries the data-backed ground too, and not as a stub: an
+/// admission ground only the `PostgreSQL` store applies is a ground the
+/// conformance suite cannot see, which is the lesson the endpoint-constraint
+/// episode taught earlier in this prototype.
+fn decide_existing(
+    tenant: &Tenant,
+    existing: &TypeRecord,
+    descriptor: &ontology::TypeDescriptor,
+    ancestors: &[(String, serde_json::Value)],
+    options: TypeRegistrationOptions,
+) -> Result<Decided, GraphStoreError> {
+    let update = options.on_existing == OnExisting::Update;
+    let traits_changed =
+        evolution::traits_diff(&existing.effective_traits, &descriptor.effective_traits);
+    let unchanged = |traits_changed: Vec<graph_storage_sdk::models::TraitChange>| Decided {
+        outcome: TypeOutcome::Unchanged,
+        basis: None,
+        change: TypeChange {
+            type_id: descriptor.type_id.clone(),
+            state: TypeChangeState::Unchanged,
+            backward: "compatible".to_owned(),
+            forward: "compatible".to_owned(),
+            diagnostics: Vec::new(),
+            traits_changed,
+            rows: None,
+            levels_not_evolvable_in_place: Vec::new(),
+            migration_required: false,
+            admissible: true,
+        },
+        revision: existing.revision,
+        created_at: existing.created_at,
+    };
+
+    // Byte-identical re-registration converges. The fake stores the resolved
+    // traits as a value rather than as JSON, so unlike the built-in store's
+    // column it cannot go stale; the diff is still reported.
+    if existing.schema == descriptor.schema {
+        return Ok(unchanged(traits_changed));
+    }
+
+    let comparison = evolution::compare(
+        &existing.schema,
+        &descriptor.schema,
+        ancestors.iter().cloned(),
+    )
+    .map_err(|error| {
+        validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
+    })?;
+    let state = comparison.state();
+    let mut change = TypeChange {
+        type_id: descriptor.type_id.clone(),
+        state,
+        backward: comparison.backward.as_str().to_owned(),
+        forward: comparison.forward.as_str().to_owned(),
+        diagnostics: comparison.diagnostics,
+        traits_changed,
+        rows: None,
+        levels_not_evolvable_in_place: comparison.levels_not_evolvable_in_place,
+        migration_required: !matches!(state, TypeChangeState::Compatible),
+        admissible: false,
+    };
+
+    let accepted = |change: TypeChange, basis: AdmissionBasis| Decided {
+        outcome: TypeOutcome::Updated,
+        basis: Some(basis),
+        change,
+        revision: existing.revision.saturating_add(1),
+        created_at: existing.created_at,
+    };
+
+    match evolution::decide(state, update, options.revalidate) {
+        evolution::Decision::Refuse => {
+            if options.dry_run {
+                return Ok(Decided {
+                    outcome: TypeOutcome::Unchanged,
+                    basis: None,
+                    change,
+                    revision: existing.revision,
+                    created_at: existing.created_at,
+                });
+            }
+            Err(GraphStoreError::Conflict {
+                reason: if update {
+                    evolution::refusal_reason(
+                        &descriptor.type_id,
+                        state,
+                        &change.diagnostics,
+                        5,
+                    )
+                } else {
+                    format!(
+                        "type `{}` is already registered with a different schema",
+                        descriptor.type_id
+                    )
+                },
+            })
+        }
+        evolution::Decision::Accept => {
+            change.admissible = true;
+            Ok(accepted(change, AdmissionBasis::SchemaProved))
+        }
+        evolution::Decision::Revalidate => {
+            let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
+            chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
+            let validator = ontology::ChainValidator::compile(&descriptor.schema, chain)
+                .map_err(|error| {
+                    validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
+                })?;
+            let rows = rows_of_type(tenant, &descriptor.type_id);
+            change.rows = Some(rows);
+            let failures = revalidate_fake(tenant, &descriptor.type_id, &validator);
+            if failures.is_empty() {
+                change.admissible = true;
+                return Ok(accepted(
+                    change,
+                    AdmissionBasis::DataBacked {
+                        rows_validated: rows,
+                    },
+                ));
+            }
+            if !options.dry_run {
+                return Err(GraphStoreError::Validation { items: failures });
+            }
+            for failure in &failures {
+                change.diagnostics.push(SchemaDiagnostic {
+                    location: failure.pointer.clone().unwrap_or_default(),
+                    finding: "stored_row_invalid".to_owned(),
+                    message: failure.message.clone(),
+                });
+            }
+            Ok(Decided {
+                outcome: TypeOutcome::Unchanged,
+                basis: None,
+                change,
+                revision: existing.revision,
+                created_at: existing.created_at,
+            })
+        }
+    }
+}
+
+/// Live rows of one type, nodes and edges alike.
+fn rows_of_type(tenant: &Tenant, type_id: &str) -> u64 {
+    let nodes = tenant
+        .nodes
+        .iter()
+        .filter(|node| !node.deleted && node.type_id == type_id)
+        .count();
+    let edges = tenant
+        .edges
+        .iter()
+        .filter(|edge| !edge.deleted && edge.type_id == type_id)
+        .count();
+    (nodes + edges) as u64
+}
+
+/// Does every live row of the type validate against the candidate?
+fn revalidate_fake(
+    tenant: &Tenant,
+    type_id: &str,
+    validator: &ontology::ChainValidator,
+) -> Vec<ItemError> {
+    let mut errors = Vec::new();
+    for (index, node) in tenant
+        .nodes
+        .iter()
+        .filter(|node| !node.deleted && node.type_id == type_id)
+        .enumerate()
+    {
+        let mut instance = serde_json::json!({ "node_key": node.key, "type": type_id });
+        if let Some(name) = &node.name {
+            instance["name"] = serde_json::json!(name);
+        }
+        if let Some(payload) = &node.payload {
+            instance["payload"] = payload.clone();
+        }
+        for (pointer, message) in validator.validate(&instance) {
+            errors.push(ItemError {
+                index,
+                family: ItemFamily::Node,
+                gts_type: Some(type_id.to_owned()),
+                pointer: Some(pointer),
+                message: format!("node `{}`: {message}", node.key),
+            });
+        }
+    }
+    for (index, edge) in tenant
+        .edges
+        .iter()
+        .filter(|edge| !edge.deleted && edge.type_id == type_id)
+        .enumerate()
+    {
+        let key_of = |id: i64| {
+            tenant
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map_or_else(String::new, |node| node.key.clone())
+        };
+        let mut instance = serde_json::json!({
+            "type": type_id,
+            "src_node_key": key_of(edge.src),
+            "dst_node_key": key_of(edge.dst),
+        });
+        if let Some(payload) = &edge.payload {
+            instance["payload"] = payload.clone();
+        }
+        for (pointer, message) in validator.validate(&instance) {
+            errors.push(ItemError {
+                index,
+                family: ItemFamily::Edge,
+                gts_type: Some(type_id.to_owned()),
+                pointer: Some(pointer),
+                message: format!("edge `{}`: {message}", edge.key),
+            });
+        }
+    }
+    errors
 }
 
 fn validation(index: usize, family: ItemFamily, type_id: &str, message: &str) -> GraphStoreError {

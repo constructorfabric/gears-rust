@@ -98,6 +98,10 @@ pub struct TypeRecord {
     pub schema: serde_json::Value,
     pub effective_traits: EffectiveTraits,
     pub created_at: OffsetDateTime,
+    /// Which retained definition of this identifier is in force: `1` until the
+    /// type is first updated in place, then one more per accepted update
+    /// (types-registry ADR-0005 calls each of them a retained revision).
+    pub revision: i32,
 }
 
 /// Filter for listing registered types.
@@ -131,6 +135,169 @@ impl TypeIdSet {
     pub fn contains(&self, type_id: &str) -> bool {
         self.0.contains(type_id)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Type evolution (registering a changed schema under a known identifier)
+// ---------------------------------------------------------------------------
+
+/// What a registration batch may do to an identifier that is already
+/// registered with a *different* schema.
+///
+/// The platform decided the policy before the gear did: types-registry
+/// ADR-0004 says a major-only GTS id names a mutable logical entity whose
+/// backward-compatible updates keep that id, and ADR-0003 fixes the direction
+/// (`BACKWARD`), the baseline (the current revision) and the posture (an
+/// undecidable check is a refusal). This enum is only the per-request switch
+/// between the gear's historical behaviour and that policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnExisting {
+    /// A changed schema is a conflict — the gear's behaviour before type
+    /// updates existed, and still the default so no existing caller changes.
+    #[default]
+    Reject,
+    /// Admit the change when it is admissible; refuse it, with the offending
+    /// schema locations, when it is not.
+    Update,
+}
+
+/// Per-batch registration options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TypeRegistrationOptions {
+    pub on_existing: OnExisting,
+    /// Admit a change the schemas cannot prove compatible when every stored
+    /// row of the type still validates against the candidate.
+    ///
+    /// This is deliberately a second, explicit ground for admission rather
+    /// than a relaxation of the first: it is a statement about *this tenant's
+    /// current rows*, not about the accepted instance sets, and it costs a
+    /// scan of the type bounded by `type_update_max_rows`.
+    pub revalidate: bool,
+    /// Compute and report every verdict, write nothing.
+    pub dry_run: bool,
+}
+
+/// How the candidate stands against the registered definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeChangeState {
+    /// Nothing is registered under this identifier yet.
+    New,
+    /// Byte-identical to what is registered.
+    Unchanged,
+    /// `Valid(old) ⊆ Valid(new)` proved from the schemas.
+    Compatible,
+    /// Proved *not* to hold.
+    Incompatible,
+    /// Could be neither proved nor disproved (`gts` reports `Unknown`).
+    /// ADR-0003 fails closed on this, so it is a refusal — but a distinct one,
+    /// because the fix is a different one.
+    Undecidable,
+}
+
+impl TypeChangeState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Unchanged => "unchanged",
+            Self::Compatible => "compatible",
+            Self::Incompatible => "incompatible",
+            Self::Undecidable => "undecidable",
+        }
+    }
+}
+
+/// One reason a directional verdict does not hold, with the schema location
+/// that carries it — so a refusal points at `$.payload` rather than saying
+/// "incompatible".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaDiagnostic {
+    /// Location in the resolved schema, `$` for the document root.
+    pub location: String,
+    /// Machine-readable finding kind, as `gts` names it.
+    pub finding: String,
+    pub message: String,
+}
+
+/// How one trait's declared paths changed between the two definitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraitChange {
+    /// `index`, `full_text_search`, `vector_search`, `src_types`, `dst_types`.
+    pub trait_name: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// The full verdict on one candidate: what the dry run reports and what a
+/// refusal explains itself with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeChange {
+    pub type_id: GtsTypeId,
+    pub state: TypeChangeState,
+    /// `compatible` / `incompatible` / `unknown`; the direction ADR-0003
+    /// enforces.
+    pub backward: String,
+    /// Computed and reported, never enforced — the same posture as the
+    /// registry. It tells a producer whether an old reader still accepts new
+    /// payloads.
+    pub forward: String,
+    /// Evidence for the backward verdict.
+    pub diagnostics: Vec<SchemaDiagnostic>,
+    pub traits_changed: Vec<TraitChange>,
+    /// Live rows of this type, when the operation needed to know.
+    pub rows: Option<u64>,
+    /// Object levels of the candidate where a *later* definition will not be
+    /// able to add an optional property (`ContentModel::is_evolvable_in_place`).
+    /// Reported so "your next edit will be a major" is a warning today rather
+    /// than a surprise later.
+    pub levels_not_evolvable_in_place: Vec<String>,
+    /// Whether this change needs more than the schemas to be admitted.
+    pub migration_required: bool,
+    /// Whether the gear would admit it under the options of this request.
+    pub admissible: bool,
+}
+
+/// Why an update was admitted. Two grounds, never conflated in a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionBasis {
+    /// The schemas prove `Valid(old) ⊆ Valid(new)`. No row was read.
+    SchemaProved,
+    /// The schemas do not prove it; every live row of the type was validated
+    /// against the candidate instead. True of *these rows*, not of the type.
+    DataBacked { rows_validated: u64 },
+}
+
+/// What one registration did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeOutcome {
+    Created,
+    /// Already registered, byte-identical, nothing written.
+    Unchanged,
+    /// The stored definition was replaced under the same identifier.
+    Updated,
+}
+
+impl TypeOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Unchanged => "unchanged",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+/// A registered type plus what this call did to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredType {
+    pub record: TypeRecord,
+    pub outcome: TypeOutcome,
+    /// Present when `outcome` is `Updated`.
+    pub basis: Option<AdmissionBasis>,
+    /// Present when the identifier was already registered, and always in a
+    /// dry run.
+    pub change: Option<TypeChange>,
 }
 
 // ---------------------------------------------------------------------------

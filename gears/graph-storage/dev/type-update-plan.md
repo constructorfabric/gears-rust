@@ -1,6 +1,10 @@
 # Updating a registered type in place — implementation plan
 
-Status: proposed, not started. Written 2026-09-10 for `feature/graph-storage-v2`.
+Status: **slices 1 and 2 implemented 2026-09-10** on `feature/graph-storage-v2`
+(dry run, in-place update, trait recompute, refusals with locations, plus one
+ground this plan did not have — see the addendum at the end). Slices 3 and 4
+(payload-rewriting migrations, revision history) are still as written below.
+Written 2026-09-10 for `feature/graph-storage-v2`.
 
 The gear registers a type once and refuses a changed schema under a known id
 (`infra/store/types.rs`, the `GraphStoreError::Conflict` branch). Every edit to
@@ -295,3 +299,107 @@ complaint.
 Automatic data copy between majors; asynchronous migrations; index DDL (#4721);
 change-event publication (`emit_events` exists as a trait, publication does not);
 and any change to the `--model-revision` path, which stays as the escape hatch.
+
+---
+
+# Addendum, 2026-09-10: what building it changed
+
+## The measurement slice 1 exists for, taken first
+
+Over the 188 instantiable node types the exporter emits from the Studio domain
+model, "add one optional property" is:
+
+| exporter shape | backward verdict |
+| --- | --- |
+| as emitted today (payload level open) | `incompatible` — 188 of 188 |
+| payload materialized and closed at the leaf | `compatible` — 188 of 188 |
+
+`Unknown` never occurred. Risk 1 of §9 was therefore wrong in its shape and
+right in its consequence: the verdicts are decidable, and it is our *schema
+shape* that makes the commonest edit inadmissible. gts sec 4.4 explains it in
+one line — at an open object level the previous definition already accepted any
+value under the new property's name, so declaring the property narrows the
+accepted set. The same run classifies the deck's four PM edits against the real
+`requirement` type:
+
+| edit | open payload | closed payload |
+| --- | --- | --- |
+| 1 add optional `owner` | incompatible | **compatible** |
+| 2 widen `status` enum | **compatible** | **compatible** |
+| 3 rename `priority` → `urgency` | incompatible | incompatible (`property_removed`) |
+| 4 make `owner` required | incompatible | incompatible (`required_changed`) |
+
+## The exporter change this implies, and its limit
+
+Close the payload at the leaf: `additionalProperties: false` with every
+inherited property restated. **Only on a type with no descendants** — 181 of
+the 188 are leaves — because an intermediate type that closes `payload` makes
+every descendant uninstantiable, `allOf` branches being evaluated
+independently. That is not a new discovery: the gear's own D-029 states the
+rule. The seven non-leaf instantiable types keep the open payload and reach the
+same outcome through the second ground below.
+
+Closing the payload also makes ingest refuse an undeclared payload field, which
+is a real behaviour change for producers and a decision worth taking
+deliberately rather than as a side effect.
+
+## The second ground for admission, which this plan did not have
+
+§3 assumed one rule: the schemas decide, and `Unknown` is a refusal. That is
+right for a *registry*, which holds no data. This gear holds the data, so when
+the schemas cannot prove inclusion there is a different question available: does
+every live row of the type validate against the candidate? `options.revalidate`
+opts into asking it, and the answer is reported as
+`admission_basis: "data_backed"` with the row count, never as a verdict about
+the type. Two grounds, never conflated:
+
+| ground | what it proves | what it costs |
+| --- | --- | --- |
+| `schema_proved` | `Valid(old) ⊆ Valid(new)` for every instance that could ever exist | no row is read |
+| `data_backed` | every row this tenant has now satisfies the candidate | one scan, capped by `type_update_max_rows` |
+
+This is what turns the 188 open-payload types from "blocked until the exporter
+changes" into "admitted, at the price of a scan" — and it is also the honest
+half of what a migration will be in slice 3, since a migration is a rewrite
+followed by exactly this check.
+
+## What shipped, against §4 and §7
+
+- §4.1 `POST /types/compatibility` — as specified, plus `admissible` and
+  `levels_not_evolvable_in_place`. Re-validation defaults **on** here and off on
+  the write path: a dry run that skipped the row check would answer a different
+  question from the one the update asks.
+- §4.2 `options.on_existing` — as specified; `reject` is the default and is the
+  previous behaviour byte for byte.
+- §4.3 migrations — **not built**. Unchanged as a design.
+- §5 — steps 1–4, 6 and 8 as written. Step 5's row pass re-validates and does
+  not rewrite. Step 7: `index` needs nothing (the projection reads the path at
+  query time); the tsvector and vector-epoch recomputes are not built, and
+  `evolution::recompute_needed` names which trait changes will need them.
+- §6 — `domain/evolution.rs` (the rule, pure), `infra/store/evolution.rs` (the
+  row pass), the split conflict branch in `infra/store/types.rs`, `m0006`, the
+  fake store mirroring both grounds, the DTOs and the route, three config keys.
+  `domain/migration.rs` and `infra/store/migrate.rs` belong to slice 3 and do
+  not exist.
+- §6 authorization — no new PDP action. A re-validating update requires `write`
+  on the node resource *in addition to* `admin` on the type resource and is
+  served under the node scope, which is the scope ingest already writes those
+  rows with. A new action would have needed a policy the deployments do not
+  carry; the two existing decisions say the same thing.
+- §8 — 10 unit cases in `domain::evolution`, 7 conformance cases on **both**
+  stores (`a_backward_compatible_change_updates_the_type_in_place`,
+  `an_incompatible_change_is_refused_with_its_location`,
+  `a_changed_schema_is_still_a_conflict_by_default`,
+  `a_dry_run_reports_every_verdict_and_writes_nothing`,
+  `a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit`,
+  `a_change_the_stored_rows_contradict_is_refused_naming_them`,
+  `a_new_index_path_becomes_filterable_without_recreating_the_type`).
+
+## A wart this closed on the way past
+
+The prototype's handover recorded that a type registered before v0.1.2 keeps a
+stale `effective_traits` (no `index_kinds`), that an idempotent re-registration
+does not refresh it, and that the only remedy was to recreate the database. In
+`update` mode a byte-identical re-registration whose *resolved traits* differ
+now rewrites them and bumps the revision. In `reject` mode it still converges
+silently, so the default path is unchanged.

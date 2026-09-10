@@ -284,6 +284,37 @@ pg_case!(
     conformance::a_deeper_chain_registers_and_its_ancestor_admits_the_leaf
 );
 
+// --- type evolution (registering a changed schema in place) -----------------
+
+pg_case!(
+    a_backward_compatible_change_updates_the_type_in_place,
+    conformance::a_backward_compatible_change_updates_the_type_in_place
+);
+pg_case!(
+    an_incompatible_change_is_refused_with_its_location,
+    conformance::an_incompatible_change_is_refused_with_its_location
+);
+pg_case!(
+    a_changed_schema_is_still_a_conflict_by_default,
+    conformance::a_changed_schema_is_still_a_conflict_by_default
+);
+pg_case!(
+    a_dry_run_reports_every_verdict_and_writes_nothing,
+    conformance::a_dry_run_reports_every_verdict_and_writes_nothing
+);
+pg_case!(
+    a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit,
+    conformance::a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit
+);
+pg_case!(
+    a_change_the_stored_rows_contradict_is_refused_naming_them,
+    conformance::a_change_the_stored_rows_contradict_is_refused_naming_them
+);
+pg_case!(
+    a_new_index_path_becomes_filterable_without_recreating_the_type,
+    conformance::a_new_index_path_becomes_filterable_without_recreating_the_type
+);
+
 /// Keyset paging over a payload ordering, which only the built-in store
 /// serves: every page continues where the last one ended, the ordered walk
 /// is the same as the one-page answer, and the rows missing the attribute

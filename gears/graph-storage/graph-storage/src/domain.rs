@@ -6,6 +6,7 @@ pub mod admission;
 pub mod authz;
 pub mod embedding;
 pub mod error;
+pub mod evolution;
 pub mod identity;
 pub mod local_client;
 pub mod ontology;

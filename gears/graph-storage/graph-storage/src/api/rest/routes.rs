@@ -47,8 +47,13 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("Register a type batch, atomically")
         .description(
             "Registers GTS node, edge and attribute types. A byte-identical \
-             re-registration converges; a different schema under a registered \
-             identifier is a conflict",
+             re-registration converges. A different schema under a registered \
+             identifier is a conflict by default; with \
+             `options.on_existing: \"update\"` it is admitted when it is \
+             backward compatible (types-registry ADR-0003, computed by GTS \
+             OP#8) and, with `options.revalidate`, also when every stored row \
+             of the type still validates against it. Anything else is refused \
+             naming the offending schema locations",
         )
         .tag(API_TAG)
         .authenticated()
@@ -57,15 +62,45 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .handler(handlers::register_types)
         // An array response is emitted inline: registering `Vec<T>` as a
         // component would name it `Vec`, which every other array resolves to.
-        .json_array_response_with_schema::<dto::GraphTypeDto>(
+        .json_array_response_with_schema::<dto::GraphRegisteredTypeDto>(
             openapi,
             http::StatusCode::OK,
-            "The registered types with their chain-resolved traits",
+            "The registered types, each with its chain-resolved traits and what \
+             this call did to it",
         )
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_409(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::post(format!("{BASE}/types/compatibility"))
+        .operation_id("graph_storage.type_compatibility")
+        .summary("What changing these types would cost: a dry run")
+        .description(
+            "Runs the identical admission path and writes nothing. Per type: \
+             the state against what is registered, both directional verdicts, \
+             every diagnostic with its schema location, which traits moved, \
+             how many rows the type has, the object levels a later edit will \
+             not be able to extend in place, and whether the change would be \
+             admitted. Re-validation of stored rows is on unless \
+             `options.revalidate` turns it off",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<dto::GraphRegisterTypesRequest>(openapi, "Candidate definitions")
+        .handler(handlers::type_compatibility)
+        .json_response_with_schema::<dto::GraphTypeCompatibilityDto>(
+            openapi,
+            http::StatusCode::OK,
+            "What each candidate would do",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);

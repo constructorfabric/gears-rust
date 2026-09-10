@@ -312,6 +312,92 @@ The projection now serves payload paths. Registration resolves every `index` poi
 - *Forward paging only.* A payload-ordered projection mints `next_cursor` and no `prev_cursor`; a backward cursor is refused with a message.
 - The `index` trait's `description` in the base schema still says "backed by a JSONB index" — true again, for equality; unchanged for the reason D-013 gives.
 
+## D-031 [impl-gap] A registered type's schema can be updated in place, on two grounds
+
+The gear registered a type once and answered `409` to any changed schema under
+the same identifier. DESIGN sanctions that ("a different schema under a
+registered identifier is a conflict") and says nothing about evolution, so this
+entry is `impl-gap`: what is built goes beyond what the documentation
+describes, and the documentation is the thing that is wrong.
+
+**The policy is not the gear's to choose, and the gear was diverging from it.**
+types-registry ADR-0003 fixes the direction (`BACKWARD`: a candidate is
+admissible when `Valid(baseline) ⊆ Valid(candidate)`), the baseline (the
+entity's *current* revision, never its history) and the posture (an undecidable
+check is a refusal — the registry fails closed). ADR-0004 says a major-only GTS
+id names a **mutable** logical entity and that *"a content update that is
+backward compatible under ADR-0003 preserves the same GTS ID"*; ADR-0005 makes
+every admitted definition a retained revision. Our own `gts_type` docstring
+calls the table "a cache with a foreign identity, never a second source of
+truth" — and a cache that refuses what its authority accepts is a bug in the
+cache.
+
+**Nothing of the relation was written here.** `gts 0.12`'s `schema_evolution`
+is the evolution check (spec sec 4.2, **OP#8**): `check_backward_diagnostics`,
+`check_forward_diagnostics`, the three-valued `CompatibilityVerdict`, and
+diagnostics carrying the offending **schema location** so a refusal can point
+at `$.payload` instead of saying "incompatible". `GtsStore::compare_documents`
+resolves both documents' `$ref`s first and also classifies every object level's
+content model, which is what `is_evolvable_in_place` reads. OP#12 is schema
+*derivation* and is a different relation over a different pair of schemas; the
+gts docs are emphatic that the two must not be conflated.
+
+**What was built.** `options.on_existing: reject | update` on `POST /types`
+(`reject` is the default and is the previous behaviour byte for byte), a
+`POST /types/compatibility` dry run that runs the identical path and writes
+nothing, `revision` and `updated_at` on `gts_type` (`m0006`), and a per-type
+report: state, both directional verdicts, every diagnostic with its location,
+which traits moved, the type's row count, the object levels a *later* edit will
+not be able to extend, and whether the change is admissible. Forward
+compatibility is computed and reported, never enforced — the registry's own
+posture, and useful to a producer, since an added optional property is exactly
+where the two directions disagree.
+
+**The one thing the gear owns, and it is deliberately a second ground rather
+than a looser first one.** ADR-0003 decides from the schemas, because a
+registry has nothing else. This gear holds the data, so when the schemas cannot
+prove inclusion it can ask a different question: does every live row of the
+type validate against the candidate? `options.revalidate` opts into that, the
+answer is reported as `admission_basis: "data_backed"` with the number of rows
+read, and it is never cached or restated as a verdict about the type — it is
+true of *these rows*, and a later ingest of the old shape fails, which is the
+point of the change. Bounded by `type_update_max_rows` (default 100 000):
+above it the honest answer is an asynchronous migration with progress, which
+does not exist. A provably compatible change reads no row at all.
+
+**Measured before any of it was written, on the Studio domain model
+(2026-09-10).** Over the 188 instantiable node types the exporter emits, "add
+one optional property" comes back **`incompatible` 188 times out of 188** — and
+`Unknown` never. The reason is gts sec 4.4: the payload object level is *open*,
+so the previous definition already accepted any value under the new property's
+name, and declaring it *narrows* the accepted set. With the payload
+materialized and closed at the leaf (`additionalProperties: false`, inherited
+properties restated) the same edit is **`compatible` 188 times out of 188**.
+Two consequences:
+
+- the exporter should close the payload on any type with no descendants — 181
+  of the 188 are leaves — and only there, because an intermediate type that
+  closes `payload` makes every descendant uninstantiable (the rule D-029
+  already states);
+- until it does, those edits go through the data-backed ground, which is
+  exactly what it is for. This is why the dry run shipped first: the number
+  above is a measurement, not a guess, and it changes the exporter rather than
+  the gear.
+
+**What is not built.** A migration that *rewrites* payloads (a closed grammar
+of `rename` / `default` / `drop` steps is designed in
+[`type-update-plan.md`](./type-update-plan.md) §4.3 and not implemented), the
+retained-revision history table and `GET /types/{id}/revisions`, re-embedding
+after a changed `vector_search` declaration, and the delegation of the verdict
+to types-registry over the wire. The call site is one function
+(`domain::evolution`) precisely so that last one can replace it without
+touching the store or the API.
+
+**Authorization.** Registration stays `admin` on the type resource. A
+re-validating update additionally requires `write` on the node resource and is
+served under *that* scope: it reads the tenant's rows, and holding ontology
+administration is not holding the data.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here

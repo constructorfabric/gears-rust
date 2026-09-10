@@ -424,6 +424,7 @@ mod tests {
                 ..graph_storage_sdk::models::EffectiveTraits::default()
             },
             created_at: time::OffsetDateTime::UNIX_EPOCH,
+            revision: 1,
         }
     }
 

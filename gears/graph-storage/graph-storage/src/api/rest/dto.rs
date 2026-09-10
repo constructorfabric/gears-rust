@@ -17,10 +17,104 @@ pub struct GraphTypeRegistrationDto {
     pub schema: serde_json::Value,
 }
 
+/// What a batch may do to an identifier that is already registered with a
+/// different schema.
+#[derive(Debug, Default)]
+#[toolkit_macros::api_dto(request)]
+pub struct GraphTypeRegisterOptionsDto {
+    /// `reject` (the default) makes a changed schema a conflict, as it always
+    /// was; `update` admits the change when it is admissible and refuses it
+    /// with the offending schema locations when it is not.
+    pub on_existing: Option<String>,
+    /// Admit a change the schemas cannot prove compatible when every stored
+    /// row of the type still validates against the candidate. A statement
+    /// about *these rows*, not about the type, and it costs a scan bounded by
+    /// `type_update_max_rows`.
+    pub revalidate: Option<bool>,
+}
+
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
 pub struct GraphRegisterTypesRequest {
     pub types: Vec<GraphTypeRegistrationDto>,
+    pub options: Option<GraphTypeRegisterOptionsDto>,
+}
+
+/// One reason a directional verdict does not hold, with the schema location
+/// that carries it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphSchemaDiagnosticDto {
+    /// Location in the resolved schema; `$` is the document root.
+    pub location: String,
+    /// Machine-readable finding kind, as `gts` names it (`property_added`,
+    /// `required_changed`, `enum_changed`, `not_provable`, ...).
+    pub finding: String,
+    pub message: String,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphTraitChangeDto {
+    pub trait_name: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// The verdict on one candidate definition.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphTypeChangeDto {
+    pub type_id: String,
+    /// `new` | `unchanged` | `compatible` | `incompatible` | `undecidable`.
+    pub state: String,
+    /// `Valid(old) ⊆ Valid(new)` — the direction that gates admission.
+    pub backward: String,
+    /// Reported, never enforced: whether a reader pinned to the old
+    /// definition still accepts payloads written against the new one.
+    pub forward: String,
+    pub diagnostics: Vec<GraphSchemaDiagnosticDto>,
+    pub traits_changed: Vec<GraphTraitChangeDto>,
+    /// Live rows of the type, when the operation needed to know.
+    pub rows: Option<i64>,
+    /// Object levels where a *later* definition will not be able to add an
+    /// optional property, so "your next edit is a major" is a warning now.
+    pub levels_not_evolvable_in_place: Vec<String>,
+    pub migration_required: bool,
+    /// Whether the gear would admit this change under the request's options.
+    pub admissible: bool,
+}
+
+/// A registered type and what the call did to it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphRegisteredTypeDto {
+    pub type_id: String,
+    pub type_uuid: String,
+    pub kind: String,
+    pub is_abstract: bool,
+    pub schema: serde_json::Value,
+    pub effective_traits: GraphEffectiveTraitsDto,
+    /// Which retained definition is in force (ADR-0005).
+    pub revision: i32,
+    /// `created` | `unchanged` | `updated`.
+    pub outcome: String,
+    /// `schema_proved` when the schemas prove inclusion, `data_backed` when
+    /// the type's own rows were validated instead. Absent unless something
+    /// was updated.
+    pub admission_basis: Option<String>,
+    /// Rows validated for a `data_backed` admission.
+    pub rows_validated: Option<i64>,
+    /// The verdict, present whenever the identifier was already registered,
+    /// and always in a dry run.
+    pub change: Option<GraphTypeChangeDto>,
+}
+
+/// What registering this batch would do. Nothing is written.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphTypeCompatibilityDto {
+    pub items: Vec<GraphRegisteredTypeDto>,
 }
 
 #[derive(Debug)]
@@ -45,6 +139,9 @@ pub struct GraphTypeDto {
     pub is_abstract: bool,
     pub schema: serde_json::Value,
     pub effective_traits: GraphEffectiveTraitsDto,
+    /// Which retained definition of this identifier is in force: `1` until it
+    /// is first updated in place (types-registry ADR-0005).
+    pub revision: i32,
 }
 
 #[derive(Debug)]
@@ -365,6 +462,73 @@ impl From<m::TypeRecord> for GraphTypeDto {
             is_abstract: value.is_abstract,
             schema: value.schema,
             effective_traits: value.effective_traits.into(),
+            revision: value.revision,
+        }
+    }
+}
+
+impl From<m::SchemaDiagnostic> for GraphSchemaDiagnosticDto {
+    fn from(value: m::SchemaDiagnostic) -> Self {
+        Self {
+            location: value.location,
+            finding: value.finding,
+            message: value.message,
+        }
+    }
+}
+
+impl From<m::TraitChange> for GraphTraitChangeDto {
+    fn from(value: m::TraitChange) -> Self {
+        Self {
+            trait_name: value.trait_name,
+            added: value.added,
+            removed: value.removed,
+        }
+    }
+}
+
+impl From<m::TypeChange> for GraphTypeChangeDto {
+    fn from(value: m::TypeChange) -> Self {
+        Self {
+            type_id: value.type_id,
+            state: value.state.as_str().to_owned(),
+            backward: value.backward,
+            forward: value.forward,
+            diagnostics: value.diagnostics.into_iter().map(Into::into).collect(),
+            traits_changed: value.traits_changed.into_iter().map(Into::into).collect(),
+            // A count crosses the boundary as a signed integer: `OpenAPI`
+            // integers are signed, and a row count cannot approach the bound.
+            rows: value.rows.and_then(|rows| i64::try_from(rows).ok()),
+            levels_not_evolvable_in_place: value.levels_not_evolvable_in_place,
+            migration_required: value.migration_required,
+            admissible: value.admissible,
+        }
+    }
+}
+
+impl From<m::RegisteredType> for GraphRegisteredTypeDto {
+    fn from(value: m::RegisteredType) -> Self {
+        let (admission_basis, rows_validated) = match value.basis {
+            None => (None, None),
+            Some(m::AdmissionBasis::SchemaProved) => (Some("schema_proved".to_owned()), None),
+            Some(m::AdmissionBasis::DataBacked { rows_validated }) => (
+                Some("data_backed".to_owned()),
+                i64::try_from(rows_validated).ok(),
+            ),
+        };
+        let record = value.record;
+        Self {
+            type_id: record.type_id,
+            type_uuid: record.type_uuid.to_string(),
+            kind: record.kind.as_str().to_owned(),
+            is_abstract: record.is_abstract,
+            schema: record.schema,
+            effective_traits: record.effective_traits.into(),
+            revision: record.revision,
+            outcome: value.outcome.as_str().to_owned(),
+            admission_basis,
+            rows_validated,
+            change: value.change.map(Into::into),
         }
     }
 }

@@ -21,9 +21,10 @@ use crate::models::{
     DeleteOutcome, DeleteRequest, Direction, EdgeRef, EmbeddingSpaceId, EngineCapabilities,
     GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest, ItemError, LabelAssignment,
     LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
-    ProjectionRequest, ReadSnapshot, RemainingBudget, RevisionOutcome, SearchRequest,
-    SearchResponse, StoreCapabilities, Subject, TenantId, TopologyPage, TopologyRequest,
-    TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    ProjectionRequest, ReadSnapshot, RegisteredType, RemainingBudget, RevisionOutcome,
+    SearchRequest, SearchResponse, StoreCapabilities, Subject, TenantId, TopologyPage,
+    TopologyRequest, TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -124,11 +125,36 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     fn capabilities(&self) -> StoreCapabilities;
 
     // --- ontology ---------------------------------------------------------
+    /// Register a batch atomically.
+    ///
+    /// `options.on_existing` decides what a changed schema under a registered
+    /// identifier means: `Reject` (the default) conflicts, `Update` admits the
+    /// change when it is admissible. A byte-identical re-registration
+    /// converges under either. `options.dry_run` computes every verdict and
+    /// writes nothing, so a caller can ask what an edit costs before making
+    /// it; a dry run therefore reports a refusal in the result rather than as
+    /// an error.
+    async fn register_types_with(
+        &self,
+        ctx: &StoreCtx<'_>,
+        batch: Vec<TypeRegistration>,
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, GraphStoreError>;
+
+    /// Register a batch under the default options, keeping only the records.
+    ///
+    /// Provided, not implemented: one code path decides admission, so the
+    /// convenience form cannot drift from the form that carries the options.
     async fn register_types(
         &self,
         ctx: &StoreCtx<'_>,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, GraphStoreError>;
+    ) -> Result<Vec<TypeRecord>, GraphStoreError> {
+        let registered = self
+            .register_types_with(ctx, batch, TypeRegistrationOptions::default())
+            .await?;
+        Ok(registered.into_iter().map(|item| item.record).collect())
+    }
     async fn get_type(
         &self,
         ctx: &StoreCtx<'_>,

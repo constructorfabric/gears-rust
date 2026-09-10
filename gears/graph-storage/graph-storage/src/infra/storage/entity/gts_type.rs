@@ -31,6 +31,10 @@ pub struct Model {
     /// Trait values resolved across the derivation chain.
     pub effective_traits: Json,
     pub created_at: OffsetDateTime,
+    /// Which retained definition of this identifier is in force. `1` for a
+    /// type that has never been updated in place (ADR-0005).
+    pub revision: i32,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

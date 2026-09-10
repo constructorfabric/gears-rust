@@ -10,9 +10,9 @@ use authz_resolver_sdk::pep::PolicyEnforcer;
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
     ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page,
-    ProjectionRequest, RemainingBudget, SearchMode, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord,
-    TypeRegistration,
+    OnExisting, ProjectionRequest, RegisteredType, RemainingBudget, SearchMode, SearchRequest,
+    SearchResponse, TraversalResponse, TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;
@@ -103,9 +103,56 @@ impl GraphServices {
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
     ) -> Result<Vec<TypeRecord>, DomainError> {
+        let registered = self
+            .register_types_with(ctx, batch, TypeRegistrationOptions::default())
+            .await?;
+        Ok(registered.into_iter().map(|item| item.record).collect())
+    }
+
+    /// What registering this batch *would* do: every verdict, no write.
+    ///
+    /// The most-asked question about a type is not "may I change it" but "what
+    /// does this change cost me" — so this runs the identical code path with
+    /// `dry_run`, which is the only way the answer cannot drift from the
+    /// decision.
+    pub async fn type_compatibility(
+        &self,
+        ctx: &SecurityContext,
+        batch: Vec<TypeRegistration>,
+        revalidate: bool,
+    ) -> Result<Vec<RegisteredType>, DomainError> {
+        self.register_types_with(
+            ctx,
+            batch,
+            TypeRegistrationOptions {
+                on_existing: OnExisting::Update,
+                revalidate,
+                dry_run: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn register_types_with(
+        &self,
+        ctx: &SecurityContext,
+        batch: Vec<TypeRegistration>,
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, DomainError> {
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
             .await?;
+        // Re-validating a change reads the tenant's own rows, and a caller
+        // holding ontology administration does not thereby hold the data. The
+        // data decision is asked for separately and the call is served under
+        // its scope — the same scope ingest writes those rows with, which is
+        // what makes one scope reach both the catalogue and the rows.
+        let auth = if options.revalidate {
+            self.authorize(ctx, &authz::node_resource(), authz::actions::WRITE)
+                .await?
+        } else {
+            auth
+        };
         let store_ctx = self.store_ctx(&auth, None);
 
         // The base ontology is published per tenant on first use rather than
@@ -152,7 +199,10 @@ impl GraphServices {
             )?;
         }
 
-        Ok(self.store.register_types(&store_ctx, batch).await?)
+        Ok(self
+            .store
+            .register_types_with(&store_ctx, batch, options)
+            .await?)
     }
 
     /// Prepend whichever base-ontology schemas this tenant is missing.
