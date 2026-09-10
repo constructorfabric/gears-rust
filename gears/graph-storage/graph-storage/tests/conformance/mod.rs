@@ -1835,7 +1835,7 @@ pub const EVOLVING: &str =
 /// Studio domain model as the exporter emits it today, that is 188 of 188 node
 /// types.
 fn requirement_revision(
-    properties: serde_json::Value,
+    properties: &serde_json::Value,
     required: &[&str],
     index: &[&str],
 ) -> TypeRegistration {
@@ -1851,7 +1851,7 @@ fn requirement_revision(
                 { "type": "object", "properties": { "payload": {
                     "type": "object",
                     "additionalProperties": false,
-                    "properties": properties,
+                    "properties": properties.clone(),
                     "required": required
                 } } }
             ]
@@ -1877,7 +1877,7 @@ fn requirement_properties(status_values: &[&str], with_owner: bool, urgency: boo
 /// Model v7: what the graph already holds 10 000 of.
 fn requirement_v1() -> TypeRegistration {
     requirement_revision(
-        requirement_properties(&["proposed", "approved"], false, false),
+        &requirement_properties(&["proposed", "approved"], false, false),
         &["key", "statement"],
         &["/payload/status"],
     )
@@ -1937,7 +1937,7 @@ pub async fn a_backward_compatible_change_updates_the_type_in_place(
     seed_requirements(store, &ctx, &["proposed", "approved", "proposed"]).await;
 
     let edited = requirement_revision(
-        requirement_properties(&["proposed", "approved", "blocked"], true, false),
+        &requirement_properties(&["proposed", "approved", "blocked"], true, false),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2001,7 +2001,7 @@ pub async fn an_incompatible_change_is_refused_with_its_location(
     seed_requirements(store, &ctx, &["proposed"]).await;
 
     let renamed = requirement_revision(
-        requirement_properties(&["proposed", "approved"], false, true),
+        &requirement_properties(&["proposed", "approved"], false, true),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2040,7 +2040,7 @@ pub async fn a_changed_schema_is_still_a_conflict_by_default(
     seed_requirements(store, &ctx, &["proposed"]).await;
 
     let compatible = requirement_revision(
-        requirement_properties(&["proposed", "approved"], true, false),
+        &requirement_properties(&["proposed", "approved"], true, false),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2071,7 +2071,7 @@ pub async fn a_dry_run_reports_every_verdict_and_writes_nothing(
     };
 
     let compatible = requirement_revision(
-        requirement_properties(&["proposed", "approved"], true, false),
+        &requirement_properties(&["proposed", "approved"], true, false),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2093,7 +2093,7 @@ pub async fn a_dry_run_reports_every_verdict_and_writes_nothing(
     );
 
     let renamed = requirement_revision(
-        requirement_properties(&["proposed", "approved"], false, true),
+        &requirement_properties(&["proposed", "approved"], false, true),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2139,7 +2139,7 @@ pub async fn a_change_the_schemas_cannot_prove_is_admitted_when_the_rows_fit(
     seed_requirements(store, &ctx, &["proposed", "proposed", "proposed"]).await;
 
     let narrowed = requirement_revision(
-        requirement_properties(&["proposed"], false, false),
+        &requirement_properties(&["proposed"], false, false),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2195,7 +2195,7 @@ pub async fn a_change_the_stored_rows_contradict_is_refused_naming_them(
     seed_requirements(store, &ctx, &["proposed", "approved"]).await;
 
     let narrowed = requirement_revision(
-        requirement_properties(&["proposed"], false, false),
+        &requirement_properties(&["proposed"], false, false),
         &["key", "statement"],
         &["/payload/status"],
     );
@@ -2255,7 +2255,7 @@ pub async fn a_new_index_path_becomes_filterable_without_recreating_the_type(
         .expect_err("an undeclared path is refused before the update");
 
     let widened = requirement_revision(
-        requirement_properties(&["proposed", "approved"], false, false),
+        &requirement_properties(&["proposed", "approved"], false, false),
         &["key", "statement"],
         &["/payload/status", "/payload/priority"],
     );

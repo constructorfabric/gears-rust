@@ -149,6 +149,9 @@ struct UpdateLimits {
     max_rows: u64,
     batch: u64,
     max_reported: usize,
+    /// The call's absolute deadline, so a re-validating scan stops waiting
+    /// rather than outliving the request that asked for it.
+    budget: graph_storage_sdk::models::RemainingBudget,
 }
 
 pub async fn register_types(
@@ -166,6 +169,7 @@ pub async fn register_types(
         max_rows: u64::from(config.type_update_max_rows),
         batch: u64::from(config.type_update_batch),
         max_reported: config.type_update_max_reported_rows as usize,
+        budget: ctx.budget,
     };
     store
         .db()
@@ -482,6 +486,7 @@ async fn register_in_tx(
                     super::evolution::ScanBounds {
                         batch: limits.batch,
                         max_reported: limits.max_reported,
+                        budget: limits.budget,
                     },
                 )
                 .await?;

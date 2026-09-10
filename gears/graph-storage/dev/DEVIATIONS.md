@@ -384,6 +384,38 @@ Two consequences:
   above is a measurement, not a guess, and it changes the exporter rather than
   the gear.
 
+**Rehearsed on the stand (2026-09-10), against the loaded model** — 1254
+types, 531 251 nodes, 637 975 edges; `m0006` applied on boot. The four PM edits
+against `…cf.studio.sdlc.requirement.v1~` (1 000 rows): widening the `status`
+enum is schema-proved in 61 ms with no row read; adding an optional property
+and renaming one are admitted data-backed over 1 000 rows in 230–360 ms;
+making a property required is refused naming the row (*node `requirement:1`:
+"owner" is a required property*). Applying the proposed exporter shape for
+real: closing the payload level (29 inherited properties restated at the leaf)
+is admitted data-backed in 270 ms, and the *next* edit — add an optional
+property — is then `schema_proved` in 62 ms with no row read. At scale, the
+250 000-row `action_run` type re-validates in 12.9 s (≈19 400 rows/s), so the
+shipped 100 000 ceiling is ~5 s; above the ceiling the refusal names both the
+count and the config key. Full run in
+[`type-update-plan.md`](./type-update-plan.md) § The stand rehearsal.
+
+**Two limits the rehearsal exposed, both now recorded rather than papered
+over.**
+- *`data_backed` means "no stored row becomes invalid", not "no query breaks".*
+  Over an **open** payload the rename `priority → urgency` is admitted — no row
+  becomes invalid, because an open level still accepts the `priority` the rows
+  carry — while every `$filter=payload/urgency` then returns nothing. Over a
+  **closed** payload the same rename is refused, naming the rows that still
+  carry `priority`. The ground is exactly as strong as the shape it checks
+  against, and a rename needs the migration of slice 3 either way.
+- *The scan did not consult the caller's deadline.* 250 000 rows take longer
+  than the 10 s interactive deadline, and only the row ceiling stood between a
+  raised limit and a request outliving itself. The scan now checks the
+  remaining budget between batches and answers `Deadline`: the ceiling bounds
+  the work, the budget bounds the wait. It is the first store path in this gear
+  to consult `StoreCtx::budget`, because it is the first whose duration scales
+  with a tenant's data.
+
 **What is not built.** A migration that *rewrites* payloads (a closed grammar
 of `rename` / `default` / `drop` steps is designed in
 [`type-update-plan.md`](./type-update-plan.md) §4.3 and not implemented), the

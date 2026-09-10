@@ -403,3 +403,90 @@ does not refresh it, and that the only remedy was to recreate the database. In
 `update` mode a byte-identical re-registration whose *resolved traits* differ
 now rewrites them and bumps the revision. In `reject` mode it still converges
 silently, so the default path is unchanged.
+
+---
+
+# The stand rehearsal, 2026-09-10
+
+Studio compose stand (PostgreSQL 19 + pgvector), the loaded domain model as it
+stands: 1254 registered types across three model revisions, 531 251 nodes,
+637 975 edges. The gear ran from the working tree, host-side, against that
+database; `m0006` applied to it on boot (`applied=1 skipped=5`). Every call
+went through the REST surface with a static admin token.
+
+## The four PM edits, dry run, against `…cf.studio.sdlc.requirement.v1~` (1 000 rows)
+
+| edit | backward | forward | rows read | admissible | why |
+| --- | --- | --- | --- | --- | --- |
+| 1 add optional `owner` | incompatible | compatible | 1 000 | **yes** (data-backed) | `$.payload property_added` — the level is open |
+| 2 widen `status` with `blocked` | **compatible** | incompatible | **none** | yes (schema-proved) | 61 ms, no row touched |
+| 3 rename `priority` → `urgency` | incompatible | incompatible | 1 000 | yes (data-backed) | `property_added`; the `index` trait diff is reported too |
+| 4 make `owner` required | incompatible | compatible | 1 000 | **no** | `required_changed`, and `node requirement:1: "owner" is a required property` |
+
+Timings: 61 ms for the schema-only verdict, 230–360 ms with a 1 000-row
+re-validation. Every answer also carried
+`levels_not_evolvable_in_place: ["$.payload", "$.payload.acceptance_criteria[]"]`
+— the warning that the *next* optional-property edit at those levels will not
+be free either.
+
+## Edit 3 is where the data-backed ground shows its limit
+
+Over the open payload the rename is *admitted*: no stored row becomes invalid,
+because an open level still accepts the `priority` the rows carry. But every
+`$filter=payload/urgency eq …` then returns nothing — the data has not moved.
+**`data_backed` means "no stored row becomes invalid", not "no query breaks".**
+That is a real limit of the ground, not a bug in it, and it is the argument for
+slice 3: a rename needs a migration, and until there is one the exporter's
+revision-suffix escape hatch stays the honest answer for a rename.
+
+Closing the payload changes what the check can even see — below.
+
+## The exporter's proposed shape, applied for real
+
+Three writes against the same 1 000 rows, in order:
+
+| step | outcome | basis | rows | ms |
+| --- | --- | --- | --- | --- |
+| 1. close the payload level (29 inherited properties restated at the leaf) | updated → revision 5 | `data_backed` | 1 000 | 270 |
+| 2. add optional `owner` on the closed level | updated → revision 6 | **`schema_proved`** | **none** | 62 |
+| 3. rename `priority` → `urgency` on the closed level, rows offered | **refused, 400** | — | 1 000 | 212 |
+
+Step 3's refusal names the rows: *node `requirement:1`: Additional properties
+are not allowed ('priority' was unexpected)*. So the same rename the open shape
+waved through is caught by the closed one, with the objects in the way named.
+This is the whole case for the exporter change in one run: **close the payload
+once, at the price of one scan, and every later field addition is free while
+every rename is caught.**
+
+Two things this run taught that the plan did not know:
+
+- Closing the leaf's own `allOf` branch is **not enough** — the inherited
+  members arrive through the ancestors' branches, and a branch that closes the
+  level rejects everything it does not itself declare. The first attempt was
+  refused with the missing names listed off the rows (`access_level`,
+  `acquisition_mode`, `confidence`, `created_at`, `external_id`, …). The
+  exporter must restate the inherited properties at the leaf; here 7 own
+  properties become 29.
+- A declared `index` path has to move *with* the property it names, or
+  registration refuses the candidate earlier — D-030's "a declared path that
+  resolves nowhere" — and the compatibility check is never reached. The message
+  is precise, but it is a different gate, and a caller renaming a field edits
+  two places in the model.
+
+## At scale: 250 000 rows
+
+The `…cf.studio.core.action_run.v1~` type from the index experiment, same edit
+(add one optional property):
+
+| | result |
+| --- | --- |
+| with the shipped default `type_update_max_rows: 100 000` | refused, `out_of_range`: *"has 250000 live rows; a synchronous update re-validates at most 100000 (`type_update_max_rows`)"* — the dry run reports the same as a `row_ceiling_exceeded` diagnostic with `admissible: false` |
+| ceiling raised to 300 000, update for real | admitted, `data_backed`, 250 000 rows validated, **12.9 s** (dry run 15.3 s) |
+| restoring the previous definition (dropping a declaration at an open level widens) | `schema_proved`, **20 ms**, no row read |
+
+≈19 400 rows/s, so the shipped 100 000 ceiling is about **5 s** — inside the
+10 s interactive deadline, and 250 000 is not. Found and fixed during the
+rehearsal: the scan did not consult the caller's deadline at all, so a raised
+ceiling could outlive the request that asked for it. It now checks the
+remaining budget between batches and answers `Deadline`; the row ceiling bounds
+the work, the budget bounds the wait.

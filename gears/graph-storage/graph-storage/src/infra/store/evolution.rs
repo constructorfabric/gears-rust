@@ -21,7 +21,13 @@ use crate::domain::ontology::ChainValidator;
 use crate::infra::storage::entity::{edge, node};
 use crate::infra::store::map_scope_err;
 
-/// How a re-validating scan is paced, and how much of a failure it reports.
+/// How a re-validating scan is paced, how much of a failure it reports, and
+/// when it must give up.
+///
+/// The budget is here because this is the one store operation whose duration
+/// scales with a tenant's data: measured on the stand, 250 000 rows validate
+/// in ~13 s, which is past the interactive deadline. The row ceiling bounds
+/// the work; the budget bounds the wait.
 #[derive(Clone, Copy)]
 pub(crate) struct ScanBounds {
     /// Rows per batch.
@@ -29,6 +35,19 @@ pub(crate) struct ScanBounds {
     /// Offending rows named in the refusal. Enough to see the pattern, not
     /// enough to make the refusal itself a data export.
     pub max_reported: usize,
+    /// What is left of the operation's absolute deadline.
+    pub budget: graph_storage_sdk::models::RemainingBudget,
+}
+
+/// Give up between batches when the caller's deadline is spent.
+///
+/// Checked per batch rather than per row: a batch is one statement, and the
+/// caller cannot be answered mid-statement anyway.
+fn still_within(bounds: ScanBounds) -> Result<(), GraphStoreError> {
+    if bounds.budget.is_exhausted() {
+        return Err(GraphStoreError::Deadline);
+    }
+    Ok(())
 }
 
 /// Live rows of one interned type.
@@ -127,6 +146,7 @@ async fn revalidate_nodes(
     let mut after: i64 = i64::MIN;
     let mut index = 0usize;
     loop {
+        still_within(bounds)?;
         let rows = node::Entity::find()
             .secure()
             .scope_with(scope)
@@ -176,6 +196,7 @@ async fn revalidate_edges(
     let mut after: i64 = i64::MIN;
     let mut index = 0usize;
     loop {
+        still_within(bounds)?;
         let rows = edge::Entity::find()
             .secure()
             .scope_with(scope)
