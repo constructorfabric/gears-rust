@@ -581,3 +581,53 @@ one:
 None of the three is hard; all three are the kind of thing that is cheap now and
 a data-integrity bug later. They are added to § 5 as steps of the migration
 pass.
+
+---
+
+# The exporter's half, applied 2026-09-10
+
+`dm2gts` now closes the payload level on every type nothing derives from — 181
+of 190 node types and all 225 edge types — restating each type's inherited
+payload members in its own branch, per DESIGN § 3.1 authoring rule 3. The 7
+intermediates and 2 abstract types stay open, because a branch that closes the
+level rejects everything it does not itself declare and would make their
+descendants uninstantiable. `--open-payload` restores the previous shape.
+`register.mjs` grew the three modes the gear now offers (`--dry-run`,
+`--on-existing update`, `--revalidate`) plus `--chunk`.
+
+## Applying it to a graph that already holds data
+
+| | result |
+| --- | --- |
+| dry run, schemas only (`--dry-run`, no `--revalidate`) | 406 of 415 types `incompatible`, none admissible — closing an open level *is* a narrowing |
+| dry run offering the rows (`--revalidate`, one type per request) | 405 admissible `data_backed`, 1 refused (`action_run`, 250 000 rows, over the 100 000 ceiling), 9 `unchanged`; **866 270 rows** read in 94 s |
+| applied for real, ceiling raised to 300 000, per-type chunks | **406 updated `data_backed`, 9 unchanged, 1 116 270 rows re-validated in 105 s** — and **no stored row contradicted the closed shape** |
+
+The last line is worth more than the timing: the transition doubles as an audit
+that the loader and the model agree about what a payload may contain. Had any
+producer ever written an undeclared field, this is where it would have surfaced,
+named by node key.
+
+## What the same four PM edits cost afterwards
+
+| edit | before the transition | after |
+| --- | --- | --- |
+| add an optional field `owner` | `incompatible`, 1 000 rows read, 357 ms, admitted only from the data | **`compatible`, 22 ms, no row read** |
+| widen `status` with `blocked` | `compatible`, 61 ms | `compatible`, 18 ms |
+| rename `priority` → `urgency` | admitted from the data — and every query on `urgency` returns nothing | **refused twice over**: `$.payload property_removed in a closed model`, plus `node requirement:1: Additional properties are not allowed ('priority' was unexpected)` |
+| make `owner` required | refused naming the row | refused naming the row |
+
+## The bound this ran into
+
+The whole-model transition cannot be one atomic request: `api-gateway` caps a
+synchronous request at 30 s (`SYNC_TIMEOUT`, a constant), and raising the gear's
+own `deadline_interactive_secs` to 300 does not move it — the batch came back
+`504 Request exceeded 30s timeout` after 31 s. So the caller chunks, giving up
+"all 415 types or none" in exchange for an operation that is convergent
+(re-running answers `unchanged` for whatever landed). A *fresh* deployment
+registers the closed shape with no rows to check and never meets any of this;
+the cost belongs to migrating a graph that is already loaded.
+
+That 30 s is also the number `type_update_max_rows` should be sized against,
+not the gear's own deadline. At ~19 000 rows/s in-gear the shipped default of
+100 000 is ~5 s, which is why it stays.

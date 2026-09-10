@@ -455,6 +455,18 @@ revision, so two reads at one revision can never observe different labels"). A
 `created` type changes no existing read and still leaves the counter alone,
 which is what registration always did; the conformance case pins both halves.
 
+**The row ceiling is set by the gateway, not by the gear's own deadline.**
+`api-gateway` kills any synchronous request at 30 s — `SYNC_TIMEOUT`, a
+constant in the proxy rather than a setting — so that, and not
+`deadline_interactive_secs`, is what a re-validating update has to fit. At the
+~19 000 rows/s measured in-gear the shipped `type_update_max_rows` of 100 000 is
+about 5 s, comfortably inside; 250 000 is not. Worth saying because the gear's
+own deadline can be *configured* above the gateway's ceiling (its hard range
+runs to 300 s), which buys nothing: raising it to 300 and posting a
+866 000-row re-validation returned `504 Request exceeded 30s timeout` on the
+stand. A transition over a loaded graph is therefore chunked by the caller, or
+asynchronous — which is the shape D-031 already says is out of scope.
+
 **One asymmetry left standing on purpose.** The in-process door
 (`GraphStorageClientV1`) offers only the default mode: `register_types`, no
 options, no dry run. Widening it means adding methods to a published trait, and
