@@ -663,7 +663,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
           </tbody>
         </table>
       </div>
-      <p class="s-foot">The gear registers a type once and refuses a changed schema under a known id. A revision per upload makes every edit a fresh, complete set: no conflict, validation intact, no gear change. The price: old objects stay on the old revision until re-ingested, and the catalogue grows per revision. Good enough to play with a model — <b>not what a product would do</b>, which is the next slide.</p>
+      <p class="s-foot">The gear registers a type once and refuses a changed schema under a known id. A revision per upload makes every edit a fresh, complete set: no conflict, validation intact, no gear change. The price: old objects stay on the old revision until re-ingested, and the catalogue grows per revision. Good enough to play with a model, and it stays as the escape hatch for a full reload — but a product updates the type instead, which is the next slide, and which now works.</p>
     
       <p class="take"><b>Takeaway</b>Edit, upload, repeat: no conflicts and no database resets, at the price of a full type set per revision.</p>
     </section>
@@ -672,38 +672,38 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">The model changes ten times · production</p>
-        <h2>A revision is a prototype answer</h2>
+        <h2>Now the type updates in place</h2>
       </header>
       <div class="s-body top">
         <table class="tb">
-          <thead><tr><th>a week of PM edits · 10 000 objects already in the graph</th><th>today</th><th>revision</th><th>in place · the product answer</th></tr></thead>
+          <thead><tr><th>a week of PM edits · objects already in the graph</th><th>before</th><th>in place · payload open</th><th>in place · payload closed</th></tr></thead>
           <tbody>
-            <tr class="hi"><td>add an optional field <span class="mono">owner</span></td><td class="num">409</td><td>fresh set of 415</td><td>accepted, same id</td></tr>
-            <tr class="hi"><td>widen <span class="mono">status</span> with <span class="mono">blocked</span></td><td class="num">409</td><td>fresh set of 415</td><td>accepted, same id</td></tr>
-            <tr class="lo"><td>rename <span class="mono">priority</span> to <span class="mono">urgency</span></td><td class="num">409</td><td>fresh set; the 10 000 stay behind</td><td>needs a stated migration</td></tr>
-            <tr class="lo"><td>make <span class="mono">owner</span> required</td><td class="num">409</td><td>fresh set; the 10 000 stay behind</td><td>refused unless the migration fills it</td></tr>
+            <tr class="hi"><td>add an optional field <span class="mono">owner</span></td><td class="num">409</td><td>from the rows · 1 000 in 0.27 s</td><td>proved · 62 ms, no row read</td></tr>
+            <tr class="hi"><td>widen <span class="mono">status</span> with <span class="mono">blocked</span></td><td class="num">409</td><td>proved · 61 ms, no row read</td><td>proved · 61 ms</td></tr>
+            <tr class="lo"><td>rename <span class="mono">priority</span> to <span class="mono">urgency</span></td><td class="num">409</td><td>let through — and queries go blind</td><td>refused, naming the rows</td></tr>
+            <tr class="lo"><td>make <span class="mono">owner</span> required</td><td class="num">409</td><td>refused, naming the row</td><td>refused, naming the row</td></tr>
           </tbody>
         </table>
         <div class="cols">
           <div class="col ok">
-            <h3>accepted in place</h3>
+            <h3><span class="mono">schema_proved</span> · nothing is read</h3>
             <ul class="chips">
-              <li><span class="mk">+</span>a new optional field, a wider enum</li>
-              <li><span class="mk">+</span>a new <span class="mono">index</span> path, new searchable text<small>index built</small></li>
+              <li><span class="mk">+</span>inclusion proved from the two schemas alone<small>GTS OP#8</small></li>
+              <li><span class="mk">+</span>same id, revision + 1, not one node row touched<small>62 ms</small></li>
             </ul>
           </div>
           <div class="col no">
-            <h3>migration, or refusal naming the rows</h3>
+            <h3><span class="mono">data_backed</span> · one bounded scan</h3>
             <ul class="chips">
-              <li><span class="mk">!</span>rename, narrowed enum, retyped field<small>rewrite rows</small></li>
-              <li><span class="mk">!</span>a new required field, changed <span class="mono">vector_search</span><small>default · re-embed</small></li>
+              <li><span class="mk">!</span>unprovable, so every live row is validated instead<small>250 000 in 12.9 s</small></li>
+              <li><span class="mk">!</span>true of these rows, not of the type; capped at 100 000<small>a rename still needs a migration</small></li>
             </ul>
           </div>
         </div>
       </div>
-      <p class="s-foot">The first two edits cannot invalidate a single one of the 10 000 objects, and the gear refuses them only because it cannot tell a safe change from a breaking one. The rule is the one a database applies to <span class="mono">NOT NULL</span>, and the compatibility check is <b>GTS OP#8</b>, which the <span class="mono">gts</span> crate already implements and types-registry already enforces — about a week of gear work, and the only item on our list no revision trick can substitute for.</p>
+      <p class="s-foot">Built and rehearsed on the stand: <span class="mono">options.on_existing: update</span> on <span class="mono">POST /types</span>, plus a <span class="mono">POST /types/compatibility</span> dry run that prices an edit before anyone makes it. The rule is not ours — types-registry ADR-0003 enforces it already and the <span class="mono">gts</span> crate computes it already; our 409 was the divergence. The measured surprise: with the payload level left <b>open</b>, adding a field is provably unsafe for <b>188 of 188</b> node types — declaring a property where anything was allowed narrows the type — so the exporter should close the payload on the 181 leaf types, after which the same edit is free and a rename is caught instead of let through.</p>
 
-      <p class="take"><b>Takeaway</b>Most real edits are safe; production accepts those under the same id and asks for a migration only for the rest.</p>
+      <p class="take"><b>Takeaway</b>Most real edits now keep the same id and the objects that are already there; only a rename still waits on a migration.</p>
     </section>
 
     <!-- 15 strengths / weaknesses -->
@@ -721,6 +721,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
               <li><span class="mk">+</span>Payloads validated; filter and sort by declared fields<small>38 ms @ 10k rows</small></li>
               <li><span class="mk">+</span>Hierarchy as GTS chain: one pattern per subtree, traits inherited<small>119 types</small></li>
               <li><span class="mk">+</span>Bounded queries that explain their truncation<small>node_budget</small></li>
+              <li><span class="mk">+</span>Compatible type edits accepted under the same id<small>OP#8 · 62 ms</small></li>
               <li><span class="mk">+</span>Load numbers at PRD scale, explosion points, model defects surfaced<small>277k · 26 conflicts</small></li>
             </ul>
           </div>
@@ -728,7 +729,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
             <h3>weak</h3>
             <ul class="chips">
               <li><span class="mk">−</span>Range and order over payload are not index-backed yet<small>gears-rust #4721</small></li>
-              <li><span class="mk">−</span>Changing a type means a new revision, not an update<small>409 otherwise</small></li>
+              <li><span class="mk">−</span>A rename needs a payload rewrite the gear cannot yet run<small>revisions meanwhile</small></li>
               <li><span class="mk">−</span>One edge type per predicate unions endpoint pairs<small>225 types</small></li>
               <li><span class="mk">−</span>Composite property types stored as opaque objects<small>111 of them</small></li>
               <li><span class="mk">−</span>Synthetic volumes are guesses; no UI, no change events<small>profile · widgets · serverless</small></li>
@@ -755,8 +756,8 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
           </div>
           <div class="card top-g">
             <span class="n">gear</span>
-            <h3>Update a type in place</h3>
-            <p>Accept compatible schema changes under the same id (new optional field, wider enum, new index path); require a migration for incompatible ones. Then "edit JSON, upload" keeps validation and filters.</p>
+            <h3>Move the data, not just the type</h3>
+            <p>The in-place update ships. What is left is the rewrite a rename needs — a closed set of <span class="mono">rename</span> / <span class="mono">default</span> / <span class="mono">drop</span> steps, validated against the rows before anything is written — plus the revision history, and an exporter that closes the payload on leaf types so most edits cost no scan at all.</p>
           </div>
           <div class="card top-v">
             <span class="n">model</span>
@@ -812,10 +813,10 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
     ["Counting objects","<p>The second ask was to find where the graph explodes. The loader plans edges from the model's cardinalities and reports the heaviest pairs before loading anything.</p><p>The pattern is clear: event-class entities are the mass, and N:M relations between a mass entity and anything else multiply. Hubs like tenant and person collect edges from everything, which is what makes traversal from them expensive.</p><p>Our proposal is the two lines at the bottom. <strong>volume</strong> is deliberately not a count: a class, plus the anchor entity that drives it, how many per driver, and how long they are kept — so the PM answers four questions they can actually answer, and 203 numbers are derived rather than invented. Retention is in there because it is the cheapest lever there is: 400 days to 90 removes two thirds of the event mass.</p><p><strong>fanout_max</strong> is a bound per relation, and it is needed badly: 334 of the 435 relation pairs — 77% — state no cardinality at all, so our own edge plan guessed for them. The same bound the analyze pass reads before a load can later be enforced at ingest.</p><p>One correction to make out loud: the model does not lack a classification for this mass — it already has one, and the next slide is about the fork that opens.</p>"],
     ["The fork","<p>This slide exists because the experiment proved us wrong, not the model. We said the model has no answer for the event mass; it has one, and we ignored it.</p><p>The system layer of the model has seven primitives, and two of them are exactly about this: a <strong>record</strong> is defined as a typed entity that is <em>not</em> a Knowledge Graph node, a <strong>link</strong> as a non-traversable connection. 69 entities are records, 4 are links, and 13 of the 23 heaviest entities are records. Our exporter honoured only projection and edge, so all of them became graph node types.</p><p>So the mass we measured is not the model's mass — it is our reading of it. Three ways forward, and the middle one is probably where a real product lands: skip the records, keep a cheap reference node where traversal is genuinely needed, or keep everything as today.</p><p>What matters for the meeting: the gear needs no change and the tooling change is half a day, so this is not an engineering question. It is the architect's call, and the price of getting it wrong is 55% of the graph.</p>"],
     ["What the type system found","<p>A side effect of typing the model: 26 places where a child re-declares a parent's property with a type the parent does not accept.</p><p>The biggest is version: an integer row version on managed-object, a semantic version string on 21 descendants. GTS derivation rejects this by rule, and in practice no instance can satisfy both schemas.</p><p>The exporter keeps the parent's declaration and reports the conflicts. The rule 'an override must narrow' belongs in the model's own validator so it never reaches the graph.</p>"],
-    ["The model changes ten times","<p>The architect's loop: edit the JSON, load, look, repeat. The gear registers a type once and returns 409 for a changed schema under a known id, and it has no update operation.</p><p>Our answer for the prototype is a model revision in the type id. Each upload is a fresh, complete set of types beside the previous one; objects carry the revision in their keys. On the stand: the edited model is a 409 without a revision and registers cleanly as m9.</p><p>The price is honest: old objects stay on the old revision until re-ingested, and the catalogue grows. The product answer is an in-place update for compatible changes, which is gear work.</p>"],
-    ["Production","<p>The revision trick answers the architect's loop, not the product's. So here is the same week of edits, and what each of the three answers does with it.</p><p>The point of the table is the first two rows: adding an optional field and widening an enum <em>cannot</em> invalidate a single one of the 10 000 objects, and the gear still returns 409 — purely because it has no way to tell a safe change from a breaking one. With a revision they cost a full new set of 415 types; with an in-place update they cost nothing at all.</p><p>The last two rows are genuinely breaking, and the honest answer is the one a database gives: demand a migration, or refuse and name the objects that would become invalid. Nobody expects a rename to be free.</p><p>Cost and prior art: the compatibility rule is GTS OP#8 — schema evolution, not the OP#12 derivation check — and the gts crate already implements it while types-registry already enforces it as a platform policy (its ADR-0003: backward only, baseline is the current revision, an undecidable check is a refusal). So the gear work is the mechanical part — validating existing rows at volume, recomputing traits and indexes, re-embedding when the vector fields change. About a week. Worth saying out loud that this is the one item on our list that no revision trick can substitute for.</p>"],
-    ["Assessment","<p>Strong: the pipeline is real and measured; validation, filter, sort, subtree patterns, bounded queries; and the exercise surfaced defects in the model itself.</p><p>Weak: range and order are not index-backed until the platform exposes DDL; type changes are revisions rather than updates; edge types per predicate union their endpoint pairs; composite property types are opaque; the volumes are guesses; there is no UI and no change events.</p>"],
-    ["Next","<p>Four things would turn this into a product path: the DDL surface in the platform, an in-place type update in the gear, volumes plus hygiene rules in the model itself, and the architecture decision about records — the only one of the four that is a decision rather than an implementation.</p><p>Then the two pillars we did not touch: widgets that read a type's declared fields and query them, and change events for a serverless runtime.</p>"]
+    ["The model changes ten times","<p>The architect's loop: edit the JSON, load, look, repeat. At the time of this experiment the gear registered a type once and returned 409 for a changed schema under a known id, with no update operation.</p><p>Our answer for the prototype is a model revision in the type id. Each upload is a fresh, complete set of types beside the previous one; objects carry the revision in their keys. On the stand: the edited model is a 409 without a revision and registers cleanly as m9.</p><p>The price is honest: old objects stay on the old revision until re-ingested, and the catalogue grows. It stays as the escape hatch for a full reload, but the product answer, an in-place update, is now built, and that is the next slide.</p>"],
+    ["Production","<p>This slide changed since the experiment: the in-place update is no longer a proposal. It is implemented, it ran on this stand against the loaded model, and these are its numbers.</p><p>Read the table left to right. <em>Before</em> is what the gear did three days ago: 409 for every one of the four edits. The two right-hand columns are the same four edits today, and they differ in exactly one thing \u2014 whether the payload level is left open, as our exporter writes it, or closed.</p><p>Two grounds for accepting a change, deliberately not the same thing. <strong>schema_proved</strong> means the two schemas by themselves prove that everything the old type accepted the new one still accepts. That is GTS OP#8, the platform already has it, and it reads no data at all: 62 milliseconds, not one row touched, same id, revision plus one. <strong>data_backed</strong> is ours, and it exists because a registry holds no data while this gear does: when the schemas cannot prove it, we ask the rows instead \u2014 does every object we actually have still validate. That is a claim about these rows and not about the type, it is reported as such, and it costs one scan: 250 000 rows in thirteen seconds, capped by configuration at a hundred thousand so a request cannot outlive its own deadline.</p><p>The fourth row is the honest refusal: making owner required is rejected, and the response names the object in the way \u2014 node requirement:1, owner is a required property. Nobody has to guess what blocked it.</p><p>Now the surprise, and it is the thing to take away from this slide. With the payload level open, which is how our exporter writes every type, adding an optional field is <em>provably unsafe</em> for 188 of 188 node types. Not a limitation of the checker: on an open level the old type accepted any value under that name, so declaring it a string is a narrowing. Close the payload at the leaf and the same edit is free for all 188. That is an exporter change of about a day, and the third row is the other half of the prize: on a closed payload a rename is <em>caught</em>, naming the rows that still carry the old field, where the open shape lets it through and leaves every query on the new field returning nothing.</p><p>What is still missing is the rewrite itself. A rename needs the data moved, and that is the one piece not built.</p>"],
+    ["Assessment","<p>Strong: the pipeline is real and measured; validation, filter, sort, subtree patterns, bounded queries; compatible type edits now accepted under the same id; and the exercise surfaced defects in the model itself.</p><p>Weak: range and order are not index-backed until the platform exposes DDL; a rename still needs a payload rewrite the gear cannot run, so revisions carry that one case meanwhile; edge types per predicate union their endpoint pairs; composite property types are opaque; the volumes are guesses; there is no UI and no change events.</p>"],
+    ["Next","<p>Four things would turn this into a product path: the DDL surface in the platform, the data half of type evolution in the gear (the update itself is done; the payload rewrite a rename needs is not), volumes plus hygiene rules in the model itself, and the architecture decision about records — the only one of the four that is a decision rather than an implementation.</p><p>Then the two pillars we did not touch: widgets that read a type's declared fields and query them, and change events for a serverless runtime.</p>"]
   ];
 
   slides.forEach(function(s, k){
