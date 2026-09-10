@@ -663,12 +663,50 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
           </tbody>
         </table>
       </div>
-      <p class="s-foot">The gear registers a type once and refuses a changed schema under a known id. A revision per upload makes every edit a fresh, complete set: no conflict, validation intact, no gear change. The price: old objects stay on the old revision until re-ingested, and the catalogue grows per revision. The product answer is an in-place update for compatible changes.</p>
+      <p class="s-foot">The gear registers a type once and refuses a changed schema under a known id. A revision per upload makes every edit a fresh, complete set: no conflict, validation intact, no gear change. The price: old objects stay on the old revision until re-ingested, and the catalogue grows per revision. Good enough to play with a model — <b>not what a product would do</b>, which is the next slide.</p>
     
-      <p class="take"><b>Takeaway</b>Edit, upload, repeat: now without conflicts or database resets, at the price of revisions.</p>
+      <p class="take"><b>Takeaway</b>Edit, upload, repeat: no conflicts and no database resets, at the price of a full type set per revision.</p>
     </section>
 
-    <!-- 14 strengths / weaknesses -->
+    <!-- 14 evolution in production -->
+    <section class="slide">
+      <header class="s-head">
+        <p class="eyebrow">The model changes ten times · production</p>
+        <h2>A revision is a prototype answer</h2>
+      </header>
+      <div class="s-body top">
+        <table class="tb">
+          <thead><tr><th>a week of PM edits · 10 000 objects already in the graph</th><th>today</th><th>revision</th><th>in place · the product answer</th></tr></thead>
+          <tbody>
+            <tr class="hi"><td>add an optional field <span class="mono">owner</span></td><td class="num">409</td><td>fresh set of 415</td><td>accepted, same id</td></tr>
+            <tr class="hi"><td>widen <span class="mono">status</span> with <span class="mono">blocked</span></td><td class="num">409</td><td>fresh set of 415</td><td>accepted, same id</td></tr>
+            <tr class="lo"><td>rename <span class="mono">priority</span> to <span class="mono">urgency</span></td><td class="num">409</td><td>fresh set; the 10 000 stay behind</td><td>needs a stated migration</td></tr>
+            <tr class="lo"><td>make <span class="mono">owner</span> required</td><td class="num">409</td><td>fresh set; the 10 000 stay behind</td><td>refused unless the migration fills it</td></tr>
+          </tbody>
+        </table>
+        <div class="cols">
+          <div class="col ok">
+            <h3>accepted in place</h3>
+            <ul class="chips">
+              <li><span class="mk">+</span>a new optional field, a wider enum</li>
+              <li><span class="mk">+</span>a new <span class="mono">index</span> path, new searchable text<small>index built</small></li>
+            </ul>
+          </div>
+          <div class="col no">
+            <h3>migration, or refusal naming the rows</h3>
+            <ul class="chips">
+              <li><span class="mk">!</span>rename, narrowed enum, retyped field<small>rewrite rows</small></li>
+              <li><span class="mk">!</span>a new required field, changed <span class="mono">vector_search</span><small>default · re-embed</small></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <p class="s-foot">The first two edits cannot invalidate a single one of the 10 000 objects, and the gear refuses them only because it cannot tell a safe change from a breaking one. The rule is the one a database applies to <span class="mono">NOT NULL</span>, and the compatibility check is <b>GTS OP#12</b>, which types-registry already implements — about a week of gear work, and the only item on our list no revision trick can substitute for.</p>
+
+      <p class="take"><b>Takeaway</b>Most real edits are safe; production accepts those under the same id and asks for a migration only for the rest.</p>
+    </section>
+
+    <!-- 15 strengths / weaknesses -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">Assessment</p>
@@ -702,7 +740,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
       <p class="take"><b>Takeaway</b>Strengths are measured; each weakness has a known owner and a known next step.</p>
     </section>
 
-    <!-- 15 next -->
+    <!-- 16 next -->
     <section class="slide">
       <header class="s-head">
         <p class="eyebrow">Next</p>
@@ -775,6 +813,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
     ["The fork","<p>This slide exists because the experiment proved us wrong, not the model. We said the model has no answer for the event mass; it has one, and we ignored it.</p><p>The system layer of the model has seven primitives, and two of them are exactly about this: a <strong>record</strong> is defined as a typed entity that is <em>not</em> a Knowledge Graph node, a <strong>link</strong> as a non-traversable connection. 69 entities are records, 4 are links, and 13 of the 23 heaviest entities are records. Our exporter honoured only projection and edge, so all of them became graph node types.</p><p>So the mass we measured is not the model's mass — it is our reading of it. Three ways forward, and the middle one is probably where a real product lands: skip the records, keep a cheap reference node where traversal is genuinely needed, or keep everything as today.</p><p>What matters for the meeting: the gear needs no change and the tooling change is half a day, so this is not an engineering question. It is the architect's call, and the price of getting it wrong is 55% of the graph.</p>"],
     ["What the type system found","<p>A side effect of typing the model: 26 places where a child re-declares a parent's property with a type the parent does not accept.</p><p>The biggest is version: an integer row version on managed-object, a semantic version string on 21 descendants. GTS derivation rejects this by rule, and in practice no instance can satisfy both schemas.</p><p>The exporter keeps the parent's declaration and reports the conflicts. The rule 'an override must narrow' belongs in the model's own validator so it never reaches the graph.</p>"],
     ["The model changes ten times","<p>The architect's loop: edit the JSON, load, look, repeat. The gear registers a type once and returns 409 for a changed schema under a known id, and it has no update operation.</p><p>Our answer for the prototype is a model revision in the type id. Each upload is a fresh, complete set of types beside the previous one; objects carry the revision in their keys. On the stand: the edited model is a 409 without a revision and registers cleanly as m9.</p><p>The price is honest: old objects stay on the old revision until re-ingested, and the catalogue grows. The product answer is an in-place update for compatible changes, which is gear work.</p>"],
+    ["Production","<p>The revision trick answers the architect's loop, not the product's. So here is the same week of edits, and what each of the three answers does with it.</p><p>The point of the table is the first two rows: adding an optional field and widening an enum <em>cannot</em> invalidate a single one of the 10 000 objects, and the gear still returns 409 — purely because it has no way to tell a safe change from a breaking one. With a revision they cost a full new set of 415 types; with an in-place update they cost nothing at all.</p><p>The last two rows are genuinely breaking, and the honest answer is the one a database gives: demand a migration, or refuse and name the objects that would become invalid. Nobody expects a rename to be free.</p><p>Cost and prior art: the compatibility rule is GTS OP#12 and types-registry already implements it, so the gear work is the mechanical part — validating existing rows at volume, recomputing traits and indexes, re-embedding when the vector fields change. About a week. Worth saying out loud that this is the one item on our list that no revision trick can substitute for.</p>"],
     ["Assessment","<p>Strong: the pipeline is real and measured; validation, filter, sort, subtree patterns, bounded queries; and the exercise surfaced defects in the model itself.</p><p>Weak: range and order are not index-backed until the platform exposes DDL; type changes are revisions rather than updates; edge types per predicate union their endpoint pairs; composite property types are opaque; the volumes are guesses; there is no UI and no change events.</p>"],
     ["Next","<p>Four things would turn this into a product path: the DDL surface in the platform, an in-place type update in the gear, volumes plus hygiene rules in the model itself, and the architecture decision about records — the only one of the four that is a decision rather than an implementation.</p><p>Then the two pillars we did not touch: widgets that read a type's declared fields and query them, and change events for a serverless runtime.</p>"]
   ];
