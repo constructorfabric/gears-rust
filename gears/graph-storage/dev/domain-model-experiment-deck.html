@@ -83,6 +83,7 @@ h2{
 }
 .s-head{flex:none}
 .s-body{flex:1; min-height:0; display:flex; flex-direction:column; justify-content:center; gap:1.5cqw}
+.s-body.top{justify-content:flex-start}
 .s-foot{flex:none; margin:0; font-size:1.3cqw; line-height:1.45; color:var(--ink-2); max-width:80cqw}
 .s-foot b{color:var(--ink); font-weight:600}
 .mono{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace}
@@ -132,7 +133,7 @@ figcaption{font-size:1.15cqw; color:var(--ink-3); text-align:center; line-height
 .cols{display:grid; grid-template-columns:1fr 1fr; gap:2.2cqw}
 .cols > *{min-width:0}
 .cols.code-pair{grid-template-columns:47fr 53fr; gap:1.8cqw}
-.cols.code-pair pre.code{font-size:1.02cqw; line-height:1.48; padding:1.1cqw 1.3cqw}
+.cols.code-pair pre.code{font-size:.96cqw; line-height:1.43; padding:1.05cqw 1.25cqw}
 .col h3{font-family:'IBM Plex Mono',monospace; font-size:1.1cqw; font-weight:500; letter-spacing:.1em; text-transform:uppercase; margin:0 0 1cqw}
 .col.ok h3{color:var(--green)} .col.no h3{color:var(--amber)}
 .chips{display:flex; flex-direction:column; gap:.55cqw; margin:0; padding:0; list-style:none}
@@ -149,6 +150,16 @@ pre.code{
 }
 pre.code .c{color:var(--ink-3)} pre.code .k{color:var(--blue)} pre.code .s{color:var(--green)} pre.code .h{color:var(--amber)}
 .code-title{font-family:'IBM Plex Mono',monospace; font-size:1cqw; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); margin:0 0 .6cqw}
+
+/* the edge type a relation becomes */
+.edge-strip{background:var(--panel); border:1px solid var(--line); border-left:.3cqw solid var(--violet); border-radius:.6cqw; padding:.95cqw 1.3cqw; display:flex; flex-direction:column; gap:.5cqw}
+.es-row{display:flex; align-items:baseline; gap:1cqw; flex-wrap:wrap; font-size:1cqw; line-height:1.35}
+.es-tag{font-family:'IBM Plex Mono',monospace; font-size:.9cqw; letter-spacing:.12em; text-transform:uppercase; color:var(--violet); flex:none}
+.es-id{color:var(--ink-3)} .es-id b{color:var(--ink); font-weight:500}
+.es-end{color:var(--ink-2)}
+.es-k{font-family:'IBM Plex Mono',monospace; font-weight:500}
+.es-k.src{color:var(--blue)} .es-k.dst{color:var(--green)}
+.es-arrow{color:var(--ink-3); flex:none}
 
 /* metric tiles */
 .tiles{display:grid; grid-template-columns:repeat(4,1fr); gap:1.4cqw}
@@ -300,7 +311,7 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
         <p class="eyebrow">Simple example</p>
         <h2>One entity in, one typed schema out</h2>
       </header>
-      <div class="s-body">
+      <div class="s-body top">
         <div class="cols code-pair">
           <div>
             <p class="code-title">kits/sdlc-full/entities.json</p>
@@ -308,8 +319,9 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
   <span class="k">"id"</span>: <span class="s">"requirement"</span>,
   <span class="k">"extends"</span>: <span class="s">"document"</span>,
   <span class="k">"properties"</span>: [
-    { <span class="k">"name"</span>: <span class="s">"key"</span>,       <span class="k">"type"</span>: <span class="s">"string"</span>, <span class="k">"required"</span>: true },
-    { <span class="k">"name"</span>: <span class="s">"statement"</span>, <span class="k">"type"</span>: <span class="s">"TextContent"</span>, <span class="k">"required"</span>: true },
+    { <span class="k">"name"</span>: <span class="s">"key"</span>,   <span class="k">"type"</span>: <span class="s">"string"</span>, <span class="k">"required"</span>: true },
+    { <span class="k">"name"</span>: <span class="s">"statement"</span>,
+      <span class="k">"type"</span>: <span class="s">"TextContent"</span>, <span class="k">"required"</span>: true },
     { <span class="k">"name"</span>: <span class="s">"status"</span>,
       <span class="k">"type"</span>: <span class="s">"proposed | approved | implemented |</span>
 <span class="s">               verified | retired"</span> },
@@ -321,31 +333,37 @@ table.tb{width:100%; border-collapse:collapse; font-size:1.2cqw}
           <div>
             <p class="code-title">out/types/…sdlc.requirement.v1~.schema.json</p>
 <pre class="code">{
-  <span class="k">"$id"</span>: <span class="s">"gts://…owned_node.v1~</span>
-<span class="s">          cf.studio.core.managed_object.v1~</span>
-<span class="s">          cf.studio.core.document.v1~</span>
-<span class="s">          cf.studio.sdlc.requirement.v1~"</span>,
+  <span class="k">"$id"</span>: <span class="s">"gts://…owned_node.v1~cf.studio.core.managed_object.v1~</span>
+<span class="s">          cf.studio.core.document.v1~cf.studio.sdlc.requirement.v1~"</span>,
   <span class="k">"x-gts-traits"</span>: {
     <span class="k">"index"</span>: [<span class="s">"/payload/status"</span>, <span class="s">"/payload/priority"</span>, <span class="c">…</span>],
     <span class="k">"full_text_search"</span>: [<span class="s">"/name"</span>, <span class="s">"/payload/statement"</span>, <span class="c">…</span>],
-    <span class="k">"vector_search"</span>: [<span class="s">"/payload/title"</span>, <span class="s">"/payload/statement"</span>]
+    <span class="k">"vector_search"</span>: [<span class="s">"/payload/title"</span>, <span class="c">…</span>]
   },
   <span class="k">"allOf"</span>: [
     { <span class="k">"$ref"</span>: <span class="s">"gts://…core.document.v1~"</span> },   <span class="c">← the parent</span>
-    { <span class="k">"properties"</span>: { <span class="k">"payload"</span>: {
-        <span class="k">"properties"</span>: {
-          <span class="k">"key"</span>:       { <span class="k">"type"</span>: <span class="s">"string"</span> },
-          <span class="k">"statement"</span>: { <span class="k">"type"</span>: <span class="s">"string"</span> },
-          <span class="k">"status"</span>:    { <span class="k">"enum"</span>: [<span class="s">"proposed"</span>, <span class="s">"approved"</span>, <span class="c">…</span>] }
-        },
-        <span class="k">"required"</span>: [<span class="s">"key"</span>, <span class="s">"statement"</span>]
-    } } }
+    { <span class="k">"properties"</span>: { <span class="k">"payload"</span>: { <span class="k">"properties"</span>: {
+        <span class="k">"key"</span>:       { <span class="k">"type"</span>: <span class="s">"string"</span> },
+        <span class="k">"statement"</span>: { <span class="k">"type"</span>: <span class="s">"string"</span> },
+        <span class="k">"status"</span>:    { <span class="k">"enum"</span>: [<span class="s">"proposed"</span>, <span class="c">…</span>] }
+      }, <span class="k">"required"</span>: [<span class="s">"key"</span>, <span class="s">"statement"</span>] } } }
   ]
 }</pre>
           </div>
         </div>
+      <div class="edge-strip">
+        <div class="es-row">
+          <span class="es-tag">and the relation</span>
+          <span class="es-id mono">gts://…static_edge.v1~<b>cf.studio.rel.implemented_by.v1~</b></span>
+        </div>
+        <div class="es-row">
+          <span class="es-end"><span class="es-k src">src_types</span> <span class="mono">…sdlc.requirement.v1~ · …core.work_item.v1~</span></span>
+          <span class="es-arrow mono">──▶</span>
+          <span class="es-end"><span class="es-k dst">dst_types</span> <span class="mono">…core.work_item.v1~ · …core.pull_request.v1~</span></span>
+        </div>
       </div>
-      <p class="s-foot">The relation becomes an edge type, <span class="mono">…static_edge.v1~cf.studio.rel.implemented_by.v1~</span>, whose <span class="mono">src_types</span>/<span class="mono">dst_types</span> traits name the admissible endpoints. The gear validates every ingested payload against this chain.</p>
+      </div>
+      <p class="s-foot">One edge type per predicate; its endpoint traits admit derived types too. Every payload is validated against the whole chain.</p>
     
       <p class="take"><b>Takeaway</b>Nothing of the model's meaning is lost in translation, and every payload is validated against it.</p>
     </section>
@@ -679,7 +697,7 @@ GET /graph-storage/v1/nodes?type_pattern=…finding.v1~
     ["Cover","<p>Three days of experiment, 7 to 9 September. Two repositories: the graph-storage gear on the fork, and the tooling next to the domain model in studio-internal.</p><p>The question we were asked: can the domain model be loaded as is, and does the graph then serve it as an API without anyone writing CRUD.</p>"],
     ["The idea","<p>The model is a set of JSON files a product manager edits. The exporter turns it into GTS type schemas; Graph Storage registers them and validates every object against them; the REST surface serves filter, sort, search and traversal.</p><p>The loader is the experimental part: it manufactures objects from a volume profile so we can measure and find where the graph explodes.</p><p>Nothing here is per-type code. The type system is the configuration.</p>"],
     ["What we built","<p>Exporter and loader are two Node scripts without dependencies, so they can run anywhere the model lives.</p><p>The gear needed two changes. The chain-depth ceiling was a hard-coded three; it is now a setting, because nothing in the gear depends on the depth. And the <strong>index</strong> trait, which existed in the contract, now reaches the query surface: registration resolves each declared path to a scalar kind from the schema, the projection admits exactly those paths.</p>"],
-    ["Simple example","<p>Left: the requirement entity as the model writes it. Right: what the exporter generates.</p><p>Property types are mapped: enums become enums, timestamps become date-time, identifiers become strings, composite types become opaque objects with a warning.</p><p>The relation does not go into the payload; it becomes an edge type with endpoint constraints. Traits are derived from property names and types, and an overlay file lets us override them per entity — that is the widget's 'which fields do you read' in its smallest form.</p>"],
+    ["Simple example","<p>Left: the requirement entity as the model writes it. Right: what the exporter generates.</p><p>Property types are mapped: enums become enums, timestamps become date-time, identifiers become strings, composite types become opaque objects with a warning.</p><p>The relation does not go into the payload. The strip at the bottom is what it becomes: one edge type per predicate, whose <strong>src_types</strong> and <strong>dst_types</strong> traits name the admissible endpoints — and since a type pattern admits derived types, an endpoint can be a whole subtree. Here the predicate is shared by two model pairs, so both ends list two types.</p><p>Traits are derived from property names and types, and an overlay file lets us override them per entity — that is the widget's 'which fields do you read' in its smallest form.</p>"],
     ["GTS","<p>We mirrored the model's inheritance into the GTS chain instead of flattening it. The grey segments are the gear's base ontology; the blue and green ones are generated.</p><p>What it buys: one pattern on managed_object selects all 119 descendant types anywhere a type pattern is accepted; a trait declared once is inherited; endpoint constraints of edges can name a subtree.</p><p>The GTS guideline recommends three segments. It is a design recommendation about readability; we made the ceiling a deployment setting.</p>"],
     ["The API question","<p>This was the direct question at the meeting: can I index a nested field and sort by it through the API. Yes.</p><p>Paths are spelled as OData paths, kinds come from the schema, and an undeclared path is refused with the list of what is allowed. A payload path without a type pattern is refused too, because the admitted paths are read from the selected types.</p><p>The numbers are on the type's row count; the next slides show what happens at 250k rows.</p>"],
     ["Metrics: load","<p>Registration of the whole model is a fraction of a second. Ingest runs at about 3.4k nodes and 2k edges per second on a laptop stand with embedding off.</p><p>Scale 0.2 is the PRD's benchmark size. The database is 771 MB, of which 110 MB is the payload GIN.</p><p>The volume profile behind these numbers is a guess by bucket; at scale 1 it would be 1.39 million nodes.</p>"],
