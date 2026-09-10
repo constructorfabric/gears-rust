@@ -444,6 +444,26 @@ gap, but it opens a second way in: a new `index` path can now appear under an
 *existing* identifier, with no lifecycle and no capacity check. Named here so
 that whoever builds the lifecycle gates this path too.
 
+**Found by reading the docs against the code, and fixed.** An accepted update
+now advances the tenant's graph revision, once per updated type, inside the same
+transaction. The Read Consistency Contract's promise is that two reads at one
+revision cannot observe different content, and an updated type changes what a
+read answers — the projection admits a path it refused a moment ago, and ingest
+validates against a different schema. `fr-labels` carries the same obligation
+for the same reason ("attach and detach **MUST** increment the tenant's graph
+revision, so two reads at one revision can never observe different labels"). A
+`created` type changes no existing read and still leaves the counter alone,
+which is what registration always did; the conformance case pins both halves.
+
+**One asymmetry left standing on purpose.** The in-process door
+(`GraphStorageClientV1`) offers only the default mode: `register_types`, no
+options, no dry run. Widening it means adding methods to a published trait, and
+`cpt-cf-graph-storage-interface-sdk-client` states the policy — "breaking
+changes introduce a new trait version". So the in-process consumer is *narrower*
+than REST rather than weaker, which is safe (it cannot reach a behaviour REST
+would refuse), and widening it is a `ClientV2` question rather than something to
+smuggle into V1.
+
 **Folded into the docs.** The documentation said `MUST reject`, so a deviation
 entry alone would not have been an outcome. Written and published with the
 implementation:

@@ -311,6 +311,10 @@ pg_case!(
     conformance::a_change_the_stored_rows_contradict_is_refused_naming_them
 );
 pg_case!(
+    an_accepted_type_update_advances_the_graph_revision,
+    conformance::an_accepted_type_update_advances_the_graph_revision
+);
+pg_case!(
     a_new_index_path_becomes_filterable_without_recreating_the_type,
     conformance::a_new_index_path_becomes_filterable_without_recreating_the_type
 );

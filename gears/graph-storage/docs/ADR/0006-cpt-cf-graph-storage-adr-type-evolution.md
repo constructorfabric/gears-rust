@@ -165,6 +165,12 @@ claims.
   but it does open a second door to it: a new `index` path can now appear under
   an existing identifier. When the lifecycle lands it must gate this path as
   well, and a trait-only update must be capacity-admitted like a registration.
+- **An accepted update advances the tenant's graph revision.** Not the type's
+  own `revision` column — the graph revision every read reports. An updated type
+  changes what a read answers, and the Read Consistency Contract promises that
+  two reads at one revision cannot observe different content; `fr-labels`
+  already carries that obligation for the same reason. A `created` type changes
+  no existing read and leaves the counter where registration always left it.
 - A revision counter on `gts_type` is not the retained history ADR-0005
   describes. Until the history table exists, an update is invisible after the
   fact beyond "the counter moved".

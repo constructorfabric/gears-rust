@@ -369,6 +369,7 @@ async fn register_in_tx(
                     .exec(tx)
                     .await
                     .map_err(map_scope_err)?;
+                super::ingest::bump_revision(tenant, scope, tx).await?;
                 out.push(RegisteredType {
                     record: written_record(&model, &descriptor, revision),
                     outcome: TypeOutcome::Updated,
@@ -550,6 +551,13 @@ async fn register_in_tx(
             .exec(tx)
             .await
             .map_err(map_scope_err)?;
+        // A read at the previous revision could refuse a filter this definition
+        // admits, or accept a payload it now rejects. That is exactly what the
+        // revision exists to fence, so an accepted update advances it — once
+        // per updated type, inside the same transaction. A `created` type
+        // changes no existing read and leaves the counter alone, as
+        // registration always has.
+        super::ingest::bump_revision(tenant, scope, tx).await?;
         out.push(RegisteredType {
             record: written_record(&model, &descriptor, revision),
             outcome: TypeOutcome::Updated,

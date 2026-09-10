@@ -2223,6 +2223,66 @@ pub async fn a_change_the_stored_rows_contradict_is_refused_naming_them(
     assert_eq!(stored.revision, 1, "a refused update writes nothing");
 }
 
+/// An accepted update moves the tenant's graph revision.
+///
+/// The Read Consistency Contract's promise is that two reads at one revision
+/// cannot observe different content, and an updated type changes what a read
+/// answers: the projection admits a path it refused, and ingest validates
+/// against a different schema. A label attach carries the same obligation for
+/// the same reason. A `created` type changes no existing read, and registration
+/// has never moved the counter for one — so this case pins the difference
+/// rather than only the bump.
+pub async fn an_accepted_type_update_advances_the_graph_revision(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_requirements(store, &ctx, &["proposed"]).await;
+
+    let before = store
+        .revision(&ctx)
+        .await
+        .expect("the tenant reports a revision");
+
+    // Registering the same batch again converges: nothing moves.
+    let mut types = ontology_batch();
+    types.push(requirement_v1());
+    store
+        .register_types_with(&ctx, types, update_options())
+        .await
+        .expect("an identical re-registration converges");
+    let unchanged = store
+        .revision(&ctx)
+        .await
+        .expect("the tenant reports a revision");
+    assert_eq!(
+        unchanged.revision, before.revision,
+        "a convergent re-registration must leave the revision alone"
+    );
+
+    let edited = requirement_revision(
+        &requirement_properties(&["proposed", "approved", "blocked"], false, false),
+        &["key", "statement"],
+        &["/payload/status"],
+    );
+    store
+        .register_types_with(&ctx, vec![edited], update_options())
+        .await
+        .expect("a wider enum is admitted in place");
+    let after = store
+        .revision(&ctx)
+        .await
+        .expect("the tenant reports a revision");
+    assert!(
+        after.revision > before.revision,
+        "an accepted update changes what a read answers, so it must fence the \
+         revision: {} -> {}",
+        before.revision,
+        after.revision
+    );
+}
+
 /// Declaring a new `index` path changes no constraint on any instance, so the
 /// comparison proves it compatible and the path becomes filterable at once —
 /// without recreating the type, and without touching a row.

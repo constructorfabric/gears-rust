@@ -324,6 +324,12 @@ impl GraphStoreV1 for FakeGraphStore {
             if !options.dry_run && decided.outcome != TypeOutcome::Unchanged {
                 tenant.types.insert(record.type_id.clone(), record.clone());
                 tenant.index_kinds.insert(record.type_id.clone(), kinds);
+                if decided.outcome == TypeOutcome::Updated {
+                    // What a read answers has changed, so the revision has to
+                    // move — the same obligation a label attach carries
+                    // (ADR-0006). A `created` type changes no existing read.
+                    tenant.revision += 1;
+                }
             }
             out.push(RegisteredType {
                 record,

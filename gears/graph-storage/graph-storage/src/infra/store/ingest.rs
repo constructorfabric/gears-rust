@@ -227,7 +227,14 @@ async fn source_epoch(scope: &AccessScope, runner: &impl DBRunner) -> Result<i64
 
 /// Advance the revision. Called **only** when the transaction actually
 /// changed stored state, so a convergent replay leaves the counter alone.
-async fn bump_revision(
+///
+/// Reachable from the ontology path as well as this one: an accepted type
+/// update changes what an existing read answers (a newly declared `index` path
+/// becomes filterable, and payloads validate against a different schema), and
+/// the Read Consistency Contract's promise is that two reads at one revision
+/// cannot observe different content — the same reason a label attach advances
+/// it (ADR-0006).
+pub(crate) async fn bump_revision(
     tenant: Uuid,
     scope: &AccessScope,
     runner: &impl DBRunner,
