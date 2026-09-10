@@ -123,6 +123,20 @@ fn routing_outcome(error: DomainError) -> Result<CanonicalError, DomainError> {
                 reasons::EMBEDDING_SPACE_MISMATCH,
             )
             .create(),
+        // DESIGN § Error Model: `permission_denied` with
+        // `SOURCE_NAMESPACE_FORBIDDEN`, "never retry; request ownership
+        // transfer". Deliberately not folded into the `NotFound` /
+        // `AccessDenied` arm above: anti-enumeration hides what the caller has
+        // no business knowing exists, and a namespace's owner is not that.
+        DomainError::SourceNamespaceForbidden { namespace } => {
+            tracing::info!(
+                namespace = %namespace,
+                "refused a write under a source namespace owned by another producer"
+            );
+            GraphNodeError::permission_denied()
+                .with_reason(reasons::SOURCE_NAMESPACE_FORBIDDEN)
+                .create()
+        }
         DomainError::Unsupported { what } => GraphNodeError::unimplemented(what).create(),
         other => return Err(other),
     })

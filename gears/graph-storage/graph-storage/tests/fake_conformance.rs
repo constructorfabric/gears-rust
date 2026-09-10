@@ -304,3 +304,27 @@ async fn a_migration_stamps_its_writer_and_moves_the_version() {
     conformance::a_migration_stamps_its_writer_and_moves_the_version(&store(), Uuid::now_v7())
         .await;
 }
+
+// --- source-namespace ownership ----------------------------------------------
+
+#[tokio::test]
+async fn a_source_namespace_is_claimed_by_its_first_writer() {
+    conformance::a_source_namespace_is_claimed_by_its_first_writer(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn writing_under_another_producers_namespace_is_forbidden() {
+    conformance::writing_under_another_producers_namespace_is_forbidden(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_transfer_moves_the_namespace_and_records_who_moved_it() {
+    conformance::a_transfer_moves_the_namespace_and_records_who_moved_it(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn an_owned_nodes_source_field_claims_no_namespace() {
+    conformance::an_owned_nodes_source_field_claims_no_namespace(&store(), Uuid::now_v7()).await;
+}

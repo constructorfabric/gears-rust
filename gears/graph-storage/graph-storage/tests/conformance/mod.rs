@@ -2631,3 +2631,252 @@ pub async fn a_migration_stamps_its_writer_and_moves_the_version(
          payload leaves the vector stale rather than silently wrong: {state:?}"
     );
 }
+
+// --- source-namespace ownership ----------------------------------------------
+
+/// A second producer, with its own principal.
+fn producer_b() -> Subject {
+    Subject {
+        subject_id: uuid::uuid!("33333333-3333-3333-3333-333333333333"),
+        subject_type: Some("gts.cf.core.security.subject_service.v1~".to_owned()),
+    }
+}
+
+/// A reference node under `system`, keyed the way the identity rule requires.
+fn mirror_node(system: &str, native_id: &str) -> NodeSpec {
+    NodeSpec {
+        node_key: format!("{system}:repo:{native_id}"),
+        type_id: REFERENCE.to_owned(),
+        payload: Some(serde_json::json!({
+            "source": { "system": system, "kind": "repo", "native_id": native_id }
+        })),
+        ..NodeSpec::default()
+    }
+}
+
+async fn seed_reference_ontology(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    let mut batch = ontology_batch();
+    batch.push(TypeRegistration {
+        type_id: REFERENCE.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{REFERENCE}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~" }]
+        }),
+    });
+    store
+        .register_types(ctx, batch)
+        .await
+        .expect("the ontology registers");
+}
+
+/// An unclaimed namespace is claimed by the producer that first writes it, so
+/// a single-producer deployment needs no setup — and the claim is visible,
+/// because an ownership boundary nobody can read is one nobody can operate.
+pub async fn a_source_namespace_is_claimed_by_its_first_writer(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_reference_ontology(store, &ctx).await;
+
+    assert!(
+        store
+            .list_source_namespaces(&ctx)
+            .await
+            .expect("the registry reads")
+            .is_empty(),
+        "nothing is claimed before anything is written"
+    );
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect("the first writer claims the namespace");
+
+    let claimed = store
+        .list_source_namespaces(&ctx)
+        .await
+        .expect("the registry reads");
+    assert_eq!(claimed.len(), 1, "{claimed:?}");
+    assert_eq!(claimed[0].namespace, "sys");
+    assert_eq!(
+        claimed[0].owner_principal,
+        writer().principal(),
+        "the namespace is bound to the principal that wrote it"
+    );
+    assert!(claimed[0].previous_owner.is_none());
+
+    // The same producer keeps writing it, including a second object.
+    ingest_batch(
+        store,
+        &ctx,
+        batch(vec![mirror_node("sys", "43")], Vec::new()),
+    )
+    .await
+    .expect("the owner keeps writing its own namespace");
+}
+
+/// The boundary, and the reason it exists: the identity triple that makes two
+/// producers converge on one object would otherwise let a generic `write`
+/// permission overwrite the projection another source maintains. Refused for
+/// an update exactly as for an insert — an overwrite is the case that matters.
+pub async fn writing_under_another_producers_namespace_is_forbidden(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let owner = ctx(tenant, &scope, None);
+    seed_reference_ontology(store, &owner).await;
+    ingest_batch(
+        store,
+        &owner,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect("the owner claims the namespace");
+
+    let intruder = ctx_as(tenant, &scope, None, producer_b());
+
+    // A new object under someone else's namespace.
+    let error = ingest_batch(
+        store,
+        &intruder,
+        batch(vec![mirror_node("sys", "99")], Vec::new()),
+    )
+    .await
+    .expect_err("another producer may not write this namespace");
+    assert!(
+        matches!(&error, GraphStoreError::SourceNamespaceForbidden { namespace } if namespace == "sys"),
+        "a namespace denial is its own error, not a not-found: {error:?}"
+    );
+
+    // And an overwrite of the owner's existing object.
+    let error = ingest_batch(
+        store,
+        &intruder,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect_err("an update is re-authorized against the owner, not only an insert");
+    assert!(
+        matches!(error, GraphStoreError::SourceNamespaceForbidden { .. }),
+        "{error:?}"
+    );
+
+    // Nothing of the intruder's batch landed.
+    assert!(
+        store
+            .get_node(&owner, &"sys:repo:99".to_owned(), 10)
+            .await
+            .is_err(),
+        "a refused batch commits nothing"
+    );
+}
+
+/// Ownership moves one way only: through the administrative flow. Afterwards
+/// the new owner writes and the old one is refused, and the row says who moved
+/// it and from whom — the audit trail of the one act that can move a boundary.
+pub async fn a_transfer_moves_the_namespace_and_records_who_moved_it(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let first = ctx(tenant, &scope, None);
+    seed_reference_ontology(store, &first).await;
+    ingest_batch(
+        store,
+        &first,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect("the first producer claims the namespace");
+
+    let admin = ctx_as(tenant, &scope, None, editor());
+    let moved = store
+        .transfer_source_namespace(&admin, "sys", &producer_b().principal())
+        .await
+        .expect("the administrative flow moves the namespace");
+    assert_eq!(moved.owner_principal, producer_b().principal());
+    assert_eq!(
+        moved.previous_owner.as_deref(),
+        Some(writer().principal().as_str()),
+        "the row records whom it was taken from"
+    );
+    assert_eq!(
+        moved.transferred_by.as_ref(),
+        Some(&editor()),
+        "and who took it"
+    );
+
+    // The new owner writes; the previous one no longer can.
+    let second = ctx_as(tenant, &scope, None, producer_b());
+    ingest_batch(
+        store,
+        &second,
+        batch(vec![mirror_node("sys", "50")], Vec::new()),
+    )
+    .await
+    .expect("the new owner writes the namespace");
+    let error = ingest_batch(
+        store,
+        &first,
+        batch(vec![mirror_node("sys", "51")], Vec::new()),
+    )
+    .await
+    .expect_err("the previous owner is refused after the transfer");
+    assert!(
+        matches!(error, GraphStoreError::SourceNamespaceForbidden { .. }),
+        "{error:?}"
+    );
+
+    // The rows the first producer created still say it created them: the
+    // registry moved, provenance did not.
+    store
+        .get_node(&second, &"sys:repo:42".to_owned(), 10)
+        .await
+        .expect("the object it created is still there, and readable by the new owner");
+}
+
+/// `source` in an owned node's payload is a payload field, not a boundary: it
+/// claims nothing, and it authorizes nothing.
+pub async fn an_owned_nodes_source_field_claims_no_namespace(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_reference_ontology(store, &ctx).await;
+
+    let mut owned = node("owned-1", "one");
+    owned.payload = Some(serde_json::json!({
+        "source": { "system": "sys", "kind": "repo", "native_id": "42" }
+    }));
+    ingest_batch(store, &ctx, batch(vec![owned], Vec::new()))
+        .await
+        .expect("an owned node with a source-shaped payload is just a payload");
+
+    assert!(
+        store
+            .list_source_namespaces(&ctx)
+            .await
+            .expect("the registry reads")
+            .is_empty(),
+        "an owned node claims no namespace"
+    );
+
+    // And the namespace is still free for the producer that does own it.
+    let other = ctx_as(tenant, &scope, None, producer_b());
+    ingest_batch(
+        store,
+        &other,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect("the reference producer claims a namespace no owned node took");
+}

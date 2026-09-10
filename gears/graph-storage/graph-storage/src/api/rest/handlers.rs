@@ -175,6 +175,30 @@ pub async fn type_compatibility(
     }))
 }
 
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn list_source_namespaces(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+) -> ApiResult<Json<dto::GraphSourceNamespaceListDto>> {
+    let items = services.list_source_namespaces(&ctx).await?;
+    Ok(Json(dto::GraphSourceNamespaceListDto {
+        items: items.into_iter().map(Into::into).collect(),
+    }))
+}
+
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn transfer_source_namespace(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Path(namespace): Path<String>,
+    Json(request): Json<dto::GraphTransferNamespaceRequest>,
+) -> ApiResult<Json<dto::GraphSourceNamespaceDto>> {
+    let row = services
+        .transfer_source_namespace(&ctx, &namespace, &request.owner_principal)
+        .await?;
+    Ok(Json(row.into()))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListTypesParams {
     /// `node`, `edge` or `attribute`.

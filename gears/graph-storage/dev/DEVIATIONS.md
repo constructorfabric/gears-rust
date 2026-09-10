@@ -562,6 +562,60 @@ responsibilities, and ADR-0003's annotation consequence. What is deliberately
 **not** amended: `fr-index-admission` and the activation lifecycle, which stay
 unimplemented deferrals rather than being redefined to match what is built.
 
+## D-032 [was impl-gap, now built] The source-namespace boundary was not a boundary
+
+**Found while planning the upstream contribution (2026-09-11), by reading
+`fr-source-ownership` against the code rather than against the other entries.**
+`node.source_namespace` was written `None` and `node.owner_principal` was
+written `""` on every path, and nothing read either. The documentation calls a
+source namespace "an enforced ownership boundary" with immutable owner
+provenance and per-update re-authorization; there was no registry, no claim, no
+comparison. Exactly the shape of the gaps the previous sweep did catch — parsed,
+stored, unread — and it is p1.
+
+No entry recorded it, which is the part worth remembering: the sweep walked the
+PRD's acceptance criteria (§ 9) and this requirement has no criterion of its
+own, so it fell between the two checks.
+
+**Built.** `source_namespace_owner` (migration `m0007`) is the authority;
+`domain/ownership.rs` reads the namespace out of a reference node's own payload
+and decides claim / allow / forbid; the ingest path authorizes before either
+branch writes, claims an unclaimed namespace inside the write transaction, and
+writes the two node columns once on insert. `GET /source-namespaces` reads the
+boundary and `POST /source-namespaces/{namespace}/owner` moves it under
+ontology administration, recording the previous owner and the acting subject.
+Four conformance cases on both stores: the first writer claims; a second
+producer is refused for an insert *and* for an overwrite; a transfer moves the
+right to write while leaving provenance alone; an owned node's `source`-shaped
+payload claims nothing.
+
+**Two decisions worth stating.**
+- *The registry is the authority, not `node.owner_principal`.* The column is
+  immutable provenance, so consulting it would make a transfer unusable — the
+  new owner could not touch a row the old one created. DESIGN said as much
+  ("the authority the comparison consults") and now says why.
+- *The denial is `permission_denied`, not `not_found`.* Everywhere else in this
+  gear a denial is indistinguishable from absence (anti-enumeration). Here the
+  caller named a namespace whose owner is a fact about the tenant rather than
+  about them, and "not found" would send them to create what exists. That is
+  DESIGN's own error-table row, and `SOURCE_NAMESPACE_FORBIDDEN` had been
+  declared in the reason vocabulary since the first commit with nothing
+  producing it.
+
+**Two doc gaps closed with it.** The `source_namespace_owner` table was named
+in DESIGN § 3.7 and never given columns — specified now, including why a claim
+is a no-op upsert rather than `DO NOTHING` (it takes the row lock, so
+simultaneous claims serialize). And the two new operations are in the § 3.3 REST
+table.
+
+**What is still thin.** The fake store enforces the boundary and carries the
+registry, but does not model the two node columns, because no read surface
+exposes them (the same blind spot as D-022). `ingest_audit`, which DESIGN names
+as where a transfer is audited, does not exist in this iteration; the transfer
+is audited on the registry row instead — previous owner, timestamp, acting
+subject — which is enough to answer "who moved this and from whom" and not
+enough to answer "how many times".
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here

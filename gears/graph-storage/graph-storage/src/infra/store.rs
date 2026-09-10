@@ -8,6 +8,7 @@
 
 pub mod evolution;
 pub mod ingest;
+pub mod namespaces;
 pub mod projection;
 pub mod reads;
 pub mod search;
@@ -21,8 +22,8 @@ use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest, LabelId,
     LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
     ReadSnapshot, RegisteredType, RevisionOutcome, SearchRequest, SearchResponse,
-    StoreCapabilities, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord,
-    TypeRegistration, TypeRegistrationOptions,
+    SourceNamespaceOwner, StoreCapabilities, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery,
+    TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -188,6 +189,22 @@ impl GraphStoreV1 for PgGraphStore {
         patterns: &[String],
     ) -> Result<TypeIdSet, GraphStoreError> {
         types::resolve_type_set(self, ctx, patterns).await
+    }
+
+    async fn list_source_namespaces(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Vec<SourceNamespaceOwner>, GraphStoreError> {
+        namespaces::list(self, ctx).await
+    }
+
+    async fn transfer_source_namespace(
+        &self,
+        ctx: &StoreCtx<'_>,
+        namespace: &str,
+        owner_principal: &str,
+    ) -> Result<SourceNamespaceOwner, GraphStoreError> {
+        namespaces::transfer(self, ctx, namespace, owner_principal).await
     }
 
     async fn ingest(

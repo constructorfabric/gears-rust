@@ -87,6 +87,14 @@ pub enum DomainError {
     #[error("access denied")]
     AccessDenied,
 
+    /// A write under a source namespace bound to another producer principal
+    /// (`permission_denied`). The one denial that is *not* disguised as
+    /// absence: the caller named a namespace whose owner is a fact about the
+    /// tenant rather than about them, and "not found" would send them to
+    /// create what already exists. Never retry; request a transfer.
+    #[error("source namespace `{namespace}` is owned by another producer")]
+    SourceNamespaceForbidden { namespace: String },
+
     /// No implementation can serve the caller's scope shape
     /// (`failed_precondition`); reached only when the fallback chain is
     /// exhausted.
@@ -152,6 +160,9 @@ impl From<graph_storage_sdk::plugin_api::GraphStoreError> for DomainError {
             E::IdempotencyExpired => Self::IdempotencyExpired,
             E::NotFound => Self::NotFound,
             E::LimitExceeded { what } => Self::LimitExceeded { what },
+            E::SourceNamespaceForbidden { namespace } => {
+                Self::SourceNamespaceForbidden { namespace }
+            }
             E::InvalidQuery { what } => Self::InvalidQuery { message: what },
             E::Corrupt { reason } => Self::Corrupt { reason },
             E::Unavailable { reason } => Self::Unavailable { detail: reason },

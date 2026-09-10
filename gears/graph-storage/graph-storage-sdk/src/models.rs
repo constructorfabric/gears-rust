@@ -86,6 +86,28 @@ pub struct EffectiveTraits {
     pub dst_types: Vec<String>,
 }
 
+/// One source namespace and the producer principal bound to it.
+///
+/// The authority the ingest path consults: a reference node's payload names a
+/// `source.system`, and this row decides who may speak for it. `node.
+/// owner_principal` records who *created* a row and never changes; this row
+/// records who may write it now, so an ownership transfer is a change here and
+/// not a rewrite of history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceNamespaceOwner {
+    /// The `source.system` value of a reference node's identity triple.
+    pub namespace: String,
+    pub owner_principal: String,
+    /// When the namespace was first claimed.
+    pub claimed_at: OffsetDateTime,
+    /// The principal the namespace was taken from, if it was ever transferred.
+    pub previous_owner: Option<String>,
+    pub transferred_at: Option<OffsetDateTime>,
+    /// The subject that performed the transfer — the audit trail of the one
+    /// administrative flow that can move a namespace.
+    pub transferred_by: Option<Subject>,
+}
+
 /// A registered type as the gear reports it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeRecord {
@@ -408,6 +430,19 @@ pub struct Subject {
 }
 
 impl Subject {
+    /// The producer principal this subject writes as.
+    ///
+    /// One string, derived from the subject id rather than invented beside it,
+    /// so "who wrote this row" (the audit envelope) and "who owns this
+    /// namespace" (the ownership boundary) cannot disagree. The subject *type*
+    /// is deliberately not part of it: the id is already unique, and folding
+    /// the type in would make one principal look like two the day a producer
+    /// is re-typed.
+    #[must_use]
+    pub fn principal(&self) -> String {
+        self.subject_id.to_string()
+    }
+
     /// The subject a `SecurityContext` names.
     #[must_use]
     pub fn from_security_context(ctx: &toolkit_security::SecurityContext) -> Self {

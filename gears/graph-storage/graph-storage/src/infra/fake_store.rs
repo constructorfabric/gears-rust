@@ -15,9 +15,9 @@ use graph_storage_sdk::models::{
     GraphRevision, GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily,
     LabelAssignment, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView,
     OnExisting, Page, ProjectionRequest, ReadSnapshot, RegisteredType, RevisionOutcome,
-    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, StoreCapabilities, Subject,
-    TopologyPage, TopologyRequest, TypeChange, TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery,
-    TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, SourceNamespaceOwner,
+    StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange, TypeChangeState,
+    TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
-use crate::domain::{evolution, identity, ontology, projection};
+use crate::domain::{evolution, identity, ontology, ownership, projection};
 
 #[derive(Clone)]
 struct FakeNode {
@@ -124,6 +124,11 @@ struct Receipt {
 #[derive(Default)]
 struct Tenant {
     types: BTreeMap<String, TypeRecord>,
+    /// Source namespace -> the producer principal bound to it. The fake
+    /// carries the ownership boundary for the same reason it carries the
+    /// others: a boundary only one implementation enforces is a boundary the
+    /// conformance suite cannot see.
+    namespaces: BTreeMap<String, SourceNamespaceOwner>,
     /// The resolved `index` kinds per registered type, what the projection
     /// admits payload paths against (mirrors `gts_type.effective_traits`'s
     /// `index_kinds` on the built-in store).
@@ -384,6 +389,50 @@ impl GraphStoreV1 for FakeGraphStore {
         Ok(out)
     }
 
+    async fn list_source_namespaces(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Vec<SourceNamespaceOwner>, GraphStoreError> {
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        Ok(tenants
+            .get(&ctx.tenant)
+            .map(|tenant| tenant.namespaces.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn transfer_source_namespace(
+        &self,
+        ctx: &StoreCtx<'_>,
+        namespace: &str,
+        owner_principal: &str,
+    ) -> Result<SourceNamespaceOwner, GraphStoreError> {
+        if owner_principal.trim().is_empty() {
+            return Err(GraphStoreError::InvalidQuery {
+                what: "a transfer needs the principal to transfer to".to_owned(),
+            });
+        }
+        let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let tenant = tenants.entry(ctx.tenant).or_default();
+        let now = OffsetDateTime::now_utc();
+        let previous = tenant
+            .namespaces
+            .get(namespace)
+            .map(|row| row.owner_principal.clone());
+        let row = SourceNamespaceOwner {
+            namespace: namespace.to_owned(),
+            owner_principal: owner_principal.to_owned(),
+            claimed_at: tenant
+                .namespaces
+                .get(namespace)
+                .map_or(now, |row| row.claimed_at),
+            previous_owner: previous.filter(|owner| owner != owner_principal),
+            transferred_at: Some(now),
+            transferred_by: Some(ctx.subject.clone()),
+        };
+        tenant.namespaces.insert(namespace.to_owned(), row.clone());
+        Ok(row)
+    }
+
     async fn get_type(
         &self,
         ctx: &StoreCtx<'_>,
@@ -481,6 +530,56 @@ impl GraphStoreV1 for FakeGraphStore {
             fence(tenant, replace, &request_hash)?;
         }
 
+        // The ownership boundary, before any working copy is taken: a
+        // reference node names its source namespace in its own payload, and a
+        // payload proves nothing about who may speak for it. Claims land in the
+        // registry here, so a batch that is later refused for any other reason
+        // has still not handed anyone a namespace it did not have — the claim
+        // and the write commit together, as they do in the built-in store's
+        // transaction.
+        let writer = ctx.subject.principal();
+        let mut claims: Vec<(String, SourceNamespaceOwner)> = Vec::new();
+        for spec in &req.nodes {
+            let family = tenant
+                .types
+                .get(&spec.type_id)
+                .and_then(|record| record.effective_traits.family.clone());
+            let namespace = match ownership::namespace_of(family.as_deref(), spec.payload.as_ref())
+                .map_err(|error| {
+                    validation(0, ItemFamily::Node, &spec.type_id, &error.to_string())
+                })? {
+                ownership::Namespaced::None => continue,
+                ownership::Namespaced::Under(namespace) => namespace.to_owned(),
+            };
+            let held = tenant
+                .namespaces
+                .get(&namespace)
+                .map(|row| row.owner_principal.clone())
+                .or_else(|| {
+                    claims
+                        .iter()
+                        .find(|(name, _)| name == &namespace)
+                        .map(|(_, row)| row.owner_principal.clone())
+                });
+            match ownership::decide(held.as_deref(), &writer) {
+                ownership::Claim::Allowed => {}
+                ownership::Claim::Forbidden => {
+                    return Err(GraphStoreError::SourceNamespaceForbidden { namespace });
+                }
+                ownership::Claim::Take => claims.push((
+                    namespace.clone(),
+                    SourceNamespaceOwner {
+                        namespace,
+                        owner_principal: writer.clone(),
+                        claimed_at: OffsetDateTime::now_utc(),
+                        previous_owner: None,
+                        transferred_at: None,
+                        transferred_by: None,
+                    },
+                )),
+            }
+        }
+
         // Working copies: written back only once the whole batch succeeded, so
         // a partway failure leaves nothing.
         let mut nodes = tenant.nodes.clone();
@@ -529,6 +628,9 @@ impl GraphStoreV1 for FakeGraphStore {
         tenant.nodes = nodes;
         tenant.edges = edges;
         tenant.next_id = next_id;
+        for (namespace, row) in claims {
+            tenant.namespaces.insert(namespace, row);
+        }
         if changed {
             tenant.revision += 1;
         }

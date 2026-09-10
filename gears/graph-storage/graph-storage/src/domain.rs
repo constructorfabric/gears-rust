@@ -11,6 +11,7 @@ pub mod identity;
 pub mod local_client;
 pub mod migration;
 pub mod ontology;
+pub mod ownership;
 pub mod projection;
 pub mod service;
 pub mod traversal;

@@ -284,6 +284,25 @@ pg_case!(
     conformance::a_deeper_chain_registers_and_its_ancestor_admits_the_leaf
 );
 
+// --- source-namespace ownership ----------------------------------------------
+
+pg_case!(
+    a_source_namespace_is_claimed_by_its_first_writer,
+    conformance::a_source_namespace_is_claimed_by_its_first_writer
+);
+pg_case!(
+    writing_under_another_producers_namespace_is_forbidden,
+    conformance::writing_under_another_producers_namespace_is_forbidden
+);
+pg_case!(
+    a_transfer_moves_the_namespace_and_records_who_moved_it,
+    conformance::a_transfer_moves_the_namespace_and_records_who_moved_it
+);
+pg_case!(
+    an_owned_nodes_source_field_claims_no_namespace,
+    conformance::an_owned_nodes_source_field_claims_no_namespace
+);
+
 // --- type evolution (registering a changed schema in place) -----------------
 
 pg_case!(

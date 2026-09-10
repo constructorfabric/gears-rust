@@ -14,6 +14,7 @@ pub mod m0003_embedding_space;
 pub mod m0004_element_envelope;
 pub mod m0005_payload_index;
 pub mod m0006_type_revision;
+pub mod m0007_source_namespace_owner;
 
 /// Text-search configuration used for both the GIN index expression and every
 /// lexical query. One constant, so predicate and index cannot drift apart —
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0004_element_envelope::Migration),
             Box::new(m0005_payload_index::Migration),
             Box::new(m0006_type_revision::Migration),
+            Box::new(m0007_source_namespace_owner::Migration),
         ]
     }
 }

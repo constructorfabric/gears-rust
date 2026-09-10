@@ -128,6 +128,57 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::get(format!("{BASE}/source-namespaces"))
+        .operation_id("graph_storage.list_source_namespaces")
+        .summary("Source namespaces and the producer principal bound to each")
+        .description(
+            "A reference node's identity names a source, and a payload proves \
+             nothing about who may speak for it. This is the ownership \
+             boundary itself: who may write each namespace, not what is stored \
+             under it",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::list_source_namespaces)
+        .json_response_with_schema::<dto::GraphSourceNamespaceListDto>(
+            openapi,
+            http::StatusCode::OK,
+            "Claimed namespaces",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::post(format!("{BASE}/source-namespaces/{{namespace}}/owner"))
+        .operation_id("graph_storage.transfer_source_namespace")
+        .summary("Move a source namespace to another producer principal")
+        .description(
+            "The only way a namespace changes hands: writing under someone \
+             else's namespace is refused rather than treated as a claim. \
+             Requires ontology administration, and records who moved it and \
+             from whom",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("namespace", "The `source.system` value to transfer")
+        .json_request::<dto::GraphTransferNamespaceRequest>(openapi, "The new owner")
+        .handler(handlers::transfer_source_namespace)
+        .json_response_with_schema::<dto::GraphSourceNamespaceDto>(
+            openapi,
+            http::StatusCode::OK,
+            "The namespace after the transfer",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     OperationBuilder::get(format!("{BASE}/types/{{gts_type_id}}"))
         .operation_id("graph_storage.get_type")
         .summary("One type with its schema and effective traits")

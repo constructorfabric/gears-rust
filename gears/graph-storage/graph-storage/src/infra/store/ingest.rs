@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
 use crate::domain::identity;
+use crate::domain::ownership;
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
 use crate::infra::store::types::interned_ids;
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
@@ -749,6 +750,24 @@ async fn upsert_node(
     let vector = plan_vector(existing.as_ref(), planned);
     let now = OffsetDateTime::now_utc();
 
+    // The ownership boundary, before either branch writes anything: a
+    // reference node names a source namespace in its own payload, and a
+    // payload proves nothing about who may speak for it
+    // (`fr-source-ownership`). An unclaimed namespace is claimed here; someone
+    // else's is refused with `permission_denied`, for an update exactly as for
+    // an insert, because an overwrite of another producer's projection is the
+    // thing the boundary exists to stop.
+    let namespace = match ownership::namespace_of(info.family.as_deref(), spec.payload.as_ref())
+        .map_err(|error| item_error(index, ItemFamily::Node, &spec.type_id, error.to_string()))?
+    {
+        ownership::Namespaced::None => None,
+        ownership::Namespaced::Under(namespace) => {
+            let writer = subject.principal();
+            super::namespaces::authorize_write(tenant, scope, tx, namespace, &writer).await?;
+            Some(namespace.to_owned())
+        }
+    };
+
     let Some(current) = existing else {
         let active = node::ActiveModel {
             tenant_id: ActiveValue::Set(tenant),
@@ -761,8 +780,12 @@ async fn upsert_node(
             embedding: ActiveValue::Set(vector.embedding),
             embedding_epoch: ActiveValue::Set(vector.epoch),
             embedding_input_hash: ActiveValue::Set(vector.input_hash),
-            source_namespace: ActiveValue::Set(None),
-            owner_principal: ActiveValue::Set(String::new()),
+            // Written once, on insert, and never by an upsert: the row's
+            // record of who created it is provenance, and provenance that a
+            // later write can rewrite is not provenance. Who may write the
+            // namespace *now* is the registry's answer, not this column's.
+            source_namespace: ActiveValue::Set(namespace),
+            owner_principal: ActiveValue::Set(subject.principal()),
             version: ActiveValue::Set(1),
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),

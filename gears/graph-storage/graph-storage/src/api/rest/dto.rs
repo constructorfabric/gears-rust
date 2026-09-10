@@ -188,6 +188,36 @@ pub struct GraphTypeListDto {
     pub revision: GraphRevisionDto,
 }
 
+/// One source namespace and the producer principal bound to it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphSourceNamespaceDto {
+    /// The `source.system` value of a reference node's identity triple.
+    pub namespace: String,
+    pub owner_principal: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub claimed_at: time::OffsetDateTime,
+    /// Who held it before the last transfer, if it was ever transferred.
+    pub previous_owner: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub transferred_at: Option<time::OffsetDateTime>,
+    pub transferred_by: Option<GraphSubjectDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphSourceNamespaceListDto {
+    pub items: Vec<GraphSourceNamespaceDto>,
+}
+
+/// Who a namespace is being transferred to.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct GraphTransferNamespaceRequest {
+    /// The producer principal that may write the namespace from now on.
+    pub owner_principal: String,
+}
+
 // ---------------------------------------------------------------------------
 // Revision
 // ---------------------------------------------------------------------------
@@ -499,6 +529,19 @@ impl From<m::TypeRecord> for GraphTypeDto {
             schema: value.schema,
             effective_traits: value.effective_traits.into(),
             revision: value.revision,
+        }
+    }
+}
+
+impl From<m::SourceNamespaceOwner> for GraphSourceNamespaceDto {
+    fn from(value: m::SourceNamespaceOwner) -> Self {
+        Self {
+            namespace: value.namespace,
+            owner_principal: value.owner_principal,
+            claimed_at: value.claimed_at,
+            previous_owner: value.previous_owner,
+            transferred_at: value.transferred_at,
+            transferred_by: value.transferred_by.map(Into::into),
         }
     }
 }

@@ -1104,6 +1104,8 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `POST` | `/api/graph-storage/v1/types/compatibility` | What registering this batch would do, without writing: per type the verdicts, the diagnostics with their schema locations, the moved traits, the row count (ADR-0006) | p1 |
 | `GET` | `/api/graph-storage/v1/types` | List types; `$filter` on kind and GTS pattern | p1 |
 | `GET` | `/api/graph-storage/v1/types/{gts_type_id}` | One type with its schema and effective traits | p1 |
+| `GET` | `/api/graph-storage/v1/source-namespaces` | Claimed source namespaces and the producer principal bound to each (`fr-source-ownership`) | p1 |
+| `POST` | `/api/graph-storage/v1/source-namespaces/{namespace}/owner` | Transfer a namespace to another principal — the only way one changes hands; ontology administration | p1 |
 | `POST` | `/api/graph-storage/v1/ingest` | Nodes and edges in one transaction; options: skip-embedding, phantom control, replace scope | p1 |
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
@@ -1877,9 +1879,37 @@ stored: this is the counter, not the history table ADR-0005 describes.
 | deleted_by_subject_id / deleted_by_subject_type | UUID / TEXT | Subject that tombstoned the row; `NULL` while live |
 
 `source_namespace` and `owner_principal` are written once, on insert, and never
-by an upsert; the ingest path compares them instead. A companion
+by an upsert; the ingest path compares against the registry instead. A companion
 `source_namespace_owner` registry table binds namespaces to producer principals
 per tenant and is the authority the comparison consults.
+
+#### Table: source_namespace_owner
+
+**ID**: `cpt-cf-graph-storage-dbtable-source-namespace-owner`
+
+Named by the paragraph above and left unspecified in the first draft; the
+columns are below. One row per `(tenant, namespace)`, where the namespace is the
+`source.system` value of a reference node's identity triple.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| tenant_id | UUID | Tenant scope; **PK (tenant_id, namespace)** |
+| namespace | TEXT | The `source.system` value the boundary is drawn around |
+| owner_principal | TEXT | The producer principal entitled to write it **now** |
+| claimed_at | TIMESTAMPTZ | When it was first claimed |
+| previous_owner | TEXT | Whom it was taken from, set only by a transfer; `NULL` otherwise |
+| transferred_at | TIMESTAMPTZ | When it last changed hands; `NULL` if never |
+| transferred_by_subject_id / transferred_by_subject_type | UUID / TEXT | The subject that performed the transfer — the audit of the one act that can move the boundary |
+
+**Why the registry and not `node.owner_principal` is the authority.** The column
+records who *created* a row and is immutable, so consulting it would make a
+transfer unusable: the new owner could not touch a row the previous one wrote.
+The registry answers "who may write this namespace now", the column answers
+"who wrote this row", and a transfer changes the first without rewriting the
+second. A claim is `INSERT … ON CONFLICT DO UPDATE SET owner_principal =
+source_namespace_owner.owner_principal` — a no-op write that takes the row lock,
+so two producers claiming one namespace in the same instant serialize and the
+loser is told it is forbidden rather than both believing they own it.
 
 #### Table: edge
 

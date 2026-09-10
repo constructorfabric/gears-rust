@@ -22,9 +22,9 @@ use crate::models::{
     GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest, ItemError, LabelAssignment,
     LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
     ProjectionRequest, ReadSnapshot, RegisteredType, RemainingBudget, RevisionOutcome,
-    SearchRequest, SearchResponse, StoreCapabilities, Subject, TenantId, TopologyPage,
-    TopologyRequest, TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
-    TypeRegistrationOptions,
+    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TenantId,
+    TopologyPage, TopologyRequest, TruncationReason, TypeIdSet, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -88,6 +88,17 @@ pub enum GraphStoreError {
     /// A documented hard bound was exceeded.
     #[error("limit exceeded: {what}")]
     LimitExceeded { what: String },
+    /// A write under a source namespace bound to another producer principal.
+    ///
+    /// Deliberately **not** `NotFound`: everywhere else a denial is
+    /// indistinguishable from absence (anti-enumeration), but here the caller
+    /// named a namespace whose owner is a fact about the tenant, not about
+    /// them, and telling them it does not exist would send them to create it.
+    /// DESIGN § Error Model maps this to `permission_denied` /
+    /// `SOURCE_NAMESPACE_FORBIDDEN`, "never retry; request ownership
+    /// transfer".
+    #[error("source namespace `{namespace}` is owned by another producer")]
+    SourceNamespaceForbidden { namespace: String },
     /// The query itself is malformed — an unknown filter field, an
     /// unparseable cursor, an ordering the store cannot serve. Distinct from
     /// `LimitExceeded`: nothing here is about a bound, and telling a caller
@@ -165,6 +176,28 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         query: TypeQuery,
     ) -> Result<Page<TypeRecord>, GraphStoreError>;
+    // --- source namespaces ------------------------------------------------
+    /// The namespaces claimed in this tenant, with the principal bound to
+    /// each. A read of the ownership boundary itself, for an operator who has
+    /// to answer "who owns this source".
+    async fn list_source_namespaces(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Vec<SourceNamespaceOwner>, GraphStoreError>;
+
+    /// Bind `namespace` to `owner_principal`, recording who moved it.
+    ///
+    /// The only way a namespace changes hands: writing under someone else's
+    /// namespace is refused rather than treated as a claim, so there is no
+    /// implicit transfer. The caller is authorized for ontology
+    /// administration, not merely for writing.
+    async fn transfer_source_namespace(
+        &self,
+        ctx: &StoreCtx<'_>,
+        namespace: &str,
+        owner_principal: &str,
+    ) -> Result<SourceNamespaceOwner, GraphStoreError>;
+
     /// Resolve GTS patterns to the set of registered types they cover, so a
     /// caller's type filter and an authorizing permission's pattern can be
     /// intersected on one representation.

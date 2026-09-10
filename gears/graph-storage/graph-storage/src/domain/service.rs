@@ -239,6 +239,44 @@ impl GraphServices {
         Ok(prefix)
     }
 
+    /// The source namespaces claimed in this tenant, with their owners.
+    ///
+    /// A read of the ownership boundary, authorized as a type-catalogue read:
+    /// it says who may write a namespace, not what is stored under it.
+    pub async fn list_source_namespaces(
+        &self,
+        ctx: &SecurityContext,
+    ) -> Result<Vec<graph_storage_sdk::models::SourceNamespaceOwner>, DomainError> {
+        let auth = self
+            .authorize(ctx, &authz::type_resource(), authz::actions::READ)
+            .await?;
+        Ok(self
+            .store
+            .list_source_namespaces(&self.store_ctx(&auth, None))
+            .await?)
+    }
+
+    /// Move a namespace to another producer principal.
+    ///
+    /// Ontology administration, not write: transferring a namespace is
+    /// deciding who may speak for a source, which is an administrative act
+    /// even though its effect is felt on the write path
+    /// (`fr-source-ownership`, DESIGN § Authorization Model).
+    pub async fn transfer_source_namespace(
+        &self,
+        ctx: &SecurityContext,
+        namespace: &str,
+        owner_principal: &str,
+    ) -> Result<graph_storage_sdk::models::SourceNamespaceOwner, DomainError> {
+        let auth = self
+            .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
+            .await?;
+        Ok(self
+            .store
+            .transfer_source_namespace(&self.store_ctx(&auth, None), namespace, owner_principal)
+            .await?)
+    }
+
     pub async fn get_type(
         &self,
         ctx: &SecurityContext,
