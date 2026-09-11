@@ -949,3 +949,15 @@ It never mattered until the adversarial sweep hydrated by a *foreign* internal i
 
 **Worth stating generally:** a fake diverging from the real store is expected and fine where the divergence is declared (snapshots, D-007). This one was undeclared and invisible, and it disarmed a test rather than failing one. The conformance suite is the only thing that can catch that class, and only for behaviour it actually exercises.
 
+## D-037 [impl-gap, fixed] A type whose schema cannot compile registered successfully and failed every write
+
+Registration validated the derivation chain from the **identifier** -- which is where the chain lives -- and never compiled the schema body. A `$ref` to something nobody registered therefore passed registration and failed at the first ingest of that type, with `schema does not compile: unresolved schema reference ...`. The producer got a success for the act that was wrong and a failure for every act that was right.
+
+Found by driving registration through the domain service for the first time (`tests/service.rs`).
+
+**Implementation:** both stores now compile the chain validator at registration, immediately after `analyze`, and report a compile failure as a per-item validation error. It is the same validator ingest compiles, so a type that registers is a type that can admit an instance.
+
+**Two things fell out of it.** The base ontology is now always resolvable inside `ChainValidator::compile`, not only when it happens to be on the chain: an analysis edge references the *provenance attribute*, a sibling family that is never an ancestor, so compiling the analysis-edge family type failed while compiling a leaf derived from it succeeded. And the conformance suite's own phantom case carried a misspelled `$ref` (`gts://gts.cf.core.graph.reference_node.v1~`, missing the `node.v1~` segment) which nothing had ever resolved, because nothing had ever compiled it.
+
+**Proposal:** none for the documents -- `fr-type-registration` already asks for a registration that validates. This is the implementation catching up with it.
+

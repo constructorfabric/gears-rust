@@ -565,14 +565,29 @@ impl jsonschema::Retrieve for MapRetriever {
 impl ChainValidator {
     /// Compile the leaf schema, resolving `gts://` references from the given
     /// chain (ancestors and the leaf itself, in any order).
+    /// The base ontology is always resolvable, whether or not it is on this
+    /// type's chain: an analysis edge references the provenance *attribute*,
+    /// which is a sibling family and therefore never an ancestor. Without
+    /// this the base schemas resolve for a leaf and not for the family type
+    /// they came with, which is the kind of asymmetry that makes a check
+    /// pass in one place and fail in another for no stated reason.
     pub fn compile(
         leaf: &Value,
         chain: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, DomainError> {
-        let schemas: BTreeMap<String, Value> = chain
-            .into_iter()
-            .map(|(id, schema)| (format!("gts://{id}"), schema))
+        let mut schemas: BTreeMap<String, Value> = BASE_SCHEMAS
+            .iter()
+            .filter_map(|(id, raw)| {
+                serde_json::from_str(raw)
+                    .ok()
+                    .map(|schema| (format!("gts://{id}"), schema))
+            })
             .collect();
+        schemas.extend(
+            chain
+                .into_iter()
+                .map(|(id, schema)| (format!("gts://{id}"), schema)),
+        );
         let validator = jsonschema::options()
             .with_retriever(MapRetriever { schemas })
             .build(leaf)

@@ -787,7 +787,9 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
             "$id": format!("gts://{REFERENCE}"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
-            "allOf": [{ "$ref": "gts://gts.cf.core.graph.reference_node.v1~" }]
+            "allOf": [{
+                "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~"
+            }]
         }),
     });
     store

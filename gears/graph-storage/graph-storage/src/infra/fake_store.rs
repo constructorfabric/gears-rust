@@ -297,6 +297,17 @@ impl GraphStoreV1 for FakeGraphStore {
                 )
             })?;
 
+            // Compiled here for the same reason the built-in store compiles
+            // it here: an unresolvable `$ref` is a type that can never admit
+            // an instance, and the registration is where that is actionable.
+            {
+                let mut chain: Vec<(String, serde_json::Value)> = ancestors.clone();
+                chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
+                ontology::ChainValidator::compile(&descriptor.schema, chain).map_err(|error| {
+                    validation(0, ItemFamily::Node, &descriptor.type_id, &error.to_string())
+                })?;
+            }
+
             if let Some(spec) = options.migration_for(&descriptor.type_id)
                 && !tenant.types.contains_key(&descriptor.type_id)
             {

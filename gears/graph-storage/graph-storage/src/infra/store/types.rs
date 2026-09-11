@@ -330,6 +330,13 @@ async fn register_in_tx(
             max_chain_depth,
         )
         .map_err(|error| invalid_candidate(&registration.type_id, error.to_string()))?;
+        // The schema must compile against its resolved chain *here*, not at
+        // the first ingest. A `$ref` to something nobody registered passes
+        // every identifier-based check -- the chain comes from the type id,
+        // not from the body -- and then fails every write of that type with
+        // "schema does not compile". Refusing it at registration puts the
+        // error where the producer can act on it.
+        let _ = chain_validator(&ancestors, &descriptor)?;
         let traits_json = traits_to_json(&descriptor);
         in_batch.insert(descriptor.type_id.clone(), descriptor.schema.clone());
         let migration = options.migration_for(&descriptor.type_id);
