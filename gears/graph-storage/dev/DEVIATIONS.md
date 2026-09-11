@@ -961,3 +961,24 @@ Found by driving registration through the domain service for the first time (`te
 
 **Proposal:** none for the documents -- `fr-type-registration` already asks for a registration that validates. This is the implementation catching up with it.
 
+## D-038 [impl-gap, fixed] Coverage was never measured, and four surfaces had no test at all
+
+`nfr-code-coverage` sets 85 %. `cargo llvm-cov` had never been run against this gear, so the number was unknown and, more to the point, so was *what* was uncovered. The first run said 73.25 % regions / 71.66 % lines, and the shape of the gap was more interesting than the number:
+
+| surface | lines covered before |
+| --- | --- |
+| `domain/service.rs` -- the layer every request goes through | 0 % |
+| `api/rest/{handlers,dto,error}.rs` | 0 % |
+| `domain/local_client.rs` -- the `ClientHub` entrance | 0 % |
+| `domain/admission.rs` -- the Capacity and Admission Contract | 0 % |
+| `infra/store/evolution.rs`, edge branch | 0 % |
+| `infra/store/spaces.rs` -- boot-time embedding-space resolution | 0 % |
+
+The conformance suite calls `GraphStoreV1` directly, which is deliberate and right; the consequence nobody had drawn is that everything *above* the port was unexercised, including the admission bounds that are the gear's half of the capacity contract.
+
+**Implementation:** `tests/service.rs` (the real `GraphServices`, a real `PolicyEnforcer` over a stub PDP, a one-hop engine over the in-memory store), `tests/rest.rs` (real requests through the gear's own axum router), an exhaustive `DomainError` to `CanonicalError` mapping test, a local-client parity case, an edge-type evolution case on both stores, and a boot-resolution case on a real server.
+
+**After: 86.77 % regions, 87.02 % lines, 83.41 % functions.** The remaining uncovered block of any size is `gear.rs` (the composition root, which needs a platform to boot) and the refusal branches of `store/types.rs`.
+
+**What the writing of them found** is recorded separately: [D-037](#d-037-impl-gap-fixed-a-type-whose-schema-cannot-compile-registered-successfully-and-failed-every-write). Worth saying once here: a coverage number is a poor goal and a good instrument. Chasing 85 % is how the fact that no test had ever sent an HTTP request to this gear became visible.
+

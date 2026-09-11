@@ -3824,3 +3824,149 @@ fn assert_no_foreign_keys(keys: &[String], what: &str) {
         "{what} returned the colliding key more than once: {keys:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Evolving an edge type
+// ---------------------------------------------------------------------------
+
+/// An edge type that carries a payload, at a given revision of its schema.
+///
+/// `closed` closes the payload level, which is what lets a widening be proved
+/// from the schemas alone; open payloads make every added property a
+/// narrowing (gts 4.4) and send the change to the row-reading grounds.
+fn weighted_edge(properties: &[&str], closed: bool) -> TypeRegistration {
+    let mut payload_properties = serde_json::Map::new();
+    for name in properties {
+        payload_properties.insert((*name).to_owned(), serde_json::json!({ "type": "string" }));
+    }
+    let mut payload = serde_json::json!({
+        "type": "object",
+        "properties": payload_properties,
+    });
+    if closed {
+        payload["additionalProperties"] = serde_json::json!(false);
+    }
+    TypeRegistration {
+        type_id: LINK.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{LINK}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~" },
+                { "type": "object", "properties": { "payload": payload } }
+            ]
+        }),
+    }
+}
+
+fn weighted(src: &str, dst: &str, weight: &str) -> EdgeSpec {
+    EdgeSpec {
+        type_id: LINK.to_owned(),
+        src_node_key: src.to_owned(),
+        dst_node_key: dst.to_owned(),
+        payload: Some(serde_json::json!({ "weight": weight })),
+        ..EdgeSpec::default()
+    }
+}
+
+/// Type evolution over an **edge** type: the grounds that read rows read edge
+/// rows too.
+///
+/// Every evolution case until this one updated a node type, so the edge half
+/// of the data-backed and migrated grounds -- counting edges, re-validating
+/// them against the candidate, rewriting their payloads, rebuilding the
+/// instance from its endpoints -- was implemented and never run.
+pub async fn an_edge_type_evolves_over_its_own_rows(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.retain(|registration| registration.type_id != LINK);
+    types.push(weighted_edge(&["weight"], false));
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("edge-a", "a"), node("edge-b", "b")],
+            vec![weighted("edge-a", "edge-b", "heavy")],
+        ),
+    )
+    .await
+    .expect("the edge commits");
+
+    // Declaring a second property narrows an open payload, so the schemas
+    // cannot prove it. The rows can: the one live edge has no `label` and
+    // nothing about it contradicts the candidate.
+    let registered = store
+        .register_types_with(
+            &ctx,
+            vec![weighted_edge(&["weight", "label"], false)],
+            graph_storage_sdk::models::TypeRegistrationOptions {
+                revalidate: true,
+                ..update_options()
+            },
+        )
+        .await
+        .expect("the rows admit what the schemas could not prove");
+    let admitted = registered.first().expect("one type, one verdict");
+    assert!(
+        matches!(
+            admitted.basis,
+            Some(graph_storage_sdk::models::AdmissionBasis::DataBacked { rows_validated: 1 })
+        ),
+        "admitted on the edge row it actually read: {:?}",
+        admitted.basis
+    );
+
+    // And the migrated ground, on edges: rename the payload field, move the
+    // data with it, and refuse if any edge would not satisfy the candidate.
+    let renamed = store
+        .register_types_with(
+            &ctx,
+            vec![weighted_edge(&["cost", "label"], false)],
+            migrating_options(vec![migration(
+                LINK,
+                vec![graph_storage_sdk::models::MigrationStep::Rename {
+                    from: "/payload/weight".to_owned(),
+                    to: "/payload/cost".to_owned(),
+                }],
+            )]),
+        )
+        .await
+        .expect("the migration runs over the edge rows");
+    let moved = renamed.first().expect("one type, one verdict");
+    assert!(
+        matches!(
+            moved.basis,
+            Some(graph_storage_sdk::models::AdmissionBasis::Migrated {
+                rows_scanned: 1,
+                rows_rewritten: 1
+            })
+        ),
+        "one edge scanned, one rewritten: {:?}",
+        moved.basis
+    );
+
+    // The data moved with the type: the edge read is what proves it, because
+    // a rename admitted without rewriting leaves the old name in the row.
+    let edge_key = only_incident_edge_key(store, &ctx, "edge-a").await;
+    let payload = store
+        .get_edge(&ctx, &edge_key)
+        .await
+        .expect("the edge reads")
+        .payload
+        .expect("it carries a payload");
+    assert_eq!(
+        payload.pointer("/cost").and_then(serde_json::Value::as_str),
+        Some("heavy"),
+        "the value moved to the new name: {payload}"
+    );
+    assert!(
+        payload.pointer("/weight").is_none(),
+        "and the old name is gone: {payload}"
+    );
+}

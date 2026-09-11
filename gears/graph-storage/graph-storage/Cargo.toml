@@ -80,3 +80,6 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 toolkit-db = { workspace = true, features = ["pg", "pgq", "integration"] }
+# Drives the gear's own axum router in-process: the REST cases send real
+# requests through it rather than calling the handlers as functions.
+tower = { workspace = true }

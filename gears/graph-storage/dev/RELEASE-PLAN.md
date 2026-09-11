@@ -153,8 +153,8 @@ What is closed so far, each with the case that closes it:
 | the scope single-writer race | done — and it found the fence was not one (D-035) | `two_replacements_of_one_scope_serialize`, on a multi-threaded runtime |
 | reference nodes, analysis edges, the edge read | done | `both_node_families_and_both_edge_families_round_trip`, `an_edge_read_carries_the_envelope`, `an_edge_whose_endpoint_is_hidden_is_not_readable`; the key rule itself in `domain::identity` unit tests |
 | adversarial case per endpoint | done | `no_read_surface_answers_with_another_tenants_rows` sweeps node read, key resolution, hydration by internal id, projection, both search arms, topology and embedding state under one trap fixture; the hop keeps its own case (`a_hop_never_leaves_its_tenant`), and the edge read its own |
-| coverage to 85 % | next | — |
-| § 6.1 timings | pending | — |
+| coverage to 85 % | done — 86.77 % regions, 87.02 % lines (`cargo llvm-cov -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk`, both lanes plus the new service and REST binaries) | the measurement itself, and what it made visible: the domain service, the REST surface, the in-process client, the error mapping, edge-type evolution and boot-time space resolution all had no test at all |
+| § 6.1 timings | next | — |
 
 Left as recorded cuts, with entries: `nfr-tenant-fairness` (D-105),
 `fr-index-admission` (D-104 + #4721), the snapshot obligation (D-007), the PG16

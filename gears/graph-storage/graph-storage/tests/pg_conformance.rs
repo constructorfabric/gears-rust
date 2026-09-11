@@ -991,3 +991,68 @@ async fn no_read_surface_answers_with_another_tenants_rows() {
     conformance::no_read_surface_answers_with_another_tenants_rows(stand.store.as_ref(), one, two)
         .await;
 }
+
+// --- boot-time embedding-space resolution -----------------------------------
+
+use graph_storage::infra::store::spaces::{SpaceResolution, resolve};
+
+fn space(model: &str) -> graph_storage_sdk::models::EmbeddingSpaceId {
+    graph_storage_sdk::models::EmbeddingSpaceId::new(
+        model,
+        "tokenizer-v1",
+        serde_json::json!({"lowercase": true}),
+        serde_json::json!({"mode": "mean"}),
+        serde_json::json!({"l2": true}),
+        8,
+    )
+}
+
+/// What boot decides about the deployment's vectors (ADR-0005).
+///
+/// Only the gear's composition root calls this, which is why it had no test:
+/// the decision that matters most on an upgrade -- a provider that is not the
+/// one the stored vectors came from -- was made by code nothing exercised.
+#[tokio::test]
+async fn a_second_boot_with_another_provider_reports_a_mismatch_rather_than_opening_an_epoch() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let first = resolve(&stand.db, &space("model-a"))
+        .await
+        .expect("the first boot resolves");
+    let SpaceResolution::Active { epoch } = first else {
+        panic!("a first boot adopts the provider's own space, got {first:?}");
+    };
+
+    assert_eq!(
+        resolve(&stand.db, &space("model-a"))
+            .await
+            .expect("a same-provider boot resolves"),
+        SpaceResolution::Active { epoch },
+        "the same provider adopts the recorded epoch rather than opening another"
+    );
+
+    // The upgrade case. Opening a new epoch here would strand every stored
+    // vector in a space nothing searches -- invisible corruption, which is
+    // what the mismatch exists to refuse.
+    match resolve(&stand.db, &space("model-b"))
+        .await
+        .expect("a different-provider boot still resolves")
+    {
+        SpaceResolution::Mismatched {
+            recorded_identity,
+            recorded_epoch,
+        } => {
+            assert_eq!(recorded_epoch, epoch);
+            assert_eq!(recorded_identity, space("model-a").identity_hash);
+        }
+        other @ SpaceResolution::Active { .. } => {
+            panic!("a different provider must not be adopted silently, got {other:?}")
+        }
+    }
+}
+
+pg_case!(
+    an_edge_type_evolves_over_its_own_rows,
+    conformance::an_edge_type_evolves_over_its_own_rows
+);

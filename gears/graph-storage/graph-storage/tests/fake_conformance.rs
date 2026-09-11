@@ -391,3 +391,8 @@ async fn no_read_surface_answers_with_another_tenants_rows() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn an_edge_type_evolves_over_its_own_rows() {
+    conformance::an_edge_type_evolves_over_its_own_rows(&store(), Uuid::now_v7()).await;
+}
