@@ -363,6 +363,10 @@ pg_case!(
     conformance::deleting_an_already_tombstoned_row_is_a_no_op
 );
 pg_case!(
+    the_type_catalogue_pages_through_its_own_cursor,
+    conformance::the_type_catalogue_pages_through_its_own_cursor
+);
+pg_case!(
     an_unchanged_re_ingest_embeds_nothing,
     conformance::an_unchanged_re_ingest_embeds_nothing
 );

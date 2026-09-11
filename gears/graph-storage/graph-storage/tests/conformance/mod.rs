@@ -4562,3 +4562,69 @@ pub async fn deleting_an_already_tombstoned_row_is_a_no_op(store: &dyn GraphStor
         "a key that never existed is still absent, got {never:?}"
     );
 }
+
+/// The type catalogue can be walked page by page.
+///
+/// It returned a `next_cursor` its own handler refused, and neither store
+/// minted one or read one — so a client shown a cursor had nowhere to send it
+/// back, and a tenant with more types than one page could not see them all.
+/// The token is the last identifier of the page rather than the platform's
+/// `CursorV1`, because the catalogue is deliberately not an `OData` collection
+/// (DESIGN § 3.3) and a keyset over the ordering column is what it has.
+pub async fn the_type_catalogue_pages_through_its_own_cursor(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    let all = store
+        .list_types(&ctx, graph_storage_sdk::models::TypeQuery::default())
+        .await
+        .expect("the catalogue lists");
+    assert!(
+        all.items.len() > 4,
+        "the base ontology alone is more than four types"
+    );
+    assert!(
+        all.next_cursor.is_none(),
+        "one page holding everything mints no cursor"
+    );
+
+    // Walk it three at a time and rebuild the whole list.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let page = store
+            .list_types(
+                &ctx,
+                graph_storage_sdk::models::TypeQuery {
+                    top: Some(3),
+                    cursor: cursor.clone(),
+                    ..graph_storage_sdk::models::TypeQuery::default()
+                },
+            )
+            .await
+            .expect("the page lists");
+        assert!(page.items.len() <= 3, "the page bound is respected");
+        seen.extend(page.items.iter().map(|item| item.type_id.clone()));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "the walk terminates");
+
+    let mut whole: Vec<String> = all.items.iter().map(|item| item.type_id.clone()).collect();
+    whole.sort();
+    let mut walked = seen.clone();
+    walked.sort();
+    assert_eq!(
+        walked, whole,
+        "paging sees every type exactly once, and no other"
+    );
+}

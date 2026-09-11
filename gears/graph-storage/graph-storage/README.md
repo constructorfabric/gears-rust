@@ -80,6 +80,11 @@ on server-wide state — so it runs at a bounded concurrency
 in-process runner). More than that on an ordinary machine and the connection
 pools start timing out, which reads as a flaky gear and is a busy host.
 
+A case that panics can leave its container behind — the removal is
+asynchronous, and nothing awaits it — so after a failed run
+`docker ps --filter ancestor=pg19-pgvector:latest` is worth a glance; a
+handful of forgotten servers is enough to make the next run look flaky too.
+
 ## Known limitations
 
 What the documents require and this iteration does not yet deliver, so a

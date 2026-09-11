@@ -521,21 +521,40 @@ impl GraphStoreV1 for FakeGraphStore {
                 },
             });
         };
-        let items = tenant
+        // Keyset paging over the identifier, as the built-in store does: the
+        // map is ordered, so "after this identifier" is a range.
+        let limit = query.top.map_or(usize::MAX, |top| top as usize);
+        let mut page: Vec<TypeRecord> = tenant
             .types
             .values()
+            .filter(|record| {
+                query
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|cursor| &record.type_id > cursor)
+            })
             .filter(|record| query.kind.is_none_or(|kind| kind == record.kind))
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect();
+        let has_more = page.len() > limit;
+        page.truncate(limit);
+        // Minted before the pattern filter, as in the built-in store.
+        let next_cursor = has_more
+            .then(|| page.last().map(|record| record.type_id.clone()))
+            .flatten();
+        let items = page
+            .into_iter()
             .filter(|record| {
                 query.pattern.as_ref().is_none_or(|pattern| {
                     ontology::matches_any_pattern(&record.type_id, std::slice::from_ref(pattern))
                         .unwrap_or(false)
                 })
             })
-            .cloned()
             .collect();
         Ok(Page {
             items,
-            next_cursor: None,
+            next_cursor,
             revision: self.revision_of(tenant),
         })
     }

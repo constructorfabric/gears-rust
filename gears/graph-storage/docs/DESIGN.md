@@ -1107,7 +1107,7 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 |---|---|---|---|
 | `POST` | `/api/graph-storage/v1/types` | Register a type batch, atomically; `options.on_existing` decides what a changed schema under a registered identifier means (ADR-0006) | p1 |
 | `POST` | `/api/graph-storage/v1/types/compatibility` | What registering this batch would do, without writing: per type the verdicts, the diagnostics with their schema locations, the moved traits, the row count (ADR-0006) | p1 |
-| `GET` | `/api/graph-storage/v1/types` | List types; plain query parameters `kind`, `pattern` (GTS identifier pattern), `limit`, `cursor` — not an OData collection (below) | p1 |
+| `GET` | `/api/graph-storage/v1/types` | List types; plain query parameters `kind`, `pattern` (GTS identifier pattern), `limit`, `cursor` — not an OData collection (below), and the cursor is a keyset over the identifier rather than `CursorV1` | p1 |
 | `GET` | `/api/graph-storage/v1/types/{gts_type_id}` | One type with its schema and effective traits | p1 |
 | `GET` | `/api/graph-storage/v1/source-namespaces` | Claimed source namespaces and the producer principal bound to each (`fr-source-ownership`) | p1 |
 | `POST` | `/api/graph-storage/v1/source-namespaces/{namespace}/owner` | Transfer a namespace to another principal — the only way one changes hands; ontology administration | p1 |
@@ -1182,6 +1182,12 @@ one, and the architecture lints (`DE0802`, `DE0803`) refuse a hand-rolled
 resolved to a set of registered types, not evaluated as an expression, so the
 type catalog takes `pattern` and `limit` as ordinary query parameters. Only the
 node projection is an OData collection.
+
+Its `cursor` is an ordinary parameter for the same reason: the platform's
+`CursorV1` belongs to the OData binding, so the catalogue pages by keyset over
+the identifier it already orders by. The token is minted before the pattern
+filter runs — a page whose rows the pattern then removes is still a page, and a
+caller that stopped at an empty one would miss every match after it.
 
 **Found while building the prototype: `CursorV1` cannot be extended with the
 revision.** An earlier draft said continuation tokens were "the platform

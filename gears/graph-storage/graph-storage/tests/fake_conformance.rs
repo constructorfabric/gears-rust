@@ -427,3 +427,8 @@ async fn hybrid_search_fuses_both_arms() {
 async fn deleting_an_already_tombstoned_row_is_a_no_op() {
     conformance::deleting_an_already_tombstoned_row_is_a_no_op(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn the_type_catalogue_pages_through_its_own_cursor() {
+    conformance::the_type_catalogue_pages_through_its_own_cursor(&store(), Uuid::now_v7()).await;
+}

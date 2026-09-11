@@ -904,12 +904,26 @@ pub async fn list_types(
     if let Some(kind) = query.kind {
         select = select.filter(Condition::all().add(gts_type::Column::Kind.eq(kind_to_str(kind))));
     }
+    // Keyset paging on the ordering column. The catalogue is deliberately not
+    // an `OData` collection (§ 3.3), so the token is not `CursorV1`: it is the
+    // last identifier of the page, which the caller has already been shown.
+    if let Some(cursor) = &query.cursor {
+        select =
+            select.filter(Condition::all().add(gts_type::Column::GtsTypeId.gt(cursor.clone())));
+    }
     let limit = query.top.unwrap_or(store.config().projection_max_page);
-    let models = select
-        .limit(u64::from(limit))
+    // One row past the page, to know whether there is another one.
+    let mut models = select
+        .limit(u64::from(limit) + 1)
         .all(&conn)
         .await
         .map_err(map_scope_err)?;
+    let has_more = models.len() > limit as usize;
+    models.truncate(limit as usize);
+    // Minted before the pattern filter runs: a page whose rows the pattern
+    // then removes is still a page, and a caller that stopped there would
+    // miss every match after it.
+    let next_cursor = has_more.then(|| models.last().map(|m| m.gts_type_id.clone()));
 
     // The pattern is resolved through the platform GTS implementation, never
     // compiled into SQL: no identifier ever reaches a LIKE pattern.
@@ -933,7 +947,7 @@ pub async fn list_types(
     let revision = crate::infra::store::reads::revision(store, ctx).await?;
     Ok(Page {
         items,
-        next_cursor: None,
+        next_cursor: next_cursor.flatten(),
         revision,
     })
 }
