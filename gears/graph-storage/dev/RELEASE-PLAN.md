@@ -152,8 +152,8 @@ What is closed so far, each with the case that closes it:
 | `fr-scope-replace` (removal half) | done | `scope_replacement_removes_what_the_batch_no_longer_names`, `scope_replacement_preserves_analysis_edges_and_their_endpoints` |
 | the scope single-writer race | done — and it found the fence was not one (D-035) | `two_replacements_of_one_scope_serialize`, on a multi-threaded runtime |
 | reference nodes, analysis edges, the edge read | done | `both_node_families_and_both_edge_families_round_trip`, `an_edge_read_carries_the_envelope`, `an_edge_whose_endpoint_is_hidden_is_not_readable`; the key rule itself in `domain::identity` unit tests |
-| adversarial case per endpoint | next | — |
-| coverage to 85 % | pending | — |
+| adversarial case per endpoint | done | `no_read_surface_answers_with_another_tenants_rows` sweeps node read, key resolution, hydration by internal id, projection, both search arms, topology and embedding state under one trap fixture; the hop keeps its own case (`a_hop_never_leaves_its_tenant`), and the edge read its own |
+| coverage to 85 % | next | — |
 | § 6.1 timings | pending | — |
 
 Left as recorded cuts, with entries: `nfr-tenant-fairness` (D-105),

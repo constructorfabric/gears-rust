@@ -381,3 +381,13 @@ async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn no_read_surface_answers_with_another_tenants_rows() {
+    conformance::no_read_surface_answers_with_another_tenants_rows(
+        &store(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

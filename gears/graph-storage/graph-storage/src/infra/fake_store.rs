@@ -138,7 +138,6 @@ struct Tenant {
     nodes: Vec<FakeNode>,
     edges: Vec<FakeEdge>,
     revision: i64,
-    next_id: i64,
     receipts: BTreeMap<String, Receipt>,
     scopes: BTreeMap<(String, String), (i64, String)>,
     /// Snapshots taken by `begin_read`: a full copy, which is what makes this
@@ -157,6 +156,12 @@ struct TenantData {
 pub struct FakeGraphStore {
     epoch: i64,
     tenants: Mutex<BTreeMap<Uuid, Tenant>>,
+    /// Internal ids are unique across the whole store, not per tenant, like
+    /// the `PostgreSQL` sequence they stand in for. Per-tenant counters would
+    /// hand two tenants the same id, and a case that hydrates by a foreign id
+    /// -- the surface where a missing tenant predicate does not show up as a
+    /// key collision -- would then be asserting nothing.
+    next_id: std::sync::atomic::AtomicI64,
     /// Longest admitted derivation chain, in segments; the platform posture
     /// (3) unless a test raises it, exactly like `ontology_max_chain_depth`.
     max_chain_depth: usize,
@@ -174,6 +179,7 @@ impl FakeGraphStore {
         Self {
             epoch: 1,
             tenants: Mutex::new(BTreeMap::new()),
+            next_id: std::sync::atomic::AtomicI64::new(0),
             max_chain_depth: 3,
         }
     }
@@ -622,7 +628,7 @@ impl GraphStoreV1 for FakeGraphStore {
         // a partway failure leaves nothing.
         let mut nodes = tenant.nodes.clone();
         let mut edges = tenant.edges.clone();
-        let mut next_id = tenant.next_id;
+        let mut next_id = self.next_id.load(std::sync::atomic::Ordering::SeqCst);
         let mut counts = IngestCounts::default();
         let mut changed = false;
 
@@ -709,7 +715,8 @@ impl GraphStoreV1 for FakeGraphStore {
 
         tenant.nodes = nodes;
         tenant.edges = edges;
-        tenant.next_id = next_id;
+        self.next_id
+            .store(next_id, std::sync::atomic::Ordering::SeqCst);
         for (namespace, row) in claims {
             tenant.namespaces.insert(namespace, row);
         }

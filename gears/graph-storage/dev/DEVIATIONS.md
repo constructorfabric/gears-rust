@@ -938,3 +938,14 @@ ADR-0001 point 2 makes PG16+ the baseline and demands CI on both PG16 and PG19. 
 
 ## D-110 [deferred] Observability contract
 `fr-observability` deny-by-default telemetry allowlist: followed in spirit (no payload/query text in logs), but the metric/counter surface (saturation counters, high-watermark gauges per limit) is not built.
+
+## D-036 [impl] The fake numbered nodes per tenant, which made a leak test pass vacuously
+
+`FakeGraphStore` allocated internal ids from a counter held **inside each tenant**, so the first node of tenant A and the first node of tenant B both had id 1. The built-in store's ids come from a PostgreSQL sequence and are unique across the whole database.
+
+It never mattered until the adversarial sweep hydrated by a *foreign* internal id -- the one read surface where a missing tenant predicate does not show up as a key collision, because nothing about the request mentions a key. On the fake the foreign id was our own node's id, so the case got a row back, and the row it got back was the right one: the assertion would have passed whatever `hydrate_nodes` did with the tenant.
+
+**Implementation:** the counter moved to the store as an `AtomicI64`. Nothing else changed; ids are opaque to every caller.
+
+**Worth stating generally:** a fake diverging from the real store is expected and fine where the divergence is declared (snapshots, D-007). This one was undeclared and invisible, and it disarmed a test rather than failing one. The conformance suite is the only thing that can catch that class, and only for behaviour it actually exercises.
+

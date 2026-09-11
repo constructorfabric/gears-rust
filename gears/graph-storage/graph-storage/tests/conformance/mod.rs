@@ -3588,3 +3588,237 @@ pub async fn an_edge_whose_endpoint_is_hidden_is_not_readable(
         "an edge with an invisible endpoint is not an edge the caller may see"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One adversarial fixture, every read surface
+// ---------------------------------------------------------------------------
+
+/// Seed one tenant with the trap: a node under a key the *other* tenant also
+/// owns, a node only this tenant owns, an edge between them, and text both
+/// tenants' nodes share so no search arm can tell them apart by content.
+async fn seed_trap(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>, only: &str) {
+    store
+        .register_types(ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        ctx,
+        batch(
+            vec![
+                summarized("shared-key", "findable thing", "a shared summary"),
+                summarized(only, "findable thing", "a shared summary"),
+            ],
+            vec![edge("shared-key", only)],
+        ),
+    )
+    .await
+    .expect("the trap commits");
+}
+
+/// `nfr-tenant-zero-leak` on every read surface the store port exposes, under
+/// one fixture built to expose a leak rather than to be absent from one.
+///
+/// Each assertion names what it would have seen had the surface leaked, and
+/// the other tenant's fixture is asserted to exist first: a guard test whose
+/// trap quietly stopped being seeded passes for as long as nobody looks.
+pub async fn no_read_surface_answers_with_another_tenants_rows(
+    store: &dyn GraphStoreV1,
+    one: Uuid,
+    two: Uuid,
+) {
+    let ours_scope = AccessScope::for_tenant(one);
+    let theirs_scope = AccessScope::for_tenant(two);
+    let ours = ctx(one, &ours_scope, None);
+    let theirs = ctx(two, &theirs_scope, None);
+    seed_trap(store, &ours, "ours-only").await;
+    seed_trap(store, &theirs, "theirs-only").await;
+
+    // Precondition. Everything below asserts an absence, and an absence is
+    // only evidence when the thing being looked for exists somewhere.
+    let their_node = store
+        .get_node(&theirs, &"theirs-only".to_owned(), 10)
+        .await
+        .expect("the other tenant's fixture exists");
+    assert_eq!(their_node.adjacency.len(), 1, "with its edge");
+    let their_id = store
+        .resolve_node_ids(&theirs, &["theirs-only".to_owned()])
+        .await
+        .expect("resolution succeeds")
+        .first()
+        .expect("their key resolves")
+        .1;
+
+    the_node_read_stays_inside(store, &ours).await;
+    resolution_and_hydration_stay_inside(store, &ours, their_id).await;
+    the_projection_stays_inside(store, &ours).await;
+    both_search_arms_stay_inside(store, &ours).await;
+    topology_and_embedding_state_stay_inside(store, &ours).await;
+}
+
+/// The colliding key is ours, the other tenant's own key is not reachable,
+/// and adjacency does not cross the boundary either.
+async fn the_node_read_stays_inside(store: &dyn GraphStoreV1, ours: &StoreCtx<'_>) {
+    let shared = store
+        .get_node(ours, &"shared-key".to_owned(), 10)
+        .await
+        .expect("we see our own node");
+    assert!(
+        shared
+            .adjacency
+            .iter()
+            .all(|entry| entry.neighbor_key == "ours-only"),
+        "adjacency crossed the tenant boundary: {:?}",
+        shared.adjacency
+    );
+    assert!(
+        store
+            .get_node(ours, &"theirs-only".to_owned(), 10)
+            .await
+            .is_err(),
+        "another tenant's key must read as absent"
+    );
+}
+
+/// Key resolution, where unknown and unauthorized are alike absent, and
+/// hydration by internal id, which bypasses keys entirely -- the surface
+/// where a missing tenant predicate would not show up as a key collision.
+async fn resolution_and_hydration_stay_inside(
+    store: &dyn GraphStoreV1,
+    ours: &StoreCtx<'_>,
+    their_id: graph_storage_sdk::models::NodeId,
+) {
+    let resolved = store
+        .resolve_node_ids(ours, &["shared-key".to_owned(), "theirs-only".to_owned()])
+        .await
+        .expect("resolution succeeds");
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>(),
+        vec!["shared-key".to_owned()],
+        "resolution admitted a key that is not ours"
+    );
+
+    let hydrated = store
+        .hydrate_nodes(ours, &[their_id])
+        .await
+        .expect("hydration succeeds");
+    assert!(
+        hydrated.is_empty(),
+        "another tenant's internal id hydrated: {hydrated:?}"
+    );
+}
+
+async fn the_projection_stays_inside(store: &dyn GraphStoreV1, ours: &StoreCtx<'_>) {
+    let page = store
+        .project_table(ours, ProjectionRequest::default())
+        .await
+        .expect("projection succeeds");
+    let projected: Vec<String> = page.items.iter().map(|row| row.node_key.clone()).collect();
+    assert!(
+        projected.iter().any(|key| key == "ours-only"),
+        "the projection must carry our own rows: {projected:?}"
+    );
+    assert_no_foreign_keys(&projected, "the projection");
+}
+
+/// Both arms, under text the two tenants share: a leak cannot hide behind
+/// ranking, because it shows up as the other tenant's key or as two hits for
+/// the colliding one.
+async fn both_search_arms_stay_inside(store: &dyn GraphStoreV1, ours: &StoreCtx<'_>) {
+    let lexical = store
+        .search(
+            ours,
+            SearchRequest {
+                mode: SearchMode::Lexical,
+                query: Some("findable".to_owned()),
+                arm_limit: 10,
+                limit: 10,
+                type_patterns: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("search succeeds")
+        .hits
+        .into_iter()
+        .map(|hit| hit.node_key)
+        .collect::<Vec<_>>();
+    assert!(
+        lexical.contains(&"ours-only".to_owned()),
+        "the lexical arm must find our own text first: {lexical:?}"
+    );
+    assert_no_foreign_keys(&lexical, "the lexical arm");
+
+    let vector = search_vector(store, ours, "a shared summary", EPOCH).await;
+    assert!(
+        vector.contains(&"ours-only".to_owned()),
+        "the vector arm must find our own text first: {vector:?}"
+    );
+    assert_no_foreign_keys(&vector, "the vector arm");
+}
+
+/// Topology is the widest surface of all -- it exists to hand a whole graph
+/// to the analytics gear, so a missing predicate here hands over two -- and
+/// embedding state decides what gets embedded, so a foreign key reading as
+/// *known* would make the coordinator skip work it owes.
+async fn topology_and_embedding_state_stay_inside(store: &dyn GraphStoreV1, ours: &StoreCtx<'_>) {
+    let request = || graph_storage_sdk::models::TopologyRequest {
+        cursor: None,
+        page_size: Some(100),
+    };
+    if store.capabilities().topology {
+        let topology = store
+            .load_topology(ours, request())
+            .await
+            .expect("topology loads");
+        let keys: Vec<String> = topology.nodes.iter().map(|(key, _)| key.clone()).collect();
+        assert!(
+            keys.contains(&"ours-only".to_owned()),
+            "the topology must carry our own nodes: {keys:?}"
+        );
+        assert_no_foreign_keys(&keys, "the topology");
+        for edge in &topology.edges {
+            assert!(
+                edge.src != "theirs-only" && edge.dst != "theirs-only",
+                "the topology leaked an edge: {edge:?}"
+            );
+        }
+    } else {
+        // A store that declares the capability absent is not excused, it is
+        // held to the other half of the contract: refuse, never approximate.
+        assert!(
+            matches!(
+                store.load_topology(ours, request()).await,
+                Err(GraphStoreError::Unsupported { .. })
+            ),
+            "a store without the topology capability must refuse it"
+        );
+    }
+
+    let states = store
+        .embedding_state(ours, &["theirs-only".to_owned()])
+        .await
+        .expect("embedding state reads");
+    assert_eq!(
+        states,
+        vec![None],
+        "another tenant's vector state is not ours"
+    );
+}
+
+fn assert_no_foreign_keys(keys: &[String], what: &str) {
+    assert!(
+        !keys.iter().any(|key| key == "theirs-only"),
+        "{what} returned another tenant's row: {keys:?}"
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.as_str() == "shared-key")
+            .count(),
+        usize::from(keys.iter().any(|key| key == "shared-key")),
+        "{what} returned the colliding key more than once: {keys:?}"
+    );
+}

@@ -978,3 +978,16 @@ async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
     conformance::an_edge_whose_endpoint_is_hidden_is_not_readable(stand.store.as_ref(), one, two)
         .await;
 }
+
+/// The adversarial sweep: one trap fixture, every read surface the store port
+/// exposes, against a real server.
+#[tokio::test]
+async fn no_read_surface_answers_with_another_tenants_rows() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let one = tenant_on(&stand).await;
+    let two = tenant_on(&stand).await;
+    conformance::no_read_surface_answers_with_another_tenants_rows(stand.store.as_ref(), one, two)
+        .await;
+}
