@@ -68,7 +68,7 @@ fn graph_image() -> Option<(String, String)> {
 async fn stand(hop: HopStrategy) -> Option<Stand> {
     let started = match graph_image() {
         Some((name, tag)) => {
-            cf_gears_test_containers::postgres_graph()
+            test_containers::postgres_graph()
                 .with_name(name)
                 .with_tag(tag)
                 .with_env_var("POSTGRES_PASSWORD", "pass")
@@ -78,7 +78,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
                 .await
         }
         None => {
-            cf_gears_test_containers::postgres_graph()
+            test_containers::postgres_graph()
                 .with_env_var("POSTGRES_PASSWORD", "pass")
                 .with_env_var("POSTGRES_USER", "user")
                 .with_env_var("POSTGRES_DB", "graph")
@@ -91,9 +91,9 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         Ok(container) => container,
         Err(error) => {
             assert!(
-                !cf_gears_test_containers::graph_lane_required(),
+                !test_containers::graph_lane_required(),
                 "GEARS_TEST_PG_GRAPH_REQUIRED is set but PostgreSQL 19 ({}) could not start: {error}",
-                cf_gears_test_containers::postgres_graph_tag()
+                test_containers::postgres_graph_tag()
             );
             eprintln!("PostgreSQL 19 unavailable - skipping the SQL/PGQ lane: {error}");
             return None;
@@ -122,7 +122,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         let message = error.to_string();
         assert!(
             !message.contains("extension \"vector\" is not available")
-                || cf_gears_test_containers::graph_lane_required(),
+                || test_containers::graph_lane_required(),
             "migrations apply: {error}"
         );
         if message.contains("extension \"vector\" is not available") {

@@ -87,9 +87,12 @@ pub fn map_scope_err(error: ScopeError) -> GraphStoreError {
                 ),
             }
         }
-        ScopeError::Pgq(inner) => GraphStoreError::ScopeUnservable {
-            reason: format!("graph pattern cannot carry this scope: {inner}"),
-        },
+        // Not `ScopeUnservable`: a syntax refusal is a malformed declaration
+        // of ours rather than a scope this store cannot carry, and routing it
+        // to the fallback backend would hide it indefinitely.
+        ScopeError::GraphSyntax(inner) => {
+            GraphStoreError::Internal(format!("graph pattern is malformed: {inner}"))
+        }
         other => GraphStoreError::Internal(other.to_string()),
     }
 }

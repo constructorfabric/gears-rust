@@ -138,9 +138,13 @@ fn scope_error(error: ScopeError) -> GraphEngineError {
                 ),
             }
         }
-        ScopeError::Pgq(inner) => GraphEngineError::ScopeNotEnforceable {
-            reason: format!("pattern cannot carry this scope: {inner}"),
-        },
+        // A syntax refusal is this gear's declaration being wrong, not the
+        // caller's scope being unservable. The same pattern is malformed on
+        // every request, so reporting it as a scope problem would send the
+        // caller after their own permissions for a bug that is ours.
+        ScopeError::GraphSyntax(inner) => {
+            GraphEngineError::Internal(format!("graph pattern is malformed: {inner}"))
+        }
         other => GraphEngineError::Internal(other.to_string()),
     }
 }
@@ -303,15 +307,24 @@ async fn expand_pgq(
                 .scope_with(ctx.scope)
                 .with_graph::<KnowledgeGraph>();
             let select = match direction {
+                // `correlate_with_anchor` is what keeps the anchor query in
+                // the FROM. It is no longer inferred from `where_`, and this
+                // predicate names the anchor's own columns, so without the
+                // opt-in the pattern would reference a relation that is not
+                // there -- and the failure would look like "this server has no
+                // property graph", quietly costing every traversal its
+                // single-statement path.
                 Direction::Outgoing => select.match_path(|p| {
                     p.vertex::<node::Entity>("a")
                         .where_(anchor_correlation("a"))
+                        .correlate_with_anchor()
                         .edge_to::<edge::Entity>("e")
                         .to::<node::Entity>("b")
                 }),
                 _ => select.match_path(|p| {
                     p.vertex::<node::Entity>("a")
                         .where_(anchor_correlation("a"))
+                        .correlate_with_anchor()
                         .edge_from::<edge::Entity>("e")
                         .to::<node::Entity>("b")
                 }),
@@ -326,9 +339,14 @@ async fn expand_pgq(
         };
         let rows = match rows {
             Ok(rows) => rows,
-            // The scope refusals stay distinguishable: those are about *this*
-            // caller and are re-raised so the caller-facing reason survives.
-            Err(error @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_))) => {
+            // Two refusals are re-raised rather than treated as "this server
+            // cannot serve the pattern": an unresolved scope property is about
+            // *this* caller and its reason must survive, and a syntax refusal
+            // is a malformed declaration of ours that falling back would hide
+            // for as long as nobody looks.
+            Err(
+                error @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::GraphSyntax(_)),
+            ) => {
                 return Err(scope_error(error));
             }
             // Anything else the pattern statement did — most often that this
