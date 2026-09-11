@@ -261,7 +261,7 @@ impl GraphStoreV1 for PgGraphStore {
                 ReadinessState::Degraded,
                 "the declared property graph did not answer a pattern at startup; the server \
                  major is not reported, because the attempt says the pattern did not run and \
-                 not why (D-004)",
+                 not why",
                 "nothing: every traversal is served by the two-query hop",
                 "restart after the property-graph migration runs on a server that supports \
                  SQL/PGQ",

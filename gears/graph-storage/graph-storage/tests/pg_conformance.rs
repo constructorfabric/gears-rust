@@ -265,7 +265,7 @@ pg_case!(
     conformance::a_projection_row_carries_the_envelope
 );
 
-// --- payload projection (DEVIATIONS D-104) ----------------------------------
+// --- payload projection -----------------------------------------------------
 
 pg_case!(
     a_declared_payload_path_filters_and_orders_the_projection,

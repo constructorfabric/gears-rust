@@ -311,14 +311,14 @@ impl GraphServices {
             TYPES_REGISTRY,
             State::NotImplemented,
             "this iteration reaches the registry only at publication, not per request, so \
-             there is no runtime dependency to probe (D-013)",
+             there is no runtime dependency to probe",
             "nothing",
             "a runtime dependency on the registry, when the verdict is delegated to it",
         ));
         rows.push(Row::new(
             DYNAMIC_INDEXES,
             State::NotImplemented,
-            "the index-activation lifecycle is not built (D-104); a declared path is \
+            "the index-activation lifecycle is not built; a declared path is \
              filterable as soon as it is declared, served by the static payload GIN",
             "nothing, and that is the gap: nothing rejects a filter for an index that is \
              still building, because no index is ever built",
@@ -327,7 +327,7 @@ impl GraphServices {
         rows.push(Row::new(
             TENANT_RECONCILIATION,
             State::NotImplemented,
-            "tenant offboarding is not built (D-106), so no deletion generation is tracked or \
+            "tenant offboarding is not built, so no deletion generation is tracked or \
              reconciled",
             "nothing",
             "the offboarding protocol",
@@ -335,7 +335,7 @@ impl GraphServices {
         rows.push(Row::new(
             METRIC_ANNOTATION,
             State::NotImplemented,
-            "metric annotation is not built (D-107); projections carry no annotations to be \
+            "metric annotation is not built; projections carry no annotations to be \
              missing",
             "nothing",
             "the analytics gear's annotation surface",

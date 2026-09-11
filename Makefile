@@ -729,8 +729,9 @@ test-graph-storage: install-tools
 ## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
 ## suite against the built-in store, plus the SQL/PGQ cases that only a real
 ## server can answer. It needs an image carrying PostgreSQL 19 **and**
-## pgvector — the platform pin has only the former (dev note D-003) — so
-## point GEARS_TEST_PG_GRAPH_IMAGE at one. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
+## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
+## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
 ## turns "no such image, skipping" into a failure, so CI cannot go green by
 ## running nothing; that is the default here, because a target whose whole
 ## purpose is the database has no business passing without one.
