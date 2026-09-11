@@ -118,14 +118,16 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
 
     if let Err(error) = run_migrations_for_testing(&db, Migrator::migrations()).await {
         // pgvector missing is the platform-pin gap, not a gear failure: say so
-        // and skip, unless the lane was declared required.
-        let message = error.to_string();
+        // and skip, unless the lane was declared required — then a stock image
+        // is a failure, because a lane that skips itself proves nothing.
+        let no_pgvector = error
+            .to_string()
+            .contains("extension \"vector\" is not available");
         assert!(
-            !message.contains("extension \"vector\" is not available")
-                || test_containers::graph_lane_required(),
-            "migrations apply: {error}"
+            !(no_pgvector && test_containers::graph_lane_required()),
+            "GEARS_TEST_PG_GRAPH_REQUIRED is set but the graph image has no pgvector: {error}"
         );
-        if message.contains("extension \"vector\" is not available") {
+        if no_pgvector {
             eprintln!(
                 "the graph image has no pgvector - skipping; set GEARS_TEST_PG_GRAPH_IMAGE \
                  to an image with PostgreSQL 19 and pgvector"
@@ -235,6 +237,14 @@ pg_case!(
 );
 
 pg_case!(an_identical_batch_converges, conformance::convergent_replay);
+pg_case!(
+    a_same_key_ingest_may_not_change_the_type,
+    conformance::a_same_key_ingest_may_not_change_the_type
+);
+pg_case!(
+    per_item_outcomes_follow_the_batch_order,
+    conformance::per_item_outcomes_follow_the_batch_order
+);
 pg_case!(
     an_unchanged_re_ingest_embeds_nothing,
     conformance::an_unchanged_re_ingest_embeds_nothing
