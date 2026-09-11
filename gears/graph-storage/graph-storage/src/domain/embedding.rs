@@ -65,6 +65,17 @@ impl EmbeddingCoordinator {
     }
 
     /// The epoch new vectors are stamped with, if any may be written.
+    /// Whether the provider can answer at all.
+    ///
+    /// Asked by readiness, and asked of the provider rather than inferred
+    /// from the last failure: a provider that recovered between requests is
+    /// healthy, and one that has never been called is not assumed to be.
+    pub async fn health(
+        &self,
+    ) -> Result<(), graph_storage_sdk::plugin_api::EmbeddingProviderError> {
+        self.provider.health().await
+    }
+
     #[must_use]
     pub fn active_epoch(&self) -> Option<i64> {
         match self.state {

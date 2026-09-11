@@ -407,6 +407,31 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::get(format!("{BASE}/health/ready"))
+        .operation_id("graph_storage.readiness")
+        .summary("Readiness per capability, with named problems")
+        .description(
+            "Per-component state: `healthy`, `degraded`, `unhealthy`, or \
+             `not_implemented` for a capability this build does not ship, \
+             each with what it blocks and the condition being waited on. The \
+             aggregate is ready unless a component whose failure blocks \
+             everything is unhealthy; an embedding-space mismatch is unhealthy \
+             and leaves the gear ready, blocking only the vector arms. \
+             Answers 200 whatever the state: readiness is a state to read",
+        )
+        .tag(API_TAG)
+        .anonymous()
+        .exposed()
+        .handler(handlers::readiness)
+        .json_response_with_schema::<dto::GraphReadinessDto>(
+            openapi,
+            http::StatusCode::OK,
+            "Per-capability readiness",
+        )
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     OperationBuilder::get(format!("{BASE}/revision"))
         .operation_id("graph_storage.revision")
         .summary("The caller-visible graph revision")

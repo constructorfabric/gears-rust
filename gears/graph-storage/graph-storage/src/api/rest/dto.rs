@@ -188,6 +188,33 @@ pub struct GraphTypeListDto {
     pub revision: GraphRevisionDto,
 }
 
+/// One capability's readiness, as DESIGN's matrix reports it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphComponentReadinessDto {
+    /// The matrix's own name for the component.
+    pub component: String,
+    /// `healthy` | `degraded` | `unhealthy` | `not_implemented`.
+    pub state: String,
+    /// What is wrong, named. Absent when healthy.
+    pub problem: Option<String>,
+    /// What this state rejects.
+    pub blocked: Option<String>,
+    /// The condition being waited on.
+    pub recovery: Option<String>,
+}
+
+/// Readiness per capability, never one global boolean.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphReadinessDto {
+    /// Ready when no component whose failure blocks everything is unhealthy.
+    /// An embedding-space mismatch is unhealthy and leaves the gear ready:
+    /// it blocks the vector arms and nothing else.
+    pub ready: bool,
+    pub components: Vec<GraphComponentReadinessDto>,
+}
+
 /// One source namespace and the producer principal bound to it.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -529,6 +556,27 @@ impl From<m::TypeRecord> for GraphTypeDto {
             schema: value.schema,
             effective_traits: value.effective_traits.into(),
             revision: value.revision,
+        }
+    }
+}
+
+impl From<m::ComponentReadiness> for GraphComponentReadinessDto {
+    fn from(value: m::ComponentReadiness) -> Self {
+        Self {
+            component: value.component,
+            state: value.state.as_str().to_owned(),
+            problem: value.problem,
+            blocked: value.blocked,
+            recovery: value.recovery,
+        }
+    }
+}
+
+impl From<m::Readiness> for GraphReadinessDto {
+    fn from(value: m::Readiness) -> Self {
+        Self {
+            ready: value.ready,
+            components: value.components.into_iter().map(Into::into).collect(),
         }
     }
 }

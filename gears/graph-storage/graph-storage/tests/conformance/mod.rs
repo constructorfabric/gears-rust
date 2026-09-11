@@ -2880,3 +2880,65 @@ pub async fn an_owned_nodes_source_field_claims_no_namespace(
     .await
     .expect("the reference producer claims a namespace no owned node took");
 }
+
+// --- readiness ----------------------------------------------------------------
+
+/// The matrix's aggregate rule, and the one row that contradicts it.
+///
+/// `fr-readiness` is per capability, not one boolean: a component is healthy,
+/// degraded or unhealthy, and only *some* states take the gear out of service.
+/// The embedding-space row is the case worth pinning — it is `unhealthy` and
+/// the gear stays ready, because a mismatch blocks the vector arms and nothing
+/// else. A conformance case rather than a unit test because the probe is the
+/// store's, and the two stores must answer the same shape.
+pub async fn readiness_reports_every_capability_and_only_some_block_service(
+    store: &dyn GraphStoreV1,
+) {
+    use graph_storage_sdk::models::{ComponentReadiness, Readiness, ReadinessState};
+
+    let rows = store.probe_readiness().await;
+    let named: Vec<&str> = rows.iter().map(|row| row.component.as_str()).collect();
+    assert!(
+        named.contains(&graph_storage_sdk::models::DATABASE),
+        "every store answers for its own storage: {named:?}"
+    );
+    assert!(
+        named.contains(&graph_storage_sdk::models::SQLPGQ),
+        "and for the traversal backend it actually provides: {named:?}"
+    );
+    for row in &rows {
+        match row.state {
+            graph_storage_sdk::models::ReadinessState::Healthy => assert!(
+                row.problem.is_none(),
+                "a healthy component names no problem: {row:?}"
+            ),
+            _ => assert!(
+                row.problem.is_some() && row.recovery.is_some(),
+                "a non-healthy component names its problem and what it waits on: {row:?}"
+            ),
+        }
+    }
+
+    let space_mismatch = ComponentReadiness::new(
+        graph_storage_sdk::models::EMBEDDING_SPACE,
+        ReadinessState::Unhealthy,
+        "stored vectors belong to another space",
+        "vector and hybrid search",
+        "re-embed",
+    );
+    assert!(
+        Readiness::of(vec![space_mismatch.clone()]).ready,
+        "an embedding-space mismatch blocks the vector arms and leaves the gear ready"
+    );
+    let database_down = ComponentReadiness::new(
+        graph_storage_sdk::models::DATABASE,
+        ReadinessState::Unhealthy,
+        "unreachable",
+        "everything",
+        "connectivity",
+    );
+    assert!(
+        !Readiness::of(vec![space_mismatch, database_down]).ready,
+        "an unreachable database admits no traffic at all"
+    );
+}

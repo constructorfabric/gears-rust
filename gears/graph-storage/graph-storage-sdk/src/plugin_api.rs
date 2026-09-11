@@ -18,13 +18,13 @@ use tokio_util::sync::CancellationToken;
 use toolkit_security::AccessScope;
 
 use crate::models::{
-    DeleteOutcome, DeleteRequest, Direction, EdgeRef, EmbeddingSpaceId, EngineCapabilities,
-    GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest, ItemError, LabelAssignment,
-    LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
-    ProjectionRequest, ReadSnapshot, RegisteredType, RemainingBudget, RevisionOutcome,
-    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TenantId,
-    TopologyPage, TopologyRequest, TruncationReason, TypeIdSet, TypeQuery, TypeRecord,
-    TypeRegistration, TypeRegistrationOptions,
+    ComponentReadiness, DeleteOutcome, DeleteRequest, Direction, EdgeRef, EmbeddingSpaceId,
+    EngineCapabilities, GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest,
+    ItemError, LabelAssignment, LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey,
+    NodeRow, NodeView, Page, ProjectionRequest, ReadSnapshot, RegisteredType, RemainingBudget,
+    RevisionOutcome, SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities,
+    Subject, TenantId, TopologyPage, TopologyRequest, TruncationReason, TypeIdSet, TypeQuery,
+    TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -176,6 +176,15 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         query: TypeQuery,
     ) -> Result<Page<TypeRecord>, GraphStoreError>;
+    /// Probe what this store can answer for, without a tenant or a scope.
+    ///
+    /// Readiness is reached before authentication — the matrix leaves the
+    /// health endpoints available when the authorization resolver is down —
+    /// so this is the one store call that takes no `StoreCtx`. It reports the
+    /// rows only the store can answer: the database and its migrations, and
+    /// the traversal backend the server actually provides.
+    async fn probe_readiness(&self) -> Vec<ComponentReadiness>;
+
     // --- source namespaces ------------------------------------------------
     /// The namespaces claimed in this tenant, with the principal bound to
     /// each. A read of the ownership boundary itself, for an operator who has

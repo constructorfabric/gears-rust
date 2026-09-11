@@ -175,6 +175,20 @@ pub async fn type_compatibility(
     }))
 }
 
+/// Readiness. No `SecurityContext`: the matrix keeps this endpoint answering
+/// when the authorization resolver is the thing that is down, and it reports
+/// capabilities rather than content.
+///
+/// Always `200`. Readiness is a state to read, not a request that failed —
+/// the body says what is wrong, and a caller that wants a status code reads
+/// `ready`.
+#[tracing::instrument(skip_all)]
+pub async fn readiness(
+    Extension(services): Extension<Arc<GraphServices>>,
+) -> ApiResult<Json<dto::GraphReadinessDto>> {
+    Ok(Json(services.readiness().await.into()))
+}
+
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
 pub async fn list_source_namespaces(
     Extension(ctx): Extension<SecurityContext>,

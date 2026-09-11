@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
-    DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest, LabelId,
-    LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
-    ReadSnapshot, RegisteredType, RevisionOutcome, SearchRequest, SearchResponse,
-    SourceNamespaceOwner, StoreCapabilities, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery,
-    TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    ComponentReadiness, DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId, IngestOutcome,
+    IngestRequest, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
+    ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType, RevisionOutcome,
+    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, TopologyPage,
+    TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -189,6 +189,81 @@ impl GraphStoreV1 for PgGraphStore {
         patterns: &[String],
     ) -> Result<TypeIdSet, GraphStoreError> {
         types::resolve_type_set(self, ctx, patterns).await
+    }
+
+    async fn probe_readiness(&self) -> Vec<ComponentReadiness> {
+        let mut out = Vec::new();
+
+        // The database row first, because every other row is meaningless
+        // without it. Two questions, not one: a reachable server whose
+        // migrations have not run serves a schema the gear does not know.
+        if let Err(error) = self.db().conn() {
+            out.push(ComponentReadiness::new(
+                graph_storage_sdk::models::DATABASE,
+                ReadinessState::Unhealthy,
+                &format!("the database is unreachable: {error}"),
+                "everything; no traffic is admitted",
+                "connectivity restored; the probe re-runs on the next request and flips \
+                 without a restart",
+            ));
+        } else {
+            let migrations =
+                <crate::infra::storage::migrations::Migrator as sea_orm_migration::MigratorTrait>::migrations();
+            match toolkit_db::migration_runner::get_pending_migrations(
+                self.db(),
+                "graph-storage",
+                &migrations,
+            )
+            .await
+            {
+                Ok(pending) if pending.is_empty() => {
+                    out.push(ComponentReadiness::healthy(
+                        graph_storage_sdk::models::DATABASE,
+                    ));
+                }
+                Ok(pending) => out.push(ComponentReadiness::new(
+                    graph_storage_sdk::models::DATABASE,
+                    ReadinessState::Unhealthy,
+                    &format!(
+                        "{} migration(s) have not been applied: {}",
+                        pending.len(),
+                        pending.join(", ")
+                    ),
+                    "everything; no traffic is admitted",
+                    "apply the migrations; the probe re-runs without a restart",
+                )),
+                Err(error) => out.push(ComponentReadiness::new(
+                    graph_storage_sdk::models::DATABASE,
+                    ReadinessState::Unhealthy,
+                    &format!("the migration history cannot be read: {error}"),
+                    "everything; no traffic is admitted",
+                    "restore access to the migration table",
+                )),
+            }
+        }
+
+        // The traversal backend, as probed at init. Degraded and never
+        // unhealthy: the matrix reserves the second for a backend an operator
+        // explicitly demanded, and this configuration cannot express the
+        // difference between a demand and a preference (DEVIATIONS D-033).
+        if self.pgq_available() {
+            out.push(ComponentReadiness::healthy(
+                graph_storage_sdk::models::SQLPGQ,
+            ));
+        } else {
+            out.push(ComponentReadiness::new(
+                graph_storage_sdk::models::SQLPGQ,
+                ReadinessState::Degraded,
+                "the declared property graph did not answer a pattern at startup; the server \
+                 major is not reported, because the attempt says the pattern did not run and \
+                 not why (D-004)",
+                "nothing: every traversal is served by the two-query hop",
+                "restart after the property-graph migration runs on a server that supports \
+                 SQL/PGQ",
+            ));
+        }
+
+        out
     }
 
     async fn list_source_namespaces(

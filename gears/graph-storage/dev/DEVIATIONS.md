@@ -616,6 +616,46 @@ is audited on the registry row instead — previous owner, timestamp, acting
 subject — which is enough to answer "who moved this and from whom" and not
 enough to answer "how many times".
 
+## D-033 [was deferred as D-109, now built] The readiness surface
+
+`GET /health/ready` answered 404 and DESIGN's 14-row matrix was normative, so
+the whole of `fr-readiness` was missing while every *input* it needs was
+already being computed at boot. Built: per-component state, each with what it
+blocks and the condition being waited on, unauthenticated (the matrix keeps the
+health endpoints answering precisely when the authorization resolver is what is
+down) and always `200` — readiness is a state to read, not a request that
+failed.
+
+**Three decisions the matrix forced.**
+
+- *The aggregate rule and one row contradict each other.* "The aggregate is
+  ready only when no component is `Unhealthy`" — and the embedding-space row
+  says the identity mismatch is `Unhealthy` while "the gear stays ready". Both
+  cannot hold. Resolved in favour of the row, because it is the specific
+  statement and the operationally right one: a mismatch blocks the vector arms
+  and nothing else, and taking the graph out of service for it would be worse
+  than the fault. The aggregate therefore asks the *component* whether its
+  failure blocks everything, not the state alone. DESIGN should pick one; this
+  entry is the proposal.
+- *A fourth state, `not_implemented`.* Five of the matrix's components do not
+  exist in this build — the authz probe (the platform PEP publishes no health
+  surface), the types registry as a runtime dependency (D-013), dynamic indexes
+  (D-104), tenant reconciliation (D-106), metric annotation (D-107). Reporting
+  them `Healthy` would be a lie an operator acts on and omitting them would
+  hide capabilities they are entitled to ask about, so each is reported absent
+  with the deviation that explains why and what would change it. A readiness
+  surface that only ever says "fine" is a green light, not a readiness surface.
+- *SQL/PGQ is reported `Degraded`, never `Unhealthy`.* The matrix reserves
+  unhealthy for a backend an operator *explicitly demanded* and the server
+  cannot provide. `traversal_hop` has no value meaning "no preference" — `pgq`
+  is both the default and the only way to ask for it — so the gear cannot tell
+  a demand from a default and does not pretend to. Either the config grows an
+  `auto`, or the matrix's row loses its distinction; until then the fallback
+  serves and readiness says so.
+
+**What it does not report.** The server major, for the reason D-004 gives: the
+probe is an attempted pattern, which says the pattern did not run and not why.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
@@ -813,7 +853,7 @@ Checking this also found the rejection to be misclassified as `out_of_range`/`LI
 ## D-108 [deferred] PG16 configuration matrix
 ADR-0001 point 2 makes PG16+ the baseline and demands CI on both PG16 and PG19. This iteration pins the test lane to PG19 (`postgres_graph()`, `19beta3-alpine`); the server-major probe and conditional property-graph DDL are implemented, but the PG16 lane is not exercised.
 
-## D-109 [deferred] The readiness surface, entirely
+## D-109 [was deferred, now built — see D-033] The readiness surface, entirely
 `fr-readiness`: DESIGN's 14-row matrix is normative, and `GET /health/ready` is in its REST surface.
 
 **Corrected after checking.** The first draft said this iteration "ships per-capability healthy/degraded/unhealthy (DB, SQL/PGQ availability, vector dimension check) without the full matrix semantics". It ships none of it: `GET /health/ready` answers 404 and the word `health` does not appear in the route registration. What exists are the *inputs* a readiness surface would report — the capability probe, the embedding-dimension check at boot — with nothing exposing them. The deferral is the whole surface, not its fidelity.

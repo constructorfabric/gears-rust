@@ -328,3 +328,8 @@ async fn a_transfer_moves_the_namespace_and_records_who_moved_it() {
 async fn an_owned_nodes_source_field_claims_no_namespace() {
     conformance::an_owned_nodes_source_field_claims_no_namespace(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn readiness_reports_every_capability_and_only_some_block_service() {
+    conformance::readiness_reports_every_capability_and_only_some_block_service(&store()).await;
+}

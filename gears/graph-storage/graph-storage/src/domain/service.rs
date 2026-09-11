@@ -239,6 +239,111 @@ impl GraphServices {
         Ok(prefix)
     }
 
+    /// Readiness, per capability, in the shape DESIGN § Readiness Matrix
+    /// specifies (`fr-readiness`).
+    ///
+    /// Unauthenticated on purpose: the matrix leaves the health endpoints
+    /// available precisely when the authorization resolver is the thing that
+    /// is down, so this method takes no `SecurityContext` and touches no
+    /// tenant data — it reports capabilities, never content.
+    ///
+    /// Rows the matrix specifies and this iteration does not ship are reported
+    /// `not_implemented` with the deviation that records why. That is the
+    /// difference between a readiness surface and a green light: an operator
+    /// can see that dynamic indexes are not degraded but absent, and that
+    /// nothing will ever flip them healthy in this build.
+    pub async fn readiness(&self) -> graph_storage_sdk::models::Readiness {
+        use graph_storage_sdk::models::{
+            AUTHZ, ComponentReadiness as Row, DYNAMIC_INDEXES, EMBEDDING_PROVIDER, EMBEDDING_SPACE,
+            GRAPH_ENGINE, METRIC_ANNOTATION, Readiness, ReadinessState as State,
+            TENANT_RECONCILIATION, TYPES_REGISTRY,
+        };
+
+        let mut rows = self.store.probe_readiness().await;
+
+        // The provider answers for itself; a provider that cannot say it is
+        // healthy degrades the paths that need it and nothing else.
+        match self.embedding.health().await {
+            Ok(()) => rows.push(Row::healthy(EMBEDDING_PROVIDER)),
+            Err(error) => rows.push(Row::new(
+                EMBEDDING_PROVIDER,
+                State::Degraded,
+                &format!("the embedding provider is unavailable: {error}"),
+                "ingest with `embed=true`, and the vector arm of search",
+                "automatic on provider recovery; vectors missed meanwhile are stale by input \
+                 hash and re-embedded by the normal path",
+            )),
+        }
+
+        // The identity row is `unhealthy` and the gear stays ready — the one
+        // place the matrix's row and its aggregate rule disagree, resolved in
+        // favour of the row (DEVIATIONS D-033).
+        rows.push(match self.embedding.active_epoch() {
+            Some(_) => Row::healthy(EMBEDDING_SPACE),
+            None => Row::new(
+                EMBEDDING_SPACE,
+                State::Unhealthy,
+                "stored vectors belong to a space the active provider is not",
+                "vector and hybrid search (`failed_precondition` /                  `EMBEDDING_SPACE_MISMATCH`)",
+                "re-embed to the active space; the identity match restores the capability at \
+                 cutover",
+            ),
+        });
+
+        // The built-in engine is the only one in this deployment, and a
+        // capability it declares absent is the contract working rather than a
+        // fault: the matrix's degraded and unhealthy rows are about *external*
+        // plugins — a stale projection, an unprovable cursor, a selector that
+        // matched nothing. There is nothing here to be stale.
+        rows.push(Row::healthy(GRAPH_ENGINE));
+
+        // What the matrix specifies and this build does not have. Named, so
+        // the absence is a fact an operator reads rather than one they infer.
+        rows.push(Row::new(
+            AUTHZ,
+            State::NotImplemented,
+            "the resolver is consulted per request and fails closed, but it is not probed \
+             here: the platform PEP publishes no health surface",
+            "nothing that is not already failing closed",
+            "a platform health surface for the PEP",
+        ));
+        rows.push(Row::new(
+            TYPES_REGISTRY,
+            State::NotImplemented,
+            "this iteration reaches the registry only at publication, not per request, so \
+             there is no runtime dependency to probe (D-013)",
+            "nothing",
+            "a runtime dependency on the registry, when the verdict is delegated to it",
+        ));
+        rows.push(Row::new(
+            DYNAMIC_INDEXES,
+            State::NotImplemented,
+            "the index-activation lifecycle is not built (D-104); a declared path is \
+             filterable as soon as it is declared, served by the static payload GIN",
+            "nothing, and that is the gap: nothing rejects a filter for an index that is \
+             still building, because no index is ever built",
+            "the DDL surface a gear may call (gears-rust #4721) and the lifecycle above it",
+        ));
+        rows.push(Row::new(
+            TENANT_RECONCILIATION,
+            State::NotImplemented,
+            "tenant offboarding is not built (D-106), so no deletion generation is tracked or \
+             reconciled",
+            "nothing",
+            "the offboarding protocol",
+        ));
+        rows.push(Row::new(
+            METRIC_ANNOTATION,
+            State::NotImplemented,
+            "metric annotation is not built (D-107); projections carry no annotations to be \
+             missing",
+            "nothing",
+            "the analytics gear's annotation surface",
+        ));
+
+        Readiness::of(rows)
+    }
+
     /// The source namespaces claimed in this tenant, with their owners.
     ///
     /// A read of the ownership boundary, authorized as a type-catalogue read:

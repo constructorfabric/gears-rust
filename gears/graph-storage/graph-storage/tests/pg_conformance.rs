@@ -284,6 +284,19 @@ pg_case!(
     conformance::a_deeper_chain_registers_and_its_ancestor_admits_the_leaf
 );
 
+/// Readiness against a real server: the database row is healthy because the
+/// migrations ran, and the SQL/PGQ row reports what this server could provide.
+#[tokio::test]
+async fn readiness_reports_every_capability_and_only_some_block_service() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::readiness_reports_every_capability_and_only_some_block_service(
+        stand.store.as_ref(),
+    )
+    .await;
+}
+
 // --- source-namespace ownership ----------------------------------------------
 
 pg_case!(

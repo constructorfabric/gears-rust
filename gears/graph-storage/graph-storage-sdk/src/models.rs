@@ -86,6 +86,123 @@ pub struct EffectiveTraits {
     pub dst_types: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Readiness
+// ---------------------------------------------------------------------------
+
+/// The state of one capability (DESIGN § Readiness Matrix).
+///
+/// `NotImplemented` is this gear's addition to the matrix's three, and it is
+/// the honest answer for a row the matrix specifies and this iteration does
+/// not ship: reporting such a component `Healthy` would be a lie an operator
+/// acts on, and omitting it would hide a capability they are entitled to ask
+/// about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessState {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    NotImplemented,
+}
+
+impl ReadinessState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+            Self::NotImplemented => "not_implemented",
+        }
+    }
+}
+
+/// One row of the readiness matrix, as the endpoint reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentReadiness {
+    /// The matrix's own name for the component.
+    pub component: String,
+    pub state: ReadinessState,
+    /// What is wrong, named rather than implied. `None` when healthy.
+    pub problem: Option<String>,
+    /// What this state rejects, in the words of the matrix's third column.
+    pub blocked: Option<String>,
+    /// The condition being waited on, so an operator knows whether to act.
+    pub recovery: Option<String>,
+}
+
+impl ComponentReadiness {
+    #[must_use]
+    pub fn healthy(component: &str) -> Self {
+        Self {
+            component: component.to_owned(),
+            state: ReadinessState::Healthy,
+            problem: None,
+            blocked: None,
+            recovery: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new(
+        component: &str,
+        state: ReadinessState,
+        problem: &str,
+        blocked: &str,
+        recovery: &str,
+    ) -> Self {
+        Self {
+            component: component.to_owned(),
+            state,
+            problem: Some(problem.to_owned()),
+            blocked: Some(blocked.to_owned()),
+            recovery: Some(recovery.to_owned()),
+        }
+    }
+
+    /// Whether this component's state takes the whole gear out of service.
+    ///
+    /// Not simply "is it unhealthy": the matrix is explicit that an
+    /// embedding-space mismatch leaves the gear ready and blocks only the
+    /// vector arms, while an unreachable database admits no traffic at all.
+    /// The aggregate therefore asks the component, not the state.
+    #[must_use]
+    pub fn fatal(&self) -> bool {
+        self.state == ReadinessState::Unhealthy && self.component != EMBEDDING_SPACE
+    }
+}
+
+/// Matrix row names, spelled once so the endpoint and the documentation cannot
+/// drift apart.
+pub const DATABASE: &str = "database_and_migrations";
+pub const SQLPGQ: &str = "server_major_and_sqlpgq";
+pub const EMBEDDING_PROVIDER: &str = "embedding_provider";
+pub const EMBEDDING_SPACE: &str = "embedding_space_identity";
+pub const GRAPH_ENGINE: &str = "graph_engine_plugin";
+pub const AUTHZ: &str = "authz_resolver";
+pub const TYPES_REGISTRY: &str = "types_registry";
+pub const DYNAMIC_INDEXES: &str = "dynamic_indexes";
+pub const TENANT_RECONCILIATION: &str = "tenant_reconciliation";
+pub const METRIC_ANNOTATION: &str = "metric_annotation_source";
+
+/// What `GET /health/ready` answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Readiness {
+    /// Ready when no component whose failure blocks everything is unhealthy.
+    pub ready: bool,
+    pub components: Vec<ComponentReadiness>,
+}
+
+impl Readiness {
+    #[must_use]
+    pub fn of(components: Vec<ComponentReadiness>) -> Self {
+        Self {
+            ready: !components.iter().any(ComponentReadiness::fatal),
+            components,
+        }
+    }
+}
+
 /// One source namespace and the producer principal bound to it.
 ///
 /// The authority the ingest path consults: a reference node's payload names a

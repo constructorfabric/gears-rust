@@ -11,13 +11,14 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, AdmissionBasis, DeleteOutcome, DeleteRequest, ElementEnvelope,
-    GraphRevision, GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily,
-    LabelAssignment, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView,
-    OnExisting, Page, ProjectionRequest, ReadSnapshot, RegisteredType, RevisionOutcome,
-    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, SourceNamespaceOwner,
-    StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange, TypeChangeState,
-    TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
+    DeleteRequest, ElementEnvelope, GraphRevision, GtsTypeId, IngestCounts, IngestOutcome,
+    IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId, LabelRecord, LabelSpec, NodeId,
+    NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest, ReadSnapshot, ReadinessState,
+    RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse,
+    SourceNamespaceOwner, StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange,
+    TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -387,6 +388,22 @@ impl GraphStoreV1 for FakeGraphStore {
             });
         }
         Ok(out)
+    }
+
+    async fn probe_readiness(&self) -> Vec<ComponentReadiness> {
+        // An in-memory store has no database to be unreachable and no
+        // migrations to be pending; the traversal backend it offers is the
+        // two-query hop, which is what the built-in store falls back to.
+        vec![
+            ComponentReadiness::healthy(graph_storage_sdk::models::DATABASE),
+            ComponentReadiness::new(
+                graph_storage_sdk::models::SQLPGQ,
+                ReadinessState::Degraded,
+                "this store has no property graph",
+                "nothing: every traversal is served by the two-query hop",
+                "not applicable to an in-memory store",
+            ),
+        ]
     }
 
     async fn list_source_namespaces(
