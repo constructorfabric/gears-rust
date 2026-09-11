@@ -1149,15 +1149,19 @@ pub async fn soft_delete(
                 let now = OffsetDateTime::now_utc();
                 let (nodes, edges) = match request {
                     DeleteRequest::Node(key) => {
-                        let model = node::Entity::find()
+                        // Live rows only; a row already tombstoned is settled
+                        // below as a no-op rather than as an absence.
+                        let live = node::Entity::find()
                             .secure()
                             .scope_with(&scope)
-                            .filter(Condition::all().add(node::Column::NodeKey.eq(key)))
+                            .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
                             .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
                             .one(tx)
                             .await
-                            .map_err(map_scope_err)?
-                            .ok_or(GraphStoreError::NotFound)?;
+                            .map_err(map_scope_err)?;
+                        let Some(model) = live else {
+                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
+                        };
 
                         // Incident edges are tombstoned in the same
                         // transaction: a node never outlives its edges'
@@ -1215,15 +1219,17 @@ pub async fn soft_delete(
                         (1u64, edges)
                     }
                     DeleteRequest::Edge(key) => {
-                        let model = edge::Entity::find()
+                        let live = edge::Entity::find()
                             .secure()
                             .scope_with(&scope)
-                            .filter(Condition::all().add(edge::Column::EdgeKey.eq(key)))
+                            .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
                             .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
                             .one(tx)
                             .await
-                            .map_err(map_scope_err)?
-                            .ok_or(GraphStoreError::NotFound)?;
+                            .map_err(map_scope_err)?;
+                        let Some(model) = live else {
+                            return already_tombstoned_edge(&scope, tx, &key, epoch).await;
+                        };
                         // An edge is a statement about two nodes: tombstoning
                         // it needs both endpoints visible under the caller's
                         // scope, the rule the edge read follows. Denied and
@@ -1274,6 +1280,68 @@ pub async fn soft_delete(
         })
         .await
         .map_err(|error| error.0)
+}
+
+/// Settle a delete of a row that is already tombstoned.
+///
+/// Rule 3 of the Soft Delete Contract: "deleting an already-deleted row is a
+/// no-op that leaves it untouched, exactly as a converging ingest replay
+/// does". Answering `NotFound` instead would make a retry of a delete whose
+/// response was lost look like a delete of something that never existed, and
+/// a producer cannot tell those apart from outside. A key that genuinely does
+/// not exist still reads as absent, so nothing about enumeration changes.
+async fn already_tombstoned_node(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    key: &str,
+    epoch: i64,
+) -> Result<DeleteOutcome, TxStoreError> {
+    let tombstoned = node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
+        .one(tx)
+        .await
+        .map_err(map_scope_err)?;
+    settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
+}
+
+async fn already_tombstoned_edge(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    key: &str,
+    epoch: i64,
+) -> Result<DeleteOutcome, TxStoreError> {
+    let tombstoned = edge::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.to_owned())))
+        .one(tx)
+        .await
+        .map_err(map_scope_err)?;
+    settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
+}
+
+/// The revision as it stands, with nothing tombstoned — or absence, when the
+/// key was never there.
+async fn settle_no_op(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    existed: bool,
+    epoch: i64,
+) -> Result<DeleteOutcome, TxStoreError> {
+    if !existed {
+        return Err(GraphStoreError::NotFound.into());
+    }
+    let revision = current_revision(scope, tx).await?;
+    Ok(DeleteOutcome {
+        revision: GraphRevision {
+            source_epoch: epoch,
+            revision,
+        },
+        tombstoned_nodes: 0,
+        tombstoned_edges: 0,
+    })
 }
 
 /// Ensure the tenant's meta rows exist, and the deployment epoch.

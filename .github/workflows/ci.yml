@@ -95,6 +95,8 @@ jobs:
             onnx_embedding:
               - 'gears/graph-storage/onnx-embedding-plugin/**'
               - 'gears/graph-storage/graph-storage-sdk/**'
+            graph_storage:
+              - 'gears/graph-storage/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -529,6 +531,65 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+
+  # graph-storage sets itself a line-coverage floor of 85% (its PRD
+  # `nfr-code-coverage`, "enforced in CI"). The workspace coverage job above
+  # reports to Codecov and gates on nothing per crate, and the shared script's
+  # project-wide threshold is 80, so nothing was enforcing the gear's own
+  # number. This does, over the gear's db-free lanes: the PostgreSQL lane
+  # needs an image carrying PostgreSQL 19 *and* pgvector, which
+  # `test-containers` does not publish yet, so the floor holds without it and
+  # the number is the more honest for that.
+  coverage-graph-storage:
+    name: Coverage floor (graph-storage)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.graph_storage == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+          components: llvm-tools-preview
+
+      - name: Pin nightly for all cargo commands
+        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage floor
+        env:
+          RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+        run: |
+          cargo llvm-cov \
+            -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
+            --summary-only --fail-under-lines 85
 
   # Runs the graph-storage ONNX embedding provider against a real model, which
   # is the only way this crate is checked at all: without artifacts its tests

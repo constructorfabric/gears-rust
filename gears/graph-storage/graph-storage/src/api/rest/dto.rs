@@ -548,6 +548,10 @@ pub struct GraphEdgeRefDto {
 pub struct GraphTraversalResponseDto {
     pub nodes: Vec<GraphNodeDto>,
     pub edges: Vec<GraphEdgeRefDto>,
+    /// The seeds the walk started from: requested, deduped, and filtered to
+    /// what the caller may see. Unknown and unauthorized seeds are absent
+    /// alike.
+    pub seeds: Vec<String>,
     /// Present when a budget stopped the walk. Never silent.
     pub truncated: Option<String>,
     pub revision: GraphRevisionDto,
@@ -917,6 +921,7 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
         Self {
             nodes: value.nodes.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
+            seeds: value.seeds,
             truncated: value.truncated.map(|reason| {
                 match reason {
                     m::TruncationReason::FrontierCap => "frontier_cap",

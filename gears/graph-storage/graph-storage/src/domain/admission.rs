@@ -105,13 +105,20 @@ pub fn admit_traverse(
             cfg.traversal_max_nodes
         )));
     }
-    // The seed set is bounded before expansion: a request whose distinct
-    // authorized seeds exceed the node budget is rejected, because seeds
-    // always survive truncation.
-    if request.seeds.len() > max_nodes as usize {
+    // The seed set is bounded before expansion, because seeds always survive
+    // truncation. Counted *distinct*: a caller that names one key twice has
+    // asked for one seed, and rejecting them for a budget they did not spend
+    // would be a refusal they cannot act on. The contract also says
+    // "authorized", which cannot be known before a store read — admission
+    // runs before any — so this bound is on what was asked for, and the
+    // authorized set can only be smaller.
+    let distinct: std::collections::BTreeSet<&str> =
+        request.seeds.iter().map(String::as_str).collect();
+    if distinct.len() > max_nodes as usize {
         return Err(exceeded(format!(
-            "{} seeds exceed the node budget {max_nodes}; seeds always survive truncation",
-            request.seeds.len()
+            "{} distinct seeds exceed the node budget {max_nodes}; seeds always survive \
+             truncation",
+            distinct.len()
         )));
     }
     Ok(())

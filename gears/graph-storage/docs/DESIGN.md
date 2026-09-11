@@ -991,7 +991,7 @@ Consumers need bounded, renderable views — neighborhood subgraphs for UIs and 
 
 ##### Responsibility scope
 
-Neighborhood projection (depth-bounded expansion, degree-ordered retention within node budgets, phantom toggle, optional metric annotations); tabular projection (type-family selection, identifier lists, OData filters restricted to the payload paths the type declares in its `index` trait, ordering, pagination, label filtering); rejection of filters on undeclared attributes with the documented error.
+Neighborhood projection (depth-bounded expansion, degree-ordered retention within node budgets — the degree comes from the engine, which is the only layer that can count it, § 3.3 — phantom toggle, optional metric annotations); tabular projection (type-family selection, identifier lists, OData filters restricted to the payload paths the type declares in its `index` trait, ordering, pagination, label filtering); rejection of filters on undeclared attributes with the documented error.
 
 ##### Responsibility boundaries
 
@@ -1247,6 +1247,25 @@ would have broken no test — a requirement nothing can observe is a requirement
 nothing checks. Topology references stay what they are: `EdgeRef` in a
 traversal and `AdjacencyEntry` in a node read carry a key, a type and two
 endpoints, and the key is the one the edge read accepts.
+
+**A search hit is a reference too, by the same rule.** `SearchHit` carries a
+key, a type, a name, the fused score and each arm's rank — what a ranking is
+*about* — and no envelope. A hit is a pointer into a result list rather than
+the element itself; the caller reads the node when it wants the element, and
+that read carries the envelope. Stating it because the alternative reading of
+"every node returned by any read surface" is that a hit list must repeat the
+audit envelope of every row it ranks, which would make the common
+search-then-open flow pay for it twice.
+
+**A re-asserted edge comes back; a re-ingested node key does not.** Rule 4 of
+the Soft Delete Contract makes a tombstoned `node_key` unusable before purge,
+because a consumer holds that key and letting it return with different content
+would break stable identity silently. An edge key is not held that way: it is
+*derived* from the type, the endpoints and the discriminator, so re-ingesting
+one is the same producer making the same statement about the same two nodes
+again. That revives the tombstoned row rather than conflicting, and the
+envelope records who revived it. The rule does not extend to edges, and this
+paragraph says so rather than leaving the difference to be discovered.
 
 **An attribute has no envelope of its own.** It is a fragment inside an element's
 payload, so its tenant, its timestamps and the subject that wrote it are the
@@ -1505,16 +1524,32 @@ pub struct ExpandRequest {
     pub direction: Direction,          // explicit; there is no "undirected" shorthand
     pub edge_types: Option<TypeIdSet>, // per-hop restriction
     pub labels: Option<LabelFilter>,   // per-hop restriction
-    pub budget: HopBudget,             // frontier cap and cumulative edges scanned
+    pub budget: HopBudget,             // frontier cap and edges scanned
+    pub with_degrees: bool,            // fill `degrees` below; costs a second scoped read
 }
 
 pub struct ExpandResponse {
     pub reached: Vec<NodeId>,
+    pub degrees: Vec<u32>,                   // index-aligned with `reached`; empty unless asked
     pub edges: Vec<EdgeRef>,
     pub truncated: Option<TruncationReason>, // never silent
     pub served_by: HopBackend,               // Pattern | TwoQuery — which path answered
 }
 ```
+
+**Found while building the prototype: the degree a projection ranks by is the
+engine's to report.** Degree-ordered retention is what keeps a hub's
+neighborhood useful when the node budget cuts it
+(`cpt-cf-graph-storage-fr-neighborhood-projection`), and nothing above this
+port can compute it: a reached node is an internal id while an `EdgeRef` names
+its endpoints by producer key, so joining them costs another read. It also has
+to be the neighbour's *own* connectivity rather than the number of edges tying
+it to this frontier — at depth one those are all exactly one, so the cheap
+count ranks a hub's neighbours arbitrarily, which is the failure the
+requirement exists to prevent. Every edge counted has passed the caller's
+scope, so this is the degree inside the authorized subgraph (§ Authorization
+Model). It is opt-in because it is a second scoped read that a traversal, whose
+caller post-processes the whole region, has no use for.
 
 Two shapes here are consequences of the PG19 spike rather than preference: the
 direction is explicit because the undirected shorthand plans as an all-vertex
@@ -2117,7 +2152,7 @@ reconciliation, never automatic re-execution.
 |--------|------|-------------|
 | tenant_id | UUID | Tenant scope |
 | scope_attribute / scope_value | TEXT / TEXT | Canonical scope identity; **PK (tenant_id, scope_attribute, scope_value)** |
-| owner_producer | TEXT | Producer owning this scope |
+| owner_producer | TEXT | Producer owning this scope: the writing principal, taken from the security context. Empty means unclaimed — the next replacement adopts it, under this row's lock, as a source namespace is claimed by its first writer |
 | generation | BIGINT | Highest accepted source generation (fencing) |
 | request_hash | TEXT | Hash of the last accepted replacement snapshot |
 | updated_at | TIMESTAMPTZ | Last accepted replacement |
@@ -2337,8 +2372,13 @@ The contract:
   owner**, not merely against the tenant — a mismatch is `permission_denied`,
   reported the same way whatever the caller's other grants;
 - **ownership transfer and reconciliation are an explicit administrative flow**
-  under the ontology-administration permission, audited in `ingest_audit` like
-  any other mutation; there is no implicit transfer by writing.
+  under the ontology-administration permission; there is no implicit transfer
+  by writing.
+
+*Found while building the prototype:* the transfer is audited on the registry
+row itself — previous owner, timestamp, acting subject — rather than in
+`ingest_audit`, which this iteration does not build. That answers "who moved
+this, and from whom" and not "how many times".
 
 An unclaimed namespace is claimed by the first producer that writes it, which
 keeps single-producer deployments free of setup while still making the second
@@ -2767,7 +2807,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal depth | `traversal_max_depth` | 5 | 1 – 8 | Admission |
 | Traversal node budget | `traversal_max_nodes` | 1,000 per request, 10,000 hard | 1 – 10,000 | Admission + per hop |
 | Traversal frontier per hop | `traversal_max_frontier` | 10,000 | 100 – 100,000 | Engine, per hop |
-| Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1,000 – 1,000,000 | Engine, cumulative |
+| Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
@@ -2815,8 +2855,11 @@ to 300 (the gateway's own 30 s ceiling is the binding one, ADR-0006) and
 `idempotency_retention_days` to 365. `embedding_input_max_bytes` (8 KiB,
 64 B – 256 KiB) bounds the composed embedding input and is not in the table
 above. `traversal_max_edges_scanned` is applied per hop rather than
-cumulatively and a hop that reaches it is trimmed without a truncation reason —
-a gap, not a decision. The `content_*`, `labels_*`, `tenant_max_*`,
+cumulatively: each hop's scan is bounded, the walk's total is not. A hop that
+reaches the bound reports `EdgeScanCap` — it reads one row past the budget to
+know, then discards it — so a partial subgraph is no longer indistinguishable
+from a whole one. A cumulative budget across the walk is what the table's
+"cumulative" describes and is not built. The `content_*`, `labels_*`, `tenant_max_*`,
 `global_max_*`, `interactive_reserved_connections`, `response_max_*`,
 `types_max_per_tenant`, `indexed_paths_*` and `ddl_*` rows belong to deferred
 features (content, labels, the admission layer, aggregate response bounds, the

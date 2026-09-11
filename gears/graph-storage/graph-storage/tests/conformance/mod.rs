@@ -4209,3 +4209,356 @@ pub async fn a_scope_and_an_idempotency_key_belong_to_their_producer(
         "one producer's receipt must not answer another's request"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Type-family filtering, and the hybrid arms
+// ---------------------------------------------------------------------------
+
+/// A GTS pattern selects a family, and one that selects nothing selects
+/// nothing.
+///
+/// `fr-type-filtering` puts the same pattern vocabulary on every search mode
+/// and on traversal, resolved through the platform matcher so that a bare
+/// family identifier already covers everything derived from it. None of it
+/// had a test: nothing anywhere passed a non-empty `type_patterns` to search
+/// or an edge-type pattern to a hop, so the whole surface rested on the
+/// resolver being called correctly somewhere out of sight.
+///
+/// The last assertion is the one worth having. An empty pattern list means
+/// "no filter"; a list that resolves to no registered type means "no type",
+/// and the two must not collapse — treating an unmatched pattern as an absent
+/// filter answers a narrowing request with the widest possible answer.
+pub async fn a_type_pattern_narrows_search_and_a_hop(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut ontology = ontology_batch();
+    ontology.push(other_thing_type());
+    store
+        .register_types(&ctx, ontology)
+        .await
+        .expect("the ontology registers");
+
+    // One whole word both names carry, because a real text-search engine
+    // matches lexemes and not substrings: a query of "widg" finds neither of
+    // them on PostgreSQL, however well it works against an in-memory
+    // `contains`.
+    let other = |key: &str, name: &str| NodeSpec {
+        type_id: OTHER_THING.to_owned(),
+        ..node(key, name)
+    };
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![
+                node("pat-thing", "widget alpha"),
+                other("pat-other", "widget beta"),
+            ],
+            vec![],
+        ),
+    )
+    .await
+    .expect("both types commit");
+
+    let search = |patterns: Vec<String>| SearchRequest {
+        mode: SearchMode::Lexical,
+        query: Some("widget".to_owned()),
+        arm_limit: 10,
+        limit: 10,
+        type_patterns: patterns,
+    };
+    let keys = |response: graph_storage_sdk::models::SearchResponse| {
+        let mut keys: Vec<String> = response.hits.into_iter().map(|hit| hit.node_key).collect();
+        keys.sort();
+        keys
+    };
+
+    // The leaf identifier selects its own type.
+    let leaf = store
+        .search(&ctx, search(vec![OWNED.to_owned()]), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(keys(leaf), vec!["pat-thing".to_owned()]);
+
+    // The family identifier covers every type derived from it, with no
+    // wildcard spelled by the caller — the implicit derived-type coverage the
+    // platform matcher already carries.
+    let family = store
+        .search(&ctx, search(vec![OWNED_FAMILY.to_owned()]), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(
+        keys(family),
+        vec!["pat-other".to_owned(), "pat-thing".to_owned()],
+        "an owned-node family pattern covers both leaves"
+    );
+
+    // A pattern nothing is registered under selects nothing.
+    let unmatched = store
+        .search(
+            &ctx,
+            search(vec![
+                "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.absent.v1~"
+                    .to_owned(),
+            ]),
+            None,
+        )
+        .await
+        .expect("search succeeds");
+    assert!(
+        unmatched.hits.is_empty(),
+        "a pattern that matches no registered type must not widen to every type: {:?}",
+        unmatched.hits
+    );
+
+    // The same vocabulary on a hop: `resolve_type_set` is what both surfaces
+    // narrow through, so the assertion is on the resolution the engine is
+    // handed.
+    let resolved = store
+        .resolve_type_set(&ctx, &[LINK.to_owned()])
+        .await
+        .expect("the edge pattern resolves");
+    assert!(
+        resolved.contains(LINK),
+        "the static-edge leaf resolves to itself"
+    );
+    assert!(
+        !resolved.contains(OWNED),
+        "an edge pattern admits no node type"
+    );
+    let nothing = store
+        .resolve_type_set(
+            &ctx,
+            &["gts.cf.core.graph.edge.v1~test.gs._.absent.v1~".to_owned()],
+        )
+        .await
+        .expect("an unmatched edge pattern resolves");
+    assert!(
+        nothing.is_empty(),
+        "an unmatched pattern resolves to the empty set, not to every type"
+    );
+}
+
+/// Hybrid search runs both arms independently and fuses them, and a document
+/// both arms find outranks one only a single arm found.
+///
+/// `fr-hybrid-search` fixes reciprocal rank fusion with each arm's own rank
+/// reported per hit. The fusion had a unit test over the built-in store's
+/// private helper and the fake carried a second copy of the same arithmetic,
+/// with nothing holding the two to the same answer — and no test ran a hybrid
+/// search against either store. The two implementations are the thing the
+/// conformance suite exists to keep honest.
+pub async fn hybrid_search_fuses_both_arms(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // `both` carries the query text in its name — which this type declares as
+    // its `full_text_search` path, so the lexical arm finds it — and as the
+    // whole of its embedding input, which is what puts it first in the vector
+    // arm. `unembedded` carries the text in its name and is ingested with
+    // `embed: false`, so it has no vector at all: the single-arm case, which
+    // a fixture of embedded nodes cannot produce, because a
+    // nearest-neighbour scan ranks every row that has a current vector, near
+    // or far.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![
+                summarized(
+                    "both",
+                    "quarterly revenue report",
+                    "quarterly revenue report",
+                ),
+                summarized("far", "unrelated title", "unrelated prose"),
+            ],
+            vec![],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+    assert_eq!(outcome.counts.nodes_inserted, 2);
+
+    let unembedded = IngestRequest {
+        options: graph_storage_sdk::models::IngestOptions {
+            embed: Some(false),
+            ..graph_storage_sdk::models::IngestOptions::default()
+        },
+        ..batch(
+            vec![summarized(
+                "unembedded",
+                "quarterly revenue report",
+                "no vector for this one",
+            )],
+            vec![],
+        )
+    };
+    ingest_batch(store, &ctx, unembedded)
+        .await
+        .expect("the unembedded node commits");
+
+    let query = "quarterly revenue report";
+    let query_vector = coordinator()
+        .embed_query(
+            query,
+            RemainingBudget::starting_now(Duration::from_secs(30)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the deterministic provider always embeds");
+    let response = store
+        .search(
+            &ctx,
+            SearchRequest {
+                mode: SearchMode::Hybrid,
+                query: Some(query.to_owned()),
+                arm_limit: 10,
+                limit: 10,
+                type_patterns: Vec::new(),
+            },
+            Some(graph_storage_sdk::plugin_api::VectorArm {
+                query_vector,
+                // The suite's epoch, not a literal 1: the fixture is
+                // deliberately non-default so a hard-coded epoch ranks
+                // nothing and says so.
+                epoch: EPOCH,
+            }),
+        )
+        .await
+        .expect("the hybrid search answers");
+
+    let keys: Vec<&str> = response
+        .hits
+        .iter()
+        .map(|hit| hit.node_key.as_str())
+        .collect();
+    assert_eq!(
+        keys.first(),
+        Some(&"both"),
+        "the document both arms found ranks first: {:?}",
+        response
+            .hits
+            .iter()
+            .map(|hit| (&hit.node_key, hit.score, hit.arms.len()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        keys.contains(&"unembedded"),
+        "a hit the lexical arm alone found is still a hit: {keys:?}"
+    );
+
+    // Each hit says which arms found it and at what rank, which is what makes
+    // a fused score inspectable rather than a number to trust.
+    let both = response
+        .hits
+        .iter()
+        .find(|hit| hit.node_key == "both")
+        .expect("the shared hit is present");
+    assert_eq!(both.arms.len(), 2, "found by both arms: {:?}", both.arms);
+    assert!(
+        both.arms.iter().all(|arm| arm.rank >= 1),
+        "ranks are one-based: {:?}",
+        both.arms
+    );
+    let single = response
+        .hits
+        .iter()
+        .find(|hit| hit.node_key == "unembedded")
+        .expect("the unembedded hit is present");
+    assert_eq!(
+        single.arms.len(),
+        1,
+        "a node with no vector is found by the lexical arm only: {:?}",
+        single.arms
+    );
+    assert!(
+        both.score > single.score,
+        "two arms outrank one: {} vs {}",
+        both.score,
+        single.score
+    );
+
+    // Every hit carries the revision the read observed, like every compound
+    // read.
+    assert!(response.revision.revision > 0);
+}
+
+/// Deleting twice is a no-op the second time, and deleting what was never
+/// there is still absence.
+///
+/// Rule 3 of the Soft Delete Contract says so, and the implementation
+/// answered `NotFound` instead — so a producer retrying a delete whose
+/// response was lost could not tell "already done" from "never existed",
+/// which is the distinction the retry was trying to resolve. The revision is
+/// the other half: it moves for the delete that tombstones and stands still
+/// for the one that finds the work already done, exactly as a converging
+/// ingest replay does.
+pub async fn deleting_an_already_tombstoned_row_is_a_no_op(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("gone-a", "a"), node("gone-b", "b")],
+            vec![edge("gone-a", "gone-b")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let edge_key = store
+        .get_node(&ctx, &"gone-a".to_owned(), 10)
+        .await
+        .expect("the node reads")
+        .adjacency
+        .first()
+        .expect("the edge is adjacent")
+        .edge_key
+        .clone();
+
+    let first = store
+        .soft_delete(&ctx, DeleteRequest::Edge(edge_key.clone()))
+        .await
+        .expect("the edge is tombstoned");
+    assert_eq!(first.tombstoned_edges, 1);
+
+    let again = store
+        .soft_delete(&ctx, DeleteRequest::Edge(edge_key))
+        .await
+        .expect("deleting it twice is not a failure");
+    assert_eq!(again.tombstoned_edges, 0, "nothing was tombstoned twice");
+    assert_eq!(
+        again.revision, first.revision,
+        "a no-op leaves the revision where it was"
+    );
+
+    let node_first = store
+        .soft_delete(&ctx, DeleteRequest::Node("gone-a".to_owned()))
+        .await
+        .expect("the node is tombstoned");
+    assert_eq!(node_first.tombstoned_nodes, 1);
+    let node_again = store
+        .soft_delete(&ctx, DeleteRequest::Node("gone-a".to_owned()))
+        .await
+        .expect("deleting it twice is not a failure");
+    assert_eq!(node_again.tombstoned_nodes, 0);
+    assert_eq!(node_again.revision, node_first.revision);
+
+    // A key that was never here is absent, as every other read surface says.
+    let never = store
+        .soft_delete(&ctx, DeleteRequest::Node("never-existed".to_owned()))
+        .await;
+    assert!(
+        matches!(never, Err(GraphStoreError::NotFound)),
+        "a key that never existed is still absent, got {never:?}"
+    );
+}

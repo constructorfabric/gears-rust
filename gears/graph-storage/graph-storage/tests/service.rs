@@ -344,6 +344,38 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
         vec!["hop-a".to_owned(), "hop-b".to_owned(), "hop-c".to_owned()],
         "two hops reach the whole chain"
     );
+    assert_eq!(
+        walked.seeds,
+        vec!["hop-a".to_owned()],
+        "the answer says which seeds it actually started from"
+    );
+
+    // A seed the caller cannot see is absent from the echo, exactly as it is
+    // absent from every other read: the walk answers about the seeds that
+    // survived authorization, and says which those were.
+    let partly = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec![
+                    "hop-a".to_owned(),
+                    "hop-a".to_owned(),
+                    "never-existed".to_owned(),
+                ],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(10),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+    assert_eq!(
+        partly.seeds,
+        vec!["hop-a".to_owned()],
+        "duplicates collapse and an unknown seed is absent, not an error"
+    );
 
     let around = harness
         .services

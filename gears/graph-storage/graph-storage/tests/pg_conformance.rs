@@ -69,6 +69,23 @@ fn stand_permits() -> &'static tokio::sync::Semaphore {
     &STAND_PERMITS
 }
 
+/// One attempt at a `PostgreSQL` 19 container: the operator's image when they
+/// named one, the platform pin otherwise.
+async fn start_server() -> Result<ContainerAsync<Postgres>, testcontainers::TestcontainersError> {
+    let request = match graph_image() {
+        Some((name, tag)) => test_containers::postgres_graph()
+            .with_name(name)
+            .with_tag(tag),
+        None => test_containers::postgres_graph(),
+    };
+    request
+        .with_env_var("POSTGRES_PASSWORD", "pass")
+        .with_env_var("POSTGRES_USER", "user")
+        .with_env_var("POSTGRES_DB", "graph")
+        .start()
+        .await
+}
+
 /// The container's mapped port, waited for rather than demanded.
 ///
 /// A container that has just been started may not have published its port
@@ -150,30 +167,37 @@ fn graph_image() -> Option<(String, String)> {
 }
 
 async fn stand(hop: HopStrategy) -> Option<Stand> {
+    // Decide the skip before starting anything. The platform pin is a stock
+    // image with no pgvector, so with no image configured this lane can only
+    // end in a skip — and paying for a container per case first is how a
+    // coverage run over the db-free lanes came to spend ten minutes starting
+    // servers it was about to throw away. When the lane is *required* the
+    // attempt still happens, so a future pin that does carry pgvector needs
+    // no change here.
+    if graph_image().is_none() && !test_containers::graph_lane_required() {
+        eprintln!(
+            "GEARS_TEST_PG_GRAPH_IMAGE is unset and the platform pin ({}) has no pgvector - \
+             skipping the SQL/PGQ lane",
+            test_containers::postgres_graph_tag()
+        );
+        return None;
+    }
     let permit = stand_permits()
         .acquire()
         .await
         .expect("the stand semaphore is never closed");
-    let started = match graph_image() {
-        Some((name, tag)) => {
-            test_containers::postgres_graph()
-                .with_name(name)
-                .with_tag(tag)
-                .with_env_var("POSTGRES_PASSWORD", "pass")
-                .with_env_var("POSTGRES_USER", "user")
-                .with_env_var("POSTGRES_DB", "graph")
-                .start()
-                .await
+    // Starting a container is itself a resource request the host can refuse
+    // under load, so a refusal is retried before it is believed: the
+    // alternative is a case that fails for the daemon's reasons and reads as
+    // the gear's.
+    let mut started = start_server().await;
+    for _ in 0..4 {
+        if started.is_ok() {
+            break;
         }
-        None => {
-            test_containers::postgres_graph()
-                .with_env_var("POSTGRES_PASSWORD", "pass")
-                .with_env_var("POSTGRES_USER", "user")
-                .with_env_var("POSTGRES_DB", "graph")
-                .start()
-                .await
-        }
-    };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        started = start_server().await;
+    }
 
     let container = match started {
         Ok(container) => container,
@@ -325,6 +349,18 @@ pg_case!(
 pg_case!(
     a_scope_and_an_idempotency_key_belong_to_their_producer,
     conformance::a_scope_and_an_idempotency_key_belong_to_their_producer
+);
+pg_case!(
+    a_type_pattern_narrows_search_and_a_hop,
+    conformance::a_type_pattern_narrows_search_and_a_hop
+);
+pg_case!(
+    hybrid_search_fuses_both_arms,
+    conformance::hybrid_search_fuses_both_arms
+);
+pg_case!(
+    deleting_an_already_tombstoned_row_is_a_no_op,
+    conformance::deleting_an_already_tombstoned_row_is_a_no_op
 );
 pg_case!(
     an_unchanged_re_ingest_embeds_nothing,

@@ -992,6 +992,15 @@ pub struct NeighborhoodRequest {
 pub struct TraversalResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<EdgeRef>,
+    /// The seeds the walk actually started from: the requested keys, deduped,
+    /// and with the ones the caller may not see removed.
+    ///
+    /// A caller cannot derive this from the request. Denied and unknown seeds
+    /// are indistinguishable by contract, and both are simply absent, so a
+    /// traversal from five keys that answers about three is otherwise silent
+    /// about which three — and "seeds always survive truncation" is a promise
+    /// with nothing to check it against.
+    pub seeds: Vec<NodeKey>,
     pub truncated: Option<TruncationReason>,
     pub revision: GraphRevision,
 }

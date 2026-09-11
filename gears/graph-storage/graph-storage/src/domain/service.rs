@@ -908,8 +908,11 @@ impl GraphServices {
         let ctx = self.store_ctx(auth, Some(snapshot));
 
         let resolved = self.store.resolve_node_ids(&ctx, seeds).await?;
+        // Deduped: the walk starts from a set, so the echo is that set and
+        // not the request's spelling of it.
         let seed_keys: std::collections::BTreeSet<&str> =
             resolved.iter().map(|(key, _)| key.as_str()).collect();
+        let admitted: Vec<NodeKey> = seed_keys.iter().map(|key| (*key).to_owned()).collect();
         let seed_ids: Vec<i64> = resolved.iter().map(|(_, id)| *id).collect();
         if seed_ids.is_empty() {
             // Denied and nonexistent seeds are indistinguishable; an empty
@@ -917,6 +920,7 @@ impl GraphServices {
             return Ok(TraversalResponse {
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                seeds: Vec::new(),
                 truncated: None,
                 revision: snapshot.revision,
             });
@@ -946,6 +950,7 @@ impl GraphServices {
         Ok(TraversalResponse {
             nodes,
             edges: result.edges,
+            seeds: admitted,
             truncated: result.truncated,
             revision: snapshot.revision,
         })

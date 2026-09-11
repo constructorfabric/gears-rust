@@ -412,3 +412,18 @@ async fn a_scope_and_an_idempotency_key_belong_to_their_producer() {
     conformance::a_scope_and_an_idempotency_key_belong_to_their_producer(&store(), Uuid::now_v7())
         .await;
 }
+
+#[tokio::test]
+async fn a_type_pattern_narrows_search_and_a_hop() {
+    conformance::a_type_pattern_narrows_search_and_a_hop(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn hybrid_search_fuses_both_arms() {
+    conformance::hybrid_search_fuses_both_arms(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn deleting_an_already_tombstoned_row_is_a_no_op() {
+    conformance::deleting_an_already_tombstoned_row_is_a_no_op(&store(), Uuid::now_v7()).await;
+}

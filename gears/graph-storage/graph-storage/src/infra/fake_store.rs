@@ -36,6 +36,12 @@ struct FakeNode {
     key: String,
     type_id: String,
     name: Option<String>,
+    /// The searchable text, composed by the *same* function the built-in
+    /// store composes it with. The fake used to match on the name alone, so
+    /// a type declaring `full_text_search` paths was searchable on one
+    /// implementation and not the other — and the suite could not see it,
+    /// because no case searched for text that lived in a payload.
+    search_text: String,
     payload: Option<serde_json::Value>,
     /// The real vector, not a flag: the fake serves an actual cosine arm, so
     /// the acceptance test -- a document retrieved by its own text -- runs
@@ -808,7 +814,11 @@ impl GraphStoreV1 for FakeGraphStore {
             DeleteRequest::Node(key) => {
                 let Some(index) = tenant.nodes.iter().position(|n| n.key == key && !n.deleted)
                 else {
-                    return Err(GraphStoreError::NotFound);
+                    // Rule 3 of the Soft Delete Contract: deleting an
+                    // already-tombstoned row is a no-op, not an absence. A
+                    // key that was never here still reads as absent.
+                    let tombstoned = tenant.nodes.iter().any(|n| n.key == key);
+                    return settle_no_op(self, tenant, tombstoned);
                 };
                 let id = tenant.nodes[index].id;
                 let mut tombstoned = 0u64;
@@ -826,7 +836,8 @@ impl GraphStoreV1 for FakeGraphStore {
             DeleteRequest::Edge(key) => {
                 let Some(position) = tenant.edges.iter().position(|e| e.key == key && !e.deleted)
                 else {
-                    return Err(GraphStoreError::NotFound);
+                    let tombstoned = tenant.edges.iter().any(|e| e.key == key);
+                    return settle_no_op(self, tenant, tombstoned);
                 };
                 // An edge is a statement about two nodes: tombstoning it needs
                 // both endpoints visible, the rule the edge read follows.
@@ -1060,21 +1071,40 @@ impl GraphStoreV1 for FakeGraphStore {
             return Err(GraphStoreError::NotFound);
         };
         let (nodes, _, revision) = visible(tenant, ctx);
-        let live: Vec<&FakeNode> = nodes.iter().filter(|n| !n.deleted).collect();
+        // The caller's type filter, resolved through the platform matcher as
+        // `resolve_type_set` does — a pattern list that resolves to nothing
+        // admits nothing, which is not the same as an absent filter.
+        let admitted: Option<BTreeSet<String>> = if req.type_patterns.is_empty() {
+            None
+        } else {
+            Some(
+                tenant
+                    .types
+                    .values()
+                    .filter(|record| {
+                        ontology::matches_any_pattern(&record.type_id, &req.type_patterns)
+                            .unwrap_or(false)
+                    })
+                    .map(|record| record.type_id.clone())
+                    .collect(),
+            )
+        };
+        let live: Vec<&FakeNode> = nodes
+            .iter()
+            .filter(|n| !n.deleted)
+            .filter(|n| {
+                admitted
+                    .as_ref()
+                    .is_none_or(|types| types.contains(&n.type_id))
+            })
+            .collect();
 
         let lexical: Vec<&FakeNode> =
             if matches!(req.mode, SearchMode::Lexical | SearchMode::Hybrid) {
                 let needle = req.query.clone().unwrap_or_default().to_lowercase();
                 live.iter()
                     .copied()
-                    .filter(|n| {
-                        needle.is_empty()
-                            || n.name
-                                .as_deref()
-                                .unwrap_or_default()
-                                .to_lowercase()
-                                .contains(&needle)
-                    })
+                    .filter(|n| needle.is_empty() || n.search_text.to_lowercase().contains(&needle))
                     .take(req.arm_limit as usize)
                     .collect()
             } else {
@@ -1900,6 +1930,23 @@ fn view_of(
 }
 
 /// Generation fencing on a scope replacement, before anything is written.
+/// A delete that found nothing live: a no-op when the row is tombstoned, an
+/// absence when the key was never there.
+fn settle_no_op(
+    store: &FakeGraphStore,
+    tenant: &Tenant,
+    tombstoned: bool,
+) -> Result<DeleteOutcome, GraphStoreError> {
+    if !tombstoned {
+        return Err(GraphStoreError::NotFound);
+    }
+    Ok(DeleteOutcome {
+        revision: store.revision_of(tenant),
+        tombstoned_nodes: 0,
+        tombstoned_edges: 0,
+    })
+}
+
 fn fence(
     tenant: &Tenant,
     producer: &str,
@@ -2018,6 +2065,11 @@ fn apply_node(
             key: spec.node_key.clone(),
             type_id: spec.type_id.clone(),
             name: spec.name.clone(),
+            search_text: crate::infra::store::ingest::compose_search_text(
+                spec.name.as_deref(),
+                spec.payload.as_ref(),
+                &record.effective_traits.full_text_search,
+            ),
             payload: spec.payload.clone(),
             embedding: vector.embedding,
             embedding_epoch: vector.epoch,
@@ -2092,6 +2144,11 @@ fn apply_node(
 
     existing.type_id.clone_from(&spec.type_id);
     existing.name.clone_from(&spec.name);
+    existing.search_text = crate::infra::store::ingest::compose_search_text(
+        spec.name.as_deref(),
+        spec.payload.as_ref(),
+        &record.effective_traits.full_text_search,
+    );
     existing.payload.clone_from(&spec.payload);
     existing.embedding = vector.embedding;
     existing.embedding_epoch = vector.epoch;
@@ -2194,6 +2251,7 @@ fn apply_endpoint(
         key: key.to_owned(),
         type_id: phantom_type.type_id.clone(),
         name: None,
+        search_text: String::new(),
         payload: None,
         embedding: None,
         embedding_epoch: None,

@@ -359,6 +359,16 @@ A scope **MUST** have a canonical identity (tenant, owning producer, scope attri
 - **Rationale**: Producers re-sync whole sources; replacement semantics keep the graph consistent with upstream without full wipes or tombstone bookkeeping.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
+> **Found while building the prototype.** Three clauses are narrower than
+> written. A replacement removes the scope's static *edges* only where they are
+> incident to a node the batch stopped naming — an edge between two re-supplied
+> nodes that the batch no longer asserts survives. Ordinary ingests do not
+> participate in the scope lock: with no `replace_scope` the registry is never
+> touched, so a plain write can interleave with a replacement. And the lock
+> itself is the fence row's own write (`ON CONFLICT DO UPDATE`, which takes the
+> row lock to commit), because the platform's secure ORM exposes no
+> row-locking surface a gear could use.
+
 #### Node Read with Adjacency
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-fr-node-read`
