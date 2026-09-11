@@ -12,6 +12,17 @@
 //! the README) to run this lane; otherwise it skips — unless
 //! `GEARS_TEST_PG_GRAPH_REQUIRED` is set, which turns a missing server into a
 //! failure so CI cannot go green by silently running nothing.
+//!
+//! **Every case gets its own server**, because two of them are operator
+//! surgery on server-wide state (dropping the property graph, re-resolving the
+//! embedding space at boot) and a shared instance would make them poison the
+//! rest. The cost is one container per case, which on an ordinary machine is
+//! more than Docker and `PostgreSQL` will take at once: at eight in parallel
+//! the connection pools time out (`PoolTimedOut`) and a *different* case fails
+//! on each run — which reads as flakiness in the gear and is contention on the
+//! host. `STAND_PERMITS` bounds it for the in-process test runner; `nextest`
+//! runs each case in its own process, so there the bound is
+//! `--test-threads` (see the `test-graph-storage-pg` target).
 
 mod conformance;
 
@@ -33,6 +44,31 @@ use toolkit_db::{ConnectOpts, connect_db};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+/// How many stands may exist at once under the in-process runner.
+///
+/// Two is deliberately conservative: measured on an 8-core, 23 GiB machine
+/// with a development stand already running, eight concurrent stands fail a
+/// different case on every run, four still fail about half the time, and two
+/// have not failed. A host with memory to spare raises it with
+/// `GEARS_TEST_PG_GRAPH_STANDS`. The cost of the conservative default is
+/// wall-clock on one lane; the cost of the optimistic one is a suite that
+/// cries wolf, which is worse.
+static STAND_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
+/// Give the semaphore its permits once, from the environment or the default.
+fn stand_permits() -> &'static tokio::sync::Semaphore {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let permits = std::env::var("GEARS_TEST_PG_GRAPH_STANDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|permits| *permits > 0)
+            .unwrap_or(2);
+        STAND_PERMITS.add_permits(permits);
+    });
+    &STAND_PERMITS
+}
+
 /// A live `PostgreSQL` 19 with the gear's schema and property graph applied.
 struct Stand {
     store: Arc<PgGraphStore>,
@@ -42,6 +78,9 @@ struct Stand {
     /// the property graph is operator surgery, not something a gear can do.
     dsn: String,
     _container: ContainerAsync<Postgres>,
+    /// Held for the case's lifetime: the stand is the scarce resource, not
+    /// its startup, so the permit is released when the stand is dropped.
+    _permit: tokio::sync::SemaphorePermit<'static>,
 }
 
 /// Remove the property graph, leaving the tables. This is what a gear sees on
@@ -66,6 +105,10 @@ fn graph_image() -> Option<(String, String)> {
 }
 
 async fn stand(hop: HopStrategy) -> Option<Stand> {
+    let permit = stand_permits()
+        .acquire()
+        .await
+        .expect("the stand semaphore is never closed");
     let started = match graph_image() {
         Some((name, tag)) => {
             test_containers::postgres_graph()
@@ -157,6 +200,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         db,
         dsn,
         _container: container,
+        _permit: permit,
     })
 }
 
