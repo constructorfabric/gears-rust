@@ -4113,3 +4113,99 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
     assert_eq!(last.per_item_edges.as_deref(), Some(&[][..]));
     assert_eq!(last.counts.phantoms_materialized, 1);
 }
+
+/// A scope belongs to the producer that claimed it, and an idempotency key is
+/// that producer's alone.
+///
+/// Both halves come from the Concurrent Ingest Protocol: rule 3 makes the
+/// scope's canonical identity `(tenant, owning producer, attribute, value)`,
+/// and rule 2 makes the idempotency key tenant- *and* producer-scoped. Both
+/// columns existed from the first migration and both were written empty, so
+/// the checks around them passed vacuously: any writer could replace any
+/// other's scope — deleting rows it had never seen, which is exactly the union
+/// state rule 3 exists to prevent — and two producers that happened to choose
+/// the same key string had one namespace between them.
+pub async fn a_scope_and_an_idempotency_key_belong_to_their_producer(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let first = ctx(tenant, &scope, None);
+    let second = ctx_as(tenant, &scope, None, producer_b());
+    store
+        .register_types(&first, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // The first producer claims the scope by replacing it.
+    ingest_batch(
+        store,
+        &first,
+        batch_replacing(vec![scoped_node("own-1", "acme/infra")], vec![], 1),
+    )
+    .await
+    .expect("the first producer claims the scope");
+
+    // The second cannot replace it, whatever generation it offers: a higher
+    // generation is not a claim, and no retry makes it right.
+    for generation in [2, 7] {
+        let refused = ingest_batch(
+            store,
+            &second,
+            batch_replacing(vec![scoped_node("own-2", "acme/infra")], vec![], generation),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(GraphStoreError::Conflict { .. })),
+            "generation {generation} from another producer is a conflict, got {refused:?}"
+        );
+    }
+
+    // And it removed nothing on the way out.
+    let kept = store
+        .get_node(&first, &"own-1".to_owned(), 10)
+        .await
+        .expect("the owner's row is untouched");
+    assert_eq!(kept.node_key, "own-1");
+    assert!(
+        store
+            .get_node(&first, &"own-2".to_owned(), 10)
+            .await
+            .is_err(),
+        "the refused batch wrote nothing"
+    );
+
+    // The owner still owns it and can carry it forward.
+    ingest_batch(
+        store,
+        &first,
+        batch_replacing(vec![scoped_node("own-3", "acme/infra")], vec![], 2),
+    )
+    .await
+    .expect("the owner replaces its own scope");
+
+    // One key string, two producers, two logical requests: the second is not
+    // a replay of the first, and each producer's own retry still is.
+    let keyed = |name: &str| IngestRequest {
+        idempotency_key: Some("shared-key".to_owned()),
+        ..batch(vec![node("keyed", name)], vec![])
+    };
+    let mine = ingest_batch(store, &first, keyed("first"))
+        .await
+        .expect("the first producer's batch commits");
+    assert!(!mine.replayed);
+    let replay = ingest_batch(store, &first, keyed("first"))
+        .await
+        .expect("the same producer's identical retry replays");
+    assert!(replay.replayed, "a producer's own retry is a replay");
+
+    // The other producer's *different* request under the same key is not a
+    // mismatch against a receipt that was never theirs.
+    let theirs = ingest_batch(store, &second, keyed("second"))
+        .await
+        .expect("another producer's batch under the same key is its own request");
+    assert!(
+        !theirs.replayed,
+        "one producer's receipt must not answer another's request"
+    );
+}

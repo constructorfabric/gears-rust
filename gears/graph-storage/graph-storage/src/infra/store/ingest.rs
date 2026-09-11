@@ -283,7 +283,14 @@ pub async fn ingest(
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
     let subject = ctx.subject.clone();
-    let producer = String::new();
+    // The producer is the writing principal, not a placeholder: the
+    // idempotency key is documented as tenant- *and* producer-scoped, and a
+    // scope's canonical identity includes its owning producer (Concurrent
+    // Ingest Protocol, rules 2 and 4). Both columns existed from the first
+    // migration and both were written empty, which made two producers in one
+    // tenant share an idempotency namespace and let any writer replace any
+    // other's scope.
+    let producer = subject.principal();
 
     store
         .db()
@@ -471,6 +478,14 @@ async fn fence_scope(
     // Unqualified names on the right of `DO UPDATE SET` are the stored row;
     // `excluded` is what this statement offered.
     let keep_higher = Expr::cust("GREATEST(scope_registry.generation, excluded.generation)");
+    // An unowned scope is claimed by its first writer, under this row lock —
+    // the rule source namespaces already follow, and what keeps a deployment
+    // whose rows predate producer identity working: those rows carry an empty
+    // owner, and the producer that next replaces the scope adopts it.
+    let claim_if_unowned = Expr::cust(
+        "CASE WHEN scope_registry.owner_producer = '' \
+         THEN excluded.owner_producer ELSE scope_registry.owner_producer END",
+    );
     let hash_of_winner = Expr::cust(
         "CASE WHEN excluded.generation > scope_registry.generation \
          THEN excluded.request_hash ELSE scope_registry.request_hash END",
@@ -483,6 +498,8 @@ async fn fence_scope(
     .value(scope_registry::Column::Generation, keep_higher)
     .map_err(map_scope_err)?
     .value(scope_registry::Column::RequestHash, hash_of_winner)
+    .map_err(map_scope_err)?
+    .value(scope_registry::Column::OwnerProducer, claim_if_unowned)
     .map_err(map_scope_err)?
     .update_columns([scope_registry::Column::UpdatedAt])
     .map_err(map_scope_err)?;
@@ -512,8 +529,16 @@ async fn fence_scope(
         })?;
 
     if row.owner_producer != producer {
+        // A scope is one producer's declarative set. Letting another writer
+        // replace it would delete rows it never had a view of, which is the
+        // union state rule 3 of the protocol exists to prevent — and unlike
+        // a stale generation, no retry makes it right.
         return Err(GraphStoreError::Conflict {
-            reason: "this scope is owned by another producer".into(),
+            reason: format!(
+                "scope `{}={}` is owned by another producer; a replacement may only be \
+                 submitted by its owner",
+                replace.attribute, replace.value
+            ),
         });
     }
     if row.generation > replace.generation {

@@ -124,6 +124,18 @@ struct Receipt {
     outcome: IngestOutcome,
 }
 
+/// One scope's fence: who owns it, the highest generation it has accepted,
+/// and the content hash that generation carried. The owner is here because
+/// the scope's canonical identity includes it (Concurrent Ingest Protocol,
+/// rule 3) — a boundary only one implementation carries is a boundary the
+/// conformance suite cannot see.
+#[derive(Clone)]
+struct FakeScope {
+    owner_producer: String,
+    generation: i64,
+    request_hash: String,
+}
+
 #[derive(Default)]
 struct Tenant {
     types: BTreeMap<String, TypeRecord>,
@@ -139,8 +151,11 @@ struct Tenant {
     nodes: Vec<FakeNode>,
     edges: Vec<FakeEdge>,
     revision: i64,
-    receipts: BTreeMap<String, Receipt>,
-    scopes: BTreeMap<(String, String), (i64, String)>,
+    /// Keyed by `(producer principal, idempotency key)`: the key is
+    /// tenant- and producer-scoped, so two producers choosing the same
+    /// string are two logical requests.
+    receipts: BTreeMap<(String, String), Receipt>,
+    scopes: BTreeMap<(String, String), FakeScope>,
     /// Snapshots taken by `begin_read`: a full copy, which is what makes this
     /// implementation able to honour the one-snapshot obligation the
     /// `PostgreSQL` store currently cannot.
@@ -548,8 +563,12 @@ impl GraphStoreV1 for FakeGraphStore {
         let tenant = tenants.entry(ctx.tenant).or_default();
         let request_hash = identity::ingest_request_hash(&req);
 
+        // Tenant- *and* producer-scoped, as the protocol says: two producers
+        // in one tenant that happen to choose the same key are two logical
+        // requests, not a retry of one.
+        let producer = ctx.subject.principal();
         if let Some(key) = &req.idempotency_key
-            && let Some(receipt) = tenant.receipts.get(key)
+            && let Some(receipt) = tenant.receipts.get(&(producer.clone(), key.clone()))
         {
             if receipt.request_hash != request_hash {
                 return Err(GraphStoreError::IdempotencyMismatch);
@@ -563,7 +582,7 @@ impl GraphStoreV1 for FakeGraphStore {
         }
 
         if let Some(replace) = &req.replace_scope {
-            fence(tenant, replace, &request_hash)?;
+            fence(tenant, &producer, replace, &request_hash)?;
         }
 
         // The ownership boundary, before any working copy is taken: a
@@ -737,9 +756,22 @@ impl GraphStoreV1 for FakeGraphStore {
             tenant.revision += 1;
         }
         if let Some(replace) = &req.replace_scope {
+            let key = (replace.attribute.clone(), replace.value.clone());
+            // An unowned scope is claimed by its first writer, as a source
+            // namespace is.
+            let owner_producer = tenant
+                .scopes
+                .get(&key)
+                .map(|scope| scope.owner_producer.clone())
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or_else(|| producer.clone());
             tenant.scopes.insert(
-                (replace.attribute.clone(), replace.value.clone()),
-                (replace.generation, request_hash.clone()),
+                key,
+                FakeScope {
+                    owner_producer,
+                    generation: replace.generation,
+                    request_hash: request_hash.clone(),
+                },
             );
         }
 
@@ -753,7 +785,7 @@ impl GraphStoreV1 for FakeGraphStore {
         };
         if let Some(key) = &req.idempotency_key {
             tenant.receipts.insert(
-                key.clone(),
+                (producer, key.clone()),
                 Receipt {
                     request_hash,
                     epoch: self.epoch,
@@ -1848,20 +1880,30 @@ fn view_of(
 /// Generation fencing on a scope replacement, before anything is written.
 fn fence(
     tenant: &Tenant,
+    producer: &str,
     replace: &graph_storage_sdk::models::ReplaceScope,
     request_hash: &str,
 ) -> Result<(), GraphStoreError> {
     let key = (replace.attribute.clone(), replace.value.clone());
-    let Some((generation, hash)) = tenant.scopes.get(&key) else {
+    let Some(scope) = tenant.scopes.get(&key) else {
         return Ok(());
     };
-    if replace.generation < *generation {
+    if !scope.owner_producer.is_empty() && scope.owner_producer != producer {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "scope `{}={}` is owned by another producer; a replacement may only be \
+                 submitted by its owner",
+                replace.attribute, replace.value
+            ),
+        });
+    }
+    if replace.generation < scope.generation {
         return Err(GraphStoreError::StaleGeneration {
-            recorded: *generation,
+            recorded: scope.generation,
             offered: replace.generation,
         });
     }
-    if replace.generation == *generation && hash != request_hash {
+    if replace.generation == scope.generation && scope.request_hash != request_hash {
         return Err(GraphStoreError::Conflict {
             reason: "same source generation with different content".into(),
         });

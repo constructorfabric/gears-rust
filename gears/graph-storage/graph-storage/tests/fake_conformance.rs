@@ -406,3 +406,9 @@ async fn a_same_key_ingest_may_not_change_the_type() {
 async fn per_item_outcomes_follow_the_batch_order() {
     conformance::per_item_outcomes_follow_the_batch_order(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn a_scope_and_an_idempotency_key_belong_to_their_producer() {
+    conformance::a_scope_and_an_idempotency_key_belong_to_their_producer(&store(), Uuid::now_v7())
+        .await;
+}

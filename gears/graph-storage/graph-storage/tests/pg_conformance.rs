@@ -290,6 +290,10 @@ pg_case!(
     conformance::per_item_outcomes_follow_the_batch_order
 );
 pg_case!(
+    a_scope_and_an_idempotency_key_belong_to_their_producer,
+    conformance::a_scope_and_an_idempotency_key_belong_to_their_producer
+);
+pg_case!(
     an_unchanged_re_ingest_embeds_nothing,
     conformance::an_unchanged_re_ingest_embeds_nothing
 );
