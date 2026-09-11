@@ -11,13 +11,13 @@ use serde::Deserialize;
 ///
 /// One per deployment, per the single-embedding-space constraint: the choice
 /// is a deployment fact, not a per-request option.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingProviderKind {
     /// The deterministic hash-based provider. Reproducible and free, and its
     /// ranking carries no meaning whatsoever -- for tests, and for a
     /// deployment that wants the write path exercised before a model exists.
-    #[default]
+    /// Never chosen implicitly: it has to be spelled out in configuration.
     Fake,
     /// ADR-0004's default: a `MiniLM`-class model in this process. Needs the
     /// `onnx` feature at compile time and artifact paths at run time.
@@ -56,8 +56,12 @@ pub struct GraphStorageConfig {
     /// other.
     pub embedding_input_max_bytes: u32,
 
-    /// Which provider computes this deployment's vectors.
-    pub embedding_provider: EmbeddingProviderKind,
+    /// Which provider computes this deployment's vectors. There is no default:
+    /// a deployment names one of `fake | onnx | remote`, or the boot fails.
+    /// Falling back to the fake would fill the graph with vectors that rank
+    /// nothing meaningfully while every health signal stayed green — the
+    /// quiet quality loss ADR-0004 is written to prevent.
+    pub embedding_provider: Option<EmbeddingProviderKind>,
     /// Path to the ONNX model artifact. Required by the `onnx` provider; the
     /// gear reads it and never fetches it, so the embedding-space identity can
     /// be the hash of the bytes actually loaded (ADR-0005).
@@ -143,7 +147,7 @@ impl Default for GraphStorageConfig {
             traversal_hop: HopStrategy::default(),
             embedding_dimension: 384,
             embedding_input_max_bytes: 8 * 1024,
-            embedding_provider: EmbeddingProviderKind::default(),
+            embedding_provider: None,
             embedding_model_path: None,
             embedding_tokenizer_path: None,
             embedding_remote_base_url: None,

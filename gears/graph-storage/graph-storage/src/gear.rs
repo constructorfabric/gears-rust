@@ -105,12 +105,19 @@ impl Gear for GraphStorage {
 ///
 /// # Errors
 ///
-/// An `onnx` deployment whose artifacts are missing or unloadable, or one
-/// built without the `onnx` feature.
+/// No provider configured at all; an `onnx` deployment whose artifacts are
+/// missing or unloadable, or one built without the `onnx` feature.
 async fn select_embedding_provider(
     cfg: &GraphStorageConfig,
 ) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
-    match cfg.embedding_provider {
+    let Some(kind) = cfg.embedding_provider else {
+        anyhow::bail!(
+            "graph-storage.embedding_provider is not set; name one of `fake`, `onnx` or \
+             `remote` -- the gear does not fall back to the fake, whose vectors rank nothing \
+             meaningfully"
+        );
+    };
+    match kind {
         EmbeddingProviderKind::Fake => {
             warn!(
                 "graph-storage.embedding_provider is `fake`: vector search will answer, \
