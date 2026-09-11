@@ -12,13 +12,13 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
-    DeleteRequest, ElementEnvelope, GraphRevision, GtsTypeId, IngestCounts, IngestOutcome,
-    IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId, LabelRecord, LabelSpec, NodeId,
-    NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest, ReadSnapshot, ReadinessState,
-    RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse,
-    SourceNamespaceOwner, StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange,
-    TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration,
-    TypeRegistrationOptions,
+    DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestCounts,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId, LabelRecord,
+    LabelSpec, NodeId, NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest,
+    ReadSnapshot, ReadinessState, RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode,
+    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TopologyPage,
+    TopologyRequest, TypeChange, TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -58,6 +58,7 @@ struct FakeEdge {
     type_id: String,
     src: i64,
     dst: i64,
+    discriminator: Option<String>,
     payload: Option<serde_json::Value>,
     deleted: bool,
     audit: FakeAudit,
@@ -902,6 +903,45 @@ impl GraphStoreV1 for FakeGraphStore {
             adjacency,
             truncated,
         ))
+    }
+
+    async fn get_edge(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: &EdgeKey,
+    ) -> Result<EdgeView, GraphStoreError> {
+        if !scope_admits(ctx.scope, ctx.tenant) {
+            return Err(GraphStoreError::NotFound);
+        }
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let tenant = tenants.get(&ctx.tenant).ok_or(GraphStoreError::NotFound)?;
+        let (nodes, edges, revision) = visible(tenant, ctx);
+        let edge = edges
+            .iter()
+            .find(|e| &e.key == key && !e.deleted)
+            .ok_or(GraphStoreError::NotFound)?;
+        // Both endpoints visible or the edge is not: the same induced-subgraph
+        // rule the PostgreSQL store applies.
+        let endpoint = |id: i64| nodes.iter().find(|n| n.id == id && !n.deleted);
+        let (Some(src), Some(dst)) = (endpoint(edge.src), endpoint(edge.dst)) else {
+            return Err(GraphStoreError::NotFound);
+        };
+        Ok(EdgeView {
+            edge_key: edge.key.clone(),
+            edge_type_id: edge.type_id.clone(),
+            src: src.key.clone(),
+            dst: dst.key.clone(),
+            discriminator: edge.discriminator.clone(),
+            payload: edge.payload.clone(),
+            envelope: edge.audit.envelope(
+                edge.key.clone(),
+                ctx.tenant,
+                GraphRevision {
+                    source_epoch: self.epoch,
+                    revision,
+                },
+            ),
+        })
     }
 
     async fn hydrate_nodes(
@@ -2173,6 +2213,7 @@ fn apply_edge(
                 type_id: spec.type_id.clone(),
                 src,
                 dst,
+                discriminator: spec.discriminator.clone(),
                 payload: spec.payload.clone(),
                 deleted: false,
                 audit: FakeAudit::created(state.subject),

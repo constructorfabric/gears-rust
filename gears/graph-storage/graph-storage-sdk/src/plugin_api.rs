@@ -18,13 +18,13 @@ use tokio_util::sync::CancellationToken;
 use toolkit_security::AccessScope;
 
 use crate::models::{
-    ComponentReadiness, DeleteOutcome, DeleteRequest, Direction, EdgeRef, EmbeddingSpaceId,
-    EngineCapabilities, GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest,
-    ItemError, LabelAssignment, LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey,
-    NodeRow, NodeView, Page, ProjectionRequest, ReadSnapshot, RegisteredType, RemainingBudget,
-    RevisionOutcome, SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities,
-    Subject, TenantId, TopologyPage, TopologyRequest, TruncationReason, TypeIdSet, TypeQuery,
-    TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    ComponentReadiness, DeleteOutcome, DeleteRequest, Direction, EdgeKey, EdgeRef, EdgeView,
+    EmbeddingSpaceId, EngineCapabilities, GraphRevision, GtsTypeId, HopBudget, IngestOutcome,
+    IngestRequest, ItemError, LabelAssignment, LabelFilter, LabelId, LabelRecord, LabelSpec,
+    NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest, ReadSnapshot, RegisteredType,
+    RemainingBudget, RevisionOutcome, SearchRequest, SearchResponse, SourceNamespaceOwner,
+    StoreCapabilities, Subject, TenantId, TopologyPage, TopologyRequest, TruncationReason,
+    TypeIdSet, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -275,6 +275,15 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         ids: &[NodeId],
     ) -> Result<Vec<NodeView>, GraphStoreError>;
+    /// One edge as an element, with its payload and audit envelope
+    /// (`fr-audit-envelope`, which asks for the envelope on every node *and
+    /// edge* a read surface returns). Scoped like a node read: an edge either
+    /// of whose endpoints lies outside the caller's scope reads as absent.
+    async fn get_edge(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: &EdgeKey,
+    ) -> Result<EdgeView, GraphStoreError>;
     /// One call, not one per arm: the scope must apply inside each arm before
     /// UNION, ranking and LIMIT, and RRF needs each arm's ranks.
     async fn search(

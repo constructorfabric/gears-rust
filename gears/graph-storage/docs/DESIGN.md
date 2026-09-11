@@ -1110,6 +1110,7 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
+| `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
 | `POST` | `/api/graph-storage/v1/search` | Lexical, vector or hybrid search | p1 |
 | `POST` | `/api/graph-storage/v1/graph/traverse` | Seeded, depth-bounded traversal | p1 |
@@ -1230,6 +1231,15 @@ and the wrapper constrains the page rather than the items. Putting
 `graph_revision` in the envelope is therefore what lets that path report the
 snapshot it observed at all (PRD § `fr-tabular-projection`).
 
+**Both halves of this are reachable.** The envelope is required on every
+returned node *and* edge, which needs a surface that returns an edge as an
+element: `GET /edges/{edge_key}`, above. Without it the edge columns were
+written by every ingest path and read by nothing, so a path that forgot one
+would have broken no test — a requirement nothing can observe is a requirement
+nothing checks. Topology references stay what they are: `EdgeRef` in a
+traversal and `AdjacencyEntry` in a node read carry a key, a type and two
+endpoints, and the key is the one the edge read accepts.
+
 **An attribute has no envelope of its own.** It is a fragment inside an element's
 payload, so its tenant, its timestamps and the subject that wrote it are the
 embedding element's, reported once on that element. What is *not* inherited is
@@ -1340,6 +1350,11 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         -> Result<GraphRevision, GraphStoreError>;
     async fn get_node(&self, ctx: &StoreCtx<'_>, key: &NodeKey, adjacency_limit: u32)
         -> Result<NodeView, GraphStoreError>;
+    /// One edge as an element. An edge either of whose endpoints the scope
+    /// does not admit reads as absent: the authorized graph is the induced
+    /// subgraph, and an edge is a statement about two nodes.
+    async fn get_edge(&self, ctx: &StoreCtx<'_>, key: &EdgeKey)
+        -> Result<EdgeView, GraphStoreError>;
     async fn hydrate_nodes(&self, ctx: &StoreCtx<'_>, ids: &[NodeId])
         -> Result<Vec<NodeView>, GraphStoreError>;
     /// One call, not one per arm: the scope must apply inside each arm before

@@ -141,6 +141,21 @@ reviewers see the gap list before the code arrives.
 | coverage measured, then raised to 85 % | 1–3 d | `cargo llvm-cov -p cf-gears-graph-storage` reports ≥ 85 % |
 | § 6.1 scenarios timed on a seeded reference graph (the loader already builds one) | 2 d | four scenarios with numbers against the thresholds, recorded |
 
+**Progress.** The § 2 table above describes the state this sprint started
+from and is left as it was, because that is the state the PR argues against.
+What is closed so far, each with the case that closes it:
+
+| item | state | what asserts it |
+| --- | --- | --- |
+| `fr-source-ownership` | done | `a_source_namespace_is_claimed_by_its_first_writer`, `writing_under_another_producers_namespace_is_forbidden`, `a_transfer_moves_the_namespace_and_records_who_moved_it`, `an_owned_nodes_source_field_claims_no_namespace` |
+| `fr-readiness` | done | `readiness_reports_every_capability_and_only_some_block_service`, on the fake and against a real server |
+| `fr-scope-replace` (removal half) | done | `scope_replacement_removes_what_the_batch_no_longer_names`, `scope_replacement_preserves_analysis_edges_and_their_endpoints` |
+| the scope single-writer race | done — and it found the fence was not one (D-035) | `two_replacements_of_one_scope_serialize`, on a multi-threaded runtime |
+| reference nodes, analysis edges, the edge read | done | `both_node_families_and_both_edge_families_round_trip`, `an_edge_read_carries_the_envelope`, `an_edge_whose_endpoint_is_hidden_is_not_readable`; the key rule itself in `domain::identity` unit tests |
+| adversarial case per endpoint | next | — |
+| coverage to 85 % | pending | — |
+| § 6.1 timings | pending | — |
+
 Left as recorded cuts, with entries: `nfr-tenant-fairness` (D-105),
 `fr-index-admission` (D-104 + #4721), the snapshot obligation (D-007), the PG16
 matrix (D-108), and every p2/p3 above.

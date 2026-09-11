@@ -956,3 +956,25 @@ async fn the_built_in_store_declines_the_snapshot_obligation() {
         .await
         .expect("snapshot closes");
 }
+
+// --- both families, and the edge read -----------------------------------------
+
+pg_case!(
+    both_node_families_and_both_edge_families_round_trip,
+    conformance::both_node_families_and_both_edge_families_round_trip
+);
+pg_case!(
+    an_edge_read_carries_the_envelope,
+    conformance::an_edge_read_carries_the_envelope
+);
+
+#[tokio::test]
+async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let one = tenant_on(&stand).await;
+    let two = tenant_on(&stand).await;
+    conformance::an_edge_whose_endpoint_is_hidden_is_not_readable(stand.store.as_ref(), one, two)
+        .await;
+}

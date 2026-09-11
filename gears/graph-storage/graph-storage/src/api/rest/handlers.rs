@@ -322,6 +322,21 @@ pub async fn get_node(
     Ok(Json(view.into()))
 }
 
+/// One edge as an element.
+///
+/// The envelope on the answer is the point of the surface: `fr-audit-envelope`
+/// asks for it on every returned node *and* edge, and until this existed no
+/// read path returned an edge as anything but a topology reference.
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn get_edge(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Path(edge_key): Path<String>,
+) -> ApiResult<Json<dto::GraphEdgeDto>> {
+    let view = services.get_edge(&ctx, &edge_key).await?;
+    Ok(Json(view.into()))
+}
+
 /// Tabular projection.
 ///
 /// The `OData` extractor is the platform binding: it parses and validates the

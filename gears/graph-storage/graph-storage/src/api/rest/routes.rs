@@ -256,6 +256,23 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::get(format!("{BASE}/edges/{{edge_key}}"))
+        .operation_id("graph_storage.get_edge")
+        .summary("Edge with payload and audit envelope")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("edge_key", "Gear-derived edge key")
+        .handler(handlers::get_edge)
+        .json_response_with_schema::<dto::GraphEdgeDto>(openapi, http::StatusCode::OK, "The edge")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router = OperationBuilder::get(format!("{BASE}/nodes"))
         .operation_id("graph_storage.project_nodes")
         .summary("Tabular projection")

@@ -243,15 +243,19 @@ PRD § `fr-tabular-projection` carries a "Found while building the prototype" no
 
 **How it was checked:** **Verified on the live stand.** `GET /nodes?limit=2` returns each row with `"graph_revision": {"source_epoch": 1, "revision": 5}`, and the conformance obligation `a_projection_row_carries_the_envelope` asserts it against both store implementations.
 
-## D-022 [impl-gap] No read surface returns an edge, so half of `fr-audit-envelope` is unexercised
+## D-022 [closed] No read surface returned an edge, so half of `fr-audit-envelope` was unexercised
 
-`fr-audit-envelope` says **every node and edge** returned by any read surface must carry the envelope. The prototype has no surface that returns an edge as an element: `DELETE /edges/{edge_key}` exists, `GET` does not, and an edge appears in a response only as a topology reference — `EdgeRef` in a traversal, `AdjacencyEntry` in a node read — which is a key, a type and two endpoints by design.
+`fr-audit-envelope` says **every node and edge** returned by any read surface must carry the envelope. The prototype had no surface that returned an edge as an element: `DELETE /edges/{edge_key}` existed, `GET` did not, and an edge appeared in a response only as a topology reference — `EdgeRef` in a traversal, `AdjacencyEntry` in a node read — which is a key, a type and two endpoints by design.
 
-**Implementation:** the edge table carries the full envelope and every write populates it (migration `m0004` adds `updated_at` and the three subject pairs), so the data is there and correct. Nothing reads it back.
+The edge table carried the full envelope and every write populated it (migration `m0004` adds `updated_at` and the three subject pairs), so the data was there and correct. Nothing read it back — and a requirement that cannot be observed is a requirement nothing tests: the columns would drift the first time an ingest path was added that forgot one.
 
-**Why this is `[impl-gap]` and not `[deferred]`:** a requirement that cannot be observed is a requirement nothing tests, and the columns will drift the first time an ingest path is added that forgets one. The conformance obligation asserts the node half against both stores; the edge half has no assertion because it has no surface to assert through.
+**Closed by implementing the read the FR implies.** `GraphStoreV1::get_edge` on both stores, `GET /api/graph-storage/v1/edges/{edge_key}` returning `GraphEdgeDto` (key, type, endpoints, discriminator, payload, envelope). The key is the one the topology references already carry, so an adjacency entry or a traversal reference is directly addressable — `an_edge_read_carries_the_envelope` reaches the edge exactly that way rather than re-deriving the hash, which is also what asserts the two surfaces agree on how an edge is named.
 
-**Proposal:** either add the edge read the FR implies, or state in the FR that an edge's envelope is reachable only through a future edge read. The first is small — the columns and the mapping already exist.
+Scoping follows the induced authorized subgraph: the edge is returned only if **both** endpoints are visible under the caller's scope. An edge is a statement about two nodes, so returning it while an endpoint is hidden would leak the connectivity the node read refuses to.
+
+**Proposal:** PRD's `fr-audit-envelope` and DESIGN § 3.3 both carry the surface now (amendment notes in place).
+
+**How it was checked:** three conformance cases against both stores — `an_edge_read_carries_the_envelope` (creator preserved, last writer moved by a second producer re-asserting the same relationship, tombstoned and unknown keys alike absent), `an_edge_whose_endpoint_is_hidden_is_not_readable` (another tenant's key, and an endpoint tombstoned within one tenant), and `both_node_families_and_both_edge_families_round_trip`, which reads every edge of the batch back through the edge read.
 
 ## D-023 [doc-gap] "Falling back is never silent" was silent to everything except a human reading logs
 

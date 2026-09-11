@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
-    ComponentReadiness, DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId, IngestOutcome,
-    IngestRequest, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
-    ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType, RevisionOutcome,
-    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, TopologyPage,
-    TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    ComponentReadiness, DeleteOutcome, DeleteRequest, EdgeKey, EdgeView, GraphRevision, GtsTypeId,
+    IngestOutcome, IngestRequest, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow,
+    NodeView, Page, ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType,
+    RevisionOutcome, SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities,
+    TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -347,6 +348,14 @@ impl GraphStoreV1 for PgGraphStore {
         adjacency_limit: u32,
     ) -> Result<NodeView, GraphStoreError> {
         reads::get_node(self, ctx, key, adjacency_limit).await
+    }
+
+    async fn get_edge(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: &EdgeKey,
+    ) -> Result<EdgeView, GraphStoreError> {
+        reads::get_edge(self, ctx, key).await
     }
 
     async fn hydrate_nodes(

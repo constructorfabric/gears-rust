@@ -13,10 +13,11 @@
 //!
 //! 1. batch atomicity across nodes, edges and the idempotency record —
 //!    asserted;
-//! 2. single-writer serialization per scope identity — **not asserted**. Two
-//!    concurrent replacements of one scope are never made to race here, so
-//!    this obligation rests on inspection alone. Listed rather than omitted
-//!    so the gap is visible from the suite that is supposed to close it;
+//! 2. single-writer serialization per scope identity — asserted by
+//!    `two_replacements_of_one_scope_serialize`, which races two replacements
+//!    of one scope on a multi-threaded runtime. It was listed here as *not*
+//!    asserted for as long as it was unmet: writing the case found the fence
+//!    was a read-decide-write and let the loser's lower generation win;
 //! 3. monotonic generation fencing under that serialization — asserted;
 //! 4. a node with a live incident edge is never removed alone — asserted;
 //! 5. one snapshot across every arm of one read — asserted on the fake, which
@@ -3225,5 +3226,365 @@ pub async fn two_replacements_of_one_scope_serialize(store: &dyn GraphStoreV1, t
             }
         ),
         "{error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Both node families and both edge families, and the edge read
+// ---------------------------------------------------------------------------
+
+/// The ontology criterion 1 of PRD § 9 asks for, registered once: owned nodes,
+/// reference nodes, static edges and analysis edges.
+async fn seed_both_families(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    let mut batch = ontology_batch();
+    for (type_id, base) in [
+        (
+            REFERENCE,
+            "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~",
+        ),
+        (
+            ANALYSIS,
+            "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~",
+        ),
+    ] {
+        batch.push(TypeRegistration {
+            type_id: type_id.to_owned(),
+            schema: serde_json::json!({
+                "$id": format!("gts://{type_id}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "allOf": [{ "$ref": base }]
+            }),
+        });
+    }
+    store
+        .register_types(ctx, batch)
+        .await
+        .expect("the ontology registers");
+}
+
+/// An analysis edge with the provenance its family requires.
+fn analysis_edge(src: &str, dst: &str, method: &str) -> EdgeSpec {
+    EdgeSpec {
+        type_id: ANALYSIS.to_owned(),
+        src_node_key: src.to_owned(),
+        dst_node_key: dst.to_owned(),
+        payload: Some(serde_json::json!({
+            "provenance": {
+                "produced_by": {
+                    "subject_id": "00000000-0000-0000-0000-0000000000aa",
+                    "subject_type": "gts.cf.core.security.subject_service.v1~"
+                },
+                "method": method
+            }
+        })),
+        ..EdgeSpec::default()
+    }
+}
+
+/// Everything the read surfaces say about a set of nodes and every edge
+/// incident to them, in a form two runs can be compared by.
+///
+/// Timestamps are included deliberately: "byte-identical state" is the
+/// criterion, and an upsert that rewrote an unchanged row would move
+/// `updated_at` while leaving every value the same.
+async fn readable_state(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    keys: &[&str],
+) -> serde_json::Value {
+    let mut nodes = Vec::new();
+    let mut edge_keys: Vec<String> = Vec::new();
+    for key in keys {
+        let view = store
+            .get_node(ctx, &(*key).to_owned(), 50)
+            .await
+            .unwrap_or_else(|error| panic!("`{key}` is readable: {error}"));
+        edge_keys.extend(view.adjacency.iter().map(|entry| entry.edge_key.clone()));
+        nodes.push(serde_json::json!({
+            "key": view.node_key,
+            "type": view.type_id,
+            "name": view.name,
+            "payload": view.payload,
+            "created_at": view.envelope.created_at.to_string(),
+            "updated_at": view.envelope.updated_at.to_string(),
+        }));
+    }
+    edge_keys.sort();
+    edge_keys.dedup();
+
+    let mut edges = Vec::new();
+    for key in &edge_keys {
+        // The key came from an adjacency entry, so the edge read must find
+        // it: the two surfaces name edges the same way or one of them is
+        // unusable from the other.
+        let view = store
+            .get_edge(ctx, key)
+            .await
+            .unwrap_or_else(|error| panic!("adjacency names edge `{key}`, which reads: {error}"));
+        edges.push(serde_json::json!({
+            "key": view.edge_key,
+            "type": view.edge_type_id,
+            "src": view.src,
+            "dst": view.dst,
+            "discriminator": view.discriminator,
+            "payload": view.payload,
+            "created_at": view.envelope.created_at.to_string(),
+            "updated_at": view.envelope.updated_at.to_string(),
+        }));
+    }
+    serde_json::json!({ "nodes": nodes, "edges": edges })
+}
+
+/// Criterion 1 of PRD § 9, end to end: a producer registers an ontology,
+/// ingests one batch holding owned nodes, reference nodes and both edge
+/// families, and re-runs the identical batch to the same graph.
+///
+/// The reference node is keyed by its full source triple and the analysis
+/// edge carries provenance -- the two rules that make those families what
+/// they are -- and both are read back rather than assumed from the counts.
+pub async fn both_node_families_and_both_edge_families_round_trip(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_both_families(store, &ctx).await;
+
+    let mirror = mirror_node("scm", "7");
+    let mirror_key = mirror.node_key.clone();
+    assert_eq!(
+        mirror_key, "scm:repo:7",
+        "the reference key is the source triple, not the native id (ADR-0002)"
+    );
+    let request = || {
+        batch(
+            vec![node("owned-a", "a"), node("owned-b", "b"), mirror.clone()],
+            vec![
+                edge("owned-a", "owned-b"),
+                edge("owned-b", &mirror_key),
+                analysis_edge("owned-a", &mirror_key, "static-analysis"),
+            ],
+        )
+    };
+
+    let first = ingest_batch(store, &ctx, request())
+        .await
+        .expect("the mixed batch commits");
+    assert_eq!(first.counts.nodes_inserted, 3, "{:?}", first.counts);
+    assert_eq!(first.counts.edges_inserted, 3, "{:?}", first.counts);
+
+    let keys = ["owned-a", "owned-b", mirror_key.as_str()];
+    let after_first = readable_state(store, &ctx, &keys).await;
+
+    // The reference node comes back with the identity it was keyed by, and
+    // the analysis edge with the provenance its family requires.
+    let reference = store
+        .get_node(&ctx, &mirror_key, 50)
+        .await
+        .expect("the reference node reads");
+    assert_eq!(reference.type_id, REFERENCE);
+    assert_eq!(
+        reference.payload.as_ref().and_then(|p| p.get("source")),
+        Some(&serde_json::json!({
+            "system": "scm", "kind": "repo", "native_id": "7"
+        })),
+        "the source triple survives the round trip intact"
+    );
+    let analysis_key = reference
+        .adjacency
+        .iter()
+        .find(|entry| entry.edge_type_id == ANALYSIS)
+        .map(|entry| entry.edge_key.clone())
+        .expect("the analysis edge is incident to the reference node");
+    let analysis = store
+        .get_edge(&ctx, &analysis_key)
+        .await
+        .expect("the analysis edge reads as an element");
+    assert_eq!(
+        analysis
+            .payload
+            .as_ref()
+            .and_then(|p| p.pointer("/provenance/method"))
+            .and_then(serde_json::Value::as_str),
+        Some("static-analysis"),
+        "an analysis edge's provenance is readable, not merely accepted"
+    );
+    assert_eq!(
+        (analysis.src, analysis.dst),
+        ("owned-a".to_owned(), mirror_key.clone())
+    );
+
+    // The same batch again: nothing inserted, nothing rewritten, nothing
+    // moved -- including the timestamps.
+    let second = ingest_batch(store, &ctx, request())
+        .await
+        .expect("the identical batch commits again");
+    assert_eq!(second.counts.nodes_unchanged, 3, "{:?}", second.counts);
+    assert_eq!(second.counts.edges_unchanged, 3, "{:?}", second.counts);
+    assert_eq!(
+        second.revision, first.revision,
+        "an identical re-run leaves the revision where it was"
+    );
+    assert_eq!(
+        readable_state(store, &ctx, &keys).await,
+        after_first,
+        "the graph a re-run leaves behind is the graph the first run left"
+    );
+}
+
+/// The key of the one edge incident to a node, as the node read names it.
+/// Going through adjacency rather than re-deriving the hash is deliberate:
+/// the two surfaces have to agree on how an edge is addressed.
+async fn only_incident_edge_key(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    node_key: &str,
+) -> String {
+    store
+        .get_node(ctx, &node_key.to_owned(), 10)
+        .await
+        .unwrap_or_else(|error| panic!("`{node_key}` reads: {error}"))
+        .adjacency
+        .first()
+        .unwrap_or_else(|| panic!("`{node_key}` has an incident edge"))
+        .edge_key
+        .clone()
+}
+
+/// `fr-audit-envelope` asks for the envelope on every node **and edge** a read
+/// surface returns. Until the edge read existed the edge half was unassertable
+/// (dev/DEVIATIONS.md D-022): the columns were written and nothing read them.
+pub async fn an_edge_read_carries_the_envelope(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let author = ctx(tenant, &scope, None);
+    let editor_subject = editor();
+    let editor = ctx_as(tenant, &scope, None, editor_subject.clone());
+    seed_both_families(store, &author).await;
+
+    ingest_batch(
+        store,
+        &author,
+        batch(
+            vec![node("env-src", "src"), node("env-dst", "dst")],
+            vec![analysis_edge("env-src", "env-dst", "first")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let key = only_incident_edge_key(store, &author, "env-src").await;
+
+    let created = store
+        .get_edge(&author, &key)
+        .await
+        .expect("the edge reads")
+        .envelope;
+    assert_eq!(
+        created.key, key,
+        "an edge has no producer-authored key, so the envelope carries the derived one"
+    );
+    assert_eq!(created.tenant_id, tenant);
+    assert_eq!(created.created_by, writer(), "the creator is recorded");
+    assert_eq!(created.updated_by, writer());
+    assert!(created.deleted_at.is_none() && created.deleted_by.is_none());
+    assert!(
+        created.graph_revision.revision > 0,
+        "the edge read reports the revision it observed"
+    );
+
+    // A second producer re-asserts the same relationship with different
+    // content. The edge is rewritten, not versioned, so `updated_by` answers
+    // the question the audit trail is for: who claimed it last.
+    ingest_batch(
+        store,
+        &editor,
+        batch(
+            Vec::new(),
+            vec![analysis_edge("env-src", "env-dst", "second")],
+        ),
+    )
+    .await
+    .expect("the re-assertion commits");
+    let updated = store
+        .get_edge(&author, &key)
+        .await
+        .expect("the edge still reads")
+        .envelope;
+    assert_eq!(updated.created_by, writer(), "creation is not rewritten");
+    assert_eq!(updated.created_at, created.created_at);
+    assert_eq!(
+        updated.updated_by, editor_subject,
+        "the last producer to assert the relationship is the one recorded"
+    );
+
+    tombstoned_and_unknown_edges_read_alike(store, &author, &key).await;
+}
+
+/// A tombstoned edge is absent from the read, like every other read path
+/// (Soft Delete Contract), and so is a key that never existed -- the same
+/// answer, because denied and nonexistent are indistinguishable.
+async fn tombstoned_and_unknown_edges_read_alike(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    key: &str,
+) {
+    store
+        .soft_delete(ctx, DeleteRequest::Edge(key.to_owned()))
+        .await
+        .expect("the edge is tombstoned");
+    assert!(
+        store.get_edge(ctx, &key.to_owned()).await.is_err(),
+        "a tombstoned edge is not returned by the edge read"
+    );
+    assert!(
+        store
+            .get_edge(ctx, &"no-such-edge".to_owned())
+            .await
+            .is_err(),
+        "an unknown key answers the same way"
+    );
+}
+
+/// The induced authorized subgraph, on the edge read: an edge is a statement
+/// about two nodes, so seeing it while an endpoint is hidden would leak the
+/// connectivity the node read refuses to.
+pub async fn an_edge_whose_endpoint_is_hidden_is_not_readable(
+    store: &dyn GraphStoreV1,
+    one: Uuid,
+    two: Uuid,
+) {
+    let scope_one = AccessScope::for_tenant(one);
+    let ctx_one = ctx(one, &scope_one, None);
+    seed_both_families(store, &ctx_one).await;
+    ingest_batch(
+        store,
+        &ctx_one,
+        batch(
+            vec![node("iso-src", "src"), node("iso-dst", "dst")],
+            vec![edge("iso-src", "iso-dst")],
+        ),
+    )
+    .await
+    .expect("the batch commits under the first tenant");
+    let key = only_incident_edge_key(store, &ctx_one, "iso-src").await;
+
+    let scope_two = AccessScope::for_tenant(two);
+    let ctx_two = ctx(two, &scope_two, None);
+    assert!(
+        store.get_edge(&ctx_two, &key).await.is_err(),
+        "another tenant's edge key reads as absent"
+    );
+
+    // And the endpoint half of the rule, within one tenant: tombstone one
+    // endpoint and the edge stops being readable even though its own row is
+    // the one the tombstone did not touch.
+    store
+        .soft_delete(&ctx_one, DeleteRequest::Node("iso-dst".to_owned()))
+        .await
+        .expect("the endpoint is tombstoned");
+    assert!(
+        store.get_edge(&ctx_one, &key).await.is_err(),
+        "an edge with an invisible endpoint is not an edge the caller may see"
     );
 }

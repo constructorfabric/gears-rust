@@ -358,3 +358,26 @@ async fn scope_replacement_preserves_analysis_edges_and_their_endpoints() {
 async fn two_replacements_of_one_scope_serialize() {
     conformance::two_replacements_of_one_scope_serialize(&store(), Uuid::now_v7()).await;
 }
+
+// --- both families, and the edge read -----------------------------------------
+
+#[tokio::test]
+async fn both_node_families_and_both_edge_families_round_trip() {
+    conformance::both_node_families_and_both_edge_families_round_trip(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn an_edge_read_carries_the_envelope() {
+    conformance::an_edge_read_carries_the_envelope(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
+    conformance::an_edge_whose_endpoint_is_hidden_is_not_readable(
+        &store(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

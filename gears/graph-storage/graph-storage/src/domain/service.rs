@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use graph_storage_sdk::models::{
-    DeleteOutcome, DeleteRequest, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView, OnExisting, Page,
-    ProjectionRequest, RegisteredType, RemainingBudget, SearchMode, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord,
-    TypeRegistration, TypeRegistrationOptions,
+    DeleteOutcome, DeleteRequest, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome,
+    IngestRequest, ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView,
+    OnExisting, Page, ProjectionRequest, RegisteredType, RemainingBudget, SearchMode,
+    SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeIdSet, TypeKind,
+    TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;
@@ -577,30 +577,13 @@ impl GraphServices {
                 return;
             }
             Some("reference") => {
-                let source = node
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("source"))
-                    .and_then(serde_json::Value::as_object);
-                if let Some(source) = source {
-                    let get = |k: &str| {
-                        source
-                            .get(k)
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                    };
-                    let expected =
-                        identity::reference_node_key(get("system"), get("kind"), get("native_id"));
-                    if node.node_key != expected {
-                        push(
-                            Some("/id".into()),
-                            format!(
-                                "reference node keys derive from the full source triple; expected `{expected}`"
-                            ),
-                        );
-                    }
+                // An absent or incomplete `source` is reported by the chain
+                // validator below, naming the member it misses.
+                if let Some(complaint) =
+                    identity::reference_key_complaint(&node.node_key, node.payload.as_ref())
+                {
+                    push(Some("/id".into()), complaint);
                 }
-                // A missing `source` is reported by the chain validator below.
             }
             _ => {}
         }
@@ -731,6 +714,26 @@ impl GraphServices {
         Ok(self
             .store
             .get_node(&self.store_ctx(&auth, None), node_key, limit)
+            .await?)
+    }
+
+    /// One edge with its payload and envelope.
+    ///
+    /// Authorized as a node read: the authorization table gives edges no
+    /// resource of their own -- an edge is reachable through its endpoints
+    /// (DESIGN § Authorization Model), and the store refuses one whose
+    /// endpoints the scope does not admit.
+    pub async fn get_edge(
+        &self,
+        ctx: &SecurityContext,
+        edge_key: &EdgeKey,
+    ) -> Result<EdgeView, DomainError> {
+        let auth = self
+            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .await?;
+        Ok(self
+            .store
+            .get_edge(&self.store_ctx(&auth, None), edge_key)
             .await?)
     }
 

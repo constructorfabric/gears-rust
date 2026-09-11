@@ -38,6 +38,28 @@ pub fn reference_node_key(system: &str, kind: &str, native_id: &str) -> String {
     format!("{system}:{kind}:{native_id}")
 }
 
+/// Whether a reference node's key is the one its own `source` triple derives,
+/// and what to say when it is not.
+///
+/// A pure rule rather than a branch inside the validator so it can be tested
+/// for what it accepts as well as what it refuses: an incomplete `source` is
+/// *not* this rule's complaint (the derivation chain refuses that, with the
+/// member it is missing), and reporting a mismatch against a triple with an
+/// empty member would name a key nobody could have written.
+#[must_use]
+pub fn reference_key_complaint(node_key: &str, payload: Option<&Value>) -> Option<String> {
+    let source = payload?.get("source")?.as_object()?;
+    let member = |k: &str| source.get(k).and_then(Value::as_str).unwrap_or_default();
+    let (system, kind, native_id) = (member("system"), member("kind"), member("native_id"));
+    if system.is_empty() || kind.is_empty() || native_id.is_empty() {
+        return None;
+    }
+    let expected = reference_node_key(system, kind, native_id);
+    (node_key != expected).then(|| {
+        format!("reference node keys derive from the full source triple; expected `{expected}`")
+    })
+}
+
 /// Recursively sort object keys so two semantically identical JSON values
 /// hash identically regardless of member order.
 fn canonicalize(value: &Value) -> Value {
@@ -119,6 +141,45 @@ mod tests {
         assert_ne!(
             derive_edge_key(type_uuid, &a),
             derive_edge_key(type_uuid, &b)
+        );
+    }
+
+    #[test]
+    fn a_reference_key_is_accepted_only_when_the_triple_derives_it() {
+        let payload = serde_json::json!({
+            "source": { "system": "scm", "kind": "repo", "native_id": "42" }
+        });
+        assert_eq!(reference_key_complaint("scm:repo:42", Some(&payload)), None);
+        let complaint = reference_key_complaint("42", Some(&payload))
+            .expect("a native id alone is not the key");
+        assert!(
+            complaint.contains("`scm:repo:42`"),
+            "the complaint names the key the producer should have written: {complaint}"
+        );
+        // Two systems spelling the same native id stay distinct (ADR-0002):
+        // the key that suits one is a mismatch for the other.
+        let other = serde_json::json!({
+            "source": { "system": "tracker", "kind": "repo", "native_id": "42" }
+        });
+        assert!(reference_key_complaint("scm:repo:42", Some(&other)).is_some());
+    }
+
+    #[test]
+    fn an_incomplete_source_is_left_to_the_derivation_chain() {
+        // No payload, no `source`, and a `source` missing a member are all
+        // refused elsewhere, naming what is absent. This rule stays quiet
+        // rather than inventing an expected key from empty strings.
+        assert_eq!(reference_key_complaint("k", None), None);
+        assert_eq!(
+            reference_key_complaint("k", Some(&serde_json::json!({"other": 1}))),
+            None
+        );
+        assert_eq!(
+            reference_key_complaint(
+                "k",
+                Some(&serde_json::json!({"source": {"system": "scm", "kind": "repo"}}))
+            ),
+            None
         );
     }
 

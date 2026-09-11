@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::NodeFilterField as Field;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, ElementEnvelope, GraphRevision, NodeId, NodeKey, NodeRow,
-    NodeView, ProjectionRequest, ReadSnapshot, Subject,
+    AdjacencyEntry, AdjacencySide, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, NodeId,
+    NodeKey, NodeRow, NodeView, ProjectionRequest, ReadSnapshot, Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingState, GraphStoreError, StoreCtx};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -378,6 +378,89 @@ pub async fn get_node(
         .unwrap_or_else(unknown);
     let revision = observed_revision(ctx, &conn).await?;
     Ok(to_view(model, type_id, adjacency, truncated, revision))
+}
+
+/// The gear-assigned envelope of an edge row (`fr-audit-envelope`).
+///
+/// `key` is the derived `edge_key`: unlike a node, an edge has no
+/// producer-authored key, which is why the envelope carries one at all.
+fn envelope_of_edge(model: &edge::Model, revision: GraphRevision) -> ElementEnvelope {
+    ElementEnvelope {
+        tenant_id: model.tenant_id,
+        key: model.edge_key.clone(),
+        created_at: model.created_at,
+        created_by: Subject {
+            subject_id: model.created_by_subject_id,
+            subject_type: model.created_by_subject_type.clone(),
+        },
+        updated_at: model.updated_at,
+        updated_by: Subject {
+            subject_id: model.updated_by_subject_id,
+            subject_type: model.updated_by_subject_type.clone(),
+        },
+        deleted_at: model.deleted_at,
+        deleted_by: model.deleted_by_subject_id.map(|subject_id| Subject {
+            subject_id,
+            subject_type: model.deleted_by_subject_type.clone(),
+        }),
+        graph_revision: revision,
+    }
+}
+
+/// One edge with its payload and envelope.
+///
+/// Both endpoints are re-read under the caller's scope and the edge is
+/// reported only if both are visible: the induced authorized subgraph is
+/// what a read may show (DESIGN § Authorization Model), and an edge is a
+/// statement about two nodes, so seeing it while one endpoint is hidden
+/// would leak connectivity the node read refuses to.
+pub async fn get_edge(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    key: &EdgeKey,
+) -> Result<EdgeView, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let model = edge::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
+        .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+        .one(&conn)
+        .await
+        .map_err(map_scope_err)?
+        .ok_or(GraphStoreError::NotFound)?;
+
+    let endpoints = node::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(
+            Condition::all().add(node::Column::Id.is_in([model.src_node_id, model.dst_node_id])),
+        )
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .all(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    let by_id: BTreeMap<i64, node::Model> = endpoints.into_iter().map(|n| (n.id, n)).collect();
+    let (Some(src), Some(dst)) = (by_id.get(&model.src_node_id), by_id.get(&model.dst_node_id))
+    else {
+        return Err(GraphStoreError::NotFound);
+    };
+
+    let names = type_names(ctx, &conn, &[model.gts_edge_type_id]).await?;
+    let revision = observed_revision(ctx, &conn).await?;
+    let envelope = envelope_of_edge(&model, revision);
+    Ok(EdgeView {
+        edge_key: model.edge_key.clone(),
+        edge_type_id: names
+            .get(&model.gts_edge_type_id)
+            .cloned()
+            .unwrap_or_default(),
+        src: src.node_key.clone(),
+        dst: dst.node_key.clone(),
+        discriminator: model.discriminator.clone(),
+        payload: Some(model.payload.clone()),
+        envelope,
+    })
 }
 
 pub async fn hydrate_nodes(

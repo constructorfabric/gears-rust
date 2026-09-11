@@ -779,6 +779,24 @@ pub struct NodeView {
     pub envelope: ElementEnvelope,
 }
 
+/// An edge as the edge read returns it.
+///
+/// The topology references (`EdgeRef`, `AdjacencyEntry`) stay what they are --
+/// a key, a type and two endpoints. This is the element form: payload and the
+/// audit envelope `fr-audit-envelope` asks every returned edge to carry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeView {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub src: NodeKey,
+    pub dst: NodeKey,
+    /// Distinguishes parallel edges of one type between one endpoint pair.
+    pub discriminator: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`).
+    pub envelope: ElementEnvelope,
+}
+
 /// One row of the tabular projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeRow {

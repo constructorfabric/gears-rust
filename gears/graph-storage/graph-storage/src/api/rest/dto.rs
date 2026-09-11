@@ -413,6 +413,20 @@ pub struct GraphNodeDto {
     pub envelope: GraphElementEnvelopeDto,
 }
 
+/// One edge as an element: what the topology references carry, plus the
+/// payload and the envelope (`fr-audit-envelope`).
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphEdgeDto {
+    pub edge_key: String,
+    pub edge_type_id: String,
+    pub src: String,
+    pub dst: String,
+    pub discriminator: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub envelope: GraphElementEnvelopeDto,
+}
+
 /// One projection row. What `$filter` and `$orderby` may name is declared
 /// once, on `graph_storage_sdk::NodeQuery`.
 #[derive(Debug)]
@@ -795,6 +809,20 @@ impl From<m::NodeView> for GraphNodeDto {
             has_embedding: value.has_embedding,
             adjacency: value.adjacency.into_iter().map(Into::into).collect(),
             adjacency_truncated: value.adjacency_truncated,
+            envelope: value.envelope.into(),
+        }
+    }
+}
+
+impl From<m::EdgeView> for GraphEdgeDto {
+    fn from(value: m::EdgeView) -> Self {
+        Self {
+            edge_key: value.edge_key,
+            edge_type_id: value.edge_type_id,
+            src: value.src,
+            dst: value.dst,
+            discriminator: value.discriminator,
+            payload: value.payload,
             envelope: value.envelope.into(),
         }
     }
