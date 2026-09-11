@@ -656,6 +656,42 @@ failed.
 **What it does not report.** The server major, for the reason D-004 gives: the
 probe is an attempted pattern, which says the pattern did not run and not why.
 
+## D-034 [was a silent cut, now built] Scope replacement removed nothing
+
+`fence_and_clear_scope` wrote the fence row, returned `(0, 0)`, and carried a
+comment saying full declarative replacement was a scope cut — which no entry
+recorded until the acceptance sweep found it (criterion 2, "removes stale
+static content and preserves analysis edges"). The fencing half was real; the
+replacement was not, so the half of the criterion about *preserving* analysis
+edges had nothing to preserve them from.
+
+**Built.** `infra/store/scope.rs` runs after the batch's own writes and inside
+the same transaction, under the fence row's lock, because "absent from the
+submitted batch" cannot be decided until the batch is in. What it removes is
+bounded three ways, and each bound is the feature rather than a detail of it:
+scope-managed types only (`scope_managed` is per type and defaults to true);
+only what the batch did not re-supply (membership is the payload attribute the
+replacement names, so anything re-written is still in scope); and static
+content only — static edges first, then only those nodes nothing references any
+more, so a node an analysis edge still points at stays. That last predicate is
+`principle-provenance-survives-resync` made executable, and it is also what
+keeps the `ON DELETE RESTRICT` foreign key from being the thing that decides.
+
+**Removal is a hard delete, not a tombstone.** A tombstoned node key is not
+reusable before purge (Soft Delete Contract), so tombstoning here would make
+the *next* import of the same object a conflict — the opposite of what a
+replacement is for. The conformance case asserts the re-add, not just the
+removal.
+
+**The scope attribute is rendered as a checked literal**, the same alphabet a
+declared `index` path must use, with the value bound — an attribute outside it
+is refused rather than escaped.
+
+**Still open from the same obligation.** Single-writer serialization per scope
+identity has no test: two concurrent replacements of one scope are still never
+made to race. The suite's own header claims it, and the claim is still ahead of
+the evidence.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
@@ -737,7 +773,7 @@ threshold in `nfr-code-coverage` is unknown rather than met.
 ## Gaps this sweep found that no entry recorded
 
 - **Scope replacement removes nothing** (criterion 2 above). The fencing is
-  real; the replacement is not. *Open.*
+  real; the replacement is not. *Fixed 2026-09-11 — see D-034.*
 - **Endpoint constraints were never enforced** (criterion 4 above). Parsed,
   stored, unread. *Fixed in `101ffaa79`.*
 - **The `vector_search` trait was published and unread.** Resolved across the

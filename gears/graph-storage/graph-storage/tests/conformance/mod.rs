@@ -48,6 +48,9 @@ pub const OWNED_FAMILY: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_no
 pub const REFERENCE: &str =
     "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~test.gs._.mirror.v1~";
 pub const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~test.gs._.link.v1~";
+/// An analysis edge: a conclusion, which a re-import must never remove.
+pub const ANALYSIS: &str =
+    "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~test.gs._.introduced_by.v1~";
 
 /// Ingest through the real Embedding Coordinator, as the domain service does.
 ///
@@ -2940,5 +2943,208 @@ pub async fn readiness_reports_every_capability_and_only_some_block_service(
     assert!(
         !Readiness::of(vec![space_mismatch, database_down]).ready,
         "an unreachable database admits no traffic at all"
+    );
+}
+
+// --- scope replacement: the removal half --------------------------------------
+
+/// A scope-managed node under `repository = acme/infra`.
+fn scoped_node(key: &str, repository: &str) -> NodeSpec {
+    NodeSpec {
+        node_key: key.to_owned(),
+        type_id: OWNED.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(serde_json::json!({ "repository": repository })),
+        ..NodeSpec::default()
+    }
+}
+
+fn replacing(generation: i64) -> ReplaceScope {
+    ReplaceScope {
+        attribute: "repository".to_owned(),
+        value: "acme/infra".to_owned(),
+        generation,
+    }
+}
+
+fn batch_replacing(nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>, generation: i64) -> IngestRequest {
+    IngestRequest {
+        replace_scope: Some(replacing(generation)),
+        ..batch(nodes, edges)
+    }
+}
+
+/// PRD § 9 criterion 2, the half that was missing: a re-import is the whole of
+/// its scope, so what it no longer names is gone.
+///
+/// Removal is a hard delete rather than a tombstone, and the second half of
+/// this case is why: a tombstoned key is not reusable before purge, so
+/// tombstoning here would make the *next* import of the same object a
+/// conflict — the opposite of what a replacement is for.
+pub async fn scope_replacement_removes_what_the_batch_no_longer_names(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("in-scope-1", "acme/infra"),
+                scoped_node("in-scope-2", "acme/infra"),
+                scoped_node("elsewhere", "acme/web"),
+            ],
+            Vec::new(),
+            1,
+        ),
+    )
+    .await
+    .expect("the first snapshot lands");
+
+    // The second snapshot names only one of them.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![scoped_node("in-scope-1", "acme/infra")], Vec::new(), 2),
+    )
+    .await
+    .expect("the second snapshot lands");
+    assert_eq!(
+        outcome.counts.scope_removed_nodes, 1,
+        "exactly the one the batch stopped naming"
+    );
+
+    store
+        .get_node(&ctx, &"in-scope-1".to_owned(), 10)
+        .await
+        .expect("what the batch re-supplied stays");
+    assert!(
+        store
+            .get_node(&ctx, &"in-scope-2".to_owned(), 10)
+            .await
+            .is_err(),
+        "what it no longer names is gone"
+    );
+    store
+        .get_node(&ctx, &"elsewhere".to_owned(), 10)
+        .await
+        .expect("another scope is untouched: membership is the payload attribute");
+
+    // The removed key is reusable at once: a hard delete, not a tombstone.
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("in-scope-1", "acme/infra"),
+                scoped_node("in-scope-2", "acme/infra"),
+            ],
+            Vec::new(),
+            3,
+        ),
+    )
+    .await
+    .expect("a later import re-adds the same key");
+}
+
+/// The other half of criterion 2, and the principle behind it
+/// (`principle-provenance-survives-resync`): a re-import removes what it
+/// re-derives and never what was concluded about it.
+pub async fn scope_replacement_preserves_analysis_edges_and_their_endpoints(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(TypeRegistration {
+        type_id: ANALYSIS.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{ANALYSIS}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~" }]
+        }),
+    });
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    // Two scoped nodes, one static edge between them, and one analysis edge
+    // carrying provenance.
+    let analysis = EdgeSpec {
+        type_id: ANALYSIS.to_owned(),
+        src_node_key: "concluded-about".to_owned(),
+        dst_node_key: "also-concluded".to_owned(),
+        payload: Some(serde_json::json!({
+            "provenance": {
+                "produced_by": {
+                    "subject_id": "00000000-0000-0000-0000-0000000000aa",
+                    "subject_type": "gts.cf.core.security.subject_service.v1~"
+                },
+                "method": "static-analysis"
+            }
+        })),
+        ..EdgeSpec::default()
+    };
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("concluded-about", "acme/infra"),
+                scoped_node("also-concluded", "acme/infra"),
+                scoped_node("plain", "acme/infra"),
+            ],
+            vec![edge("concluded-about", "plain"), analysis],
+            1,
+        ),
+    )
+    .await
+    .expect("the first snapshot lands");
+
+    // A snapshot that names none of them.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![scoped_node("kept", "acme/infra")], Vec::new(), 2),
+    )
+    .await
+    .expect("the second snapshot lands");
+
+    // `plain` had only a static edge, so both it and the edge go.
+    assert!(
+        store.get_node(&ctx, &"plain".to_owned(), 10).await.is_err(),
+        "a node held only by static content is removed with it"
+    );
+    assert!(
+        outcome.counts.scope_removed_edges >= 1,
+        "the static edge is removed: {:?}",
+        outcome.counts
+    );
+
+    // The two endpoints of the analysis edge stay, and so does the edge.
+    let src = store
+        .get_node(&ctx, &"concluded-about".to_owned(), 10)
+        .await
+        .expect("an endpoint of an analysis edge survives the re-import");
+    store
+        .get_node(&ctx, &"also-concluded".to_owned(), 10)
+        .await
+        .expect("and so does the other one");
+    assert!(
+        src.adjacency
+            .iter()
+            .any(|entry| entry.edge_type_id == ANALYSIS),
+        "the conclusion itself survives: {:?}",
+        src.adjacency
     );
 }

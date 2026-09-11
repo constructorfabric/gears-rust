@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod namespaces;
 pub mod projection;
 pub mod reads;
+pub mod scope;
 pub mod search;
 pub mod spaces;
 pub mod types;

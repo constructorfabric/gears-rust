@@ -333,3 +333,20 @@ async fn an_owned_nodes_source_field_claims_no_namespace() {
 async fn readiness_reports_every_capability_and_only_some_block_service() {
     conformance::readiness_reports_every_capability_and_only_some_block_service(&store()).await;
 }
+
+// --- scope replacement --------------------------------------------------------
+
+#[tokio::test]
+async fn scope_replacement_removes_what_the_batch_no_longer_names() {
+    conformance::scope_replacement_removes_what_the_batch_no_longer_names(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn scope_replacement_preserves_analysis_edges_and_their_endpoints() {
+    conformance::scope_replacement_preserves_analysis_edges_and_their_endpoints(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

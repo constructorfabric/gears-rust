@@ -341,13 +341,14 @@ async fn ingest_in_tx(
         return Ok(replayed);
     }
 
-    // --- scope replacement: lock the fence row before anything else --------
+    // --- scope replacement, part one: fence before anything else ----------
+    // The generation check and the row lock come first, so a stale snapshot
+    // is refused before it writes; the *removal* comes after the batch's own
+    // writes, because "absent from the submitted batch" cannot be decided
+    // until the batch is in.
     let mut counts = IngestCounts::default();
     if let Some(replace) = &request.replace_scope {
-        let (removed_nodes, removed_edges) =
-            fence_and_clear_scope(tenant, scope, producer, tx, replace, &request_hash).await?;
-        counts.scope_removed_nodes = removed_nodes;
-        counts.scope_removed_edges = removed_edges;
+        fence_scope(tenant, scope, producer, tx, replace, &request_hash).await?;
     }
 
     let types = resolve_types(scope, tx, &request).await?;
@@ -366,6 +367,21 @@ async fn ingest_in_tx(
     .await?;
 
     changed |= write_edges(w, tx, &request, &types, &mut node_ids, &mut counts).await?;
+
+    // --- scope replacement, part two: remove what the batch did not name ---
+    if let Some(replace) = &request.replace_scope {
+        let written: std::collections::BTreeSet<String> = request
+            .nodes
+            .iter()
+            .map(|spec| spec.node_key.clone())
+            .collect();
+        let (removed_nodes, removed_edges) =
+            super::scope::remove_stale(scope, tx, &replace.attribute, &replace.value, &written)
+                .await?;
+        counts.scope_removed_nodes = removed_nodes;
+        counts.scope_removed_edges = removed_edges;
+        changed |= removed_nodes > 0 || removed_edges > 0;
+    }
 
     // The revision advances if and only if stored state actually changed.
     let revision_value = if changed {
@@ -412,14 +428,14 @@ async fn ingest_in_tx(
 
 /// Lock the scope's fence row, apply generation fencing, and tombstone the
 /// scope's static content. Analysis-originated edges are never removed.
-async fn fence_and_clear_scope(
+async fn fence_scope(
     tenant: Uuid,
     scope: &AccessScope,
     producer: &str,
     tx: &impl DBRunner,
     replace: &ReplaceScope,
     request_hash: &str,
-) -> Result<(u64, u64), GraphStoreError> {
+) -> Result<(), GraphStoreError> {
     let existing = scope_registry::Entity::find()
         .secure()
         .scope_with(scope)
@@ -480,10 +496,10 @@ async fn fence_and_clear_scope(
         .await
         .map_err(map_scope_err)?;
 
-    // Scope-managed content of this scope is replaced; nothing is removed in
-    // this iteration beyond what the caller re-supplies, so the counts are
-    // zero. (Full declarative replacement is a scope cut — see DEVIATIONS.)
-    Ok((0, 0))
+    // The fence is set and the row is locked for the rest of the
+    // transaction; what the replacement removes is decided after the batch's
+    // own writes, in `scope::remove_stale`.
+    Ok(())
 }
 
 enum NodeWrite {

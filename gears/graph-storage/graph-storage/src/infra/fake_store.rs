@@ -6,7 +6,7 @@
 //! `PostgreSQL` store can satisfy fails here. It is deliberately simple —
 //! correctness of the *obligations*, not of a database.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -597,6 +597,26 @@ impl GraphStoreV1 for FakeGraphStore {
             }
         }
 
+        // Which types a replacement may remove, read before the working
+        // copies take their borrows. `scope_managed` defaults to true and a
+        // type that turns it off is never removed by another producer's
+        // re-sync; only `static` edges are re-derived by one.
+        let managed_node_types: BTreeSet<String> = tenant
+            .types
+            .values()
+            .filter(|record| {
+                record.kind == graph_storage_sdk::models::TypeKind::Node
+                    && record.effective_traits.scope_managed
+            })
+            .map(|record| record.type_id.clone())
+            .collect();
+        let static_edge_types: BTreeSet<String> = tenant
+            .types
+            .values()
+            .filter(|record| record.effective_traits.family.as_deref() == Some("static"))
+            .map(|record| record.type_id.clone())
+            .collect();
+
         // Working copies: written back only once the whole batch succeeded, so
         // a partway failure leaves nothing.
         let mut nodes = tenant.nodes.clone();
@@ -640,6 +660,50 @@ impl GraphStoreV1 for FakeGraphStore {
                 spec,
                 req.options.create_phantoms.unwrap_or(true),
             )?;
+        }
+
+        // Scope replacement, after the batch's own writes: a node the batch
+        // re-supplied is by definition still in the scope. Static edges go
+        // first, then only those nodes nothing references any more — a node
+        // an analysis edge still points at stays, because the conclusion
+        // drawn about it survives the re-import of the thing it was drawn
+        // about.
+        if let Some(replace) = &req.replace_scope {
+            let written: BTreeSet<&str> = req
+                .nodes
+                .iter()
+                .map(|spec| spec.node_key.as_str())
+                .collect();
+            let dropped: Vec<i64> = nodes
+                .iter()
+                .filter(|node| {
+                    !node.deleted
+                        && managed_node_types.contains(&node.type_id)
+                        && !written.contains(node.key.as_str())
+                        && node
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.get(&replace.attribute))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(replace.value.as_str())
+                })
+                .map(|node| node.id)
+                .collect();
+            if !dropped.is_empty() {
+                let before = edges.len();
+                edges.retain(|edge| {
+                    !(static_edge_types.contains(&edge.type_id)
+                        && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
+                });
+                counts.scope_removed_edges = (before - edges.len()) as u64;
+
+                let referenced: BTreeSet<i64> =
+                    edges.iter().flat_map(|edge| [edge.src, edge.dst]).collect();
+                let before = nodes.len();
+                nodes.retain(|node| !dropped.contains(&node.id) || referenced.contains(&node.id));
+                counts.scope_removed_nodes = (before - nodes.len()) as u64;
+                changed |= counts.scope_removed_nodes > 0 || counts.scope_removed_edges > 0;
+            }
         }
 
         tenant.nodes = nodes;

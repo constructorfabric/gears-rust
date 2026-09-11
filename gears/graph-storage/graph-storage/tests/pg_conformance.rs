@@ -297,6 +297,17 @@ async fn readiness_reports_every_capability_and_only_some_block_service() {
     .await;
 }
 
+// --- scope replacement --------------------------------------------------------
+
+pg_case!(
+    scope_replacement_removes_what_the_batch_no_longer_names,
+    conformance::scope_replacement_removes_what_the_batch_no_longer_names
+);
+pg_case!(
+    scope_replacement_preserves_analysis_edges_and_their_endpoints,
+    conformance::scope_replacement_preserves_analysis_edges_and_their_endpoints
+);
+
 // --- source-namespace ownership ----------------------------------------------
 
 pg_case!(
