@@ -56,12 +56,29 @@ Both are off by default: a deployment links the provider it selected.
 ## Testing
 
 ```sh
-# Unit and fake-store tests
-cargo test -p cf-gears-graph-storage
-# Against a real PostgreSQL 19 + pgvector image
-GEARS_TEST_PG_GRAPH_IMAGE=<image> GEARS_TEST_PG_GRAPH_REQUIRED=1 \
-  cargo test -p cf-gears-graph-storage
+# Everything that needs no database: unit tests, the conformance suite against
+# the in-memory store, the domain service, the REST surface.
+make test-graph-storage
+
+# The same conformance suite against a real PostgreSQL 19, plus the cases only
+# a server can answer (the SQL/PGQ hop, its parity with the fallback, the
+# cross-tenant trap). It needs a server with SQL/PGQ *and* pgvector, which no
+# published image carries yet, so build the one this gear pins:
+docker build -f gears/graph-storage/docker/pg19-pgvector.Dockerfile \
+  -t pg19-pgvector:latest gears/graph-storage/docker
+GEARS_TEST_PG_GRAPH_IMAGE=pg19-pgvector:latest make test-graph-storage-pg
 ```
+
+Without `GEARS_TEST_PG_GRAPH_IMAGE` the PostgreSQL lane skips with a named
+reason and starts nothing; `GEARS_TEST_PG_GRAPH_REQUIRED=1` (which the Make
+target sets) turns that skip into a failure, so CI cannot pass by running
+nothing.
+
+Every case in that lane gets its own server — two of them are operator surgery
+on server-wide state — so it runs at a bounded concurrency
+(`GRAPH_PG_TEST_THREADS`, default 2, and `GEARS_TEST_PG_GRAPH_STANDS` for the
+in-process runner). More than that on an ordinary machine and the connection
+pools start timing out, which reads as a flaky gear and is a busy host.
 
 ## Known limitations
 
@@ -114,9 +131,10 @@ type-revision history.
 - *Base-ontology schemas are published once per tenant and have no update
   path*: an edit to a base schema does not reach a database that already
   published it.
-- *The PostgreSQL lane needs an image with both PostgreSQL 19 and pgvector*,
-  which `test-containers` does not publish yet (`GEARS_TEST_PG_GRAPH_IMAGE`);
-  PostgreSQL 16, the documented baseline, has no lane.
+- *No published image carries both PostgreSQL 19 and pgvector*, so the lane
+  builds its own from [`docker/pg19-pgvector.Dockerfile`](../docker/pg19-pgvector.Dockerfile);
+  `test-containers` should publish one. PostgreSQL 16, the documented
+  baseline, has no lane at all.
 - *The `remote` embedding provider has no per-tenant egress policy in front of
   it* (ADR-0004 asks for one); it is off by default and sends every tenant's
   node and query text to the one configured endpoint when selected.

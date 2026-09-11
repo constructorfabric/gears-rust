@@ -532,16 +532,21 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
 
-  # graph-storage sets itself a line-coverage floor of 85% (its PRD
-  # `nfr-code-coverage`, "enforced in CI"). The workspace coverage job above
-  # reports to Codecov and gates on nothing per crate, and the shared script's
-  # project-wide threshold is 80, so nothing was enforcing the gear's own
-  # number. This does, over the gear's db-free lanes: the PostgreSQL lane
-  # needs an image carrying PostgreSQL 19 *and* pgvector, which
-  # `test-containers` does not publish yet, so the floor holds without it and
-  # the number is the more honest for that.
-  coverage-graph-storage:
-    name: Coverage floor (graph-storage)
+  # The gear's whole suite against a real PostgreSQL 19 with pgvector, and its
+  # own coverage floor, in one pass.
+  #
+  # Two things make this job exist. The lane needs a server that has both
+  # SQL/PGQ and pgvector, and no published image carries both, so the image is
+  # built here from the gear's own Dockerfile (`test-containers` should publish
+  # one; until it does, this is a `docker build`, not a blocked lane). And
+  # `nfr-code-coverage` asks for 85% line coverage "enforced in CI": the
+  # workspace coverage job reports to Codecov and gates on nothing per crate,
+  # while the shared script's project-wide threshold is 80. Without the
+  # PostgreSQL lane the figure is ~55%, because the built-in store is the half
+  # of the gear only a real server exercises — so measuring and running are the
+  # same job or neither is honest.
+  test-graph-storage:
+    name: graph-storage (PostgreSQL 19 + pgvector, coverage floor)
     needs: changes
     if: >-
       !cancelled()
@@ -578,17 +583,34 @@ jobs:
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
 
-      - name: Install cargo-llvm-cov
+      - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
 
-      - name: Coverage floor
+      # PostgreSQL 19 plus a pinned pgvector, on the official base so the
+      # stock entrypoint and server arguments testcontainers drives are intact.
+      - name: Build the PostgreSQL 19 + pgvector image
+        run: |
+          docker build \
+            -f gears/graph-storage/docker/pg19-pgvector.Dockerfile \
+            -t pg19-pgvector:ci \
+            gears/graph-storage/docker
+
+      # REQUIRED turns a skip into a failure: this lane exists to run against
+      # a real server, and a green run that quietly skipped it proves nothing.
+      # The thread bound is the lane's own — every case gets its own server,
+      # and more than a couple at once is more than the runner will take.
+      - name: Test and enforce the coverage floor
+        timeout-minutes: 30
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+          GEARS_TEST_PG_GRAPH_IMAGE: "pg19-pgvector:ci"
+          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
         run: |
-          cargo llvm-cov \
+          cargo llvm-cov nextest \
             -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
+            --test-threads=2 \
             --summary-only --fail-under-lines 85
 
   # Runs the graph-storage ONNX embedding provider against a real model, which
