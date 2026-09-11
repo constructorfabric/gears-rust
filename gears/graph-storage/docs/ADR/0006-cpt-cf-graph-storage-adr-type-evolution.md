@@ -170,9 +170,9 @@ claims.
   makes changing an annotation a type-version change with a durable index
   activation lifecycle (`requested -> building -> active`), and admits filters
   only while a path's index is `active`. Neither the lifecycle nor the capacity
-  admission of `fr-index-admission` exists (DEVIATIONS D-104, D-105), so a
+  admission of `fr-index-admission` exists (both deferred), so a
   declared path is filterable as soon as it is declared and served by the static
-  payload GIN plus a scan (D-030). An in-place update does not create that gap,
+  payload GIN plus a scan (ADR-0003). An in-place update does not create that gap,
   but it does open a second door to it: a new `index` path can now appear under
   an existing identifier. When the lifecycle lands it must gate this path as
   well, and a trait-only update must be capacity-admitted like a registration.
@@ -209,8 +209,8 @@ claims.
   531 251 nodes, 637 975 edges): the four PM edits classified as expected,
   62 ms for a proved update, 270 ms for a data-backed one over 1 000 rows,
   12.9 s over 250 000, and the row ceiling refused with the count and the
-  configuration key named. The full run is in the gear's development notes,
-  which are kept with the implementation and are not published here.
+  configuration key named. The full run is in the implementer's working
+  notes, which are not part of the published set.
 - Measured before the write path existed: with the payload object level left
   open, "add one optional property" is `Incompatible` for **188 of 188**
   instantiable node types of the Studio model, and `Compatible` for 188 of 188
@@ -296,7 +296,7 @@ sees exactly what changes:
    backward compatibility, which is now checked rather than assumed.
 
 `fr-index-admission` and the index activation lifecycle are **not** amended:
-they remain unimplemented deferrals (D-104, D-105), and this decision adds a
+they remain unimplemented deferrals, and this decision adds a
 second door to the same gap rather than a new gap.
 
 ## More Information
@@ -304,11 +304,10 @@ second door to the same gap rather than a new gap.
 - types-registry ADR-0003 (compatibility strategy), ADR-0004 (identifier
   mutability and the `force` waiver), ADR-0005 (retained revisions).
 - `gts` 0.12 `schema_evolution` (OP#8) and `GtsStore::compare_documents`.
-- The gear's development notes — the implementation plan, the measurement,
+- The implementer's working notes — the implementation plan, the measurement,
   the stand rehearsal, and the register of where the implementation departs
-  from these documents. Kept with the implementation rather than published:
-  they record how the decision was reached, which dates, while the decision
-  itself does not.
+  from these documents. Not part of the published set: they record how the
+  decision was reached, which dates, while the decision itself does not.
 
 ## Traceability
 

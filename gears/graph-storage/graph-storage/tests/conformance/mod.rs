@@ -205,7 +205,7 @@ impl graph_storage_sdk::plugin_api::EmbeddingProviderV1 for CountingProvider {
     }
 }
 
-/// D-027: a re-ingest embeds only what changed. The first batch embeds every
+/// A re-ingest embeds only what changed. The first batch embeds every
 /// node; an identical second batch reaches the provider with nothing; a third
 /// batch that changes one node's text embeds that node alone — and the
 /// untouched node still ranks, because the store preserved its vector.
@@ -3456,7 +3456,7 @@ async fn only_incident_edge_key(
 
 /// `fr-audit-envelope` asks for the envelope on every node **and edge** a read
 /// surface returns. Until the edge read existed the edge half was unassertable
-/// (the gear's development notes, D-022): the columns were written by every
+/// (`fr-audit-envelope`): the columns were written by every
 /// ingest path and read by nothing.
 pub async fn an_edge_read_carries_the_envelope(store: &dyn GraphStoreV1, tenant: Uuid) {
     let scope = AccessScope::for_tenant(tenant);

@@ -277,7 +277,7 @@ impl GraphServices {
 
         // The identity row is `unhealthy` and the gear stays ready — the one
         // place the matrix's row and its aggregate rule disagree, resolved in
-        // favour of the row (DEVIATIONS D-033).
+        // favour of the row (DESIGN § Readiness Matrix).
         rows.push(match self.embedding.active_epoch() {
             Some(_) => Row::healthy(EMBEDDING_SPACE),
             None => Row::new(
@@ -428,7 +428,7 @@ impl GraphServices {
         // Composed and embedded *before* the transaction, as DESIGN's ingest
         // sequence has it (step 5, ahead of step 6). It costs one extra read:
         // what the store already holds of each node's vector, so a node whose
-        // text has not changed is not embedded again (D-027). Validation
+        // text has not changed is not embedded again (`GraphStoreV1::embedding_state`). Validation
         // already resolved every type record, so each node's `vector_search`
         // trait is in hand.
         let embed = request.options.embed.unwrap_or(true);

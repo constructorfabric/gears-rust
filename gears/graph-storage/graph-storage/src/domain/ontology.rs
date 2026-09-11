@@ -96,7 +96,7 @@ pub struct TypeDescriptor {
     /// The `index` trait resolved against the chain's schemas: each declared
     /// pointer with the scalar kind the schema gives it. Registration refuses
     /// a pointer that lands nowhere or on a non-scalar, so a projection can
-    /// trust that every admitted path has a kind (DEVIATIONS D-104).
+    /// trust that every admitted path has a kind (ADR-0003).
     pub index_paths: Vec<IndexedPath>,
     pub schema: Value,
 }
@@ -112,7 +112,7 @@ pub enum ScalarKind {
     Boolean,
     /// A `string` with `format: date-time`. Compared as text in this
     /// iteration, which is exact for RFC 3339 timestamps in one offset and
-    /// approximate across offsets (see D-104).
+    /// approximate across offsets (ADR-0003).
     DateTime,
 }
 
@@ -413,7 +413,7 @@ pub fn analyze(
     // is 3 segments (base -> family -> producer type) and the default. It is
     // a design recommendation, not a capability of the type system: nothing
     // below depends on the length, so a deployment mirroring a deeper domain
-    // hierarchy raises `ontology_max_chain_depth` (DEVIATIONS D-029).
+    // hierarchy raises `ontology_max_chain_depth` (DESIGN § 3.1).
     if chain.len() > max_chain_depth {
         return Err(invalid_type(
             type_id,

@@ -707,7 +707,7 @@ fn endpoint_admitted(
 ///
 /// The *decision* is `domain::embedding::decide_vector`, shared with every
 /// other store; this only spells it onto columns. The encoding (recorded in
-/// the gear's development notes, since the FR names the states and not their
+/// DESIGN § 3.7 (`node` table), since the FR names the states and not their
 /// representation):
 ///
 /// | state | `embedding` | `embedding_epoch` | `embedding_input_hash` |
@@ -1291,7 +1291,7 @@ pub async fn ensure_meta(
 /// Readiness compares the configured dimension against this constant rather
 /// than against `pg_attribute`: the sealed runner exposes no way for a gear
 /// to issue a catalog query, so the migration constant is the only in-process
-/// authority (see the gear's development notes).
+/// authority (DESIGN § 3.7, `source_namespace_owner`).
 #[must_use]
 pub const fn migrated_embedding_dimension() -> u32 {
     crate::infra::storage::migrations::m0001_initial_schema::EMBEDDING_DIMENSION

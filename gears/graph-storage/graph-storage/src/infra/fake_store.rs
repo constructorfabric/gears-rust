@@ -1118,7 +1118,7 @@ impl GraphStoreV1 for FakeGraphStore {
         // store, and the fake answers the unfiltered page for them. A payload
         // path is this gear's own rule, so the fake evaluates the shared plan
         // -- the admissibility check and the semantics it implies are then
-        // asserted against both implementations (DEVIATIONS D-104).
+        // asserted against both implementations (ADR-0003).
         let selected: Vec<&FakeNode> = if projection::mentions_payload(&req.query) {
             let admitted = req.type_set.as_ref().map(|set| {
                 let kinds: Vec<BTreeMap<String, ontology::ScalarKind>> = set

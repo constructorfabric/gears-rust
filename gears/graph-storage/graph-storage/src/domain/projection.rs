@@ -8,7 +8,7 @@
 //! resolves every identifier to a column or an admitted payload path with its
 //! kind, checks literal types, and hands each store one plan to execute. The
 //! `PostgreSQL` store renders it to SQL, the fake evaluates it in memory, so
-//! the admissibility rules cannot drift between them (DEVIATIONS D-104).
+//! the admissibility rules cannot drift between them (ADR-0003).
 
 use std::collections::BTreeMap;
 

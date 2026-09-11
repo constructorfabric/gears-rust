@@ -10,7 +10,7 @@
 //! no way to tell.
 //!
 //! Three steps, not an expression language (ADR-0006, and § 4.3 of the
-//! type-update plan in the gear's development notes). Three covered every incompatible edit the Studio domain model
+//! type-update plan behind ADR-0006). Three covered every incompatible edit the Studio domain model
 //! produced in three days, and a closed set is what lets every path be a
 //! checked literal.
 

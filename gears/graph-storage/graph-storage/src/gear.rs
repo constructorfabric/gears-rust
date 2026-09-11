@@ -223,7 +223,7 @@ async fn onnx_provider(_cfg: &GraphStorageConfig) -> anyhow::Result<Arc<dyn Embe
 /// A mismatch does not stop the gear: only the vector arm is incomparable, and
 /// every other path serves the same rows it always did. It stops *that arm*,
 /// loudly, which is what `fr-embedding-dim-guard` asks for — the readiness
-/// surface that should also report it does not exist yet (the gear's development notes).
+/// surface that should also report it does not exist yet (a known gap of this iteration).
 async fn resolve_embedding_space(
     db: &toolkit_db::secure::Db,
     provider: Arc<dyn EmbeddingProviderV1>,

@@ -154,7 +154,7 @@ impl GraphStoreV1 for PgGraphStore {
             scope_replace: true,
             // A true repeatable-read snapshot needs a transaction held across
             // calls, which the sealed runner cannot express; `begin_read`
-            // returns a revision-stamped handle instead (see the gear's development notes).
+            // returns a revision-stamped handle instead (DESIGN § 3.3, obligation 5, which the built-in store declines).
             snapshots: false,
             vector_search: true,
             labels: false,
@@ -250,7 +250,7 @@ impl GraphStoreV1 for PgGraphStore {
         // The traversal backend, as probed at init. Degraded and never
         // unhealthy: the matrix reserves the second for a backend an operator
         // explicitly demanded, and this configuration cannot express the
-        // difference between a demand and a preference (DEVIATIONS D-033).
+        // difference between a demand and a preference (DESIGN § Readiness Matrix).
         if self.pgq_available() {
             out.push(ComponentReadiness::healthy(
                 graph_storage_sdk::models::SQLPGQ,

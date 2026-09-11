@@ -292,6 +292,14 @@ Convergence **MUST** hold under retries with unknown commit outcomes: every inge
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
+> **Found while building the prototype.** Two clauses are not yet met: the
+> idempotency key is scoped to the tenant, not to the tenant *and producer*
+> (the producer principal is not carried into the store), and writes are one
+> statement per node and per edge rather than batched statements. The
+> measured § 6.1 ingest budget is met regardless (10k nodes + 20k edges in
+> ~20 s on developer hardware), so batching is a cost question rather than a
+> correctness one; the producer scope is an open gap.
+
 #### Stable Identity and Parallel Edges
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-fr-stable-identity`
@@ -322,6 +330,14 @@ When an ingested edge references a node key that does not exist, the system **MU
 
 - **Rationale**: Producers ingest incrementally and out of order; silently dropped edges are much harder to diagnose than visible phantoms.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
+
+> **Found while building the prototype.** The phantom type's payload is empty
+> by schema (`maxProperties: 0`, DESIGN § 3.1), so a phantom does not record
+> the referencing edge type in its payload; the edge that brought it into
+> being is visible through the phantom's adjacency, which is where a consumer
+> reads it. Concurrent creation of one phantom resolves as a unique-key
+> conflict (`aborted` / `CAS_CONFLICT`) for the later writer rather than as a
+> retry inside the gear.
 
 #### Edge Provenance and Analysis Preservation
 
@@ -423,6 +439,15 @@ The system **MUST** persist a canonical hash of each embedding input, and the ve
 The system **MUST** verify at readiness that the configured embedding dimension matches the database vector column definition, and **MUST** reject ingest batches whose produced vectors do not match the configured dimension. The system **MUST** also record the embedding-space identity (model artifact, tokenizer, preprocessing and pooling configuration) under which stored vectors were produced, verify the active provider against that record at readiness, and on mismatch **MUST** fail readiness and block vector search until re-embedding completes. Readiness reporting **MUST** state the active provider identity and dimension.
 
 - **Rationale**: A silent dimension mismatch corrupts similarity ranking, and a same-dimension model swap corrupts it invisibly; the prototype documented the dimension case as a real failure mode, and identity verification closes the remaining gap.
+
+> **Found while building the prototype.** Vectors are computed by the gear, not
+> sent by producers, so "reject ingest batches whose produced vectors do not
+> match" is a check on what the provider returns, per batch, and a provider
+> whose declared width differs from the migrated column fails the boot. On an
+> identity mismatch the gear blocks vector and hybrid search and *stays
+> ready* — the readiness matrix's own row (DESIGN § Readiness Matrix) — rather
+> than failing readiness as written here. Readiness does not yet state the
+> active provider identity and dimension.
 - **Actors**: `cpt-cf-graph-storage-actor-platform-admin`, `cpt-cf-graph-storage-actor-embedding-provider`
 
 ### 5.5 Search
@@ -765,7 +790,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 
 - **Type**: Rust trait (ClientHub client) in the SDK crate
 - **Stability**: unstable (v1 during incubation)
-- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer.
+- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer. *Found while building the prototype:* parity holds for every operation the trait carries; the `V1` trait is narrower than REST (no edge read, no compatibility dry run, no registration options or migrations, no source-namespace operations), and widening it is a `ClientV2` change under the policy below.
 - **Breaking Change Policy**: Versioned trait names (`...ClientV1`); breaking changes introduce a new trait version.
 
 ### 7.2 External Integration Contracts

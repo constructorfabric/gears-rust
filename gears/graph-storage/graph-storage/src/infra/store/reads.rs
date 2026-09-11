@@ -517,7 +517,7 @@ pub async fn project_table(
 
     // The selected types, with the payload paths each declares: the interned
     // ids narrow the statement, the declarations decide what `$filter` and
-    // `$orderby` may name (DEVIATIONS D-104).
+    // `$orderby` may name (ADR-0003).
     let mut declared_kinds: Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>> = Vec::new();
     if let Some(set) = &req.type_set {
         let names: Vec<String> = set.0.iter().cloned().collect();

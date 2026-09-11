@@ -2,7 +2,7 @@
 //!
 //! The platform pager (`toolkit_db::odata::paginate_odata`) maps a field to a
 //! column; a declared payload path is an extraction expression over the
-//! `payload` column, which that binding has no slot for (DEVIATIONS D-104).
+//! `payload` column, which that binding has no slot for (ADR-0003, the platform asks).
 //! So when a projection names a payload path — in `$filter`, `$orderby` or
 //! the order its cursor carries — the store renders the shared
 //! [`Plan`](crate::domain::projection::Plan) itself: the same statement

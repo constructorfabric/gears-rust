@@ -1,7 +1,7 @@
 //! One GIN over every node payload (`jsonb_path_ops`).
 //!
 //! The projection admits `$filter` over the payload paths a type declares in
-//! its `index` trait (DEVIATIONS D-104). The design asks for a B-tree over
+//! its `index` trait (ADR-0003). The design asks for a B-tree over
 //! each declared path's extraction expression, which needs `CREATE INDEX` at
 //! registration time — and the platform's secure ORM exposes no statement
 //! surface a gear could run DDL through, by design. What a static migration

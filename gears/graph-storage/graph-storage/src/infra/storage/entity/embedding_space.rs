@@ -7,7 +7,7 @@
 //!
 //! `tenant_id` holds the nil UUID: the table is deployment-wide, and the
 //! column exists so the row is reachable through the secure ORM at all. See
-//! the migration for why, and the gear's development notes for the divergence.
+//! the migration and DESIGN § 3.7 for why.
 
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
