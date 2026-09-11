@@ -381,10 +381,35 @@ pub struct ExpandRequest {
     /// `Unsupported`).
     pub labels: Option<LabelFilter>,
     pub budget: HopBudget,
+    /// Ask for `ExpandResponse::degrees` to be filled.
+    ///
+    /// Off by default because it costs a second scoped read: the edges
+    /// incident to the *reached* set, not only to the frontier. A traversal
+    /// does not need it — its caller post-processes the whole region — and a
+    /// neighborhood projection cannot do without it, because that is what
+    /// decides which neighbours of a hub survive the node budget.
+    pub with_degrees: bool,
 }
 
 pub struct ExpandResponse {
     pub reached: Vec<NodeId>,
+    /// Each reached node's degree in the authorized subgraph, index-aligned
+    /// with `reached`. Empty unless the request asked for it.
+    ///
+    /// The engine is the only party that can say: a reached node is an
+    /// internal id and an `EdgeRef` names its endpoints by producer key, so
+    /// nothing above this port can join the two without another read. Every
+    /// edge counted has passed the caller's scope, so this is the degree
+    /// *inside the authorized subgraph* and never a global one the caller
+    /// cannot see (Authorization Model: "degree ordering, budgets and
+    /// truncation are computed on authorized rows only"). It is what lets a
+    /// neighborhood projection keep the structural core when a hub exceeds
+    /// the node budget (`fr-neighborhood-projection`).
+    ///
+    /// A count is a lower bound when the hop reports `EdgeScanCap`: the scan
+    /// stopped at the budget, so a node may have edges it did not see. The
+    /// ranking is then approximate — which the truncation reason says.
+    pub degrees: Vec<u32>,
     pub edges: Vec<EdgeRef>,
     /// Never silent.
     pub truncated: Option<TruncationReason>,

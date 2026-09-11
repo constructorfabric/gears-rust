@@ -6,7 +6,7 @@
 //! are treated as undirected for reachability (`Direction::Either` — the
 //! union of two directed scans, never the undirected pattern).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use graph_storage_sdk::models::{
     Direction, EdgeRef, HopBudget, NodeId, TruncationReason, TypeIdSet,
@@ -14,6 +14,27 @@ use graph_storage_sdk::models::{
 use graph_storage_sdk::plugin_api::{ExpandRequest, GraphEngineV1, StoreCtx};
 
 use crate::domain::error::DomainError;
+
+/// Which nodes survive when a hop reaches more of them than the budget
+/// allows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Retention {
+    /// The order the hop reached them in, by internal id. What a traversal
+    /// does: its caller asked for a region and post-processes it, so no node
+    /// of the region is privileged.
+    #[default]
+    Reached,
+    /// The most connected first, counting only the edges of this hop —
+    /// "degree ordering, budgets and truncation are computed on authorized
+    /// rows only", so the degree is the one visible inside the authorized
+    /// subgraph, never a global count the caller cannot see.
+    ///
+    /// What the neighborhood projection does: a UI that can draw 200 of a
+    /// hub's 5 000 neighbours wants the structural core, and arrival order
+    /// gives it 200 arbitrary leaves instead
+    /// (`fr-neighborhood-projection`).
+    Degree,
+}
 
 pub struct WalkPlan {
     pub depth: u8,
@@ -23,6 +44,7 @@ pub struct WalkPlan {
     pub max_frontier: u32,
     pub max_edges_scanned: u64,
     pub edge_types: Option<TypeIdSet>,
+    pub retention: Retention,
 }
 
 pub struct WalkResult {
@@ -72,6 +94,7 @@ pub async fn walk(
                         max_frontier: plan.max_frontier,
                         max_edges_scanned: plan.max_edges_scanned,
                     },
+                    with_degrees: plan.retention == Retention::Degree,
                 },
             )
             .await?;
@@ -79,25 +102,51 @@ pub async fn walk(
         if response.truncated.is_some() {
             truncated = response.truncated;
         }
+        // Index-aligned by the port's contract; a short list would silently
+        // read as degree zero, so it is the engine's bug rather than a
+        // default to paper over.
+        let degree: BTreeMap<NodeId, u32> = response
+            .reached
+            .iter()
+            .copied()
+            .zip(response.degrees.iter().copied())
+            .collect();
         for edge in response.edges {
             if seen_edges.insert(edge.edge_key.clone()) {
                 edges.push(edge);
             }
         }
 
-        let mut next: Vec<NodeId> = Vec::new();
+        // Candidates: what this hop reached and the walk has not seen.
         let mut reached = response.reached;
         reached.sort_unstable();
         reached.dedup();
-        for node in reached {
-            if visited.insert(node) {
-                if ordered.len() >= plan.max_nodes as usize {
-                    truncated = Some(TruncationReason::NodeBudget);
-                    break;
-                }
-                ordered.push(node);
-                next.push(node);
+        let mut candidates: Vec<NodeId> = reached
+            .into_iter()
+            .filter(|node| !visited.contains(node))
+            .collect();
+
+        if plan.retention == Retention::Degree {
+            // Most connected first, ties by id so the answer is reproducible.
+            candidates.sort_by_key(|node| {
+                (
+                    std::cmp::Reverse(degree.get(node).copied().unwrap_or(0)),
+                    *node,
+                )
+            });
+        }
+
+        let mut next: Vec<NodeId> = Vec::new();
+        for node in candidates {
+            if ordered.len() >= plan.max_nodes as usize {
+                // The budget is reached, not the end of the hop: what is left
+                // out is what the retention rule put last.
+                truncated = Some(TruncationReason::NodeBudget);
+                break;
             }
+            visited.insert(node);
+            ordered.push(node);
+            next.push(node);
         }
         frontier = next;
     }
@@ -235,6 +284,7 @@ mod tests {
             max_frontier: 100,
             max_edges_scanned: 1_000,
             edge_types: None,
+            retention: Retention::Reached,
         };
         let result = walk(&engine, &ctx, vec![seed], &plan)
             .await

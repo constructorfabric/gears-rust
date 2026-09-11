@@ -705,3 +705,110 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
         1
     );
 }
+
+/// A hub's neighbourhood keeps the structural core when the budget cuts it,
+/// not whichever leaves happened to be reached first.
+///
+/// `fr-neighborhood-projection` asks for retained nodes to be ordered by
+/// degree "so truncation keeps the structural core", and the PRD's own
+/// alternative flow spells out the case: a dense hub truncates to the
+/// *highest-degree* neighbours. Before this, retention was arrival order by
+/// internal id — for a UI that can draw 200 of a hub's 5 000 neighbours, 200
+/// arbitrary leaves.
+///
+/// The fixture makes the two orders disagree on purpose. `hub` has six
+/// neighbours; the last three by id are the connected ones, so arrival order
+/// and degree order are exact opposites and a passing assertion cannot be an
+/// accident of insertion order.
+#[tokio::test]
+async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
+    let harness = Harness::allowed();
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // Ingest order is the id order: leaves first, then the well-connected
+    // three, then the far nodes that give them their degree.
+    let mut nodes = vec![conformance::node("hub", "hub")];
+    for leaf in ["leaf-1", "leaf-2", "leaf-3"] {
+        nodes.push(conformance::node(leaf, leaf));
+    }
+    for core in ["core-1", "core-2", "core-3"] {
+        nodes.push(conformance::node(core, core));
+    }
+    for far in ["far-1", "far-2", "far-3", "far-4", "far-5", "far-6"] {
+        nodes.push(conformance::node(far, far));
+    }
+
+    let mut edges = Vec::new();
+    for neighbour in ["leaf-1", "leaf-2", "leaf-3", "core-1", "core-2", "core-3"] {
+        edges.push(conformance::edge("hub", neighbour));
+    }
+    // Each `core-*` carries two edges of its own; every `leaf-*` has only the
+    // one that ties it to the hub.
+    for (core, far) in [
+        ("core-1", "far-1"),
+        ("core-1", "far-2"),
+        ("core-2", "far-3"),
+        ("core-2", "far-4"),
+        ("core-3", "far-5"),
+        ("core-3", "far-6"),
+    ] {
+        edges.push(conformance::edge(core, far));
+    }
+
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the hub commits");
+
+    // Budget four: the root plus three of its six neighbours.
+    let around = harness
+        .services
+        .neighborhood(
+            &ctx,
+            NeighborhoodRequest {
+                root: "hub".to_owned(),
+                depth: 1,
+                node_budget: Some(4),
+                include_phantoms: false,
+            },
+        )
+        .await
+        .expect("the neighborhood answers");
+
+    let mut kept: Vec<String> = around.nodes.iter().map(|n| n.node_key.clone()).collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec![
+            "core-1".to_owned(),
+            "core-2".to_owned(),
+            "core-3".to_owned(),
+            "hub".to_owned(),
+        ],
+        "the budget keeps the root and the three connected neighbours, not the leaves"
+    );
+    assert!(
+        around.truncated.is_some(),
+        "a truncated neighborhood says so"
+    );
+
+    // And the same walk without a binding budget still answers with all of
+    // them, so the ordering is a retention rule and not a filter.
+    let whole = harness
+        .services
+        .neighborhood(
+            &ctx,
+            NeighborhoodRequest {
+                root: "hub".to_owned(),
+                depth: 1,
+                node_budget: Some(50),
+                include_phantoms: false,
+            },
+        )
+        .await
+        .expect("the neighborhood answers");
+    assert_eq!(whole.nodes.len(), 7, "the root and all six neighbours");
+    assert!(whole.truncated.is_none());
+}

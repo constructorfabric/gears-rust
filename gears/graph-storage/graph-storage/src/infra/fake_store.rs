@@ -1318,6 +1318,7 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
         let Some(tenant) = tenants.get(&ctx.tenant) else {
             return Ok(graph_storage_sdk::plugin_api::ExpandResponse {
                 reached: Vec::new(),
+                degrees: Vec::new(),
                 edges: Vec::new(),
                 truncated: None,
                 served_by: graph_storage_sdk::plugin_api::HopBackend::TwoQuery,
@@ -1365,8 +1366,29 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
         reached.sort_unstable();
         reached.dedup();
 
+        // The reached nodes' own degree in the authorized subgraph, as the
+        // built-in engine computes it: a ranking only one implementation
+        // gets right is a ranking the conformance suite cannot see.
+        let degrees = if req.with_degrees {
+            let mut incident: BTreeMap<i64, u32> = BTreeMap::new();
+            for edge in edges.iter().filter(|e| !e.deleted) {
+                if live.contains_key(&edge.src) && live.contains_key(&edge.dst) {
+                    for id in [edge.src, edge.dst] {
+                        *incident.entry(id).or_default() += 1;
+                    }
+                }
+            }
+            reached
+                .iter()
+                .map(|id| incident.get(id).copied().unwrap_or(0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(graph_storage_sdk::plugin_api::ExpandResponse {
             reached,
+            degrees,
             edges: out_edges,
             truncated: None,
             // The fake walks in memory; it has no pattern backend to decline.

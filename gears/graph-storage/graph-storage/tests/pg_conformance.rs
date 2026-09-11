@@ -69,6 +69,51 @@ fn stand_permits() -> &'static tokio::sync::Semaphore {
     &STAND_PERMITS
 }
 
+/// The container's mapped port, waited for rather than demanded.
+///
+/// A container that has just been started may not have published its port
+/// yet, and under load the gap is wide enough to see (`PortNotExposed`).
+async fn mapped_port(container: &ContainerAsync<Postgres>) -> u16 {
+    let mut last = None;
+    for _ in 0..20 {
+        match container.get_host_port_ipv4(5432).await {
+            Ok(port) => return port,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("the container never published its port: {last:?}");
+}
+
+/// Connect, allowing the server a moment to finish coming up.
+///
+/// A server whose process is running is not yet a server that answers: the
+/// first connections to a fresh instance can time out or meet a half-open
+/// socket (`unexpected response from SSLRequest`). Retrying a connection to a
+/// server that is still starting is what any client does; it is not papering
+/// over a gear failure, and the assertion still fails if the server never
+/// arrives.
+async fn connect_with_retry(dsn: &str) -> Db {
+    let opts = || ConnectOpts {
+        max_conns: Some(4),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let mut last = None;
+    for _ in 0..15 {
+        match connect_db(dsn, opts()).await {
+            Ok(db) => return db,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!("the server never accepted a connection: {last:?}");
+}
+
 /// A live `PostgreSQL` 19 with the gear's schema and property graph applied.
 struct Stand {
     store: Arc<PgGraphStore>,
@@ -143,21 +188,9 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         }
     };
 
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("mapped port");
+    let port = mapped_port(&container).await;
     let dsn = format!("postgres://user:pass@127.0.0.1:{port}/graph");
-    let db = connect_db(
-        &dsn,
-        ConnectOpts {
-            max_conns: Some(4),
-            min_conns: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("connect");
+    let db = connect_with_retry(&dsn).await;
 
     if let Err(error) = run_migrations_for_testing(&db, Migrator::migrations()).await {
         // pgvector missing is the platform-pin gap, not a gear failure: say so
@@ -563,6 +596,7 @@ async fn the_pattern_hop_walks_the_graph() {
                     max_frontier: 100,
                     max_edges_scanned: 1_000,
                 },
+                with_degrees: false,
             },
         )
         .await
@@ -642,6 +676,7 @@ async fn seed_and_expand(
                     max_frontier: 100,
                     max_edges_scanned: 1_000,
                 },
+                with_degrees: false,
             },
         )
         .await
@@ -766,6 +801,7 @@ async fn a_hop_never_leaves_its_tenant() {
                     max_frontier: 100,
                     max_edges_scanned: 1_000,
                 },
+                with_degrees: false,
             },
         )
         .await
@@ -810,6 +846,7 @@ async fn a_stopped_hop_reports_why() {
                     max_frontier: 1,
                     max_edges_scanned: 10,
                 },
+                with_degrees: false,
             },
         )
         .await
@@ -818,6 +855,202 @@ async fn a_stopped_hop_reports_why() {
         response.truncated,
         Some(TruncationReason::FrontierCap),
         "a frontier over the cap must be reported, not silently trimmed"
+    );
+}
+
+/// The edge-scan budget is a bound *and* a report.
+///
+/// It was neither: `live_edges` passed the budget to `LIMIT` and nothing
+/// compared what came back against it, so `TruncationReason::EdgeScanCap`
+/// existed in the vocabulary, was rendered by the DTO, and was produced by no
+/// code path. A hop over a dense region returned a partial subgraph that a
+/// caller could not tell from a complete one -- the failure mode the type's own
+/// "never silent" comment forbids, and the same shape as the traversal
+/// backend that fell back in silence.
+///
+/// Run on both backends, because they build their answer differently and each
+/// has to reach the same conclusion about its own scan.
+#[tokio::test]
+async fn a_hop_that_hits_its_edge_budget_reports_it_on_both_backends() {
+    for hop in [HopStrategy::Pgq, HopStrategy::TwoQuery] {
+        let Some(stand) = stand(hop).await else {
+            return;
+        };
+        let tenant = tenant_on(&stand).await;
+        let scope = AccessScope::for_tenant(tenant);
+        let ctx = conformance::ctx(tenant, &scope, None);
+
+        stand
+            .store
+            .register_types(&ctx, conformance::ontology_batch())
+            .await
+            .expect("ontology registers");
+
+        // A hub with six edges, so a budget of three is inside it.
+        let mut nodes = vec![conformance::node("hub", "hub")];
+        let mut edges = Vec::new();
+        for index in 0..6 {
+            let key = format!("spoke-{index}");
+            nodes.push(conformance::node(&key, &key));
+            edges.push(conformance::edge("hub", &key));
+        }
+        conformance::ingest_batch(stand.store.as_ref(), &ctx, conformance::batch(nodes, edges))
+            .await
+            .expect("the hub commits");
+
+        let ids = stand
+            .store
+            .resolve_node_ids(&ctx, &["hub".to_owned()])
+            .await
+            .expect("the hub resolves");
+        let frontier: Vec<_> = ids.into_iter().map(|(_, id)| id).collect();
+
+        let request = |max_edges_scanned| ExpandRequest {
+            frontier: frontier.clone(),
+            direction: Direction::Either,
+            edge_types: None,
+            labels: None,
+            budget: HopBudget {
+                max_frontier: 1_000,
+                max_edges_scanned,
+            },
+            with_degrees: false,
+        };
+
+        let cut = stand
+            .engine
+            .expand(&ctx, request(3))
+            .await
+            .expect("the hop runs");
+        assert_eq!(
+            cut.truncated,
+            Some(TruncationReason::EdgeScanCap),
+            "{hop:?}: a scan stopped by the edge budget must say so"
+        );
+        assert_eq!(
+            cut.edges.len(),
+            3,
+            "{hop:?}: the budget still bounds the work"
+        );
+
+        // The same hop inside its budget is not truncated, otherwise the
+        // assertion above would pass on a hop that reports the cap always.
+        let whole = stand
+            .engine
+            .expand(&ctx, request(100))
+            .await
+            .expect("the hop runs");
+        assert_eq!(whole.truncated, None, "{hop:?}: an unbounded hop is whole");
+        assert_eq!(whole.edges.len(), 6, "{hop:?}: every edge of the hub");
+    }
+}
+
+/// The degree a neighborhood ranks by is the neighbour's own connectivity in
+/// the authorized subgraph, and it is opt-in.
+///
+/// Both halves matter. The count has to be the node's *own* degree — at depth
+/// one every neighbour is tied to the frontier by exactly one edge, so a
+/// within-hop count would rank a hub's neighbours arbitrarily, which is the
+/// failure `fr-neighborhood-projection` exists to prevent. And it has to be
+/// opt-in, because it is a second scoped read that a traversal has no use
+/// for.
+#[tokio::test]
+async fn a_hop_reports_the_reached_nodes_degree_only_when_asked() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    // `core` carries two edges of its own; `leaf` carries only the one that
+    // ties it to the root.
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("root", "root"),
+                conformance::node("core", "core"),
+                conformance::node("leaf", "leaf"),
+                conformance::node("far-1", "far-1"),
+                conformance::node("far-2", "far-2"),
+            ],
+            vec![
+                conformance::edge("root", "core"),
+                conformance::edge("root", "leaf"),
+                conformance::edge("core", "far-1"),
+                conformance::edge("core", "far-2"),
+            ],
+        ),
+    )
+    .await
+    .expect("the fixture commits");
+
+    let ids = stand
+        .store
+        .resolve_node_ids(&ctx, &["root".to_owned(), "core".to_owned()])
+        .await
+        .expect("the root resolves");
+    let by_key: std::collections::BTreeMap<String, i64> = ids.into_iter().collect();
+    let frontier = vec![by_key["root"]];
+
+    let request = |with_degrees| ExpandRequest {
+        frontier: frontier.clone(),
+        direction: Direction::Either,
+        edge_types: None,
+        labels: None,
+        budget: HopBudget {
+            max_frontier: 1_000,
+            max_edges_scanned: 1_000,
+        },
+        with_degrees,
+    };
+
+    let silent = stand
+        .engine
+        .expand(&ctx, request(false))
+        .await
+        .expect("the hop runs");
+    assert!(
+        silent.degrees.is_empty(),
+        "a hop that was not asked for degrees does not pay for them"
+    );
+
+    let ranked = stand
+        .engine
+        .expand(&ctx, request(true))
+        .await
+        .expect("the hop runs");
+    assert_eq!(ranked.degrees.len(), ranked.reached.len(), "index-aligned");
+    let degree_of_core = ranked
+        .reached
+        .iter()
+        .zip(&ranked.degrees)
+        .find(|(id, _)| **id == by_key["core"])
+        .map(|(_, degree)| *degree);
+    assert_eq!(
+        degree_of_core,
+        Some(3),
+        "`core` has three live edges: one to the root and two of its own"
+    );
+    let leaf_degree = ranked
+        .reached
+        .iter()
+        .zip(&ranked.degrees)
+        .filter(|(id, _)| **id != by_key["core"])
+        .map(|(_, degree)| *degree)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        leaf_degree,
+        vec![1],
+        "the leaf has only the edge that reached it"
     );
 }
 
@@ -894,6 +1127,7 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
                     max_frontier: 100,
                     max_edges_scanned: 1_000,
                 },
+                with_degrees: false,
             },
         )
         .await
@@ -928,6 +1162,7 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
                     max_frontier: 100,
                     max_edges_scanned: 1_000,
                 },
+                with_degrees: false,
             },
         )
         .await

@@ -184,6 +184,7 @@ impl GraphEngineV1 for PgGraphEngine {
         if req.frontier.is_empty() {
             return Ok(ExpandResponse {
                 reached: Vec::new(),
+                degrees: Vec::new(),
                 edges: Vec::new(),
                 truncated: None,
                 served_by: would_serve,
@@ -192,6 +193,7 @@ impl GraphEngineV1 for PgGraphEngine {
         if req.frontier.len() as u64 > u64::from(req.budget.max_frontier) {
             return Ok(ExpandResponse {
                 reached: Vec::new(),
+                degrees: Vec::new(),
                 edges: Vec::new(),
                 truncated: Some(TruncationReason::FrontierCap),
                 served_by: would_serve,
@@ -365,15 +367,13 @@ async fn expand_pgq(
     // candidates are authorized. What it could not express are the columns
     // outside the elements' `PROPERTIES` — `deleted_at` and the interned edge
     // type — so an ordinary scoped read applies those and produces the edges.
-    let (edges, live) = live_edges(ctx, &conn, req, Some(&reached)).await?;
-
-    let truncated = (live.len() as u64 > u64::from(req.budget.max_frontier))
-        .then_some(TruncationReason::FrontierCap);
+    let incidence = live_edges(ctx, &conn, req, Some(&reached)).await?;
 
     Ok(PatternOutcome::Answered(ExpandResponse {
-        reached: live,
-        edges,
-        truncated,
+        truncated: hop_truncation(req, &incidence),
+        reached: incidence.reached,
+        degrees: incidence.degrees,
+        edges: incidence.edges,
         served_by: HopBackend::Pattern,
     }))
 }
@@ -392,12 +392,26 @@ fn directions_of(direction: Direction) -> Vec<Direction> {
 /// `candidates`, when present, restricts the far side to a set a pattern
 /// already authorized; when absent every far endpoint is authorized here by
 /// the scoped node read, which is the two-query hop's second query.
+/// One hop's incident edges and the authorized far endpoints they reach,
+/// plus whether the edge-scan budget cut the scan short.
+struct Incidence {
+    edges: Vec<EdgeRef>,
+    reached: Vec<i64>,
+    /// Index-aligned with `reached`: how many of this hop's edges touch it.
+    degrees: Vec<u32>,
+    /// True when the scan found more incident edges than the budget allows.
+    /// The budget still bounds the work — the extra row is read to know, and
+    /// discarded — but the answer now says it is partial. A hop that trims
+    /// silently returns a subgraph a caller cannot tell from a complete one.
+    over_edge_budget: bool,
+}
+
 async fn live_edges(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
     req: &ExpandRequest,
     candidates: Option<&[i64]>,
-) -> Result<(Vec<EdgeRef>, Vec<i64>), GraphEngineError> {
+) -> Result<Incidence, GraphEngineError> {
     let type_ids = edge_type_ids(ctx, runner, req.edge_types.as_ref()).await?;
 
     let mut incidence = Condition::any();
@@ -426,7 +440,12 @@ async fn live_edges(
     }
     if let Some(candidates) = candidates {
         if candidates.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Incidence {
+                edges: Vec::new(),
+                reached: Vec::new(),
+                degrees: Vec::new(),
+                over_edge_budget: false,
+            });
         }
         // Only edges whose far endpoint survived the pattern's scope.
         let far = Condition::any()
@@ -435,11 +454,15 @@ async fn live_edges(
         select = select.filter(far);
     }
 
-    let rows = select
-        .limit(req.budget.max_edges_scanned)
+    // One row past the budget, so the difference between "exactly the budget"
+    // and "more than the budget" is observable; the extra row is then dropped.
+    let mut rows = select
+        .limit(req.budget.max_edges_scanned.saturating_add(1))
         .all(runner)
         .await
         .map_err(scope_error)?;
+    let over_edge_budget = rows.len() as u64 > req.budget.max_edges_scanned;
+    rows.truncate(usize::try_from(req.budget.max_edges_scanned).unwrap_or(usize::MAX));
 
     // Endpoints the caller may not see are not reachable: a scoped node read
     // decides which endpoints exist for this caller.
@@ -478,7 +501,7 @@ async fn live_edges(
     let frontier: std::collections::BTreeSet<i64> = req.frontier.iter().copied().collect();
     let mut reached: Vec<i64> = Vec::new();
     let mut edges = Vec::new();
-    for e in rows {
+    for e in &rows {
         let (Some(src), Some(dst)) = (keys.get(&e.src_node_id), keys.get(&e.dst_node_id)) else {
             // An endpoint the caller cannot see makes the edge unreachable;
             // denied and nonexistent are indistinguishable.
@@ -491,7 +514,7 @@ async fn live_edges(
             reached.push(e.src_node_id);
         }
         edges.push(EdgeRef {
-            edge_key: e.edge_key,
+            edge_key: e.edge_key.clone(),
             edge_type_id: names.get(&e.gts_edge_type_id).cloned().unwrap_or_default(),
             src: src.clone(),
             dst: dst.clone(),
@@ -499,7 +522,69 @@ async fn live_edges(
     }
     reached.sort_unstable();
     reached.dedup();
-    Ok((edges, reached))
+
+    // The degree that decides which neighbours of a hub survive a node
+    // budget is the neighbour's *own* connectivity, not how many edges tie it
+    // to this frontier — at depth one those are all exactly one, so the
+    // within-hop count would rank a hub's neighbours arbitrarily, which is
+    // the whole failure the requirement names. So it is a second scoped read
+    // over the edges incident to the reached set, taken only when the caller
+    // asked (a traversal does not pay for it).
+    let (degrees, degree_scan_over_budget) = if req.with_degrees && !reached.is_empty() {
+        degrees_of(ctx, runner, req, &reached).await?
+    } else {
+        (Vec::new(), false)
+    };
+
+    Ok(Incidence {
+        edges,
+        reached,
+        degrees,
+        over_edge_budget: over_edge_budget || degree_scan_over_budget,
+    })
+}
+
+/// Each reached node's degree in the authorized subgraph, index-aligned with
+/// `reached`, and whether the scan hit the hop's edge budget.
+///
+/// Counted in Rust from scoped rows rather than by a `GROUP BY`: the
+/// platform's secure ORM exposes `all`, `one` and `count` on a scoped select
+/// and no aggregate projection, and a per-node `count()` would be one
+/// statement per neighbour. The scan carries the hop's own edge budget, so a
+/// dense region bounds this read exactly as it bounds the incidence read; on
+/// overflow the counts are a lower bound and the hop says so.
+async fn degrees_of(
+    ctx: &StoreCtx<'_>,
+    runner: &impl DBRunner,
+    req: &ExpandRequest,
+    reached: &[i64],
+) -> Result<(Vec<u32>, bool), GraphEngineError> {
+    let incidence = Condition::any()
+        .add(edge::Column::SrcNodeId.is_in(reached.to_vec()))
+        .add(edge::Column::DstNodeId.is_in(reached.to_vec()));
+    let mut rows = edge::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(incidence)
+        .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+        .limit(req.budget.max_edges_scanned.saturating_add(1))
+        .all(runner)
+        .await
+        .map_err(scope_error)?;
+    let over_budget = rows.len() as u64 > req.budget.max_edges_scanned;
+    rows.truncate(usize::try_from(req.budget.max_edges_scanned).unwrap_or(usize::MAX));
+
+    let mut incident: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
+    for row in &rows {
+        for id in [row.src_node_id, row.dst_node_id] {
+            *incident.entry(id).or_default() += 1;
+        }
+    }
+    let degrees = reached
+        .iter()
+        .map(|id| incident.get(id).copied().unwrap_or(0))
+        .collect();
+    Ok((degrees, over_budget))
 }
 
 /// Two scoped queries: the incident live edges, then the authorized far
@@ -520,14 +605,27 @@ async fn expand_two_query(
             reason: e.to_string(),
         })?;
 
-    let (edges, reached) = live_edges(ctx, &conn, req, None).await?;
-    let truncated = (reached.len() as u64 > u64::from(req.budget.max_frontier))
-        .then_some(TruncationReason::FrontierCap);
+    let incidence = live_edges(ctx, &conn, req, None).await?;
 
     Ok(ExpandResponse {
-        reached,
-        edges,
-        truncated,
+        truncated: hop_truncation(req, &incidence),
+        reached: incidence.reached,
+        degrees: incidence.degrees,
+        edges: incidence.edges,
         served_by: HopBackend::TwoQuery,
     })
+}
+
+/// Which bound, if either, cut this hop short.
+///
+/// The edge budget is reported ahead of the frontier cap when both are hit:
+/// it is the earlier cut, and the frontier the caller sees was computed from
+/// an already-incomplete edge set, so naming the frontier would send them to
+/// raise the wrong limit.
+fn hop_truncation(req: &ExpandRequest, incidence: &Incidence) -> Option<TruncationReason> {
+    if incidence.over_edge_budget {
+        return Some(TruncationReason::EdgeScanCap);
+    }
+    (incidence.reached.len() as u64 > u64::from(req.budget.max_frontier))
+        .then_some(TruncationReason::FrontierCap)
 }

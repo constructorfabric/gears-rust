@@ -23,7 +23,7 @@ use crate::config::GraphStorageConfig;
 use crate::domain::embedding;
 use crate::domain::embedding::EmbeddingCoordinator;
 use crate::domain::error::DomainError;
-use crate::domain::traversal::{WalkPlan, walk};
+use crate::domain::traversal::{Retention, WalkPlan, walk};
 use crate::domain::{admission, authz, identity, ontology};
 
 #[domain_model]
@@ -817,6 +817,9 @@ impl GraphServices {
             edge_types: self
                 .resolve_patterns(&auth, &request.edge_type_patterns)
                 .await?,
+            // A traversal's caller asked for a region and post-processes it,
+            // so no node of the region is privileged over another.
+            retention: Retention::Reached,
         };
         let node_types = self
             .resolve_patterns(&auth, &request.node_type_patterns)
@@ -844,6 +847,10 @@ impl GraphServices {
             max_frontier: self.config.traversal_max_frontier,
             max_edges_scanned: self.config.traversal_max_edges_scanned,
             edge_types: None,
+            // A UI that can draw 200 of a hub's 5 000 neighbours wants the
+            // structural core, not 200 arbitrary leaves
+            // (`fr-neighborhood-projection`).
+            retention: Retention::Degree,
         };
         let seeds = vec![request.root.clone()];
         self.walk_and_hydrate(&auth, &seeds, plan, None, request.include_phantoms)

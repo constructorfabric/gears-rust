@@ -172,18 +172,34 @@ impl GraphEngineV1 for HopOverStore {
         }
         neighbours.sort();
         neighbours.dedup();
-        let reached: Vec<NodeId> = self
+        let resolved = self
             .store
             .resolve_node_ids(ctx, &neighbours)
             .await
             .map_err(|error| GraphEngineError::Unavailable {
                 reason: error.to_string(),
-            })?
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
+            })?;
+        let mut reached: Vec<NodeId> = Vec::new();
+        let mut degrees: Vec<u32> = Vec::new();
+        for (key, id) in resolved {
+            reached.push(id);
+            if req.with_degrees {
+                // The stub reads the neighbour back to count its adjacency,
+                // which is this engine's version of the second scoped read
+                // the real ones do.
+                let degree = self
+                    .store
+                    .get_node(ctx, &key, 1000)
+                    .await
+                    .map_or(0, |view| {
+                        u32::try_from(view.adjacency.len()).unwrap_or(u32::MAX)
+                    });
+                degrees.push(degree);
+            }
+        }
         Ok(ExpandResponse {
             reached,
+            degrees,
             edges,
             truncated: None,
             served_by: graph_storage_sdk::plugin_api::HopBackend::TwoQuery,

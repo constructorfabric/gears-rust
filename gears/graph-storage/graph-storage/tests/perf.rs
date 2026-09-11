@@ -544,6 +544,7 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
                                 max_frontier: 1_000,
                                 max_edges_scanned: 50_000,
                             },
+                            with_degrees: false,
                         },
                     )
                     .await
@@ -589,6 +590,7 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
                             max_frontier: 1_000,
                             max_edges_scanned: 50_000,
                         },
+                        with_degrees: false,
                     },
                 )
                 .await
