@@ -117,9 +117,6 @@ pub enum RemoteConfigError {
 /// but the contract requires it to get a vector aligned with its position.
 const EMPTY_INPUT_PLACEHOLDER: &str = "(empty)";
 
-/// How many bytes of an error body are worth carrying into a log line.
-const ERROR_BODY_LIMIT: usize = 512;
-
 /// An `OpenAI`-compatible `/embeddings` endpoint, as the gear's provider.
 pub struct RemoteEmbeddingProvider {
     http: reqwest::Client,
@@ -326,15 +323,14 @@ impl RemoteEmbeddingProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let excerpt = response
-                .text()
-                .await
-                .map(|text| text.chars().take(ERROR_BODY_LIMIT).collect::<String>())
-                .unwrap_or_default();
+            // The status is the diagnosis; the body is the vendor's and may
+            // echo the request, so only its size is logged (telemetry
+            // contract: no provider response bodies in logs).
+            let body_bytes = response.bytes().await.map_or(0, |b| b.len());
             warn!(
                 endpoint = %endpoint_name(&self.endpoint),
                 status = status.as_u16(),
-                body = %excerpt,
+                body_bytes,
                 "the embeddings endpoint refused the request"
             );
             return Err(classify_status(status));

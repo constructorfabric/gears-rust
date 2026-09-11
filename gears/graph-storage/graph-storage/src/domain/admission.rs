@@ -76,7 +76,9 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
     // through the same provider ingest used, which is what makes a hit
     // comparable at all (`fr-vector-search`).
     if request.query.as_deref().is_none_or(str::is_empty) {
-        return Err(DomainError::invalid("this search mode requires `query`"));
+        return Err(DomainError::limit_combination(
+            "this search mode requires `query`",
+        ));
     }
     Ok(())
 }
@@ -86,7 +88,9 @@ pub fn admit_traverse(
     request: &TraverseRequest,
 ) -> Result<(), DomainError> {
     if request.seeds.is_empty() {
-        return Err(DomainError::invalid("traversal requires at least one seed"));
+        return Err(DomainError::limit_combination(
+            "traversal requires at least one seed",
+        ));
     }
     if request.depth == 0 || request.depth > cfg.traversal_max_depth {
         return Err(exceeded(format!(

@@ -367,6 +367,10 @@ pub struct GraphIngestCountsDto {
     pub edges_unchanged: u64,
     pub phantoms_created: u64,
     pub phantoms_materialized: u64,
+    /// Static content a scope replacement removed because the batch no longer
+    /// named it. Zero unless `replace_scope` was set.
+    pub scope_removed_nodes: u64,
+    pub scope_removed_edges: u64,
 }
 
 #[derive(Debug)]
@@ -376,6 +380,23 @@ pub struct GraphIngestResultDto {
     /// True when an idempotency receipt answered without touching state.
     pub replayed: bool,
     pub counts: GraphIngestCountsDto,
+    /// One of `inserted | updated | unchanged | materialized` per node of the
+    /// batch, in batch order. Present only when `options.report_per_item`
+    /// was set, and absent on a replayed call: the receipt keeps the counts,
+    /// not the list.
+    pub per_item_nodes: Option<Vec<String>>,
+    /// The same for the batch's edges (`inserted | updated | unchanged`).
+    pub per_item_edges: Option<Vec<String>>,
+}
+
+fn item_outcome_name(outcome: &m::ItemOutcome) -> String {
+    match outcome {
+        m::ItemOutcome::Inserted => "inserted",
+        m::ItemOutcome::Updated => "updated",
+        m::ItemOutcome::Unchanged => "unchanged",
+        m::ItemOutcome::Materialized => "materialized",
+    }
+    .to_owned()
 }
 
 #[derive(Debug)]
@@ -744,7 +765,15 @@ impl From<m::IngestOutcome> for GraphIngestResultDto {
                 edges_unchanged: value.counts.edges_unchanged,
                 phantoms_created: value.counts.phantoms_created,
                 phantoms_materialized: value.counts.phantoms_materialized,
+                scope_removed_nodes: value.counts.scope_removed_nodes,
+                scope_removed_edges: value.counts.scope_removed_edges,
             },
+            per_item_nodes: value
+                .per_item_nodes
+                .map(|items| items.iter().map(item_outcome_name).collect()),
+            per_item_edges: value
+                .per_item_edges
+                .map(|items| items.iter().map(item_outcome_name).collect()),
         }
     }
 }

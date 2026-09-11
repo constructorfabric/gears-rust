@@ -223,6 +223,8 @@ pub struct ListTypesParams {
     /// got.
     pub pattern: Option<String>,
     pub limit: Option<u32>,
+    /// The `next_cursor` of a previous page, to continue it.
+    pub cursor: Option<String>,
     /// Anything else the caller sent. Collected so it can be refused: a
     /// parameter silently ignored is a filter the caller believes is applied,
     /// which is the failure mode the projection's `OData` binding exists to
@@ -240,7 +242,7 @@ pub async fn list_types(
     if let Some(unknown) = params.rest.keys().next() {
         return Err(DomainError::invalid(format!(
             "`{unknown}` is not an accepted query option; the type catalog takes \
-             `kind`, `pattern` and `limit`"
+             `kind`, `pattern`, `limit` and `cursor`"
         ))
         .into());
     }
@@ -260,7 +262,7 @@ pub async fn list_types(
                 kind,
                 pattern: params.pattern,
                 top: params.limit,
-                cursor: None,
+                cursor: params.cursor,
             },
         )
         .await?;

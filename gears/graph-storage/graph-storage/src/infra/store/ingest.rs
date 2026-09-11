@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeSpec, EffectiveTraits, GraphRevision, IngestCounts,
-    IngestOutcome, IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope, Subject,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, ItemOutcome, NodeSpec, ReplaceScope,
+    Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
 use crate::domain::identity;
 use crate::domain::ownership;
+use crate::domain::tally::IngestTally;
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
 use crate::infra::store::types::interned_ids;
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
@@ -346,13 +348,13 @@ async fn ingest_in_tx(
     // is refused before it writes; the *removal* comes after the batch's own
     // writes, because "absent from the submitted batch" cannot be decided
     // until the batch is in.
-    let mut counts = IngestCounts::default();
+    let mut tally = IngestTally::new(request.options.report_per_item);
     if let Some(replace) = &request.replace_scope {
         fence_scope(tenant, scope, producer, tx, replace, &request_hash).await?;
     }
 
     let types = resolve_types(scope, tx, &request).await?;
-    let mut changed = counts.scope_removed_nodes > 0 || counts.scope_removed_edges > 0;
+    let mut changed = false;
 
     let mut node_ids: BTreeMap<String, Endpoint> = BTreeMap::new();
     changed |= write_nodes(
@@ -361,12 +363,12 @@ async fn ingest_in_tx(
         &request,
         &types,
         &mut node_ids,
-        &mut counts,
+        &mut tally,
         embedding,
     )
     .await?;
 
-    changed |= write_edges(w, tx, &request, &types, &mut node_ids, &mut counts).await?;
+    changed |= write_edges(w, tx, &request, &types, &mut node_ids, &mut tally).await?;
 
     // --- scope replacement, part two: remove what the batch did not name ---
     if let Some(replace) = &request.replace_scope {
@@ -378,8 +380,8 @@ async fn ingest_in_tx(
         let (removed_nodes, removed_edges) =
             super::scope::remove_stale(scope, tx, &replace.attribute, &replace.value, &written)
                 .await?;
-        counts.scope_removed_nodes = removed_nodes;
-        counts.scope_removed_edges = removed_edges;
+        tally.counts.scope_removed_nodes = removed_nodes;
+        tally.counts.scope_removed_edges = removed_edges;
         changed |= removed_nodes > 0 || removed_edges > 0;
     }
 
@@ -390,6 +392,7 @@ async fn ingest_in_tx(
         current_revision(scope, tx).await?
     };
 
+    let (counts, per_item_nodes, per_item_edges) = tally.into_parts();
     let outcome = IngestOutcome {
         revision: GraphRevision {
             source_epoch: epoch,
@@ -397,8 +400,8 @@ async fn ingest_in_tx(
         },
         replayed: false,
         counts,
-        per_item_nodes: None,
-        per_item_edges: None,
+        per_item_nodes,
+        per_item_edges,
     };
 
     // The receipt commits with the batch, never after it.
@@ -533,19 +536,6 @@ async fn fence_scope(
     // what the replacement removes is decided after the batch's own writes,
     // in `scope::remove_stale`.
     Ok(())
-}
-
-enum NodeWrite {
-    Inserted,
-    Updated,
-    Unchanged,
-    Materialized,
-}
-
-enum EdgeWrite {
-    Inserted,
-    Updated,
-    Unchanged,
 }
 
 async fn lookup_endpoint(
@@ -776,7 +766,7 @@ async fn upsert_node(
     info: &TypeInfo,
     index: usize,
     planned: PlannedVector<'_>,
-) -> Result<(i64, NodeWrite), GraphStoreError> {
+) -> Result<(i64, ItemOutcome), GraphStoreError> {
     let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let existing = node::Entity::find()
         .secure()
@@ -853,7 +843,7 @@ async fn upsert_node(
             .exec_with_returning(tx)
             .await
             .map_err(map_scope_err)?;
-        return Ok((model.id, NodeWrite::Inserted));
+        return Ok((model.id, ItemOutcome::Inserted));
     };
 
     // A tombstoned key is not reusable before purge.
@@ -872,16 +862,16 @@ async fn upsert_node(
     if materializing {
         let previous_is_phantom = is_phantom_type(scope, tx, current.gts_node_type_id).await?;
         if !previous_is_phantom {
-            return Err(item_error(
-                index,
-                ItemFamily::Node,
-                &spec.type_id,
-                format!(
-                    "node `{}` is already registered under a different type; \
-                     a same-key ingest may not change it",
+            // A conflict, not a validation failure: the payload may be
+            // perfectly valid under the new type, and the only permitted
+            // transition is phantom materialization.
+            return Err(GraphStoreError::Conflict {
+                reason: format!(
+                    "node `{}` is already registered under a different type; a same-key \
+                     ingest may not change it",
                     spec.node_key
                 ),
-            ));
+            });
         }
     }
 
@@ -907,7 +897,7 @@ async fn upsert_node(
         && current.embedding_input_hash == vector.input_hash
         && !materializing;
     if unchanged {
-        return Ok((current.id, NodeWrite::Unchanged));
+        return Ok((current.id, ItemOutcome::Unchanged));
     }
 
     if materializing {
@@ -947,9 +937,9 @@ async fn upsert_node(
     Ok((
         id,
         if materializing {
-            NodeWrite::Materialized
+            ItemOutcome::Materialized
         } else {
-            NodeWrite::Updated
+            ItemOutcome::Updated
         },
     ))
 }
@@ -1030,7 +1020,7 @@ async fn upsert_edge(
     info: &TypeInfo,
     src: i64,
     dst: i64,
-) -> Result<EdgeWrite, GraphStoreError> {
+) -> Result<ItemOutcome, GraphStoreError> {
     let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let edge_key = identity::derive_edge_key(info.uuid, spec);
     let now = OffsetDateTime::now_utc();
@@ -1074,11 +1064,11 @@ async fn upsert_edge(
             .exec(tx)
             .await
             .map_err(map_scope_err)?;
-        return Ok(EdgeWrite::Inserted);
+        return Ok(ItemOutcome::Inserted);
     };
 
     if current.payload == payload && current.deleted_at.is_none() {
-        return Ok(EdgeWrite::Unchanged);
+        return Ok(ItemOutcome::Unchanged);
     }
 
     let id = current.id;
@@ -1111,7 +1101,7 @@ async fn upsert_edge(
         .exec(tx)
         .await
         .map_err(map_scope_err)?;
-    Ok(EdgeWrite::Updated)
+    Ok(ItemOutcome::Updated)
 }
 
 pub async fn soft_delete(
@@ -1209,6 +1199,23 @@ pub async fn soft_delete(
                             .await
                             .map_err(map_scope_err)?
                             .ok_or(GraphStoreError::NotFound)?;
+                        // An edge is a statement about two nodes: tombstoning
+                        // it needs both endpoints visible under the caller's
+                        // scope, the rule the edge read follows. Denied and
+                        // absent answer alike.
+                        let mut endpoints = vec![model.src_node_id, model.dst_node_id];
+                        endpoints.dedup();
+                        let visible = node::Entity::find()
+                            .secure()
+                            .scope_with(&scope)
+                            .filter(Condition::all().add(node::Column::Id.is_in(endpoints.clone())))
+                            .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+                            .all(tx)
+                            .await
+                            .map_err(map_scope_err)?;
+                        if visible.len() != endpoints.len() {
+                            return Err(GraphStoreError::NotFound.into());
+                        }
                         edge::Entity::update_many()
                             .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
                             .col_expr(
@@ -1298,7 +1305,7 @@ async fn write_nodes(
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
     node_ids: &mut BTreeMap<String, Endpoint>,
-    counts: &mut IngestCounts,
+    tally: &mut IngestTally,
     embedding: &EmbeddingPlan,
 ) -> Result<bool, GraphStoreError> {
     let mut changed = false;
@@ -1340,21 +1347,7 @@ async fn write_nodes(
                 type_id: info.id,
             },
         );
-        match write {
-            NodeWrite::Inserted => {
-                counts.nodes_inserted += 1;
-                changed = true;
-            }
-            NodeWrite::Updated => {
-                counts.nodes_updated += 1;
-                changed = true;
-            }
-            NodeWrite::Unchanged => counts.nodes_unchanged += 1,
-            NodeWrite::Materialized => {
-                counts.phantoms_materialized += 1;
-                changed = true;
-            }
-        }
+        changed |= tally.node(&write);
     }
     Ok(changed)
 }
@@ -1374,7 +1367,7 @@ async fn resolve_endpoint(
     types: &BTreeMap<String, TypeInfo>,
     node_ids: &mut BTreeMap<String, Endpoint>,
     create_phantoms: bool,
-    counts: &mut IngestCounts,
+    tally: &mut IngestTally,
 ) -> Result<bool, GraphStoreError> {
     if node_ids.contains_key(key) {
         return Ok(false);
@@ -1410,7 +1403,7 @@ async fn resolve_endpoint(
             type_id: phantom_type.id,
         },
     );
-    counts.phantoms_created += 1;
+    tally.phantom_created();
     Ok(true)
 }
 
@@ -1422,7 +1415,7 @@ async fn write_edges(
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
     node_ids: &mut BTreeMap<String, Endpoint>,
-    counts: &mut IngestCounts,
+    tally: &mut IngestTally,
 ) -> Result<bool, GraphStoreError> {
     let create_phantoms = request.options.create_phantoms.unwrap_or(true);
     let mut changed = false;
@@ -1447,7 +1440,7 @@ async fn write_edges(
                 types,
                 node_ids,
                 create_phantoms,
-                counts,
+                tally,
             )
             .await?;
         }
@@ -1484,17 +1477,7 @@ async fn write_edges(
             }
         }
 
-        match upsert_edge(w, tx, spec, info, src.id, dst.id).await? {
-            EdgeWrite::Inserted => {
-                counts.edges_inserted += 1;
-                changed = true;
-            }
-            EdgeWrite::Updated => {
-                counts.edges_updated += 1;
-                changed = true;
-            }
-            EdgeWrite::Unchanged => counts.edges_unchanged += 1,
-        }
+        changed |= tally.edge(&upsert_edge(w, tx, spec, info, src.id, dst.id).await?);
     }
     Ok(changed)
 }

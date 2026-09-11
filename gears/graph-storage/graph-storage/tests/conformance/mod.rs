@@ -3971,3 +3971,145 @@ pub async fn an_edge_type_evolves_over_its_own_rows(store: &dyn GraphStoreV1, te
         "and the old name is gone: {payload}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identity under upsert, and per-item outcomes
+// ---------------------------------------------------------------------------
+
+/// A second concrete node type, for the one transition upsert must refuse.
+pub const OTHER_THING: &str =
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.other_thing.v1~";
+
+fn other_thing_type() -> TypeRegistration {
+    TypeRegistration {
+        type_id: OTHER_THING.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{OTHER_THING}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" }
+            ]
+        }),
+    }
+}
+
+/// A concrete node's type is immutable under upsert (`fr-stable-identity`,
+/// Concurrent Ingest Protocol rule 1): the same key offered under another
+/// concrete type is a *conflict*, not a schema violation. The payload may be
+/// perfectly valid under the new type; what is wrong is the identity claim,
+/// and a client that matches on `CAS_CONFLICT` must be told so. The only
+/// permitted transition is phantom materialization, covered separately.
+pub async fn a_same_key_ingest_may_not_change_the_type(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut ontology = ontology_batch();
+    ontology.push(other_thing_type());
+    store
+        .register_types(&ctx, ontology)
+        .await
+        .expect("ontology registers");
+
+    ingest_batch(store, &ctx, batch(vec![node("fixed-1", "one")], vec![]))
+        .await
+        .expect("first commits");
+
+    let moved = NodeSpec {
+        type_id: OTHER_THING.to_owned(),
+        ..node("fixed-1", "one")
+    };
+    let refused = ingest_batch(store, &ctx, batch(vec![moved], vec![])).await;
+    assert!(
+        matches!(refused, Err(GraphStoreError::Conflict { .. })),
+        "a same-key type change is a conflict, got {refused:?}"
+    );
+
+    let view = store
+        .get_node(&ctx, &"fixed-1".to_owned(), 10)
+        .await
+        .expect("the node is untouched");
+    assert_eq!(view.type_id, OWNED, "the refused batch changed nothing");
+}
+
+/// `options.report_per_item` answers with one outcome per item of the batch,
+/// in batch order — the convergence-observability lever DESIGN § 3.3 names,
+/// and off by default so a producer that only wants the counts pays nothing.
+pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, tenant: Uuid) {
+    use graph_storage_sdk::models::ItemOutcome as O;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    let silent = ingest_batch(
+        store,
+        &ctx,
+        batch(vec![node("pi-a", "a"), node("pi-b", "b")], vec![]),
+    )
+    .await
+    .expect("seed commits");
+    assert!(
+        silent.per_item_nodes.is_none() && silent.per_item_edges.is_none(),
+        "per-item outcomes are opt-in"
+    );
+
+    // One of each outcome the nodes can have (bar materialization), and an
+    // edge whose far endpoint becomes a phantom — a phantom is not an item of
+    // the batch, so it shows in the counts and not in the list.
+    let mut told = batch(
+        vec![
+            node("pi-a", "a"),
+            node("pi-b", "b, renamed"),
+            node("pi-c", "c"),
+        ],
+        vec![edge("pi-a", "pi-b"), edge("pi-b", "pi-d")],
+    );
+    told.options.report_per_item = true;
+    let first = ingest_batch(store, &ctx, told.clone())
+        .await
+        .expect("reported batch commits");
+    assert_eq!(
+        first.per_item_nodes.as_deref(),
+        Some(&[O::Unchanged, O::Updated, O::Inserted][..])
+    );
+    assert_eq!(
+        first.per_item_edges.as_deref(),
+        Some(&[O::Inserted, O::Inserted][..])
+    );
+    assert_eq!(first.counts.phantoms_created, 1);
+    assert_eq!(
+        (
+            first.counts.nodes_unchanged,
+            first.counts.nodes_updated,
+            first.counts.nodes_inserted,
+            first.counts.edges_inserted,
+        ),
+        (1, 1, 1, 2),
+        "the counts are the same record as the list"
+    );
+
+    let again = ingest_batch(store, &ctx, told)
+        .await
+        .expect("convergent replay commits");
+    assert_eq!(
+        again.per_item_nodes.as_deref(),
+        Some(&[O::Unchanged, O::Unchanged, O::Unchanged][..])
+    );
+    assert_eq!(
+        again.per_item_edges.as_deref(),
+        Some(&[O::Unchanged, O::Unchanged][..])
+    );
+
+    // Materialization is the fourth node outcome, and it is per item too.
+    let mut materialize = batch(vec![node("pi-d", "d, at last")], vec![]);
+    materialize.options.report_per_item = true;
+    let last = ingest_batch(store, &ctx, materialize)
+        .await
+        .expect("materialization commits");
+    assert_eq!(last.per_item_nodes.as_deref(), Some(&[O::Materialized][..]));
+    assert_eq!(last.per_item_edges.as_deref(), Some(&[][..]));
+    assert_eq!(last.counts.phantoms_materialized, 1);
+}

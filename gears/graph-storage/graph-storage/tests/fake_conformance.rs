@@ -396,3 +396,13 @@ async fn no_read_surface_answers_with_another_tenants_rows() {
 async fn an_edge_type_evolves_over_its_own_rows() {
     conformance::an_edge_type_evolves_over_its_own_rows(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn a_same_key_ingest_may_not_change_the_type() {
+    conformance::a_same_key_ingest_may_not_change_the_type(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn per_item_outcomes_follow_the_batch_order() {
+    conformance::per_item_outcomes_follow_the_batch_order(&store(), Uuid::now_v7()).await;
+}

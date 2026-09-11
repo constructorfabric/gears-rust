@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
-    DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestCounts,
-    IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId, LabelRecord,
+    DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestOutcome,
+    IngestRequest, ItemError, ItemFamily, ItemOutcome, LabelAssignment, LabelId, LabelRecord,
     LabelSpec, NodeId, NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest,
     ReadSnapshot, ReadinessState, RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode,
     SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TopologyPage,
@@ -27,6 +27,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
+use crate::domain::tally::IngestTally;
 use crate::domain::{evolution, identity, ontology, ownership, projection};
 
 #[derive(Clone)]
@@ -640,12 +641,12 @@ impl GraphStoreV1 for FakeGraphStore {
         let mut nodes = tenant.nodes.clone();
         let mut edges = tenant.edges.clone();
         let mut next_id = self.next_id.load(std::sync::atomic::Ordering::SeqCst);
-        let mut counts = IngestCounts::default();
+        let mut tally = IngestTally::new(req.options.report_per_item);
         let mut changed = false;
 
         let mut state = BatchState {
             next_id: &mut next_id,
-            counts: &mut counts,
+            tally: &mut tally,
             subject: &ctx.subject,
         };
         for (index, spec) in req.nodes.iter().enumerate() {
@@ -713,14 +714,15 @@ impl GraphStoreV1 for FakeGraphStore {
                     !(static_edge_types.contains(&edge.type_id)
                         && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
                 });
-                counts.scope_removed_edges = (before - edges.len()) as u64;
+                tally.counts.scope_removed_edges = (before - edges.len()) as u64;
 
                 let referenced: BTreeSet<i64> =
                     edges.iter().flat_map(|edge| [edge.src, edge.dst]).collect();
                 let before = nodes.len();
                 nodes.retain(|node| !dropped.contains(&node.id) || referenced.contains(&node.id));
-                counts.scope_removed_nodes = (before - nodes.len()) as u64;
-                changed |= counts.scope_removed_nodes > 0 || counts.scope_removed_edges > 0;
+                tally.counts.scope_removed_nodes = (before - nodes.len()) as u64;
+                changed |=
+                    tally.counts.scope_removed_nodes > 0 || tally.counts.scope_removed_edges > 0;
             }
         }
 
@@ -741,12 +743,13 @@ impl GraphStoreV1 for FakeGraphStore {
             );
         }
 
+        let (counts, per_item_nodes, per_item_edges) = tally.into_parts();
         let outcome = IngestOutcome {
             revision: self.revision_of(tenant),
             replayed: false,
             counts,
-            per_item_nodes: None,
-            per_item_edges: None,
+            per_item_nodes,
+            per_item_edges,
         };
         if let Some(key) = &req.idempotency_key {
             tenant.receipts.insert(
@@ -789,10 +792,18 @@ impl GraphStoreV1 for FakeGraphStore {
                 (1u64, tombstoned)
             }
             DeleteRequest::Edge(key) => {
-                let Some(edge) = tenant.edges.iter_mut().find(|e| e.key == key && !e.deleted)
+                let Some(position) = tenant.edges.iter().position(|e| e.key == key && !e.deleted)
                 else {
                     return Err(GraphStoreError::NotFound);
                 };
+                // An edge is a statement about two nodes: tombstoning it needs
+                // both endpoints visible, the rule the edge read follows.
+                let (src, dst) = (tenant.edges[position].src, tenant.edges[position].dst);
+                let visible = |id: i64| tenant.nodes.iter().any(|n| n.id == id && !n.deleted);
+                if !(visible(src) && visible(dst)) {
+                    return Err(GraphStoreError::NotFound);
+                }
+                let edge = &mut tenant.edges[position];
                 edge.deleted = true;
                 edge.audit.tombstoned(&ctx.subject);
                 (0u64, 1u64)
@@ -888,21 +899,27 @@ impl GraphStoreV1 for FakeGraphStore {
             .collect();
         let mut adjacency = Vec::new();
         let mut truncated = false;
+        // The bound applies per direction, as in the built-in store: a node
+        // with many incoming edges still shows all of its outgoing ones. A
+        // neighbour the caller cannot see takes its slot and is then absent,
+        // which is also what the built-in store does.
+        let mut taken = [0u32; 2];
         for edge in edges.iter().filter(|e| !e.deleted) {
-            let (side, other) = if edge.src == node.id {
-                (AdjacencySide::Outgoing, edge.dst)
+            let (side, other, slot) = if edge.src == node.id {
+                (AdjacencySide::Outgoing, edge.dst, 0)
             } else if edge.dst == node.id {
-                (AdjacencySide::Incoming, edge.src)
+                (AdjacencySide::Incoming, edge.src, 1)
             } else {
                 continue;
             };
+            if taken[slot] >= adjacency_limit {
+                truncated = true;
+                continue;
+            }
+            taken[slot] += 1;
             let Some(neighbour) = by_id.get(&other) else {
                 continue;
             };
-            if u32::try_from(adjacency.len()).unwrap_or(u32::MAX) >= adjacency_limit {
-                truncated = true;
-                break;
-            }
             adjacency.push(AdjacencyEntry {
                 edge_key: edge.key.clone(),
                 edge_type_id: edge.type_id.clone(),
@@ -1859,7 +1876,7 @@ fn fence(
 /// parameters longer than it had any reason to be.
 struct BatchState<'a> {
     next_id: &'a mut i64,
-    counts: &'a mut IngestCounts,
+    tally: &'a mut IngestTally,
     /// The subject stamped on every element this batch writes.
     subject: &'a Subject,
 }
@@ -1945,8 +1962,7 @@ fn apply_node(
             deleted: false,
             audit: FakeAudit::created(state.subject),
         });
-        state.counts.nodes_inserted += 1;
-        return Ok(true);
+        return Ok(state.tally.node(&ItemOutcome::Inserted));
     };
 
     if existing.deleted {
@@ -1977,12 +1993,16 @@ fn apply_node(
             .as_deref()
             == Some("phantom");
         if !was_phantom {
-            return Err(validation(
-                index,
-                ItemFamily::Node,
-                &spec.type_id,
-                "a same-key ingest may not change a node's type",
-            ));
+            // A conflict, not a validation failure: the payload may be
+            // perfectly valid under the new type, and the only permitted
+            // transition is phantom materialization.
+            return Err(GraphStoreError::Conflict {
+                reason: format!(
+                    "node `{}` is already registered under type `{}`; a same-key ingest may \
+                     not change it",
+                    spec.node_key, existing.type_id
+                ),
+            });
         }
     }
 
@@ -1996,8 +2016,7 @@ fn apply_node(
         && existing.payload == spec.payload
         && vector_unchanged;
     if unchanged {
-        state.counts.nodes_unchanged += 1;
-        return Ok(false);
+        return Ok(state.tally.node(&ItemOutcome::Unchanged));
     }
 
     if !same_type {
@@ -2015,12 +2034,11 @@ fn apply_node(
     existing.embedding_input_hash = vector.input_hash;
     existing.version += 1;
     existing.audit.updated(state.subject);
-    if same_type {
-        state.counts.nodes_updated += 1;
+    Ok(state.tally.node(&if same_type {
+        ItemOutcome::Updated
     } else {
-        state.counts.phantoms_materialized += 1;
-    }
-    Ok(true)
+        ItemOutcome::Materialized
+    }))
 }
 
 /// Every edge already incident to a node becoming concrete must still be
@@ -2122,7 +2140,7 @@ fn apply_endpoint(
         // subject writing that edge is the one recorded here.
         audit: FakeAudit::created(state.subject),
     });
-    state.counts.phantoms_created += 1;
+    state.tally.phantom_created();
     Ok(*state.next_id)
 }
 
@@ -2145,7 +2163,7 @@ fn apply_edge(
         )
     })?;
 
-    let before = state.counts.phantoms_created;
+    let before = state.tally.counts.phantoms_created;
     let src = apply_endpoint(
         tenant,
         nodes,
@@ -2164,7 +2182,7 @@ fn apply_edge(
         &spec.dst_node_key,
         create_phantoms,
     )?;
-    let mut changed = state.counts.phantoms_created > before;
+    let mut changed = state.tally.counts.phantoms_created > before;
 
     // Endpoint constraints. A phantom endpoint is skipped: its concrete type
     // is not known yet, and the materialization path revalidates then.
@@ -2214,16 +2232,15 @@ fn apply_edge(
     }
 
     let edge_key = identity::derive_edge_key(record.type_uuid, spec);
-    match edges.iter_mut().find(|e| e.key == edge_key) {
+    let outcome = match edges.iter_mut().find(|e| e.key == edge_key) {
         Some(existing) if existing.payload == spec.payload && !existing.deleted => {
-            state.counts.edges_unchanged += 1;
+            ItemOutcome::Unchanged
         }
         Some(existing) => {
             existing.payload.clone_from(&spec.payload);
             existing.deleted = false;
             existing.audit.updated(state.subject);
-            state.counts.edges_updated += 1;
-            changed = true;
+            ItemOutcome::Updated
         }
         None => {
             edges.push(FakeEdge {
@@ -2236,10 +2253,10 @@ fn apply_edge(
                 deleted: false,
                 audit: FakeAudit::created(state.subject),
             });
-            state.counts.edges_inserted += 1;
-            changed = true;
+            ItemOutcome::Inserted
         }
-    }
+    };
+    changed |= state.tally.edge(&outcome);
     Ok(changed)
 }
 

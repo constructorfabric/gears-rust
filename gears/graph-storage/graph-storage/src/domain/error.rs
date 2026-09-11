@@ -11,6 +11,11 @@ use toolkit_macros::domain_model;
 /// parse human-readable detail strings.
 pub mod reasons {
     pub const SCHEMA_VIOLATION: &str = "SCHEMA_VIOLATION";
+    /// A request the gear cannot interpret: an unknown enumeration value, a
+    /// query option it does not take, a malformed migration step.
+    pub const INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
+    /// Two bounds that cannot hold at once (a mode that needs a query text
+    /// without one, a traversal without a seed).
     pub const LIMIT_COMBINATION: &str = "LIMIT_COMBINATION";
     pub const LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
     pub const CAS_CONFLICT: &str = "CAS_CONFLICT";
@@ -41,6 +46,13 @@ pub enum DomainError {
     /// Malformed request outside the per-item shape.
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
+
+    /// Two request bounds that cannot hold at once: a mode that needs a
+    /// query text sent without one, a traversal without a seed. Its own
+    /// variant so the stable reason says `LIMIT_COMBINATION` only when that
+    /// is what happened.
+    #[error("inconsistent request: {message}")]
+    LimitCombination { message: String },
 
     /// A malformed query: an unknown filter field, an unparseable cursor, an
     /// ordering the store cannot serve. Its own variant so the stable reason
@@ -141,6 +153,12 @@ impl DomainError {
 
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidArgument {
+            message: message.into(),
+        }
+    }
+
+    pub fn limit_combination(message: impl Into<String>) -> Self {
+        Self::LimitCombination {
             message: message.into(),
         }
     }

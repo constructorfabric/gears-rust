@@ -62,6 +62,9 @@ fn client_correctable(error: DomainError) -> Result<CanonicalError, DomainError>
     Ok(match error {
         DomainError::Validation { items } => validation_error(&items),
         DomainError::InvalidArgument { message } => GraphNodeError::invalid_argument()
+            .with_field_violation("request", message, reasons::INVALID_ARGUMENT)
+            .create(),
+        DomainError::LimitCombination { message } => GraphNodeError::invalid_argument()
             .with_field_violation("request", message, reasons::LIMIT_COMBINATION)
             .create(),
         DomainError::InvalidQuery { message } => GraphNodeError::invalid_argument()
@@ -224,6 +227,10 @@ mod tests {
             // sees when the collection was assembled and never filled.
             (DomainError::Validation { items: Vec::new() }, 400),
             (DomainError::invalid("a message"), 400),
+            (
+                DomainError::limit_combination("a mode without its query"),
+                400,
+            ),
             (
                 DomainError::InvalidQuery {
                     message: "unknown field".to_owned(),

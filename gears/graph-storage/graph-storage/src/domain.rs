@@ -14,4 +14,5 @@ pub mod ontology;
 pub mod ownership;
 pub mod projection;
 pub mod service;
+pub mod tally;
 pub mod traversal;

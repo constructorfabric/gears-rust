@@ -272,9 +272,9 @@ async fn a_read_bound_is_refused_rather_than_clamped() {
         "expected a limit refusal, got {error}"
     );
 
-    // A search mode that needs text and was given none is an argument error,
-    // not a limit: the two carry different canonical reasons, and a client
-    // matches on the reason.
+    // A search mode that needs text and was given none is an inconsistent
+    // combination (`LIMIT_COMBINATION`), not a breached bound: the two carry
+    // different canonical reasons, and a client matches on the reason.
     let error = harness
         .services
         .search(
@@ -290,8 +290,8 @@ async fn a_read_bound_is_refused_rather_than_clamped() {
         .await
         .expect_err("a search without text is refused");
     assert!(
-        matches!(error, DomainError::InvalidArgument { .. }),
-        "expected an argument error, got {error}"
+        matches!(error, DomainError::LimitCombination { .. }),
+        "expected a limit-combination refusal, got {error}"
     );
 }
 
