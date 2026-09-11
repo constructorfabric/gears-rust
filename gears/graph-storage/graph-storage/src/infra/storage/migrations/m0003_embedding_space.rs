@@ -11,7 +11,7 @@
 //! scopable entity. `graph_meta` already carries deployment-level keys the
 //! same way, and `probe_pgq` already reads under a nil-tenant scope, so this
 //! is the gear's existing device rather than a new one. Recorded in
-//! `dev/DEVIATIONS.md`.
+//! the gear's development notes.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

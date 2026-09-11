@@ -111,7 +111,7 @@ async fn only_the_active_epoch_ranks() {
 ///
 /// The built-in `PostgreSQL` store declares this capability **absent** — a true
 /// repeatable-read snapshot needs a transaction held across calls, which the
-/// sealed runner cannot express (see `dev/DEVIATIONS.md`). Keeping the case
+/// sealed runner cannot express (see the gear's development notes). Keeping the case
 /// here, against the implementation that does honour it, is what stops the
 /// obligation from quietly disappearing from the contract.
 #[tokio::test]
@@ -159,7 +159,7 @@ async fn one_snapshot_spans_every_arm_of_one_read() {
     );
     // The platform `Page` has no revision slot, so the compound read's
     // revision is asserted through the arms that do carry it (see
-    // `dev/DEVIATIONS.md` D-005).
+    // the gear's development notes (D-005)).
 
     let resolved = store
         .resolve_node_ids(&under, &["snap-2".to_owned()])

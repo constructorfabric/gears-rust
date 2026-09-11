@@ -719,14 +719,25 @@ test-pgq: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
 		-E 'kind(lib) | binary(mod) | binary(ui)'
 
-## Run the graph-storage gear's suites: the in-memory conformance lane (no
-## database) plus the PostgreSQL 19 SQL/PGQ lane. The PG19 lane needs an image
-## carrying both PostgreSQL 19 and pgvector — the platform pin has only the
-## former — so point GEARS_TEST_PG_GRAPH_IMAGE at one; otherwise it skips.
-## GEARS_TEST_PG_GRAPH_REQUIRED=1 turns that skip into a failure.
+## Run the graph-storage gear's database-free suites: unit tests, the
+## in-memory conformance lane, the domain-service and REST lanes. The
+## PostgreSQL lanes skip here; `test-graph-storage-pg` runs them.
 test-graph-storage: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-graph-storage
+	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
+
+## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
+## suite against the built-in store, plus the SQL/PGQ cases that only a real
+## server can answer. It needs an image carrying PostgreSQL 19 **and**
+## pgvector — the platform pin has only the former (dev note D-003) — so
+## point GEARS_TEST_PG_GRAPH_IMAGE at one. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## turns "no such image, skipping" into a failure, so CI cannot go green by
+## running nothing; that is the default here, because a target whose whole
+## purpose is the database has no business passing without one.
+test-graph-storage-pg: install-tools
+	$(call print_target_banner)
+	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
+		--test pg_conformance
 
 ## Run MySQL integration tests
 test-mysql: install-tools

@@ -154,7 +154,7 @@ impl GraphStoreV1 for PgGraphStore {
             scope_replace: true,
             // A true repeatable-read snapshot needs a transaction held across
             // calls, which the sealed runner cannot express; `begin_read`
-            // returns a revision-stamped handle instead (see dev/DEVIATIONS).
+            // returns a revision-stamped handle instead (see the gear's development notes).
             snapshots: false,
             vector_search: true,
             labels: false,

@@ -3456,7 +3456,8 @@ async fn only_incident_edge_key(
 
 /// `fr-audit-envelope` asks for the envelope on every node **and edge** a read
 /// surface returns. Until the edge read existed the edge half was unassertable
-/// (dev/DEVIATIONS.md D-022): the columns were written and nothing read them.
+/// (the gear's development notes, D-022): the columns were written by every
+/// ingest path and read by nothing.
 pub async fn an_edge_read_carries_the_envelope(store: &dyn GraphStoreV1, tenant: Uuid) {
     let scope = AccessScope::for_tenant(tenant);
     let author = ctx(tenant, &scope, None);

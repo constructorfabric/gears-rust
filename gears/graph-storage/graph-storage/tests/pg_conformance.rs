@@ -9,7 +9,7 @@
 //! `postgres_graph()` pin is a stock `19beta3-alpine`, which has no pgvector,
 //! while the gear's documented baseline requires it. Set
 //! `GEARS_TEST_PG_GRAPH_IMAGE` to an image that carries both (see
-//! `dev/DEVIATIONS.md` D-003) to run this lane; otherwise it skips — unless
+//! the gear's development notes D-003) to run this lane; otherwise it skips — unless
 //! `GEARS_TEST_PG_GRAPH_REQUIRED` is set, which turns a missing server into a
 //! failure so CI cannot go green by silently running nothing.
 

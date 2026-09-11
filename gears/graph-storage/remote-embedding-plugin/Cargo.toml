@@ -1,7 +1,6 @@
 [package]
 name = "cf-gears-graph-storage-remote-embedding-plugin"
 version = "0.1.0"
-publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

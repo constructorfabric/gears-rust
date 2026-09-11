@@ -11,7 +11,9 @@ plugin contracts (`GraphStoreV1`, `GraphEngineV1`, `EmbeddingProviderV1`).
 
 - [PRD](../docs/PRD.md), [DESIGN](../docs/DESIGN.md), [ADRs](../docs/ADR/)
 - Base ontology schemas the gear registers at boot: [`schemas/`](./schemas/)
-- Implementation notes and known gaps: [`dev/DEVIATIONS.md`](../dev/DEVIATIONS.md)
+- Known gaps between these documents and the code are tracked in the gear's
+  development notes, which live with the implementation rather than in the
+  published set
 
 ## Requirements
 

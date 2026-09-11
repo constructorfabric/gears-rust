@@ -34,8 +34,8 @@ review-evidence: conformance suite on both store implementations; stand rehearsa
 > design review, and recorded that way on purpose — this narrows a normative
 > MUST of the PRD, so a reader is entitled to know how wide the agreement
 > behind it is. Two follow-on decisions are deliberately **not** covered here
-> and want their own record: payload-rewriting migrations (§ 4.3 of
-> [`dev/type-update-plan.md`](../../dev/type-update-plan.md), unbuilt), and
+> and want their own record: payload-rewriting migrations (unbuilt when this
+> was written; see Confirmation), and
 > closing the payload level in the exporter, which is a producer-visible
 > contract change even though DESIGN § 3.1's authoring rule 3 already sanctions
 > the shape.
@@ -209,8 +209,8 @@ claims.
   531 251 nodes, 637 975 edges): the four PM edits classified as expected,
   62 ms for a proved update, 270 ms for a data-backed one over 1 000 rows,
   12.9 s over 250 000, and the row ceiling refused with the count and the
-  configuration key named. Numbers and the full run in
-  [`dev/type-update-plan.md`](../../dev/type-update-plan.md).
+  configuration key named. The full run is in the gear's development notes,
+  which are kept with the implementation and are not published here.
 - Measured before the write path existed: with the payload object level left
   open, "add one optional property" is `Incompatible` for **188 of 188**
   instantiable node types of the Studio model, and `Compatible` for 188 of 188
@@ -304,10 +304,11 @@ second door to the same gap rather than a new gap.
 - types-registry ADR-0003 (compatibility strategy), ADR-0004 (identifier
   mutability and the `force` waiver), ADR-0005 (retained revisions).
 - `gts` 0.12 `schema_evolution` (OP#8) and `GtsStore::compare_documents`.
-- [`dev/type-update-plan.md`](../../dev/type-update-plan.md) — the
-  implementation plan, the measurement, and the stand rehearsal.
-- [`dev/DEVIATIONS.md`](../../dev/DEVIATIONS.md) D-031 — what is built and what
-  is not.
+- The gear's development notes — the implementation plan, the measurement,
+  the stand rehearsal, and the register of where the implementation departs
+  from these documents. Kept with the implementation rather than published:
+  they record how the decision was reached, which dates, while the decision
+  itself does not.
 
 ## Traceability
 

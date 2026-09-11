@@ -23,7 +23,7 @@
 //! **One divergence from DESIGN § 3.7,** which types the subject id `TEXT`:
 //! `SecurityContext::subject_id` is a `Uuid`, so `UUID` is what the value
 //! actually is and `TEXT` would widen it for nothing. `subject_type` stays
-//! `TEXT` — it is a GTS identifier. Recorded in `dev/DEVIATIONS.md`.
+//! `TEXT` — it is a GTS identifier. Recorded in the gear's development notes.
 //!
 //! Backfill: existing rows are stamped with the nil UUID, which is the same
 //! "no subject recorded" the empty `created_by` meant. Nothing in the gear
