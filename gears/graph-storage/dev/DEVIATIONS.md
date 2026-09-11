@@ -692,6 +692,43 @@ identity has no test: two concurrent replacements of one scope are still never
 made to race. The suite's own header claims it, and the claim is still ahead of
 the evidence.
 
+## D-035 [impl-gap] The scope fence compared and wrote in three steps, with no lock between them
+
+Obligation 2 of the store contract — "replacements of one scope serialize on
+that identity through a lock held to commit, and the highest accepted
+generation is compared and updated atomically under that lock" — was
+implemented as read, decide, write. Two concurrent replacements therefore both
+read the old generation, both passed the check, and the loser's *lower*
+generation overwrote the winner's: the fence was real against a sequential
+retry and absent against the case it exists for.
+
+The suite's own header had claimed this obligation since the first commit with
+no case behind it, which is how the gap survived: the sequential fencing case
+passes either way.
+
+**Fixed** by making the compare *be* the write:
+`ON CONFLICT DO UPDATE SET generation = GREATEST(stored, offered)` keeps the
+higher generation whoever arrives second and takes the row lock for the rest of
+the transaction — so the batch's writes and the stale removal all happen under
+it, which is what serializes the two replacements. The row is read back
+afterwards and the decision is made on that settled value: higher stored than
+offered is stale, equal with another hash is a conflict, equal with ours is
+accepted.
+
+**This is not a clever alternative to a lock — it is the only lock available.**
+The platform's secure ORM exposes no row-locking surface at all: `SELECT …
+FOR UPDATE` cannot be expressed from a gear, and there is no `lock_exclusive`
+on the query builders. Worth raising with the platform alongside the other two
+asks, because the next gear that needs a fence will write the same three steps
+and not notice.
+
+**Covered** by `two_replacements_of_one_scope_serialize`, on both stores and on
+a multi-threaded runtime — on the default single-threaded one the two futures
+only interleave at await points, which is not the race in question. The
+assertion holds whichever reaches the fence first: the higher generation's
+content is what remains, the lower one's node is never there beside it, and the
+recorded generation is the higher.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
@@ -817,9 +854,10 @@ The conformance module's own header lists five obligations "asserted against
 both the built-in store and the fake". Four are: batch atomicity, generation
 fencing, no-orphan-edges, and the snapshot obligation (asserted on the fake,
 and asserted as *declined* on the PostgreSQL store). **Obligation 2 —
-single-writer serialization per scope identity, held until durable — has no
-case at all.** Two concurrent replacements of one scope are never made to
-race. The header should not claim it until one does.
+single-writer serialization per scope identity, held until durable — had no
+case at all.** Two concurrent replacements of one scope were never made to
+race. *Fixed 2026-09-11: the case exists, and writing it found that the fence
+did not hold — see D-035.*
 
 ---
 

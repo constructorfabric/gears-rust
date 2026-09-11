@@ -350,3 +350,11 @@ async fn scope_replacement_preserves_analysis_edges_and_their_endpoints() {
     )
     .await;
 }
+
+/// Multi-threaded on purpose: on the default single-threaded runtime the two
+/// futures only interleave at await points, which is not the race the
+/// obligation is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_replacements_of_one_scope_serialize() {
+    conformance::two_replacements_of_one_scope_serialize(&store(), Uuid::now_v7()).await;
+}

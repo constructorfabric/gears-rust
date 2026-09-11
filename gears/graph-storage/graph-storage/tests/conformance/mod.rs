@@ -3148,3 +3148,82 @@ pub async fn scope_replacement_preserves_analysis_edges_and_their_endpoints(
         src.adjacency
     );
 }
+
+/// Obligation 2 of the store contract, which the suite's header has claimed
+/// since the beginning with no case behind it: two concurrent replacements of
+/// one scope serialize rather than union.
+///
+/// The assertion holds whichever of them reaches the fence first, and that is
+/// the point. If the higher generation lands first, the lower one is refused
+/// as stale; if the lower lands first, the higher one's removal takes what it
+/// wrote. Either way the scope ends up holding exactly one snapshot — never
+/// both — and the recorded generation is the higher one.
+pub async fn two_replacements_of_one_scope_serialize(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    let lower = ctx(tenant, &scope, None);
+    let higher = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    let (first, second) = tokio::join!(
+        ingest_batch(
+            store,
+            &higher,
+            batch_replacing(
+                vec![scoped_node("from-higher", "acme/infra")],
+                Vec::new(),
+                2
+            ),
+        ),
+        ingest_batch(
+            store,
+            &lower,
+            batch_replacing(vec![scoped_node("from-lower", "acme/infra")], Vec::new(), 1),
+        ),
+    );
+
+    assert!(
+        first.is_ok(),
+        "the higher generation is never the one refused: {first:?}"
+    );
+    if let Err(error) = &second {
+        assert!(
+            matches!(error, GraphStoreError::StaleGeneration { .. }),
+            "a loser is refused as stale, not as something else: {error:?}"
+        );
+    }
+
+    store
+        .get_node(&reader, &"from-higher".to_owned(), 10)
+        .await
+        .expect("the higher generation's content is what remains");
+    assert!(
+        store
+            .get_node(&reader, &"from-lower".to_owned(), 10)
+            .await
+            .is_err(),
+        "the two snapshots never union: the lower generation's node is not there"
+    );
+
+    // And the fence records the higher generation, so a replay of the lower
+    // one is refused from now on.
+    let error = ingest_batch(
+        store,
+        &reader,
+        batch_replacing(vec![scoped_node("from-lower", "acme/infra")], Vec::new(), 1),
+    )
+    .await
+    .expect_err("the recorded generation is the higher one");
+    assert!(
+        matches!(
+            error,
+            GraphStoreError::StaleGeneration {
+                recorded: 2,
+                offered: 1
+            }
+        ),
+        "{error:?}"
+    );
+}

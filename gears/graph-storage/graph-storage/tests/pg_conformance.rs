@@ -299,6 +299,17 @@ async fn readiness_reports_every_capability_and_only_some_block_service() {
 
 // --- scope replacement --------------------------------------------------------
 
+/// Written out rather than `pg_case!`d: the two replacements have to run on
+/// real threads, or the race the obligation is about never happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_replacements_of_one_scope_serialize() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_replacements_of_one_scope_serialize(stand.store.as_ref(), Uuid::now_v7())
+        .await;
+}
+
 pg_case!(
     scope_replacement_removes_what_the_batch_no_longer_names,
     conformance::scope_replacement_removes_what_the_batch_no_longer_names

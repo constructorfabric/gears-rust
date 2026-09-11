@@ -428,6 +428,26 @@ async fn ingest_in_tx(
 
 /// Lock the scope's fence row, apply generation fencing, and tombstone the
 /// scope's static content. Analysis-originated edges are never removed.
+/// Take the scope's fence and settle the generation, atomically.
+///
+/// The obligation is "replacements of one scope serialize on that identity
+/// through a lock held to commit, and the highest accepted generation is
+/// compared and updated atomically under that lock". The first version read
+/// the row, decided, and then wrote — three steps with no lock between them,
+/// so two concurrent replacements both read the old generation, both passed
+/// the check, and the loser's lower generation overwrote the winner's. The
+/// compare *is* the write now:
+///
+/// `ON CONFLICT DO UPDATE SET generation = GREATEST(stored, offered)` keeps
+/// the higher generation whoever arrives second, and takes the row lock for
+/// the rest of the transaction — which is what serializes the two
+/// replacements, since everything after it (the batch's writes and the stale
+/// removal) happens while that lock is held. Reading the row back afterwards
+/// therefore reads a settled value, and the decision is made on that.
+///
+/// The platform's secure ORM exposes no row-locking surface at all
+/// (`SELECT … FOR UPDATE` is unreachable from a gear), so this statement is
+/// not a clever alternative to a lock — it is the only lock available.
 async fn fence_scope(
     tenant: Uuid,
     scope: &AccessScope,
@@ -436,37 +456,6 @@ async fn fence_scope(
     replace: &ReplaceScope,
     request_hash: &str,
 ) -> Result<(), GraphStoreError> {
-    let existing = scope_registry::Entity::find()
-        .secure()
-        .scope_with(scope)
-        .filter(
-            Condition::all()
-                .add(scope_registry::Column::ScopeAttribute.eq(replace.attribute.clone())),
-        )
-        .filter(Condition::all().add(scope_registry::Column::ScopeValue.eq(replace.value.clone())))
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
-
-    if let Some(row) = &existing {
-        if row.owner_producer != producer {
-            return Err(GraphStoreError::Conflict {
-                reason: "this scope is owned by another producer".into(),
-            });
-        }
-        if replace.generation < row.generation {
-            return Err(GraphStoreError::StaleGeneration {
-                recorded: row.generation,
-                offered: replace.generation,
-            });
-        }
-        if replace.generation == row.generation && row.request_hash != request_hash {
-            return Err(GraphStoreError::Conflict {
-                reason: "same source generation with different content".into(),
-            });
-        }
-    }
-
     let active = scope_registry::ActiveModel {
         tenant_id: ActiveValue::Set(tenant),
         scope_attribute: ActiveValue::Set(replace.attribute.clone()),
@@ -476,16 +465,23 @@ async fn fence_scope(
         request_hash: ActiveValue::Set(request_hash.to_owned()),
         updated_at: ActiveValue::Set(OffsetDateTime::now_utc()),
     };
+    // Unqualified names on the right of `DO UPDATE SET` are the stored row;
+    // `excluded` is what this statement offered.
+    let keep_higher = Expr::cust("GREATEST(scope_registry.generation, excluded.generation)");
+    let hash_of_winner = Expr::cust(
+        "CASE WHEN excluded.generation > scope_registry.generation \
+         THEN excluded.request_hash ELSE scope_registry.request_hash END",
+    );
     let on_conflict = toolkit_db::secure::SecureOnConflict::<scope_registry::Entity>::columns([
         scope_registry::Column::TenantId,
         scope_registry::Column::ScopeAttribute,
         scope_registry::Column::ScopeValue,
     ])
-    .update_columns([
-        scope_registry::Column::Generation,
-        scope_registry::Column::RequestHash,
-        scope_registry::Column::UpdatedAt,
-    ])
+    .value(scope_registry::Column::Generation, keep_higher)
+    .map_err(map_scope_err)?
+    .value(scope_registry::Column::RequestHash, hash_of_winner)
+    .map_err(map_scope_err)?
+    .update_columns([scope_registry::Column::UpdatedAt])
     .map_err(map_scope_err)?;
     scope_registry::Entity::insert(active)
         .secure()
@@ -496,9 +492,46 @@ async fn fence_scope(
         .await
         .map_err(map_scope_err)?;
 
-    // The fence is set and the row is locked for the rest of the
-    // transaction; what the replacement removes is decided after the batch's
-    // own writes, in `scope::remove_stale`.
+    // Settled: the row is ours to read until commit.
+    let row = scope_registry::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(scope_registry::Column::ScopeAttribute.eq(replace.attribute.clone()))
+                .add(scope_registry::Column::ScopeValue.eq(replace.value.clone())),
+        )
+        .one(tx)
+        .await
+        .map_err(map_scope_err)?
+        .ok_or_else(|| {
+            GraphStoreError::Internal("the scope fence vanished after being written".to_owned())
+        })?;
+
+    if row.owner_producer != producer {
+        return Err(GraphStoreError::Conflict {
+            reason: "this scope is owned by another producer".into(),
+        });
+    }
+    if row.generation > replace.generation {
+        // Either it was already ahead, or a concurrent replacement won the
+        // row while this one waited for it.
+        return Err(GraphStoreError::StaleGeneration {
+            recorded: row.generation,
+            offered: replace.generation,
+        });
+    }
+    if row.request_hash != request_hash {
+        // Equal generation, different content: two snapshots claim to be the
+        // same state of the source and disagree about what it is.
+        return Err(GraphStoreError::Conflict {
+            reason: "same source generation with different content".into(),
+        });
+    }
+
+    // The fence is set and the row is locked for the rest of the transaction;
+    // what the replacement removes is decided after the batch's own writes,
+    // in `scope::remove_stale`.
     Ok(())
 }
 
