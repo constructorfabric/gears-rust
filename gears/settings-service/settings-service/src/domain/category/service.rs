@@ -7,8 +7,6 @@
 //! of an object-safe trait. The cost is a type parameter; the benefit is that
 //! every operation below can run in a transaction when its caller needs one.
 
-use std::sync::Arc;
-
 use toolkit_db::secure::DBRunner;
 use toolkit_security::SecurityContext;
 
@@ -20,7 +18,6 @@ use super::visibility::{self, DomainVisibility};
 use super::{Category, CategoryDraft, CategoryPatch, CategoryRepository};
 use crate::api::precondition::{self, ETag};
 use crate::domain::error::DomainError;
-use crate::domain::platform_scope::PlatformScope;
 
 /// Who performed a mutation and under which request.
 ///
@@ -55,11 +52,6 @@ fn snapshot(category: &Category) -> serde_json::Value {
 pub struct CategoryService<R, S> {
     repo: R,
     sink: S,
-    /// Where the root tenant's id comes from. Categories are platform-scoped,
-    /// and platform scope is that id rather than an absent tenant (DESIGN.md
-    /// §4.1) — asked for at the first mutation, since the Tenant Resolver is
-    /// fetched at first use and never during init (DESIGN.md §4.9).
-    scope: Arc<dyn PlatformScope>,
 }
 
 impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
@@ -69,8 +61,8 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
     /// "no audit configured" a supported state, and a mutation could then
     /// succeed leaving no trail — which is precisely what DESIGN.md §4.2's
     /// fail-closed rule forbids.
-    pub fn new(repo: R, sink: S, scope: Arc<dyn PlatformScope>) -> Self {
-        Self { repo, sink, scope }
+    pub fn new(repo: R, sink: S) -> Self {
+        Self { repo, sink }
     }
 
     /// Record a mutation, failing the operation if the trail cannot be written.
@@ -89,12 +81,13 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         actor: Actor<'_>,
     ) -> Result<(), DomainError> {
         // Categories are platform-global -- the table has no tenant column --
-        // so their audit scope is the root tenant's, which is platform scope.
-        // A mutation that cannot name its scope does not proceed.
-        let tenant = self.scope.root_tenant().await?;
+        // so their record carries no scope either. It used to borrow the root
+        // tenant's id, which meant a Tenant Resolver lookup for a value nothing
+        // reads back: history matches on a real tenant, and a category has
+        // none.
         let mut rec = AuditRecord::new(
             key.as_str(),
-            tenant,
+            None,
             actor.ctx.subject_id().to_string(),
             operation,
             actor.request_id,
@@ -106,8 +99,14 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
             rec = rec.with_post_image(post);
         }
         // Last step of the mutation's transaction: the record commits with the
-        // change or rolls back with it.
-        self.sink.append(conn, access, rec).await
+        // change or rolls back with it. The append runs unconstrained, as every
+        // other audit write does: a scopeless row cannot satisfy a tenant
+        // predicate, so handing the caller's own scope here would fail the
+        // insert closed for every caller who has one.
+        let _ = access;
+        self.sink
+            .append(conn, &toolkit_security::AccessScope::allow_all(), rec)
+            .await
     }
 
     /// Fetch one category.

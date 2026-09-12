@@ -79,6 +79,30 @@ impl ChangePublisher for LoggingPublisher {
                 %change_set_id,
                 "setting value changed"
             ),
+            ValueEvent::DeclarationRegistered { key, actor } => info!(
+                event = "event_declaration_registered",
+                %key,
+                %actor,
+                "declaration registered"
+            ),
+            ValueEvent::DeclarationUpdated { key, actor } => info!(
+                event = "event_declaration_updated",
+                %key,
+                %actor,
+                "contributed declaration metadata rewritten by its owner"
+            ),
+            ValueEvent::DeclarationRetired { key, actor } => info!(
+                event = "event_declaration_retired",
+                %key,
+                %actor,
+                "declaration retired"
+            ),
+            ValueEvent::DeclarationReactivated { key, actor } => info!(
+                event = "event_declaration_reactivated",
+                %key,
+                %actor,
+                "declaration reactivated"
+            ),
             ValueEvent::ChangeFailed {
                 key,
                 tenant_id,

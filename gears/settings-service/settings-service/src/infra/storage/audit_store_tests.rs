@@ -22,7 +22,7 @@ async fn db() -> Arc<DBProvider<DbError>> {
 }
 
 fn record(tenant: Uuid, request: &str) -> AuditRecord {
-    AuditRecord::new(KEY, tenant, "admin", AuditOperation::Change, request)
+    AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, request)
         .with_pre_image(AuditValue::record(json!(false), false))
         .with_post_image(AuditValue::record(json!(true), false))
 }
@@ -69,7 +69,7 @@ async fn appended_records_come_back_newest_first_for_their_pair_only() {
     let page = history(&db, a, None, None).await;
     let requests: Vec<&str> = page.items.iter().map(|r| r.request_id.as_str()).collect();
     assert_eq!(requests, vec!["r3", "r2", "r1"], "newest first");
-    assert!(page.items.iter().all(|r| r.tenant_id == a));
+    assert!(page.items.iter().all(|r| r.tenant_id == Some(a)));
     assert_eq!(
         page.items[0].pre_image,
         Some(AuditValue::Clear(json!(false)))
@@ -121,7 +121,7 @@ async fn a_secret_image_is_stored_masked_and_read_back_masked() {
     let db = db().await;
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
-    let rec = AuditRecord::new(KEY, tenant, "admin", AuditOperation::Change, "r")
+    let rec = AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, "r")
         .with_post_image(AuditValue::record(json!("hunter2"), true));
     AuditStore
         .append(&conn, &AccessScope::allow_all(), rec)

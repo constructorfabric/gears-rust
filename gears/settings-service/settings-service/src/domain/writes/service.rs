@@ -41,7 +41,9 @@ pub struct WriteActor {
 }
 
 impl WriteActor {
-    fn subject(&self) -> String {
+    /// The subject id as recorded and audited.
+    #[must_use]
+    pub fn subject(&self) -> String {
         self.ctx.subject_id().to_string()
     }
 
@@ -51,7 +53,9 @@ impl WriteActor {
         self.ctx.subject_type() == Some(USER_SUBJECT_TYPE)
     }
 
-    fn step_up_subject(&self) -> StepUpSubject {
+    /// Who a step-up assertion must be bound to.
+    #[must_use]
+    pub fn step_up_subject(&self) -> StepUpSubject {
         StepUpSubject {
             subject_id: self.ctx.subject_id(),
             session_sub: self
@@ -589,8 +593,12 @@ where
                 let secret_ref = secret_ref.clone();
                 // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-6
                 // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-5
+                // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-classification-sync:p1:inst-tvv-sync-1
+                // @cpt-begin:cpt-cf-settings-service-state-typed-value-validation-review:p1:inst-tvv-state-2
                 // A valid re-set clears `needs_review`; the unique index guards
-                // the first insert so two first writers cannot both land.
+                // the first insert so two first writers cannot both land. The
+                // row takes the declaration's classification as it is written,
+                // so masking reads one column and the two never disagree.
                 match &current {
                     Some(row) => (
                         Some(
@@ -624,6 +632,8 @@ where
                         AuditOperation::Create,
                     ),
                 }
+                // @cpt-end:cpt-cf-settings-service-state-typed-value-validation-review:p1:inst-tvv-state-2
+                // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-classification-sync:p1:inst-tvv-sync-1
                 // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-5
             }
             Staged::Revert | Staged::Remove => {
@@ -656,7 +666,7 @@ where
         // a sink that cannot write rolls the change back with it.
         let mut record = AuditRecord::new(
             declaration.key.as_str(),
-            gated.tenant_id,
+            Some(gated.tenant_id),
             actor.subject(),
             operation,
             actor.request_id.clone(),

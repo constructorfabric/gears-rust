@@ -46,10 +46,20 @@ use crate::infra::type_validator::GtsTypeValidator;
 pub struct FakeSource {
     pub schemas: HashMap<String, GtsTypeSchema>,
     pub instances: HashSet<String>,
+    pub enums: HashMap<String, Vec<String>>,
     pub unavailable: bool,
 }
 
 impl FakeSource {
+    /// A dynamic enumeration this source knows, and its members.
+    pub fn with_enum(mut self, source: &str, members: &[&str]) -> Self {
+        self.enums.insert(
+            source.to_owned(),
+            members.iter().map(|m| (*m).to_owned()).collect(),
+        );
+        self
+    }
+
     pub fn with_type(mut self, id: &str, schema: Value) -> Self {
         let schema = GtsTypeSchema::try_new(GtsTypeId::new(id), schema, None, None)
             .expect("fixture schema is a valid root type");
@@ -77,6 +87,10 @@ impl SchemaSource for FakeSource {
     async fn instance_exists(&self, instance_id: &str) -> Result<bool, DomainError> {
         Ok(self.instances.contains(instance_id))
     }
+
+    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError> {
+        Ok(self.enums.get(source).cloned())
+    }
 }
 
 /// An audit sink that keeps what it was given.
@@ -86,6 +100,12 @@ pub struct RecordingAudit {
 }
 
 impl RecordingAudit {
+    /// A copy of every record the sink was handed, for assertions about the
+    /// record itself rather than the shape of the sequence.
+    pub fn records(&self) -> Vec<AuditRecord> {
+        self.records.lock().expect("audit lock").clone()
+    }
+
     pub fn operations(&self) -> Vec<&'static str> {
         self.records
             .lock()
@@ -395,12 +415,13 @@ impl ResolutionHarness {
         let tree = Tree::new();
         let hierarchy = Arc::new(tree.hierarchy());
         let cache = Arc::new(EffectiveCache::new(ttl));
+        let platform: Arc<dyn PlatformScope> = Arc::new(FixedScope(tree.root));
         let resolver = Arc::new(ValueResolver::new(
             DeclarationRepo,
             ValueRepo,
             AccessRepo,
             Arc::clone(&hierarchy) as Arc<dyn crate::domain::resolution::TenantHierarchy>,
-            Arc::new(FixedScope(tree.root)),
+            Arc::clone(&platform),
             Arc::new(GtsTypeValidator::new(resolution_catalogue())),
             Arc::clone(&cache),
         ));

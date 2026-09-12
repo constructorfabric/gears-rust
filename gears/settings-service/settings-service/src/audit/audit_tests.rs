@@ -16,7 +16,7 @@ fn key() -> SettingKey {
 fn record() -> AuditRecord {
     AuditRecord::new(
         key().as_str(),
-        uuid::Uuid::nil(),
+        Some(uuid::Uuid::nil()),
         "admin@acme",
         AuditOperation::Change,
         "req-1",
@@ -76,10 +76,10 @@ fn the_record_uses_the_shared_resource_formatter_and_the_indexed_pair() {
     let rec = record();
     assert_eq!(
         rec.resource,
-        super::resource_id::format(&key(), uuid::Uuid::nil())
+        super::resource_id::format(&key(), Some(uuid::Uuid::nil()))
     );
     assert_eq!(rec.declaration_key, key().to_string());
-    assert_eq!(rec.tenant_id, uuid::Uuid::nil());
+    assert_eq!(rec.tenant_id, Some(uuid::Uuid::nil()));
 }
 
 #[test]

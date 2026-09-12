@@ -101,7 +101,7 @@ async fn an_authorized_caller_gets_the_plaintext_and_one_masked_secret_use_recor
     assert_eq!(records.len(), 1);
     let record = &records[0];
     assert_eq!(record.operation, AuditOperation::SecretUse);
-    assert_eq!(record.tenant_id, t.b);
+    assert_eq!(record.tenant_id, Some(t.b));
     assert_eq!(record.actor, Uuid::from_u128(0x5e57).to_string());
     assert_eq!(record.post_image, Some(AuditValue::Masked));
     assert!(record.pre_image.is_none());

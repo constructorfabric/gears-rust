@@ -342,14 +342,14 @@ An access change **MUST** evict the setting's cached entries for the target tena
 - [x] An ancestor with `hidden` and a descendant with `read_only` yield `hidden` for the descendant, and siblings outside the restricted branch are unaffected
 - [x] A tenant administrator targeting its own tenant receives `403` and no row is written
 - [x] Targeting an ancestor, a sibling, a tenant outside the subtree, or a standalone descendant receives `403`
-- [ ] A row set below an already `hidden` tenant is stored and becomes effective when the ancestor restriction is cleared
+- [x] A row set below an already `hidden` tenant is stored and becomes effective when the ancestor restriction is cleared
 - [x] A value set before its tenant became `read_only` still resolves and is inherited, and a write by that tenant is refused
 - [x] An `overridable` ancestor writes at a `read_only` descendant successfully, while the descendant's own write remains refused
 - [x] A gear reading through `SettingsReaderClient` receives the effective value of a `hidden` tenant unchanged
 - [x] `PUT` with `access=overridable` returns `400`
 - [x] `PUT` or `DELETE` without `If-Match` returns `428`; with a tag made stale by another delegate returns `412`, and the newer restriction remains stored
 - [x] `GET` for a pair with no row returns `overridable` and an absent-state ETag that a subsequent `PUT` can present
-- [ ] `DELETE` clears one row, and the effective access afterwards reflects any ancestor row that remains
+- [x] `DELETE` clears one row, and the effective access afterwards reflects any ancestor row that remains
 - [x] Setting or clearing a restriction evicts the cached entries of the target tenant and its descendants
 - [x] Restriction rows survive a retire and revive of their declaration unchanged
 - [x] Every restriction change leaves an audit record with the previous and the new row

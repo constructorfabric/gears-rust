@@ -28,6 +28,19 @@ pub struct ValidateRequest {
     pub limit: Option<usize>,
 }
 
+/// `POST /settings/{key}/impact`: the candidate whose reach is asked about.
+/// A body rather than a query string: a value may run to 64 KiB, which no
+/// URL carries.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct ImpactRequest {
+    /// The candidate value.
+    pub value: Value,
+    /// Page size, one to five hundred; outside that band it is clamped.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// `POST /settings/{key}/value/clone`: where to copy from.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -48,7 +61,11 @@ pub struct BatchChangeRequest {
     pub tenant: Option<Uuid>,
     /// The new value.
     pub value: Value,
-    /// The value state tag the caller last read.
+    /// The value state tag the caller last read for this scope, or the literal
+    /// `absent` for a first write. Required in effect: a change that omits it
+    /// is rejected on its own with `if_match_required` while the rest of the
+    /// batch proceeds. It is optional in the schema only so that one missing
+    /// tag refuses one change instead of the whole request.
     #[serde(default)]
     pub if_match: Option<String>,
 }
@@ -132,7 +149,11 @@ pub struct BatchItemDto {
     /// The change, when committed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<SetResultDto>,
-    /// Why, when rejected: a short stable code.
+    /// Why, when rejected — one of a fixed vocabulary: `invalid`,
+    /// `if_match_required`, `stale`, `conflict`, `forbidden`,
+    /// `step_up_required`, `retired`, `not_found`, `unavailable` or `error`.
+    /// `retired` also covers a declaration retired after the client assembled
+    /// the change: the check runs again as each change commits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The rejection in words.
@@ -150,7 +171,8 @@ pub struct BatchResultDto {
     pub results: Vec<BatchItemDto>,
 }
 
-/// A short stable code for a rejection.
+/// A short stable code for a rejection. The vocabulary is closed and is
+/// documented on [`BatchItemDto::error`]; a new arm here is a new word there.
 #[must_use]
 pub fn rejection_code(err: &DomainError) -> &'static str {
     match err {

@@ -311,3 +311,156 @@ async fn the_list_covers_the_callers_subtree_without_standalone_branches() {
     assert_eq!(from_a.len(), 2);
     assert!(from_a.contains(&t.a) && from_a.contains(&t.b));
 }
+
+#[tokio::test]
+async fn a_row_below_a_hidden_tenant_is_stored_and_takes_effect_when_the_ancestor_lifts() {
+    let h = Harness::new().await;
+    h.base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let root = actor(t.root);
+
+    // `a` is hidden, and `b` below it is recorded `read_only` anyway. The
+    // stricter ancestor dominates, so `b` reads `hidden` and its own row waits.
+    h.service
+        .set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("the ancestor");
+    let below = h
+        .service
+        .set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.b,
+            TenantAccess::ReadOnly,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("stored under a stricter ancestor");
+    assert_eq!(
+        below.stored.as_ref().map(|r| r.access),
+        Some(TenantAccess::ReadOnly),
+        "the row is stored even while dominated"
+    );
+    assert_eq!(below.effective.access, TenantAccess::Hidden);
+    assert_eq!(below.effective.supplied_by, Some(t.a));
+
+    // Lifting the ancestor's restriction is what makes the waiting row the
+    // answer: nothing about `b`'s row changed, only what dominates it.
+    let ancestor = h
+        .service
+        .read(&conn, &root, &h.key("strict"), t.a)
+        .await
+        .expect("reads");
+    h.service
+        .clear(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            Some(ancestor.etag.as_str()),
+        )
+        .await
+        .expect("cleared");
+    let now = h
+        .service
+        .read(&conn, &root, &h.key("strict"), t.b)
+        .await
+        .expect("reads");
+    assert_eq!(now.effective.access, TenantAccess::ReadOnly);
+    assert_eq!(now.effective.supplied_by, Some(t.b));
+}
+
+#[tokio::test]
+async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
+    let h = Harness::new().await;
+    h.base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let root = actor(t.root);
+
+    // Two rows on one chain: `a` read-only, `b` hidden.
+    h.service
+        .set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            TenantAccess::ReadOnly,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("the ancestor");
+    let deeper = h
+        .service
+        .set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.b,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("the descendant");
+
+    // Clearing `b`'s row removes that row only; what `a` imposes still reaches
+    // `b`, so the pair falls back to the ancestor rather than to overridable.
+    let cleared = h
+        .service
+        .clear(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.b,
+            Some(deeper.etag.as_str()),
+        )
+        .await
+        .expect("cleared");
+    assert!(cleared.stored.is_none());
+    assert_eq!(cleared.etag.as_str(), ABSENT_RESTRICTION_TAG);
+    assert_eq!(cleared.effective.access, TenantAccess::ReadOnly);
+    assert_eq!(cleared.effective.supplied_by, Some(t.a));
+
+    // And `a`'s own row is untouched: one row was cleared, not the chain.
+    let ancestor = h
+        .service
+        .read(&conn, &root, &h.key("strict"), t.a)
+        .await
+        .expect("reads");
+    assert_eq!(
+        ancestor.stored.as_ref().map(|r| r.access),
+        Some(TenantAccess::ReadOnly)
+    );
+
+    // Clearing the last row leaves the pair overridable everywhere.
+    h.service
+        .clear(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            Some(ancestor.etag.as_str()),
+        )
+        .await
+        .expect("cleared");
+    let free = h
+        .service
+        .read(&conn, &root, &h.key("strict"), t.b)
+        .await
+        .expect("reads");
+    assert_eq!(free.effective.access, TenantAccess::Overridable);
+    assert!(free.effective.supplied_by.is_none());
+}

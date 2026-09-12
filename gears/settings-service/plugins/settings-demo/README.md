@@ -2,7 +2,8 @@
 
 A demo contributor for the Settings Service. At init it resolves
 `SettingsContributionClient` from `ClientHub` and registers a sample catalogue
-of fifteen declarations — one per value type the Settings Service SDK ships —
+of sixteen declarations — one per value type the Settings Service SDK ships, plus a
+second of a few types —
 so a running example server has settings to browse, read and set.
 
 It is example code, enabled in the example server by the `settings-demo`

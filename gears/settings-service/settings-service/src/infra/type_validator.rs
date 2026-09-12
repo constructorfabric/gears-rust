@@ -15,14 +15,14 @@
 //! regex that must compile, a reference that must resolve — is not a schema
 //! keyword at all; here it rejects the value.
 //!
-//! # What is not checked yet
+//! # Failing closed
 //!
-//! Two trait rules the design names have no binding in this gear: a cron
-//! expression parsing under its declared dialect, and a value's membership in
-//! a dynamic enumeration's source. The curated value-type catalogue that would
-//! carry those traits does not exist in the workspace yet, so no registered
-//! type declares them; the steps stay open in the FEATURE rather than being
-//! satisfied by a check that accepts silently.
+//! Two of the trait rules name something outside the value: the dialect a cron
+//! expression is written in, and the source a dynamic enumeration draws its
+//! members from. When the gear cannot check what the trait names — a dialect it
+//! does not implement, a source this deployment does not know — the value is
+//! refused rather than admitted. An uncheckable rule is not an absent one, and
+//! accepting silently is how a rule stops being a rule.
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
 
 use crate::domain::error::DomainError;
 use crate::domain::validation::{
-    FieldViolation, TraitSet, TypeValidator, ValidationResult, guards,
+    FieldViolation, TraitSet, TypeValidator, ValidationResult, cron, guards,
 };
 use crate::field;
 
@@ -54,6 +54,36 @@ pub trait SchemaSource: Send + Sync {
     /// # Errors
     /// [`DomainError::Unavailable`] when the registry cannot be reached.
     async fn instance_exists(&self, instance_id: &str) -> Result<bool, DomainError>;
+
+    /// The members of a dynamic enumeration, or `None` when the source is not
+    /// one this deployment knows.
+    ///
+    /// A source that does not resolve fails the value closed rather than
+    /// admitting it: an unknown membership is not an empty rule.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the source cannot be consulted at all.
+    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError>;
+}
+
+/// A few members, for a message a reader can act on without printing a
+/// thousand of them.
+fn summarize(members: &[String]) -> String {
+    const SHOWN: usize = 8;
+    if members.is_empty() {
+        return "nothing".to_owned();
+    }
+    let head = members
+        .iter()
+        .take(SHOWN)
+        .map(|m| format!("`{m}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if members.len() > SHOWN {
+        format!("{head} and {} more", members.len() - SHOWN)
+    } else {
+        head
+    }
 }
 
 fn unavailable(what: &str, err: &CanonicalError) -> DomainError {
@@ -77,6 +107,31 @@ impl SchemaSource for Arc<dyn TypesRegistryClient> {
             Ok(_) => Ok(true),
             Err(CanonicalError::NotFound { .. }) => Ok(false),
             Err(err) => Err(unavailable("get_instance", &err)),
+        }
+    }
+
+    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError> {
+        // A dynamic enumeration names a GTS type whose registered instances are
+        // its members, which is the one membership the registry can answer.
+        // Anything else a deployment might mean by a source is a binding this
+        // release does not have, and the caller refuses the value for it.
+        // The source names a GTS type; its registered instances are the
+        // members. The pattern is the source itself, so the query returns the
+        // instances derived from it and nothing else.
+        match self.get_type_schema(source).await {
+            Ok(_) => {}
+            Err(CanonicalError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(unavailable("get_type_schema", &err)),
+        }
+        let query = types_registry_sdk::InstanceQuery::new().with_pattern(source);
+        match self.list_instances(query).await {
+            Ok(instances) => Ok(Some(
+                instances
+                    .into_iter()
+                    .map(|instance| instance.id.to_string())
+                    .collect(),
+            )),
+            Err(err) => Err(unavailable("list_instances", &err)),
         }
     }
 }
@@ -185,9 +240,34 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-6
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-5
 
+        // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-rules:p1
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-7
         // Trait rules apply to the string leaves a trait describes. A structured
         // value carrying such a trait on the whole is checked leaf by leaf.
+        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-8
+        if let Some(dialect) = traits.cron_dialect.as_deref() {
+            for (path, text) in string_leaves(value, "value") {
+                if cron::is_known(dialect) {
+                    if let Err(reason) = cron::parse(text) {
+                        violations.push(FieldViolation {
+                            field: path,
+                            code: field::VALUE_CRON_INVALID,
+                            message: format!("not a cron expression: {reason}"),
+                        });
+                    }
+                } else {
+                    violations.push(FieldViolation {
+                        field: path,
+                        code: field::VALUE_CRON_DIALECT_UNKNOWN,
+                        message: format!(
+                            "the type declares the cron dialect `{dialect}`, which this service \
+                             cannot check; the value is refused rather than admitted unchecked"
+                        ),
+                    });
+                }
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-8
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-9
         if traits.regex {
             for (path, text) in string_leaves(value, "value") {
@@ -201,6 +281,32 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
             }
         }
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-9
+        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-10
+        if let Some(source) = traits.dynamic_enum_source.as_deref() {
+            let members = self.source.enum_members(source).await?;
+            for (path, text) in string_leaves(value, "value") {
+                match &members {
+                    Some(members) if members.iter().any(|m| m == text) => {}
+                    Some(members) => violations.push(FieldViolation {
+                        field: path,
+                        code: field::VALUE_NOT_IN_ENUM,
+                        message: format!(
+                            "`{text}` is not a member of `{source}`, which offers {}",
+                            summarize(members)
+                        ),
+                    }),
+                    None => violations.push(FieldViolation {
+                        field: path,
+                        code: field::VALUE_ENUM_SOURCE_UNKNOWN,
+                        message: format!(
+                            "the type draws its members from `{source}`, which this deployment \
+                             does not know; the value is refused rather than admitted unchecked"
+                        ),
+                    }),
+                }
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-10
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-11
         if let Some(target_type) = traits.entity_reference.as_deref() {
             for (path, id) in string_leaves(value, "value") {

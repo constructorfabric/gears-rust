@@ -24,7 +24,7 @@
 //! reason. It becomes testable the day a required field is added — which is
 //! also the day it starts to matter.
 
-use super::SettingsServiceConfig;
+use super::{IN_PROCESS_CONTRACTS, SettingsServiceConfig};
 
 fn parse(json: serde_json::Value) -> Result<SettingsServiceConfig, serde_json::Error> {
     serde_json::from_value(json)
@@ -86,4 +86,47 @@ fn the_step_up_section_is_optional_and_defaults_its_window_to_five_minutes() {
         parse(serde_json::json!({ "step_up": { "max_age_seconds": 60 } })).is_err(),
         "the JWKS endpoint is required"
     );
+}
+
+#[test]
+fn a_remote_binding_for_either_sdk_trait_is_refused_with_the_contract_named() {
+    for contract in IN_PROCESS_CONTRACTS {
+        for transport in ["rest", "grpc", "REST"] {
+            let config: SettingsServiceConfig = serde_json::from_value(serde_json::json!({
+                "client_wiring": {
+                    contract: { "transport": transport, "endpoint": "http://elsewhere" }
+                }
+            }))
+            .expect("the section parses");
+            let refusal = config
+                .check_in_process_bindings()
+                .expect_err("a remote binding is refused");
+            assert!(refusal.contains(contract), "{refusal}");
+            assert!(refusal.contains(transport), "{refusal}");
+        }
+    }
+}
+
+#[test]
+fn a_local_binding_another_contract_and_no_section_at_all_are_all_accepted() {
+    for section in [
+        serde_json::json!({}),
+        serde_json::json!({ "client_wiring": {} }),
+        serde_json::json!({
+            "client_wiring": { "settings_reader_client": { "transport": "local" } }
+        }),
+        // Another gear's contract is none of this gear's business.
+        serde_json::json!({
+            "client_wiring": {
+                "authz_resolver_api": { "transport": "rest", "endpoint": "http://authz" }
+            }
+        }),
+    ] {
+        let config: SettingsServiceConfig =
+            serde_json::from_value(section.clone()).expect("parses");
+        assert!(
+            config.check_in_process_bindings().is_ok(),
+            "{section} should be accepted"
+        );
+    }
 }

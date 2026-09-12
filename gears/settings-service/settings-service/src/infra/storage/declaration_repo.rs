@@ -210,6 +210,7 @@ impl DeclarationRepository for DeclarationRepo {
                 declaration::Column::AnonymousExposable,
                 Expr::value(metadata.anonymous_exposable),
             )
+            .col_expr(declaration::Column::LastChangeAt, Expr::value(now()))
             .col_expr(declaration::Column::UpdatedAt, Expr::value(now()))
             .filter(declaration::Column::Id.eq(id))
             .secure()

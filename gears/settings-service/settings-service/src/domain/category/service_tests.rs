@@ -59,7 +59,7 @@ mod transactional {
     use crate::domain::error::DomainError;
     use crate::infra::storage::audit_store::AuditStore;
     use crate::infra::storage::category_repo::CategoryRepo;
-    use crate::test_support::{FailingSink, FixedScope, sqlite_provider};
+    use crate::test_support::{FailingSink, sqlite_provider};
 
     fn draft(slug: &str) -> CategoryDraft {
         CategoryDraft {
@@ -76,11 +76,7 @@ mod transactional {
     async fn a_category_mutation_leaves_exactly_one_record_in_the_same_commit() {
         let db = sqlite_provider().await;
         let root = Uuid::new_v4();
-        let svc = Arc::new(CategoryService::new(
-            CategoryRepo,
-            AuditStore,
-            Arc::new(FixedScope(root)),
-        ));
+        let svc = Arc::new(CategoryService::new(CategoryRepo, AuditStore));
         let ctx = SecurityContext::anonymous();
         let created = db
             .db()
@@ -118,8 +114,8 @@ mod transactional {
         let record = &page.items[0];
         assert_eq!(record.operation, AuditOperation::Create);
         assert_eq!(
-            record.tenant_id, root,
-            "platform scope is the root tenant's id"
+            record.tenant_id, None,
+            "a category is platform-wide and sits at no scope, so it borrows none"
         );
         assert_eq!(record.request_id, "req-1");
         assert!(record.pre_image.is_none() && record.post_image.is_some());
@@ -128,11 +124,7 @@ mod transactional {
     #[tokio::test]
     async fn a_record_that_cannot_be_written_rolls_the_mutation_back() {
         let db = sqlite_provider().await;
-        let svc = Arc::new(CategoryService::new(
-            CategoryRepo,
-            FailingSink,
-            Arc::new(FixedScope(Uuid::new_v4())),
-        ));
+        let svc = Arc::new(CategoryService::new(CategoryRepo, FailingSink));
         let ctx = SecurityContext::anonymous();
         let outcome = db
             .db()

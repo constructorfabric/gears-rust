@@ -131,7 +131,7 @@ where
         // leaves: a resolution that cannot be recorded does not happen.
         let record = AuditRecord::new(
             effective.key.as_str(),
-            effective.tenant_id,
+            Some(effective.tenant_id),
             ctx.subject_id().to_string(),
             AuditOperation::SecretUse,
             Uuid::new_v4().to_string(),

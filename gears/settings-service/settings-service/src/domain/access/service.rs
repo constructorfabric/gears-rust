@@ -280,7 +280,7 @@ where
         };
         let mut record = AuditRecord::new(
             key.as_str(),
-            target,
+            Some(target),
             actor.ctx.subject_id().to_string(),
             operation,
             actor.request_id.clone(),
@@ -334,7 +334,7 @@ where
                 .await?;
             let record = AuditRecord::new(
                 key.as_str(),
-                target,
+                Some(target),
                 actor.ctx.subject_id().to_string(),
                 AuditOperation::Remove,
                 actor.request_id.clone(),

@@ -66,6 +66,61 @@ pub struct SettingsServiceConfig {
     /// The step-up verifier binding. Absent, no verifier is bound.
     #[serde(default)]
     pub step_up: Option<StepUpConfig>,
+    /// Per-contract client wiring, as `ToolKit` reads it.
+    ///
+    /// Accepted here so a deployment that names one gets the reason rather
+    /// than an unknown-field error, and refused at init for this gear's own
+    /// two SDK traits: R1 is Embedded-only, publishes no remote contract for
+    /// them, and a configuration asking for one is a boot failure rather than
+    /// a silent hole.
+    #[serde(default)]
+    pub client_wiring: std::collections::BTreeMap<String, WiringEntry>,
+}
+
+/// One `client_wiring` entry, read for its transport alone.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WiringEntry {
+    /// `local`, `rest` or `grpc`; `ToolKit`'s default is `local`.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Everything else `ToolKit` reads from the entry, kept so a valid section
+    /// still parses here.
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_transport() -> String {
+    "local".to_owned()
+}
+
+/// The contract keys this gear binds in process, named as `ToolKit` names them:
+/// the SDK trait in snake case.
+pub const IN_PROCESS_CONTRACTS: [&str; 2] =
+    ["settings_reader_client", "settings_contribution_client"];
+
+impl SettingsServiceConfig {
+    /// Refuse a remote binding for either of this gear's SDK traits.
+    ///
+    /// # Errors
+    /// Names the contract and the transport asked for.
+    // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-reader-binding:p1
+    // @cpt-dod:cpt-cf-settings-service-dod-module-contributions-trust:p1
+    pub fn check_in_process_bindings(&self) -> Result<(), String> {
+        for contract in IN_PROCESS_CONTRACTS {
+            let Some(entry) = self.client_wiring.get(contract) else {
+                continue;
+            };
+            if !entry.transport.eq_ignore_ascii_case("local") {
+                return Err(format!(
+                    "client_wiring.{contract} asks for `{}`, but this release binds that trait \
+                     in process and publishes no remote contract for it; remove the entry or \
+                     set transport `local`",
+                    entry.transport
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The OIDC/JWKS step-up binding's deployment values.

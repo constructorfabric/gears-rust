@@ -62,3 +62,14 @@ fn the_secret_default_is_the_empty_placeholder() {
         .expect("api_token is declared");
     assert_eq!(token.default_value, serde_json::json!(""));
 }
+
+#[test]
+fn the_catalogue_size_is_pinned() {
+    // The README states the number, and nothing else checks it: a declaration
+    // added without updating the prose is the drift this pins.
+    assert_eq!(
+        declarations().len(),
+        16,
+        "the catalogue changed size; update README.md with it"
+    );
+}

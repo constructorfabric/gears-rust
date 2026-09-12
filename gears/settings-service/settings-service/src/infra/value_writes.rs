@@ -357,7 +357,9 @@ impl WriteCoordinator {
             .await
     }
 
-    /// The bounded impact report for a candidate value.
+    /// The bounded impact report for a candidate value, with the declaration's
+    /// classification so the caller masks each descendant's current value as a
+    /// read would.
     ///
     /// # Errors
     /// As [`Self::validate`].
@@ -368,7 +370,7 @@ impl WriteCoordinator {
         requested: Option<Uuid>,
         candidate: &Value,
         limit: Option<usize>,
-    ) -> Result<ImpactReport, DomainError> {
+    ) -> Result<ImpactOutcome, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-2
         let (target, _, root) = self.writer.target_for(actor, requested).await?;
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-2
@@ -379,9 +381,14 @@ impl WriteCoordinator {
             .writer
             .declaration_for_write(&conn, actor, key, root)
             .await?;
-        self.writer
+        let report = self
+            .writer
             .impact(&conn, &declaration, target, candidate, limit)
-            .await
+            .await?;
+        Ok(ImpactOutcome {
+            report,
+            data_classification: declaration.data_classification,
+        })
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-4
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-3
     }
@@ -399,3 +406,17 @@ impl WriteCoordinator {
         self.writer.resolver().resolve(&conn, key, target).await
     }
 }
+
+/// An impact report together with the classification that masks it.
+#[derive(Debug, Clone)]
+pub struct ImpactOutcome {
+    /// The bounded walk.
+    pub report: ImpactReport,
+    /// `public`, `pii` or `secret`, from the declaration.
+    pub data_classification: String,
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "value_writes_tests.rs"]
+mod value_writes_tests;

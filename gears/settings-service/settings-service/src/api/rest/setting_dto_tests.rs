@@ -132,7 +132,7 @@ mod history {
         StoredAuditRecord {
             id: Uuid::nil(),
             declaration_key: "k".to_owned(),
-            tenant_id: Uuid::nil(),
+            tenant_id: Some(Uuid::nil()),
             operation: AuditOperation::Change,
             actor: "admin@acme".to_owned(),
             actor_classification: actor,

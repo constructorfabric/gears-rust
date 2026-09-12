@@ -56,6 +56,7 @@ fn subjectless() -> sea_orm::Condition {
 
 #[async_trait]
 impl ValueRepository for ValueRepo {
+    // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-classification:p1
     async fn resync_classification<C: DBRunner>(
         &self,
         conn: &C,
@@ -107,6 +108,52 @@ impl ValueRepository for ValueRepo {
             .await
             .map_err(db_error)?;
         Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn find_all<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+    ) -> Result<Vec<StoredValue>, DomainError> {
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn flag<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        detail: Option<String>,
+    ) -> Result<(), DomainError> {
+        ValueEntity::update_many()
+            .col_expr(
+                setting_value::Column::NeedsReview,
+                Expr::value(detail.is_some()),
+            )
+            .col_expr(
+                setting_value::Column::NeedsReviewDetail,
+                Expr::value(detail),
+            )
+            .col_expr(
+                setting_value::Column::UpdatedAt,
+                Expr::value(time::OffsetDateTime::now_utc()),
+            )
+            .filter(setting_value::Column::Id.eq(id))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(|err| map_write_error(&err))?;
+        Ok(())
     }
 
     async fn find_one<C: DBRunner>(

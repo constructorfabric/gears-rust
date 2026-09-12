@@ -8,8 +8,6 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use serde::Deserialize;
-use serde_json::Value;
 use settings_service_sdk::SettingKey;
 use toolkit::api::canonical_prelude::*;
 use toolkit_canonical_errors::CanonicalError;
@@ -20,7 +18,7 @@ use crate::api::authz::{self, resource};
 use crate::api::rest::setting_dto::render;
 use crate::api::rest::setting_handlers::TenantParam;
 use crate::api::rest::value_dto::{
-    BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, SetValueRequest,
+    BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactRequest, SetValueRequest,
     ValidateRequest, render_batch_item, render_committed, render_impact, render_validation,
 };
 use crate::domain::error::DomainError;
@@ -46,11 +44,11 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
-fn if_match(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn if_match(headers: &HeaderMap) -> Option<&str> {
     header_str(headers, "if-match").map(|v| v.trim().trim_matches('"'))
 }
 
-fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
+pub(crate) fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-1
     let step_up_token = header_str(headers, STEP_UP_HEADER)
         .map(str::to_owned)
@@ -90,7 +88,7 @@ fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainError> {
 /// The RFC 9470 challenge: `401` telling the client what to ask the
 /// provider for.
 // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-7
-fn step_up_challenge(err: DomainError) -> Response {
+pub(crate) fn step_up_challenge(err: DomainError) -> Response {
     let (reason, max_age, acr) = match &err {
         DomainError::StepUpRequired {
             reason,
@@ -399,53 +397,43 @@ pub async fn validate_value(
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
 }
 
-/// The candidate and page size of an impact request.
-#[derive(Debug, Default, Deserialize)]
-pub struct ImpactParams {
-    /// The target tenant.
-    #[serde(default)]
-    pub tenant: Option<String>,
-    /// The candidate value, as JSON.
-    #[serde(default)]
-    pub value: Option<String>,
-    /// Page size, one to five hundred.
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-/// `GET /settings-service/v1/settings/{key}/impact?tenant={tenant_id}&value={json}&limit={n}`
+/// `POST /settings-service/v1/settings/{key}/impact?tenant={tenant_id}`
+///
+/// The candidate travels in the body, as it does for `validate`: a value may
+/// run to 64 KiB, which no query string carries. Read-only, and never
+/// required before a write.
 ///
 /// # Errors
-/// 400 for a malformed key, `tenant` or `value`; 403 when the caller may not
-/// read or the target is outside the subtree; 404 when the declaration is
-/// absent or hidden; 410 when retired.
+/// 400 for a malformed key or `tenant`; 403 when the caller may not read or
+/// the target is outside the subtree; 404 when the declaration is absent or
+/// hidden; 410 when retired.
 pub async fn impact(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Path(key): Path<String>,
-    Query(params): Query<ImpactParams>,
+    Query(params): Query<TenantParam>,
     headers: HeaderMap,
+    Json(body): Json<ImpactRequest>,
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-1
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
-    let candidate: Value = match params.value.as_deref() {
-        None | Some("") => Value::Null,
-        Some(raw) => serde_json::from_str(raw).map_err(|e| DomainError::Validation {
-            field: "value".to_owned(),
-            code: field::VALIDATION,
-            message: format!("`value` is not JSON: {e}"),
-        })?,
-    };
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-1
     authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     let actor = actor(&ctx, &headers);
-    let report = writes
-        .impact(&actor, &key, tenant, &candidate, params.limit)
+    let outcome = writes
+        .impact(&actor, &key, tenant, &body.value, body.limit)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-5
+    // Each descendant's current value is masked by the declaration's own
+    // classification, exactly as a read of that descendant would mask it.
     let pii = may_read_pii(&enforcer, &ctx).await;
-    Ok(Json(render_impact(&report, "public", pii)).into_response())
+    Ok(Json(render_impact(
+        &outcome.report,
+        &outcome.data_classification,
+        pii,
+    ))
+    .into_response())
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-5
 }

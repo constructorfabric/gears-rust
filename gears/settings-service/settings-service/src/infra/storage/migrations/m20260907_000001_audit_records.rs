@@ -30,7 +30,7 @@ impl MigrationTrait for Migration {
                     id                    uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
                     resource              text         NOT NULL,
                     declaration_key       text         NOT NULL,
-                    tenant_id             uuid         NOT NULL,
+                    tenant_id             uuid         NULL,
                     operation             text         NOT NULL
                                           CHECK (operation IN ('create', 'change', 'revert',
                                                                'remove', 'clone', 'secret_use')),
@@ -58,7 +58,7 @@ impl MigrationTrait for Migration {
                     id                    text     PRIMARY KEY,
                     resource              text     NOT NULL,
                     declaration_key       text     NOT NULL,
-                    tenant_id             text     NOT NULL,
+                    tenant_id             text     NULL,
                     operation             text     NOT NULL
                                           CHECK (operation IN ('create', 'change', 'revert',
                                                                'remove', 'clone', 'secret_use')),

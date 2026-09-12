@@ -84,7 +84,7 @@ The hardest constraint here is not any single field but the rule connecting them
 
 ### Create Declaration
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-create`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-create`
 
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
@@ -101,31 +101,31 @@ The hardest constraint here is not any single field but the rule connecting them
 - Duplicate `key`, or a leaf slug already held by an active declaration in the category
 
 **Steps**:
-1. [ ] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
-2. [ ] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` through the `PolicyEnforcer` PEP - `inst-decl-create-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-create-3`
-4. [ ] - `p1` - DB: SELECT the target category WHERE id = {category_id} - `inst-decl-create-4`
-5. [ ] - `p1` - **IF** the category does not exist → **RETURN** `404` - `inst-decl-create-5`
-6. [ ] - `p1` - Invoke setting instance key construction using `value_type_id`, `vendor`, the category's slug, and the leaf `name` - `inst-decl-create-6`
-7. [ ] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment - `inst-decl-create-7`
-8. [ ] - `p1` - Resolve the value type's trait set through the Type Validator trait - `inst-decl-create-8`
-9. [ ] - `p1` - Invoke classification and secret-trait derivation using the resolved traits and any author-supplied `data_classification` - `inst-decl-create-9`
-10. [ ] - `p1` - **IF** derivation rejects the combination → **RETURN** `400` - `inst-decl-create-10`
-11. [ ] - `p1` - **IF** `has_secret_trait` is true **AND** `default_value` is non-empty → **RETURN** `400`, because a secret setting has no secret default - `inst-decl-create-11`
-12. [ ] - `p1` - **IF** `has_secret_trait` is false → validate `default_value` against `value_type_id` through the Type Validator trait - `inst-decl-create-12`
-13. [ ] - `p1` - **IF** Schema Default validation fails → **RETURN** `400` with the validator's field-level errors - `inst-decl-create-13`
-14. [ ] - `p1` - **IF** `anonymous_exposable` is requested **AND** the derived `data_classification` is `secret` or `pii` → **RETURN** `400`, because the two classifications that must never leave are excluded from the anonymous surface in the schema as well as here - `inst-decl-create-14`
-15. [ ] - `p1` - Set `source` to `admin_authored`, `status` to `active`, `mode` to its default when unsupplied, `requires_step_up` to `true` when unsupplied, and `created_by` from the authenticated principal - `inst-decl-create-15`
-16. [ ] - `p1` - Register the composed setting type in the types registry — derived from the Settings base, composed with the `value_type_id`, and carrying no `default` — before the row is inserted; registration is idempotent, so a retry after a failed create reuses the type rather than minting a second one - `inst-decl-create-16`
-17. [ ] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, and derived columns - `inst-decl-create-17`
-18. [ ] - `p1` - **IF** unique violation on `uq_declaration_key` → **RETURN** `409` - `inst-decl-create-18`
-19. [ ] - `p1` - **IF** unique violation on `uq_declaration_category_slug` → **RETURN** `409` stating the leaf name is held by an active declaration in this category - `inst-decl-create-19`
-20. [ ] - `p1` - Emit a declaration-created audit record - `inst-decl-create-20`
-21. [ ] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, and its resolved traits - `inst-decl-create-21`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
+2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` through the `PolicyEnforcer` PEP - `inst-decl-create-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-create-3`
+4. [x] - `p1` - DB: SELECT the target category WHERE id = {category_id} - `inst-decl-create-4`
+5. [x] - `p1` - **IF** the category does not exist → **RETURN** `404` - `inst-decl-create-5`
+6. [x] - `p1` - Invoke setting instance key construction using `value_type_id`, `vendor`, the category's slug, and the leaf `name` - `inst-decl-create-6`
+7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment - `inst-decl-create-7`
+8. [x] - `p1` - Resolve the value type's trait set through the Type Validator trait - `inst-decl-create-8`
+9. [x] - `p1` - Invoke classification and secret-trait derivation using the resolved traits and any author-supplied `data_classification` - `inst-decl-create-9`
+10. [x] - `p1` - **IF** derivation rejects the combination → **RETURN** `400` - `inst-decl-create-10`
+11. [x] - `p1` - **IF** `has_secret_trait` is true **AND** `default_value` is non-empty → **RETURN** `400`, because a secret setting has no secret default - `inst-decl-create-11`
+12. [x] - `p1` - **IF** `has_secret_trait` is false → validate `default_value` against `value_type_id` through the Type Validator trait - `inst-decl-create-12`
+13. [x] - `p1` - **IF** Schema Default validation fails → **RETURN** `400` with the validator's field-level errors - `inst-decl-create-13`
+14. [x] - `p1` - **IF** `anonymous_exposable` is requested **AND** the derived `data_classification` is `secret` or `pii` → **RETURN** `400`, because the two classifications that must never leave are excluded from the anonymous surface in the schema as well as here - `inst-decl-create-14`
+15. [x] - `p1` - Set `source` to `admin_authored`, `status` to `active`, `mode` to its default when unsupplied, `requires_step_up` to `true` when unsupplied, and `created_by` from the authenticated principal - `inst-decl-create-15`
+16. [x] - `p1` - Register the composed setting type in the types registry — derived from the Settings base, composed with the `value_type_id`, and carrying no `default` — before the row is inserted; registration is idempotent, so a retry after a failed create reuses the type rather than minting a second one - `inst-decl-create-16`
+17. [x] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, and derived columns - `inst-decl-create-17`
+18. [x] - `p1` - **IF** unique violation on `uq_declaration_key` → **RETURN** `409` - `inst-decl-create-18`
+19. [x] - `p1` - **IF** unique violation on `uq_declaration_category_slug` → **RETURN** `409` stating the leaf name is held by an active declaration in this category - `inst-decl-create-19`
+20. [x] - `p1` - Emit a declaration-created audit record - `inst-decl-create-20`
+21. [x] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, and its resolved traits - `inst-decl-create-21`
 
 ### Update Declaration Metadata
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-update`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-update`
 
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
@@ -139,25 +139,25 @@ The hardest constraint here is not any single field but the rule connecting them
 - `If-Match` absent or stale
 
 **Steps**:
-1. [ ] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
-2. [ ] - `p1` - Authorize `update` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-update-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-update-3`
-4. [ ] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-update-4`
-5. [ ] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-update-5`
-6. [ ] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, because gear declarations change only through their owning module - `inst-decl-update-6`
-7. [ ] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-update-7`
-8. [ ] - `p1` - Invoke declaration mutation class resolution over every field present in the request - `inst-decl-update-8`
-9. [ ] - `p1` - **IF** any field resolves to the immutable class → **RETURN** `400` naming the field and stating that the change is expressible only as a replacement declaration - `inst-decl-update-9`
-10. [ ] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
-11. [ ] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
-12. [ ] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [ ] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `last_change_at` = now(), `updated_at` = now() WHERE id = {id} - `inst-decl-update-13`
-14. [ ] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
-15. [ ] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
+1. [x] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
+2. [x] - `p1` - Authorize `update` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-update-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-update-3`
+4. [x] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-update-4`
+5. [x] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-update-5`
+6. [x] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, because gear declarations change only through their owning module - `inst-decl-update-6`
+7. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-update-7`
+8. [x] - `p1` - Invoke declaration mutation class resolution over every field present in the request - `inst-decl-update-8`
+9. [x] - `p1` - **IF** any field resolves to the immutable class → **RETURN** `400` naming the field and stating that the change is expressible only as a replacement declaration - `inst-decl-update-9`
+10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
+11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
+12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `last_change_at` = now(), `updated_at` = now() WHERE id = {id} - `inst-decl-update-13`
+14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
+15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
 ### Retire Declaration
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-retire`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-retire`
 
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
@@ -170,24 +170,24 @@ The hardest constraint here is not any single field but the rule connecting them
 - `If-Match` absent or stale
 
 **Steps**:
-1. [ ] - `p1` - Actor sends DELETE /settings-service/v1/declarations/{id} with `If-Match` - `inst-decl-retire-1`
-2. [ ] - `p1` - Authorize `delete` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-retire-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-retire-3`
-4. [ ] - `p1` - Require a valid credential step-up assertion, because retire drops a live setting out of resolution at once - `inst-decl-retire-4`
-5. [ ] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-retire-5`
-6. [ ] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-retire-6`
-7. [ ] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-retire-7`
-8. [ ] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable` - `inst-decl-retire-8`
-9. [ ] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-retire-9`
-10. [ ] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id}, in one transaction with the invalidation below - `inst-decl-retire-10`
-11. [ ] - `p1` - Retain every row in `setting_values` for this declaration; retire never deletes values - `inst-decl-retire-11`
-12. [ ] - `p1` - Invalidate the local cache for the affected scopes and publish the cache-invalidation and declaration-retired signals - `inst-decl-retire-12`
-13. [ ] - `p1` - Emit a declaration-retired audit record carrying pre-images - `inst-decl-retire-13`
-14. [ ] - `p1` - **RETURN** `200` with the retired declaration; this is a soft delete, not a `204` removal - `inst-decl-retire-14`
+1. [x] - `p1` - Actor sends DELETE /settings-service/v1/declarations/{id} with `If-Match` - `inst-decl-retire-1`
+2. [x] - `p1` - Authorize `delete` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-retire-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-retire-3`
+4. [x] - `p1` - Require a valid credential step-up assertion, because retire drops a live setting out of resolution at once - `inst-decl-retire-4`
+5. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-retire-5`
+6. [x] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-retire-6`
+7. [x] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-retire-7`
+8. [x] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable` - `inst-decl-retire-8`
+9. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-retire-9`
+10. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id}, in one transaction with the invalidation below - `inst-decl-retire-10`
+11. [x] - `p1` - Retain every row in `setting_values` for this declaration; retire never deletes values - `inst-decl-retire-11`
+12. [x] - `p1` - Invalidate the local cache for the affected scopes and publish the cache-invalidation and declaration-retired signals - `inst-decl-retire-12`
+13. [x] - `p1` - Emit a declaration-retired audit record carrying pre-images - `inst-decl-retire-13`
+14. [x] - `p1` - **RETURN** `200` with the retired declaration; this is a soft delete, not a `204` removal - `inst-decl-retire-14`
 
 ### Reactivate Declaration
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-reactivate`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-reactivate`
 
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
@@ -199,18 +199,18 @@ The hardest constraint here is not any single field but the rule connecting them
 - The re-declared key does not match an existing retired row, in which case the request is an ordinary create
 
 **Steps**:
-1. [ ] - `p1` - Actor sends POST /settings-service/v1/declarations at a key that matches an existing `retired` declaration - `inst-decl-react-1`
-2. [ ] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-react-2`
-3. [ ] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-react-3`
-4. [ ] - `p1` - Construct the key and look up an existing declaration at that key - `inst-decl-react-4`
-5. [ ] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
-6. [ ] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key - `inst-decl-react-6`
-7. [ ] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
-8. [ ] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-9. [ ] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active' and the re-declared metadata WHERE key = {key} - `inst-decl-react-9`
-10. [ ] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
-11. [ ] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
-12. [ ] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations at a key that matches an existing `retired` declaration - `inst-decl-react-1`
+2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-react-2`
+3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-react-3`
+4. [x] - `p1` - Construct the key and look up an existing declaration at that key - `inst-decl-react-4`
+5. [x] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
+6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key - `inst-decl-react-6`
+7. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
+8. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
+9. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active' and the re-declared metadata WHERE key = {key} - `inst-decl-react-9`
+10. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+11. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
+12. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
 
 ### Declare Dependency Group
 
@@ -281,55 +281,55 @@ The hardest constraint here is not any single field but the rule connecting them
 
 ### Declaration Mutation Class Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-setting-declarations-mutation-class`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-setting-declarations-mutation-class`
 
 **Input**: The set of fields present in an update request, and the declaration's current `data_classification`
 
 **Output**: A per-field class of immediate, immutable, or step-up-gated
 
 **Steps**:
-1. [ ] - `p1` - **FOR EACH** field present in the request - `inst-decl-mutcls-1`
-   1. [ ] - `p1` - **IF** the field is `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate - `inst-decl-mutcls-2`
-   2. [ ] - `p1` - **IF** the field is `default_value`, the value type, or `scope_class` → classify as immutable, because each would change a live setting's resolution without any gate - `inst-decl-mutcls-3`
-   3. [ ] - `p1` - **IF** the field is `data_classification` **AND** the change tightens from `public` toward `pii` → classify as immediate - `inst-decl-mutcls-4`
-   4. [ ] - `p1` - **IF** the field is `data_classification` **AND** the change loosens from `pii` toward `public` → classify as step-up-gated, because it un-masks content previously withheld - `inst-decl-mutcls-5`
-   5. [ ] - `p1` - **IF** the field is `data_classification` **AND** the request sets `secret` → classify as immutable, because `secret` is derived from the value type's trait and is never author-supplied - `inst-decl-mutcls-6`
-   6. [ ] - `p1` - **IF** the field loosens a gate — clears `requires_step_up` or enables `anonymous_exposable` → classify as step-up-gated whatever the flag currently says, because a caller holding a live session could otherwise clear the gate and then write with no re-verification anywhere in the sequence - `inst-decl-mutcls-8`
-2. [ ] - `p1` - **RETURN** the per-field classes, treating any unrecognized field as immutable so an unknown field can never take the immediate path - `inst-decl-mutcls-7`
+1. [x] - `p1` - **FOR EACH** field present in the request - `inst-decl-mutcls-1`
+   1. [x] - `p1` - **IF** the field is `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate - `inst-decl-mutcls-2`
+   2. [x] - `p1` - **IF** the field is `default_value`, the value type, or `scope_class` → classify as immutable, because each would change a live setting's resolution without any gate - `inst-decl-mutcls-3`
+   3. [x] - `p1` - **IF** the field is `data_classification` **AND** the change tightens from `public` toward `pii` → classify as immediate - `inst-decl-mutcls-4`
+   4. [x] - `p1` - **IF** the field is `data_classification` **AND** the change loosens from `pii` toward `public` → classify as step-up-gated, because it un-masks content previously withheld - `inst-decl-mutcls-5`
+   5. [x] - `p1` - **IF** the field is `data_classification` **AND** the request sets `secret` → classify as immutable, because `secret` is derived from the value type's trait and is never author-supplied - `inst-decl-mutcls-6`
+   6. [x] - `p1` - **IF** the field loosens a gate — clears `requires_step_up` or enables `anonymous_exposable` → classify as step-up-gated whatever the flag currently says, because a caller holding a live session could otherwise clear the gate and then write with no re-verification anywhere in the sequence - `inst-decl-mutcls-8`
+2. [x] - `p1` - **RETURN** the per-field classes, treating any unrecognized field as immutable so an unknown field can never take the immediate path - `inst-decl-mutcls-7`
 
 ### Classification and Secret-Trait Derivation
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-setting-declarations-classification`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-setting-declarations-classification`
 
 **Input**: The value type's resolved trait set, and any author-supplied `data_classification`
 
 **Output**: The derived `has_secret_trait` and `data_classification`, or a validation problem
 
 **Steps**:
-1. [ ] - `p1` - Set `has_secret_trait` from the presence of the secret trait in the resolved trait set, never from author input - `inst-decl-class-1`
-2. [ ] - `p1` - **IF** `has_secret_trait` is true - `inst-decl-class-2`
-   1. [ ] - `p1` - Set `data_classification` to `secret` - `inst-decl-class-3`
-   2. [ ] - `p1` - **IF** the author supplied a `data_classification` other than `secret` → **RETURN** validation problem, since the class is derived and cannot be overridden - `inst-decl-class-4`
-3. [ ] - `p1` - **IF** `has_secret_trait` is false - `inst-decl-class-5`
-   1. [ ] - `p1` - **IF** the author supplied `secret` → **RETURN** validation problem, because a non-secret value type cannot carry a secret classification - `inst-decl-class-6`
-   2. [ ] - `p1` - Set `data_classification` to the author's `pii` or `public`, defaulting to `public` when unsupplied - `inst-decl-class-7`
-4. [ ] - `p1` - **RETURN** the derived pair, which the database re-checks through its equality constraint between `data_classification` being `secret` and `has_secret_trait` - `inst-decl-class-8`
+1. [x] - `p1` - Set `has_secret_trait` from the presence of the secret trait in the resolved trait set, never from author input - `inst-decl-class-1`
+2. [x] - `p1` - **IF** `has_secret_trait` is true - `inst-decl-class-2`
+   1. [x] - `p1` - Set `data_classification` to `secret` - `inst-decl-class-3`
+   2. [x] - `p1` - **IF** the author supplied a `data_classification` other than `secret` → **RETURN** validation problem, since the class is derived and cannot be overridden - `inst-decl-class-4`
+3. [x] - `p1` - **IF** `has_secret_trait` is false - `inst-decl-class-5`
+   1. [x] - `p1` - **IF** the author supplied `secret` → **RETURN** validation problem, because a non-secret value type cannot carry a secret classification - `inst-decl-class-6`
+   2. [x] - `p1` - Set `data_classification` to the author's `pii` or `public`, defaulting to `public` when unsupplied - `inst-decl-class-7`
+4. [x] - `p1` - **RETURN** the derived pair, which the database re-checks through its equality constraint between `data_classification` being `secret` and `has_secret_trait` - `inst-decl-class-8`
 
 ## 4. States (CDSL)
 
 ### SettingDeclaration State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-state-setting-declarations-lifecycle`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-state-setting-declarations-lifecycle`
 
 **States**: `active`, `retired`
 
 **Initial State**: `active`
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** none **TO** `active` **WHEN** a declaration is created at a key that holds no existing row - `inst-decl-state-1`
-2. [ ] - `p1` - **FROM** `active` **TO** `retired` **WHEN** an authorized administrator retires it with a valid credential step-up assertion - `inst-decl-state-2`
-3. [ ] - `p1` - **FROM** `retired` **TO** `active` **WHEN** the key is re-declared with a valid credential step-up assertion - `inst-decl-state-3`
-4. [ ] - `p1` - **FROM** `retired` **TO** `retired` **WHEN** values remain stored against the declaration, since retire never deletes values and a retired declaration continues to occupy its category - `inst-decl-state-4`
+1. [x] - `p1` - **FROM** none **TO** `active` **WHEN** a declaration is created at a key that holds no existing row - `inst-decl-state-1`
+2. [x] - `p1` - **FROM** `active` **TO** `retired` **WHEN** an authorized administrator retires it with a valid credential step-up assertion - `inst-decl-state-2`
+3. [x] - `p1` - **FROM** `retired` **TO** `active` **WHEN** the key is re-declared with a valid credential step-up assertion - `inst-decl-state-3`
+4. [x] - `p1` - **FROM** `retired` **TO** `retired` **WHEN** values remain stored against the declaration, since retire never deletes values and a retired declaration continues to occupy its category - `inst-decl-state-4`
 
 ## 5. Definitions of Done
 
@@ -350,7 +350,7 @@ The system **MUST** persist declarations in a `setting_declarations` table carry
 
 ### Setting Key Construction and Uniqueness
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-key`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-key`
 
 The system **MUST** construct the setting key as the Settings gear's abstract base `gts.cf.core.settings.setting_type.v1~` followed by one derived type `<vendor>.settings.<category>.<name>.v1~`, validating every segment against the GTS grammar, and **MUST** enforce global key uniqueness alongside leaf-slug uniqueness among a category's active declarations. The setting is itself a GTS **type**: the composed type **MUST** be registered in the types registry — derived from the base, composed with the value type, carrying no `default` — before its row is inserted, and retiring the declaration **MUST NOT** unregister it ([ADR-002](../ADR/ADR-002-setting-key-gts-type-id.md)).
 
@@ -365,7 +365,7 @@ The system **MUST** construct the setting key as the Settings gear's abstract ba
 
 ### Schema Default Semantics
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-schema-default`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-schema-default`
 
 The Schema Default **MUST** live solely in the `default_value` column, be non-null so every resolution chain terminates, support structured object and array values, and be validated against the declaration's value type at create time. It **MUST** remain independent of any override and **MUST NOT** be editable through the declaration update path; changing the effective baseline is done with a platform-scope override instead. A secret-trait declaration **MUST** reject a non-empty Schema Default.
 
@@ -379,7 +379,7 @@ The Schema Default **MUST** live solely in the `default_value` column, be non-nu
 
 ### Scope Class Derivation
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-scope-class`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-scope-class`
 
 Every declaration **MUST** carry a mandatory `scope_class` of `global`, `cascading`, or `local`, and override and inheritance behaviour **MUST** be derived from it rather than from independently settable flags. A `global` declaration **MUST** hold no tenant-scoped value at all — a tenant caller resolves its platform value read-only, subject only to visibility — and what a tenant may do with any setting **MUST** come from `tenant_permissions` rather than from flags on the declaration.
 
@@ -392,7 +392,7 @@ Every declaration **MUST** carry a mandatory `scope_class` of `global`, `cascadi
 
 ### Derived Data Classification
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-classification`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-classification`
 
 The system **MUST** derive `has_secret_trait` from the value type's resolved traits and **MUST** derive the `secret` classification from that trait alone, never from author input. An author-supplied `secret` on a non-secret value type **MUST** be rejected, and a non-`secret` classification supplied on a secret-trait value type **MUST** be rejected.
 
@@ -405,7 +405,7 @@ The system **MUST** derive `has_secret_trait` from the value type's resolved tra
 
 ### Mutation Class Discipline
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-mutation-classes`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-mutation-classes`
 
 The system **MUST** partition declaration changes into descriptive metadata applied immediately under `update` permission plus `If-Match`, behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate.
 
@@ -421,7 +421,7 @@ The system **MUST** partition declaration changes into descriptive metadata appl
 
 ### Retire and Reactivate Lifecycle
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
 
 Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated. Neither action goes through the value write path, and neither deletes values.
 
@@ -440,7 +440,7 @@ Retire **MUST** be an immediate soft delete setting `status` to `retired` in one
 
 ### Contributed Declaration Protection
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-contributed-protection`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-contributed-protection`
 
 A declaration whose `source` is `module_contributed` **MUST** be rejected for administrative update and administrative retire with a contributed-immutable conflict, and the database **MUST** enforce that `owner_module` is present exactly when `source` is `module_contributed`. This feature reads contributed declarations but never writes them.
 
@@ -483,7 +483,7 @@ Declaration reads **MUST** be visibility- and domain-gated with the predicate ap
 
 ### Declaration Mutation Audit
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-audit`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-audit`
 
 The system **MUST** emit an audit record through the Audit Emitter for every declaration create, metadata update, retire, reactivate, and Dependency Group declaration, with the update and retire records carrying pre-images so a category rename or a retirement stays reconstructable from the trail.
 
@@ -502,33 +502,33 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 
 ## 6. Acceptance Criteria
 
-- [ ] Creating a declaration against an existing category returns `201` with a key composed of the Settings base type and a derived type `<vendor>.settings.<category>.<name>.v1~`, the derived half carrying the trailing type terminator, and the composed type registered in the types registry
-- [ ] Creating a declaration against a missing category returns `404`
-- [ ] A `vendor`, category slug, or leaf name containing uppercase, `/`, or a character outside the permitted set returns `400` naming the offending segment
-- [ ] Two active declarations with the same leaf name in the same category conflict on `uq_declaration_category_slug`, while a retired predecessor does not hold its name against a successor
-- [ ] Two declarations with the same leaf name in different categories both succeed, and their keys differ by the category segment
-- [ ] A declaration created without `requires_step_up` is stored with it `true`, and a direct database insert with `anonymous_exposable` true on a `pii` or `secret` classification is rejected by the check constraint
-- [ ] A Schema Default that fails validation against the value type returns `400` with field-level errors and inserts no row
-- [ ] A structured object or array Schema Default is accepted
-- [ ] A declaration on a secret-trait value type with a non-empty Schema Default returns `400`
-- [ ] A declaration on a secret-trait value type is stored with `data_classification` of `secret` even though the author supplied nothing
-- [ ] An author-supplied `secret` classification on a non-secret value type returns `400`
-- [ ] A direct database insert with `data_classification` of `secret` and `has_secret_trait` false is rejected by the equivalence check
-- [ ] A `PATCH` carrying `default_value`, the value type, or `scope_class` returns `400` and modifies no row
-- [ ] A `PATCH` carrying an unrecognized field is rejected rather than silently applied
-- [ ] A `PATCH` tightening `data_classification` from `public` to `pii` succeeds without step-up
-- [ ] A `PATCH` loosening `data_classification` from `pii` to `public` without step-up returns `403`, and succeeds with a valid step-up assertion
-- [ ] A `PATCH` clearing `requires_step_up` or enabling `anonymous_exposable` without step-up returns `403` and leaves the flag unchanged; the opposite edits apply immediately
-- [ ] A `PATCH` on a `module_contributed` declaration returns a contributed-immutable conflict
-- [ ] A `PATCH` without `If-Match` returns `428`, and with a stale `If-Match` returns `412`
-- [ ] Retiring a declaration without step-up returns `403`
-- [ ] Retiring a declaration sets `status` to `retired`, leaves every row in `setting_values` intact, and does not go through the value write path
-- [ ] Retiring a declaration invalidates the cache for the affected scopes in the same transaction that flips the status
-- [ ] A retired declaration still blocks deletion of its category
-- [ ] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
-- [ ] Re-declaring a key that is already `active` returns `409`
+- [x] Creating a declaration against an existing category returns `201` with a key composed of the Settings base type and a derived type `<vendor>.settings.<category>.<name>.v1~`, the derived half carrying the trailing type terminator, and the composed type registered in the types registry
+- [x] Creating a declaration against a missing category returns `404`
+- [x] A `vendor`, category slug, or leaf name containing uppercase, `/`, or a character outside the permitted set returns `400` naming the offending segment
+- [x] Two active declarations with the same leaf name in the same category conflict on `uq_declaration_category_slug`, while a retired predecessor does not hold its name against a successor
+- [x] Two declarations with the same leaf name in different categories both succeed, and their keys differ by the category segment
+- [x] A declaration created without `requires_step_up` is stored with it `true`, and a direct database insert with `anonymous_exposable` true on a `pii` or `secret` classification is rejected by the check constraint
+- [x] A Schema Default that fails validation against the value type returns `400` with field-level errors and inserts no row
+- [x] A structured object or array Schema Default is accepted
+- [x] A declaration on a secret-trait value type with a non-empty Schema Default returns `400`
+- [x] A declaration on a secret-trait value type is stored with `data_classification` of `secret` even though the author supplied nothing
+- [x] An author-supplied `secret` classification on a non-secret value type returns `400`
+- [x] A direct database insert with `data_classification` of `secret` and `has_secret_trait` false is rejected by the equivalence check
+- [x] A `PATCH` carrying `default_value`, the value type, or `scope_class` returns `400` and modifies no row
+- [x] A `PATCH` carrying an unrecognized field is rejected rather than silently applied
+- [x] A `PATCH` tightening `data_classification` from `public` to `pii` succeeds without step-up
+- [x] A `PATCH` loosening `data_classification` from `pii` to `public` without step-up returns `403`, and succeeds with a valid step-up assertion
+- [x] A `PATCH` clearing `requires_step_up` or enabling `anonymous_exposable` without step-up returns `403` and leaves the flag unchanged; the opposite edits apply immediately
+- [x] A `PATCH` on a `module_contributed` declaration returns a contributed-immutable conflict
+- [x] A `PATCH` without `If-Match` returns `428`, and with a stale `If-Match` returns `412`
+- [x] Retiring a declaration without step-up returns `403`
+- [x] Retiring a declaration sets `status` to `retired`, leaves every row in `setting_values` intact, and does not go through the value write path
+- [x] Retiring a declaration invalidates the cache for the affected scopes in the same transaction that flips the status
+- [x] A retired declaration still blocks deletion of its category
+- [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
+- [x] Re-declaring a key that is already `active` returns `409`
 - [ ] A Dependency Group naming a key that resolves to no active declaration returns `400`
 - [ ] An attempt to edit an existing Dependency Group or its constraint in place is rejected
 - [ ] A declaration read outside the caller's visibility, domain, or licence gate returns `404` rather than `403`
 - [ ] Every declaration read returns the `key`, the `value_type_id`, and the resolved trait set
-- [ ] Every create, update, retire, and reactivate produces exactly one audit record, and update and retire records carry pre-images
+- [x] Every create, update, retire, and reactivate produces exactly one audit record, and update and retire records carry pre-images

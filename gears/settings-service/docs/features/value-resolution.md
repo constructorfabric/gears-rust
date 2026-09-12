@@ -269,7 +269,7 @@ Three properties matter more than the walk itself.
 
 ### Cache Invalidation
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-cache-invalidate`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-value-resolution-cache-invalidate`
 
 **Input**: An invalidation request naming a declaration key, and optionally a scope
 
@@ -278,7 +278,7 @@ Three properties matter more than the walk itself.
 **Steps**:
 1. [x] - `p1` - **IF** a specific scope is named → evict the entry for that key and scope on this instance - `inst-vr-inv-1`
 2. [x] - `p1` - **IF** the affected declaration is `cascading` → evict every cached scope for that key, because an ancestor change alters descendants' effective values and they must re-resolve lazily on next read - `inst-vr-inv-2`
-3. [ ] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no value write need be involved - `inst-vr-inv-3`
+3. [x] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no value write need be involved - `inst-vr-inv-3`
 4. [x] - `p1` - Record that the tenant resolver publishes no such hierarchy signal today, so until it does the time-to-live is the only backstop and the post-re-parent staleness window equals it - `inst-vr-inv-4`
 5. [x] - `p1` - **RETURN** having evicted locally only; converging peer replicas is the R2 `cache_invalidate` broadcast and out of scope here - `inst-vr-inv-5`
 
@@ -406,7 +406,7 @@ The cache **MUST** own a configurable time-to-live and **MUST** evict entries ol
 
 ### Hierarchy-Change Invalidation
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-value-resolution-hierarchy-invalidation`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-value-resolution-hierarchy-invalidation`
 
 The cache **MUST** evict the affected subtree's cascading entries on a tenant hierarchy change such as a re-parent or a mid-chain insertion, because an effective value is a function of the ancestor chain and can change with no apply involved. The tenant resolver publishes no such signal today, so this **MUST** be documented as depending on that signal, with the time-to-live as the interim backstop.
 
@@ -435,7 +435,7 @@ The system **MUST** serve `GET /settings-service/v1/settings/{key}` and `GET /se
 
 ### In-Process Reader Binding
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-reader-binding`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-reader-binding`
 
 The system **MUST** implement `SettingsReaderClient` over the resolver — `get_effective` and `get_effective_bulk` with the degradation contract's distinguishable `Unavailable`, `Retired` and `NotFound` outcomes and no Schema Default substituted on failure — and register it into `ClientHub` at gear init. While the release is Embedded-only the gear **MUST** publish no REST contract for the trait and **MUST** fail startup when configuration asks for a remote binding. The reader **MUST NOT** be gated by tenant access, and a secret-trait value **MUST** be returned as an opaque handle.
 
@@ -464,10 +464,10 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] A flagged override at the requested scope is skipped and the nearest valid ancestor value is served instead
 - [x] A flagged override with no valid ancestor falls through to the Schema Default
 - [x] A flagged override is never returned to a consumer and never produces a consumer-facing error
-- [ ] A flagged override remains present in storage and appears on the administrative listing
+- [x] A flagged override remains present in storage and appears on the administrative listing
 - [x] A retired declaration resolves as the retired outcome, distinct from not-found, and its retained values are not returned
 - [x] A key with no declaration resolves as not-found, and the response does not assert which sub-case applies
-- [ ] A key made stale by a category rename is indistinguishable from a key that never existed
+- [x] A key made stale by a category rename is indistinguishable from a key that never existed
 - [x] An unreachable dependency yields the unavailable outcome rather than a substituted Schema Default
 - [x] A setting whose type admits `null` and is explicitly set to `null` is distinguishable from an unset one by source alone
 - [x] A bulk read returns one outcome per key, and a single failing key leaves the other results intact
@@ -484,7 +484,7 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
 - [x] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
 - [x] `GET /settings-service/v1/settings?$filter=key in (…)` returns one entry per key, a hidden or non-existent key carrying its own outcome
-- [ ] `GET /settings-service/v1/settings?$filter=needs_review eq true` lists the flagged overrides in the caller's subtree with their detail and none from a standalone descendant
+- [x] `GET /settings-service/v1/settings?$filter=needs_review eq true` lists the flagged overrides in the caller's subtree with their detail and none from a standalone descendant
 - [ ] Under a base-type grant a page costs one authorization decision; under a narrowed grant denied settings are absent from the page and the count and the page comes back full
 - [x] An OData expression on an unmapped field returns `400` rather than an unfiltered page
-- [ ] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup
+- [x] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup

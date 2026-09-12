@@ -11,8 +11,8 @@ use toolkit::api::operation_builder::{
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 use crate::api::rest::value_dto::{
-    BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactReportDto, SetResultDto,
-    SetValueRequest, ValidateRequest, ValidationReportDto,
+    BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactReportDto, ImpactRequest,
+    SetResultDto, SetValueRequest, ValidateRequest, ValidationReportDto,
 };
 use crate::api::rest::value_handlers as handlers;
 use crate::infra::value_writes::WriteCoordinator;
@@ -247,7 +247,13 @@ pub fn register_routes(
              `if_match`. Step-up is verified once for the request when any target declaration \
              requires it; each change then commits on its own, with no atomicity across \
              changes, and the answer carries one entry per change - committed with its new \
-             tag, or rejected with its reason.",
+             tag, or rejected with one of a fixed vocabulary of codes: `invalid`, \
+             `if_match_required`, `stale`, `conflict`, `forbidden`, `step_up_required`, \
+             `retired`, `not_found`, `unavailable`, `error`. `if_match` is required in \
+             effect - a change without one is rejected `if_match_required` on its own while \
+             the rest proceed; a first write sends the literal `absent`. `retired` covers a \
+             declaration retired after the change was assembled, since the check runs again \
+             as each change commits.",
         )
         .tag(TAG)
         .authenticated()
@@ -293,7 +299,7 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get("/settings-service/v1/settings/{key}/impact")
+    let router = OperationBuilder::post("/settings-service/v1/settings/{key}/impact")
         .operation_id("settings_service.impact")
         .summary("Report the cascading impact of a candidate value")
         .description(
@@ -301,15 +307,17 @@ pub fn register_routes(
              candidate: the first `limit` in breadth-first order (default 100, at most 500), \
              the total, how many were scanned under the node budget of 5000, and whether the \
              report was truncated. Standalone descendants are omitted from the list and the \
-             count. Informational, never blocking a write.",
+             count; each listed descendant's current value is masked by the setting's \
+             classification. A POST because the candidate travels in the body, as it does \
+             for `validate` - a value may run to 64 KiB. Read-only, informational, and never \
+             blocking a write.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
         .path_param("key", "The setting key, a URL-encoded GTS type id")
         .param(tenant_param())
-        .query_param("value", false, "The candidate value, as JSON")
-        .query_param_typed("limit", false, "Page size, one to five hundred", "integer")
+        .json_request::<ImpactRequest>(openapi, "The candidate value and the page size")
         .handler(handlers::impact)
         .json_response_with_schema::<ImpactReportDto>(openapi, StatusCode::OK, "The bounded report")
         .error_400(openapi)

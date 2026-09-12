@@ -78,7 +78,7 @@ Not applicable. Validation is an internal service invoked by other features rath
 
 ### Value Validation Against GTS Type
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-typed-value-validation-validate`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-typed-value-validation-validate`
 
 **Input**: A GTS type id and a candidate value
 
@@ -92,9 +92,9 @@ Not applicable. Validation is an internal service invoked by other features rath
 5. [x] - `p1` - Validate the value structurally against the JSON Schema dialect the registry publishes - `inst-tvv-val-5`
 6. [x] - `p1` - Assert every `format` keyword the schema declares, such as URI and IP address forms, as a hard check rather than an annotation - `inst-tvv-val-6`
 7. [x] - `p1` - **FOR EACH** trait-driven rule on the resolved trait set - `inst-tvv-val-7`
-   1. [ ] - `p1` - Assert a cron-dialect value parses under its declared dialect - `inst-tvv-val-8`
+   1. [x] - `p1` - Assert a cron-dialect value parses under its declared dialect - `inst-tvv-val-8`
    2. [x] - `p1` - Assert a regex-bearing value compiles - `inst-tvv-val-9`
-   3. [ ] - `p1` - Assert a dynamic-enum value is a member of its declared source - `inst-tvv-val-10`
+   3. [x] - `p1` - Assert a dynamic-enum value is a member of its declared source - `inst-tvv-val-10`
    4. [x] - `p1` - Assert an entity reference resolves - `inst-tvv-val-11`
 8. [x] - `p1` - Collect every failure as a field-level error carrying the field path, a stable code, and a message, rather than stopping at the first - `inst-tvv-val-12`
 9. [x] - `p1` - **RETURN** accepted when no error was collected, otherwise the collected errors - `inst-tvv-val-13`
@@ -131,14 +131,14 @@ Not applicable. Validation is an internal service invoked by other features rath
 
 ### Classification Denormalization Sync
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-typed-value-validation-classification-sync`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-typed-value-validation-classification-sync`
 
 **Input**: A declaration whose `data_classification` is being written or changed
 
 **Output**: Value rows whose denormalized classification matches their declaration
 
 **Steps**:
-1. [ ] - `p1` - Copy the declaration's `data_classification` onto every `setting_values` row written for that declaration - `inst-tvv-sync-1`
+1. [x] - `p1` - Copy the declaration's `data_classification` onto every `setting_values` row written for that declaration - `inst-tvv-sync-1`
 2. [x] - `p1` - **WHEN** a declaration's classification changes → re-sync the denormalized column on every existing value row for that declaration - `inst-tvv-sync-2`
 3. [x] - `p1` - Perform the re-sync in the same transaction as the declaration change, so no window exists in which the two disagree - `inst-tvv-sync-3`
 4. [x] - `p1` - **RETURN** having preserved the table check tying a `secret` classification to the presence of `secret_ref` - `inst-tvv-sync-4`
@@ -147,15 +147,15 @@ Not applicable. Validation is an internal service invoked by other features rath
 
 ### SettingValue Review State
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-state-typed-value-validation-review`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-state-typed-value-validation-review`
 
 **States**: `valid`, `needs_review`
 
 **Initial State**: `valid`
 
 **Transitions**:
-1. [ ] - `p2` - **FROM** `valid` **TO** `needs_review` **WHEN** an invalidating value-type upgrade means the stored value no longer validates against the current type - `inst-tvv-state-1`
-2. [ ] - `p2` - **FROM** `needs_review` **TO** `valid` **WHEN** a valid value is set at that scope, or the override is reverted - `inst-tvv-state-2`
+1. [x] - `p2` - **FROM** `valid` **TO** `needs_review` **WHEN** an invalidating value-type upgrade means the stored value no longer validates against the current type - `inst-tvv-state-1`
+2. [x] - `p2` - **FROM** `needs_review` **TO** `valid` **WHEN** a valid value is set at that scope, or the override is reverted - `inst-tvv-state-2`
 
 This wave delivers the `needs_review` and `needs_review_detail` columns, the partial index supporting the administrator's needs-review listing, and the guarantee that a flagged value is excluded from resolution. Both transitions are driven by later features: the flagging side by the Contribution Reconciler on a type upgrade, the clearing side by the Value Writer.
 
@@ -178,7 +178,7 @@ The system **MUST** provide a Type Validator resolving GTS types through the typ
 
 ### Structural and Trait Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-rules`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-rules`
 
 The system **MUST** validate a value structurally against the type's JSON Schema, **MUST** assert declared `format` keywords, and **MUST** enforce trait-driven rules — cron dialect parsing, regex compilation, dynamic-enum membership, and entity-reference resolution — as hard checks that reject the value, never as advisory annotations. Failures **MUST** be reported as a field-level array rather than a single first error.
 
@@ -251,7 +251,7 @@ Uniqueness **MUST** be expressed as two partial unique indexes, one per scope sh
 
 ### Needs-Review Flag
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review`
 
 The system **MUST** carry a non-null `needs_review` boolean with an optional human-readable detail, **MUST** provide the partial index supporting an administrator listing of flagged values, and **MUST** guarantee that a flagged value is excluded from resolution and from apply until corrected.
 
@@ -264,7 +264,7 @@ The system **MUST** carry a non-null `needs_review` boolean with an optional hum
 
 ### Classification Denormalization
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-classification`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-classification`
 
 The system **MUST** copy the owning declaration's `data_classification` onto each value row on write and **MUST** re-sync it in the same transaction when the declaration's classification changes, because a Postgres partial-index predicate can only reference columns of the table being indexed and the search corpus split depends on that predicate.
 
@@ -280,9 +280,9 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [x] A value conforming to its type's schema validates successfully
 - [x] A value violating its type's schema returns every field-level error, not only the first
 - [x] A declared `format` keyword such as a URI or IP address form is enforced, and a malformed instance is rejected
-- [ ] A cron-dialect value that does not parse under its declared dialect is rejected
+- [x] A cron-dialect value that does not parse under its declared dialect is rejected
 - [x] A regex-bearing value that does not compile is rejected
-- [ ] A dynamic-enum value outside its declared source is rejected
+- [x] A dynamic-enum value outside its declared source is rejected
 - [x] An entity reference that does not resolve is rejected
 - [x] A value whose serialized JSON is just under 64 KiB is accepted, and one just over is rejected as too large
 - [x] An integer beyond the double-precision integer range is rejected as not canonical
@@ -300,5 +300,5 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [x] A root-tenant row and a tenant row for the same declaration coexist, as do a tenant row and a subject-scoped row at that tenant
 - [x] A row naming `subject_type` without `subject_id`, or the reverse, is rejected by the both-or-neither check
 - [x] Deleting a declaration cascades to its value rows
-- [ ] Changing a declaration's classification re-syncs every value row in the same transaction, leaving no window where the two disagree
-- [ ] A value flagged `needs_review` carries a detail string, and clearing the flag clears the detail
+- [x] Changing a declaration's classification re-syncs every value row in the same transaction, leaving no window where the two disagree
+- [x] A value flagged `needs_review` carries a detail string, and clearing the flag clears the detail

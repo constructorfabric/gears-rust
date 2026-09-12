@@ -16,7 +16,13 @@ pub struct Model {
     pub id: Uuid,
     pub resource: String,
     pub declaration_key: String,
-    pub tenant_id: Uuid,
+    /// The scope the record is about, absent for a definition — a declaration
+    /// or a category — which is platform-wide and sits at no scope. A scoped
+    /// read cannot see such a row (`tenant_id = $1` and `tenant_id IN (…)` are
+    /// both never true for NULL), which is correct: per-`(setting, scope)`
+    /// history is about values, and these rows are not about a scope at all.
+    /// The history read reaches them through an explicit `IS NULL` branch.
+    pub tenant_id: Option<Uuid>,
     pub operation: String,
     pub actor: String,
     pub actor_classification: String,

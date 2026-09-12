@@ -254,9 +254,21 @@ pub struct SettingItemDto {
     /// What went wrong, for the failure outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// `standard` or `advanced`, from the declaration. Absent only for a
+    /// requested key that has no declaration. Mode is a tag, never a filter:
+    /// every page carries every setting and a client groups them itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl SettingItemDto {
+    /// The same entry, tagged with its declaration's mode.
+    #[must_use]
+    pub fn with_mode(mut self, mode: &str) -> Self {
+        self.mode = Some(mode.to_owned());
+        self
+    }
+
     /// A resolved entry.
     #[must_use]
     pub fn resolved(effective: EffectiveValueDto) -> Self {
@@ -266,6 +278,7 @@ impl SettingItemDto {
             effective: Some(effective),
             flagged: None,
             detail: None,
+            mode: None,
         }
     }
 
@@ -278,6 +291,7 @@ impl SettingItemDto {
             effective: None,
             flagged: Some(flagged),
             detail: None,
+            mode: None,
         }
     }
 
@@ -297,6 +311,7 @@ impl SettingItemDto {
             effective: None,
             flagged: None,
             detail: Some(err.to_string()),
+            mode: None,
         }
     }
 

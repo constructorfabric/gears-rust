@@ -8,7 +8,7 @@ use serde_json::json;
 use settings_service_sdk::EffectiveSource;
 use uuid::Uuid;
 
-use super::EffectiveCache;
+use super::{EffectiveCache, tests_entry};
 use crate::domain::resolution::{EffectiveValue, scope_class};
 
 fn entry(key: &str, tenant: Uuid) -> Arc<EffectiveValue> {
@@ -93,4 +93,31 @@ fn a_declaration_change_evicts_the_whole_key() {
     cache.populate(entry("k", b));
     cache.invalidate_key("k");
     assert!(cache.is_empty());
+}
+
+#[test]
+fn a_hierarchy_change_evicts_the_affected_subtree_across_every_setting() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let moved = Uuid::new_v4();
+    let below = Uuid::new_v4();
+    let elsewhere = Uuid::new_v4();
+    for tenant in [moved, below, elsewhere] {
+        for key in ["one", "two"] {
+            cache.populate(Arc::new(tests_entry(key, tenant)));
+        }
+    }
+    assert_eq!(cache.len(), 6);
+
+    // A re-parent changes what the moved tenant and everything under it
+    // resolves, for every setting at once, with no value write involved.
+    cache.invalidate_subtree(&[moved, below]);
+    assert_eq!(cache.len(), 2);
+    assert!(cache.get("one", elsewhere).is_some());
+    assert!(cache.get("two", elsewhere).is_some());
+    assert!(cache.get("one", moved).is_none());
+    assert!(cache.get("two", below).is_none());
+
+    // An empty subtree is not an instruction to evict everything.
+    cache.invalidate_subtree(&[]);
+    assert_eq!(cache.len(), 2);
 }

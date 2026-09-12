@@ -364,12 +364,11 @@ pub async fn browse_settings(
         let rows = resolver.flagged_overrides(&conn, &ids, &tenants).await?;
         rows.iter()
             .filter_map(|row| {
-                let key = page
-                    .items
-                    .iter()
-                    .find(|d| d.id == row.declaration_id)
-                    .map(|d| d.key.as_str())?;
-                Some(SettingItemDto::flagged(render_flagged(key, row, root, pii)))
+                let declaration = page.items.iter().find(|d| d.id == row.declaration_id)?;
+                Some(
+                    SettingItemDto::flagged(render_flagged(&declaration.key, row, root, pii))
+                        .with_mode(&declaration.mode),
+                )
             })
             .collect()
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
@@ -382,8 +381,12 @@ pub async fn browse_settings(
             .iter()
             .zip(outcomes)
             .map(|(declaration, outcome)| match outcome {
-                Ok(effective) => SettingItemDto::resolved(render(&effective, pii)),
-                Err(err) => SettingItemDto::failed(&declaration.key, &err),
+                Ok(effective) => {
+                    SettingItemDto::resolved(render(&effective, pii)).with_mode(&declaration.mode)
+                }
+                Err(err) => {
+                    SettingItemDto::failed(&declaration.key, &err).with_mode(&declaration.mode)
+                }
             })
             .collect()
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8

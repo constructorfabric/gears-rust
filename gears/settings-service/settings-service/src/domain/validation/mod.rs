@@ -12,6 +12,7 @@
 //! this gear's own services rather than a contract a consumer calls; the
 //! binding over the types registry is in `infra`.
 
+pub mod cron;
 pub mod guards;
 
 use async_trait::async_trait;

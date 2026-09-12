@@ -189,9 +189,19 @@ impl AuditStore {
         query: &ODataQuery,
     ) -> Result<Page<StoredAuditRecord>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        // The scope's own records, plus the setting's scopeless ones. A
+        // declaration event belongs to no tenant and would otherwise be
+        // invisible from every scope — including the one the reader is asking
+        // about — yet "who defined this setting, and when" is part of the same
+        // story as "who changed its value here". `tenant_id = $1` is never true
+        // for NULL, so the branch has to be explicit.
         let base = AuditEntity::find()
             .filter(audit_record::Column::DeclarationKey.eq(declaration_key))
-            .filter(audit_record::Column::TenantId.eq(tenant_id))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(audit_record::Column::TenantId.eq(tenant_id))
+                    .add(audit_record::Column::TenantId.is_null()),
+            )
             .secure()
             .scope_with(scope);
         let paged = ODataQuery {

@@ -22,20 +22,31 @@ const PREFIX: &str = "cf.settings:";
 /// Separator between the setting key and its scope.
 const SCOPE_SEPARATOR: char = '@';
 
-/// The tenant an audit record is written against.
+/// The scope an audit record is written against, when it has one.
 ///
-/// Always a real tenant id, never a sentinel: platform scope is the **root
-/// tenant's** id like any other (DESIGN.md §4.1, §4.7). Keyed by the flat tenant
-/// UUID, never a tenant path — a path is derived state, resolved by the Tenant
-/// Resolver and never stored, so a path-based id would break every historical
-/// record on any reparent or rename, while the immutable UUID stays valid for
-/// the life of the trail.
-pub type AuditTenant = Uuid;
+/// `Some` for anything that happens **at a scope** — a value set, reverted,
+/// removed or cloned, a tenant's access restricted, a secret resolved. The id
+/// is the flat tenant UUID, never a tenant path: a path is derived state,
+/// resolved by the Tenant Resolver and never stored, so a path-based id would
+/// break every historical record on any reparent or rename, while the
+/// immutable UUID stays valid for the life of the trail. Platform scope is the
+/// root tenant's id like any other (DESIGN.md §4.1, §4.7).
+///
+/// `None` for what has no scope to be at. A **declaration** and a **category**
+/// are platform-wide definitions, not values held somewhere: they carry no
+/// `tenant_id` of their own (§4.7), and there is no tenant whose history they
+/// belong to. Writing them against the root tenant would have been a loan, not
+/// a fact — and an expensive one, because learning the root tenant means asking
+/// the Tenant Resolver, which is a cross-gear call these paths have no reason
+/// to make and, from inside their own transaction, cannot make at all.
+pub type AuditTenant = Option<Uuid>;
 
 /// Format the canonical audit resource id for a setting at a scope.
 ///
-/// `cf.settings:{key}@{tenant_id}` for every scope; the root tenant's id is
-/// platform scope.
+/// `cf.settings:{key}@{tenant_id}` when the record has a scope, and
+/// `cf.settings:{key}` when it has none. The root tenant's id is platform
+/// scope; the scopeless form belongs to definitions — a declaration or a
+/// category — which exist once for the whole platform.
 ///
 /// A `(setting, scope)` tuple maps to exactly one id, so history is a single
 /// exact-match query — no prefix or wildcard search.
@@ -59,11 +70,18 @@ pub fn format_raw(id: &str, tenant: AuditTenant) -> String {
     // history stays continuous through every metadata edit — and the flat
     // tenant UUID, never a path a re-parent would invalidate. One pair, one
     // string: per-scope history is an exact match, never a prefix search.
+    //
+    // A record with no scope carries the key alone. The separator is omitted
+    // rather than followed by a placeholder: a sentinel would be a scope that
+    // does not exist, and the whole point of the absent tenant is that there is
+    // nothing there to name.
     let mut out = String::with_capacity(PREFIX.len() + id.len() + 40);
     out.push_str(PREFIX);
     out.push_str(id);
-    out.push(SCOPE_SEPARATOR);
-    out.push_str(&tenant.to_string());
+    if let Some(tenant) = tenant {
+        out.push(SCOPE_SEPARATOR);
+        out.push_str(&tenant.to_string());
+    }
     out
     // @cpt-end:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-3
     // @cpt-end:cpt-cf-settings-service-algo-audit-store-resource-id:p1:inst-as-rid-2

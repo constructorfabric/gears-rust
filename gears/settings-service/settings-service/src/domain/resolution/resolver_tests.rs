@@ -14,7 +14,9 @@ use settings_service_sdk::EffectiveSource;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::resolution::{ScopeTarget, scope_class};
+use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
+use settings_service_sdk::SettingKey;
+
 use crate::test_support::{ResolutionHarness as Harness, SECRET};
 
 fn tenant(id: Uuid) -> ScopeTarget {
@@ -512,4 +514,134 @@ mod access {
             .expect("resolves");
         assert_eq!(value.value, json!(true));
     }
+}
+
+#[tokio::test]
+async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_listing_shows() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+
+    // One flagged row and one sound row on the same setting.
+    h.set_flagged(d, t.a, json!("no longer a boolean")).await;
+    h.set(d, t.c, json!(true)).await;
+
+    // The resolver skips the flagged row without serving or deleting it: `a`
+    // falls through to the Schema Default while the row is still there.
+    let resolved = h
+        .resolve("strict", ScopeTarget::Tenant(t.a))
+        .await
+        .expect("resolves");
+    assert_eq!(resolved.value, json!(false));
+    assert_eq!(resolved.source, EffectiveSource::SchemaDefault);
+
+    // The administrative listing is the other half: it reads rows rather than
+    // resolved values, so the flagged one is exactly what it reports, with the
+    // detail that explains it.
+    let conn = h.db.conn().expect("connection");
+    let mut tenants = h.hierarchy.descendants(t.root).await.expect("descendants");
+    tenants.push(t.root);
+    let flagged = h
+        .resolver
+        .flagged_overrides(&conn, &[d], &tenants)
+        .await
+        .expect("listing");
+    assert_eq!(flagged.len(), 1);
+    assert_eq!(flagged[0].tenant_id, t.a);
+    assert_eq!(flagged[0].value, Some(json!("no longer a boolean")));
+    assert!(flagged[0].needs_review);
+    assert!(flagged[0].needs_review_detail.is_some());
+}
+
+#[tokio::test]
+async fn the_flagged_listing_stops_at_a_standalone_descendant() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+
+    // `s` is standalone below `a`, and holds a flagged row of its own.
+    h.set_flagged(d, t.a, json!("bad at a")).await;
+    h.set_flagged(d, t.s, json!("bad at s")).await;
+
+    // The listing walks the caller's subtree as the hierarchy reports it, and
+    // the hierarchy does not traverse into a standalone tenant from above.
+    let conn = h.db.conn().expect("connection");
+    let mut tenants = h.hierarchy.descendants(t.root).await.expect("descendants");
+    tenants.push(t.root);
+    assert!(!tenants.contains(&t.s), "the subtree stops at the seam");
+    let flagged = h
+        .resolver
+        .flagged_overrides(&conn, &[d], &tenants)
+        .await
+        .expect("listing");
+    let listed: Vec<uuid::Uuid> = flagged.iter().map(|r| r.tenant_id).collect();
+    assert_eq!(listed, vec![t.a]);
+
+    // The row is there; it is simply not this caller's to see. Asked for
+    // directly, the standalone tenant's own listing reports it.
+    let own = h
+        .resolver
+        .flagged_overrides(&conn, &[d], &[t.s])
+        .await
+        .expect("listing");
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].value, Some(json!("bad at s")));
+}
+
+#[tokio::test]
+async fn a_key_stale_after_a_category_rename_is_absent_exactly_as_one_never_declared_is() {
+    let h = Harness::new().await;
+    let declared = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let _ = declared;
+    let t = &h.tree;
+
+    // The category slug rides inside the key, so a setting filed under a
+    // renamed category answers at its new key and no alias is kept. Nothing
+    // resolves the old spelling, and nothing distinguishes it from a spelling
+    // that was never declared: both are the same absence.
+    let stale = SettingKey::contributed(
+        "cf",
+        "demo",
+        "renamed_away",
+        "strict",
+        std::num::NonZeroU32::MIN,
+    )
+    .expect("well-formed");
+    let never = SettingKey::contributed(
+        "cf",
+        "demo",
+        "renamed_away",
+        "never_existed",
+        std::num::NonZeroU32::MIN,
+    )
+    .expect("well-formed");
+
+    let conn = h.db.conn().expect("connection");
+    let stale_outcome = h
+        .resolver
+        .resolve(&conn, &stale, ScopeTarget::Tenant(t.a))
+        .await;
+    let never_outcome = h
+        .resolver
+        .resolve(&conn, &never, ScopeTarget::Tenant(t.a))
+        .await;
+    assert!(
+        matches!(&stale_outcome, Err(DomainError::NotFound { resource }) if *resource == "declaration"),
+        "{stale_outcome:?}"
+    );
+    assert!(
+        matches!(&never_outcome, Err(DomainError::NotFound { resource }) if *resource == "declaration"),
+        "{never_outcome:?}"
+    );
+    assert_eq!(
+        format!("{:?}", stale_outcome.err()),
+        format!("{:?}", never_outcome.err()),
+        "the two absences are indistinguishable"
+    );
 }

@@ -73,3 +73,36 @@ pub const SECRET_HANDLE_MALFORMED: &str = "secret_handle_malformed";
 
 /// A secret handle naming a setting that is not secret-classified.
 pub const NOT_A_SECRET: &str = "not_a_secret";
+
+/// A composed setting key segment outside the GTS grammar.
+pub const SETTING_KEY_SEGMENT: &str = "setting_key_segment";
+
+/// A declaration without a valid scope class.
+pub const SCOPE_CLASS_INVALID: &str = "scope_class_invalid";
+
+/// A declaration whose author-supplied classification contradicts the trait.
+pub const CLASSIFICATION_CONFLICT: &str = "classification_conflict";
+
+/// A non-empty Schema Default on a secret-trait declaration.
+pub const SECRET_DEFAULT_NOT_EMPTY: &str = "secret_default_not_empty";
+
+/// `anonymous_exposable` on a setting that is not `public`.
+pub const EXPOSABLE_NOT_SENSITIVE: &str = "exposable_not_sensitive";
+
+/// A `PATCH` field that is immutable or unknown.
+pub const DECLARATION_FIELD_IMMUTABLE: &str = "declaration_field_immutable";
+
+/// `default_value` omitted from a declaration.
+pub const DEFAULT_REQUIRED: &str = "default_required";
+
+/// A cron expression that does not parse under its declared dialect.
+pub const VALUE_CRON_INVALID: &str = "value_cron_invalid";
+
+/// A cron dialect this gear cannot check.
+pub const VALUE_CRON_DIALECT_UNKNOWN: &str = "value_cron_dialect_unknown";
+
+/// A value outside the membership of its declared dynamic enumeration.
+pub const VALUE_NOT_IN_ENUM: &str = "value_not_in_enum";
+
+/// A dynamic enumeration source that does not resolve.
+pub const VALUE_ENUM_SOURCE_UNKNOWN: &str = "value_enum_source_unknown";

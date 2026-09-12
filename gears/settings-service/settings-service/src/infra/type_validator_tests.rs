@@ -15,9 +15,47 @@ const REGEX_TYPE: &str = "gts.cf.toolkit.settings.type_regex.v1~";
 const REF_TYPE: &str = "gts.cf.toolkit.settings.type_tenant_ref.v1~";
 const SECRET_TYPE: &str = "gts.cf.toolkit.settings.type_api_token.v1~";
 const TENANT_TYPE: &str = "gts.cf.core.am.tenant.v1~";
+const CRON_TYPE: &str = "gts.cf.toolkit.settings.type_cron.v1~";
+const ODD_DIALECT_TYPE: &str = "gts.cf.toolkit.settings.type_quartz_cron.v1~";
+const REGION_TYPE: &str = "gts.cf.toolkit.settings.type_region.v1~";
+const UNKNOWN_SOURCE_TYPE: &str = "gts.cf.toolkit.settings.type_ghost_enum.v1~";
+const REGION_SOURCE: &str = "gts.cf.core.platform.region.v1~";
 
 fn catalogue() -> FakeSource {
     FakeSource::default()
+        .with_type(
+            CRON_TYPE,
+            json!({
+                "$id": format!("gts://{CRON_TYPE}"),
+                "type": "string",
+                "x-gts-traits": { "cron_dialect": "standard" }
+            }),
+        )
+        .with_type(
+            ODD_DIALECT_TYPE,
+            json!({
+                "$id": format!("gts://{ODD_DIALECT_TYPE}"),
+                "type": "string",
+                "x-gts-traits": { "cron_dialect": "quartz" }
+            }),
+        )
+        .with_type(
+            REGION_TYPE,
+            json!({
+                "$id": format!("gts://{REGION_TYPE}"),
+                "type": "string",
+                "x-gts-traits": { "dynamic_enum_source": REGION_SOURCE }
+            }),
+        )
+        .with_type(
+            UNKNOWN_SOURCE_TYPE,
+            json!({
+                "$id": format!("gts://{UNKNOWN_SOURCE_TYPE}"),
+                "type": "string",
+                "x-gts-traits": { "dynamic_enum_source": "gts.cf.core.platform.nowhere.v1~" }
+            }),
+        )
+        .with_enum(REGION_SOURCE, &["eu-west-1", "eu-central-1", "us-east-1"])
         .with_type(
             PORT_TYPE,
             json!({
@@ -243,4 +281,114 @@ async fn trait_resolution_of_an_unknown_type_fails_rather_than_returning_an_empt
         }
         other => panic!("expected a validation error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_cron_value_must_parse_under_the_dialect_its_type_declares() {
+    let v = GtsTypeValidator::new(catalogue());
+    for accepted in ["0 3 * * *", "*/5 9-17 * * mon-fri"] {
+        let result = v
+            .validate_value(CRON_TYPE, &json!(accepted))
+            .await
+            .expect("validates");
+        assert!(result.violations.is_empty(), "{accepted}: {result:?}");
+    }
+
+    let refused = v
+        .validate_value(CRON_TYPE, &json!("0 3 * *"))
+        .await
+        .expect("validates");
+    assert_eq!(refused.violations.len(), 1);
+    assert_eq!(refused.violations[0].code, field::VALUE_CRON_INVALID);
+    assert_eq!(refused.violations[0].field, "value");
+    assert!(
+        refused.violations[0].message.contains("five fields"),
+        "{:?}",
+        refused.violations[0]
+    );
+}
+
+#[tokio::test]
+async fn a_cron_dialect_this_service_cannot_check_refuses_the_value() {
+    // Admitting it would turn the rule into an annotation, which is the one
+    // thing the trait is specified not to be.
+    let v = GtsTypeValidator::new(catalogue());
+    let refused = v
+        .validate_value(ODD_DIALECT_TYPE, &json!("0 0 12 * * ?"))
+        .await
+        .expect("validates");
+    assert_eq!(refused.violations.len(), 1);
+    assert_eq!(
+        refused.violations[0].code,
+        field::VALUE_CRON_DIALECT_UNKNOWN
+    );
+    assert!(
+        refused.violations[0].message.contains("quartz"),
+        "{:?}",
+        refused.violations[0]
+    );
+}
+
+#[tokio::test]
+async fn a_dynamic_enum_value_must_be_a_member_of_its_source() {
+    let v = GtsTypeValidator::new(catalogue());
+    let accepted = v
+        .validate_value(REGION_TYPE, &json!("eu-west-1"))
+        .await
+        .expect("validates");
+    assert!(accepted.violations.is_empty(), "{accepted:?}");
+
+    let refused = v
+        .validate_value(REGION_TYPE, &json!("mars-north-2"))
+        .await
+        .expect("validates");
+    assert_eq!(refused.violations.len(), 1);
+    assert_eq!(refused.violations[0].code, field::VALUE_NOT_IN_ENUM);
+    // The message names what is on offer, so a client can correct it.
+    assert!(
+        refused.violations[0].message.contains("eu-west-1"),
+        "{:?}",
+        refused.violations[0]
+    );
+}
+
+#[tokio::test]
+async fn a_dynamic_enum_source_this_deployment_does_not_know_refuses_the_value() {
+    let v = GtsTypeValidator::new(catalogue());
+    let refused = v
+        .validate_value(UNKNOWN_SOURCE_TYPE, &json!("anything"))
+        .await
+        .expect("validates");
+    assert_eq!(refused.violations.len(), 1);
+    assert_eq!(refused.violations[0].code, field::VALUE_ENUM_SOURCE_UNKNOWN);
+}
+
+#[tokio::test]
+async fn every_trait_failure_is_collected_rather_than_only_the_first() {
+    // A structured value carrying a trait on the whole is checked leaf by leaf,
+    // and each bad leaf is its own field-level error.
+    let source = catalogue().with_type(
+        "gts.cf.toolkit.settings.type_schedules.v1~",
+        json!({
+            "$id": "gts://gts.cf.toolkit.settings.type_schedules.v1~",
+            "type": "array",
+            "items": { "type": "string" },
+            "x-gts-traits": { "cron_dialect": "standard" }
+        }),
+    );
+    let v = GtsTypeValidator::new(source);
+    let result = v
+        .validate_value(
+            "gts.cf.toolkit.settings.type_schedules.v1~",
+            &json!(["0 3 * * *", "not cron", "60 0 * * *"]),
+        )
+        .await
+        .expect("validates");
+    assert_eq!(result.violations.len(), 2);
+    let fields: Vec<&str> = result
+        .violations
+        .iter()
+        .map(|violation| violation.field.as_str())
+        .collect();
+    assert_eq!(fields, vec!["value/1", "value/2"]);
 }

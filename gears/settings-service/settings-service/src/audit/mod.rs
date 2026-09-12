@@ -174,8 +174,10 @@ pub struct AuditRecord {
     pub resource: String,
     /// The setting key, denormalized from `resource` for the scoped query.
     pub declaration_key: String,
-    /// The scope as an id; the root tenant's id is platform scope.
-    pub tenant_id: Uuid,
+    /// The scope as an id; the root tenant's id is platform scope. Absent on a
+    /// record about a **definition** — a declaration or a category — which is
+    /// platform-wide and sits at no scope at all (see [`AuditTenant`]).
+    pub tenant_id: AuditTenant,
     /// What happened.
     pub operation: AuditOperation,
     /// Who did it.
@@ -203,7 +205,8 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    /// A successful mutation of `key` at `tenant` by an administrator.
+    /// A successful mutation of `key` at `tenant` by an administrator, or of a
+    /// scopeless definition when `tenant` is `None`.
     ///
     /// The actor is classified `pii`: an administrator identity is personal
     /// data. A module actor calls [`Self::by_module`].
@@ -289,8 +292,8 @@ pub struct StoredAuditRecord {
     pub id: Uuid,
     /// The setting key.
     pub declaration_key: String,
-    /// The scope as an id.
-    pub tenant_id: Uuid,
+    /// The scope as an id; absent on a record about a definition.
+    pub tenant_id: AuditTenant,
     /// What happened.
     pub operation: AuditOperation,
     /// Who did it.

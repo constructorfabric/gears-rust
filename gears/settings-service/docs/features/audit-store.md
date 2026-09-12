@@ -124,8 +124,8 @@ Two things about the record itself are fixed before it is written. Masking happe
 **Output**: The resource id string both the write and the history read use
 
 **Steps**:
-1. [x] - `p1` - Format `cf.settings:{key}@{tenant_id}` — the key verbatim, since it is immutable for the life of the declaration and so keeps a setting's history continuous through every metadata edit - `inst-as-rid-1`
-2. [x] - `p1` - Use the flat tenant UUID for every scope, the root tenant's id being platform scope, and never a tenant path, which is derived state that a re-parent or rename would invalidate under every historical record - `inst-as-rid-2`
+1. [x] - `p1` - Format `cf.settings:{key}@{tenant_id}` where the record has a scope, and `cf.settings:{key}` where it has none — the key verbatim, since it is immutable for the life of the declaration and so keeps a setting's history continuous through every metadata edit - `inst-as-rid-1`
+2. [x] - `p1` - Use the flat tenant UUID for every scope, the root tenant's id being platform scope, and never a tenant path, which is derived state that a re-parent or rename would invalidate under every historical record; omit the scope entirely — separator and all — for a record about a **definition**, which sits at no scope and would otherwise have to borrow one - `inst-as-rid-2`
 3. [x] - `p1` - **RETURN** the id, which maps one `(setting, scope)` pair to exactly one string, so per-scope history is a single exact-match query and never a prefix or wildcard search - `inst-as-rid-3`
 
 ### Retention Horizon
@@ -152,7 +152,7 @@ Not applicable. An audit record is appended once and never transitions; its only
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-table`
 
-The system **MUST** persist audit records in an `audit_records` table carrying `resource`, `declaration_key`, a non-null `tenant_id`, `operation`, `actor`, `actor_classification`, masked `pre_value` and `post_value`, `outcome`, `request_id`, a nullable `change_set_id`, `occurred_at` and a nullable `retain_until`, with check constraints on the `operation` and `outcome` vocabularies, `idx_audit_scoped` on `(declaration_key, tenant_id, occurred_at DESC)` and the partial `idx_audit_retention`. The table **MUST** be append-only: no code path issues an `UPDATE`, and the only `DELETE` is retention pruning.
+The system **MUST** persist audit records in an `audit_records` table carrying `resource`, `declaration_key`, a `tenant_id` that is set for a record about a scope and null for one about a definition, `operation`, `actor`, `actor_classification`, masked `pre_value` and `post_value`, `outcome`, `request_id`, a nullable `change_set_id`, `occurred_at` and a nullable `retain_until`, with check constraints on the `operation` and `outcome` vocabularies, `idx_audit_scoped` on `(declaration_key, tenant_id, occurred_at DESC)` and the partial `idx_audit_retention`. The table **MUST** be append-only: no code path issues an `UPDATE`, and the only `DELETE` is retention pruning.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-append`
@@ -182,7 +182,7 @@ The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` �
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-resource-id`
 
-The system **MUST** form every record's `resource` as `cf.settings:{key}@{tenant_id}` through one formatter shared by the write side and the history read, keyed by the flat tenant UUID with the root tenant's id as platform scope and never by a tenant path, so that a `(setting, scope)` pair maps to exactly one id and its history is a single exact-match query.
+The system **MUST** form every record's `resource` as `cf.settings:{key}@{tenant_id}`, or as `cf.settings:{key}` when the record is about a definition and has no scope, through one formatter shared by the write side and the history read, keyed by the flat tenant UUID with the root tenant's id as platform scope and never by a tenant path, so that a `(setting, scope)` pair maps to exactly one id and its history is a single exact-match query.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-resource-id`
@@ -240,11 +240,11 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 - [x] When the record cannot be inserted, the mutation is rejected as unavailable and the caller sees no change
 - [x] A `secret`-classified value appears in no record; its pre-image and post-image carry the mask token
 - [x] A record's `resource` equals the shared formatter's output for the same key and tenant, and the history read finds it by that pair
-- [x] The platform-scope record of a category or a platform-level value carries the root tenant's id, never a sentinel
+- [x] A platform-level **value** record carries the root tenant's id, never a sentinel; a record about a **definition** — a category or a declaration — carries no tenant at all, so the write borrows no scope and asks the Tenant Resolver for nothing
 - [x] History for one setting at one scope returns only that pair's records, newest first, and a second page follows the cursor without duplicates
 - [x] A `pii`-classified actor is masked for a caller without the PII entitlement and unmasked for one with it
 - [x] History of a hidden setting returns `404`, and history of a setting for a tenant outside the caller's subtree, or for a standalone descendant, returns `403`
-- [ ] History of a retired declaration is readable
+- [x] History of a retired declaration is readable
 - [x] A setting with no history returns `200` with an empty page
 - [x] A record inserted with no `retain_until` is pruned only after the configured default horizon, and one with an explicit `retain_until` only after that instant
 - [x] No code path issues an `UPDATE` against `audit_records`, and the only `DELETE` is pruning

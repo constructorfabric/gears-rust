@@ -118,6 +118,32 @@ impl EffectiveCache {
 
     /// Evict a key's entries for the given tenants only: an access change on a
     /// tenant and its descendants, whatever the scope class.
+    /// Evict every cached entry of the given tenants, whatever the setting.
+    ///
+    /// What a tenant hierarchy change costs: an effective value is a function
+    /// of the ancestor chain, so a re-parent or a mid-chain insertion changes
+    /// what a whole subtree resolves with no value write anywhere. The signal
+    /// that would call this does not exist yet — the tenant resolver publishes
+    /// no hierarchy event — so until it does the time-to-live is the only
+    /// backstop and the post-re-parent staleness window equals it.
+    // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-hierarchy-invalidation:p1
+    pub fn invalidate_subtree(&self, tenants: &[Uuid]) {
+        // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-3
+        if tenants.is_empty() {
+            return;
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Every key, because which settings cascade is a property of each
+        // declaration and the subtree's chain changed for all of them at once;
+        // a non-cascading entry re-resolves to the same answer, so evicting it
+        // costs a read and risks nothing.
+        entries.retain(|(_, tenant), _| !tenants.contains(tenant));
+        // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-3
+    }
+
     pub fn invalidate_tenants(&self, key: &str, tenants: &[Uuid]) {
         let mut entries = self
             .entries

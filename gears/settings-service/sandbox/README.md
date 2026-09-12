@@ -152,6 +152,28 @@ the mask token `********`; there is no way to read a secret back. Recovering
 a lost secret means setting it again. A consuming gear resolves the plaintext
 through the SDK reader, never through REST.
 
+Declaring a setting as an administrator:
+`POST /settings-service/v1/declarations` with `value_type_id`, `vendor`,
+`name`, `category_id`, `default_value` and `scope_class`, plus optional
+`description`, `mode`, `requires_step_up`, `anonymous_exposable`,
+`domain_affinity`, `licence_feature` and `data_classification`. The key is
+composed by the service as `<vendor>.settings.<category>.<name>.v1~` under the
+Settings base type, so a caller never supplies it. `default_value` is
+mandatory and is validated against the value type; a secret-trait type takes
+an empty placeholder instead. The classification is derived from the type's
+traits, so `secret` cannot be asked for. Answers `201` with `Location` and
+`ETag`. A key that holds a retired declaration is revived instead, answering
+`200` with `reactivated` true, which needs step-up.
+
+`PATCH /settings-service/v1/declarations/{id}` with `If-Match` edits
+descriptive metadata. `default_value`, the value type and `scope_class` are
+refused as immutable, as is any field the surface does not know. Tightening a
+gate or a classification applies at once; loosening one needs step-up.
+`DELETE /settings-service/v1/declarations/{id}` with `If-Match` retires:
+a soft delete answering `200` with the retired body, values retained. Retire
+and revive always need step-up, and a gear's contributed declarations answer
+`409` to both.
+
 | Status | When |
 |---|---|
 | 400 | malformed key or `tenant`, invalid value (with `violations`), unsupported OData, over 500 batch changes |
@@ -166,8 +188,6 @@ through the SDK reader, never through REST.
 
 ## What is not there yet
 
-- Administrative creation of declarations: they come from gears through the
-  SDK. The demo gear is the only contributor.
 - Secret values live in the `credstore` gear; the sandbox binds its static
   plugin, which keeps entries in memory only. After a server restart a secret
   setting still shows its masked row, but the credential behind it is gone

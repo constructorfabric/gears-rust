@@ -100,7 +100,8 @@ impl<R: DeclarationRepository> DeclarationService<R> {
     /// Separate from [`Self::render`] rather than a one-element call into it:
     /// taking the single element back out of a vector would be an unwrap that
     /// only the shape of this function proves safe.
-    async fn render_one(&self, declaration: Declaration) -> RenderedDeclaration {
+    /// One declaration with its value type's resolved traits, for a response.
+    pub async fn render_one(&self, declaration: Declaration) -> RenderedDeclaration {
         let traits = self.traits_for(std::slice::from_ref(&declaration)).await;
         pair(declaration, &traits)
     }
