@@ -172,6 +172,47 @@ impl From<WorkerError> for CanonicalError {
                 ),
                 "admission",
             ),
+            // Corruption, not input: an entity row without the current-state row its
+            // own admission transaction wrote. Nothing the caller can act on.
+            WorkerError::CurrentStateMissing { gts_id, entity_id } => opaque_internal(
+                &format!("entity '{gts_id}' (id {entity_id}) has no current-state row of its kind"),
+                "admission",
+            ),
+            // Its own arm, not folded into the one above: the entity row is gone,
+            // which points at a different table and a different cause.
+            WorkerError::EntityVanished { gts_id, entity_id } => opaque_internal(
+                &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
+                "admission",
+            ),
+            // Corruption of an immutable stored revision, so the document itself
+            // stays in the operator log and never reaches the caller.
+            WorkerError::BaselineUnparsable { gts_id, source } => opaque_internal(
+                &format!("the stored baseline document for '{gts_id}' is not valid JSON: {source}"),
+                "admission",
+            ),
+            // A retryable snapshot race, not a malformed candidate.
+            WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
+                &format!("dependency target '{gts_id}' vanished before its edge was committed"),
+                "admission",
+            ),
+            // Contention, not corruption: the request is correct and can be
+            // repeated after the short hint advertised by the response.
+            WorkerError::ResourceVersionExhausted { gts_id } => opaque_internal(
+                &format!("entity '{gts_id}' cannot advance resource_version after i64::MAX"),
+                "admission",
+            ),
+            WorkerError::RevisionNumberExhausted { gts_id } => opaque_internal(
+                &format!("entity '{gts_id}' cannot allocate a revision after i32::MAX"),
+                "admission",
+            ),
+            // Exhaustive only: `process_item` records this as a failed item.
+            WorkerError::RefusedAfterWrite(failure) => {
+                opaque_internal(&failure.to_string(), "admission")
+            }
+            // Exhaustive only: `process_item` retries or records revalidation exhaustion.
+            WorkerError::RevalidationRequired(drift) => {
+                opaque_internal(&drift.to_string(), "admission")
+            }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
         }
@@ -341,6 +382,22 @@ impl From<AcceptanceError> for CanonicalError {
                 format!("force on '{gts_id}' has no cross-minor compatibility check to waive"),
                 field::VALIDATION_FAILED,
             ),
+            // The identifier is at fault, not the flag, so the violation points at
+            // the identifier field rather than at `force`.
+            AcceptanceError::UnreadableVersion { gts_id } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' names no readable major in its last segment"),
+                field::INVALID_GTS_ID,
+            ),
+            AcceptanceError::MinorTypeSchemaRevision { gts_id } => invalid_candidate(
+                gts_id,
+                vf::EXPECTED_RESOURCE_VERSION,
+                format!(
+                    "minor-bearing Type Schema '{gts_id}' is immutable; register a new minor instead"
+                ),
+                field::VALIDATION_FAILED,
+            ),
             AcceptanceError::ZeroPrecondition { gts_id } => invalid_candidate(
                 gts_id,
                 vf::EXPECTED_RESOURCE_VERSION,
@@ -354,19 +411,6 @@ impl From<AcceptanceError> for CanonicalError {
                 gts_id,
                 vf::EXPECTED_RESOURCE_VERSION,
                 format!("expected_resource_version {version} on '{gts_id}' is negative"),
-                field::VALIDATION_FAILED,
-            ),
-            // `400`, not `501`, and for the same reason as the deletion refusal
-            // above: what the caller sent is not accepted by this API version, and
-            // answering well-formed client input with a `5xx` would page an
-            // operator over a client's request.
-            AcceptanceError::RevisionNotAccepted { gts_id, version } => invalid_candidate(
-                gts_id,
-                vf::EXPECTED_RESOURCE_VERSION,
-                format!(
-                    "expected_resource_version {version} on '{gts_id}' is refused: content \
-                     revisions are not accepted yet"
-                ),
                 field::VALIDATION_FAILED,
             ),
 
@@ -414,7 +458,10 @@ impl From<AcceptanceError> for CanonicalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::admission::AdmissionFailureReason;
     use crate::domain::admission::acceptance::PolicyRefusalError;
+    use crate::domain::admission::vector::{VectorDrift, VectorRole};
+    use crate::domain::admission::worker::ItemFailure;
     use crate::domain::gts_store::StoreBuildError;
     use crate::domain::policy::PolicyRefusal;
     use toolkit_canonical_errors::Problem;
@@ -560,22 +607,24 @@ mod tests {
                 field::VALIDATION_FAILED,
             ),
             (
+                AcceptanceError::UnreadableVersion { gts_id: id.clone() },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::MinorTypeSchemaRevision { gts_id: id.clone() },
+                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::VALIDATION_FAILED,
+            ),
+            (
                 AcceptanceError::ZeroPrecondition { gts_id: id.clone() },
                 violation_field::EXPECTED_RESOURCE_VERSION,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::NegativePrecondition {
-                    gts_id: id.clone(),
-                    version: -1,
-                },
-                violation_field::EXPECTED_RESOURCE_VERSION,
-                field::VALIDATION_FAILED,
-            ),
-            (
-                AcceptanceError::RevisionNotAccepted {
                     gts_id: id,
-                    version: 1,
+                    version: -1,
                 },
                 violation_field::EXPECTED_RESOURCE_VERSION,
                 field::VALIDATION_FAILED,
@@ -650,6 +699,41 @@ mod tests {
             worker_problem(WorkerError::ConformingTypeAbsent {
                 gts_id: "instance-secret".to_owned(),
                 type_id: "type-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::CurrentStateMissing {
+                gts_id: "state-secret".to_owned(),
+                entity_id: 7,
+            }),
+            worker_problem(WorkerError::EntityVanished {
+                gts_id: "entity-secret".to_owned(),
+                entity_id: 7,
+            }),
+            worker_problem(WorkerError::RevisionNumberExhausted {
+                gts_id: "revision-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::DependencyTargetAbsent {
+                gts_id: "dependency-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::ResourceVersionExhausted {
+                gts_id: "version-secret".to_owned(),
+            }),
+            // Cover the variants whose `Display` includes caller-visible content.
+            worker_problem(WorkerError::RefusedAfterWrite(ItemFailure::new(
+                AdmissionFailureReason::Unknown("reason-secret".to_owned()),
+                "message-secret".to_owned(),
+            ))),
+            worker_problem(WorkerError::RevalidationRequired(VectorDrift::Moved {
+                gts_id: "drift-secret".to_owned(),
+                role: VectorRole::Dependent,
+                recorded: 1,
+                found: 2,
+            })),
+            // The `source` is a real serde error, since the variant interpolates both
+            // it and the identifier into its `Display`.
+            worker_problem(WorkerError::BaselineUnparsable {
+                gts_id: "baseline-secret".to_owned(),
+                source: serde_json::from_str::<serde_json::Value>("{not-secret-json")
+                    .expect_err("the fixture must not parse"),
             }),
             worker_problem(WorkerError::Storage(ScopeError::Invalid("storage-secret"))),
             worker_problem(WorkerError::Db(DbError::InvalidConfig(

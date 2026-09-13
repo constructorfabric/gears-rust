@@ -457,9 +457,10 @@ mod tests {
             billing.rest_endpoint.as_ref().map(|e| e.uri.as_str()),
             Some("http://billing:8080")
         );
-        // The cross-gear snapshot never inlines the OpenAPI document; consumers
-        // fetch it per gear via `get_openapi_spec`.
-        assert!(billing.openapi_spec.is_none());
+        // The cross-gear snapshot never inlines the OpenAPI document; it carries
+        // only the hash, and consumers fetch the document per gear via
+        // `get_openapi_spec`.
+        assert!(billing.openapi_spec_hash.is_some());
         assert!(
             api.get_openapi_spec("billing")
                 .await
@@ -478,7 +479,7 @@ mod tests {
             Some("http://reporting:7000")
         );
         assert!(reporting.rest_endpoint.is_none());
-        assert!(reporting.openapi_spec.is_none());
+        assert!(reporting.openapi_spec_hash.is_none());
     }
 
     fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
@@ -636,20 +637,16 @@ mod tests {
             .unwrap();
         assert_eq!(matched.len(), 1);
         assert!(
-            matched[0].openapi_spec.is_none(),
-            "in-process resolve_by_labels must not attach the OpenAPI document"
+            matched[0].openapi_spec_hash.is_some(),
+            "in-process resolve_by_labels carries only the spec hash, never the document"
         );
 
         // The plain enumeration path is spec-free too: only the hash rides
         // along, the document is fetched via `get_openapi_spec`.
         let listed = api.list_instances("worker").await.unwrap();
         assert!(
-            listed[0].openapi_spec.is_none(),
-            "list_instances must not attach the OpenAPI document"
-        );
-        assert!(
             listed[0].openapi_spec_hash.is_some(),
-            "list_instances must still carry the spec hash"
+            "list_instances must carry the spec hash, never the document"
         );
     }
 

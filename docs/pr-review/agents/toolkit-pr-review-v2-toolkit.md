@@ -63,6 +63,7 @@ Apply **only** to files listed in `toolkit_owned_files`, and apply **only** thes
 
 ## Checklist References
 
+- `docs/pr-review/comment-style.md` — comment voice. **Mandatory read before emitting findings.**
 - `docs/pr-review/toolkit-framework-compliance-review.md` — full definitions and examples for all TOOLKIT-* checks
 - `docs/toolkit_unified_system/README.md` — authoritative reference for ToolKit architecture
 
@@ -85,6 +86,7 @@ Schema (one object per finding):
   "line": 42,
   "severity": "CRITICAL",
   "id": "TOOLKIT-DB-002",
+  "comment": "This runs raw SQL outside a migration, so it bypasses the ORM scoping the rest of the layer relies on.",
   "issue": "Raw SQL executed outside a migration file.",
   "fix": "Route the query through the ORM or a repository abstraction instead of inline SQL."
 }
@@ -93,7 +95,19 @@ Schema (one object per finding):
 Field rules:
 - `"file"`: repo-root-relative path, exactly as it appears in the diff (strip `a/` or `b/` prefix). Must be in `toolkit_owned_files`.
 - `"line"`: integer, must be in `changed_ranges[file]` for that file. If unsure, omit the finding.
+  Exception: when `"file"` is in `deleted_files` it has no RIGHT-side line at all, so omit this
+  field entirely (do not guess a value) and the finding posts as a file-level comment. Use that
+  exception only when the deletion **itself** violates one of your check IDs, such as a removed
+  public item under RUST-NO-007. Do not use it to comment on the contents of removed code; most
+  file deletions are deliberate and are not findings.
 - `"severity"`: one of `"CRITICAL"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` (verbatim strings, uppercase). TOOLKIT-DB-* violations are typically CRITICAL or HIGH.
 - `"id"`: exact check ID from the list above (TOOLKIT-CORE-*, TOOLKIT-REST-*, TOOLKIT-DB-*, TOOLKIT-CLIENT-*, TOOLKIT-ODATA-*, TOOLKIT-OOP-*).
-- `"issue"`: one sentence, engineering English, no praise or hedging.
-- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion).
+- `"comment"`: **the inline comment body a human will read on GitHub.** 1 to 3 sentences.
+  `docs/pr-review/comment-style.md` is the contract for how it is worded, including which
+  phrasings are banned and how to keep a finding's uncertainty intact. Read it before emitting any
+  finding; its rules are deliberately not restated here, so that this file cannot drift from it.
+- `"issue"`: terse analytic restatement for the summary table and the local-mode report. One
+  sentence, engineering English, no praise or hedging. This is never posted as a comment, so it
+  does not need to read naturally.
+- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion). Table and
+  report only, like `"issue"`.

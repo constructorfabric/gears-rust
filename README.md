@@ -121,7 +121,7 @@ cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --moc
 
 # Core server configuration (global section)
 server:
-  home_dir: "~/.cfgears
+  home_dir: "~/.cf-gears"
 
 # Database configuration (global section)
 database:
@@ -133,7 +133,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/cfgears.log"
+    file: "logs/cf-gears.log"
     file_level: warn
     max_age_days: 28
     max_backups: 3
@@ -181,7 +181,7 @@ See **[Security Overview §9 — Cryptographic Stack & FIPS-140-3](docs/security
 
 # Global server configuration
 server:
-  home_dir: "~/.cfgears"
+  home_dir: "~/.cf-gears"
 
 # Database configuration
 database:
@@ -223,12 +223,14 @@ gears:
 
 ### Environment Variable Overrides
 
-Configuration supports environment variable overrides with `CF_` prefix:
+Configuration supports environment variable overrides with the `APP__` prefix,
+using `__` to separate nesting levels:
 
 ```bash
-export CF_GEARS_DATABASE_URL="postgres://user:pass@localhost/db"
-export CF_GEARS_API_GATEWAY_BIND_ADDR="0.0.0.0:8080"
-export CF_GEARS_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
+export APP__SERVER__PORT=8087
+export APP__MODULES__api_gateway__CONFIG__BIND_ADDR="0.0.0.0:8080"
+export APP__LOGGING__DEFAULT__CONSOLE_LEVEL="debug"
+export APP__OPENTELEMETRY__TRACING__ENABLED=true
 ```
 
 ## Testing

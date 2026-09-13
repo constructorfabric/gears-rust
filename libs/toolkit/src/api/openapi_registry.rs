@@ -27,6 +27,7 @@ use utoipa::openapi::{
 
 use crate::api::operation_builder;
 use toolkit_canonical_errors::problem;
+use toolkit_contract::StreamFraming;
 
 /// Type alias for schema collections used in API operations.
 type SchemaCollection = Vec<(String, RefOr<Schema>)>;
@@ -270,9 +271,15 @@ impl OpenApiRegistryImpl {
                 // empty `content_type`. Emit just `description` — attaching a
                 // `content` block would make code-generators expect a body.
                 if !r.content_type.is_empty() {
+                    // Streaming media types are json-like here too: their
+                    // declared schema is the *item* type, so it must render as
+                    // a `$ref` rather than as an opaque string blob. Derived
+                    // from `StreamFraming` rather than hard-coded, so a new
+                    // framing variant is covered automatically instead of
+                    // silently falling through to the opaque-string branch.
                     let is_json_like = r.content_type == "application/json"
                         || r.content_type == problem::APPLICATION_PROBLEM_JSON
-                        || r.content_type == "text/event-stream";
+                        || StreamFraming::is_stream_media_type(r.content_type);
                     let content = if is_json_like {
                         // Manually build content to preserve the correct content type.
                         ContentBuilder::new()
@@ -1247,6 +1254,42 @@ mod tests {
 
         assert_eq!(schema["$ref"], "#/components/schemas/GearDto");
         assert!(schema.get("type").is_none());
+    }
+
+    /// `OperationBuilder::multipart_json` declares the *item* schema under the
+    /// bare `multipart/mixed` media-type key: no `boundary=` parameter (that is
+    /// generated per response at runtime, so it is not a property of the
+    /// operation), and a `$ref` rather than the opaque string blob a
+    /// non-json-like media type would render as.
+    #[test]
+    fn multipart_mixed_response_emits_the_item_ref_under_a_bare_media_type() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response(
+            "/events",
+            "stream_events",
+            Some(ResponseSchema::Ref {
+                schema_name: "FrameDto".to_owned(),
+            }),
+        );
+        spec.responses[0].content_type = "multipart/mixed";
+        registry.register_operation(&spec);
+
+        let doc = serde_json::to_value(registry.build_openapi(&test_info()).unwrap()).unwrap();
+        let content = &doc["paths"]["/events"]["get"]["responses"]["200"]["content"];
+
+        assert_eq!(
+            content["multipart/mixed"]["schema"]["$ref"],
+            "#/components/schemas/FrameDto"
+        );
+        // The runtime boundary must not leak into the spec's media-type key.
+        assert_eq!(
+            content.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+            Some(vec![&"multipart/mixed".to_owned()])
+        );
+        // Not rendered as a string with a custom format — that is what a
+        // non-json-like media type would produce, and it would lose the item
+        // schema entirely.
+        assert!(content["multipart/mixed"]["schema"].get("format").is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-v2-tests
-description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 9 test anti-patterns. Returns JSON array only."
+description: "Test quality review sub-agent for toolkit-pr-review-v2. Covers RUST-TEST-001 and 10 test anti-patterns. Returns JSON array only."
 tools: Read, Bash
 model: inherit
 ---
@@ -42,6 +42,8 @@ Tests must exercise the actual behavior of the code, not just "it compiles" or "
 - Tests must include edge cases and error paths, not only happy paths.
 - Complex logic must have multiple tests covering different scenarios.
 - If a function is added or changed but has no tests, it's a finding.
+- New parser, validator, or serde-roundtrip code should carry at least one property-based test (`proptest`/`quickcheck`): no panic on arbitrary input, and roundtrip identity. Point examples alone are a finding for this class of code.
+- Check tier placement. A test that needs live services or network access must not land in the unit tier; it belongs under `tests/integration` or `tests/e2e`, with the tier stated, so the default suite stays runnable without external dependencies.
 
 ### TEST-QUALITY-1 — Constructor Echo
 
@@ -139,6 +141,18 @@ fn test_config() {
 
 **Finding**: If a test relies solely on snapshot assertions (insta, pretty_assertions snapshots, etc.) without also asserting on specific properties or behavior, flag it as TEST-QUALITY-8.
 
+The other shape to catch is an assertion on a `Debug` rendering:
+
+```rust
+assert_eq!(format!("{:?}", cfg), "Config { path: \"/tmp/x\" }");
+```
+
+`Debug` output is not a stable format, and Rust 1.98 escapes more characters than earlier
+versions, so this can start failing with no change to the code under test. Assert on the data, or
+on an owned `render_*()` method whose format the type actually promises. The risk is highest in
+audit-log and redaction tests, where the assertion is often the only thing checking that a secret
+stays masked.
+
 ### TEST-QUALITY-9 — Suppressed or Deleted Failing Test
 
 **Anti-pattern**: A previously-failing test is deleted, weakened (assertion loosened or removed), or marked `#[ignore]` in the diff, with no linked follow-up issue or clear justification.
@@ -151,10 +165,34 @@ fn test_config() {
 
 Do not omit either case for lack of a line — see Scope Rules and Output Contract.
 
+### TEST-QUALITY-10 — Assertion-Macro Temporaries
+
+**Anti-pattern**: A guard, lock, or `RefCell` borrow created inline inside `assert_eq!` / `assert_ne!` instead of being bound to a `let` first.
+
+```rust
+assert_eq!(shared.lock().unwrap().len(), 1);
+```
+
+**Problem**: Rust 1.98 added a temporary scope to these macros, so the temporary now drops at the end of the assertion rather than the end of the statement. That changes borrow-checker outcomes: a test that compiled before can stop compiling, and a lock-held-too-long bug the old code exposed can be masked.
+
+**Finding**: Flag as TEST-QUALITY-10 and ask for the value to be read inside a short block, with the assertion on the copy:
+
+```rust
+let len = { shared.lock().unwrap().len() };
+assert_eq!(len, 1);
+```
+
+Do not ask for a bare `let guard = shared.lock().unwrap();` at statement level: that holds the lock
+for the rest of the scope, and any later `shared.lock()` in the same test deadlocks on a
+non-reentrant `std::sync::Mutex`. A guard should outlive the block only when several reads must be
+atomic, and then it should be scoped explicitly. Applies only on Rust >= 1.98 — check the toolchain
+pin before flagging.
+
 ---
 
 ## Checklist References
 
+- `docs/pr-review/comment-style.md` — comment voice. **Mandatory read before emitting findings.**
 - `docs/pr-review/toolkit-tests-quality-review.md` — full anti-pattern definitions and examples
 - Code under review in the diff
 
@@ -184,6 +222,7 @@ Schema (one object per finding):
   "line": 42,
   "severity": "MEDIUM",
   "id": "TEST-QUALITY-1",
+  "comment": "This only checks that the constructor stored what we passed it. It will keep passing if the logic underneath breaks.",
   "issue": "Constructor echo: test only verifies the constructor stores its input.",
   "fix": "Test behavior that depends on the constructor, not just the constructor itself."
 }
@@ -195,6 +234,7 @@ For a `TEST-QUALITY-9` finding whose `"file"` is listed in `context.json`'s `del
   "file": "gears/foo/tests/dead_letter.rs",
   "severity": "HIGH",
   "id": "TEST-QUALITY-9",
+  "comment": "The whole test file is gone with nothing linked. Was it failing? If so we lose the coverage and the signal.",
   "issue": "Test file was deleted wholesale with no linked follow-up.",
   "fix": "Restore the test or open a tracked issue and reference it in the PR description."
 }
@@ -204,6 +244,13 @@ Field rules:
 - `"file"`: repo-root-relative path, exactly as it appears in the diff (strip `a/` or `b/` prefix).
 - `"line"`: integer, must be in `changed_ranges[file]` for that file. If unsure, omit the finding. Omit this field entirely (do not set it to a guessed value) when `"file"` is in `deleted_files`.
 - `"severity"`: one of `"CRITICAL"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` (verbatim strings, uppercase). Test quality issues are typically MEDIUM or LOW.
-- `"id"`: exact check ID: `"RUST-TEST-001"` for coverage gaps, or `"TEST-QUALITY-1"` through `"TEST-QUALITY-9"` for anti-patterns.
-- `"issue"`: one sentence, engineering English, no praise or hedging.
-- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion).
+- `"id"`: exact check ID: `"RUST-TEST-001"` for coverage gaps, or `"TEST-QUALITY-1"` through `"TEST-QUALITY-10"` for anti-patterns.
+- `"comment"`: **the inline comment body a human will read on GitHub.** 1 to 3 sentences.
+  `docs/pr-review/comment-style.md` is the contract for how it is worded, including which
+  phrasings are banned and how to keep a finding's uncertainty intact. Read it before emitting any
+  finding; its rules are deliberately not restated here, so that this file cannot drift from it.
+- `"issue"`: terse analytic restatement for the summary table and the local-mode report. One
+  sentence, engineering English, no praise or hedging. This is never posted as a comment, so it
+  does not need to read naturally.
+- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion). Table and
+  report only, like `"issue"`.

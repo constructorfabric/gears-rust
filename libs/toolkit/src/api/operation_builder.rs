@@ -473,7 +473,7 @@ where
         T: toolkit_odata::filter::FilterField,
     {
         use std::fmt::Write as _;
-        use toolkit_odata::filter::FieldKind;
+        use toolkit_odata::filter::FilterOp;
 
         let mut filter = self
             .spec
@@ -486,21 +486,24 @@ where
             let name = field.name().to_owned();
             let kind = field.kind();
 
-            let ops: Vec<String> = match kind {
-                FieldKind::String => vec!["eq", "ne", "contains", "startswith", "endswith", "in"],
-                FieldKind::Uuid => vec!["eq", "ne", "in"],
-                FieldKind::Bool => vec!["eq", "ne"],
-                FieldKind::I64
-                | FieldKind::F64
-                | FieldKind::Decimal
-                | FieldKind::DateTimeUtc
-                | FieldKind::Date
-                | FieldKind::Time => {
-                    vec!["eq", "ne", "gt", "ge", "lt", "le", "in"]
-                }
-            }
+            // Published straight from the parser's own table, so the contract
+            // cannot promise an operator the parser refuses, or hide one it
+            // accepts.
+            let ops: Vec<String> = [
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::Gt,
+                FilterOp::Ge,
+                FilterOp::Lt,
+                FilterOp::Le,
+                FilterOp::Contains,
+                FilterOp::StartsWith,
+                FilterOp::EndsWith,
+                FilterOp::In,
+            ]
             .into_iter()
-            .map(String::from)
+            .filter(|op| kind.allows(*op))
+            .map(|op| op.to_string())
             .collect();
 
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));
@@ -1555,6 +1558,41 @@ where
             _license_state: self._license_state,
         }
     }
+
+    /// First response: `multipart/mixed` stream of JSON items, one item per
+    /// body part — the server-to-server counterpart to [`Self::sse_json`].
+    ///
+    /// `T` is the *item* type, exactly as for SSE: the media-type key in the
+    /// spec is the bare `multipart/mixed`, with no `boundary=` parameter,
+    /// because the boundary is generated per response at runtime by
+    /// [`crate::http::multipart::MultipartJsonStream`] and is not a property of
+    /// the operation.
+    pub fn multipart_json<T>(
+        mut self,
+        openapi: &dyn OpenApiRegistry,
+        description: impl Into<String>,
+    ) -> OperationBuilder<H, Present, S, A, L>
+    where
+        T: utoipa::ToSchema + utoipa::PartialSchema + api_dto::ResponseApiDto + 'static,
+    {
+        let name = ensure_schema::<T>(openapi);
+        self.spec.responses.push(ResponseSpec {
+            status: http::StatusCode::OK.as_u16(),
+            content_type: "multipart/mixed",
+            description: description.into(),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
+        });
+        OperationBuilder {
+            spec: self.spec,
+            method_router: self.method_router,
+            _has_handler: self._has_handler,
+            _has_response: PhantomData::<Present>,
+            _state: self._state,
+            _auth_state: self._auth_state,
+            _license_state: self._license_state,
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1753,6 +1791,28 @@ where
         self.spec.upsert_response(ResponseSpec {
             status: http::StatusCode::OK.as_u16(),
             content_type: "text/event-stream",
+            description: description.into(),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
+        });
+        self
+    }
+
+    /// Additional `multipart/mixed` response (if the operation already has
+    /// one). See [`OperationBuilder::multipart_json`] on the first-response
+    /// builder for what `T` and the media-type key mean.
+    pub fn multipart_json<T>(
+        mut self,
+        openapi: &dyn OpenApiRegistry,
+        description: impl Into<String>,
+    ) -> Self
+    where
+        T: utoipa::ToSchema + utoipa::PartialSchema + api_dto::ResponseApiDto + 'static,
+    {
+        let name = ensure_schema::<T>(openapi);
+        self.spec.upsert_response(ResponseSpec {
+            status: http::StatusCode::OK.as_u16(),
+            content_type: "multipart/mixed",
             description: description.into(),
             schema: Some(ResponseSchema::Ref { schema_name: name }),
             headers: Vec::new(),

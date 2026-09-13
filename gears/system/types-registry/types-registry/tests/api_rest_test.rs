@@ -151,6 +151,7 @@ async fn router_with(v1_ready: bool) -> Router {
         dispatch,
         // Admission inline, as `init()` wires it until T21.
         AdmissionMode::Inline,
+        common::metrics(),
     ));
     types_registry::api::rest::routes::register_routes(
         Router::new(),
@@ -733,13 +734,14 @@ async fn a_zero_precondition_is_refused() {
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
 }
 
-/// The review's probe, as a standing test: a candidate in a **closed** region
-/// naming `expected_resource_version` is refused, and nothing is registered.
+/// The review's probe, as a standing test: naming `expected_resource_version` must
+/// not get a candidate into a **closed** region.
 ///
-/// Before the fix this path skipped SPEC §8.1's policy gate — the gate is skipped
-/// for revisions — and then committed the candidate as an ordinary creation at
-/// `resource_version = 1`. Naming a version was therefore enough to register
-/// inside a region the deployment closes.
+/// A revision bypasses SPEC §8.1's policy gate at acceptance — otherwise closing a
+/// region would freeze the entities already in it — so this is accepted and then
+/// refused *terminally by the worker*, which requires the identifier to exist at the
+/// named version. What this pins is that it is never committed as an ordinary
+/// creation inside the closed region.
 #[tokio::test]
 async fn naming_a_version_does_not_get_a_candidate_past_a_closed_region() {
     let router = router_with_db().await;
@@ -752,17 +754,87 @@ async fn naming_a_version_does_not_get_a_candidate_past_a_closed_region() {
         }]
     });
 
-    let refused = call(&router, submit(Some("key-1"), &body)).await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-    let text = serde_json::to_string(&refused.body).expect("serialize");
+    let accepted = call(&router, submit(Some("key-1"), &body)).await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let operation_id = accepted.body["operation_id"]
+        .as_str()
+        .expect("operation_id");
+
+    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let item = &operation.body["items"][0];
+    assert_eq!(item["status"], json!("failed"));
+    let text = serde_json::to_string(&item["error"]).expect("serialize");
     assert!(
-        text.contains("expected_resource_version"),
-        "the offending field must be named: {text}",
+        text.contains("precondition_failed"),
+        "the item must name the precondition it lost: {text}",
     );
 
     // The claim that matters: no entity exists in the closed region.
     let entity = call(&router, get(&format!("{V2}/entities/{acme}"))).await;
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
+}
+
+/// The standing read criterion for anything that extends the write path: whatever
+/// becomes storable is readable through the public route.
+#[tokio::test]
+async fn a_revision_is_readable_through_the_entity_route() {
+    let router = router_with_db().await;
+    call(&router, submit(Some("key-1"), &one_candidate(CF_TYPE))).await;
+
+    let mut revised = schema(CF_TYPE);
+    revised["title"] = json!("revised");
+    let body = json!({
+        "items": [{
+            "gts_id": CF_TYPE,
+            "content": revised,
+            "expected_resource_version": 1,
+        }]
+    });
+    let accepted = call(&router, submit(Some("key-2"), &body)).await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let operation_id = accepted.body["operation_id"]
+        .as_str()
+        .expect("operation_id");
+    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
+    assert_eq!(operation.body["items"][0]["resource_version"], json!(2));
+
+    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    assert_eq!(entity.status, StatusCode::OK);
+    assert_eq!(entity.body["resource_version"], json!(2));
+    assert_eq!(entity.body["content"]["title"], json!("revised"));
+    assert_eq!(
+        entity.body["resolved_schema"]["title"],
+        json!("revised"),
+        "the artifacts were re-materialized with the pointer, not left on revision 1",
+    );
+}
+
+/// Resubmitting the current content is terminal and successful, and says so with
+/// its own status rather than as a second `succeeded`.
+#[tokio::test]
+async fn unchanged_content_reports_unchanged_on_the_operation() {
+    let router = router_with_db().await;
+    call(&router, submit(Some("key-1"), &one_candidate(CF_TYPE))).await;
+
+    let body = json!({
+        "items": [{
+            "gts_id": CF_TYPE,
+            "content": schema(CF_TYPE),
+            "expected_resource_version": 1,
+        }]
+    });
+    let accepted = call(&router, submit(Some("key-2"), &body)).await;
+    let operation_id = accepted.body["operation_id"]
+        .as_str()
+        .expect("operation_id");
+    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let item = &operation.body["items"][0];
+    assert_eq!(item["status"], json!("unchanged"));
+    assert_eq!(item["resource_version"], json!(1));
+
+    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    assert_eq!(entity.body["resource_version"], json!(1));
 }
 
 /// An absent operation and an absent entity are both `404` problem documents

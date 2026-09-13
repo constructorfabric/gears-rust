@@ -227,8 +227,7 @@ pub fn register_routes(
         .error_413(openapi)
         .error_415(openapi)
         .error_422(openapi)
-        // `require_registry` answers 503 where no database is bound
-        // (`no-db.yaml`, `--mock`): declared, not merely enforced.
+        // An unbound database is a deployment state, so this 503 has no `Retry-After`.
         .error_503(openapi)
         .register(router, openapi);
 

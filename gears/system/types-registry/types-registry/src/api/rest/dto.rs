@@ -220,6 +220,22 @@ mod tests {
     use gts::GtsIdSegment;
     use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
+    #[test]
+    fn operation_item_error_preserves_reason_and_message() -> Result<(), serde_json::Error> {
+        let payload = serde_json::json!({
+            "reason": "incompatible_with_baseline",
+            "message": "PropertyAdded at $.payload",
+        });
+        let dto = OperationItemDto::from(OperationItemRecord {
+            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+            status: OperationItemStatus::Failed,
+            resource_version: None,
+            error: Some(payload.to_string()),
+        });
+        assert_eq!(serde_json::to_value(dto)?["error"], payload);
+        Ok(())
+    }
+
     fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
         gts::GtsId::try_new(full_id)
             .unwrap_or_else(|e| panic!("invalid GTS id `{full_id}`: {e}"))
@@ -457,12 +473,14 @@ pub struct SubmitEntityDto {
     /// The authored document.
     pub content: serde_json::Value,
     /// Optimistic precondition. **Omit** to require that the identifier does not
-    /// exist; a literal `0` is refused. Positive versions are reserved for T11
-    /// revisions and are synchronously refused until revisions are implemented.
+    /// exist; a literal `0` is refused. A positive version names a content
+    /// revision: the entity must exist at exactly that `resource_version`, and a
+    /// mismatch fails the candidate terminally rather than rebasing it.
     #[serde(default)]
     pub expected_resource_version: Option<i64>,
-    /// ADR-0004 `force`: waive one cross-minor compatibility check. Refused where
-    /// the deployment disallows it, or where the candidate has no such check.
+    /// ADR-0004: waive one cross-minor check when the deployment permits it.
+    /// Intra-entity revisions are never waivable. The revision records the
+    /// effective waiver as `compat_forced`.
     #[serde(default)]
     pub force: Option<bool>,
 }
@@ -506,7 +524,10 @@ pub struct OperationItemDto {
     pub gts_id: String,
     pub status: OperationItemStatusDto,
     pub resource_version: Option<i64>,
-    /// The structured refusal reason, when this candidate failed.
+    /// The refusal as `{reason, message}`, when this candidate failed.
+    /// `reason` is a stable machine-readable code; `message` is an explanation for humans.
+    /// Compatibility messages include causes and schema locations where available.
+    /// Clients must not parse `message` or depend on its wording.
     pub error: Option<serde_json::Value>,
 }
 

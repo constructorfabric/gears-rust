@@ -46,6 +46,27 @@ pub enum EntityKind {
     Instance,
 }
 
+impl EntityKind {
+    /// The public spelling, for a message a caller reads.
+    ///
+    /// `Display` rather than `{:?}` because a refusal naming `TypeSchema` is a
+    /// wire-visible string: `clippy::use_debug` is denied precisely so a derive's
+    /// output cannot become an API by accident.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeSchema => "Type Schema",
+            Self::Instance => "Registered Instance",
+        }
+    }
+}
+
+impl std::fmt::Display for EntityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Whether an entity is live or a tombstone (ADR-0008).
 ///
 /// P0 has no managed `deprecated` state. `Deleted` entities remain readable so
@@ -117,15 +138,22 @@ pub enum OperationItemStatus {
 
 /// Why one entity depends on another.
 ///
-/// `GtsRef` constrains what a value may *name* and is not itself a
-/// schema-resolution dependency, which is why the strict reference extractor in
-/// `gts-rust` excludes it from resolution. Its edge protects the entity the value
-/// or the constraint names, not constraint satisfiability.
+/// `x-gts-ref` is excluded because it validates identifier syntax without reading a target.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DependencyKind {
     SchemaRef,
-    GtsRef,
     Derivation,
     InstanceOf,
+}
+
+impl DependencyKind {
+    /// Edge verb used in quarantine refusal messages.
+    pub(crate) const fn quarantine_verb(self) -> &'static str {
+        match self {
+            Self::SchemaRef => "$ref",
+            Self::Derivation => "derive from",
+            Self::InstanceOf => "conform to",
+        }
+    }
 }

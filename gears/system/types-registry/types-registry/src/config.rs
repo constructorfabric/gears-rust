@@ -37,12 +37,9 @@ pub struct TypesRegistryConfig {
     #[serde(default)]
     pub local_client: LocalClientSettings,
 
-    /// Whether ADR-0004 `force` may waive a cross-minor compatibility check.
-    ///
-    /// Off by default: waiving compatibility is a deployment decision, and a
-    /// registry that accepted `force` because a caller asked would make the
-    /// guarantee advisory. The per-candidate gate is acceptance step 7 (T7);
-    /// this key is what it consults.
+    /// Allow ADR-0004 `force` for cross-minor checks; disabled by default.
+    /// Acceptance and each worker pass check this setting. Intra-entity checks
+    /// remain unwaivable.
     #[serde(default)]
     pub allow_compatibility_force: bool,
 
@@ -64,6 +61,32 @@ pub struct TypesRegistryConfig {
     /// Admission-worker tuning (SPEC §10.3).
     #[serde(default)]
     pub worker: WorkerSettings,
+
+    /// Metrics naming configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Metrics configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Metric name prefix.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl MetricsConfig {
+    /// Resolve the effective prefix: explicit config value, or `snake_case(gear_name)`.
+    #[must_use]
+    pub fn effective_prefix(&self, gear_name: &str) -> String {
+        let trimmed = self.prefix.trim();
+        if trimmed.is_empty() {
+            heck::ToSnakeCase::to_snake_case(gear_name)
+        } else {
+            trimmed.to_owned()
+        }
+    }
 }
 
 /// Bounds on one request's work and on one document's size.
@@ -81,47 +104,21 @@ pub struct Limits {
     /// fingerprinted (`AcceptanceError::AuthoredDocumentTooLarge`).
     pub authored_document: ByteSize,
     /// Largest resolved document the registry will materialize (§3.2).
-    ///
-    /// **Accepted, not enforced in P0.** Its place is D3's materialization
-    /// (`domain::artifacts::materialize`), which has no configuration in scope;
-    /// threading the limits through `worker::run_operation` is T14's change. Also
-    /// the figure T30's SDK cache sizes its byte bound against.
+    /// Enforced on the canonical bytes of each effective artifact at admission and refresh.
     pub resolved_document: ByteSize,
     /// Largest reference-resolution closure one candidate may need.
-    ///
-    /// **Accepted, not enforced in P0**, and *not* the same bound as
-    /// [`Self::activation_write_set`]: this counts what one candidate must read to
-    /// resolve, that counts the dependents an admission writes. Its consumer is the
-    /// reference-resolution work (T13/T19).
+    /// Enforced before resolution, per candidate or refreshed schema, including its own document.
+    /// Distinct documents count once; unrelated documents in a shared store do not count.
     pub resolution_closure: usize,
     /// Largest number of candidates in one batch.
     ///
     /// **Enforced** — acceptance step 1 (`AcceptanceError::BatchTooLarge`).
     pub batch_candidates: usize,
-    /// Largest number of dependent rows one admission may refresh (P0-specific,
-    /// SPEC §4).
-    ///
-    /// **Accepted, not enforced in P0.** SPEC §8.1 step 4.6 is what bounds, and that
-    /// step arrives with **T14** (reverse-impact worklist and artifact refresh);
-    /// until then no admission refreshes a dependent at all, so there is no write set
-    /// to bound. `CLOSURE_BOUND` in `infra::storage::repo::dependency_repo` is a
-    /// *different* bound that borrowed this number as its starting value — on the
-    /// closure a store build reads, not on the rows an admission writes — so setting
-    /// this key does not move it. T14 is where the configured value should reach the
-    /// worker, and the sibling limits above with it.
+    /// Maximum dependents reached by one revision; also caps CTE depth (SPEC §4).
     pub activation_write_set: usize,
-    /// `GET /entities` page size when the caller names none.
-    ///
-    /// **Validated, and without a consumer until T27**: `GET /entities` is still
-    /// served from the pre-database in-memory path, which pages nothing. Validated
-    /// anyway because the pair constrains each other and a boot is the only honest
-    /// place to say so.
+    /// Default `GET /entities` page size; not consumed in P0.
     pub page_size_default: u32,
-    /// Largest page a caller may ask for. A request above this is **refused,
-    /// not clamped** (D12) — a clamped page looks complete and is not.
-    ///
-    /// **Validated, and without a consumer until T27** — see
-    /// [`Self::page_size_default`].
+    /// Maximum `GET /entities` page size; not consumed in P0.
     pub page_size_max: u32,
 }
 
@@ -143,19 +140,10 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerSettings {
-    /// Wall-clock bound on one operation's admission.
-    ///
-    /// **Accepted, not enforced in P0.** There is nothing to time out against: a
-    /// pass is a direct call, not a lease, so no operation can be held by a worker
-    /// that stopped. **T21** turns this into the lease that lets a live pass be told
-    /// apart from a dead one — see `worker::mark_running`, which cannot honour its
-    /// own CAS until then.
+    /// Wall-clock admission bound; accepted but not enforced in P0.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub operation_timeout: Duration,
-    /// Revalidation attempts before an item is terminalized as `failed` (D4).
-    ///
-    /// **Accepted, not enforced in P0.** Nothing revalidates yet: the guard that
-    /// rolls back and retries is the revision-vector comparison, which is **T15**.
+    /// Revalidation attempts before failure; `1` allows no retry.
     pub max_revalidation_attempts: u32,
 }
 
@@ -325,6 +313,7 @@ impl Default for TypesRegistryConfig {
             limits: Limits::default(),
             registration_policy: BTreeMap::new(),
             worker: WorkerSettings::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -339,7 +328,8 @@ impl TypesRegistryConfig {
     ///
     /// # Errors
     /// [`ConfigError::Policy`] for an unparsable region or vendor list, and
-    /// [`ConfigError::Limits`] for a default page size above the maximum.
+    /// [`ConfigError::Limits`] for an invalid limit, or [`ConfigError::Worker`]
+    /// for an invalid worker setting.
     pub fn validate(&self) -> Result<RegistrationPolicy, ConfigError> {
         if self.limits.page_size_default > self.limits.page_size_max {
             return Err(ConfigError::Limits(format!(
@@ -352,7 +342,7 @@ impl TypesRegistryConfig {
                 "limits.page_size_default and limits.page_size_max must be positive".to_owned(),
             ));
         }
-        // The two enforced limits, held to the same standard as the page sizes: a
+        // The enforced admission limits, held to the same standard as the page sizes: a
         // zero here is a deployment that boots and then refuses every request it
         // receives — `BatchTooLarge` for any batch, `AuthoredDocumentTooLarge` for any
         // document — which is worse than a boot that says why.
@@ -366,36 +356,41 @@ impl TypesRegistryConfig {
                 "limits.authored_document must be positive: 0 refuses every candidate".to_owned(),
             ));
         }
+        if self.limits.resolved_document.bytes() == 0 {
+            return Err(ConfigError::Limits(
+                "limits.resolved_document must be positive".to_owned(),
+            ));
+        }
+        if self.limits.resolution_closure == 0 {
+            return Err(ConfigError::Limits(
+                "limits.resolution_closure must be positive".to_owned(),
+            ));
+        }
+        // Zero would reject every revision with dependents.
+        if self.limits.activation_write_set == 0 {
+            return Err(ConfigError::Limits(
+                "limits.activation_write_set must be positive: 0 refuses every revision of a \
+                 type anything depends on"
+                    .to_owned(),
+            ));
+        }
+        // At least one evaluation attempt is required.
+        if self.worker.max_revalidation_attempts == 0 {
+            return Err(ConfigError::Worker(
+                "worker.max_revalidation_attempts must be positive: 0 refuses every candidate \
+                 without evaluating it"
+                    .to_owned(),
+            ));
+        }
         Ok(RegistrationPolicy::compile(&self.registration_policy)?)
     }
 
-    /// The keys this deployment moved off their default that P0 accepts **without
-    /// enforcing**, ready to be named in one boot-time line.
-    ///
-    /// Not a validation failure: a P1-ready configuration legitimately carries every
-    /// one of them. But an operator who writes `activation_write_set: 1024` and
-    /// silently gets the hardcoded 512 has no way to find that out — that is the
-    /// defect, not the missing enforcement, which is scheduled. Each field's
-    /// docstring says which task binds it.
-    ///
-    /// Comparison is against the default rather than against presence, because
-    /// `#[serde(default)]` erases the difference. That errs towards silence — an
-    /// explicit `resolution_closure: 64` gets no warning — which is the right
-    /// direction, since that deployment gets what it asked for.
+    /// Non-default settings accepted but not enforced in P0.
     #[must_use]
     pub fn inert_limit_keys(&self) -> Vec<&'static str> {
         let limits = Limits::default();
         let worker = WorkerSettings::default();
         let mut keys = Vec::new();
-        if self.limits.resolved_document != limits.resolved_document {
-            keys.push("limits.resolved_document");
-        }
-        if self.limits.resolution_closure != limits.resolution_closure {
-            keys.push("limits.resolution_closure");
-        }
-        if self.limits.activation_write_set != limits.activation_write_set {
-            keys.push("limits.activation_write_set");
-        }
         if self.limits.page_size_default != limits.page_size_default {
             keys.push("limits.page_size_default");
         }
@@ -404,9 +399,6 @@ impl TypesRegistryConfig {
         }
         if self.worker.operation_timeout != worker.operation_timeout {
             keys.push("worker.operation_timeout");
-        }
-        if self.worker.max_revalidation_attempts != worker.max_revalidation_attempts {
-            keys.push("worker.max_revalidation_attempts");
         }
         keys
     }
@@ -432,6 +424,8 @@ pub enum ConfigError {
     Policy(#[from] PolicyConfigError),
     #[error("invalid limits: {0}")]
     Limits(String),
+    #[error("invalid worker settings: {0}")]
+    Worker(String),
 }
 
 #[cfg(test)]

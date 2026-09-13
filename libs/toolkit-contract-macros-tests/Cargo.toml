@@ -28,6 +28,9 @@ trybuild = { workspace = true }
 
 # Required by UI test cases
 async-trait = { workspace = true }
+# The streaming projections emit `Pin<Box<dyn futures_core::Stream>>`, so a UI
+# case that names that type needs the crate in scope.
+futures-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }

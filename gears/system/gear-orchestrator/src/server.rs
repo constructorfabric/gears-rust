@@ -141,9 +141,6 @@ impl DirectoryService for DirectoryServiceImpl {
             .await
             .map_err(|e| lookup_status(&e))?;
         instances.retain(|inst| selector.matches(&inst.labels));
-        for inst in &mut instances {
-            inst.openapi_spec = None;
-        }
 
         let resp = ListInstancesResponse {
             instances: instances
@@ -168,15 +165,12 @@ impl DirectoryService for DirectoryServiceImpl {
         let resp = ListAllInstancesResponse {
             instances: instances
                 .into_iter()
-                // `openapi_spec` and `labels` are both omitted from the broad
-                // cross-gear snapshot; `without_labels` is the shared transform
-                // (see the `list_all_instances` trait doc). The spec is dropped
-                // here too — it is never inlined into this snapshot.
+                // `labels` are omitted from the broad cross-gear snapshot;
+                // `without_labels` is the shared transform (see the
+                // `list_all_instances` trait doc). The full OpenAPI document is
+                // never inlined into any enumeration — `InstanceInfo` carries
+                // only the `openapi_spec_hash`.
                 .map(|inst| domain_instance_to_proto(inst.without_labels()))
-                .map(|mut proto| {
-                    proto.openapi_spec = None;
-                    proto
-                })
                 .collect(),
         };
 
@@ -274,7 +268,6 @@ fn domain_instance_to_proto(i: ServiceInstanceInfo) -> InstanceInfo {
         endpoint_uri: i.endpoint.map(|ep| ep.uri).unwrap_or_default(),
         version: i.version.unwrap_or_default(),
         rest_endpoint_uri: i.rest_endpoint.map(|ep| ep.uri),
-        openapi_spec: i.openapi_spec,
         openapi_spec_hash: i.openapi_spec_hash,
         labels: i.labels.into_iter().collect(),
         state: domain_state_to_proto(i.state) as i32,
@@ -874,8 +867,8 @@ mod tests {
         for inst in &all {
             assert!(inst.rest_endpoint_uri.is_some());
             assert!(
-                inst.openapi_spec.is_none(),
-                "discovery snapshot must not inline the OpenAPI document"
+                inst.openapi_spec_hash.is_some(),
+                "discovery snapshot carries only the spec hash, never the inline document"
             );
         }
         let gears: Vec<_> = all.iter().map(|i| i.gear_name.as_str()).collect();
@@ -1273,8 +1266,8 @@ mod tests {
             Some("1")
         );
         assert!(
-            matched[0].openapi_spec.is_none(),
-            "label-resolve path must strip the OpenAPI document"
+            matched[0].openapi_spec_hash.is_some(),
+            "label-resolve path carries only the spec hash, never the inline document"
         );
 
         // A selector matching nothing returns an empty list (not an error).
@@ -1303,12 +1296,8 @@ mod tests {
             .instances;
         assert_eq!(all_spec_free.len(), 2, "empty selector matches every shard");
         assert!(
-            all_spec_free.iter().all(|i| i.openapi_spec.is_none()),
-            "list_instances must never inline the OpenAPI document"
-        );
-        assert!(
             all_spec_free.iter().all(|i| i.openapi_spec_hash.is_some()),
-            "list_instances must still carry the spec hash"
+            "list_instances must carry the spec hash, never the inline document"
         );
     }
 
@@ -1366,8 +1355,8 @@ mod tests {
             Some("1")
         );
         assert!(
-            matched[0].openapi_spec.is_none(),
-            "resolve_by_labels must not carry the OpenAPI document"
+            matched[0].openapi_spec_hash.is_some(),
+            "resolve_by_labels carries only the spec hash, never the inline document"
         );
 
         // A selector matching nothing yields an empty set (not an error).
@@ -1383,8 +1372,8 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 2, "empty selector matches every shard");
         assert!(
-            all.iter().all(|i| i.openapi_spec.is_none()),
-            "empty-selector resolve_by_labels must not carry the OpenAPI document"
+            all.iter().all(|i| i.openapi_spec_hash.is_some()),
+            "empty-selector resolve_by_labels carries only the spec hash"
         );
 
         server.abort();

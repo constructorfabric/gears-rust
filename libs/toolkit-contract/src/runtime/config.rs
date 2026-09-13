@@ -122,18 +122,43 @@ pub struct ClientConfig {
     /// itself clamped to [`RetryConfig::max_delay`], including a server-advised
     /// `Retry-After`). There is deliberately no separate whole-call budget field.
     pub timeout: Duration,
-    /// Per-**event** idle deadline for SSE streams: the maximum gap between two
-    /// received stream events before the stream is treated as timed out. A
-    /// long-lived stream is NOT bounded by [`timeout`](Self::timeout) (which
-    /// would kill a healthy slow stream); it is bounded by this larger idle
-    /// deadline instead. Defaults to 60s (> the unary default).
-    pub sse_idle_timeout: Duration,
+    /// Per-**item** idle deadline for streams of any framing: the maximum gap
+    /// between two received wire chunks before the stream is treated as timed
+    /// out. A long-lived stream is NOT bounded by [`timeout`](Self::timeout)
+    /// (which would kill a healthy slow stream); it is bounded by this larger
+    /// idle deadline instead. Defaults to 60s (> the unary default).
+    ///
+    /// This is *idle*, not *quiet*: any wire chunk resets it, including ones
+    /// that dispatch no item (an SSE keepalive comment, a multipart part header
+    /// block arriving on its own).
+    pub stream_idle_timeout: Duration,
     /// Retry policy applied to methods marked `#[retryable]`.
     pub retry: RetryConfig,
-    /// SSE-stream reconnect policy. By default `max_attempts: 0` — stream
-    /// failures bubble up unchanged. Set explicitly to opt into HTML5
-    /// EventSource-style `Last-Event-ID` reconnect.
-    pub sse_reconnect: ReconnectConfig,
+    /// Reconnect policy for streams of any framing. By default
+    /// `max_attempts: 0` — stream failures bubble up unchanged. Set explicitly
+    /// to opt into transparent re-open on a transient failure.
+    ///
+    /// Two limits are deliberate rather than accidental:
+    ///
+    /// - **It applies only to a method whose open is immediate**
+    ///   (`#[streaming] fn`). A fallible open (`#[streaming] async fn`) carries
+    ///   domain semantics the client must not blindly repeat — a re-open can
+    ///   collide with an exclusion lease the first open acquired, and its
+    ///   failure would land as a stream item, past the caller's open-time error
+    ///   handling. Generated code therefore passes
+    ///   [`ReconnectConfig::disabled`] for a fallible open regardless of this
+    ///   value.
+    /// - **Resume via `Last-Event-ID` is SSE-only.** A reconnected
+    ///   `multipart/mixed` stream re-issues the original request with no resume
+    ///   token, because the framing has none. The transport still reopens it,
+    ///   but that is a blind restart, not a resume: the server replays the body
+    ///   from its first part, so any items already delivered before the failure
+    ///   are **delivered again** (at-least-once, with no marker for the
+    ///   restart). Enable reconnect for a multipart stream only where the
+    ///   consumer tolerates duplicates; one needing exactly-once must instead
+    ///   leave reconnect disabled and run its own reopen loop with
+    ///   application-level dedup.
+    pub stream_reconnect: ReconnectConfig,
     /// When `true`, the generated client refuses plaintext `http://` and
     /// requires TLS (`toolkit_http::TransportSecurity::TlsOnly`) for every
     /// request — including the bearer-carrying `Authorization` header, which
@@ -162,9 +187,9 @@ impl ClientConfig {
         Self {
             base_url: base_url.into(),
             timeout: Duration::from_secs(30),
-            sse_idle_timeout: Duration::from_mins(1),
+            stream_idle_timeout: Duration::from_mins(1),
             retry: RetryConfig::default(),
-            sse_reconnect: ReconnectConfig::default(),
+            stream_reconnect: ReconnectConfig::default(),
             require_tls: false,
             internal_token_provider: None,
         }
@@ -177,10 +202,11 @@ impl ClientConfig {
         self
     }
 
-    /// Override the SSE per-event idle deadline (max gap between stream events).
+    /// Override the per-item stream idle deadline (max gap between wire
+    /// chunks). See [`Self::stream_idle_timeout`].
     #[must_use]
-    pub fn with_sse_idle_timeout(mut self, idle: Duration) -> Self {
-        self.sse_idle_timeout = idle;
+    pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
         self
     }
 
@@ -191,12 +217,13 @@ impl ClientConfig {
         self
     }
 
-    /// Override the SSE reconnect policy. Use [`ReconnectConfig::default()`]
-    /// to disable (the default) or build a non-zero `max_attempts` policy
-    /// to enable reconnect.
+    /// Override the stream reconnect policy. Use
+    /// [`ReconnectConfig::disabled()`] to disable (the default) or
+    /// [`ReconnectConfig::enabled()`] to opt in. See
+    /// [`Self::stream_reconnect`] for what it does and does not govern.
     #[must_use]
-    pub fn with_sse_reconnect(mut self, sse_reconnect: ReconnectConfig) -> Self {
-        self.sse_reconnect = sse_reconnect;
+    pub fn with_stream_reconnect(mut self, stream_reconnect: ReconnectConfig) -> Self {
+        self.stream_reconnect = stream_reconnect;
         self
     }
 
@@ -269,13 +296,31 @@ impl Default for RetryConfig {
 /// no behaviour change.
 #[derive(Debug, Clone)]
 pub struct ReconnectConfig {
-    /// Maximum number of reconnect attempts after the initial connection.
-    /// `0` (default) disables reconnect entirely — stream errors bubble up.
+    /// Maximum number of *consecutive* reconnect attempts with no healthy
+    /// connection in between (the burst budget). `0` (default) disables
+    /// reconnect entirely — stream errors bubble up. The budget is reset by a
+    /// connection that both delivers an item and stays up at least
+    /// [`min_healthy_uptime`](Self::min_healthy_uptime).
     pub max_attempts: u32,
     /// Initial delay before the first reconnect attempt.
     pub base_delay: Duration,
     /// Hard cap on delay between reconnect attempts.
     pub max_delay: Duration,
+    /// Minimum time a connection must stay up — *in addition to* delivering at
+    /// least one item — before its end resets the burst budget. Delivering a
+    /// single item is too weak a health signal on its own: a peer that emits
+    /// one item and immediately drops would reset the budget on every cycle and
+    /// reopen forever, re-sending the auth token each time (#4740). A connection
+    /// shorter than this counts against `max_attempts` like any other failed
+    /// attempt.
+    pub min_healthy_uptime: Duration,
+    /// Absolute lifetime ceiling on reopens, independent of budget resets. It
+    /// bounds the pathological peer that stays up *just past*
+    /// `min_healthy_uptime`, delivers an item, and drops on a loop — which would
+    /// otherwise reset the burst budget indefinitely. Set high enough that a
+    /// genuinely healthy long-lived subscription (which reconnects rarely) never
+    /// approaches it; `0` refuses reopen outright.
+    pub max_total_reopens: u32,
 }
 
 impl Default for ReconnectConfig {
@@ -284,6 +329,8 @@ impl Default for ReconnectConfig {
             max_attempts: 0,
             base_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(10),
+            min_healthy_uptime: Duration::from_secs(5),
+            max_total_reopens: 10_000,
         }
     }
 }
@@ -296,7 +343,37 @@ impl ReconnectConfig {
         Self {
             max_attempts,
             base_delay,
+            ..Self::default()
+        }
+    }
+
+    /// A policy that never reconnects: the stream's first transport failure
+    /// ends it.
+    ///
+    /// The counterpart to [`ReconnectConfig::enabled`]. [`Default`] already
+    /// yields `max_attempts: 0`, so this is behaviourally the same value — it
+    /// exists so a call site that *must* not reconnect reads as a deliberate
+    /// choice rather than an accepted default.
+    ///
+    /// Generated clients pass this for a method whose open is fallible
+    /// (`#[streaming] async fn`). Such an open carries domain semantics the
+    /// client must not blindly repeat: any exclusion lease it acquired is owned
+    /// by the returned stream's lifetime, resume may be specified through the
+    /// contract's own cursor rather than `Last-Event-ID`, and a reconnect-time
+    /// failure would arrive as a stream *item* — past the caller's open-time
+    /// error handling, which is the whole reason the fallible shape exists.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        // Every field is named explicitly (rather than `..Self::default()`) so a
+        // future field with an *enabling* default can't silently leak into a
+        // constructor documented as never reconnecting — matching
+        // [`RetryConfig::off`]. These are the same values as [`Default`].
+        Self {
+            max_attempts: 0,
+            base_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(10),
+            min_healthy_uptime: Duration::from_secs(5),
+            max_total_reopens: 10_000,
         }
     }
 
@@ -304,6 +381,22 @@ impl ReconnectConfig {
     #[must_use]
     pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
         self.max_delay = max_delay;
+        self
+    }
+
+    /// Override the minimum healthy connection uptime that resets the burst
+    /// budget. See [`min_healthy_uptime`](Self::min_healthy_uptime).
+    #[must_use]
+    pub fn with_min_healthy_uptime(mut self, min_healthy_uptime: Duration) -> Self {
+        self.min_healthy_uptime = min_healthy_uptime;
+        self
+    }
+
+    /// Override the absolute lifetime cap on reopens. See
+    /// [`max_total_reopens`](Self::max_total_reopens).
+    #[must_use]
+    pub fn with_max_total_reopens(mut self, max_total_reopens: u32) -> Self {
+        self.max_total_reopens = max_total_reopens;
         self
     }
 }
@@ -325,6 +418,13 @@ mod tests {
         let r = RetryConfig::off();
         assert_eq!(r.max_attempts, 1);
     }
+
+    // The "never a second attempt" guarantee that `disabled()` carries is
+    // pinned behaviourally by `reconnect_is_derived_from_the_open_shape_not_from_client_config`
+    // (tests/rest_client_codegen.rs), which counts real server connections on
+    // the fallible-open path and asserts exactly one. A unit test that merely
+    // read back `disabled()`'s fields couldn't fail unless struct construction
+    // itself broke, so it isn't restated here.
 
     #[test]
     fn client_config_chains_overrides() {

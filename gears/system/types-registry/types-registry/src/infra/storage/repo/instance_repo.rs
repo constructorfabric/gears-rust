@@ -5,8 +5,11 @@
 //! reads look alike but the rows do not, and factoring them together would make both
 //! halves optional on both sides.
 
+use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
-use toolkit_db::secure::{AccessScope, DBRunner, ScopeError, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{
+    AccessScope, DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert,
+};
 
 use super::IN_CHUNK;
 use crate::domain::ports::{
@@ -77,6 +80,7 @@ impl InstanceRepo {
                 entity_id: r.entity_id,
                 revision_no: r.revision_no,
                 canonical_value: r.canonical_value,
+                content_hash: r.content_hash,
                 type_schema_entity_id: r.type_schema_entity_id,
                 type_schema_revision_no: r.type_schema_revision_no,
             }));
@@ -156,5 +160,31 @@ impl InstanceRepo {
         };
         secure_insert::<instance::Entity>(am, scope, runner).await?;
         Ok(())
+    }
+
+    /// Move the current-revision pointer onto a newly admitted revision.
+    ///
+    /// Shorter than its Type Schema counterpart because there is nothing else on
+    /// the row: an Instance has no artifact to re-materialize.
+    ///
+    /// `Ok(false)` means the entity has no current row — see
+    /// [`super::type_schema_repo::TypeSchemaRepo::update_current`].
+    ///
+    /// # Errors
+    /// Propagates the update's failure.
+    pub async fn update_current(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        new: NewCurrentInstance,
+    ) -> Result<bool, ScopeError> {
+        let result = instance::Entity::update_many()
+            .secure()
+            .col_expr(instance::Column::RevisionNo, Expr::value(new.revision_no))
+            .col_expr(instance::Column::UpdatedAt, Expr::value(new.now))
+            .filter(Condition::all().add(instance::Column::EntityId.eq(new.entity_id)))
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 }

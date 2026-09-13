@@ -18,6 +18,10 @@ service PaymentApi {
   rpc ListPayments(ListPaymentsFilter) returns (stream PaymentSummary) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+  // server-streaming, NO_SIDE_EFFECTS
+  rpc StreamPayments(ListPaymentsFilter) returns (stream PaymentSummary) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 message ChargeRequest {

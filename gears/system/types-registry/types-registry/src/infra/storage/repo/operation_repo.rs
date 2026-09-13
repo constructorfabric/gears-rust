@@ -18,10 +18,10 @@ use crate::domain::ports::{NewOperation, NewOperationItem, OperationItemRow, Ope
 use crate::infra::storage::entity::enums::{OperationItemStatus, OperationStatus};
 use crate::infra::storage::entity::{operation, operation_item};
 
-/// The multi-row insert budget for `operation_item`, where every row binds 14
+/// The multi-row insert budget for `operation_item`, where every row binds 15
 /// columns rather than the one parameter per row that `IN_CHUNK`'s
-/// `SQLITE_MAX_VARIABLE_NUMBER = 999` reasoning budgets for: 70 × 14 = 980.
-const ITEM_INSERT_CHUNK: usize = 70;
+/// `SQLITE_MAX_VARIABLE_NUMBER = 999` reasoning budgets for: 66 × 15 = 990.
+const ITEM_INSERT_CHUNK: usize = 66;
 
 /// One stored operation as the domain names it. See `entity_repo::row` for why the
 /// mapper sits beside the repository rather than on the entity.
@@ -62,6 +62,7 @@ fn operation_item_row(m: operation_item::Model) -> Result<OperationItemRow, Scop
         dry_run: m.dry_run,
         kind: m.kind.into(),
         precondition,
+        compat_forced: m.compat_forced,
         status: m.status.into(),
         request_payload: m.request_payload,
         result_revision_no: m.result_revision_no,
@@ -180,6 +181,7 @@ impl OperationRepo {
                 dry_run: Set(parent.dry_run),
                 kind: Set(parent.kind.into()),
                 expected_resource_version: Set(item.precondition.stored_value()),
+                compat_forced: Set(item.compat_forced),
                 status: Set(OperationItemStatus::Pending),
                 request_payload: Set(Some(item.request_payload.clone())),
                 result_revision_no: Set(None),
@@ -318,6 +320,46 @@ impl OperationRepo {
             .col_expr(
                 operation_item::Column::ResultRevisionNo,
                 Expr::value(Some(revision_no)),
+            )
+            .col_expr(
+                operation_item::Column::ResultResourceVersion,
+                Expr::value(Some(resource_version)),
+            )
+            .col_expr(operation_item::Column::StartedAt, Expr::value(now))
+            .col_expr(operation_item::Column::CompletedAt, Expr::value(now))
+            .filter(non_terminal(item_id))
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Record a committed registration that changed **nothing**.
+    ///
+    /// No `result_revision_no`, and that is the whole difference from
+    /// [`Self::mark_item_succeeded`]: an `unchanged` candidate allocates no revision
+    /// number (ADR-0005), and `ck_tr_operation_item_state` enforces that pairing.
+    /// The same CHECK requires `expected_resource_version >= 1`, so a creation
+    /// cannot reach this state.
+    ///
+    /// # Errors
+    /// Propagates the update's failure.
+    pub async fn mark_item_unchanged(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        item_id: i64,
+        resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        let result = operation_item::Entity::update_many()
+            .secure()
+            .col_expr(
+                operation_item::Column::Status,
+                Expr::value(OperationItemStatus::Unchanged),
+            )
+            .col_expr(
+                operation_item::Column::RequestPayload,
+                Expr::value(Option::<String>::None),
             )
             .col_expr(
                 operation_item::Column::ResultResourceVersion,

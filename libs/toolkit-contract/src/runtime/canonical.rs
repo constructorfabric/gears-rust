@@ -52,9 +52,13 @@ impl From<TransportError> for CanonicalError {
             TransportError::Serialization(msg) => {
                 CanonicalError::internal(format!("serialization error: {msg}")).create()
             }
-            TransportError::Sse(msg) => {
-                CanonicalError::internal(format!("SSE protocol error: {msg}")).create()
-            }
+            // A peer that does not conform to the wire framing is an internal
+            // fault; naming the framing is what makes the detail actionable.
+            TransportError::Framing { framing, source } => CanonicalError::internal(format!(
+                "{} framing error: {source}",
+                framing.media_type()
+            ))
+            .create(),
             TransportError::UrlBuild(msg) => {
                 CanonicalError::internal(format!("URL build error: {msg}")).create()
             }

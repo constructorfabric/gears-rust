@@ -136,9 +136,12 @@ pub struct ServiceInstanceInfo {
     /// exposes no REST API. This is the address the edge reverse-proxy actually
     /// dials for REST routing.
     pub rest_endpoint: Option<ServiceEndpoint>,
-    /// Optional `OpenAPI` spec (JSON) this instance published, if any.
-    pub openapi_spec: Option<String>,
     /// Stable content token for the published `OpenAPI` spec, if any.
+    ///
+    /// Enumeration is deliberately spec-free: only this hash rides along, never
+    /// the full document (fetched out-of-band via
+    /// [`DirectoryClient::get_openapi_spec`]). The hash lets a consumer detect a
+    /// spec change without inlining N copies of the document.
     pub openapi_spec_hash: Option<String>,
     /// Published gRPC services as `(service name, endpoint)` pairs.
     ///
@@ -191,13 +194,6 @@ impl ServiceInstanceInfo {
     #[must_use]
     pub fn with_rest_endpoint(mut self, rest_endpoint: Option<ServiceEndpoint>) -> Self {
         self.rest_endpoint = rest_endpoint;
-        self
-    }
-
-    /// Set the optional `OpenAPI` spec (JSON).
-    #[must_use]
-    pub fn with_openapi_spec(mut self, openapi_spec: Option<String>) -> Self {
-        self.openapi_spec = openapi_spec;
         self
     }
 
@@ -414,7 +410,7 @@ pub trait DirectoryClient: Send + Sync {
     /// List all service instances for a given gear.
     ///
     /// Entries are **spec-free**: only the `openapi_spec_hash` is carried, never
-    /// the full `openapi_spec` document, so a multi-instance response stays
+    /// the full `OpenAPI` document, so a multi-instance response stays
     /// bounded regardless of spec size. Callers fetch the document out-of-band
     /// via [`get_openapi_spec`](Self::get_openapi_spec); the hash lets a consumer
     /// detect a spec change without inlining N copies of the document.
@@ -444,14 +440,13 @@ pub trait DirectoryClient: Send + Sync {
     /// have the match silently hidden.
     ///
     /// Returned entries are **spec-free** on every implementation — the full
-    /// `openapi_spec` document is omitted (only its hash is carried), so the
+    /// `OpenAPI` document is omitted (only its hash is carried), so the
     /// polled resolve payload stays bounded; the caller fetches documents via
     /// [`get_openapi_spec`](Self::get_openapi_spec). This holds regardless of
     /// whether the selector is empty. The default body enumerates via
-    /// [`list_instances`](Self::list_instances), filters in-process, and drops
-    /// the spec; transport-backed clients (e.g. the gRPC client) override it to
-    /// push the selector server-side and request spec-free entries over the
-    /// wire.
+    /// [`list_instances`](Self::list_instances) and filters in-process;
+    /// transport-backed clients (e.g. the gRPC client) override it to push the
+    /// selector server-side.
     ///
     /// Label-based selection is effectively **out-of-process only**. Labels are
     /// published from the `OoP` serve path's configuration (`oop_http.labels`);
@@ -468,24 +463,20 @@ pub trait DirectoryClient: Send + Sync {
         // cancel-safe: the single await precedes any mutation; cancelling here
         // just drops the in-flight list and leaves no partial state.
         let instances = self.list_instances(gear).await?;
+        // Entries are spec-free by construction — `ServiceInstanceInfo` carries
+        // only the `openapi_spec_hash`, never the full OpenAPI document.
         Ok(instances
             .into_iter()
             .filter(|i| selector.matches(&i.labels))
-            // Spec-free entries, matching the documented contract and the
-            // transport-backed overrides: the label-resolve path never inlines
-            // the OpenAPI document (the hash still rides along).
-            .map(|mut i| {
-                i.openapi_spec = None;
-                i
-            })
             .collect())
     }
 
     /// List every service instance across all registered gears.
     ///
     /// Used by the edge gateway to discover which gears (and their REST
-    /// endpoints) to reverse-proxy. This is a lightweight discovery snapshot:
-    /// the returned instances do **not** carry `openapi_spec` — even when the
+    /// endpoints) to reverse-proxy. This is a lightweight discovery snapshot.
+    /// Like every enumeration path, it is **spec-free**: entries carry only the
+    /// `openapi_spec_hash`, never the full `OpenAPI` document, even when the
     /// backing store holds a stored specification. The edge fetches a gear's
     /// document once, on first discovery, via
     /// [`get_openapi_spec`](Self::get_openapi_spec).

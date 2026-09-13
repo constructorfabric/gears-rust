@@ -13,18 +13,17 @@
 //! |---|---|
 //! | 1 envelope and batch size | here |
 //! | 2 candidate identifiers | here |
-//! | 3 registration policy | here (via [`RegistrationPolicy`]) |
+//! | 3 registration policy | here (via [`RegistrationPolicy`]), for creations only |
 //! | 4 managed identifier profile | here |
 //! | 5 declared dialect | here |
 //! | 6 `force` | here |
-//! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
+//! | 7 ADR-0015 major-0 quarantine | **the worker** — see below |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is a gap by dependency: it refuses a stable candidate whose base, `$ref`
-//! or `x-gts-ref` targets include a major-0 identifier, and the extractor that
-//! finds those targets is T13's. A `TODO` marks its position between steps 6 and 8,
-//! so it lands as an insertion rather than a reordering.
-
+//! Step 7 runs in the worker over the dependency edges extracted by
+//! [`unit::evaluate`](super::unit), keeping malformed references and quarantine
+//! refusals in the admission-stage vocabulary (P16).
+//!
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -42,22 +41,14 @@ use super::fingerprint::{
 };
 use super::{Accepted, OperationDispatch, Precondition, SubmitRequest};
 use crate::config::TypesRegistryConfig;
+use crate::domain::compat::{normalize_dialect, select_baseline};
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 use crate::domain::policy::{PolicyRefusal, RegistrationPolicy};
+use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationRow, Stores};
 
 /// Largest `Idempotency-Key` the column accepts (`varchar(255)`).
 pub(crate) const MAX_IDEMPOTENCY_KEY: usize = 255;
-
-/// The canonical Draft-07 dialect, and the closed set that normalizes onto it
-/// (ADR-0014, SPEC §8.1 step 5).
-const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
-const DRAFT_07_SPELLINGS: [&str; 4] = [
-    "http://json-schema.org/draft-07/schema#",
-    "http://json-schema.org/draft-07/schema",
-    "https://json-schema.org/draft-07/schema#",
-    "https://json-schema.org/draft-07/schema",
-];
 
 /// Why a request is refused before it becomes an operation.
 ///
@@ -102,17 +93,17 @@ pub enum AcceptanceError {
     ForceNotPermitted { gts_id: String },
     #[error("force on '{gts_id}' is refused: it has no cross-minor check to waive")]
     ForceHasNothingToWaive { gts_id: String },
+    /// The last segment has no readable major, so baseline selection fails.
+    #[error("'{gts_id}' names no readable major, so no compatibility baseline exists")]
+    UnreadableVersion { gts_id: String },
+    #[error("minor-bearing Type Schema '{gts_id}' is content-immutable")]
+    MinorTypeSchemaRevision { gts_id: String },
     #[error(
         "expected_resource_version 0 on '{gts_id}' is refused: omit the field to require absence"
     )]
     ZeroPrecondition { gts_id: String },
     #[error("expected_resource_version {version} on '{gts_id}' is negative")]
     NegativePrecondition { gts_id: String, version: i64 },
-    #[error(
-        "expected_resource_version {version} on '{gts_id}' is refused: \
-         content revisions arrive with T11"
-    )]
-    RevisionNotAccepted { gts_id: String, version: i64 },
     #[error("operation kind is not accepted yet: deletion arrives with T20")]
     UnsupportedOperationKind,
     #[error("dry_run is not accepted yet: rollback-only evaluation arrives with T20")]
@@ -130,6 +121,41 @@ pub enum AcceptanceError {
     Db(#[from] DbError),
 }
 
+impl AcceptanceError {
+    /// The stable machine reason this refusal is counted and logged under.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::MissingIdempotencyKey => "missing_idempotency_key",
+            Self::IdempotencyKeyTooLong { .. } => "idempotency_key_too_long",
+            Self::EmptyBatch => "empty_batch",
+            Self::BatchTooLarge { .. } => "batch_too_large",
+            Self::InvalidIdentifier { .. } => "invalid_identifier",
+            Self::DuplicateCandidate { .. } => "duplicate_candidate",
+            Self::PolicyRefused(_) => "policy_refused",
+            Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
+            Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingDialect { .. } => "missing_dialect",
+            Self::UnsupportedDialect { .. } => "unsupported_dialect",
+            Self::ConflictingDialect { .. } => "conflicting_dialect",
+            Self::MissingContent { .. } => "missing_content",
+            Self::AuthoredDocumentTooLarge { .. } => "authored_document_too_large",
+            Self::ForceNotPermitted { .. } => "force_not_permitted",
+            Self::ForceHasNothingToWaive { .. } => "force_has_nothing_to_waive",
+            Self::UnreadableVersion { .. } => "unreadable_version",
+            Self::MinorTypeSchemaRevision { .. } => "minor_type_schema_revision",
+            Self::ZeroPrecondition { .. } => "zero_precondition",
+            Self::NegativePrecondition { .. } => "negative_precondition",
+            Self::UnsupportedOperationKind => "unsupported_operation_kind",
+            Self::DryRunNotAccepted => "dry_run_not_accepted",
+            Self::FingerprintConflict { .. } => "fingerprint_conflict",
+            Self::Dispatch(_) => "dispatch_failure",
+            Self::Storage(_) => "storage_failure",
+            Self::Db(_) => "database_failure",
+        }
+    }
+}
+
 /// Wrapper so [`PolicyRefusal`] — which is a value, not an error — can be a
 /// `#[source]` without implementing `Error` in the policy module.
 #[domain_model]
@@ -143,6 +169,8 @@ pub struct PolicyRefusalError(pub PolicyRefusal);
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
     pub config: &'a TypesRegistryConfig,
+    /// Admission metrics.
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// A validated request: everything the transaction needs, and nothing that would
@@ -239,33 +267,42 @@ pub fn validate(
                     version: v,
                 });
             }
-            // A positive precondition claims the candidate is a revision, and
-            // nothing in P0 can check the claim: `commit_creation` ignores the field,
-            // so it would commit as an ordinary creation at `resource_version = 1` —
-            // with step 3 skipped, because step 3 is skipped for revisions. Naming a
-            // version would then be enough to register inside a region the deployment
-            // closes. Refused loudly until T11, as deletion is until T20.
-            Some(v) => {
-                return Err(AcceptanceError::RevisionNotAccepted {
-                    gts_id: id.id().to_owned(),
-                    version: v,
-                });
-            }
+            // The claim is not taken on trust: the worker commits it through
+            // `commit_revision`, which refuses an absent identifier, so naming a
+            // version cannot register a new entity.
+            Some(v) => Precondition::Version(v),
         };
+        // ADR-0004: a minor-bearing Type Schema is content-immutable. During
+        // ceiling C9 this permanent refusal also bounds the implementation window.
+        if request.kind == OperationKind::Registration
+            && matches!(expected, Precondition::Version(_))
+            && is_minor_bearing_type_schema(&id)
+        {
+            return Err(AcceptanceError::MinorTypeSchemaRevision {
+                gts_id: id.id().to_owned(),
+            });
+        }
 
         // --- step 3: registration policy ---------------------------------
-        // Unconditional, because every candidate reaching this line is a declared
-        // creation: a positive `expected_resource_version` was refused above and
-        // deletion was refused with the envelope.
+        // **Creations only** (SPEC §8.1 step 3, DESIGN §3.2). The policy governs
+        // what may *appear* in a region; applying it to a revision would let closing
+        // a region freeze the entities already inside it, which is a different — and
+        // unasked-for — power.
         //
-        // TODO(T11): a revision — and at T20 a deletion — must bypass this gate
-        // again, so that closing a region cannot freeze the entities already in it
-        // (SPEC §8.1 step 3, DESIGN §3.2). Restore the condition *together with*
-        // the precondition check in the commit transaction: gating on the
-        // caller's declared kind alone is the bypass this refusal replaces.
-        ctx.policy
-            .admits(&id, OwnershipScope::Global)
-            .map_err(|refusal| AcceptanceError::PolicyRefused(PolicyRefusalError(refusal)))?;
+        // Safe only because the declared kind is enforced downstream: a revision
+        // naming a version for an identifier the registry does not hold is refused
+        // terminally by `commit_revision`, having created nothing. Without that, the
+        // bypass would be a way past the deployment allowlist.
+        //
+        // ponytail: ceiling C6 — the bypass leaves **no** authorization on the
+        // revision path. The right control is an owner or principal check, which P0
+        // has nothing to check against. The residual exposure is recorded on
+        // `unit::commit_revision`.
+        if expected == Precondition::MustNotExist {
+            ctx.policy
+                .admits(&id, OwnershipScope::Global)
+                .map_err(|refusal| AcceptanceError::PolicyRefused(PolicyRefusalError(refusal)))?;
+        }
 
         // --- step 4: managed identifier profile --------------------------
         if id
@@ -311,23 +348,33 @@ pub fn validate(
         }
 
         // --- step 6: force ------------------------------------------------
+        // Check the deployment flag and baseline eligibility here; the worker
+        // evaluates compatibility and re-authorizes the waiver.
         if candidate.force {
             if !ctx.config.allow_compatibility_force {
                 return Err(AcceptanceError::ForceNotPermitted {
                     gts_id: id.id().to_owned(),
                 });
             }
-            if !has_cross_minor_check(&id) {
-                return Err(AcceptanceError::ForceHasNothingToWaive {
-                    gts_id: id.id().to_owned(),
-                });
+            // Use baseline selection so acceptance and evaluation agree on waiver eligibility.
+            match select_baseline(&id, expected) {
+                Ok(baseline) if baseline.waivable() => {}
+                Ok(_) => {
+                    return Err(AcceptanceError::ForceHasNothingToWaive {
+                        gts_id: id.id().to_owned(),
+                    });
+                }
+                // No baseline exists to waive, which is not the same refusal as a
+                // baseline that nothing may waive.
+                Err(unreadable) => {
+                    return Err(AcceptanceError::UnreadableVersion {
+                        gts_id: unreadable.gts_id,
+                    });
+                }
             }
         }
 
-        // TODO(T18): step 7, the ADR-0015 quarantine — refuse a stable candidate
-        // whose immediate base, `$ref` or `x-gts-ref` targets include a major-0
-        // identifier. It needs T13's reference extractor, so it slots in here
-        // rather than being reordered in later.
+        // Step 7 runs in the worker over the extracted dependency edges.
 
         // --- step 8: canonicalize ----------------------------------------
         let canonical = canonical_text(content);
@@ -349,6 +396,9 @@ pub fn validate(
             item_no,
             gts_id: id.id().to_owned(),
             precondition: expected,
+            // The wire and ADR-0004 say `force`; the column says `compat_forced`.
+            // This is the one place the two names meet.
+            compat_forced: candidate.force,
             request_payload: canonical,
         });
     }
@@ -394,6 +444,38 @@ pub fn validate(
 /// Any [`AcceptanceError`], including [`AcceptanceError::FingerprintConflict`]
 /// for a key already bound to a different request.
 pub async fn accept(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    ctx: &AcceptanceContext<'_>,
+    dispatch: &Arc<dyn OperationDispatch>,
+    request: &SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
+    // Count at the shared exit so every refusal is covered.
+    if let Err(error) = &accepted {
+        let reason = error.reason();
+        ctx.metrics.refused(RefusalStage::Acceptance, reason);
+        // The `warn` is for client refusals only.
+        let infrastructure = matches!(
+            error,
+            AcceptanceError::Storage(_) | AcceptanceError::Db(_) | AcceptanceError::Dispatch(_)
+        );
+        if !infrastructure {
+            tracing::warn!(
+                reason,
+                candidates = request.candidates.len(),
+                %error,
+                "types_registry refused a submission"
+            );
+        }
+    }
+    accepted
+}
+
+/// [`accept`]'s body.
+async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
     scope: &AccessScope,
@@ -524,10 +606,6 @@ fn check_dialect(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
     Ok(())
 }
 
-fn normalize_dialect(declared: &str) -> Option<&'static str> {
-    DRAFT_07_SPELLINGS.contains(&declared).then_some(DRAFT_07)
-}
-
 /// The path of the first `$schema` below the root that does not normalize onto
 /// the same dialect. A nested `$schema` equal to the root's — after
 /// normalization, so `…/schema` and `…/schema#` agree — is not a conflict
@@ -569,18 +647,16 @@ fn conflicting_dialect_at(value: &Value, path: &str) -> Option<String> {
     conflicting_dialect_below(value, path)
 }
 
-/// Whether the candidate has a cross-minor compatibility check for `force` to
-/// waive: a minor-bearing segment past `M.0`, at a stable major. Request-static,
-/// which is why it belongs to acceptance — whether the waived comparison *would*
-/// have failed stays a worker decision under the family lock.
-fn has_cross_minor_check(id: &GtsId) -> bool {
-    let Some(last) = id.segments().last() else {
-        return false;
-    };
-    match (last.ver_major_opt(), last.ver_minor()) {
-        (Some(0) | None, _) | (_, None | Some(0)) => false,
-        (Some(_), Some(_)) => true,
-    }
+/// ADR-0004 makes a minor-bearing Type Schema an immutable published contract.
+/// Its next minor is a new logical entity; only major-only Type Schemas and
+/// Instances have a content-revision path.
+fn is_minor_bearing_type_schema(id: &GtsId) -> bool {
+    id.is_type()
+        && id
+            .segments()
+            .last()
+            .and_then(GtsIdSegment::ver_minor)
+            .is_some()
 }
 
 /// The keyed read both replay paths make.

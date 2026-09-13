@@ -26,7 +26,11 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
-// Version-family key derivation (T8; the family rules are T12).
+// Compatibility against one baseline: which definition, and the verdict (ADR-0003).
+pub mod compat;
+// The three direct dependency edge kinds, extracted from authored content and the identifier.
+pub mod dependency;
+// Version-family key derivation and the three family rules.
 pub mod family;
 // The transient `gts-rust` store, one per admission unit (SPEC D2, §8.2).
 pub mod gts_store;

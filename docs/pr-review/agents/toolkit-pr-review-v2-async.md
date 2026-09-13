@@ -36,6 +36,8 @@ Apply **only** these specific check IDs:
    - Functions holding partial/shared state across `.await` points with no consideration of what happens if the future is dropped mid-await (`select!`, timeout)
    - `Drop` impls on async-held resources (transactions, connections, guards) that assume cleanup runs, when the cleanup actually needs an async call (`Drop` cannot `.await`)
    - CPU-bound async loops with no periodic `tokio::task::yield_now()`, starving other tasks on the executor
+   - An async fn reachable from `select!`, `timeout`, or an abortable task with no `// cancel-safe:` or `// NOT cancel-safe:` annotation. "All awaits are idempotent" is not a valid reason; per-call semantics differ (`read` is cancel-safe, `read_exact` is not)
+   - A lock guard that escapes `await_holding_lock`: returned from a helper, stored in a struct field, or produced by `MutexGuard::map`. The lint only sees the direct shape, so hand-review every `Mutex` import in an async module
 
 2. **RUST-CONC-001** — Concurrent state access must be safe. Check for:
    - Unjustified `unsafe` blocks in concurrent code
@@ -43,6 +45,7 @@ Apply **only** these specific check IDs:
    - Deadlock patterns (lock ordering, nested locks)
    - Channel misuse (closed channels, receiver drops)
    - Arc/Mutex/RwLock used correctly (not bypassed)
+   - A hand-rolled `compare_exchange` retry loop where `Atomic*::update` / `try_update` would do (needs Rust >= 1.95)
 
 3. **RUST-PERF-001** — Code must not have obvious performance footguns. Check for:
    - Unnecessary allocations or clones (especially in hot loops)
@@ -52,6 +55,16 @@ Apply **only** these specific check IDs:
    - Excessive logging or tracing in performance-critical paths
    - `.collect::<Vec<_>>()` immediately consumed by another loop/iteration instead of chaining iterators
    - `Box::new([0; N])` for large buffers instead of `vec![0; n]`
+   - `map.get(&key.to_string())` or a `.clone()` at a lookup site, when a `HashMap<String, V>` can be queried with `&str`
+   - Oversized enum variants that should be boxed, and double indirection (`Box<Vec<T>>`, `Box<String>`, `Arc<String>` where `Arc<str>` is meant)
+   - Hand-rolled shift/mask bit arithmetic where a std method exists (`bit_width`, `isolate_highest_one`, `isolate_lowest_one`, `highest_one`, `lowest_one`; needs Rust >= 1.97)
+   - `to_string()`/`format!` per iteration in a hot integer-formatting loop, where `NumBuffer` + `format_into` reuses one buffer (needs Rust >= 1.98)
+
+   Skip the following in this repo: gratuitous clones, `&str.to_string()`, `with_capacity(0)`,
+   `String::from("lit")`, `push_str` chains, and large stack arrays are all denied in
+   `Cargo.toml` `[workspace.lints]` (`redundant_clone`, `str_to_string`, `manual_string_new`,
+   `format_push_string`, `large_stack_arrays`), so the build already rejects them. Do not spend a
+   finding slot on them.
 
 4. **RUST-NO-004** — No async blocking footguns. Do not block the async runtime — equivalent to RUST-ASYNC-001 but phrased as a "must not."
 
@@ -65,6 +78,7 @@ Apply **only** these specific check IDs:
 
 ## Checklist References
 
+- `docs/pr-review/comment-style.md` — comment voice. **Mandatory read before emitting findings.**
 - `docs/pr-review/toolkit-rust-review.md` — sections on RUST-ASYNC-001, RUST-CONC-001, RUST-PERF-001, RUST-NO-004, RUST-NO-005
 - `docs/pr-review/toolkit-framework-compliance-review.md` — section on TOOLKIT-LIFE-001 (ToolKit files only)
 
@@ -88,6 +102,7 @@ Schema (one object per finding):
   "line": 42,
   "severity": "HIGH",
   "id": "RUST-ASYNC-001",
+  "comment": "`std::thread::sleep` parks the whole executor thread, not just this task. Every other task scheduled on it stalls for the full duration.",
   "issue": "std::thread::sleep() blocks the async runtime.",
   "fix": "Use tokio::time::sleep().await instead."
 }
@@ -96,7 +111,19 @@ Schema (one object per finding):
 Field rules:
 - `"file"`: repo-root-relative path, exactly as it appears in the diff (strip `a/` or `b/` prefix).
 - `"line"`: integer, must be in `changed_ranges[file]` for that file. If unsure, omit the finding.
+  Exception: when `"file"` is in `deleted_files` it has no RIGHT-side line at all, so omit this
+  field entirely (do not guess a value) and the finding posts as a file-level comment. Use that
+  exception only when the deletion **itself** violates one of your check IDs, such as a removed
+  public item under RUST-NO-007. Do not use it to comment on the contents of removed code; most
+  file deletions are deliberate and are not findings.
 - `"severity"`: one of `"CRITICAL"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` (verbatim strings, uppercase). RUST-ASYNC-001 and RUST-CONC-001 violations are typically CRITICAL or HIGH.
 - `"id"`: exact check ID from the list above.
-- `"issue"`: one sentence, engineering English, no praise or hedging.
-- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion).
+- `"comment"`: **the inline comment body a human will read on GitHub.** 1 to 3 sentences.
+  `docs/pr-review/comment-style.md` is the contract for how it is worded, including which
+  phrasings are banned and how to keep a finding's uncertainty intact. Read it before emitting any
+  finding; its rules are deliberately not restated here, so that this file cannot drift from it.
+- `"issue"`: terse analytic restatement for the summary table and the local-mode report. One
+  sentence, engineering English, no praise or hedging. This is never posted as a comment, so it
+  does not need to read naturally.
+- `"fix"`: one sentence, concrete and actionable (what to change, not a suggestion). Table and
+  report only, like `"issue"`.

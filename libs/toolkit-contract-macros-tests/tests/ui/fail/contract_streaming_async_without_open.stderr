@@ -1,0 +1,5 @@
+error: `async fn` on a streaming method selects the fallible open, which must be stated explicitly: write `#[streaming(open = fallible)]` (on a REST projection a framing selector may accompany it, e.g. `#[streaming(multipart_mixed, open = fallible)]`; gRPC framing is fixed, so no selector is allowed there). Remove `async` for the immediate shape.
+  --> tests/ui/fail/contract_streaming_async_without_open.rs:12:14
+   |
+12 |     async fn frames(&self, since: u64) -> Result<u64, std::io::Error>;
+   |              ^^^^^^

@@ -1,8 +1,8 @@
 //! Database migrations for the Types Registry gear.
 //!
-//! One initial migration creates the P0 subset of `docs/database.sql`: 9 of its
-//! 11 tables, omitting `source_claim` and `routing_config` (federation, out of
-//! P0 scope — SPEC §9).
+//! The initial migration creates nine P0 tables. Later migrations add
+//! `coordination_state` and `operation_item.compat_forced`; federation still owns
+//! `source_claim` and `routing` (SPEC §9).
 //!
 //! Outbox tables are **not** created here. They come from
 //! `toolkit_db::outbox::outbox_migrations_with_prefix("types_registry_outbox")`,
@@ -11,12 +11,18 @@
 use sea_orm_migration::MigratorTrait;
 
 mod m20260817_000001_initial;
+mod m20260904_000002_coordination_state;
+mod m20260908_000003_operation_item_compat_forced;
 
 /// Migrator for the Types Registry managed-state schema.
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
-        vec![Box::new(m20260817_000001_initial::Migration)]
+        vec![
+            Box::new(m20260817_000001_initial::Migration),
+            Box::new(m20260904_000002_coordination_state::Migration),
+            Box::new(m20260908_000003_operation_item_compat_forced::Migration),
+        ]
     }
 }
