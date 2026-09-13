@@ -124,7 +124,7 @@ Built on top of the control plane and sidecar above, FileStorage also provides:
   per-part hash after only a length/size check, and `complete` builds the composite hash from those
   stored hashes with no re-read of the assembled object. See
   [ADR-0003](docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s "Known gap" note for the
-  mitigation available today (`require_finalize_internal_secret`).
+  mitigation available today (`finalize_internal_secret`).
 
 **Not yet implemented**: sharing (shareable links) and WebDAV. Storage-quota enforcement is likewise not wired (see
 above). The S3 backend is implemented and available as an opt-in backend for the control plane and sidecar, gated

@@ -230,16 +230,21 @@ Interim gear-local shared secret the s2s finalize/report-part callback routes ad
 signed upload token, via the `x-fs-internal-token` request header. `None` (the default) preserves the token-only
 trust model. This is a stop-gap until the platform's `toolkit-security::internal_auth` profiles are deployable in
 this gear (see [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s trust-model section).
-**Production recommendation**: set this to a strong shared secret and set the matching `FS_SIDECAR_INTERNAL_TOKEN`
-on every sidecar talking to this control plane, then flip `require_finalize_internal_secret` to `true`. Never
-logged (`FileStorageConfig`'s manual `Debug` impl redacts it).
+Enforcement begins the moment this secret is set, independent of `require_finalize_internal_secret`:
+`FinalizeAuth::verify` is a no-op only while the secret is `None`; the flag doesn't gate the check at all, it only
+turns a missing secret into a startup error. Once a secret is configured, the control plane rejects with `403`
+every sidecar callback lacking a matching `x-fs-internal-token`, which the client sees as a `502` on every fresh
+single-part `PUT` (a replay of the same `PUT` is answered `409`, per the sidecar's `!created` decision table) and
+on every part of a multipart upload. **Rollout order**: (1) redeploy every sidecar talking
+to this control plane with `FS_SIDECAR_INTERNAL_TOKEN` set first — a control plane with no secret configured
+ignores the header either way; (2) only then set `finalize_internal_secret` on the control plane, together with
+`require_finalize_internal_secret: true`. Never logged (`FileStorageConfig`'s manual `Debug` impl redacts it).
 
 ### `require_finalize_internal_secret`
 When `true`, gear init fails fast if `finalize_internal_secret` is absent instead of silently accepting the
 token-only trust model for the finalize/report-part callbacks. Mirrors `require_signing_key_seed`. Defaults to
-`false` so existing deployments — and any sidecar not yet redeployed with `FS_SIDECAR_INTERNAL_TOKEN` — keep
-working. **Production recommendation**: flip to `true` only after every sidecar talking to this control plane has
-been redeployed with the matching `FS_SIDECAR_INTERNAL_TOKEN` env var (see the migration-path note in the ADR).
+`false` so a control plane with no secret configured still starts. This flag does not disable the enforcement
+check — see the rollout order under `finalize_internal_secret` above for the sequencing that actually matters.
 
 ## Sidecar config: `FS_SIDECAR_*` environment variables
 
@@ -256,7 +261,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks, applied **per attempt** (up to `CALLBACK_MAX_ATTEMPTS = 3`). The control plane re-reads and re-hashes the whole object inside this window on the single-part finalize path, so the budget has to cover a full read-back, not just the round trip. **Misconfiguration risk**: a single-part object whose read-back reliably exceeds the timeout never finalizes — every attempt is cut short and the client sees `502` even though the bytes landed (F5 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Raise the timeout for such workloads, or use multipart, whose `complete` performs no full read-back (ADR-0006). |
 | `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane — without these timeouts, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
 | `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` | `2` | Caps how many `upload_multipart_part` requests take the `multipart_native` write path (`write_multipart_part_native`) concurrently. Each in-flight request on that path buffers up to `MAX_PART_SIZE` (5 GiB) in memory before writing it out, so with no cap N concurrent part uploads could drive memory to roughly `N * MAX_PART_SIZE`; at the default of `2` that is up to 10 GiB. A request that cannot immediately acquire a slot waits briefly (`PART_UPLOAD_ACQUIRE_TIMEOUT`, 200ms) for one to free up before it is rejected with `503`/`Retry-After: 1` — not queued indefinitely, but not rejected outright the instant the limit is hit either. |
-| `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret once it flips `require_finalize_internal_secret` on. |
+| `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret from the moment `finalize_internal_secret` is set on the control plane, regardless of `require_finalize_internal_secret`. |
 | `FS_SIDECAR_S3_BACKENDS` | unset (no S3 backends) | Optional JSON array of `S3BackendConfig` entries (mirrors the control plane's `s3_backends`), folded into the sidecar's own `BackendRegistry` alongside the always-present `local-fs` backend so a control-plane-registered `S3Backend` is reachable by real traffic dispatched per-request via `claims.backend_id`. Credentials embedded in this JSON blob are acceptable for the sidecar (the one component authorized to hold them, per ADR-0003) but should be sourced from a secrets manager / mounted file in production where supported. **Keep this list in lockstep with the control plane's `s3_backends`**: signed tokens carry `backend_id` and `backend_path`, and the sidecar resolves them against *its own* registry, with no reconciliation, handshake or version check between the two. A `backend_id` the sidecar does not know fails the request with `500` ("unknown backend") after the URL was already minted; worse, an id that resolves on both sides but points at a different endpoint/bucket fails silently in the other direction — the upload lands in the wrong bucket and the control plane's read-back finds nothing, surfacing as a `502` on finalize (or a `404` on a later download) rather than as a configuration error. |
 
 Every `FS_SIDECAR_*` numeric env var (`FS_SIDECAR_MAX_BODY_BYTES`, the two timeout vars, and

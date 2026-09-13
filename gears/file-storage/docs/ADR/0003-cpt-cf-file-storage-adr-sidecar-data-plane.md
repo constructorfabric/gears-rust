@@ -179,13 +179,14 @@ platform auth module's token revocation, not the URL layer.
   matching the configured secret (constant-time comparison via `ring::constant_time`,
   `handlers::FinalizeAuth`), checked *after* `fs-token` verification; a missing/mismatched header is
   a `403`. The sidecar sends this header (from `FS_SIDECAR_INTERNAL_TOKEN`) on both callbacks when
-  configured; unset on either side preserves pre-0.1 behavior (token-only trust), so **the rollout
-  order matters**: (1) deploy the control plane with the secret configured but
-  `require_finalize_internal_secret: false` (accepts calls with or without the header); (2) redeploy
-  every sidecar talking to it with the matching `FS_SIDECAR_INTERNAL_TOKEN`; (3) only then flip
-  `require_finalize_internal_secret: true` (rejects any caller lacking the header, closing the
-  client-driven-finalize gap). Flipping step 3 before step 2 completes bricks uploads from any
-  not-yet-redeployed sidecar. This is explicitly a stop-gap: once the platform's `internal_auth`
+  configured; an unset secret on the control plane preserves pre-0.1 behavior (token-only trust),
+  while a control plane that has the secret set answers `403` to any sidecar not yet sending the
+  header, so **the rollout order matters**: (1) redeploy every sidecar talking to the control plane with the matching
+  `FS_SIDECAR_INTERNAL_TOKEN` first; (2) only then set `finalize_internal_secret` on the control
+  plane together with `require_finalize_internal_secret: true` (a configured secret rejects any
+  caller lacking the header regardless of the flag, closing the client-driven-finalize gap).
+  Configuring the secret on the control plane before every sidecar carries the token bricks uploads
+  from any not-yet-redeployed sidecar. This is explicitly a stop-gap: once the platform's `internal_auth`
   profiles are deployable here, `handlers::FinalizeAuth`'s comparator should be swapped for
   `InternalAuthenticator` and this shared secret retired.
 * **Known gap: multipart part-hash trust.** The data-integrity claim above
@@ -199,8 +200,8 @@ platform auth module's token revocation, not the URL layer.
   per-part hashes (ADR-0006) — the assembled object itself is never re-hashed
   end to end. Since the `fs-token` authorizing a part write is client-visible
   (the same exposure this bullet's trust-model update addresses) and the
-  `x-fs-internal-token` gate is not required by default
-  (`require_finalize_internal_secret: false`), a caller holding a valid part
+  `x-fs-internal-token` gate is off by default
+  (`finalize_internal_secret: None`), a caller holding a valid part
   token could in principle report a hash that does not match the bytes it
   streamed, corrupting the composite hash without being caught by any
   read-back. Mitigations available today: enable `finalize_internal_secret` +
