@@ -3892,7 +3892,7 @@
         "type": "object"
       },
       "CredentialDto": {
-        "description": "Response body for `GET /credstore/v1/credentials/{ref}` (ADR-0004): the\ncredential record. Never carries the value — see [`SecretDto`].",
+        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `value` is populated only when `$select` names it (point read)\nor in value mode (collection) and only for an item the caller may read;\nabsent from the wire entirely otherwise — including when the item's value\ncould not be served (refused, missing, fingerprint mismatch — omitted by\nthe domain layer already, never reported as an error for one item).\n\n`Debug` is hand-written to redact `value`.",
         "properties": {
           "expires_at": {
             "format": "date-time",
@@ -3937,6 +3937,13 @@
           "updated_at": {
             "description": "The caller's own row's last-write instant; absent iff `status` is\n`none`.",
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The decrypted value — present only when `$select` names it (point\nread) or in value mode (collection), and only for an item the caller\nmay read.",
             "type": [
               "string",
               "null"
@@ -10030,6 +10037,24 @@
         ],
         "type": "object"
       },
+      "Page_CredentialDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_CredentialListItemDto": {
         "properties": {
           "items": {
@@ -13783,7 +13808,7 @@
       },
       "PutCredentialRequestDto": {
         "additionalProperties": false,
-        "description": "Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004): a\nwhole-credential replace. `value` is modelled as optional at the wire\nshape (`Option<String>`) so its *absence* can be distinguished from a\nmalformed body and rejected with the typed `VALUE_REQUIRED` reason rather\nthan a generic deserialization error.\n\n`Debug` is hand-written to redact `value`.",
+        "description": "Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state\n`value` per Amendment B): a whole-credential replace. `value` is tri-state\n(`Option<Option<String>>`, like [`CredentialPatchDto::value`]) so its\n*absence* — rejected with the typed `VALUE_REQUIRED` reason rather than a\ngeneric deserialization error — can be told apart from an explicit JSON\n`null` (no value is written: a value-less create, or a value\nremoval/no-op on replace) and from a string (the value is written).\n\n`Debug` is hand-written to redact `value`.",
         "properties": {
           "expires_at": {
             "description": "Expiry instant (RFC 3339); only for expirable types. A `PUT` is a\nwhole-value replace: omitting `expires_at` clears a stored expiry.",
@@ -13809,7 +13834,7 @@
             ]
           },
           "value": {
-            "description": "The value to write. Required — its absence is `400 VALUE_REQUIRED`.",
+            "description": "The value to write. Required at the wire — absent is `400\nVALUE_REQUIRED` — but once present it is tri-state: a string writes a\nvalue, an explicit `null` writes none (ADR-0004 Amendment B).",
             "type": [
               "string",
               "null"
@@ -42887,7 +42912,7 @@
     },
     "/credstore/v1/credentials": {
       "get": {
-        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or `type` selector only, capped and unpaginated.",
+        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `value` in `$select` switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or `type` selector only, capped and unpaginated.",
         "operationId": "credstore.list_credentials",
         "parameters": [
           {
@@ -42941,11 +42966,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_CredentialListItemDto"
+                  "$ref": "#/components/schemas/Page_CredentialDto"
                 }
               }
             },
-            "description": "A page of reduced credential items (value-mode items additionally carry `secret`)"
+            "description": "A page of reduced credential items (value-mode items additionally carry `value`)"
           },
           "400": {
             "content": {
@@ -43208,7 +43233,7 @@
         ]
       },
       "get": {
-        "description": "Retrieve the credential record for the authenticated tenant, with walk-up resolution. Never carries the value -- see `.../secret`.",
+        "description": "Retrieve the credential for the authenticated tenant, with walk-up resolution: the same item shape the collection returns. Without `$select`, the record fields only (never `value`); selecting `value` includes it, for a caller the projection's action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` when `value` is named, both when both. Supersedes the withdrawn `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,value` is its equivalent, and a value-only projection resolving to a value-less winner is the same canonical 404 that address gave.",
         "operationId": "credstore.get_credential",
         "parameters": [
           {
@@ -43216,6 +43241,15 @@
             "in": "path",
             "name": "ref",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 select expression",
+            "in": "query",
+            "name": "$select",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -43230,7 +43264,7 @@
                 }
               }
             },
-            "description": "The resolved credential record"
+            "description": "The resolved credential, carrying `value` only when `$select` names it"
           },
           "400": {
             "content": {
@@ -43298,7 +43332,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Get a credential record by reference",
+        "summary": "Get a credential by reference",
         "tags": [
           "Credential Store"
         ]
@@ -43433,7 +43467,7 @@
         ]
       },
       "put": {
-        "description": "Whole-credential replace: record and value together, in one call. Exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded/unconditional replace) is required. `value` is required in the body -- a PUT always carries a value.",
+        "description": "Whole-credential replace: record and, unless `value` is an explicit `null`, its value together, in one call. Exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded/unconditional replace) is required. `value` is required in the body (its absence is 400 VALUE_REQUIRED) but is tri-state: a string writes a value; an explicit `null` writes none -- on create the row is inserted `declared`; on replace of an active row the value is removed in the same transaction `PATCH {\"value\": null}` uses; on replace of an already-declared row nothing about the value changes.",
         "operationId": "credstore.put_credential",
         "parameters": [
           {
@@ -43546,104 +43580,6 @@
           }
         ],
         "summary": "Create or replace a credential by reference",
-        "tags": [
-          "Credential Store"
-        ]
-      }
-    },
-    "/credstore/v1/credentials/{ref}/secret": {
-      "get": {
-        "description": "Retrieve the resolved secret value for the authenticated tenant, with walk-up resolution. A winning record with no value (declared, or suppressed) is the canonical 404.",
-        "operationId": "credstore.get_secret",
-        "parameters": [
-          {
-            "description": "Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)",
-            "in": "path",
-            "name": "ref",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SecretDto"
-                }
-              }
-            },
-            "description": "The resolved secret value"
-          },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "500": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Get a credential's secret value by reference",
         "tags": [
           "Credential Store"
         ]
