@@ -4742,7 +4742,9 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
 
     let mut cursor = None;
     let mut found = false;
+    let mut requests = 0usize;
     for _ in 0..60 {
+        requests += 1;
         let page = store
             .list_types(
                 ctx,
@@ -4764,6 +4766,18 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
     assert!(
         found,
         "a match beyond the scan cap is still reachable by following the cursor"
+    );
+    // Reachable is half the contract; the other half is how far one request
+    // gets. A pass examines a whole slice and the cursor is set to the last
+    // row it examined, so sixteen passes cover sixteen rows per request and
+    // the twenty-five types here take three or four. A cursor that recorded
+    // the last *matching* row instead, or advanced one row per request, would
+    // still find `FAR` inside the sixty-attempt ceiling above and pass — it
+    // would just cost twenty-five round trips to do it.
+    assert!(
+        requests <= 5,
+        "the cursor must advance by the whole examined slice: {requests} requests \
+         for 25 types means it is advancing a row at a time"
     );
 }
 

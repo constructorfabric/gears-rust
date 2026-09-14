@@ -142,4 +142,11 @@ type-revision history.
   baseline, has no lane at all.
 - *The `remote` embedding provider has no per-tenant egress policy in front of
   it* (ADR-0004 asks for one); it is off by default and sends every tenant's
-  node and query text to the one configured endpoint when selected.
+  node and query text to the one configured endpoint when selected. It also
+  builds its own HTTP client rather than going through the `oagw` gear, so the
+  centralized egress policy, credential injection and audit trail that gear
+  provides are not in this path. Routing it through `oagw` is the intended
+  remediation and the natural place to put the per-tenant policy; it is not
+  done here because the plugin is a reference implementation of the provider
+  port, and which gear owns egress is a platform decision rather than this
+  gear's.

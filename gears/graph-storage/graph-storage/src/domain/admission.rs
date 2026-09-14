@@ -33,6 +33,21 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
             cfg.ingest_max_edges
         )));
     }
+    // The idempotency key is the one caller-controlled string the batch
+    // carries on its own, and it is the most durable of all of them: it is the
+    // TEXT primary key of `ingest_idempotency`, kept for the retention window
+    // and read on every retry. Bounding the node keys and not this one leaves
+    // the cheapest oversized field unbounded, and an index entry is where it
+    // lands.
+    if let Some(key) = &request.idempotency_key
+        && key.len() > cfg.identifier_max_bytes as usize
+    {
+        return Err(exceeded(format!(
+            "idempotency_key is {} bytes; identifier_max_bytes is {}",
+            key.len(),
+            cfg.identifier_max_bytes
+        )));
+    }
     // The two caller-controlled strings a node carries outside its payload.
     // Bounding the payload and not these leaves the cheapest oversized field
     // unbounded: `node_key` and `name` are indexed columns, and every read of

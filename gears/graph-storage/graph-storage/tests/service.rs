@@ -778,6 +778,36 @@ async fn the_caller_controlled_strings_are_bounded() {
         .expect_err("an oversized name is refused");
     assert!(matches!(refused, DomainError::LimitExceeded { .. }));
 
+    // The idempotency key is the same kind of string and the most durable of
+    // them: it is the primary key of the retry record, kept for the retention
+    // window and read on every retry.
+    let mut batch = conformance::batch(vec![conformance::node("fine", "fine")], vec![]);
+    batch.idempotency_key = Some(long.clone());
+    let refused = harness
+        .services
+        .ingest(&ctx, batch)
+        .await
+        .expect_err("an oversized idempotency_key is refused");
+    assert!(matches!(refused, DomainError::LimitExceeded { .. }));
+
+    // The catalogue page bound is enforced in the same place, which is what
+    // makes it enforced for every caller: REST passes its `limit` query
+    // parameter straight through, so a guard at the edge would be a guard the
+    // in-process client does not have.
+    let over = harness.services.config().projection_max_page + 1;
+    let refused = harness
+        .services
+        .list_types(
+            &ctx,
+            TypeQuery {
+                top: Some(over),
+                ..TypeQuery::default()
+            },
+        )
+        .await
+        .expect_err("an oversized catalogue page is refused");
+    assert!(matches!(refused, DomainError::LimitExceeded { .. }));
+
     let query = "q".repeat(harness.services.config().search_query_max_bytes as usize + 1);
     let refused = harness
         .services

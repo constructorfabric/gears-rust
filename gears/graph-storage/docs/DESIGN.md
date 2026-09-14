@@ -2622,6 +2622,21 @@ job categories (`graph-analytics` DESIGN § Error Model).
 - after a durable commit or a published job result — success wins even if response delivery was cancelled; the recorded outcome remains retrievable by idempotency key or job identifier;
 - for `202` jobs — cancellation and result publication compete through a single persisted terminal-state transition, so exactly one of them wins.
 
+**Found while building the prototype: the deadline is in force, the token is a
+seam.** Every request opens with an absolute budget (`deadline_interactive` by
+default) and that budget is what actually stops long work — traversal hops,
+provider calls and evolution scans all check it. The `CancellationToken` beside
+it in `StoreCtx` is threaded through the same call sites and polled by them, but
+in this build nothing signals it: no caller-supplied cancellation and no
+connection-lifecycle source is wired to it, and the only thing that fires it is
+the SDK's own contract test. A REST caller who disconnects still stops the work
+— axum drops the handler future, which drops everything it was awaiting — so
+the observable behaviour is right for HTTP and the gap is the *cooperative*
+path: an in-process `ClientHub` caller cannot ask a running operation to stop
+early, and a shutdown cannot interrupt one before its deadline. The seam is
+present so that wiring it later is a change at the edges rather than through
+every signature.
+
 The same rules apply during shutdown.
 
 **Expired idempotency receipts.** Retention deletes the recorded response, not the guarantee: a compact tombstone (tenant, producer, key, request hash, committed revision) outlives the full record. A retry whose key matches only a tombstone is answered with `IDEMPOTENCY_KEY_EXPIRED` (`failed_precondition`) — the caller must reconcile and issue a new logical request. Absence of a full response record never by itself grants permission to re-execute an uncertain key.

@@ -59,6 +59,7 @@ jobs:
       fips:   ${{ steps.filter.outputs.fips }}
       magika: ${{ steps.filter.outputs.magika }}
       onnx_embedding: ${{ steps.filter.outputs.onnx_embedding }}
+      graph_storage: ${{ steps.filter.outputs.graph_storage }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
