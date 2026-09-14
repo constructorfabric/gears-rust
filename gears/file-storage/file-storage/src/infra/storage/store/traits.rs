@@ -24,6 +24,14 @@ impl CleanupStore for Store {
         Store::list_abandoned_pending_versions(self, older_than, now).await
     }
 
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        Store::list_versionless_orphan_files(self, created_before, limit).await
+    }
+
     async fn delete_version(
         &self,
         file_id: Uuid,

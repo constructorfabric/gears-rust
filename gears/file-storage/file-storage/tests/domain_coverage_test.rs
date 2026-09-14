@@ -315,6 +315,16 @@ impl CleanupStore for FaultyCleanupStore {
             .await
     }
 
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
+            .await
+    }
+
     async fn delete_version(
         &self,
         file_id: Uuid,

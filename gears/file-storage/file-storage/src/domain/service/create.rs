@@ -502,14 +502,14 @@ impl FileService {
     /// [`Self::create_file_bare`] commits a version-less `files` row
     /// *before* the multipart plan is initiated;
     /// if initiation then fails (a capability rejection, a backend-side
-    /// error), nothing else ever triggers the orphan-parent reclamation
-    /// path (`CleanupEngine`'s sweep only reaches
-    /// `delete_orphan_file_with_event` as a side effect of reclaiming an
-    /// abandoned *pending version*, and none was ever created here — the
-    /// multipart initiate registers its own version, which also never
-    /// happened). Call this immediately after an initiate failure, with the
-    /// `file_id` `create_file_bare` just returned, to delete the orphan
-    /// synchronously instead of leaving it as a permanent, unreclaimed row.
+    /// error) before the plan ever registers its own pending version,
+    /// nothing else would otherwise trigger the orphan-parent reclamation
+    /// path in time: `CleanupEngine`'s sweep step 1 normally reaches
+    /// `delete_orphan_file_with_event` only as a side effect of reclaiming
+    /// an abandoned *pending version*, and none was ever created here. Call
+    /// this immediately after an initiate failure, with the `file_id`
+    /// `create_file_bare` just returned, to delete the orphan synchronously
+    /// instead of waiting on the background sweep.
     ///
     /// Reuses [`crate::infra::storage::store::Store::delete_orphan_file_with_event`]
     /// — the same transactionally-guarded primitive the background sweep
@@ -523,10 +523,17 @@ impl FileService {
     /// Best-effort: a failure here (including the guard correctly declining
     /// to delete, e.g. because something unexpected already gave this file
     /// a version) is logged, never propagated — the caller must still
-    /// surface the *original* initiate error, and a file this compensation
-    /// fails to remove is still eventually reclaimed by the background
-    /// sweep once it ages past `orphan_grace_secs`, which backstops this
-    /// compensation rather than being the only reclaim path.
+    /// surface the *original* initiate error. A file this compensation
+    /// fails to remove -- and, symmetrically, one left behind by a process
+    /// crash between `create_file_bare`'s commit and the multipart plan's
+    /// own `insert_pending_version` call, so this compensation never even
+    /// ran -- is not lost: `CleanupEngine::run_sweep`'s step 1 has a second
+    /// phase, `sweep_versionless_files`, dedicated to exactly this shape of
+    /// row (`content_id IS NULL`, zero `file_versions` rows), which reclaims
+    /// it once it ages past `orphan_grace_secs`. That dedicated phase is the
+    /// actual backstop here, not the pending-version side effect described
+    /// above -- this compensation is the fast path, the sweep's second phase
+    /// is the correctness net under it.
     pub async fn compensate_failed_multipart_initiate(&self, ctx: &SecurityContext, file_id: Uuid) {
         use toolkit_security::AccessScope;
         let scope = AccessScope::allow_all();
@@ -581,7 +588,8 @@ impl FileService {
                     error = ?e,
                     %file_id,
                     "failed to compensate orphan file after multipart-initiate failure -- \
-                     the background sweep will reclaim it once it ages past orphan_grace_secs"
+                     CleanupEngine's sweep_versionless_files phase will reclaim it once it \
+                     ages past orphan_grace_secs"
                 );
             }
         }

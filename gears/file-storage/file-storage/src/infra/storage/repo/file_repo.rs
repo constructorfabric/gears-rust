@@ -278,6 +278,60 @@ impl FileRepo {
         Ok(res.rows_affected)
     }
 
+    /// List `files` rows that never received **any** version at all --
+    /// `content_id IS NULL` **and** zero `file_versions` rows -- created
+    /// before `created_before`, ordered by `(created_at, file_id)`
+    /// ascending, up to `limit` rows. Feeds the cleanup sweep's dedicated
+    /// versionless-orphan-file phase
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    ///
+    /// Same correlated-subquery shape as [`Self::delete_if_orphan`]'s
+    /// `NOT EXISTS` guard, generalized from a single literal `file_id` to a
+    /// column correlated against this query's own `files.file_id` (via
+    /// `Expr::col((Entity, Column::FileId))`), since this scans every
+    /// tenant's `files` table rather than re-verifying one already-known row.
+    ///
+    /// This is a plain, uncommitted `SELECT` -- not a guard inside a
+    /// `DELETE` -- so it only *finds candidates*. The actual delete for each
+    /// one still goes through `delete_if_orphan`'s transactionally-guarded
+    /// statement (via `Store::delete_orphan_file_with_event`), which
+    /// re-verifies the same zero-versions/`NULL`-`content_id` condition
+    /// fresh inside its own transaction; a version or content bound in the
+    /// gap between this list and that delete therefore cannot cause data
+    /// loss, only a safely-declined delete attempt (same reasoning as
+    /// `CleanupEngine::orphan_candidate_file`'s doc comment).
+    pub async fn list_versionless_orphan_files<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        let mut has_any_version = Query::select();
+        has_any_version
+            .expr(Expr::value(1))
+            .from(VersionEntity)
+            .and_where(Expr::col(VersionColumn::FileId).equals((Entity, Column::FileId)));
+        let no_versions_exist = Condition::all().add(Expr::exists(has_any_version)).not();
+
+        let rows = Entity::find()
+            .filter(
+                Condition::all()
+                    .add(Column::ContentId.is_null())
+                    .add(Column::CreatedAt.lt(created_before))
+                    .add(no_versions_exist),
+            )
+            .order_by_asc(Column::CreatedAt)
+            .order_by_asc(Column::FileId)
+            .limit(limit)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// List files across all tenants for the retention sweep engine,
     /// **keyset-paginated by `file_id`** to bound sweep memory on large
     /// deployments. Returns up to `limit` files ordered by `file_id`, starting
