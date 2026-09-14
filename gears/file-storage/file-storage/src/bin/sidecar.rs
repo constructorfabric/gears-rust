@@ -8,7 +8,20 @@
 //!
 //! Configuration (env):
 //!   - `FS_SIDECAR_ADDR`         — bind address (default `0.0.0.0:8087`)
-//!   - `FS_SIDECAR_PUBLIC_KEY`   — base64url Ed25519 public key (from control)
+//!   - `FS_SIDECAR_PUBLIC_KEY`   — base64url Ed25519 **primary** public key (from control)
+//!   - `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` — optional comma-separated list of
+//!     additional base64url Ed25519 public keys, tried in order *after* the
+//!     primary. Unset/empty = none (single-key behaviour, unchanged from
+//!     before this existed). This is what lets a control-plane
+//!     `signing_key_seed` rotation happen without an outage or invalidating
+//!     already-issued signed URLs: the sidecar fleet is rolled out first with
+//!     the new key added to its set (as primary or previous — order only
+//!     affects verification cost, not correctness), so tokens signed by
+//!     either the old or the new key verify throughout the rollout. There is
+//!     deliberately no `kid` claim selecting among these — the set stays
+//!     small, so trying each key in turn is cheap. See
+//!     `docs/operations.md`'s `signing_key_seed` → **Rotation** section for
+//!     the full procedure.
 //!   - `FS_SIDECAR_BACKEND_ROOT` — local-fs backend root (default `./.file-storage-data`)
 //!   - `FS_SIDECAR_CONTROL_URL`  — base URL of the control plane (for finalize callback,
 //!     default `http://localhost:8080`). When set to an empty string the callback is
@@ -22,6 +35,19 @@
 //!   - `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` — connect timeout (seconds) for the
 //!     same callbacks (default `5`). Together these bound how long a client's upload
 //!     request can be held open by an unreachable or hung control plane.
+//!   - `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` — maximum time (seconds) the sidecar
+//!     will wait between two consecutive chunks of a client's request body (and
+//!     for the first chunk) on the `upload` and `upload_multipart_part` routes
+//!     (default `60`; `0` disables the guard entirely). This bounds only the
+//!     *pause* between chunks, never the stream's total duration — a slow but
+//!     steady multi-GiB upload always completes. It exists because the token's
+//!     `exp` is checked exactly once, before any body bytes are read, and
+//!     `FS_SIDECAR_MAX_BODY_BYTES` only bounds bytes, not time: without this, a
+//!     client that opens the connection and then never sends (or stalls
+//!     forever mid-stream) would hold the request open indefinitely (CWE-400).
+//!     A client that goes idle past this timeout gets `408 Request Timeout`
+//!     and any partial object is cleaned up the same way an ordinary broken
+//!     stream is (see `idle_timeout_stream`'s doc comment).
 //!   - `FS_SIDECAR_INTERNAL_TOKEN` — optional gear-local shared secret sent as the
 //!     `x-fs-internal-token` header on BOTH the finalize and report-part
 //!     control-plane callbacks. Unset/empty = the header is not sent, which is
@@ -87,6 +113,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -150,6 +177,13 @@ struct SidecarState {
     /// [`acquire_part_upload_slot`] for how a request acquires a permit from
     /// this field.
     part_upload_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Maximum pause allowed between two consecutive body chunks (and before
+    /// the first one) on `upload`/`upload_multipart_part`, from
+    /// `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` (default 60s; `None` when set to
+    /// `0`, disabling the guard). Deliberately not an absolute deadline on
+    /// the whole stream — see the module doc comment and
+    /// [`idle_timeout_stream`].
+    body_idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +233,31 @@ where
     parse_optional(name, std::env::var(name).ok(), default)
 }
 
+/// Parse `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`'s raw value: a comma-separated
+/// list of base64url Ed25519 public keys, decoded the same way the primary
+/// `FS_SIDECAR_PUBLIC_KEY` is. See `docs/operations.md`'s `signing_key_seed`
+/// → **Rotation** section and this module's doc comment for why the sidecar
+/// accepts more than one key at all.
+///
+/// Each element is trimmed; an empty element (e.g. a stray trailing comma)
+/// is silently skipped rather than rejected — unlike a genuinely malformed
+/// key, it carries no ambiguity about operator intent. A key that fails to
+/// base64url-decode fails the whole parse — and therefore sidecar startup,
+/// exactly like an invalid primary key — naming its 0-based position in the
+/// list so a misconfiguration is easy to locate.
+fn parse_public_key_list(raw: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, s)| {
+            URL_SAFE_NO_PAD.decode(s).map_err(|e| {
+                anyhow::anyhow!("invalid FS_SIDECAR_PREVIOUS_PUBLIC_KEYS entry #{i}: {e}")
+            })
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("FS_SIDECAR_ADDR")
@@ -211,6 +270,31 @@ async fn main() -> anyhow::Result<()> {
     let public_key = URL_SAFE_NO_PAD
         .decode(public_key_b64.trim())
         .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?;
+
+    // Keys retained from an earlier `signing_key_seed`, tried after the
+    // primary during a rotation window (see `docs/operations.md`'s
+    // `signing_key_seed` → Rotation section, and this module's doc comment).
+    // Unset/empty = no previous keys, matching pre-rotation behaviour.
+    let previous_public_keys: Vec<Vec<u8>> = match std::env::var("FS_SIDECAR_PREVIOUS_PUBLIC_KEYS")
+    {
+        Ok(raw) if !raw.trim().is_empty() => parse_public_key_list(&raw)?,
+        _ => Vec::new(),
+    };
+    // Primary always leads the set (`Verifier::verify` tries keys in
+    // order); a duplicate of the primary in the previous-keys list is
+    // silently dropped rather than rejected -- it's a harmless no-op that
+    // would otherwise force operators to scrub the list precisely at the
+    // moment a rotation completes.
+    let mut verifier_keys = vec![public_key.clone()];
+    verifier_keys.extend(
+        previous_public_keys
+            .into_iter()
+            .filter(|k| k != &public_key),
+    );
+    tracing::info!(
+        accepted_key_count = verifier_keys.len(),
+        "sidecar signed-URL verifier configured"
+    );
 
     // `FS_SIDECAR_CONTROL_URL` — base URL of the control-plane finalize endpoint.
     // An empty string disables the callback (useful for local dev or standalone tests).
@@ -238,6 +322,18 @@ async fn main() -> anyhow::Result<()> {
     let finalize_timeout_secs: u64 = parse_env_or_default("FS_SIDECAR_FINALIZE_TIMEOUT_SECS", 10)?;
     let finalize_connect_timeout_secs: u64 =
         parse_env_or_default("FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS", 5)?;
+
+    // Bound the pause between body chunks (and before the first one) on the
+    // upload paths — see the module doc comment and `SidecarState::body_idle_timeout`.
+    // `0` disables the guard entirely (`None`); this is a per-chunk idle bound,
+    // never an absolute deadline on the whole stream.
+    let body_idle_timeout_secs: u64 =
+        parse_env_or_default("FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS", 60)?;
+    let body_idle_timeout = if body_idle_timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(body_idle_timeout_secs))
+    };
 
     // See the module doc comment and `DEFAULT_MAX_CONCURRENT_PART_UPLOADS` for
     // the memory rationale and worst-case arithmetic. `0` is rejected
@@ -320,10 +416,9 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let state = SidecarState {
-        verifier: Arc::new(
-            Verifier::from_public_key(public_key)
-                .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?,
-        ),
+        verifier: Arc::new(Verifier::from_public_keys(verifier_keys).map_err(|e| {
+            anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY/FS_SIDECAR_PREVIOUS_PUBLIC_KEYS: {e}")
+        })?),
         backends,
         control_base_url,
         internal_token,
@@ -332,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
         // See `SidecarState::part_upload_semaphore`'s doc comment for why it
         // lives here rather than as a process-wide static.
         part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_part_uploads)),
+        body_idle_timeout,
     };
 
     let app = build_router(state, max_body_bytes);
@@ -477,6 +573,106 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// Response text used for both the single-part `upload` and
+/// `upload_multipart_part` routes when [`idle_timeout_stream`] fires.
+const BODY_IDLE_TIMEOUT_MESSAGE: &str = "request body idle timeout";
+
+/// Wrap a body byte-stream so that a pause of more than `idle` between two
+/// consecutive chunks — or before the very first one — ends the stream with
+/// `Err(io::Error::new(ErrorKind::TimedOut, ..))` and sets `timed_out` to
+/// `true`, instead of leaving the read hanging forever (CWE-400: the token's
+/// `exp` is only checked once, up front, and `FS_SIDECAR_MAX_BODY_BYTES`
+/// bounds bytes, not time).
+///
+/// This is a *per-chunk idle* bound, never an absolute deadline on the
+/// stream's total duration: a slow-but-steady multi-GiB upload that never
+/// pauses longer than `idle` between chunks is expected to run to
+/// completion no matter how long that takes in total. `idle == None`
+/// disables the guard: the input stream is returned unwrapped (boxed) and
+/// `timed_out` is never touched.
+///
+/// Once the timeout fires, the wrapped stream yields exactly that one `Err`
+/// and then ends (`None`) — callers already treat any stream error as
+/// terminal, so this just gives them a way (via `timed_out`) to tell "the
+/// client/backend stream broke" apart from "the client went idle past the
+/// deadline" and answer `408 Request Timeout` instead of the generic
+/// error status. Every storage backend's `publish_exclusive`/`put_stream`
+/// already cleans up a partial object on *any* stream error (see their own
+/// doc comments — `LocalFsBackend` removes the temp file, `S3Backend` aborts
+/// the multipart session it may have started, `InMemoryBackend` simply never
+/// inserted anything), so an idle-timeout abort is cleaned up exactly like
+/// any other broken upload — no special-casing needed there.
+fn idle_timeout_stream<S>(
+    stream: S,
+    idle: Option<Duration>,
+    timed_out: Arc<AtomicBool>,
+) -> futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>
+where
+    S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+{
+    let Some(idle) = idle else {
+        return Box::pin(stream);
+    };
+    Box::pin(futures::stream::unfold(
+        (Box::pin(stream), false),
+        move |(mut stream, done)| {
+            let timed_out = Arc::clone(&timed_out);
+            async move {
+                if done {
+                    return None;
+                }
+                match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(Some(item)) => Some((item, (stream, false))),
+                    Ok(None) => None,
+                    Err(_elapsed) => {
+                        timed_out.store(true, Ordering::SeqCst);
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                BODY_IDLE_TIMEOUT_MESSAGE,
+                            )),
+                            (stream, true),
+                        ))
+                    }
+                }
+            }
+        },
+    ))
+}
+
+/// If `timed_out` was set by [`idle_timeout_stream`] (the read stalled
+/// longer than `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS`), logs one
+/// `tracing::warn!` naming `context` (and `bytes_received` when the caller
+/// has it cheaply on hand — see each call site) and returns the `408
+/// Request Timeout` response callers should answer with, instead of their
+/// normal backend/stream-error handling. Returns `None` when this wasn't an
+/// idle timeout, so the caller falls through to its own error handling
+/// unchanged.
+///
+/// Split out of the three call sites ([`upload`], `write_multipart_part_native`,
+/// `write_multipart_part_offset_object`) purely to keep their cognitive
+/// complexity under the crate's lint ceiling — the branch itself is
+/// otherwise identical in all three.
+fn idle_timeout_response(
+    timed_out: &AtomicBool,
+    context: &str,
+    bytes_received: Option<u64>,
+) -> Option<Response> {
+    if !timed_out.load(Ordering::SeqCst) {
+        return None;
+    }
+    if let Some(bytes_received) = bytes_received {
+        tracing::warn!(
+            context,
+            bytes_received,
+            "request body idle timeout \u{2014} answering 408"
+        );
+    } else {
+        tracing::warn!(context, "request body idle timeout \u{2014} answering 408");
+    }
+    Some((StatusCode::REQUEST_TIMEOUT, BODY_IDLE_TIMEOUT_MESSAGE).into_response())
+}
+
 /// `PUT` upload: verify token (op=PUT), stream bytes straight to the backend.
 ///
 /// The body is never buffered whole in this handler — it is converted to a
@@ -533,9 +729,12 @@ async fn upload(
         }
     };
 
-    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let byte_stream = idle_timeout_stream(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
+        state.body_idle_timeout,
+        Arc::clone(&timed_out),
     );
     let outcome = match backend
         .publish_exclusive(&claims.backend_path, byte_stream, claims.upload.max_size)
@@ -548,6 +747,9 @@ async fn upload(
             return (StatusCode::PAYLOAD_TOO_LARGE, "exceeds max_size").into_response();
         }
         Err(e) => {
+            if let Some(resp) = idle_timeout_response(&timed_out, &claims.backend_path, None) {
+                return resp;
+            }
             tracing::error!(error = %e, "backend publish_exclusive failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
         }
@@ -1047,17 +1249,18 @@ async fn write_multipart_part(
     part_number: u32,
     body: Body,
     semaphore: &Arc<tokio::sync::Semaphore>,
+    idle: Option<Duration>,
 ) -> Result<(u64, String, String), Response> {
     if backend.capabilities().multipart_native {
         // The permit is held only for the duration of the buffering write
         // below, released right after it completes and before the
         // report-part callback -- see `upload_multipart_part`'s doc comment.
         let permit = acquire_part_upload_slot(semaphore).await?;
-        let result = write_multipart_part_native(backend, claims, part_number, body).await;
+        let result = write_multipart_part_native(backend, claims, part_number, body, idle).await;
         drop(permit);
         result
     } else {
-        write_multipart_part_offset_object(backend, claims, part_number, body).await
+        write_multipart_part_offset_object(backend, claims, part_number, body, idle).await
     }
 }
 
@@ -1068,9 +1271,16 @@ async fn write_multipart_part_native(
     claims: &Claims,
     part_number: u32,
     body: Body,
+    idle: Option<Duration>,
 ) -> Result<(u64, String, String), Response> {
     let max_size = claims.multipart.size;
-    let mut stream = body.into_data_stream();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let mut stream = idle_timeout_stream(
+        body.into_data_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+        idle,
+        Arc::clone(&timed_out),
+    );
     let mut buf = bytes::BytesMut::new();
     loop {
         match stream.next().await {
@@ -1085,6 +1295,16 @@ async fn write_multipart_part_native(
                 buf.extend_from_slice(&chunk);
             }
             Some(Err(e)) => {
+                // Cheap here (unlike the other two call sites): the part is
+                // buffered locally, so `buf.len()` is exactly how much of
+                // this part had arrived when the client went idle.
+                if let Some(resp) = idle_timeout_response(
+                    &timed_out,
+                    &format!("{} (part {part_number})", claims.backend_path),
+                    Some(buf.len() as u64),
+                ) {
+                    return Err(resp);
+                }
                 tracing::error!(error = %e, part_number, "part body stream read failed");
                 return Err((StatusCode::BAD_REQUEST, "body read error").into_response());
             }
@@ -1135,11 +1355,15 @@ async fn write_multipart_part_offset_object(
     claims: &Claims,
     part_number: u32,
     body: Body,
+    idle: Option<Duration>,
 ) -> Result<(u64, String, String), Response> {
     let part_path = format!("{}.part.{}", claims.backend_path, part_number);
-    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let byte_stream = idle_timeout_stream(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
+        idle,
+        Arc::clone(&timed_out),
     );
     let (body_len, part_hash) = match backend
         .put_stream(&part_path, byte_stream, Some(claims.multipart.size))
@@ -1157,6 +1381,9 @@ async fn write_multipart_part_offset_object(
                 .into_response());
         }
         Err(e) => {
+            if let Some(resp) = idle_timeout_response(&timed_out, &part_path, None) {
+                return Err(resp);
+            }
             tracing::error!(error = %e, part_number, "backend part write failed");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response());
         }
@@ -1355,6 +1582,7 @@ async fn upload_multipart_part(
         part_number,
         body,
         &state.part_upload_semaphore,
+        state.body_idle_timeout,
     )
     .await
     {
