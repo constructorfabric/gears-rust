@@ -78,7 +78,13 @@ graph-storage-sdk = { workspace = true, features = ["test-support"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-toolkit-db = { workspace = true, features = ["pg", "pgq", "integration"] }
+# Deliberately *not* `integration`. That feature gates toolkit-db's own
+# Docker-backed tests, and cargo unifies features across a workspace build —
+# so asking for it here turns those tests on for every `cargo test
+# --workspace` in the repository, including the macOS lane, which has no
+# Docker and fails on them. Nothing in this gear's tests needs it:
+# `run_migrations_for_testing` is not behind it.
+toolkit-db = { workspace = true, features = ["pg", "pgq"] }
 # Drives the gear's own axum router in-process: the REST cases send real
 # requests through it rather than calling the handlers as functions.
 tower = { workspace = true }
