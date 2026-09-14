@@ -611,7 +611,22 @@ jobs:
           cargo llvm-cov nextest \
             -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
             --test-threads=2 \
-            --summary-only --fail-under-lines 85
+            --lcov --output-path lcov.info --fail-under-lines 85
+
+      # The workspace coverage job cannot run this gear's PostgreSQL lane — it
+      # has no pgvector image — so in its report the built-in store reads as
+      # untested and the patch coverage of any change to it is wrong by a wide
+      # margin. Codecov merges uploads per commit, so sending this job's report
+      # as well is what makes the repository's own number true for this gear
+      # rather than an artefact of which lane happened to run.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
+          files: lcov.info
+          flags: graph-storage
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
 
   # Runs the graph-storage ONNX embedding provider against a real model, which
   # is the only way this crate is checked at all: without artifacts its tests
