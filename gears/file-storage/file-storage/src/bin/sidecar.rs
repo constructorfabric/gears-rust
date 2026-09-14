@@ -258,6 +258,31 @@ fn parse_public_key_list(raw: &str) -> anyhow::Result<Vec<Vec<u8>>> {
         .collect()
 }
 
+/// De-duplicate the sidecar's accepted-verifier-key set: `primary` always
+/// leads, followed by `previous` in order, with any repeat -- of `primary`,
+/// or of an entry already kept from `previous` -- dropped. Order is
+/// preserved among the survivors. Returns `(deduped_keys, dropped_count)`.
+///
+/// A duplicate key is a harmless no-op here: [`Verifier::verify`] already
+/// tries each key in the set in order and stops at the first match, so a
+/// repeated key only costs one wasted comparison in the rare case where
+/// every other key fails to verify -- never a correctness issue. That is why
+/// this silently drops duplicates (with a startup warning, at the call site
+/// in `main`) instead of rejecting them as a configuration error.
+fn dedupe_public_keys(primary: Vec<u8>, previous: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, usize) {
+    let mut deduped = Vec::with_capacity(previous.len() + 1);
+    deduped.push(primary);
+    let mut dropped = 0_usize;
+    for key in previous {
+        if deduped.contains(&key) {
+            dropped += 1;
+        } else {
+            deduped.push(key);
+        }
+    }
+    (deduped, dropped)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("FS_SIDECAR_ADDR")
@@ -281,16 +306,20 @@ async fn main() -> anyhow::Result<()> {
         _ => Vec::new(),
     };
     // Primary always leads the set (`Verifier::verify` tries keys in
-    // order); a duplicate of the primary in the previous-keys list is
-    // silently dropped rather than rejected -- it's a harmless no-op that
-    // would otherwise force operators to scrub the list precisely at the
-    // moment a rotation completes.
-    let mut verifier_keys = vec![public_key.clone()];
-    verifier_keys.extend(
-        previous_public_keys
-            .into_iter()
-            .filter(|k| k != &public_key),
-    );
+    // order); a duplicate -- of the primary, or within `previous_public_keys`
+    // itself -- is silently dropped rather than rejected: it's a harmless
+    // no-op (see `dedupe_public_keys`'s doc) that would otherwise force
+    // operators to scrub the list precisely at the moment a rotation
+    // completes.
+    let (verifier_keys, dropped_duplicates) = dedupe_public_keys(public_key, previous_public_keys);
+    if dropped_duplicates > 0 {
+        // Key material itself is never logged -- only the count.
+        tracing::warn!(
+            dropped_duplicates,
+            "FS_SIDECAR_PREVIOUS_PUBLIC_KEYS contains keys already in the accepted set; \
+             dropped \u{2014} a completed rotation usually means the list should be cleared"
+        );
+    }
     tracing::info!(
         accepted_key_count = verifier_keys.len(),
         "sidecar signed-URL verifier configured"
