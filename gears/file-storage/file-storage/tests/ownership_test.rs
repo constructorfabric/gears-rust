@@ -118,7 +118,7 @@ async fn transfer_ownership_updates_owner_fields() {
     let file_id = ticket.file_id;
 
     // Transfer ownership.
-    let updated = svc
+    let (updated, _meta) = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
         .await
         .unwrap();
@@ -440,7 +440,7 @@ async fn transfer_to_same_tenant_member_succeeds() {
         .unwrap();
     let file_id = ticket.file_id;
 
-    let updated = svc
+    let (updated, _meta) = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::User, new_owner)
         .await
         .unwrap();
@@ -454,24 +454,22 @@ async fn transfer_to_same_tenant_member_succeeds() {
 
 // ── 11. transfer_ownership's response reflects the committed swap ─────────────
 
-/// The `File` returned by `transfer_ownership` must reflect the just-committed
-/// swap (new owner, bumped `last_modified_at`) without depending on a
-/// post-commit re-read of the row. Regression test for a verifier finding: the
-/// prior implementation re-read the file via `self.store.require_file(&scope,
-/// file_id)` using the pre-transfer `scope` captured before the owner swap.
-/// With `TenantOnlyAuthorizer` (used here) that scope only carries a tenant
-/// constraint, so the bug is not directly observable through this harness —
-/// there is no way to construct an owner-constrained `AccessScope` without a
-/// PDP-backed `Authorizer`, which is out of reach for this test crate (see
-/// module docs on `ScopedTestAuthorizer` elsewhere in this gear's tests for
-/// why authorizer test doubles are kept local/minimal). What this test does
-/// verify is the *positive* contract the fix restructures the code around:
-/// the response is built from data captured before the transaction and must
-/// therefore carry the new owner and a strictly later `last_modified_at`,
-/// exactly like a real re-read would show after a successful commit.
+/// The `(File, custom metadata)` returned by `transfer_ownership` must reflect
+/// the just-*committed* state — read back after the transaction under the
+/// tenant-only `prefetch` scope — rather than the pre-transfer snapshot
+/// patched in memory. Regression test for a verifier finding: the prior
+/// implementation returned the pre-transfer row with only `owner_kind`/
+/// `owner_id`/`last_modified_at` patched locally, so a concurrent
+/// `PATCH /files/{id}` landing between the prefetch and the transfer's commit
+/// would have its `meta_version`/`content_id`/custom-metadata changes
+/// silently dropped from the transfer response. This test forces exactly
+/// that: it bumps `meta_version` and attaches custom metadata via
+/// `update_metadata` *before* calling `transfer_ownership`, then asserts the
+/// transfer response carries that state and matches an independent re-read
+/// of the row/metadata.
 #[tokio::test]
 async fn transfer_ownership_response_reflects_committed_swap() {
-    let (svc, _dp, _store) = build_service().await;
+    let (svc, _dp, store) = build_service().await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
     let original_owner = Uuid::now_v7();
@@ -484,7 +482,21 @@ async fn transfer_ownership_response_reflects_committed_swap() {
     let file_id = ticket.file_id;
     let before = svc.get_file(&ctx, file_id).await.unwrap();
 
-    let updated = svc
+    // Bump meta_version and attach custom metadata ahead of the transfer, so
+    // a response built from the pre-transfer snapshot is distinguishable
+    // from one built from a post-commit re-read.
+    svc.update_metadata(
+        &ctx,
+        file_id,
+        file_storage_sdk::CustomMetadataPatch {
+            entries: vec![("k1".to_owned(), Some("v1".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (updated, updated_meta) = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
         .await
         .unwrap();
@@ -495,11 +507,26 @@ async fn transfer_ownership_response_reflects_committed_swap() {
         updated.last_modified_at >= before.last_modified_at,
         "last_modified_at must be bumped (or at least not regress) by the transfer"
     );
-    // A subsequent independent read must agree with what transfer_ownership
-    // returned — proving the locally-applied response is not just
-    // self-consistent but actually matches what got committed.
-    let reread = svc.get_file(&ctx, file_id).await.unwrap();
+    assert!(
+        updated.meta_version > before.meta_version,
+        "meta_version must reflect the pre-transfer metadata update, not the original snapshot"
+    );
+
+    // Independent re-read of the row (same tenant-only scope the service
+    // itself re-reads under) and of the metadata table must agree with what
+    // transfer_ownership returned.
+    let tenant_scope = toolkit_security::AccessScope::for_tenant(tenant);
+    let reread = store.require_file(&tenant_scope, file_id).await.unwrap();
     assert_eq!(reread.owner_id, updated.owner_id);
     assert_eq!(reread.owner_kind, updated.owner_kind);
     assert_eq!(reread.last_modified_at, updated.last_modified_at);
+    assert_eq!(reread.meta_version, updated.meta_version);
+    assert_eq!(reread.content_id, updated.content_id);
+
+    let stored_meta = store.list_metadata(file_id).await.unwrap();
+    assert!(
+        !stored_meta.is_empty(),
+        "test setup must have written metadata"
+    );
+    assert_eq!(updated_meta, stored_meta);
 }

@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use file_storage_sdk::{CustomMetadataPatch, File};
+use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, File};
 
 use crate::domain::audit::{AuditEntry, AuditOperation};
 use crate::domain::authz::actions;
@@ -512,7 +512,7 @@ impl FileService {
         file_id: Uuid,
         new_owner_kind: file_storage_sdk::OwnerKind,
         new_owner_id: Uuid,
-    ) -> Result<File, DomainError> {
+    ) -> Result<(File, Vec<CustomMetadataEntry>), DomainError> {
         if new_owner_id.is_nil() {
             return Err(DomainError::validation(
                 "new_owner_id",
@@ -596,23 +596,37 @@ impl FileService {
             file_count_delta: 1,
         });
 
-        // Return the file reflecting the just-committed owner swap, built
-        // from the pre-transfer row plus the exact fields
-        // `transfer_ownership_atomic`/`FileRepo::update_owner` mutate
-        // (`owner_kind`, `owner_id`, `last_modified_at` — see that repo
-        // method: `meta_version` is untouched by a transfer), rather than
-        // re-reading via `require_file` with the pre-transfer `scope`. The
-        // `files` entity declares `owner_col = "owner_id"`
-        // (`infra/storage/entity/file.rs`), so an owner-constrained
-        // `AccessScope` — one that only matches the *old* owner — would no
-        // longer match the row after a successful swap, and a re-read with
-        // that stale scope would incorrectly surface a 404 for a transfer
-        // that already committed (usage deltas and all).
-        let mut updated_file = file;
-        updated_file.owner_kind = new_owner_kind;
-        updated_file.owner_id = new_owner_id;
-        updated_file.last_modified_at = now;
-        Ok(updated_file)
+        // Re-read the row under the tenant-only `prefetch` scope (not the
+        // authz `scope` from above), which already committed the owner
+        // swap. `scope` may be owner-constrained (the `files` entity
+        // declares `owner_col = "owner_id"` — `infra/storage/entity/file.rs`)
+        // and would no longer match the row under its *new* owner, giving a
+        // false 404 for a transfer that already committed. `prefetch`
+        // constrains only on tenant id (`Self::tenant_scope`), so it still
+        // finds the row post-swap. Reading back post-commit — rather than
+        // patching the pre-transfer snapshot in memory — also picks up any
+        // concurrent metadata writes that landed between the prefetch and
+        // the commit, instead of echoing stale `meta_version`/`content_id`/
+        // custom metadata.
+        //
+        // The only case the re-read can't handle is the row disappearing
+        // between the commit above and this read (a concurrent DELETE): the
+        // transfer itself is already committed (audit row, usage deltas), so
+        // answering with 404 would be wrong. Fall back to the pre-transfer
+        // snapshot with the owner fields patched in, same as before.
+        let meta = self.store.list_metadata(file_id).await?;
+        let file = match self.store.require_file(&prefetch, file_id).await {
+            Ok(f) => f,
+            Err(DomainError::FileNotFound { .. }) => {
+                let mut fallback = file;
+                fallback.owner_kind = new_owner_kind;
+                fallback.owner_id = new_owner_id;
+                fallback.last_modified_at = now;
+                fallback
+            }
+            Err(e) => return Err(e),
+        };
+        Ok((file, meta))
     }
 
     /// Record an uploaded version's size+hash and mark it available, authorized
