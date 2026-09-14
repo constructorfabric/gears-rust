@@ -73,10 +73,10 @@ async fn a_schema_outside_its_declared_chain_is_refused_by_the_service() {
     harness.seed_ontology(&ctx).await;
 
     let orphan = graph_storage_sdk::models::TypeRegistration {
-        type_id: "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.orphan.v1~"
+        type_id: "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.orphan.v1~"
             .to_owned(),
         schema: serde_json::json!({
-            "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.orphan.v1~",
+            "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.orphan.v1~",
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [{ "$ref": "gts://gts.nobody.registered.this.v1~" }]
@@ -167,7 +167,7 @@ async fn an_unregistered_type_fails_the_item_not_the_request() {
 
     let mut node = conformance::node("unknown-type", "x");
     node.type_id =
-        "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.nope.v1~".to_owned();
+        "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.nope.v1~".to_owned();
     let error = harness
         .services
         .ingest(&ctx, conformance::batch(vec![node], Vec::new()))

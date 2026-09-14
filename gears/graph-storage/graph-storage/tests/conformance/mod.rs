@@ -39,19 +39,19 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 /// Producer types the suite registers on top of the base ontology.
-pub const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.thing.v1~";
+pub const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.thing.v1~";
 /// An edge type that admits only owned nodes at either end — the constraint
 /// that gives the endpoint check something to refuse.
 pub const OWNED_ONLY: &str =
-    "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~test.gs._.owned_link.v1~";
+    "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~acme.gs._.owned_link.v1~";
 pub const OWNED_FAMILY: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~";
 /// A node type from a different family, which `OWNED_ONLY` must refuse.
 pub const REFERENCE: &str =
-    "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~test.gs._.mirror.v1~";
-pub const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~test.gs._.link.v1~";
+    "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.gs._.mirror.v1~";
+pub const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~acme.gs._.link.v1~";
 /// An analysis edge: a conclusion, which a re-import must never remove.
 pub const ANALYSIS: &str =
-    "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~test.gs._.introduced_by.v1~";
+    "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~acme.gs._.introduced_by.v1~";
 
 /// Ingest through the real Embedding Coordinator, as the domain service does.
 ///
@@ -422,7 +422,7 @@ pub async fn batch_atomicity(store: &dyn GraphStoreV1, tenant: Uuid) {
         vec![node("atomic-1", "one"), node("atomic-2", "two")],
         vec![edge("atomic-1", "atomic-2")],
     );
-    "gts.test.unregistered._.nope.v1~".clone_into(&mut doomed.edges[0].type_id);
+    "gts.acme.unregistered._.nope.v1~".clone_into(&mut doomed.edges[0].type_id);
     doomed.idempotency_key = Some("atomic-key".to_owned());
 
     let error = ingest_batch(store, &ctx, doomed)
@@ -1442,7 +1442,7 @@ async fn envelope_of(
 /// A producer type declaring three payload paths -- a string, a number and a
 /// nested integer -- as filterable and orderable.
 pub const INDEXED: &str =
-    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.ticket.v1~";
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.ticket.v1~";
 
 fn indexed_type() -> TypeRegistration {
     TypeRegistration {
@@ -1829,7 +1829,7 @@ pub async fn projection_seeded(
 /// The deck's worked example, as a registrable type: the `requirement` a PM
 /// edits four times in a week.
 pub const EVOLVING: &str =
-    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.requirement.v1~";
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.requirement.v1~";
 
 /// One revision of that type.
 ///
@@ -3978,7 +3978,7 @@ pub async fn an_edge_type_evolves_over_its_own_rows(store: &dyn GraphStoreV1, te
 
 /// A second concrete node type, for the one transition upsert must refuse.
 pub const OTHER_THING: &str =
-    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.other_thing.v1~";
+    "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.other_thing.v1~";
 
 fn other_thing_type() -> TypeRegistration {
     TypeRegistration {
@@ -4298,7 +4298,7 @@ pub async fn a_type_pattern_narrows_search_and_a_hop(store: &dyn GraphStoreV1, t
         .search(
             &ctx,
             search(vec![
-                "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.absent.v1~"
+                "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.absent.v1~"
                     .to_owned(),
             ]),
             None,
@@ -4329,7 +4329,7 @@ pub async fn a_type_pattern_narrows_search_and_a_hop(store: &dyn GraphStoreV1, t
     let nothing = store
         .resolve_type_set(
             &ctx,
-            &["gts.cf.core.graph.edge.v1~test.gs._.absent.v1~".to_owned()],
+            &["gts.cf.core.graph.edge.v1~acme.gs._.absent.v1~".to_owned()],
         )
         .await
         .expect("an unmatched edge pattern resolves");
