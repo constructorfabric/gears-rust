@@ -20,6 +20,7 @@ Updated:  2026-07-08 by Constructor Tech
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Run Sweep Cycle](#run-sweep-cycle)
   - [Sweep Abandoned Pending Versions (Orphan Reconciliation)](#sweep-abandoned-pending-versions-orphan-reconciliation)
+  - [Sweep Versionless Files (Abandoned Multipart-Create Orphans)](#sweep-versionless-files-abandoned-multipart-create-orphans)
   - [Sweep Expired Multipart Sessions](#sweep-expired-multipart-sessions)
   - [Sweep Retention-Policy Expiry](#sweep-retention-policy-expiry)
   - [Validate Retention Rule on Write](#validate-retention-rule-on-write)
@@ -44,8 +45,13 @@ Two related P2 capabilities sharing one background engine (`CleanupEngine::run_s
 (1) **retention policies** (`cpt-cf-file-storage-fr-retention-policies`) — tenant/user/file-scoped rules that
 auto-expire files by age, inactivity, or a custom-metadata match; and (2) **orphan reconciliation**
 (`cpt-cf-file-storage-fr-orphan-reconciliation`) — reclaiming `pending` version rows (and, transitively, permanently
-orphaned zero-version `files` rows) that were pre-registered but never finalized, and aborting multipart sessions
-whose TTL expired without a `complete`/`abort` call. The sweep also purges expired `idempotency_keys` rows (a
+orphaned zero-version `files` rows) that were pre-registered but never finalized, aborting multipart sessions
+whose TTL expired without a `complete`/`abort` call, and — as a second phase of that same reclamation step —
+reclaiming a `files` row that never had *any* version row in the first place (a multipart `POST /files` whose
+control plane died between committing the file row and inserting its pending version, or whose synchronous
+initiate-failure compensation itself failed; see [Sweep Versionless
+Files](#sweep-versionless-files-abandoned-multipart-create-orphans)). The sweep also purges expired
+`idempotency_keys` rows (a
 housekeeping task riding the same cycle, not part of either named requirement). One background task per
 control-plane instance runs the full sweep on a fixed interval; there is no cross-instance coordination in P2 — see
 §4.
@@ -210,7 +216,9 @@ retention_expired_deleted, idempotency_keys_deleted }`
 
 **Steps**:
 1. [x] - `p1` - Step 1: sweep abandoned pending versions (+ any now-permanently-orphaned parent `files` row) —
-   `cpt-cf-file-storage-algo-sweep-abandoned-pending` - `inst-sweep-step1`
+   `cpt-cf-file-storage-algo-sweep-abandoned-pending` — **and**, as a second phase of this same step, sweep
+   versionless `files` rows that never had any version row at all —
+   `cpt-cf-file-storage-algo-sweep-versionless-files` - `inst-sweep-step1`
 2. [x] - `p1` - Step 2: sweep expired `in_progress` multipart sessions —
    `cpt-cf-file-storage-algo-sweep-expired-multipart` - `inst-sweep-step2`
 3. [x] - `p1` - Step 3: sweep retention-policy expiry across all scopes —
@@ -238,6 +246,40 @@ retention_expired_deleted, idempotency_keys_deleted }`
 4. [x] - `p1` - Best-effort: delete the backend blob at the version's `(backend_id, backend_path)` — a failure leaves an unreachable orphan blob, acceptable in P2 - `inst-sweep-pending-blob`
 5. [x] - `p1` - **IF** the parent file now has zero versions **AND** `content_id IS NULL` **AND** no `in_progress`, unexpired multipart session still references it (the same guard as step 1, re-checked because a session that has not yet expired could still legitimately have its backing version reclaimed by an unrelated grace-window aging in the *same* sweep pass): delete the `files` row too, transactionally re-verifying both conditions inside the delete so a version inserted in the gap is never lost — write a `file.deleted` event and debit `file_count_delta = -1`, `bytes_delta = 0` - `inst-sweep-pending-orphan-file`
 6. [x] - `p1` - RETURN the two counts - `inst-sweep-pending-return`
+
+### Sweep Versionless Files (Abandoned Multipart-Create Orphans)
+
+- [x] `p1` - **ID**: `cpt-cf-file-storage-algo-sweep-versionless-files`
+
+Runs as the **second phase of step 1** in [Run Sweep Cycle](#run-sweep-cycle) — the sweep is still four steps
+overall, not five. Unlike [Sweep Abandoned Pending Versions](#sweep-abandoned-pending-versions-orphan-reconciliation)
+above, this phase's candidates never had a pending version to begin with: it is the reaper for a multipart
+`POST /files` whose control plane died between `FileService::create_file_bare` committing the versionless `files`
+row and `MultipartService::initiate_multipart_upload` inserting the pending version, or one whose synchronous
+`compensate_failed_multipart_initiate` compensation (run by the handler on any initiate error) itself failed. Before
+this phase existed no sweep step ever picked up such a row: the zero-version cleanup in [Sweep Abandoned Pending
+Versions](#sweep-abandoned-pending-versions-orphan-reconciliation) step 5 only ever fires as a side effect of
+reclaiming a *pending* version, and [Sweep Expired Multipart Sessions](#sweep-expired-multipart-sessions) only ever
+fires as a side effect of aborting a session — a file that got neither had no reaper at all. There is no race
+against a live `POST /files`: the gap between committing the file row and inserting its version is milliseconds,
+while `orphan_grace_secs` is measured in hours.
+
+**Input**: `grace_cutoff` (`now - orphan_grace_secs`)
+
+**Output**: count of versionless files deleted
+
+**Steps**:
+1. [x] - `p1` - DB: list `files` rows with `content_id IS NULL` and zero rows in `file_versions`, `created_at <
+   grace_cutoff`, in batches - `inst-sweep-versionless-list`
+2. [x] - `p1` - FOR EACH candidate: reuse `maybe_delete_orphaned_file` — the same guarded primitive [Sweep Abandoned
+   Pending Versions](#sweep-abandoned-pending-versions-orphan-reconciliation) step 5 uses for its own zero-version
+   case, so the [Live-Multipart-Session Guard](#live-multipart-session-guard) (`has_blocking_multipart_session`) and
+   the transactional re-check of "zero versions AND `content_id IS NULL`" apply identically here: a candidate that
+   picked up a version, content, or a blocking `in_progress`/`completing` multipart session in the gap since the
+   list query is left untouched. On a successful delete, write an `orphan_reconcile` audit row and a `file.deleted`
+   event, and debit `file_count_delta = -1`, `bytes_delta = 0` (no bytes were ever uploaded against a row that never
+   had a version) - `inst-sweep-versionless-delete`
+3. [x] - `p1` - RETURN the count - `inst-sweep-versionless-return`
 
 ### Sweep Expired Multipart Sessions
 
@@ -349,6 +391,7 @@ and call `run_sweep()` directly), and exports the `SweepResult` tallies as metri
 **Implements**:
 - `cpt-cf-file-storage-algo-run-sweep`
 - `cpt-cf-file-storage-algo-sweep-abandoned-pending`
+- `cpt-cf-file-storage-algo-sweep-versionless-files`
 - `cpt-cf-file-storage-algo-sweep-expired-multipart`
 - `cpt-cf-file-storage-algo-sweep-retention-expiry`
 
@@ -384,6 +427,10 @@ between them is reclaimed on the *next* cycle, not silently missed. The same liv
 independently, by `CleanupEngine::has_blocking_multipart_session` before deleting a permanently-orphaned zero-version
 `files` row (§3, step 5's `inst-sweep-pending-orphan-file`), for the same reason at the file-deletion granularity: a
 `files` row's `ON DELETE CASCADE` would otherwise take a still-`in_progress` `multipart_uploads` row down with it.
+[Sweep Versionless Files](#sweep-versionless-files-abandoned-multipart-create-orphans) (step 1's second phase,
+`inst-sweep-versionless-delete`) reuses the very same `maybe_delete_orphaned_file` call and therefore the same
+guard, even though its candidates never had a pending version for the version-query-level check to apply to in the
+first place.
 
 Directly exercised by `tests/cleanup_test.rs::sweep_skips_pending_version_of_active_multipart_session` (a backdated-
 `created_at`, still-live session's version survives the sweep untouched) and its companion
@@ -434,6 +481,11 @@ mechanics in isolation from the guard.
   blob (best-effort), and an `orphan_reconcile` audit row is written (`cpt-cf-file-storage-fr-orphan-reconciliation`)
 - [x] A file left with zero versions and `content_id IS NULL` after its last pending version is reclaimed is itself
   deleted (not left as a permanent, unreachable-forever `files` row), with a `file.deleted` event
+- [x] A `files` row that never had any version at all — a multipart `POST /files` whose control plane crashed
+  between committing the file row and inserting its pending version, or whose synchronous initiate-failure
+  compensation itself failed — is also reclaimed, once it ages past `orphan_grace_secs`, by step 1's second phase
+  (`cpt-cf-file-storage-algo-sweep-versionless-files`); it does not require a pending version to have existed and
+  been reclaimed first
 - [x] A file that still has another (bound) version is never deleted by the zero-version-orphan check, even while
   one of its other versions is independently reclaimed as abandoned-pending
 - [x] A `pending` version still backing a **live** (`in_progress`, unexpired) multipart session is **never** selected

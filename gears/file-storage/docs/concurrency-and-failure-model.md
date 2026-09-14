@@ -95,7 +95,7 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
 
 | # | Transition | DB writes | Backend I/O | In flight / clocks |
 |---|---|---|---|---|
-| M1 | create+plan | Tx A: file row only (`Store::create_file_with_event` — **no** single-part pending version, so no presign orphan); then `file_versions` pending insert; then session insert (`MultipartRepo::create`, `auto_bind` recorded). Session-insert failure triggers best-effort compensation (`compensate_failed_session_create`) | `StorageBackend::initiate_multipart` (S3 `CreateMultipartUpload`) between the version insert and the session insert | The `POST /files` request. Per-part URLs share one `exp` (`default_url_ttl_secs`); the session gets its own `expires_at` (`multipart_session_ttl_secs`) |
+| M1 | create+plan | Tx A: file row only (`Store::create_file_with_event` — **no** single-part pending version, so no presign orphan); then `file_versions` pending insert; then session insert (`MultipartRepo::create`, `auto_bind` recorded). Session-insert failure triggers best-effort compensation (`compensate_failed_session_create`, aborts the backend handle + deletes the pending version row). More generally, an error from **any** step of `initiate_multipart_upload` after Tx A — quota/capability rejection, backend initiate failure, or the session-insert failure above — makes the handler synchronously call `FileService::compensate_failed_multipart_initiate`: a best-effort, guarded delete of the versionless `files` row (`Store::delete_orphan_file_with_event`, the same primitive the sweep uses, re-verifying zero versions + `content_id IS NULL` inside the delete transaction). A control-plane crash between Tx A and the version insert, or a failed compensation itself, leaves that versionless row behind; it is reclaimed by the cleanup sweep's step 1 second phase (`sweep_versionless_files`) once it ages past `orphan_grace_secs` | `StorageBackend::initiate_multipart` (S3 `CreateMultipartUpload`) between the version insert and the session insert | The `POST /files` request. Per-part URLs share one `exp` (`default_url_ttl_secs`); the session gets its own `expires_at` (`multipart_session_ttl_secs`) |
 | M2 | part upload | none by the sidecar; the **control plane** upserts the part row on the token-authenticated report callback (`MultipartStore::upsert_multipart_part` — single upsert) | Sidecar streams the part (`upload_part` / S3 `UploadPart`), enforcing the token's **exact** `size` claim, hashing on the fly | The part's `PUT` connection; report callback bounded like finalize (10 s / 3 attempts). Part URL `exp` bounds *starting* an upload; the session `expires_at` bounds the whole endeavour (two-clock model, DESIGN §4.7 Phase C) |
 | M3 | acquire lease | **Single CAS**: `state='completing', lease_until=now+K, lease_owner=:me WHERE upload_id=:id AND (state='in_progress' OR (state='completing' AND lease_until < now))` — `MultipartRepo::acquire_complete_lease`. One statement covers fresh acquire **and** dead-owner takeover | none | Read-only pre-flight (missing-parts diff, size, policy) runs **before** the CAS, so a deterministic rejection never occupies the lease. `K = multipart_complete_lease_secs` (default 120 s) |
 | M4 | assembly | none | Winner's **detached task** (`tokio::spawn` in `complete_multipart_upload`; the HTTP handler awaits its `JoinHandle`, but a dropped request future cannot cancel the work): S3 `CompleteMultipartUpload` (manifest + root folded from reported part rows — **no re-read**, ADR-0006), then one ~8 KiB ranged `get_range` for MIME sniffing. Takeover recovery: if the backend handle was already consumed but the assembled object exists, `(manifest, root)` are rebuilt locally from the part rows (`assemble_and_finish_inner`) | The client's `complete` request is open but expendable (F5-safe). The lease clock bounds how long the state stays `completing` unobserved |
@@ -189,17 +189,21 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
 - **Bytes never mutate in place.** Backend objects are immutable per `(file_id, version_id)`
   (`publish_exclusive`; new content = new version + pointer swap, DESIGN §3.1/§3.6).
 - **Garbage is bounded and owned**, with one documented exception. Every failure leaves at most: a
-  `pending` version (+blob), an unbound `available` version, orphan S3 parts of an aborted handle, or a
-  lease-expired `completing` session — each enumerated in §3 with its reaper (cleanup engine) or its
-  converging retry. The exception is the backend multipart handle: `initiate_multipart` runs between the
-  pending-version insert and the session insert (M1), and the compensation that aborts the handle
-  (`compensate_failed_session_create`) only covers a *returned* error, not a process crash in that window —
-  a handle orphaned that way has no persisted correlation, so no sweep can ever find it. The same is true of
-  a best-effort backend abort that fails after the session has already flipped to `aborted`, since later
-  passes only list `in_progress` and lease-expired `completing` sessions. No bytes are at stake in either
-  case (the parts were never uploaded, or are already abandoned), but S3 bills for incomplete uploads: put
-  an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket (`DaysAfterInitiation >=
-  ceil(multipart_session_ttl_secs / 86400) + 1`, i.e. 2 days at the default) as the backstop reaper for both.
+  `pending` version (+blob), an unbound `available` version, a versionless `files` row (a multipart create
+  that died after Tx A, or whose synchronous `compensate_failed_multipart_initiate` compensation itself
+  failed — see M1), orphan S3 parts of an aborted handle, or a lease-expired `completing` session — each
+  enumerated in §3 with its reaper (cleanup engine) or its converging retry, except the versionless `files`
+  row, whose reaper is the sweep's step 1 second phase (`sweep_versionless_files`; see operations.md's
+  cleanup-sweep section) rather than a row in §3. The exception is the backend multipart handle:
+  `initiate_multipart` runs between the pending-version insert and the session insert (M1), and the
+  compensation that aborts the handle (`compensate_failed_session_create`) only covers a *returned* error,
+  not a process crash in that window — a handle orphaned that way has no persisted correlation, so no sweep
+  can ever find it. The same is true of a best-effort backend abort that fails after the session has already
+  flipped to `aborted`, since later passes only list `in_progress` and lease-expired `completing` sessions.
+  No bytes are at stake in either case (the parts were never uploaded, or are already abandoned), but S3
+  bills for incomplete uploads: put an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket
+  (`DaysAfterInitiation >= ceil(multipart_session_ttl_secs / 86400) + 1`, i.e. 2 days at the default;
+  rationale in operations.md → s3_backends) as the backstop reaper for both.
 
 ## 6. Traceability
 

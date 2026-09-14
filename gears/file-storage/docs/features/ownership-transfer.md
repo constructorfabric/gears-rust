@@ -120,8 +120,15 @@ owner changed but no audit trail exists for it, or vice versa.
   the commit, rather than echoing a stale `meta_version`/`content_id`/custom
   metadata. If the row has disappeared by the time of the re-read (a
   concurrent delete racing the already-committed transfer), the response
-  falls back to the pre-transfer row with the owner fields patched in, since
-  the transfer itself is already committed and a `404` for it would be wrong
+  falls back to the **step-4 prefetch `File` value held in memory**, with only
+  `owner_kind`/`owner_id`/`last_modified_at` patched onto it — `meta_version`,
+  `content_id`, and every other field keep their pre-transfer prefetch values
+  — since the transfer itself is already committed and a `404` for it would be
+  wrong. The custom metadata shipped alongside is whatever the post-commit
+  `list_metadata` read (taken before the `File` re-read) returned regardless
+  of which branch fires: normally empty on the fallback path, since
+  `files_custom_metadata` cascade-deletes with the file, but not guaranteed to
+  be if that read raced ahead of the delete's cascade
 
 **Error Scenarios**:
 - `new_owner_id` is the nil UUID — `400` (`Validation`, field `new_owner_id`)
@@ -142,8 +149,23 @@ owner changed but no audit trail exists for it, or vice versa.
 6. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
 7. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
 8. [x] - `p1` - Compute the file's total available-version bytes; fire (fire-and-forget) a usage-delta debit for the old owner and a credit for the new owner using `cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance` - `inst-transfer-usage-rebalance`
-9. [x] - `p1` - Control plane, now that the swap has committed: re-read the `File` row under the tenant-only `prefetch` scope from step 4 (**not** the authz `AccessScope` from that step, which may be owner-constrained and would no longer match the row under its new owner, falsely surfacing `404` for an already-committed transfer) and re-read the custom metadata, so the response reflects the committed state — including any concurrent metadata write that landed between the prefetch and the commit. **IF** the row has disappeared by the time of this re-read (a concurrent delete racing the already-committed transfer): fall back to the pre-transfer row with `owner_kind`/`owner_id`/`last_modified_at` patched in, since the transfer already committed and a `404` for it would be wrong - `inst-transfer-post-commit-read`
-10. [x] - `p1` - RETURN `200` with the re-read `File` and custom metadata (or the step 9 fallback, if the row raced a concurrent delete) - `inst-transfer-return`
+9. [x] - `p1` - Control plane, now that the swap has committed: read the custom metadata (`list_metadata(file_id)`,
+   tenant-unscoped — it neither re-checks the file's existence nor its tenant) **first**, then re-read the `File`
+   row via `require_file` under the tenant-only `prefetch` scope from step 4 (**not** the authz `AccessScope` from
+   that step, which may be owner-constrained and would no longer match the row under its new owner, falsely
+   surfacing `404` for an already-committed transfer), so the response reflects the committed state — including any
+   concurrent metadata write that landed between the prefetch and the commit. **IF** that `File` re-read returns
+   `FileNotFound` (a concurrent delete racing the already-committed transfer): fall back to the **step-4 prefetch
+   `File` value held in memory** (not a fresh read), with only `owner_kind`/`owner_id`/`last_modified_at` patched
+   onto it — `meta_version`, `content_id`, and every other field keep their pre-transfer prefetch values, since the
+   transfer already committed and a `404` for it would be wrong. The custom metadata already read above ships
+   unchanged either way — it is never itself replaced by a fallback: after a real concurrent delete it is normally
+   empty, since `files_custom_metadata` rows cascade-delete with the file, but a `list_metadata` call that raced
+   ahead of the delete's cascade can still come back non-empty, so its accuracy on this fallback path is not
+   guaranteed - `inst-transfer-post-commit-read`
+10. [x] - `p1` - RETURN `200` with the `File` from step 9 (the re-read value, or its pre-transfer-prefetch fallback
+    if the row raced a concurrent delete) and the custom metadata read in step 9, which is always the post-commit
+    `list_metadata` result and is never itself substituted with a fallback - `inst-transfer-return`
 
 ## 3. Processes / Business Logic (CDSL)
 

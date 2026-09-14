@@ -242,8 +242,12 @@ endpoint or missing credentials with no env fallback fails gear init (fail-fast,
 
 **Set an `AbortIncompleteMultipartUpload` lifecycle rule on every bucket used here** — this is **required**, not a
 recommendation. The rule's `DaysAfterInitiation` parameter only accepts whole days, minimum 1, so set
-`DaysAfterInitiation >= ceil(multipart_session_ttl_secs / 86400) + 1` (2 days at the default 24h TTL). This is safe
-because no session outlives its `expires_at` (a resume re-caps `exp` at the same `expires_at`), so a handle still
+`DaysAfterInitiation >= ceil(multipart_session_ttl_secs / 86400) + 1` (2 days at the default 24h TTL). The `+ 1` is
+required, not cosmetic: `DaysAfterInitiation` counts whole days, and whenever the TTL is an exact multiple of a day,
+`ceil(ttl / 86400)` in seconds equals the TTL exactly, leaving zero margin against S3's day-granularity enforcement
+of the rule — the `+ 1` guarantees at least one full day of headroom beyond the session's actual lifetime regardless
+of how the TTL lines up with day boundaries. Example: a 48h TTL (172800 s) needs a minimum of 3 days, not 2. This is
+safe because no session outlives its `expires_at` (a resume re-caps `exp` at the same `expires_at`), so a handle still
 open once that many days have passed is by construction already abandoned. FileStorage aborts backend multipart
 handles on a best-effort basis only, and two windows are not covered by any sweep: a control-plane crash between
 `initiate_multipart` and the session-row insert leaves a handle with no persisted correlation at all, and a backend
@@ -306,7 +310,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 |---|---|---|
 | `FS_SIDECAR_ADDR` | `0.0.0.0:8087` | Bind address. |
 | `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 **primary** public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
-| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
+| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. An entry that duplicates `FS_SIDECAR_PUBLIC_KEY` or repeats elsewhere within the list is dropped at startup with a `warn`-level log (`dropped_duplicates`) rather than rejected — a harmless no-op, not a startup error, since the list need not be scrubbed the instant a rotation finishes, but the warning is a signal that step 4 of the rotation procedure has not been completed yet. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
 | `FS_SIDECAR_BACKEND_ROOT` | `./.file-storage-data` | Local-fs backend root — same durability caveat as the control plane's `storage_root`; the two should point at the **same** underlying storage for a single-backend deployment, or the sidecar will read/write blobs the control plane's metadata doesn't expect to find there. |
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus, when configured, the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
@@ -350,12 +354,25 @@ today — every replica runs its own sweep independently; cross-instance coordin
 
 The sweep runs **four** steps, in this order:
 
-1. **Abandoned-pending sweep** (`cpt-cf-file-storage-fr-orphan-reconciliation`) — deletes `file_versions` rows still
-   `pending` (pre-registered but never finalized) older than `orphan_grace_secs`, best-effort deletes their backend
-   blobs, and additionally deletes the parent `files` row too if reclaiming its last pending version leaves it a
-   permanent zero-version orphan (no versions left **and** `content_id IS NULL`, and no blocking in-progress
-   multipart session for that file). This zero-version file cleanup is not a separate fifth sweep step; it is
-   folded into step 1's per-version cleanup.
+1. **Abandoned-pending sweep** (`cpt-cf-file-storage-fr-orphan-reconciliation`) — runs in two phases, still just one
+   of the four sweep steps:
+   - **(a)** Deletes `file_versions` rows still `pending` (pre-registered but never finalized) older than
+     `orphan_grace_secs`, best-effort deletes their backend blobs, and additionally deletes the parent `files` row
+     too if reclaiming its last pending version leaves it a permanent zero-version orphan (no versions left **and**
+     `content_id IS NULL`, and no blocking in-progress multipart session for that file).
+   - **(b)** Separately sweeps `files` rows that never had a version in the first place: `content_id IS NULL`, no
+     rows in `file_versions`, `created_at` older than the same `grace_cutoff` (`orphan_grace_secs`), and no blocking
+     `in_progress`/`completing` multipart session for that file — batched, each candidate re-verified and deleted
+     through the same guarded `maybe_delete_orphaned_file` path that phase (a) uses for its own zero-version case,
+     with an `OrphanReconcile` audit row and a `file.deleted` event. This is the reaper for a `POST /files`
+     multipart create whose control plane crashed between committing the bare file row and inserting the pending
+     version, or whose synchronous `compensate_failed_multipart_initiate` compensation (see
+     [concurrency-and-failure-model.md](./concurrency-and-failure-model.md) §2.2 M1) itself failed — before this
+     phase existed, that versionless row was never picked up by any sweep pass; the zero-version cleanup in phase
+     (a) only ever fired as a side effect of reclaiming a *pending* version, and step 2's expired-session sweep only
+     ever fired as a side effect of aborting a session, so a file that got neither had no reaper at all. There is no
+     race with a live `POST /files`: the gap between committing the file row and inserting its pending version is
+     milliseconds, while `orphan_grace_secs` is measured in hours.
 2. **Expired-multipart sweep** — aborts `multipart_uploads` sessions whose `expires_at` has passed: those still
    `in_progress`, **and** those left `completing` by a completer that died, once their lease has expired too (a
    live lease is never reaped mid-assembly). It wins the session's own `→ aborted` CAS first (racing a concurrent
