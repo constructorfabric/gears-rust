@@ -211,11 +211,13 @@ pub async fn create_file(
                     // Known defect FS-01/F1 fix: a capability rejection or
                     // backend-side initiation error here would otherwise
                     // leave the bare file just created above as a
-                    // permanent, version-less orphan (nothing else ever
-                    // triggers its reclamation — see
+                    // version-less orphan that nothing reclaims until the
+                    // background sweep's `sweep_versionless_files` phase
+                    // ages it past `orphan_grace_secs` — see
                     // FileService::compensate_failed_multipart_initiate's
-                    // own doc). Compensate synchronously; the ORIGINAL
-                    // initiate error is still what the caller sees.
+                    // own doc. Compensate synchronously instead of waiting
+                    // on that sweep; the ORIGINAL initiate error is still
+                    // what the caller sees.
                     svc.compensate_failed_multipart_initiate(&ctx, file_id)
                         .await;
                     return Err(e.into());

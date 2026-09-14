@@ -302,6 +302,16 @@ impl CleanupStore for FaultyListVersionsStore {
             .await
     }
 
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
+            .await
+    }
+
     async fn delete_version(
         &self,
         file_id: Uuid,
@@ -622,6 +632,256 @@ async fn sweep_keeps_file_with_other_versions() {
         .unwrap()
         .expect("bound version must survive the sweep");
     assert_eq!(v2_after.status, VersionStatus::Available);
+}
+
+// ── test 1b: versionless orphan files (never received any version) ───────────
+
+/// Second phase of sweep step 1 (`CleanupEngine::sweep_versionless_files`):
+/// a `files` row created via [`FileService::create_file_bare`] that never
+/// got a version at all (simulating a crash between that commit and the
+/// multipart plan's `insert_pending_version`, or a failed
+/// `compensate_failed_multipart_initiate`) is reclaimed once its own
+/// `created_at` ages past the grace cutoff -- even though it was never
+/// picked up by `sweep_abandoned_pending`, which only ever sees a row that
+/// once had a `file_versions` entry.
+#[tokio::test]
+async fn sweep_deletes_versionless_file_past_grace() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h so we can deterministically distinguish "old" (backdated
+    // 2h) from "fresh" (just created) without racing the clock.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    // `create_file_bare` is the merged `POST /files` create+plan path's first
+    // step: it commits a `files` row with NO version at all -- exactly the
+    // shape this phase targets.
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // Sanity: zero versions from the start.
+    let versions = store.list_versions(file_id).await.unwrap();
+    assert!(
+        versions.is_empty(),
+        "create_file_bare must leave no version"
+    );
+
+    // Backdate the file's own `created_at` past the grace cutoff -- there is
+    // no public API to backdate it on an already-created row (mirrors the
+    // sibling tests' direct-entity backdating of `file_versions.created_at`
+    // / `multipart_uploads.expires_at`).
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "no pending version ever existed for this file"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "sweep_versionless_files should have deleted the permanently versionless file"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_none(),
+        "the versionless orphan file row must be deleted by the sweep"
+    );
+
+    let audit = store.list_audit(file_id).await.unwrap();
+    let reconcile_count = audit
+        .iter()
+        .filter(|r| r.operation == "orphan_reconcile")
+        .count();
+    assert!(
+        reconcile_count >= 1,
+        "expected at least 1 orphan_reconcile audit row"
+    );
+
+    let events = store.list_file_events(file_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "file.deleted"),
+        "expected a file.deleted event for the reclaimed versionless file"
+    );
+}
+
+/// Negative control: a versionless file younger than the grace cutoff must
+/// not be swept.
+#[tokio::test]
+async fn sweep_keeps_recent_versionless_file_within_grace() {
+    let (svc, _msvc, store, engine, _db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a recently-created versionless file must not be swept within the grace window"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the recent versionless file must survive the sweep"
+    );
+}
+
+/// A versionless file past the grace cutoff, but with a live `in_progress`
+/// multipart session still pointing at it, must NOT be deleted --
+/// `maybe_delete_orphaned_file`'s `has_blocking_multipart_session` guard is
+/// shared across every sweep phase, so this phase respects it exactly like
+/// `sweep_abandoned_pending`'s own reclaim does. In production such a session
+/// always implies a pending `file_versions` row exists (it is inserted
+/// first, in `MultipartService::initiate_multipart_upload`), which would
+/// already exclude the file from this phase's own listing query -- this test
+/// exercises the guard directly (via a hand-inserted session row) to prove
+/// the second phase never bypasses it, rather than relying on that
+/// production invariant alone.
+#[tokio::test]
+async fn sweep_versionless_file_blocked_by_in_progress_multipart_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    // Hand-insert an `in_progress` session for this file -- bypassing
+    // `insert_pending_version` -- purely to exercise the shared blocking
+    // guard in isolation (see the doc comment above for why this shape
+    // cannot arise through the real `POST /files/{id}/multipart` path).
+    let now = time::OffsetDateTime::now_utc();
+    store
+        .create_multipart_upload(
+            Uuid::now_v7(),
+            file_id,
+            Uuid::now_v7(),
+            "backend-handle",
+            "text/plain",
+            1024,
+            1024,
+            false,
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("insert in_progress multipart session");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a versionless file with a live in_progress multipart session must not be reclaimed"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the file must survive while its multipart session is still in_progress"
+    );
+}
+
+/// A file that has a version (even an untouched `pending` one, itself still
+/// fresh) must never be picked up by `sweep_versionless_files`, no matter how
+/// old the *file* row itself is -- the phase's `NOT EXISTS (file_versions)`
+/// predicate is what actually distinguishes it from
+/// `sweep_abandoned_pending`'s version-age-keyed query, not `files.created_at`
+/// alone.
+#[tokio::test]
+async fn sweep_versionless_files_skips_file_with_a_version() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h: the version created below stays fresh (not itself
+    // eligible for `sweep_abandoned_pending`), while the file row is
+    // deliberately backdated past the cutoff.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    // Leaves one (fresh, still-pending) version -- unlike `create_file_bare`.
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(ticket.file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "the version itself is fresh, not past the grace cutoff"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a file with an existing version row must never be treated as versionless, \
+         regardless of the file row's own age"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap();
+    assert!(file_after.is_some(), "the file must survive the sweep");
+    let version_after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version_after.is_some(),
+        "the pending version must survive the sweep"
+    );
 }
 
 // ── test 2: expired multipart session sweep ────────────────────────────────────

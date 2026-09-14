@@ -29,6 +29,17 @@ use crate::infra::external_clients::{UsageDelta, UsageReporter};
 /// `File` rows the sweep holds in memory at once, independent of total count.
 const RETENTION_SWEEP_BATCH: u64 = 500;
 
+/// Page size for the second phase of sweep step 1
+/// ([`CleanupEngine::sweep_versionless_files`]): permanently versionless
+/// `files` rows reclaimed per sweep pass. One batch per pass, same as its
+/// step-1 sibling [`CleanupEngine::sweep_abandoned_pending`] (which has no
+/// limit at all) and step 2's `sweep_expired_multipart` -- neither loops to
+/// exhaustion, so this phase doesn't either; a bound is still applied here
+/// (rather than an unbounded scan) purely as a defensive cap against a
+/// pathological backlog, with any remainder left for the next scheduled
+/// sweep.
+const VERSIONLESS_SWEEP_BATCH: u64 = 500;
+
 /// Configuration knobs for the cleanup engine.
 #[derive(Debug, Clone)]
 pub struct CleanupConfig {
@@ -42,8 +53,13 @@ pub struct CleanupConfig {
 pub struct SweepResult {
     /// Number of abandoned pending version rows deleted (and their blobs).
     pub abandoned_pending_deleted: usize,
-    /// Number of permanent zero-version orphan `files` rows deleted after
-    /// their last abandoned pending version was reclaimed.
+    /// Number of permanent zero-version, `NULL`-`content_id` orphan `files`
+    /// rows deleted -- whether reclaimed as a side effect of step 1's
+    /// abandoned-pending-version phase or step 2's expired-multipart-session
+    /// phase (a `file_versions` row existed and was aged out, leaving the
+    /// parent with zero versions), or by step 1's dedicated
+    /// versionless-files phase ([`CleanupEngine::sweep_versionless_files`])
+    /// for a `files` row that never received a version at all.
     pub abandoned_files_deleted: usize,
     /// Number of expired in-progress multipart sessions aborted.
     pub expired_multipart_aborted: usize,
@@ -115,7 +131,14 @@ impl CleanupEngine {
     /// 1. Abandoned pending versions (pre-registered but never finalised, past
     ///    the orphan grace window) -- **except** a version still backing a
     ///    live `in_progress` multipart session (`expires_at > now`), which is
-    ///    never selected regardless of age.
+    ///    never selected regardless of age. Followed by a second phase,
+    ///    [`Self::sweep_versionless_files`], for `files` rows that never got a
+    ///    version row in the first place (so the first phase's own
+    ///    version-age query can never see them) -- e.g. a process crash
+    ///    between `FileService::create_file_bare`'s commit and
+    ///    `MultipartService::initiate_multipart_upload`'s
+    ///    `insert_pending_version`, or a failed
+    ///    `FileService::compensate_failed_multipart_initiate`.
     /// 2. Expired multipart sessions (`expires_at < now`, still `in_progress`).
     /// 3. Retention-policy expiry (age / inactivity / metadata rules, all scopes).
     /// 4. Expired idempotency-key rows (`expires_at <= now`). `audit_outbox`/
@@ -140,6 +163,15 @@ impl CleanupEngine {
             self.sweep_abandoned_pending(grace_cutoff, now).await;
         result.abandoned_pending_deleted += pending_deleted;
         result.abandoned_files_deleted += files_deleted;
+
+        // Step 1, second phase -- `files` rows that never received a version
+        // at all (so the query above, keyed on a *version's* age, could never
+        // have selected them). Same `grace_cutoff`: a live `POST /files`
+        // request between `create_file_bare`'s commit and the multipart
+        // plan's `insert_pending_version` spans milliseconds, while
+        // `orphan_grace_secs` is configured in hours, so there is no race
+        // between this phase and an in-flight create.
+        result.abandoned_files_deleted += self.sweep_versionless_files(grace_cutoff).await;
 
         // Step 2 -- expired multipart sessions. This can also reclaim a
         // zero-version orphan file left behind by step 1 above: step 1's own
@@ -321,7 +353,13 @@ impl CleanupEngine {
                 // row, instead of letting `orphan_candidate_file` fetch it a
                 // second time -- same read-elimination as
                 // `cleanup_expired_session_version_with_file`'s.
-                let files_deleted = self.maybe_delete_orphaned_file(file_id, file).await;
+                let files_deleted = self
+                    .maybe_delete_orphaned_file(
+                        file_id,
+                        file,
+                        "abandoned_pending_version_orphan_file",
+                    )
+                    .await;
                 (1, files_deleted)
             }
             Ok(false) => {
@@ -344,6 +382,65 @@ impl CleanupEngine {
         }
     }
 
+    /// Second phase of sweep step 1: reclaim `files` rows that never
+    /// received **any** version at all -- not even a `pending` one -- and are
+    /// therefore invisible to [`Self::sweep_abandoned_pending`]'s own
+    /// zero-version-orphan reclaim just above, which only ever runs as a side
+    /// effect of aging out a `file_versions` row that existed in the first
+    /// place.
+    ///
+    /// Such a row is born when the merged `POST /files` create+plan path
+    /// commits [`crate::domain::service::FileService::create_file_bare`]'s
+    /// version-less `files` row and then never gets as far as inserting a
+    /// version for it -- a process crash between that commit and
+    /// `MultipartService::initiate_multipart_upload`'s
+    /// `insert_pending_version`, or a `FileService::
+    /// compensate_failed_multipart_initiate` that itself failed to delete the
+    /// row (see that method's doc comment). Neither of those ever produces a
+    /// `file_versions` row, so `sweep_abandoned_pending`'s
+    /// `list_abandoned_pending_versions` query (keyed on a *version's* age)
+    /// and `sweep_expired_multipart`'s `list_expired_multipart_uploads`
+    /// (keyed on a *session's* expiry) can never select the file.
+    ///
+    /// One batch per sweep pass, same as every other step-1/step-2 query
+    /// (none of them loop to exhaustion either) -- bounded by
+    /// `VERSIONLESS_SWEEP_BATCH` purely as a defensive cap; any remainder is
+    /// picked up by the next scheduled sweep.
+    ///
+    /// Returns the number of `files` rows deleted.
+    async fn sweep_versionless_files(&self, grace_cutoff: OffsetDateTime) -> usize {
+        let candidates = match self
+            .store
+            .list_versionless_orphan_files(grace_cutoff, VERSIONLESS_SWEEP_BATCH)
+            .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "cleanup: failed to list versionless orphan files"
+                );
+                return 0;
+            }
+        };
+
+        let mut count = 0_usize;
+        for file in candidates {
+            let file_id = file.file_id;
+            // `maybe_delete_orphaned_file` re-verifies zero-versions fresh
+            // (via `orphan_candidate_file`'s own `list_versions` call) and
+            // still checks `has_blocking_multipart_session` before deleting
+            // -- the same guard `sweep_abandoned_pending`'s reclaim above
+            // relies on -- so a version or an in-progress multipart session
+            // that appears for this file after the list query above cannot
+            // be destroyed out from under it.
+            count += self
+                .maybe_delete_orphaned_file(file_id, Some(file), "versionless_orphan_file")
+                .await;
+        }
+        count
+    }
+
     /// After deleting a file's last abandoned pending version, check whether
     /// the parent `files` row is now a permanent zero-version orphan (no
     /// versions left **and** `content_id IS NULL`) and delete it too if so.
@@ -364,10 +461,18 @@ impl CleanupEngine {
     /// moments ago (for its own audit-row `tenant_id`, typically) hand it down
     /// so [`Self::orphan_candidate_file`] does not read it a third time for
     /// the same file -- pass `None` when no such snapshot is available.
+    ///
+    /// `reason` is recorded verbatim in both the audit row's `detail.reason`
+    /// and the `file.deleted` event's `payload.reason` -- callers pass a
+    /// string describing *how* this file was found to be a permanent
+    /// zero-version orphan, since [`Self::orphan_candidate_file`]'s own check
+    /// (no versions, `NULL` `content_id`) is identical regardless of which
+    /// sweep phase got here.
     async fn maybe_delete_orphaned_file(
         &self,
         file_id: Uuid,
         prefetched_file: Option<file_storage_sdk::File>,
+        reason: &str,
     ) -> usize {
         let Some(file) = self.orphan_candidate_file(file_id, prefetched_file).await else {
             return 0;
@@ -376,18 +481,14 @@ impl CleanupEngine {
         let audit = orphan_reconcile_audit(
             file_id,
             file.tenant_id,
-            serde_json::json!({
-                "reason": "abandoned_pending_version_orphan_file",
-            }),
+            serde_json::json!({ "reason": reason }),
         );
         let event = Some(FileEvent {
             tenant_id: file.tenant_id,
             owner_id: file.owner_id,
             file_id: file.file_id,
             event_type: "file.deleted".to_owned(),
-            payload: serde_json::json!({
-                "reason": "abandoned_pending_version_orphan_file",
-            }),
+            payload: serde_json::json!({ "reason": reason }),
         });
 
         match self
@@ -794,7 +895,12 @@ impl CleanupEngine {
         // still looked in-progress). `file` (the same snapshot used for
         // `del_audit`'s tenant_id above) is handed down so
         // `orphan_candidate_file` does not re-fetch it.
-        self.maybe_delete_orphaned_file(session.file_id, file).await
+        self.maybe_delete_orphaned_file(
+            session.file_id,
+            file,
+            "abandoned_pending_version_orphan_file",
+        )
+        .await
     }
 
     /// Tell a backend to abort a multipart upload handle; log and ignore errors.
