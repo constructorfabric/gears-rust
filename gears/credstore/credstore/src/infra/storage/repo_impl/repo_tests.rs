@@ -26,7 +26,9 @@ use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, GcReason, NewSecret, SecretStatus};
+use crate::domain::secret::model::{
+    Fallback, GcReason, NewDeclaredSecret, NewSecret, SecretStatus,
+};
 use crate::domain::secret::repo::SecretRepo;
 use crate::infra::storage::entity;
 use crate::infra::storage::migrations::Migrator;
@@ -304,6 +306,110 @@ async fn duplicate_nonprivate_insert_conflicts() {
     let new = new_secret(tenant, owner, "dup", SharingMode::Tenant, ValueId::new_v4());
     let err = repo
         .insert_active(&AccessScope::for_tenant(tenant), &new)
+        .await
+        .expect_err("duplicate non-private insert violates unique index");
+    assert!(matches!(err, DomainError::Conflict));
+}
+
+// ── write protocol: insert_declared (ADR-0004 Amendment B) ──────────────────
+
+fn new_declared_secret(
+    tenant: Uuid,
+    owner: Uuid,
+    key: &str,
+    sharing: SharingMode,
+    fallback: Fallback,
+) -> NewDeclaredSecret {
+    NewDeclaredSecret {
+        id: Uuid::new_v4(),
+        tenant_id: TenantId(tenant),
+        reference: sref(key),
+        sharing,
+        owner_id: OwnerId(owner),
+        secret_type_uuid: SecretType::generic().uuid(),
+        expires_at: None,
+        fallback,
+    }
+}
+
+#[tokio::test]
+async fn insert_declared_creates_a_value_less_row() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let new = new_declared_secret(
+        tenant,
+        owner,
+        "declared",
+        SharingMode::Tenant,
+        Fallback::None,
+    );
+    let id = new.id;
+
+    repo.insert_declared(&scope, &new)
+        .await
+        .expect("insert_declared");
+
+    let row = repo
+        .resolve_for_get(
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("declared"),
+            &[tenant],
+        )
+        .await
+        .expect("resolve_for_get")
+        .expect("declared/none row resolves and competes as a winner");
+    assert_eq!(row.id, id);
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert_eq!(row.fallback, Fallback::None);
+    assert!(row.value_id.is_none());
+    assert!(row.value_fp.is_none());
+    assert!(row.fp_key_id.is_none());
+    assert_eq!(row.version, 1);
+}
+
+#[tokio::test]
+async fn insert_declared_leaves_no_gc_entry() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let new = new_declared_secret(
+        tenant,
+        owner,
+        "declared-nogc",
+        SharingMode::Tenant,
+        Fallback::Inherit,
+    );
+
+    repo.insert_declared(&scope, &new)
+        .await
+        .expect("insert_declared");
+
+    assert!(
+        repo.gc_list(100).await.expect("gc_list").is_empty(),
+        "a value-less create must enqueue no gc intent"
+    );
+}
+
+#[tokio::test]
+async fn insert_declared_duplicate_nonprivate_conflicts() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    seed_active(&repo, tenant, owner, "dup-declared", SharingMode::Tenant).await;
+
+    let new = new_declared_secret(
+        tenant,
+        owner,
+        "dup-declared",
+        SharingMode::Tenant,
+        Fallback::Inherit,
+    );
+    let err = repo
+        .insert_declared(&AccessScope::for_tenant(tenant), &new)
         .await
         .expect_err("duplicate non-private insert violates unique index");
     assert!(matches!(err, DomainError::Conflict));

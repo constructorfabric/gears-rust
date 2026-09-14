@@ -1,8 +1,8 @@
 //! Unit tests for the credstore REST DTOs.
 
 use credstore_sdk::{
-    Credential, CredentialStatus, Fallback, InheritanceStatus, OwnerId, Secret, SecretRef,
-    SecretType, SecretValue, SharingMode, Validator,
+    Credential, CredentialListItem, CredentialStatus, Fallback, InheritanceStatus, OwnerId,
+    SecretRef, SecretType, SecretValue, SharingMode, Validator,
 };
 use uuid::Uuid;
 
@@ -66,11 +66,44 @@ fn put_credential_request_debug_redacts_value() {
         sharing: SharingModeDto::default(),
         fallback: FallbackDto::default(),
         expires_at: None,
-        value: Some("super-secret-value".to_owned()),
+        value: Some(Some("super-secret-value".to_owned())),
     };
     let debug = format!("{dto:?}");
     assert!(debug.contains("[REDACTED]"));
     assert!(!debug.contains("super-secret-value"));
+}
+
+#[test]
+fn put_credential_request_debug_shows_absent_and_null_tri_state() {
+    let absent = PutCredentialRequestDto {
+        secret_type: None,
+        sharing: SharingModeDto::default(),
+        fallback: FallbackDto::default(),
+        expires_at: None,
+        value: None,
+    };
+    assert!(format!("{absent:?}").contains("<absent>"));
+
+    let null = PutCredentialRequestDto {
+        value: Some(None),
+        ..absent
+    };
+    assert!(format!("{null:?}").contains("<null>"));
+}
+
+#[test]
+fn put_credential_request_deserializes_absent_null_and_set_value() {
+    let json = r#"{"sharing": "tenant", "value": null}"#;
+    let dto: PutCredentialRequestDto = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(dto.value, Some(None));
+
+    let json2 = r#"{"sharing": "tenant", "value": "s"}"#;
+    let dto2: PutCredentialRequestDto = serde_json::from_str(json2).expect("deserialize");
+    assert_eq!(dto2.value, Some(Some("s".to_owned())));
+
+    let json3 = r#"{"sharing": "tenant"}"#;
+    let dto3: PutCredentialRequestDto = serde_json::from_str(json3).expect("deserialize");
+    assert_eq!(dto3.value, None, "an absent value key must stay Absent");
 }
 
 #[test]
@@ -184,43 +217,72 @@ fn credential_dto_from_credential_no_own_row() {
     );
 }
 
-#[test]
-fn secret_dto_debug_redacts_value() {
-    let secret = Secret {
+fn cred_with_value_fields(owner: Uuid) -> Credential {
+    Credential {
         reference: sref("k"),
         secret_type: SecretType::generic().gts_id().to_owned(),
+        sharing: SharingMode::Tenant,
+        fallback: Some(Fallback::Inherit),
+        status: CredentialStatus::Active,
+        inheritance: InheritanceStatus::Own,
+        version: Some(1),
+        updated_at: None,
+        owner_id: Some(OwnerId(owner)),
         expires_at: None,
-        value: SecretValue::from("super-secret-value"),
-        validator: Validator {
+        validator: Some(Validator {
             id: Uuid::new_v4(),
             version: 1,
-        },
-    };
-    let dto = SecretDto::try_from_secret(&secret).expect("utf-8 value");
-    let debug = format!("{dto:?}");
-    assert!(debug.contains("[REDACTED]"));
-    assert!(!debug.contains("super-secret-value"));
-    assert_eq!(dto.value, "super-secret-value");
+        }),
+    }
 }
 
 #[test]
-fn secret_dto_rejects_non_utf8_value() {
-    let secret = Secret {
-        reference: sref("k"),
-        secret_type: SecretType::generic().gts_id().to_owned(),
-        expires_at: None,
-        value: SecretValue::new(vec![0xff, 0xfe, 0x00]),
-        validator: Validator {
-            id: Uuid::new_v4(),
-            version: 1,
-        },
-    };
-    let err = SecretDto::try_from_secret(&secret)
+fn credential_dto_try_from_parts_carries_value_and_debug_redacts_it() {
+    let cred = cred_with_value_fields(Uuid::new_v4());
+    let value = SecretValue::from("super-secret-value");
+    let dto = CredentialDto::try_from_parts(&cred, Some(&value)).expect("utf-8 value");
+    let debug = format!("{dto:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("super-secret-value"));
+    assert_eq!(dto.value.as_deref(), Some("super-secret-value"));
+
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert_eq!(json["value"], "super-secret-value");
+}
+
+#[test]
+fn credential_dto_try_from_parts_without_value_omits_the_key() {
+    let cred = cred_with_value_fields(Uuid::new_v4());
+    let dto = CredentialDto::try_from_parts(&cred, None).expect("no value");
+    assert_eq!(dto.value, None);
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert!(
+        json.get("value").is_none(),
+        "value key must be absent, not null"
+    );
+}
+
+#[test]
+fn credential_dto_rejects_non_utf8_value() {
+    let cred = cred_with_value_fields(Uuid::new_v4());
+    let value = SecretValue::new(vec![0xff, 0xfe, 0x00]);
+    let err = CredentialDto::try_from_parts(&cred, Some(&value))
         .expect_err("non-UTF-8 value must be rejected, not lossily decoded");
     assert!(matches!(
         err,
         crate::domain::error::DomainError::Internal { .. }
     ));
+}
+
+#[test]
+fn credential_dto_try_from_list_item_carries_the_item_value() {
+    let cred = cred_with_value_fields(Uuid::new_v4());
+    let item = CredentialListItem {
+        credential: cred,
+        value: Some(SecretValue::from("listed-value")),
+    };
+    let dto = CredentialDto::try_from_list_item(&item).expect("utf-8 value");
+    assert_eq!(dto.value.as_deref(), Some("listed-value"));
 }
 
 #[test]

@@ -128,7 +128,7 @@ fn value_mode_selector_accepts_exactly_reference_or_type() {
 }
 
 #[test]
-fn select_allowlist_accepts_credential_fields_and_secret() {
+fn select_allowlist_accepts_credential_fields_and_value() {
     for field in [
         "reference",
         "type",
@@ -139,7 +139,8 @@ fn select_allowlist_accepts_credential_fields_and_secret() {
         "inheritance",
         "version",
         "updated_at",
-        "secret",
+        "owner_id",
+        "value",
     ] {
         assert!(validate_select(&[field.to_owned()]).is_ok(), "{field}");
     }
@@ -148,13 +149,38 @@ fn select_allowlist_accepts_credential_fields_and_secret() {
 }
 
 #[test]
-fn is_value_mode_detects_secret_in_select() {
+fn is_value_mode_detects_value_in_select() {
     assert!(is_value_mode(Some(&[
         "reference".to_owned(),
-        "secret".to_owned()
+        "value".to_owned()
     ])));
     assert!(!is_value_mode(Some(&["reference".to_owned()])));
     assert!(!is_value_mode(None));
+}
+
+#[test]
+fn admin_field_selected_detects_each_administrative_field_but_not_envelope_fields() {
+    for field in [
+        "sharing",
+        "status",
+        "fallback",
+        "inheritance",
+        "version",
+        "updated_at",
+        "owner_id",
+    ] {
+        assert!(
+            admin_field_selected(Some(&[field.to_owned()])),
+            "{field} must be detected as an administrative field"
+        );
+    }
+    for field in ["reference", "type", "expires_at", "value"] {
+        assert!(
+            !admin_field_selected(Some(&[field.to_owned()])),
+            "{field} must not be treated as administrative"
+        );
+    }
+    assert!(!admin_field_selected(None));
 }
 
 #[test]

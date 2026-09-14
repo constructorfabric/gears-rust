@@ -30,9 +30,10 @@ use crate::domain::resolver::TenantDirectory;
 use time::OffsetDateTime;
 
 use crate::domain::secret::fence;
+use crate::domain::secret::list_filter;
 use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewSecret, PutPrecondition, SecretRow, SecretStatus,
-    WritePrecondition,
+    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow,
+    SecretStatus, WritePrecondition,
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
@@ -220,6 +221,24 @@ pub struct Service {
     /// more than one backend re-read per window. Independent of the cache's own
     /// load time.
     last_fence_refresh: std::sync::Mutex<Option<Instant>>,
+}
+
+/// Selection-aware answer to the point read (`Service::get_item`, ADR-0004
+/// Amendment A): the resolved [`Credential`], its decrypted value when the
+/// projection named `value` and the winner had one to serve, that value's
+/// own validator (the row it was actually served from — a concurrent switch
+/// can make this momentarily different from `credential.validator`), and the
+/// weak-`ETag` source the REST layer needs whenever the caller holds no own
+/// row.
+#[domain_model]
+#[derive(Debug)]
+pub struct CredentialItem {
+    pub credential: Credential,
+    pub value: Option<SecretValue>,
+    /// The validator of the row `value` was served from; `Some` iff `value`
+    /// is.
+    pub value_validator: Option<Validator>,
+    pub weak_validator_source: Option<(Uuid, i64)>,
 }
 
 impl Service {
@@ -518,10 +537,11 @@ impl Service {
         Ok(fence::compute_fp(key.as_slice(), value.as_bytes()))
     }
 
-    /// Retrieve the credential **record** (ADR-0004). See
-    /// [`Self::resolve_credential`] for the resolution/reduction this
-    /// delegates to; the SDK contract never needs the winning row's identity
-    /// this method's sibling carries for the REST layer's weak `ETag`.
+    /// Retrieve the credential **record** (ADR-0004). See [`Self::get_item`]
+    /// for the resolution/reduction/projection this delegates to; the SDK
+    /// contract never needs the winning row's identity
+    /// [`Self::resolve_credential`] carries for the REST layer's weak
+    /// `ETag`.
     ///
     /// # Errors
     ///
@@ -532,15 +552,17 @@ impl Service {
         key: &SecretRef,
     ) -> Result<Option<Credential>, DomainError> {
         Ok(self
-            .resolve_credential(ctx, key)
+            .get_item(ctx, key, None)
             .await?
-            .map(|(credential, _weak_validator_source)| credential))
+            .map(|item| item.credential))
     }
 
     /// Retrieve the credential **record** (ADR-0004), walking up the tenant
     /// hierarchy to determine the effective row and reducing it with the
     /// caller's own row (ADR-0005 "Reducing a reference to one item").
-    /// Never carries the value — see [`Self::get_secret`].
+    /// Never carries the value — see [`Self::get_secret`]. Thin wrapper over
+    /// [`Self::get_item`] with no projection (the unselected point read:
+    /// `read` alone, exactly as [`Self::get`]).
     ///
     /// Returns the assembled [`Credential`] together with the winning row's
     /// `(id, version)` whenever the caller holds no own row — the REST
@@ -557,6 +579,63 @@ impl Service {
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<(Credential, Option<(Uuid, i64)>)>, DomainError> {
+        Ok(self
+            .get_item(ctx, key, None)
+            .await?
+            .map(|item| (item.credential, item.weak_validator_source)))
+    }
+
+    /// The projection-aware point read (`GET /credstore/v1/credentials/{ref}`,
+    /// ADR-0004 Amendment A — mirror of [`Self::authorize_write_actions`] for
+    /// reads): resolves the candidates and reduces them exactly as
+    /// [`Self::resolve_credential`] and the collection read do, evaluates
+    /// the action(s) `fields` requires once each on the effective concrete
+    /// type — `read` when `fields` is `None` or names any administrative
+    /// record field (`sharing`/`status`/`fallback`/`inheritance`/`version`/
+    /// `updated_at`/`owner_id`), `read_secret` when `fields` names `value`,
+    /// both when both — and reads the value via the fence-checked
+    /// [`Self::read_value_for_row`] only when `value` is selected and the
+    /// winner has one. A denial on either required action is the canonical
+    /// 404 (`Ok(None)`), before either representation is assembled. A
+    /// `value`-only projection (no administrative field alongside it — the
+    /// shape [`Self::get_secret`] uses) against a winner with no value to
+    /// serve is the canonical miss too, exactly as the withdrawn
+    /// `GET …/secret` was; the same value-less winner, projected together
+    /// with an administrative field, is returned as a record with no
+    /// `value` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::NotFound`] or [`DomainError::ServiceUnavailable`]
+    /// from the value read, exactly as [`Self::get_secret`] documents, when
+    /// `value` is selected and the winner has one.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "resolve -> reduce -> authorize(s) -> assemble -> conditionally read is \
+                  inherently branchy; kept as one function for readability of the flow, \
+                  mirroring resolve_credential/put/patch"
+    )]
+    pub async fn get_item(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        fields: Option<&[String]>,
+    ) -> Result<Option<CredentialItem>, DomainError> {
+        if let Some(f) = fields {
+            list_filter::validate_select(f)?;
+        }
+
+        // Amendment A's projection-to-action rule: `read` is required unless
+        // this is a pure value request (`value` named, no administrative
+        // field alongside it) — the shape `get_secret` uses; `read_secret`
+        // is required whenever `value` is named. At least one is always
+        // `true`.
+        let need_value = list_filter::is_value_mode(fields);
+        let need_admin = list_filter::admin_field_selected(fields);
+        let need_read = !need_value || need_admin;
+        let need_read_secret = need_value;
+
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
@@ -566,6 +645,9 @@ impl Service {
             .resolve_candidates(req, subject, key, &chain)
             .await?;
         if candidates.is_empty() {
+            if need_read_secret {
+                self.metrics.read_outcome(ReadOutcome::Miss);
+            }
             return Ok(None);
         }
 
@@ -595,6 +677,9 @@ impl Service {
 
         let Some(effective) = own.or(winner) else {
             // Nothing resolves and the caller holds no row at all.
+            if need_read_secret {
+                self.metrics.read_outcome(ReadOutcome::Miss);
+            }
             return Ok(None);
         };
 
@@ -623,25 +708,60 @@ impl Service {
 
         let resolved = self.resolve_stored(effective.secret_type_uuid).await?;
 
-        // Single PDP evaluation, on the effective record's full concrete
-        // type, gated on the *caller's* tenant. A PDP denial or an
+        // Evaluate whichever of `read`/`read_secret` the projection needs,
+        // gated on the caller's own tenant, before either representation is
+        // assembled (mirrors `authorize_write_actions`). A PDP denial or an
         // out-of-scope tenant is indistinguishable from a missing record
         // (anti-enumeration 404); a PDP or registry *outage* propagates.
-        let scope = match self
-            .scope_for_timed(
-                ctx,
-                &authz::credential_type_resource(&resolved.gts_id),
-                actions::READ,
-            )
-            .await
-        {
-            Ok(scope) => scope,
-            Err(DomainError::AccessDenied { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if !self.repo.scope_includes_tenant(&scope, req.0).await? {
-            self.metrics.cross_tenant_denied();
-            return Ok(None);
+        if need_read {
+            match self
+                .scope_for_timed(
+                    ctx,
+                    &authz::credential_type_resource(&resolved.gts_id),
+                    actions::READ,
+                )
+                .await
+            {
+                Ok(scope) => {
+                    if !self.repo.scope_includes_tenant(&scope, req.0).await? {
+                        self.metrics.cross_tenant_denied();
+                        if need_read_secret {
+                            self.metrics.read_outcome(ReadOutcome::Miss);
+                        }
+                        return Ok(None);
+                    }
+                }
+                Err(DomainError::AccessDenied { .. }) => {
+                    if need_read_secret {
+                        self.metrics.read_outcome(ReadOutcome::Miss);
+                    }
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if need_read_secret {
+            match self
+                .scope_for_timed(
+                    ctx,
+                    &authz::credential_type_resource(&resolved.gts_id),
+                    actions::READ_SECRET,
+                )
+                .await
+            {
+                Ok(scope) => {
+                    if !self.repo.scope_includes_tenant(&scope, req.0).await? {
+                        self.metrics.cross_tenant_denied();
+                        self.metrics.read_outcome(ReadOutcome::Miss);
+                        return Ok(None);
+                    }
+                }
+                Err(DomainError::AccessDenied { .. }) => {
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let (status, fallback, version, updated_at, owner_id, validator) = match own {
@@ -672,27 +792,82 @@ impl Service {
             None
         };
 
-        Ok(Some((
-            Credential {
-                reference: key.clone(),
-                secret_type: resolved.gts_id,
-                sharing: effective.sharing,
-                fallback,
-                status,
-                inheritance,
-                version,
-                updated_at,
-                owner_id,
-                expires_at: effective.expires_at,
-                validator,
-            },
+        let credential = Credential {
+            reference: key.clone(),
+            secret_type: resolved.gts_id,
+            sharing: effective.sharing,
+            fallback,
+            status,
+            inheritance,
+            version,
+            updated_at,
+            owner_id,
+            expires_at: effective.expires_at,
+            validator,
+        };
+
+        // Read the value only when it was asked for and the winner actually
+        // has one. This re-resolves the winning row through
+        // `resolve_for_get` — the same single targeted query
+        // `get_secret`'s classic implementation issued — rather than reusing
+        // the in-memory `winner` above: it is what carries this read's
+        // retry-once-and-verify-fingerprint protocol (ADR-0006 §6.2), and
+        // its `Secret::validator` is the row the value actually came from,
+        // which a concurrent switch can make momentarily different from the
+        // `winner` snapshot taken above.
+        let mut secret = None;
+        if need_read_secret {
+            let value_row = self.repo.resolve_for_get(req, subject, key, &chain).await?;
+            match &value_row {
+                Some(row) if row.value_id.is_some() => {
+                    let plugin = self.plugins.resolve().await?;
+                    secret = self
+                        .read_value_for_row(
+                            &plugin,
+                            ctx,
+                            req,
+                            subject,
+                            key,
+                            &chain,
+                            row,
+                            &credential.secret_type,
+                        )
+                        .await?;
+                }
+                _ => {
+                    // No winning row, or a value-less (declared/suppressed)
+                    // one: nothing to read, and `read_value_for_row` was
+                    // never called, so the miss is not yet recorded.
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                }
+            }
+        }
+
+        if need_read_secret && !need_read && secret.is_none() {
+            // A pure value request (no administrative field rode along) that
+            // resolved to a value-less winner is the canonical miss — the
+            // same 404 the withdrawn `GET …/secret` gave, not a 200 with no
+            // `value`.
+            return Ok(None);
+        }
+
+        let value_validator = secret.as_ref().map(|s| s.validator);
+        let value = secret.map(|s| s.value);
+        Ok(Some(CredentialItem {
+            credential,
+            value,
+            value_validator,
             weak_validator_source,
-        )))
+        }))
     }
 
     /// Retrieve the resolved **value** (ADR-0004), walking up the tenant
     /// hierarchy. A winning record with no value (`declared`, including the
-    /// suppression case) is the canonical miss.
+    /// suppression case) is the canonical miss. Thin wrapper over
+    /// [`Self::get_item`], projected to exactly `reference`, `type`,
+    /// `expires_at` and `value` — the shape the SDK's `Secret` envelope
+    /// wraps, and the same projection `CredStoreLocalClient::get_secret`
+    /// sends over the in-process trait (ADR-0004, "One item, one shape").
     ///
     /// # Errors
     ///
@@ -709,69 +884,29 @@ impl Service {
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<Secret>, DomainError> {
-        let req = TenantId(ctx.subject_tenant_id());
-        let subject = OwnerId(ctx.subject_id());
-        let chain = self.dir.ancestor_chain(ctx, req).await?;
-
-        // Resolve first (prefetch — AUTHZ_USAGE_SCENARIOS S09): a reference
-        // that does not resolve is a 404 without consulting the PDP; there
-        // is nothing to authorize. The predicate already admits a
-        // `declared`/`none` suppressing row (ADR-0004) — such a winner
-        // carries no value, so the resolved row's `value_id` decides the
-        // canonical miss below.
-        let Some(row) = self.repo.resolve_for_get(req, subject, key, &chain).await? else {
-            self.metrics.read_outcome(ReadOutcome::Miss);
+        let fields = [
+            "reference".to_owned(),
+            "type".to_owned(),
+            "expires_at".to_owned(),
+            "value".to_owned(),
+        ];
+        let Some(item) = self.get_item(ctx, key, Some(&fields)).await? else {
             return Ok(None);
         };
-        if row.value_id.is_none() {
-            // The winning row is `declared`/`none` (suppression): the walk
-            // stopped here and there is nothing to serve for this reference.
-            self.metrics.read_outcome(ReadOutcome::Miss);
+        // `get_item` already applied the value-only miss rule above, so
+        // reaching here with either absent is structurally unreachable
+        // (`value_validator` is `Some` iff `value` is); guard rather than
+        // unwrap.
+        let (Some(value), Some(validator)) = (item.value, item.value_validator) else {
             return Ok(None);
-        }
-
-        // Single PDP evaluation, on the secret's full concrete type (including
-        // `generic`) as resolved from the types-registry, gated on the
-        // *caller's* tenant. Hierarchical visibility (a shared secret
-        // inherited from an ancestor) is decided by the resolver above, so
-        // the gate uses `req`, not the row's owner tenant — this is what lets
-        // inherited reads work. A PDP denial or an out-of-scope tenant is
-        // indistinguishable from a missing secret (anti-enumeration 404); a
-        // PDP or registry *outage* propagates as 503.
-        let resolved = self.resolve_stored(row.secret_type_uuid).await?;
-        let scope = match self
-            .scope_for_timed(
-                ctx,
-                &authz::credential_type_resource(&resolved.gts_id),
-                actions::READ_SECRET,
-            )
-            .await
-        {
-            Ok(scope) => scope,
-            Err(DomainError::AccessDenied { .. }) => {
-                self.metrics.read_outcome(ReadOutcome::Miss);
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
         };
-        if !self.repo.scope_includes_tenant(&scope, req.0).await? {
-            self.metrics.cross_tenant_denied();
-            self.metrics.read_outcome(ReadOutcome::Miss);
-            return Ok(None);
-        }
-
-        let plugin = self.plugins.resolve().await?;
-        self.read_value_for_row(
-            &plugin,
-            ctx,
-            req,
-            subject,
-            key,
-            &chain,
-            &row,
-            &resolved.gts_id,
-        )
-        .await
+        Ok(Some(Secret {
+            reference: key.clone(),
+            secret_type: item.credential.secret_type,
+            expires_at: item.credential.expires_at,
+            value,
+            validator,
+        }))
     }
 
     /// Read and fingerprint-verify the backend value named by `row.value_id`
@@ -997,18 +1132,33 @@ impl Service {
         result
     }
 
-    /// Create or replace the whole credential — record and value together
-    /// (ADR-0004, "Two write verbs on one resource").
+    /// Create or replace the whole credential — record and, unless `value`
+    /// is an explicit `None`, its value together (ADR-0004, "Two write verbs
+    /// on one resource"; Amendment B, "The value-less record: reached only
+    /// on purpose").
     ///
     /// A write targets the row of its own sharing class — `private` →
     /// `(tenant, ref, owner)`, `tenant`/`shared` → `(tenant, ref)` — so a private
     /// and a tenant/shared secret coexist under one reference (per design §4.1);
     /// a write of one class never affects the other.
     ///
-    /// Every write that carries a value follows ADR-0006's single protocol
-    /// regardless of precondition: mint a fresh `value_id`, record its intent,
-    /// write the backend, then one transaction switches the row's pointer
-    /// (`insert_active` on create, `switch_value` on overwrite).
+    /// `value: Some(_)` follows ADR-0006's single protocol regardless of
+    /// precondition: mint a fresh `value_id`, record its intent, write the
+    /// backend, then one transaction switches the row's pointer
+    /// (`insert_active` on create, `switch_value` on overwrite) — the plugin
+    /// is resolved (fail-fast) only on this path. `value: None` never
+    /// touches the plugin at all on create (`insert_declared`, a plain
+    /// `INSERT`) or on replace of an already-`declared` row (metadata-only,
+    /// `update_metadata`, itself skipped when nothing would change — ADR-0004
+    /// "A metadata-only write that changes nothing bumps nothing"); on
+    /// replace of an `active` row it removes the value in the same one
+    /// transaction `PATCH {"value": null}` uses (`remove_value`), and the
+    /// plugin is then resolved for the old version's best-effort cleanup.
+    ///
+    /// `write` is always required; `write_secret` is additionally required
+    /// when `value` is `Some(_)`, or when a `None` removes an existing value
+    /// (replace of an `active` row) — never when `None` creates or replaces
+    /// an already value-less row.
     ///
     /// # Errors
     ///
@@ -1046,9 +1196,6 @@ impl Service {
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
 
-        // Fail fast if no plugin is available before touching metadata.
-        let plugin = self.plugins.resolve().await?;
-
         // Prefetch the target row of this sharing class (own-tenant, keyed by
         // tenant+owner+key+sharing, of either resting status — a `declared`
         // row still "holds" the reference, ADR-0004) with `allow_all`; the
@@ -1060,10 +1207,14 @@ impl Service {
             .await?
         {
             let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
+            // `write_secret` is needed whenever a value is named, or a
+            // `null` removes one this row already holds (Amendment B); never
+            // when `null` replaces an already value-less row.
+            let need_write_secret = value.is_some() || existing.status == SecretStatus::Active;
             // Authorize on the concrete type BEFORE any 4xx that would reveal
             // the row exists.
             let scope = self
-                .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, true)
+                .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, need_write_secret)
                 .await?;
 
             if matches!(precondition, PutPrecondition::CreateOnly) {
@@ -1081,28 +1232,91 @@ impl Service {
                     ),
                 });
             }
-            typing::validate_write(
-                &resolved.gts_id,
-                &resolved.traits,
-                sharing,
-                &value,
-                expires_at,
-            )?;
+            typing::validate_metadata(&resolved.gts_id, &resolved.traits, sharing, expires_at)?;
+            if let Some(v) = value.as_ref() {
+                typing::validate_value(&resolved.gts_id, &resolved.traits, v)?;
+            }
             let expected_version = Self::precheck_put_version(&precondition, &existing)?;
-            let validator = self
-                .overwrite_existing(
-                    ctx,
-                    &plugin,
-                    tenant,
-                    &scope,
-                    existing.id,
-                    sharing,
-                    fallback,
-                    expected_version,
-                    expires_at,
-                    value,
-                )
-                .await?;
+
+            let validator = match value {
+                Some(v) => {
+                    let plugin = self.plugins.resolve().await?;
+                    self.overwrite_existing(
+                        ctx,
+                        &plugin,
+                        tenant,
+                        &scope,
+                        existing.id,
+                        sharing,
+                        fallback,
+                        expected_version,
+                        expires_at,
+                        v,
+                    )
+                    .await?
+                }
+                None if existing.status == SecretStatus::Active => {
+                    // Replace of an active row with an explicit `null`:
+                    // remove the value in the same one transaction
+                    // `PATCH {"value": null}` uses, then best-effort clean up
+                    // the version it superseded.
+                    let plugin = self.plugins.resolve().await?;
+                    let (row, old_value_id) = self
+                        .repo
+                        .remove_value(
+                            &scope,
+                            existing.id,
+                            expected_version,
+                            sharing,
+                            fallback,
+                            expires_at,
+                        )
+                        .await?
+                        .ok_or(DomainError::VersionConflict)?;
+                    if let Some(old_id) = old_value_id {
+                        self.cleanup_replaced_value(ctx, &plugin, &tenant, old_id)
+                            .await;
+                    }
+                    Validator {
+                        id: row.id,
+                        version: row.version,
+                    }
+                }
+                None => {
+                    // Replace of an already-`declared` row with an explicit
+                    // `null`: metadata-only, and a no-op (204, unchanged
+                    // ETag, no bump) when nothing about the metadata would
+                    // change either — the same rule `PATCH`'s metadata-only
+                    // no-op follows (ADR-0004, "A metadata-only write that
+                    // changes nothing bumps nothing").
+                    if sharing == existing.sharing
+                        && fallback == existing.fallback
+                        && expires_at == existing.expires_at
+                    {
+                        Validator {
+                            id: existing.id,
+                            version: existing.version,
+                        }
+                    } else {
+                        let row = self
+                            .repo
+                            .update_metadata(
+                                &scope,
+                                existing.id,
+                                expected_version,
+                                sharing,
+                                fallback,
+                                expires_at,
+                            )
+                            .await?
+                            .ok_or(DomainError::VersionConflict)?;
+                        Validator {
+                            id: row.id,
+                            version: row.version,
+                        }
+                    }
+                }
+            };
             return Ok(PutOutcome {
                 created: false,
                 validator,
@@ -1126,19 +1340,19 @@ impl Service {
         };
         let type_uuid = requested_type.to_uuid();
         let resolved = self.types.resolve(type_uuid).await?;
-        typing::validate_write(
-            &resolved.gts_id,
-            &resolved.traits,
-            sharing,
-            &value,
-            expires_at,
-        )?;
+        typing::validate_metadata(&resolved.gts_id, &resolved.traits, sharing, expires_at)?;
+        if let Some(v) = value.as_ref() {
+            typing::validate_value(&resolved.gts_id, &resolved.traits, v)?;
+        }
 
         // Authorize on the requested concrete type BEFORE the inherited-type
         // check below: its 409 detail names the inherited type, which a
         // caller without `write`/`write_secret` on this type must not learn.
+        // `write_secret` is never evaluated for a `null` create — nothing
+        // about a value is being changed, there being none on either side of
+        // the request (ADR-0004 Amendment B).
         let scope = self
-            .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, true)
+            .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, value.is_some())
             .await?;
 
         // If the reference currently resolves to an ancestor's `shared`
@@ -1163,12 +1377,31 @@ impl Service {
             });
         }
 
-        let validator = self
-            .create_new(
-                ctx, &plugin, tenant, owner, key, sharing, fallback, type_uuid, expires_at, value,
+        let validator = if let Some(v) = value {
+            let plugin = self.plugins.resolve().await?;
+            self.create_new(
+                ctx, &plugin, tenant, owner, key, sharing, fallback, type_uuid, expires_at, v,
                 &scope,
             )
-            .await?;
+            .await?
+        } else {
+            // Explicit `null` on create: insert the row `declared` directly —
+            // no `value_id`, no fence, no gc entry, no backend call
+            // (ADR-0004 Amendment B).
+            let id = Uuid::new_v4();
+            let new = NewDeclaredSecret {
+                id,
+                tenant_id: tenant,
+                reference: key.clone(),
+                sharing,
+                owner_id: owner,
+                secret_type_uuid: type_uuid,
+                expires_at,
+                fallback,
+            };
+            self.repo.insert_declared(&scope, &new).await?;
+            Validator { id, version: 1 }
+        };
         Ok(PutOutcome {
             created: true,
             validator,

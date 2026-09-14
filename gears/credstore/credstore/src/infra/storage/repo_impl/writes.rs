@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewSecret, SecretRow, SecretStatus,
+    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus,
 };
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
@@ -395,6 +395,47 @@ async fn switch_value_tx(
         .ok_or_else(|| DomainError::internal("switch_value: row vanished after its own update"))?;
     let row = entity_to_model(row)?;
     Ok(Some((row, old_value_id.map(ValueId))))
+}
+
+/// Create-with-no-value path (ADR-0004 Amendment B): ONE plain `INSERT` —
+/// `status = declared`, `value_id`/`value_fp`/`fp_key_id` all `NULL`. No
+/// transaction is needed (unlike [`insert_active`], there is no paired
+/// `credstore_value_gc` row to delete atomically) and no plugin call is ever
+/// made. A unique-index conflict maps to `DomainError::Conflict` through the
+/// same `classify_db_err_to_domain` ladder every other write uses.
+pub(super) async fn insert_declared(
+    repo: &SecretRepoImpl,
+    scope: &AccessScope,
+    new: &NewDeclaredSecret,
+) -> Result<(), DomainError> {
+    let conn = repo.db.conn()?;
+    let now = OffsetDateTime::now_utc();
+    let am = entity::secrets::ActiveModel {
+        id: ActiveValue::Set(new.id),
+        tenant_id: ActiveValue::Set(new.tenant_id.0),
+        reference: ActiveValue::Set(new.reference.as_ref().to_owned()),
+        sharing: ActiveValue::Set(sharing_to_i16(new.sharing)),
+        owner_id: ActiveValue::Set(new.owner_id.0),
+        status: ActiveValue::Set(SecretStatus::Declared.as_smallint()),
+        created_at: ActiveValue::Set(now),
+        updated_at: ActiveValue::Set(now),
+        version: ActiveValue::NotSet,
+        secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
+        expires_at: ActiveValue::Set(new.expires_at),
+        value_id: ActiveValue::Set(None),
+        value_fp: ActiveValue::Set(None),
+        fp_key_id: ActiveValue::Set(None),
+        fallback: ActiveValue::Set(new.fallback.as_smallint()),
+    };
+    // scope_unchecked: INSERT cannot subtree-clamp on a row that doesn't exist yet.
+    entity::secrets::Entity::insert(am)
+        .secure()
+        .scope_unchecked(scope)
+        .map_err(map_scope_err)?
+        .exec(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    Ok(())
 }
 
 /// Metadata-only update (ADR-0004 `PATCH` with no `value` key): never

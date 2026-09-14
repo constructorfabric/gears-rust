@@ -11,6 +11,7 @@ use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use crate::domain::authz::actions;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
@@ -18,8 +19,8 @@ use crate::domain::secret::model::PutPrecondition;
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::service::{GcSettings, ListSettings, Service};
 use crate::domain::secret::test_support::{
-    FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver,
-    make_ctx, mock_enforcer,
+    FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, action_deny_enforcer,
+    catalog_type_resolver, make_ctx, mock_enforcer,
 };
 use credstore_sdk::{CredentialWrite, Fallback, SecretRef, SecretType, SecretValue, SharingMode};
 
@@ -47,10 +48,13 @@ struct TestHarness {
 }
 
 fn build_harness() -> TestHarness {
+    build_harness_with_enforcer(mock_enforcer())
+}
+
+fn build_harness_with_enforcer(enforcer: authz_resolver_sdk::PolicyEnforcer) -> TestHarness {
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let selector = Arc::new(FakePluginSelector::new(plugin));
-    let enforcer = mock_enforcer();
     let dir = Arc::new(FakeDir::single(test_tenant()));
     let metrics = FakeMetrics::new();
     let svc = Arc::new(Service::new(
@@ -158,7 +162,7 @@ async fn seed_credential(harness: &TestHarness, reference: &str, value: &str) ->
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
     };
     let outcome = harness
         .svc
@@ -199,10 +203,6 @@ async fn get_credential_existing_returns_200_with_body_and_strong_etag() {
     assert_eq!(body["sharing"], "tenant");
     assert_eq!(body["status"], "active");
     assert_eq!(body["inheritance"], "own");
-    assert!(
-        body.get("secret").is_none(),
-        "credential must never carry a value"
-    );
     assert!(
         body.get("value").is_none(),
         "credential must never carry a value"
@@ -492,6 +492,39 @@ async fn put_missing_target_with_if_match_never_creates_returns_409() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn put_create_with_explicit_null_value_returns_201_declared() {
+    let h = build_harness();
+    let req = json_request_preconditioned(
+        "PUT",
+        "/credstore/v1/credentials/nullcreate",
+        Some(serde_json::json!({
+            "type": SecretType::generic().gts_id(),
+            "sharing": "tenant",
+            "value": null
+        })),
+        Some("*"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.clone().oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(resp.headers().get(axum::http::header::LOCATION).is_some());
+    assert!(resp.headers().get(axum::http::header::ETAG).is_some());
+
+    let get = json_request(
+        "GET",
+        "/credstore/v1/credentials/nullcreate",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(get).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "declared");
+    assert!(body.get("value").is_none());
+}
+
 // ── PATCH /credstore/v1/credentials/{ref} ───────────────────────────────────
 
 #[tokio::test]
@@ -518,7 +551,7 @@ async fn patch_rotates_value_returns_204_with_new_etag() {
 
     let get = json_request(
         "GET",
-        "/credstore/v1/credentials/rot/secret",
+        "/credstore/v1/credentials/rot?%24select=reference%2Ctype%2Cexpires_at%2Cvalue",
         None,
         test_ctx(),
     );
@@ -698,7 +731,7 @@ async fn patch_value_null_suppresses_and_secret_read_becomes_404() {
 
     let get_secret = json_request(
         "GET",
-        "/credstore/v1/credentials/suppress/secret",
+        "/credstore/v1/credentials/suppress?%24select=value",
         None,
         test_ctx(),
     );
@@ -765,16 +798,18 @@ async fn delete_missing_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-// ── GET /credentials/{ref}/secret ───────────────────────────────────────────
+// ── GET /credentials/{ref}?$select=... (ADR-0004 Amendment A) ───────────────
+// The withdrawn `GET /credentials/{ref}/secret` is superseded by
+// `$select=reference,type,expires_at,value` on the point read.
 
 #[tokio::test]
-async fn get_secret_existing_returns_200_with_value() {
+async fn get_credential_select_value_returns_the_value() {
     let h = build_harness();
     seed_credential(&h, "sec", "topsecret").await;
 
     let req = json_request(
         "GET",
-        "/credstore/v1/credentials/sec/secret",
+        "/credstore/v1/credentials/sec?%24select=reference%2Ctype%2Cexpires_at%2Cvalue",
         None,
         test_ctx(),
     );
@@ -790,19 +825,115 @@ async fn get_secret_existing_returns_200_with_value() {
     let body = body_json(resp).await;
     assert_eq!(body["value"], "topsecret");
     assert_eq!(body["reference"], "sec");
+    assert!(
+        body.get("sharing").is_none(),
+        "an administrative field must not ride along with a value-only projection: {body}"
+    );
 }
 
 #[tokio::test]
-async fn get_secret_missing_returns_404() {
+async fn get_credential_select_value_missing_returns_404() {
     let h = build_harness();
     let req = json_request(
         "GET",
-        "/credstore/v1/credentials/nosec/secret",
+        "/credstore/v1/credentials/nosec?%24select=value",
         None,
         test_ctx(),
     );
     let resp = h.router.oneshot(req).await.expect("router");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_credential_select_projects_only_the_requested_fields() {
+    let h = build_harness();
+    seed_credential(&h, "proj", "v").await;
+
+    let req = json_request(
+        "GET",
+        "/credstore/v1/credentials/proj?%24select=reference%2Ctype",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["reference", "type"]);
+}
+
+#[tokio::test]
+async fn get_credential_select_unknown_field_returns_400() {
+    let h = build_harness();
+    seed_credential(&h, "badselect", "v").await;
+
+    let req = json_request(
+        "GET",
+        "/credstore/v1/credentials/badselect?%24select=bogus",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"],
+        "INVALID_SELECT"
+    );
+}
+
+#[tokio::test]
+async fn get_credential_select_value_without_read_secret_grant_returns_404() {
+    // A caller holding `read` but not `read_secret`: the unselected point
+    // read (metadata only) still succeeds, but naming `value` in `$select`
+    // is the canonical 404 -- not a 403, and not a 200 missing the field.
+    let denied_type = SecretType::generic().gts_id().to_owned();
+    let (enforcer, _resolver) = action_deny_enforcer(denied_type, actions::READ_SECRET);
+    let h = build_harness_with_enforcer(enforcer);
+    seed_credential(&h, "noreadsecret", "v").await;
+
+    let plain = json_request(
+        "GET",
+        "/credstore/v1/credentials/noreadsecret",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.clone().oneshot(plain).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK, "read alone must still work");
+
+    let with_value = json_request(
+        "GET",
+        "/credstore/v1/credentials/noreadsecret?%24select=value",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(with_value).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn secret_route_is_withdrawn_returns_404_from_the_router() {
+    let h = build_harness();
+    seed_credential(&h, "goneroute", "v").await;
+
+    let req = json_request(
+        "GET",
+        "/credstore/v1/credentials/goneroute/secret",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "no route is registered for .../secret any more"
+    );
 }
 
 // ── misc ─────────────────────────────────────────────────────────────────────
@@ -901,7 +1032,7 @@ async fn list_credentials_without_select_returns_the_full_credential_shape() {
             "updated_at",
             "version",
         ],
-        "no `secret` key outside value mode (no expiry set on this fixture, so `expires_at` is \
+        "no `value` key outside value mode (no expiry set on this fixture, so `expires_at` is \
          skipped too)"
     );
     assert_eq!(item["status"], "active");
@@ -944,7 +1075,7 @@ async fn list_credentials_value_mode_returns_the_value() {
 
     let req = json_request(
         "GET",
-        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27list-value%27"),
+        &list_uri("%24select=reference%2Cvalue&%24filter=reference%20eq%20%27list-value%27"),
         None,
         test_ctx(),
     );
@@ -954,7 +1085,7 @@ async fn list_credentials_value_mode_returns_the_value() {
     let items = body["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["reference"], "list-value");
-    assert_eq!(items[0]["secret"], "top-secret");
+    assert_eq!(items[0]["value"], "top-secret");
     assert!(body["page_info"]["next_cursor"].is_null());
 }
 
@@ -963,7 +1094,7 @@ async fn list_credentials_value_mode_rejects_limit() {
     let h = build_harness();
     let req = json_request(
         "GET",
-        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27x%27&limit=5"),
+        &list_uri("%24select=reference%2Cvalue&%24filter=reference%20eq%20%27x%27&limit=5"),
         None,
         test_ctx(),
     );

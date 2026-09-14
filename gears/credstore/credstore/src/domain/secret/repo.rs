@@ -14,7 +14,9 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, GcEntry, GcReason, NewSecret, SecretRow};
+use crate::domain::secret::model::{
+    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow,
+};
 
 #[async_trait]
 pub trait SecretRepo: Send + Sync {
@@ -182,6 +184,19 @@ pub trait SecretRepo: Send + Sync {
     /// maps to the existing `Conflict` error; `new.value_id` is fresh, so it
     /// never collides with `uq_credstore_value_id` itself.
     async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError>;
+
+    /// Create-with-no-value path (ADR-0004 Amendment B, "The value-less
+    /// record: reached only on purpose"): ONE plain `INSERT` — `status =
+    /// declared`, `value_id`/`value_fp`/`fp_key_id` all `NULL`. No gc intent
+    /// is recorded and no plugin call is ever made — there is no backend
+    /// entry to protect. A unique-index conflict on the reference's own
+    /// create-only uniqueness maps to the existing `Conflict` error, exactly
+    /// like [`Self::insert_active`].
+    async fn insert_declared(
+        &self,
+        scope: &AccessScope,
+        new: &NewDeclaredSecret,
+    ) -> Result<(), DomainError>;
 
     /// Overwrite step 4: ONE transaction —
     /// `UPDATE … SET value_id = new_value_id, value_fp, fp_key_id, sharing,

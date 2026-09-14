@@ -13,10 +13,7 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::page_to_projected_json;
 use toolkit_security::SecurityContext;
 
-use super::dto::{
-    CredentialDto, CredentialListItemDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto,
-    weak_etag,
-};
+use super::dto::{CredentialDto, CredentialPatchDto, PutCredentialRequestDto, weak_etag};
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
     PutPrecondition as DomainPutPrecondition, WritePrecondition as DomainWritePrecondition,
@@ -167,10 +164,10 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
 /// `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the collection read.
 ///
 /// Metadata-mode responses carry every reduced item as the same shape
-/// `GET .../{ref}` returns (`secret` absent); selecting `secret` in
+/// `GET .../{ref}` returns (`value` absent); selecting `value` in
 /// `$select` switches to value mode (ADR-0004, "Bulk secret read"), whose
 /// items additionally carry the decrypted value — audited per item exactly
-/// like `GET .../{ref}/secret`, since both paths share
+/// like the point read's `$select=…,value`, since both paths share
 /// `Service::read_value_for_row`'s retry/fence-verification/metrics.
 ///
 /// # Errors
@@ -188,7 +185,7 @@ pub async fn list_credentials(
     let page = svc.list(&ctx, &query).await?;
     let mut items = Vec::with_capacity(page.items.len());
     for item in &page.items {
-        items.push(CredentialListItemDto::try_from_list_item(item)?);
+        items.push(CredentialDto::try_from_list_item(item)?);
     }
     let dto_page = toolkit_odata::Page {
         items,
@@ -206,26 +203,34 @@ pub async fn list_credentials(
         .into_response())
 }
 
-/// `GET /credstore/v1/credentials/{ref}` (ADR-0004).
+/// `GET /credstore/v1/credentials/{ref}` (ADR-0004 Amendment A): the point
+/// read, sharing its item shape and `$select` mechanism with the collection.
+/// Without `$select`, the full record (never `value`); selecting `value`
+/// includes it, for a caller the projection's action(s) admit — the same
+/// projection-to-action rule `Service::get_item` documents.
 ///
 /// # Errors
 ///
-/// Returns a canonical `Problem` envelope on invalid reference (400), access denied (403),
-/// or not found (404).
+/// Returns a canonical `Problem` envelope on invalid reference or an
+/// unsupported `$select` field (400), access denied (403), or not found
+/// (404) — a denial evaluated against the concrete type, a value-only
+/// projection resolving to a value-less winner, and an unknown reference all
+/// render as the same 404.
 pub async fn get_credential(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
     Path(reference): Path<String>,
+    OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     let key = SecretRef::new(reference).map_err(|e| {
         CanonicalError::from(DomainError::InvalidSecretRef {
             detail: e.to_string(),
         })
     })?;
-    match svc.resolve_credential(&ctx, &key).await? {
-        Some((credential, weak_source)) => {
-            let dto = CredentialDto::try_from_credential(&credential)?;
-            let etag = match (&credential.validator, weak_source) {
+    match svc.get_item(&ctx, &key, query.selected_fields()).await? {
+        Some(item) => {
+            let dto = CredentialDto::try_from_parts(&item.credential, item.value.as_ref())?;
+            let etag = match (&item.credential.validator, item.weak_validator_source) {
                 (Some(v), _) => format!("\"{}.{}\"", v.id, v.version),
                 (None, Some((winner_id, winner_version))) => weak_etag(
                     ctx.subject_tenant_id(),
@@ -234,12 +239,16 @@ pub async fn get_credential(
                     winner_version,
                 ),
                 (None, None) => {
-                    // Structurally unreachable: `resolve_credential` only
-                    // returns `Some` with no validator when a winner exists.
+                    // Structurally unreachable: `get_item` only returns
+                    // `Some` with no validator when a winner exists.
                     return Err(CanonicalError::from(DomainError::internal(
                         "credential resolved with neither a strong nor a weak validator source",
                     )));
                 }
+            };
+            let body = match query.selected_fields() {
+                Some(fields) => Json(apply_select(&dto, Some(fields))).into_response(),
+                None => Json(dto).into_response(),
             };
             Ok((
                 StatusCode::OK,
@@ -247,41 +256,7 @@ pub async fn get_credential(
                     (axum::http::header::ETAG, etag),
                     (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
                 ],
-                Json(dto),
-            )
-                .into_response())
-        }
-        None => Err(CanonicalError::from(DomainError::NotFound)),
-    }
-}
-
-/// `GET /credstore/v1/credentials/{ref}/secret` (ADR-0004).
-///
-/// # Errors
-///
-/// Returns a canonical `Problem` envelope on invalid reference (400), access denied (403),
-/// or not found (404).
-pub async fn get_secret(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<ConcreteService>>,
-    Path(reference): Path<String>,
-) -> ApiResult<impl IntoResponse> {
-    let key = SecretRef::new(reference).map_err(|e| {
-        CanonicalError::from(DomainError::InvalidSecretRef {
-            detail: e.to_string(),
-        })
-    })?;
-    match svc.get_secret(&ctx, &key).await? {
-        Some(ref secret) => {
-            let dto = SecretDto::try_from_secret(secret)?;
-            let etag = format!("\"{}.{}\"", secret.validator.id, secret.validator.version);
-            Ok((
-                StatusCode::OK,
-                [
-                    (axum::http::header::ETAG, etag),
-                    (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
-                ],
-                Json(dto),
+                body,
             )
                 .into_response())
         }
@@ -310,6 +285,9 @@ pub async fn put_credential(
             detail: e.to_string(),
         })
     })?;
+    // Tri-state (ADR-0004 Amendment B): absent (`None`) is 400
+    // `VALUE_REQUIRED`; `Some(None)` (explicit JSON `null`) writes no value;
+    // `Some(Some(s))` writes `s`.
     let Some(raw_value) = body.value else {
         return Err(CanonicalError::from(DomainError::InvalidRequest {
             field: "value",
@@ -333,7 +311,7 @@ pub async fn put_credential(
         sharing: body.sharing.into(),
         fallback: Fallback::from(body.fallback),
         expires_at,
-        value: SecretValue::from(raw_value),
+        value: raw_value.map(SecretValue::from),
     };
     let outcome = svc.put(&ctx, &key, write, precondition).await?;
     let etag = format!("\"{}.{}\"", outcome.validator.id, outcome.validator.version);

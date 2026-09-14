@@ -40,7 +40,8 @@ pub mod actions {
     pub const WRITE: &str = "write";
     /// `DELETE /credentials/{ref}`.
     pub const DELETE: &str = "delete";
-    /// Point read of the value (`GET /credentials/{ref}/secret`).
+    /// Point read of the value: `GET /credentials/{ref}` (or the collection)
+    /// with `value` named in `$select` (ADR-0004 Amendment A).
     pub const READ_SECRET: &str = "read_secret";
     /// `PUT`/`PATCH` of the `value` field.
     pub const WRITE_SECRET: &str = "write_secret";
