@@ -81,6 +81,29 @@ pub trait CleanupStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Vec<FileVersion>, DomainError>;
 
+    /// List `files` rows that never received **any** version at all --
+    /// `content_id IS NULL` **and** zero `file_versions` rows exist for
+    /// them -- created before `created_before`, ordered `(created_at,
+    /// file_id)` ascending, up to `limit` rows.
+    ///
+    /// Feeds the second phase of sweep step 1
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    /// Unlike [`Self::list_abandoned_pending_versions`] above (keyed on the
+    /// age of a `file_versions` row that exists), this method finds `files`
+    /// rows that never got a version row in the first place -- e.g. a
+    /// process crash between `FileService::create_file_bare`'s commit and
+    /// `MultipartService::initiate_multipart_upload`'s
+    /// `insert_pending_version`, or a failed
+    /// `FileService::compensate_failed_multipart_initiate`. Neither
+    /// `list_abandoned_pending_versions` nor `list_expired_multipart_uploads`
+    /// can ever select such a row, since both key off a `file_versions` (or
+    /// `multipart_uploads`) row that was never created.
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError>;
+
     /// Delete a version row + audit in one transaction. Returns `true` if removed.
     async fn delete_version(
         &self,

@@ -73,6 +73,24 @@ impl Store {
             .await
     }
 
+    /// List `files` rows that never received any version at all -- see
+    /// [`crate::domain::ports::CleanupStore::list_versionless_orphan_files`]
+    /// for the full contract and
+    /// [`crate::infra::storage::repo::FileRepo::list_versionless_orphan_files`]
+    /// for the query. Feeds the second phase of sweep step 1
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    pub async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .files
+            .list_versionless_orphan_files(&conn, &AccessScope::allow_all(), created_before, limit)
+            .await
+    }
+
     /// List all `in_progress` multipart sessions whose `expires_at` is before `now`.
     pub async fn list_expired_multipart_uploads(
         &self,
