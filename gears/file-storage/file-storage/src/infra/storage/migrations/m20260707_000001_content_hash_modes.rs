@@ -9,7 +9,10 @@
 //!   SHA-256 upload, requiring no re-hash).
 //! - `file_versions.part_count integer` — `NOT NULL` only for
 //!   `hash_mode = 'multipart-composite-sha256'`, enforced by a cross-column
-//!   presence `CHECK`. Pre-existing rows backfill to `NULL`.
+//!   presence `CHECK`. Pre-existing rows backfill to `NULL`. The same
+//!   `CHECK` also pins `part_count >= 2` whenever it is present: a one-part
+//!   multipart plan degenerates to `whole-sha256` with `part_count = NULL`
+//!   (ADR-0006), so a composite row always carries at least 2 parts.
 //! - A unique index on `file_versions (version_id)` alone, so
 //!   `version_hash_manifest` can carry a single-column FK into it (the
 //!   table's actual PK is the composite `(file_id, version_id)` — see
@@ -37,7 +40,8 @@ ALTER TABLE file_versions
 
 ALTER TABLE file_versions
     ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
+               AND (part_count IS NULL OR part_count >= 2));
 
 CREATE UNIQUE INDEX IF NOT EXISTS file_versions_version_id_unique_idx
     ON file_versions (version_id);
@@ -55,7 +59,8 @@ const SQLITE_UP: &str = r"
 ALTER TABLE file_versions ADD COLUMN hash_mode TEXT NOT NULL DEFAULT 'whole-sha256'
     CHECK (hash_mode IN ('whole-sha256', 'multipart-composite-sha256'));
 ALTER TABLE file_versions ADD COLUMN part_count INTEGER
-    CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+    CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
+           AND (part_count IS NULL OR part_count >= 2));
 
 CREATE UNIQUE INDEX IF NOT EXISTS file_versions_version_id_unique_idx
     ON file_versions (version_id);
