@@ -146,7 +146,11 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
     ) -> Result<PutOutcome, CredStoreError> {
         self.put_calls.lock().push((
             key.as_ref().to_owned(),
-            write.value.as_bytes().to_vec(),
+            write
+                .value
+                .as_ref()
+                .map(|v| v.as_bytes().to_vec())
+                .unwrap_or_default(),
             write.sharing,
         ));
         self.next_put_response

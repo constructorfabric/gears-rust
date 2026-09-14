@@ -102,7 +102,7 @@ impl FilterField for CredentialFilterField {
 }
 
 /// `$select` allowlist (ADR-0004): the `Credential` field names plus
-/// `secret`. Selecting `secret` switches the request to value mode.
+/// `value`. Selecting `value` switches the request to value mode.
 const SELECT_ALLOWLIST: &[&str] = &[
     "reference",
     "type",
@@ -113,7 +113,25 @@ const SELECT_ALLOWLIST: &[&str] = &[
     "inheritance",
     "version",
     "updated_at",
-    "secret",
+    "owner_id",
+    "value",
+];
+
+/// The administrative record fields (ADR-0004 Amendment A): naming any of
+/// these in `$select` requires `read`/`list` — in addition to, or instead
+/// of, `read_secret` — because disclosing them is that action's privilege,
+/// not `read_secret`'s. Distinct from the envelope fields (`reference`,
+/// `type`, `expires_at`), which carry no action requirement of their own and
+/// ride along under whichever action the rest of the projection already
+/// needs.
+const ADMIN_FIELDS: &[&str] = &[
+    "sharing",
+    "status",
+    "fallback",
+    "inheritance",
+    "version",
+    "updated_at",
+    "owner_id",
 ];
 
 /// Validates a parsed `$select` field list (already lower-cased by the
@@ -131,9 +149,16 @@ pub(crate) fn validate_select(fields: &[String]) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// `true` iff `fields` names `secret` — the value-mode switch (ADR-0004).
+/// `true` iff `fields` names `value` — the value-mode switch (ADR-0004).
 pub(crate) fn is_value_mode(fields: Option<&[String]>) -> bool {
-    fields.is_some_and(|fields| fields.iter().any(|f| f == "secret"))
+    fields.is_some_and(|fields| fields.iter().any(|f| f == "value"))
+}
+
+/// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's and
+/// the collection value mode's shared trigger for requiring `read`/`list` on
+/// top of (or instead of) `read_secret` (ADR-0004 Amendment A).
+pub(crate) fn admin_field_selected(fields: Option<&[String]>) -> bool {
+    fields.is_some_and(|fields| fields.iter().any(|f| ADMIN_FIELDS.contains(&f.as_str())))
 }
 
 /// Canonical sort direction for the collection read's one orderable field,

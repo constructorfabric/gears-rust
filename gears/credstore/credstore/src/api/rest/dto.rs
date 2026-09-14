@@ -1,7 +1,8 @@
 //! REST DTOs for the credstore module (ADR-0004: the credential surface).
 
 use credstore_sdk::{
-    Credential, CredentialStatus, Fallback, InheritanceStatus, Secret, SharingMode,
+    Credential, CredentialListItem, CredentialStatus, Fallback, InheritanceStatus, SecretValue,
+    SharingMode,
 };
 use uuid::Uuid;
 
@@ -127,16 +128,19 @@ where
     serde::Deserialize::deserialize(de).map(Some)
 }
 
-/// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004): a
-/// whole-credential replace. `value` is modelled as optional at the wire
-/// shape (`Option<String>`) so its *absence* can be distinguished from a
-/// malformed body and rejected with the typed `VALUE_REQUIRED` reason rather
-/// than a generic deserialization error.
+/// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state
+/// `value` per Amendment B): a whole-credential replace. `value` is tri-state
+/// (`Option<Option<String>>`, like [`CredentialPatchDto::value`]) so its
+/// *absence* — rejected with the typed `VALUE_REQUIRED` reason rather than a
+/// generic deserialization error — can be told apart from an explicit JSON
+/// `null` (no value is written: a value-less create, or a value
+/// removal/no-op on replace) and from a string (the value is written).
 ///
 /// `Debug` is hand-written to redact `value`.
 #[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::option_option)]
 pub struct PutCredentialRequestDto {
     /// Full GTS type id. Required on create; on replace it must equal the
     /// stored type (`TYPE_IMMUTABLE` otherwise).
@@ -152,9 +156,12 @@ pub struct PutCredentialRequestDto {
     #[serde(default)]
     #[schema(format = DateTime)]
     pub expires_at: Option<String>,
-    /// The value to write. Required — its absence is `400 VALUE_REQUIRED`.
-    #[serde(default)]
-    pub value: Option<String>,
+    /// The value to write. Required at the wire — absent is `400
+    /// VALUE_REQUIRED` — but once present it is tri-state: a string writes a
+    /// value, an explicit `null` writes none (ADR-0004 Amendment B).
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<String>)]
+    pub value: Option<Option<String>>,
 }
 
 impl std::fmt::Debug for PutCredentialRequestDto {
@@ -164,7 +171,14 @@ impl std::fmt::Debug for PutCredentialRequestDto {
             .field("sharing", &self.sharing)
             .field("fallback", &self.fallback)
             .field("expires_at", &self.expires_at)
-            .field("value", &self.value.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "value",
+                &match &self.value {
+                    None => "<absent>",
+                    Some(None) => "<null>",
+                    Some(Some(_)) => "[REDACTED]",
+                },
+            )
             .finish()
     }
 }
@@ -222,9 +236,17 @@ impl std::fmt::Debug for CredentialPatchDto {
     }
 }
 
-/// Response body for `GET /credstore/v1/credentials/{ref}` (ADR-0004): the
-/// credential record. Never carries the value — see [`SecretDto`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Response body for both `GET /credstore/v1/credentials/{ref}` and each item
+/// of `GET /credstore/v1/credentials` (ADR-0004 Amendment A, "Why one item
+/// shape, and why writes do not follow `$select`"): one shape for both
+/// addresses. `value` is populated only when `$select` names it (point read)
+/// or in value mode (collection) and only for an item the caller may read;
+/// absent from the wire entirely otherwise — including when the item's value
+/// could not be served (refused, missing, fingerprint mismatch — omitted by
+/// the domain layer already, never reported as an error for one item).
+///
+/// `Debug` is hand-written to redact `value`.
+#[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub struct CredentialDto {
     pub reference: String,
@@ -255,83 +277,16 @@ pub struct CredentialDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(format = DateTime)]
     pub expires_at: Option<String>,
+    /// The decrypted value — present only when `$select` names it (point
+    /// read) or in value mode (collection), and only for an item the caller
+    /// may read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
-impl CredentialDto {
-    /// Convert the domain [`Credential`] into the REST DTO shape.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
-    /// format as RFC 3339 (never expected in practice).
-    pub fn try_from_credential(c: &Credential) -> Result<Self, DomainError> {
-        let updated_at = c
-            .updated_at
-            .map(|at| {
-                at.format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|e| DomainError::internal(format!("updated_at failed to format: {e}")))
-            })
-            .transpose()?;
-        let expires_at = c
-            .expires_at
-            .map(|at| {
-                at.format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|e| DomainError::internal(format!("expires_at failed to format: {e}")))
-            })
-            .transpose()?;
-        Ok(Self {
-            reference: c.reference.as_ref().to_owned(),
-            secret_type: c.secret_type.clone(),
-            sharing: c.sharing.into(),
-            fallback: c.fallback.map(Into::into),
-            status: c.status.into(),
-            inheritance: c.inheritance.into(),
-            version: c.version,
-            updated_at,
-            owner_id: c.owner_id.map(|o| o.0.to_string()),
-            expires_at,
-        })
-    }
-}
-
-/// One item of `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the same
-/// fields as [`CredentialDto`], plus `secret` — populated only in value mode
-/// (`$select` containing `secret`) and only for an item the caller may read;
-/// absent from the wire entirely in metadata mode or when the item's value
-/// could not be served (refused, missing, fingerprint mismatch — omitted by
-/// the domain layer already, never reported as an error for one item).
-///
-/// `Debug` is hand-written to redact `secret`.
-#[derive(Clone, PartialEq, Eq)]
-#[toolkit_macros::api_dto(response)]
-pub struct CredentialListItemDto {
-    pub reference: String,
-    #[serde(rename = "type")]
-    pub secret_type: String,
-    pub sharing: SharingModeDto,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<FallbackDto>,
-    pub status: CredentialStatusDto,
-    pub inheritance: InheritanceStatusDto,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = DateTime)]
-    pub updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = DateTime)]
-    pub expires_at: Option<String>,
-    /// The decrypted value — the same wire form as [`SecretDto::value`] —
-    /// present only in value mode, for an item the caller may read.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secret: Option<String>,
-}
-
-impl std::fmt::Debug for CredentialListItemDto {
+impl std::fmt::Debug for CredentialDto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CredentialListItemDto")
+        f.debug_struct("CredentialDto")
             .field("reference", &self.reference)
             .field("type", &self.secret_type)
             .field("sharing", &self.sharing)
@@ -342,23 +297,52 @@ impl std::fmt::Debug for CredentialListItemDto {
             .field("updated_at", &self.updated_at)
             .field("owner_id", &self.owner_id)
             .field("expires_at", &self.expires_at)
-            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("value", &self.value.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
 
-impl CredentialListItemDto {
-    /// Convert one domain [`CredentialListItem`] into the REST DTO shape.
+impl CredentialDto {
+    /// Convert the domain [`Credential`] into the REST DTO shape, with no
+    /// value (the unselected point read, or a metadata-mode collection item).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
+    /// format as RFC 3339 (never expected in practice).
+    pub fn try_from_credential(c: &Credential) -> Result<Self, DomainError> {
+        Self::build(c, None)
+    }
+
+    /// Convert one domain [`CredentialListItem`] into the REST DTO shape,
+    /// carrying its value when the collection read ran in value mode and the
+    /// item's value was served.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
     /// format as RFC 3339, or the value is not valid UTF-8 (never expected
     /// in practice).
-    pub fn try_from_list_item(
-        item: &credstore_sdk::CredentialListItem,
+    pub fn try_from_list_item(item: &CredentialListItem) -> Result<Self, DomainError> {
+        Self::build(&item.credential, item.value.as_ref())
+    }
+
+    /// Convert a resolved [`Credential`] plus an optional decrypted value
+    /// (the point read's projection-aware shape, ADR-0004 Amendment A) into
+    /// the REST DTO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
+    /// format as RFC 3339, or `value` is not valid UTF-8.
+    pub fn try_from_parts(
+        c: &Credential,
+        value: Option<&SecretValue>,
     ) -> Result<Self, DomainError> {
-        let c = &item.credential;
+        Self::build(c, value)
+    }
+
+    fn build(c: &Credential, value: Option<&SecretValue>) -> Result<Self, DomainError> {
         let updated_at = c
             .updated_at
             .map(|at| {
@@ -373,9 +357,7 @@ impl CredentialListItemDto {
                     .map_err(|e| DomainError::internal(format!("expires_at failed to format: {e}")))
             })
             .transpose()?;
-        let secret = item
-            .secret
-            .as_ref()
+        let value = value
             .map(|v| {
                 String::from_utf8(v.as_bytes().to_vec()).map_err(|_| {
                     DomainError::internal(
@@ -395,64 +377,6 @@ impl CredentialListItemDto {
             version: c.version,
             updated_at,
             owner_id: c.owner_id.map(|o| o.0.to_string()),
-            expires_at,
-            secret,
-        })
-    }
-}
-
-/// Response body for `GET /credstore/v1/credentials/{ref}/secret`
-/// (ADR-0004): the value with exactly what is needed to use it.
-///
-/// `Debug` is hand-written to redact `value`.
-#[derive(Clone, PartialEq, Eq)]
-#[toolkit_macros::api_dto(response)]
-pub struct SecretDto {
-    pub reference: String,
-    #[serde(rename = "type")]
-    pub secret_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = DateTime)]
-    pub expires_at: Option<String>,
-    pub value: String,
-}
-
-impl std::fmt::Debug for SecretDto {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SecretDto")
-            .field("reference", &self.reference)
-            .field("type", &self.secret_type)
-            .field("expires_at", &self.expires_at)
-            .field("value", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl SecretDto {
-    /// Convert the domain [`Secret`] into the REST DTO shape.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomainError::Internal`] when the value is not valid UTF-8
-    /// (e.g. binary written via the SDK). The JSON/string transport cannot
-    /// represent it, and lossy decoding would silently corrupt the secret, so
-    /// we reject rather than mangle.
-    pub fn try_from_secret(s: &Secret) -> Result<Self, DomainError> {
-        let value = String::from_utf8(s.value.as_bytes().to_vec()).map_err(|_| {
-            DomainError::internal(
-                "secret value is not valid UTF-8 and cannot be encoded for the REST transport",
-            )
-        })?;
-        let expires_at = s
-            .expires_at
-            .map(|at| {
-                at.format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|e| DomainError::internal(format!("expires_at failed to format: {e}")))
-            })
-            .transpose()?;
-        Ok(Self {
-            reference: s.reference.as_ref().to_owned(),
-            secret_type: s.secret_type.clone(),
             expires_at,
             value,
         })
