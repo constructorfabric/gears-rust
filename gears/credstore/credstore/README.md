@@ -21,12 +21,16 @@ The `cf-gears-credstore` module provides:
   (ADR-0006) `value_id`, the pointer to the row's current immutable backend
   version, plus a `credstore_value_gc` table tracking versions pending
   reclaim
-- **Credential record / secret value split** (ADR-0004): the record
-  (`reference`, `type`, `sharing`, `fallback`, `status`, `inheritance`,
-  `version`, `owner_id`) and its value are two representations, each with
-  its own read address — `GET /credentials/{ref}` never carries the value,
-  only `GET /credentials/{ref}/secret` does — and one write address: `PUT`
-  creates or replaces both together, `PATCH` (RFC 7396 JSON Merge Patch)
+- **One item shape for the record and its value** (ADR-0004): a credential
+  is metadata (`reference`, `type`, `sharing`, `fallback`, `status`,
+  `inheritance`, `version`, `owner_id`) plus an optional `value`, in one
+  representation — `GET /credentials/{ref}` and `GET /credentials` both
+  return it, carrying `value` only when `$select` names it, gated by
+  `read_secret`; there is no dedicated value address. One write address:
+  `PUT` creates or replaces the whole credential, its `value` tri-state —
+  a string writes it, an explicit `null` creates or leaves the record
+  without one, which is also how a tenant suppresses an inherited
+  credential with no row of its own; `PATCH` (RFC 7396 JSON Merge Patch)
   edits the record, rotates the value, or removes it (`{"value": null}`)
   without recreating anything
 - **PDP authorization** — six actions on the resolved concrete type
@@ -39,7 +43,7 @@ The `cf-gears-credstore` module provides:
 - **Upward-rooted collection read** (ADR-0005): `GET /credentials` lists one
   reduced record per reference, rooted at the caller's tenant and its
   ancestor chain only, filterable/orderable on an indexed allowlist and
-  keyset-paginated; selecting `secret` in `$select` switches the same
+  keyset-paginated; naming `value` in `$select` switches the same
   collection into a capped, non-paginated **value mode** that returns the
   decrypted value alongside each item the caller may read
 - **Value-fingerprint fence** — every read verifies the backend value against a
@@ -113,7 +117,7 @@ credstore:
       batch_size: 256            # rows per batch in the job's expiry and gc passes
     list:                        # GET /credentials (ADR-0005/ADR-0004)
       max_limit: 200             # metadata-mode page-size cap; a caller `limit` above this is 400 INVALID_LIMIT
-      value_mode_cap: 25         # match-set cap for a value-mode ($select=…,secret) request; over this is 400 TOO_MANY_MATCHES
+      value_mode_cap: 25         # match-set cap for a value-mode ($select=…,value) request; over this is 400 TOO_MANY_MATCHES
 ```
 
 ## License

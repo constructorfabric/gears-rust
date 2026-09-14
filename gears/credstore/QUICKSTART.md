@@ -1,27 +1,30 @@
 # CredStore - Quickstart
 
-Stores credential **records** and their secret **values** as two separate
-representations, scoped to tenants and owners, and resolves both
-hierarchically — if the caller's tenant holds no value under a reference,
-resolution walks up the tenant ancestry and returns the nearest inherited
-value. `GET .../credentials/{ref}` never carries the value; only
-`GET .../credentials/{ref}/secret` does.
+Stores a credential as one **item** — metadata plus an optional secret
+**value** — scoped to tenants and owners, and resolves it hierarchically —
+if the caller's tenant holds no value under a reference, resolution walks
+up the tenant ancestry and returns the nearest inherited value.
+`GET .../credentials/{ref}` carries the value only when `$select` names it.
 
 **Features:**
 - Tenant-scoped credential storage with hierarchical resolution (`shared`
   credentials are inherited across isolation barriers too)
 - Three sharing modes: `private` (owner only), `tenant` (all users in
   tenant), `shared` (cross-tenant)
-- Record and value are one resource: `PUT`/`PATCH` write both together (or
-  the record alone); `GET` the record without ever seeing the value,
-  `GET .../secret` for the value alone
+- One item shape: the point read and the collection return the same
+  representation; `PUT`/`PATCH` write the record and its value together (or
+  the record alone); `GET` returns metadata by default and the value too
+  when `$select` names it, under `read_secret` — there is no separate value
+  address, and a credential can be created without a value by an explicit
+  `null`
 - Six PDP actions — `list`/`read`/`write`/`delete` on the record,
   `read_secret`/`write_secret` on the value — so a metadata grant never
   implies value access
 - Suppression: `fallback: none` lets a tenant block an inherited value
-  locally without touching the ancestor's credential
+  locally without touching the ancestor's credential, even with no row of
+  its own
 - List credential records (`$filter`/`$orderby`/`limit`/`cursor`), or bulk-read
-  several values at once by selecting `secret`
+  several values at once by selecting `value`
 - Immutable value versions: every write mints a fresh version and switches
   the record's pointer to it; no in-place overwrite, no in-gear reaper —
   a periodic maintenance job (`CredStoreMaintenanceV1::run_gc`) does the
@@ -58,7 +61,7 @@ gears:
         batch_size: 256             # rows per batch in the maintenance job's passes (default: 256)
       list:
         max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
-        value_mode_cap: 25          # cap on how many references a value-mode ($select=…,secret) request may match (default: 25)
+        value_mode_cap: 25          # cap on how many references a value-mode ($select=…,value) request may match (default: 25)
 ```
 
 There is no `reaper:` block — the maintenance job (`gc:` above) runs on an
@@ -83,12 +86,14 @@ suffix is shown.
 | `read` | `GET /credentials/{ref}` | `credential_read.v1` |
 | `write` | `PUT`/`PATCH` — metadata fields (`type`, `sharing`, `fallback`, `expires_at`) | `credential_write.v1` |
 | `delete` | `DELETE /credentials/{ref}` | `credential_delete.v1` |
-| `read_secret` | `GET /credentials/{ref}/secret`; `GET /credentials` value mode (`$select=…,secret`) | `secret_read.v1` |
+| `read_secret` | `$select=value` on `GET /credentials/{ref}`; `GET /credentials` value mode (`$select=…,value`) | `secret_read.v1` |
 | `write_secret` | `PUT`/`PATCH` — `value` field | `secret_write.v1` |
 
-`PUT` always requires **both** `write` and `write_secret` — it always
-carries a value. `PATCH` requires whichever of the two the body's keys
-touch (both when both are present), all evaluated before any side effect.
+`PUT` always requires `write`; it requires `write_secret` too only when
+`value` is a string, or an explicit `null` that removes an existing value —
+not when `null` creates or leaves a value-less record. `PATCH` requires
+whichever of the two the body's keys touch (both when both are present),
+all evaluated before any side effect.
 
 ## Examples
 
@@ -112,9 +117,11 @@ Location: /cf/credstore/v1/credentials/partner-openai-key
 ETag: "3fa85f64-5717-4562-b3fc-2c963f66afa6.1"
 ```
 
-`value` is required in every `PUT` body — its absence is **400**
-(`VALUE_REQUIRED`); `type` is required on create — its absence is **400**
-(`TYPE_REQUIRED`). `If-None-Match: *` conflicts with **409** if the caller's
+`value` is **tri-state** in every `PUT` body: a string writes it, an
+explicit `null` creates the record without one (`declared`); only an
+**absent** `value` key is rejected, with **400** (`VALUE_REQUIRED`); `type`
+is required on create — its absence is **400** (`TYPE_REQUIRED`).
+`If-None-Match: *` conflicts with **409** if the caller's
 own tenant already holds a record under the reference. Replacing an
 existing record uses `If-Match` instead — `"<id>.<version>"` for a guarded
 replace, or `*` for last-writer-wins — never both headers together (**400**
@@ -151,12 +158,16 @@ caller's **own** row only, never from an ancestor's — even while
 
 ### Get the secret value
 
+Naming `value` in `$select` on the same address returns just those four
+fields — no separate address for the value.
+
 ```bash
-curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/secret" \
+curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key?\$select=reference,type,expires_at,value" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Response: **200 OK** (`ETag`, `Cache-Control: no-store`)
+Response: **200 OK** (`ETag` — the record's validator, whatever the
+projection; `Cache-Control: no-store`)
 ```json
 {
   "reference": "partner-openai-key",
@@ -166,8 +177,11 @@ Response: **200 OK** (`ETag`, `Cache-Control: no-store`)
 }
 ```
 
-A winning record with no value (`declared`, or `suppressed`) is the
-canonical **404** — indistinguishable from "does not exist".
+Without `$select`, the same address returns the record fields and never
+`value` (see above). A winning record with no value (`declared`, or
+`suppressed`) is the canonical **404** — indistinguishable from "does not
+exist". Requires `read_secret`; naming an administrative field such as
+`sharing` alongside `value` additionally requires `read`.
 
 ### Rotate the value
 
@@ -238,6 +252,35 @@ curl -si -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-ope
 Both are **204 No Content**. Deleting the record (below) removes the
 suppression too, so the reference resolves through inheritance again.
 
+### Suppress an inherited credential you do not own
+
+Blocking a partner's shared credential does not require ever holding a
+value of your own: a create-only `PUT` whose `value` is an explicit `null`
+inserts the record directly in the value-less `declared` state with
+`fallback: none` — no backend call is made, since there is no value to
+write.
+
+```bash
+curl -si -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H 'If-None-Match: *' \
+  -d '{"type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "sharing": "tenant", "fallback": "none", "value": null}'
+```
+
+Response: **201 Created**
+```json
+{
+  "reference": "partner-openai-key",
+  "status": "declared",
+  "inheritance": "suppressed",
+  "fallback": "none"
+}
+```
+
+Requires `write` only — `value` is `null` on both sides of this request, so
+`write_secret` is never evaluated.
+
 ### List credential records
 
 ```bash
@@ -246,7 +289,7 @@ curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=20&\$filter=typ
 ```
 
 Response: **200 OK** (`Cache-Control: no-store`) — one reduced record per
-reference, never a `secret` field:
+reference, never a `value` field:
 ```json
 {
   "items": [
@@ -274,20 +317,20 @@ Requires `list`.
 
 ### Bulk-read secret values (value mode)
 
-Selecting `secret` in `$select` switches the collection into value mode:
+Naming `value` in `$select` switches the collection into value mode:
 bounded, unpaginated, one request for several values at once.
 
 ```bash
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,value" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
 Response: **200 OK** — the same page envelope, `page_info.next_cursor`
-always `null`; each item additionally carries the decrypted `secret`:
+always `null`; each item additionally carries the decrypted `value`:
 ```json
 {
   "items": [
-    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "sharing": "tenant", "status": "active", "inheritance": "own", "secret": "smtp-pass"}
+    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "sharing": "tenant", "status": "active", "inheritance": "own", "value": "smtp-pass"}
   ],
   "page_info": {"next_cursor": null, "prev_cursor": null, "limit": 25}
 }

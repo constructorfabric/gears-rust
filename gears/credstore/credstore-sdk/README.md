@@ -5,15 +5,16 @@ SDK crate for the `CredStore` gear, providing public API contracts for credentia
 ## Overview
 
 This crate defines the transport-agnostic interface for the `CredStore` gear
-(ADR-0004: the credential record and its secret value are separate
-resources):
+(ADR-0004: a credential is metadata plus an optional secret value, one item
+shape — `value` a selectable field of it, not a separate resource):
 
 - **`CredStoreClientV1`** — consumer-facing trait, seven methods:
   - `get` — point read of one credential record (`Credential`), without its
     value; also the source of the `ETag` a value-blind writer needs
-  - `get_secret` — hierarchical read of the value (`Secret`), at its own
-    address; a winning record with no value (`declared`/`suppressed`) is the
-    canonical miss
+  - `get_secret` — hierarchical read of the value (`Secret`) — the
+    in-process equivalent of the point read with `value` named in
+    `$select`, over the same `/credentials/{ref}` address; a winning record
+    with no value (`declared`/`suppressed`) is the canonical miss
   - `put` — precondition-guarded create-or-replace of the whole credential —
     record and value together, in one call; `PutPrecondition::CreateOnly` is
     how a credential is created (there is no separate `create` method)
@@ -24,10 +25,10 @@ resources):
   - `delete` — precondition-guarded delete of the record and its value
   - `list` — the upward-rooted collection read (ADR-0005): one reduced
     `CredentialListItem` per reference, keyset-paginated by `reference`
-    (`toolkit_odata::CursorV1`); selecting `secret` in the `OData` `$select`
+    (`toolkit_odata::CursorV1`); naming `value` in the `OData` `$select`
     switches the request to bulk **value mode** (ADR-0004, "Bulk secret read:
     the collection in value mode") — no pagination, a configured cap, and
-    each item's `secret` field populated for what the caller may read
+    each item's `value` field populated for what the caller may read
 - **`CredStoreMaintenanceV1`** — in-process maintenance entry point
   (ADR-0006): `run_gc` is the periodic garbage-collection job's only address,
   registered in `ClientHub` next to `CredStoreClientV1` and invoked by the
@@ -41,7 +42,7 @@ resources):
   `expires_at`, `validator`); `Secret` carries only what is needed to use the
   value (`reference`, `secret_type`, `expires_at`, `value`, `validator`)
 - **`CredentialListItem`** — `list`'s item shape: a `Credential` plus an
-  optional `secret`, populated only in value mode
+  optional `value`, populated only in value mode
 - **`GcReport`** — `run_gc`'s outcome (`expired_deleted`, `gc_deleted`,
   `gc_pending_reclaimed`)
 - **`CredentialWrite`** / **`CredentialPatch`** — `put`/`patch` request
