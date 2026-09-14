@@ -40,10 +40,6 @@ def _credential(ref: str) -> str:
     return f"/credstore/v1/credentials/{ref}"
 
 
-def _secret(ref: str) -> str:
-    return f"/credstore/v1/credentials/{ref}/secret"
-
-
 # ── S1: Route smoke ─────────────────────────────────────────────────────
 
 
@@ -107,14 +103,21 @@ async def test_credential_lifecycle_and_listing_seam(
     assert body["expires_at"] == "2099-01-01T00:00:00Z"
     assert body["owner_id"] is not None
 
-    # --- GET secret: 200, value round-trips, type, expires_at ---
+    # --- GET point read, $select=value: 200, value round-trips, type,
+    #     expires_at (ADR-0004 Amendment A supersedes the withdrawn
+    #     GET .../secret) ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        secret_resp = await c.get(f"{base_url}{_secret(ref)}", headers=l1a_headers)
+        secret_resp = await c.get(
+            f"{base_url}{_credential(ref)}",
+            headers=l1a_headers,
+            params={"$select": "reference,type,expires_at,value"},
+        )
     assert secret_resp.status_code == 200
     secret_body = secret_resp.json()
     assert secret_body["value"] == "initial-value"
     assert secret_body["type"] == PERSONAL_TOKEN_TYPE
     assert secret_body["expires_at"] == "2099-01-01T00:00:00Z"
+    assert "sharing" not in secret_body, "a value-only projection carries no administrative field"
 
     # --- PATCH: rotate the value (merge-patch, If-Match) -> 204, new ETag ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -131,7 +134,7 @@ async def test_credential_lifecycle_and_listing_seam(
     rotated_etag = patch_resp.headers["etag"]
     assert rotated_etag != create_etag
 
-    # --- Collection read, metadata mode: item present, no `secret` key ---
+    # --- Collection read, metadata mode: item present, no `value` key ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         list_resp = await c.get(
             f"{base_url}/credstore/v1/credentials",
@@ -142,15 +145,15 @@ async def test_credential_lifecycle_and_listing_seam(
     items = list_resp.json()["items"]
     assert len(items) == 1, items
     assert items[0]["reference"] == ref
-    assert "secret" not in items[0]
+    assert "value" not in items[0]
 
-    # --- Collection read, value mode: item carries the rotated secret ---
+    # --- Collection read, value mode: item carries the rotated value ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         value_mode_resp = await c.get(
             f"{base_url}/credstore/v1/credentials",
             headers=l1a_headers,
             params={
-                "$select": "reference,secret",
+                "$select": "reference,value",
                 "$filter": f"reference eq '{ref}'",
             },
         )
@@ -158,7 +161,7 @@ async def test_credential_lifecycle_and_listing_seam(
     value_items = value_mode_resp.json()["items"]
     assert len(value_items) == 1, value_items
     assert value_items[0]["reference"] == ref
-    assert value_items[0]["secret"] == "rotated-value"
+    assert value_items[0]["value"] == "rotated-value"
 
     # --- PATCH: suppress (fallback: none, value: null) -> 204 ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -173,10 +176,12 @@ async def test_credential_lifecycle_and_listing_seam(
         )
     assert suppress_resp.status_code == 204
 
-    # --- GET secret now 404 (no value); GET record: declared/suppressed ---
+    # --- GET $select=value now 404 (no value); GET record: declared/suppressed ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         secret_after_suppress = await c.get(
-            f"{base_url}{_secret(ref)}", headers=l1a_headers
+            f"{base_url}{_credential(ref)}",
+            headers=l1a_headers,
+            params={"$select": "value"},
         )
         record_after_suppress = await c.get(
             f"{base_url}{_credential(ref)}", headers=l1a_headers
@@ -202,11 +207,17 @@ async def test_credential_lifecycle_and_listing_seam(
 
 async def test_tenant_isolation_seam(
     base_url, root_headers, l1a_headers, tenant_a_headers, unique_ref, create_credential,
+    cleanup,
 ):
     """Seam: a `shared` credential published by hierarchy-root is inherited
     by its descendant hierarchy-l1a, but invisible to hierarchy-root's own
     ancestor (e2e-root / tenant_a) — resolution walks upward only, so a
     tenant above the publisher never sees what was shared below it.
+
+    Also covers suppressing that inherited credential from hierarchy-l1a
+    without ever holding a value of its own: one `PUT` with an explicit
+    `null` value (ADR-0004 Amendment B, "Suppressing an inherited credential
+    without ever holding a value of your own is therefore one request too").
     """
     ref = unique_ref("isolation")
     create_resp = create_credential(
@@ -231,6 +242,38 @@ async def test_tenant_isolation_seam(
     assert "owner_id" not in inherited_body
 
     assert invisible_resp.status_code == 404
+
+    # --- l1a suppresses the inherited credential in one request: it holds
+    #     no row of its own yet, so `PUT` + `If-None-Match: *` with an
+    #     explicit `null` value creates a `declared`/`none` row directly —
+    #     no dummy value, no second request, no `write_secret` evaluation. ---
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        suppress_resp = await c.put(
+            f"{base_url}{_credential(ref)}",
+            headers={**l1a_headers, "If-None-Match": "*"},
+            json={
+                "type": GENERIC_TYPE,
+                "sharing": "tenant",
+                "fallback": "none",
+                "value": None,
+            },
+        )
+    assert suppress_resp.status_code == 201, suppress_resp.text
+    cleanup(l1a_headers, ref)
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        value_after_suppress = await c.get(
+            f"{base_url}{_credential(ref)}",
+            headers=l1a_headers,
+            params={"$select": "value"},
+        )
+        record_after_suppress = await c.get(
+            f"{base_url}{_credential(ref)}", headers=l1a_headers
+        )
+    assert value_after_suppress.status_code == 404
+    suppressed_body = record_after_suppress.json()
+    assert suppressed_body["status"] == "declared"
+    assert suppressed_body["inheritance"] == "suppressed"
 
 
 # ── S4: Error shape (RFC 9457) ──────────────────────────────────────────────

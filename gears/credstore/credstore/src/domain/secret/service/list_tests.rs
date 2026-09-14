@@ -31,7 +31,7 @@ fn write_typed(sharing: SharingMode, value: &str, type_name: &str) -> Credential
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
     }
 }
 
@@ -242,7 +242,7 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
     assert_eq!(d.credential.status, CredentialStatus::Declared);
 
     // Metadata mode never carries a value.
-    assert!(page.items.iter().all(|i| i.secret.is_none()));
+    assert!(page.items.iter().all(|i| i.value.is_none()));
 }
 
 // ── type clamp / authorization ───────────────────────────────────────────────
@@ -420,7 +420,7 @@ async fn orderby_other_than_reference_is_rejected() {
 
 fn value_mode_query(filter_raw: &str) -> ODataQuery {
     ODataQuery::new()
-        .with_select(vec!["reference".to_owned(), "secret".to_owned()])
+        .with_select(vec!["reference".to_owned(), "value".to_owned()])
         .with_filter(filter_expr(filter_raw))
 }
 
@@ -498,7 +498,7 @@ async fn value_mode_items_carry_values_and_evaluate_read_secret_once_per_type() 
     assert_eq!(page.page_info.next_cursor, None);
     assert_eq!(page.items.len(), 2);
     for item in &page.items {
-        let value = item.secret.as_ref().expect("value present");
+        let value = item.value.as_ref().expect("value present");
         let expected = if item.credential.reference.as_ref() == "r1" {
             "value-one"
         } else {
@@ -562,7 +562,84 @@ async fn value_mode_omits_items_of_a_refused_type() {
     let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(references_of(&page), vec!["allowed"]);
     assert_eq!(
-        page.items[0].secret.as_ref().expect("value").as_bytes(),
+        page.items[0].value.as_ref().expect("value").as_bytes(),
         b"v-ok"
+    );
+}
+
+#[tokio::test]
+async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let svc_setup = service_with(
+        repo.clone(),
+        plugin.clone(),
+        dir.clone(),
+        mock_enforcer(),
+        200,
+        25,
+    );
+    svc_setup
+        .put(
+            &ctx,
+            &key("r1"),
+            write_generic(SharingMode::Tenant, "v1"),
+            create_only(),
+        )
+        .await
+        .expect("create r1");
+
+    // A pure value-only selector evaluates `read_secret` alone.
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer, 200, 25);
+    let value_only = value_mode_query("reference eq 'r1'");
+    let page = svc.list(&ctx, &value_only).await.expect("list");
+    assert_eq!(references_of(&page), vec!["r1"]);
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&"read_secret".to_owned()));
+    assert!(
+        !seen.contains(&"list".to_owned()),
+        "a value-only selector must not evaluate list: {seen:?}"
+    );
+
+    // Selecting a record-only field alongside `value` needs `list` too.
+    let (enforcer2, resolver2) = type_recording_enforcer();
+    let svc2 = service_with(
+        repo.clone(),
+        plugin.clone(),
+        dir.clone(),
+        enforcer2,
+        200,
+        25,
+    );
+    let combined = ODataQuery::new()
+        .with_select(vec![
+            "reference".to_owned(),
+            "sharing".to_owned(),
+            "value".to_owned(),
+        ])
+        .with_filter(filter_expr("reference eq 'r1'"));
+    let page2 = svc2.list(&ctx, &combined).await.expect("list");
+    assert_eq!(references_of(&page2), vec!["r1"]);
+    let seen2 = resolver2.seen_actions();
+    assert!(seen2.contains(&"read_secret".to_owned()));
+    assert!(seen2.contains(&"list".to_owned()));
+
+    // And a caller denied `list` (but holding `read_secret`) loses the item
+    // entirely once a record field rides with `value` — dropped, not
+    // returned without its record fields (ADR-0004 Amendment A).
+    let (enforcer3, _resolver3) = action_deny_enforcer(
+        SecretType::generic().gts_id().to_owned(),
+        crate::domain::authz::actions::LIST,
+    );
+    let svc3 = service_with(repo, plugin, dir, enforcer3, 200, 25);
+    let page3 = svc3.list(&ctx, &combined).await.expect("list");
+    assert!(
+        page3.items.is_empty(),
+        "list denied must drop the type entirely when a record field rides with value"
     );
 }

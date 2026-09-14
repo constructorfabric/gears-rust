@@ -25,7 +25,7 @@ fn generic_write(value: &str) -> credstore_sdk::CredentialWrite {
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
     }
 }
 
@@ -35,7 +35,7 @@ fn replace_write(value: &str) -> credstore_sdk::CredentialWrite {
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
     }
 }
 

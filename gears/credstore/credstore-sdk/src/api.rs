@@ -18,7 +18,7 @@ use crate::models::{
 /// Consumer-facing API trait for credential storage operations. Seven
 /// methods, none named `create` or `read_secrets`: `put` under
 /// [`PutPrecondition::CreateOnly`] **is** create, and [`Self::list`] is the
-/// collection read (metadata by default; `$select` containing `secret`
+/// collection read (metadata by default; `$select` containing `value`
 /// switches it to bulk value mode, ADR-0005/ADR-0004).
 #[async_trait]
 pub trait CredStoreClientV1: Send + Sync {
@@ -50,16 +50,27 @@ pub trait CredStoreClientV1: Send + Sync {
         key: &SecretRef,
     ) -> Result<Option<Secret>, CredStoreError>;
 
-    /// Creates or replaces the whole credential — record and value together,
-    /// in one call. `precondition` carries the intent:
-    /// [`PutPrecondition::CreateOnly`] fails with [`CredStoreError::Conflict`]
-    /// if the caller's own tenant already holds a record under the
-    /// reference; [`PutPrecondition::Exists`] / [`PutPrecondition::Matches`]
-    /// fail the same way if it does not (a `put` under either never
-    /// creates).
+    /// Creates or replaces the whole credential — record and, unless
+    /// `write.value` is an explicit `None`, its value together, in one call.
+    /// `precondition` carries the intent: [`PutPrecondition::CreateOnly`]
+    /// fails with [`CredStoreError::Conflict`] if the caller's own tenant
+    /// already holds a record under the reference;
+    /// [`PutPrecondition::Exists`] / [`PutPrecondition::Matches`] fail the
+    /// same way if it does not (a `put` under either never creates).
     ///
-    /// Requires **both** `write` and `write_secret`, evaluated before any
-    /// side effect — a caller missing either fails the whole request.
+    /// `write` is the whole-credential replace: an explicit `None` in
+    /// `write.value` writes no value — on create the row is inserted
+    /// `declared`; on replace of an `active` row the value is removed in the
+    /// same transaction; on replace of an already-`declared` row nothing
+    /// about the value changes (ADR-0004 Amendment B, "The value-less
+    /// record: reached only on purpose").
+    ///
+    /// `write` always requires `write`; `write_secret` is additionally
+    /// required when `write.value` is `Some(_)`, or when a `None` removes an
+    /// existing value (replace of an `active` row) — never when `None`
+    /// creates or replaces an already value-less row. Both required actions
+    /// are evaluated before any side effect — a caller missing either fails
+    /// the whole request.
     ///
     /// # Errors
     ///
@@ -142,13 +153,13 @@ pub trait CredStoreClientV1: Send + Sync {
     /// `inheritance`, `owner_tenant_id` and `updated_at` are never
     /// filterable or orderable. `query.order` accepts only `reference`
     /// (ascending by default). `query.selected_fields()` accepts the
-    /// `Credential` field names plus `secret`.
+    /// `Credential` field names plus `value`.
     ///
-    /// Selecting `secret` switches the request to **value mode**: `limit`
+    /// Selecting `value` switches the request to **value mode**: `limit`
     /// and `query.cursor` are rejected, `query.order` must be empty, the
     /// selector in `query.filter()` must be exactly `reference` or `type`
     /// (`eq`/`in`), the match set is capped, and each returned item's
-    /// [`CredentialListItem::secret`] carries the decrypted value for the
+    /// [`CredentialListItem::value`] carries the decrypted value for the
     /// items the caller may read — a refused, missing, or
     /// fingerprint-mismatched item is omitted rather than reported.
     /// `Page::page_info.next_cursor` is always `None` in this mode; there is
