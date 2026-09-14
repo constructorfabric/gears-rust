@@ -6,11 +6,14 @@
 //! as `super`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::StreamExt;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -25,8 +28,8 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, SidecarState, build_router,
-    finalize_with_control_plane, parse_optional, write_multipart_part_native,
-    write_multipart_part_offset_object,
+    finalize_with_control_plane, idle_timeout_stream, parse_optional, parse_public_key_list,
+    write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 /// A part-upload concurrency semaphore sized at the production default
@@ -54,6 +57,7 @@ fn test_state() -> SidecarState {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     }
 }
 
@@ -92,6 +96,7 @@ async fn sidecar_readyz_returns_200_when_backends_ready() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -137,6 +142,7 @@ async fn sidecar_readyz_returns_503_when_backend_root_missing() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -342,6 +348,7 @@ fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
     (state, issuer, backend)
 }
@@ -962,6 +969,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let file_id = Uuid::now_v7();
@@ -1142,9 +1150,10 @@ async fn write_multipart_part_native_undersized_returns_400() {
         bind_on_finalize: false,
     };
 
-    let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
-        .await
-        .expect_err("undersized part must be rejected");
+    let err =
+        write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()), None)
+            .await
+            .expect_err("undersized part must be rejected");
     assert_eq!(
         err.status(),
         StatusCode::BAD_REQUEST,
@@ -1179,10 +1188,15 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         bind_on_finalize: false,
     };
 
-    let err =
-        write_multipart_part_offset_object(&backend, &claims, 1, Body::from(b"short".to_vec()))
-            .await
-            .expect_err("undersized part must be rejected");
+    let err = write_multipart_part_offset_object(
+        &backend,
+        &claims,
+        1,
+        Body::from(b"short".to_vec()),
+        None,
+    )
+    .await
+    .expect_err("undersized part must be rejected");
     assert_eq!(
         err.status(),
         StatusCode::BAD_REQUEST,
@@ -1219,6 +1233,7 @@ async fn upload_replay_after_publish_is_rejected_with_409() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let file_id = Uuid::now_v7();
@@ -1299,6 +1314,7 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let file_id_a = Uuid::now_v7();
@@ -1413,6 +1429,147 @@ fn parse_optional_invalid_value_errors() {
 fn parse_optional_empty_string_errors() {
     parse_optional::<u64>("FS_SIDECAR_TEST_VAR", Some(String::new()), 10)
         .expect_err("empty string is not a valid u64");
+}
+
+// ── `idle_timeout_stream` (T3: idle-timeout on the request body) ───────────
+
+/// A stream that yields one chunk and then hangs forever must time out on
+/// the *next* poll once no further chunk arrives within `idle` — the
+/// wrapper hands back exactly one `Err(ErrorKind::TimedOut)` and sets the
+/// `timed_out` flag, then ends.
+#[tokio::test]
+async fn idle_timeout_stream_times_out_when_the_stream_goes_quiet() {
+    let chunk = bytes::Bytes::from_static(b"hello");
+    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(chunk) })
+        .chain(futures::stream::pending::<std::io::Result<bytes::Bytes>>());
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let mut wrapped = idle_timeout_stream(
+        stream,
+        Some(Duration::from_millis(50)),
+        Arc::clone(&timed_out),
+    );
+
+    let first = wrapped
+        .next()
+        .await
+        .expect("stream has a first item")
+        .expect("first item is Ok");
+    assert_eq!(first, bytes::Bytes::from_static(b"hello"));
+    assert!(
+        !timed_out.load(Ordering::SeqCst),
+        "flag must not be set before the idle deadline"
+    );
+
+    let second = wrapped
+        .next()
+        .await
+        .expect("wrapper yields the timeout error instead of hanging forever");
+    let err = second.expect_err("must be an idle-timeout error, not a chunk");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        timed_out.load(Ordering::SeqCst),
+        "flag must be set once the idle timeout fires"
+    );
+
+    // The wrapper terminates the stream right after the timeout error --
+    // it never keeps polling a stream that already went idle past the
+    // deadline.
+    assert!(wrapped.next().await.is_none());
+}
+
+/// `idle = None` must disable the guard entirely: the stream passes through
+/// unwrapped and the flag is never touched, no matter how long a caller
+/// waits between polls.
+#[tokio::test]
+async fn idle_timeout_stream_disabled_passes_stream_through_unchanged() {
+    let items: Vec<std::io::Result<bytes::Bytes>> = vec![
+        Ok(bytes::Bytes::from_static(b"a")),
+        Ok(bytes::Bytes::from_static(b"b")),
+    ];
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let mut wrapped =
+        idle_timeout_stream(futures::stream::iter(items), None, Arc::clone(&timed_out));
+
+    assert_eq!(
+        wrapped.next().await.unwrap().unwrap(),
+        bytes::Bytes::from_static(b"a")
+    );
+    assert_eq!(
+        wrapped.next().await.unwrap().unwrap(),
+        bytes::Bytes::from_static(b"b")
+    );
+    assert!(wrapped.next().await.is_none());
+    assert!(!timed_out.load(Ordering::SeqCst));
+}
+
+/// A stream whose pauses between chunks all stay comfortably under `idle`
+/// must run to completion with every chunk delivered and no error at all --
+/// this is the "slow but alive" case the design deliberately protects (no
+/// absolute deadline on the whole stream, only on the gap between chunks).
+#[tokio::test]
+async fn idle_timeout_stream_tolerates_pauses_under_the_limit() {
+    let stream = futures::stream::unfold(0u8, |i| async move {
+        if i >= 3 {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Some((Ok::<_, std::io::Error>(bytes::Bytes::from(vec![i])), i + 1))
+    });
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let mut wrapped = idle_timeout_stream(
+        stream,
+        Some(Duration::from_millis(200)),
+        Arc::clone(&timed_out),
+    );
+
+    let mut collected = Vec::new();
+    while let Some(item) = wrapped.next().await {
+        collected.push(item.expect("no idle timeout expected -- pauses stay under the limit"));
+    }
+    assert_eq!(
+        collected,
+        vec![
+            bytes::Bytes::from(vec![0u8]),
+            bytes::Bytes::from(vec![1u8]),
+            bytes::Bytes::from(vec![2u8]),
+        ]
+    );
+    assert!(!timed_out.load(Ordering::SeqCst));
+}
+
+// ── `parse_public_key_list` (T5: rotation without outage) ──────────────────
+
+#[test]
+fn parse_public_key_list_empty_string_is_empty_vec() {
+    assert_eq!(parse_public_key_list("").unwrap(), Vec::<Vec<u8>>::new());
+}
+
+/// Elements are trimmed and empty elements (e.g. a stray double/trailing
+/// comma) are silently skipped rather than rejected.
+#[test]
+fn parse_public_key_list_trims_and_skips_empty_elements() {
+    let a = URL_SAFE_NO_PAD.encode([1, 2, 3]);
+    let b = URL_SAFE_NO_PAD.encode([4, 5, 6]);
+    let c = URL_SAFE_NO_PAD.encode([7, 8, 9]);
+    let raw = format!("{a}, {b},,{c}");
+
+    let parsed = parse_public_key_list(&raw).expect("valid entries parse");
+    assert_eq!(parsed, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]]);
+}
+
+/// An entry that fails to base64url-decode fails the whole parse, naming
+/// its 0-based position so a misconfiguration is easy to locate.
+#[test]
+fn parse_public_key_list_invalid_element_names_its_position() {
+    let a = URL_SAFE_NO_PAD.encode([1, 2, 3]);
+    let raw = format!("{a}, not-valid-base64!!!");
+
+    let err = parse_public_key_list(&raw).expect_err("second entry is not valid base64url");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("entry #1"),
+        "error should name the 0-based position of the bad entry: {msg}"
+    );
 }
 
 // -- HEAD download ---------------------------------------------------------
@@ -1539,6 +1696,7 @@ fn test_multipart_state_with_limit(limit: usize) -> (SidecarState, Issuer, Arc<I
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+        body_idle_timeout: None,
     };
     (state, issuer, backend)
 }
@@ -1713,6 +1871,7 @@ async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
         part_upload_semaphore: test_part_upload_semaphore(),
+        body_idle_timeout: None,
     };
 
     let file_id = Uuid::now_v7();
