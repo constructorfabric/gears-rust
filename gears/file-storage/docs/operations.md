@@ -238,7 +238,19 @@ single-part `PUT` (a replay of the same `PUT` is answered `409`, per the sidecar
 on every part of a multipart upload. **Rollout order**: (1) redeploy every sidecar talking
 to this control plane with `FS_SIDECAR_INTERNAL_TOKEN` set first — a control plane with no secret configured
 ignores the header either way; (2) only then set `finalize_internal_secret` on the control plane, together with
-`require_finalize_internal_secret: true`. Never logged (`FileStorageConfig`'s manual `Debug` impl redacts it).
+`require_finalize_internal_secret: true`.
+
+**Rotating an already-configured secret is a brief upload outage, not a zero-downtime operation.**
+`FinalizeAuth` holds exactly one secret, built once at gear init and kept in a `OnceLock`, so changing it takes a
+control-plane restart; each sidecar likewise reads `FS_SIDECAR_INTERNAL_TOKEN` once at startup. There is no
+dual-accept window on either side, so any sidecar whose token differs from the control plane's current secret
+fails exactly as above (`403` server-side, `502` at the client) for as long as the two disagree. The sequence that
+keeps that window shortest: stage the replacement sidecar fleet with the new token **outside** the load balancer,
+restart the control plane on the new secret, cut traffic over to the new fleet, then drain the old one. Uploads in
+flight on the old fleet at the cutover still fail and have to be retried. A true dual-secret window would need a
+code change, and is expected to arrive with the `internal_auth` migration that retires this stop-gap.
+
+Never logged (`FileStorageConfig`'s manual `Debug` impl redacts it).
 
 ### `require_finalize_internal_secret`
 When `true`, gear init fails fast if `finalize_internal_secret` is absent instead of silently accepting the

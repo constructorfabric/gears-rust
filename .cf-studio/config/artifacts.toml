@@ -132,7 +132,7 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore file-storage codebase and features — the feature docs declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) that were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands; the matching code/tests/sdk markers stay in sync with them there. Same shape as the oagw entry below. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
+reason = "Ignore file-storage codebase and features — the feature docs declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) that were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands; the matching code/tests/sdk markers stay in sync with them there. Same shape as the oagw entry above. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
 patterns = [
   "gears/file-storage/file-storage/src/*",
   "gears/file-storage/file-storage/tests/*",
