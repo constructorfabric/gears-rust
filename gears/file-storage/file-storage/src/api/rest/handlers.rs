@@ -749,12 +749,7 @@ pub async fn transfer_ownership(
 ) -> ApiResult<JsonBody<FileDto>> {
     let new_owner_kind = file_storage_sdk::OwnerKind::parse(&req.new_owner_kind)
         .ok_or_else(|| DomainError::validation("new_owner_kind", "must be 'user' or 'app'"))?;
-    // Capture metadata BEFORE the transfer. A transfer does not change custom
-    // metadata, but afterwards the caller may no longer have read access under
-    // the new owner — re-reading then and defaulting on failure would return a
-    // 200 with empty `custom_metadata` for a file that actually has some.
-    let (_, meta) = svc.get_file_with_metadata(&ctx, file_id).await?;
-    let file = svc
+    let (file, meta) = svc
         .transfer_ownership(&ctx, file_id, new_owner_kind, req.new_owner_id)
         .await?;
     Ok(Json(FileDto::from_parts(file, meta)))
