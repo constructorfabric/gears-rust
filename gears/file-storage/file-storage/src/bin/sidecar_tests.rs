@@ -28,8 +28,8 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, SidecarState, build_router,
-    finalize_with_control_plane, idle_timeout_stream, parse_optional, parse_public_key_list,
-    write_multipart_part_native, write_multipart_part_offset_object,
+    dedupe_public_keys, finalize_with_control_plane, idle_timeout_stream, parse_optional,
+    parse_public_key_list, write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 /// A part-upload concurrency semaphore sized at the production default
@@ -1570,6 +1570,61 @@ fn parse_public_key_list_invalid_element_names_its_position() {
         msg.contains("entry #1"),
         "error should name the 0-based position of the bad entry: {msg}"
     );
+}
+
+// ── `dedupe_public_keys` ────────────────────────────────────────────────────
+
+/// No duplicates anywhere: nothing is dropped and order is preserved
+/// (primary first, then `previous` in order).
+#[test]
+fn dedupe_public_keys_no_duplicates_drops_nothing() {
+    let primary = vec![1, 2, 3];
+    let previous = vec![vec![4, 5, 6], vec![7, 8, 9]];
+
+    let (keys, dropped) = dedupe_public_keys(primary.clone(), previous.clone());
+    assert_eq!(
+        keys,
+        vec![primary, previous[0].clone(), previous[1].clone()]
+    );
+    assert_eq!(dropped, 0);
+}
+
+/// The primary repeated inside `previous` is dropped as a duplicate of the
+/// primary, which always leads the set.
+#[test]
+fn dedupe_public_keys_drops_primary_repeated_in_previous() {
+    let primary = vec![1, 2, 3];
+    let previous = vec![vec![4, 5, 6], primary.clone()];
+
+    let (keys, dropped) = dedupe_public_keys(primary.clone(), previous);
+    assert_eq!(keys, vec![primary, vec![4, 5, 6]]);
+    assert_eq!(dropped, 1);
+}
+
+/// A key repeated within `previous` itself (not just against the primary)
+/// is also de-duplicated -- only the first occurrence survives.
+#[test]
+fn dedupe_public_keys_drops_duplicate_within_previous() {
+    let primary = vec![1, 2, 3];
+    let b = vec![4, 5, 6];
+    let previous = vec![b.clone(), b.clone()];
+
+    let (keys, dropped) = dedupe_public_keys(primary.clone(), previous);
+    assert_eq!(keys, vec![primary, b]);
+    assert_eq!(dropped, 1);
+}
+
+/// Combined case: primary repeated AND a `previous` entry repeated, in the
+/// same list -- `[A(primary), B, A, B]` collapses to `[A, B]`, dropping 2.
+#[test]
+fn dedupe_public_keys_combined_primary_and_previous_repeats() {
+    let a = vec![1, 2, 3];
+    let b = vec![4, 5, 6];
+    let previous = vec![b.clone(), a.clone(), b.clone()];
+
+    let (keys, dropped) = dedupe_public_keys(a.clone(), previous);
+    assert_eq!(keys, vec![a, b]);
+    assert_eq!(dropped, 2);
 }
 
 // -- HEAD download ---------------------------------------------------------
