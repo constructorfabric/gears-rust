@@ -137,7 +137,7 @@ fn write_create_typed(sharing: SharingMode, value: &str, type_name: &str) -> Cre
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
     }
 }
 
@@ -149,7 +149,33 @@ fn write_replace(sharing: SharingMode, value: &str) -> CredentialWrite {
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: SecretValue::from(value),
+        value: Some(SecretValue::from(value)),
+    }
+}
+
+/// A `CredentialWrite` for a create with an explicit `null` value (ADR-0004
+/// Amendment B): the row is inserted `declared`, `fallback` as given.
+fn write_create_null(sharing: SharingMode, fallback: SdkFallback) -> CredentialWrite {
+    CredentialWrite {
+        secret_type: Some(SecretType::generic().into()),
+        sharing,
+        fallback,
+        expires_at: None,
+        value: None,
+    }
+}
+
+/// A `CredentialWrite` for a replace with an explicit `null` value
+/// (ADR-0004 Amendment B): removes an existing value (active row) or leaves
+/// an already value-less row's value untouched (declared row), depending on
+/// the target's current state.
+fn write_replace_null(sharing: SharingMode, fallback: SdkFallback) -> CredentialWrite {
+    CredentialWrite {
+        secret_type: None,
+        sharing,
+        fallback,
+        expires_at: None,
+        value: None,
     }
 }
 
@@ -550,7 +576,7 @@ async fn put_create_without_type_is_rejected() {
         sharing: SharingMode::Tenant,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: SecretValue::from("v"),
+        value: Some(SecretValue::from("v")),
     };
     let err = svc
         .put(&ctx, &key("k"), write, create_only())
@@ -2697,6 +2723,526 @@ async fn run_gc_pending_reclaim_claims_before_deleting_from_the_backend() {
         repo.gc_entries().iter().all(|e| e.value_id != orphan),
         "the gc row must be claimed (removed) even when the backend delete fails"
     );
+}
+
+// ── ADR-0004 Amendment A: Service::get_item (projection-aware point read) ───
+
+#[tokio::test]
+async fn get_item_without_select_evaluates_read_only_and_carries_no_value() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+
+    let item = svc
+        .get_item(&ctx, &key("k"), None)
+        .await
+        .expect("get_item")
+        .expect("item");
+    assert!(item.value.is_none());
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::READ.to_owned()));
+    assert!(
+        !seen.contains(&crate::domain::authz::actions::READ_SECRET.to_owned()),
+        "no $select must never evaluate read_secret: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_item_select_value_evaluates_read_secret_only_and_carries_the_value() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+
+    let fields = ["value".to_owned()];
+    let item = svc
+        .get_item(&ctx, &key("k"), Some(&fields))
+        .await
+        .expect("get_item")
+        .expect("item");
+    assert_eq!(item.value.expect("value present").as_bytes(), b"v");
+    assert_eq!(
+        item.credential.reference.as_ref(),
+        "k",
+        "envelope fields ride along"
+    );
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::READ_SECRET.to_owned()));
+    assert!(
+        !seen.contains(&crate::domain::authz::actions::READ.to_owned()),
+        "a pure value projection must not evaluate read: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_item_select_sharing_and_value_evaluates_both_actions() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+
+    let fields = ["sharing".to_owned(), "value".to_owned()];
+    let item = svc
+        .get_item(&ctx, &key("k"), Some(&fields))
+        .await
+        .expect("get_item")
+        .expect("item");
+    assert!(item.value.is_some());
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::READ.to_owned()));
+    assert!(seen.contains(&crate::domain::authz::actions::READ_SECRET.to_owned()));
+}
+
+#[tokio::test]
+async fn get_item_denial_of_read_secret_with_value_selected_returns_none() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc_setup = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc_setup
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+
+    let denied_type = SecretType::generic().gts_id().to_owned();
+    let (enforcer, _resolver) =
+        action_deny_enforcer(denied_type, crate::domain::authz::actions::READ_SECRET);
+    let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
+
+    let fields = ["value".to_owned()];
+    let item = svc
+        .get_item(&ctx, &key("k"), Some(&fields))
+        .await
+        .expect("get_item");
+    assert!(item.is_none());
+}
+
+#[tokio::test]
+async fn get_item_suppressed_winner_with_value_only_selected_returns_none_but_record_still_visible()
+{
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin, dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+    let row = repo.rows()[0].clone();
+    svc.patch(
+        &ctx,
+        &key("k"),
+        patch_value_null_keep_inherit(),
+        matches(row.id, row.version),
+    )
+    .await
+    .expect("remove value -> declared");
+
+    // A pure value-only projection of a value-less (declared) row is the
+    // canonical miss, exactly as the withdrawn `GET …/secret` was.
+    let value_only = ["value".to_owned()];
+    let item = svc
+        .get_item(&ctx, &key("k"), Some(&value_only))
+        .await
+        .expect("get_item");
+    assert!(item.is_none());
+
+    // The same value-less row, projected together with an administrative
+    // field, is a record with no `value` instead of a miss.
+    let with_admin = ["sharing".to_owned(), "value".to_owned()];
+    let item = svc
+        .get_item(&ctx, &key("k"), Some(&with_admin))
+        .await
+        .expect("get_item")
+        .expect("record still visible");
+    assert!(item.value.is_none());
+    assert_eq!(item.credential.status, CredentialStatus::Declared);
+}
+
+#[tokio::test]
+async fn get_item_rejects_an_unknown_select_field() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo, plugin, dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let fields = ["bogus".to_owned()];
+    let err = svc
+        .get_item(&ctx, &key("k"), Some(&fields))
+        .await
+        .expect_err("must reject");
+    assert!(matches!(
+        err,
+        DomainError::InvalidRequest {
+            reason: "INVALID_SELECT",
+            ..
+        }
+    ));
+}
+
+// ── ADR-0004 Amendment B: create/replace with an explicit `null` value ──────
+
+#[tokio::test]
+async fn put_create_with_explicit_null_creates_a_declared_row_write_only() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let outcome = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create_null(SharingMode::Tenant, SdkFallback::Inherit),
+            create_only(),
+        )
+        .await
+        .expect("create with null");
+    assert!(outcome.created);
+    assert_eq!(outcome.validator.version, 1);
+
+    let row = repo.rows()[0].clone();
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert!(row.value_id.is_none());
+    assert!(row.value_fp.is_none());
+    assert!(
+        repo.gc_entries().is_empty(),
+        "a value-less create must enqueue no gc intent"
+    );
+    assert_eq!(
+        plugin.fence_key_gets(),
+        0,
+        "a value-less create must never call the plugin"
+    );
+
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::WRITE.to_owned()));
+    assert!(
+        !seen.contains(&crate::domain::authz::actions::WRITE_SECRET.to_owned()),
+        "a null create must evaluate write alone: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
+    let t1 = Uuid::new_v4();
+    let t2 = Uuid::new_v4();
+    let t3 = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir_t1 = Arc::new(FakeDir::single(t1));
+    let dir_t2 = Arc::new(FakeDir::new(vec![t2, t1]));
+    let dir_t3 = Arc::new(FakeDir::new(vec![t3, t2, t1]));
+
+    let svc_t1 = make_service_noop(repo.clone(), plugin.clone(), dir_t1);
+    let svc_t3 = make_service_noop(repo.clone(), plugin.clone(), dir_t3);
+
+    let ctx1 = make_ctx(Uuid::new_v4(), t1);
+    let ctx2 = make_ctx(Uuid::new_v4(), t2);
+    let ctx3 = make_ctx(Uuid::new_v4(), t3);
+    let name = key("smtp-default");
+
+    // T1 publishes a shared value; T3 (through T2) inherits it.
+    svc_t1
+        .put(
+            &ctx1,
+            &name,
+            write_create(SharingMode::Shared, "V1"),
+            create_only(),
+        )
+        .await
+        .expect("T1 publishes");
+    assert_eq!(
+        svc_t3
+            .get_secret(&ctx3, &name)
+            .await
+            .expect("t3 get_secret")
+            .expect("v1")
+            .value
+            .as_bytes(),
+        b"V1"
+    );
+
+    // T2 suppresses the inherited credential without ever holding a value of
+    // its own — one request, `write` alone (ADR-0004 Amendment B,
+    // "Suppressing an inherited credential without ever holding a value of
+    // your own is therefore one request too").
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc_t2_recording = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir_t2.clone(),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let outcome = svc_t2_recording
+        .put(
+            &ctx2,
+            &name,
+            write_create_null(SharingMode::Shared, SdkFallback::None),
+            create_only(),
+        )
+        .await
+        .expect("T2 suppresses with null");
+    assert!(outcome.created);
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::WRITE.to_owned()));
+    assert!(
+        !seen.contains(&crate::domain::authz::actions::WRITE_SECRET.to_owned()),
+        "no value is named on either side of a null create: {seen:?}"
+    );
+
+    let svc_t2 = make_service_noop(repo.clone(), plugin.clone(), dir_t2);
+    let t2_cred = svc_t2
+        .get(&ctx2, &name)
+        .await
+        .expect("t2 get")
+        .expect("cred");
+    assert_eq!(t2_cred.status, CredentialStatus::Declared);
+    assert_eq!(t2_cred.inheritance, InheritanceStatus::Suppressed);
+
+    assert!(
+        svc_t2
+            .get_secret(&ctx2, &name)
+            .await
+            .expect("t2 get_secret")
+            .is_none()
+    );
+    assert!(
+        svc_t3
+            .get_secret(&ctx3, &name)
+            .await
+            .expect("t3 get_secret")
+            .is_none(),
+        "T3 must miss once T2 suppresses the subtree"
+    );
+    assert_eq!(
+        svc_t1
+            .get_secret(&ctx1, &name)
+            .await
+            .expect("t1 get_secret")
+            .expect("still v1")
+            .value
+            .as_bytes(),
+        b"V1",
+        "T1's own record and value are untouched"
+    );
+}
+
+#[tokio::test]
+async fn put_null_on_active_row_removes_the_value_in_one_transaction_and_cleans_up_the_old_version()
+{
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc_setup = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc_setup
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v1"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    let row = repo.rows()[0].clone();
+    let old_value_id = row.value_id.expect("value_id");
+
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let outcome = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace_null(SharingMode::Tenant, SdkFallback::Inherit),
+            put_matches(row.id, row.version),
+        )
+        .await
+        .expect("replace with null");
+    assert!(!outcome.created);
+    assert_eq!(outcome.validator.version, row.version + 1);
+
+    let after = repo.rows()[0].clone();
+    assert_eq!(after.status, SecretStatus::Declared);
+    assert!(after.value_id.is_none());
+    assert!(
+        !plugin.contains(&TenantId(tenant), old_value_id),
+        "the superseded version must be cleaned up"
+    );
+
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::WRITE.to_owned()));
+    assert!(
+        seen.contains(&crate::domain::authz::actions::WRITE_SECRET.to_owned()),
+        "removing an existing value requires write_secret: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn put_null_on_declared_row_replaces_metadata_without_write_secret() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc_setup = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc_setup
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v1"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    let row = repo.rows()[0].clone();
+    svc_setup
+        .patch(
+            &ctx,
+            &key("k"),
+            patch_value_null_keep_inherit(),
+            matches(row.id, row.version),
+        )
+        .await
+        .expect("remove value -> declared");
+    let declared = repo.rows()[0].clone();
+    assert_eq!(declared.status, SecretStatus::Declared);
+
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = make_service(repo.clone(), plugin, dir, enforcer, Arc::new(NoopMetrics));
+    // A genuine metadata change (sharing, still non-private) so this does
+    // not take the no-op shortcut below.
+    let outcome = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace_null(SharingMode::Shared, SdkFallback::Inherit),
+            put_matches(declared.id, declared.version),
+        )
+        .await
+        .expect("metadata-only replace");
+    assert!(!outcome.created);
+    assert_eq!(outcome.validator.version, declared.version + 1);
+    let after = repo.rows()[0].clone();
+    assert_eq!(after.sharing, SharingMode::Shared);
+    assert_eq!(after.status, SecretStatus::Declared);
+
+    let seen = resolver.seen_actions();
+    assert!(seen.contains(&crate::domain::authz::actions::WRITE.to_owned()));
+    assert!(
+        !seen.contains(&crate::domain::authz::actions::WRITE_SECRET.to_owned()),
+        "replacing an already value-less row's metadata needs write alone: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn put_null_on_declared_row_is_a_no_op_when_metadata_is_unchanged() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin, dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v1"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+    let row = repo.rows()[0].clone();
+    svc.patch(
+        &ctx,
+        &key("k"),
+        patch_value_null_keep_inherit(),
+        matches(row.id, row.version),
+    )
+    .await
+    .expect("remove value -> declared");
+    let declared = repo.rows()[0].clone();
+
+    let outcome = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace_null(declared.sharing, SdkFallback::Inherit),
+            put_matches(declared.id, declared.version),
+        )
+        .await
+        .expect("no-op replace");
+    assert!(!outcome.created);
+    assert_eq!(
+        outcome.validator.version, declared.version,
+        "a metadata-unchanged null replace must not bump the version"
+    );
+    assert_eq!(repo.rows()[0].version, declared.version);
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

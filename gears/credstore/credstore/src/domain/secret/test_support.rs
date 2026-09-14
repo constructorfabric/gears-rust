@@ -25,7 +25,9 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use crate::domain::secret::model::{GcEntry, GcReason, NewSecret, SecretRow, SecretStatus};
+use crate::domain::secret::model::{
+    GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus,
+};
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
 use crate::domain::secret::typing::reasons;
@@ -1128,6 +1130,44 @@ impl SecretRepo for FakeSecretRepo {
             .lock()
             .expect("lock")
             .retain(|e| e.value_id != new.value_id);
+        Ok(())
+    }
+
+    async fn insert_declared(
+        &self,
+        _scope: &AccessScope,
+        new: &NewDeclaredSecret,
+    ) -> Result<(), DomainError> {
+        let mut rows = self.rows.lock().expect("lock");
+        let conflict = rows.iter().any(|r| {
+            r.tenant_id == new.tenant_id
+                && r.reference == new.reference.as_ref()
+                && match new.sharing {
+                    SharingMode::Private => {
+                        r.sharing == SharingMode::Private && r.owner_id == new.owner_id
+                    }
+                    _ => r.sharing != SharingMode::Private,
+                }
+        });
+        if conflict {
+            return Err(DomainError::Conflict);
+        }
+        rows.push(SecretRow {
+            id: new.id,
+            tenant_id: new.tenant_id,
+            reference: new.reference.as_ref().to_owned(),
+            sharing: new.sharing,
+            owner_id: new.owner_id,
+            status: SecretStatus::Declared,
+            version: 1,
+            updated_at: OffsetDateTime::now_utc(),
+            secret_type_uuid: new.secret_type_uuid,
+            expires_at: new.expires_at,
+            value_id: None,
+            value_fp: None,
+            fp_key_id: None,
+            fallback: new.fallback,
+        });
         Ok(())
     }
 

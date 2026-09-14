@@ -223,7 +223,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
     /// Minimal double: every stored reference is returned as one item
     /// (unfiltered, unpaginated — this test double is read-oriented and does
     /// not model the `OData` allowlist, reduction, or cursor semantics a real
-    /// server enforces). `secret` is populated only when `query`'s `$select`
+    /// server enforces). `value` is populated only when `query`'s `$select`
     /// names it, mirroring the real value-mode switch.
     async fn list(
         &self,
@@ -233,7 +233,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
         let limit = query.limit.unwrap_or(50);
         let value_mode = query
             .selected_fields()
-            .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
+            .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("value")));
         match &self.behavior {
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
             Behavior::NotFound | Behavior::AnyValue(_) => Ok(Page::empty(limit)),
@@ -244,7 +244,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
                         let key = SecretRef::new(k.clone()).ok()?;
                         Some(CredentialListItem {
                             credential: Self::credential(&key),
-                            secret: value_mode.then(|| SecretValue::new(v.clone())),
+                            value: value_mode.then(|| SecretValue::new(v.clone())),
                         })
                     })
                     .collect();

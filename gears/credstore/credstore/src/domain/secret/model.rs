@@ -222,6 +222,26 @@ pub struct NewSecret {
     pub fallback: Fallback,
 }
 
+/// A new declared row (ADR-0004 Amendment B, "The value-less record: reached
+/// only on purpose"): a create whose `value` is an explicit `null` inserts
+/// the row `declared` directly — no `value_id`, no fingerprint, no gc entry,
+/// no backend call. Distinct from [`NewSecret`], which always carries a
+/// written value.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct NewDeclaredSecret {
+    pub id: Uuid,
+    pub tenant_id: TenantId,
+    pub reference: SecretRef,
+    pub sharing: SharingMode,
+    pub owner_id: OwnerId,
+    /// Deterministic v5 UUID of the (registry-validated) GTS type id.
+    pub secret_type_uuid: Uuid,
+    pub expires_at: Option<OffsetDateTime>,
+    /// Suppression policy carried into the row at create time (ADR-0004).
+    pub fallback: Fallback,
+}
+
 /// Why a `credstore_value_gc` entry was enqueued (`reason` column,
 /// `CHECK (reason IN (1, 2, 3, 4))`).
 #[domain_model]

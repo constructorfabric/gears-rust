@@ -16,7 +16,9 @@ use uuid::Uuid;
 pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, GcEntry, GcReason, NewSecret, SecretRow};
+use crate::domain::secret::model::{
+    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow,
+};
 use crate::domain::secret::repo::SecretRepo;
 
 #[async_trait]
@@ -143,6 +145,14 @@ impl SecretRepo for SecretRepoImpl {
 
     async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError> {
         writes::insert_active(self, scope, new).await
+    }
+
+    async fn insert_declared(
+        &self,
+        scope: &AccessScope,
+        new: &NewDeclaredSecret,
+    ) -> Result<(), DomainError> {
+        writes::insert_declared(self, scope, new).await
     }
 
     async fn switch_value(

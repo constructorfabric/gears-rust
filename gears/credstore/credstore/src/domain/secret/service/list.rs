@@ -107,7 +107,7 @@ fn build_credential(key: &SecretRef, secret_type: String, reduced: &Reduced<'_>)
 impl Service {
     /// The collection read (ADR-0005): one reduced item per reference,
     /// rooted at the caller's tenant and walking upward through its
-    /// ancestor chain only. Selecting `secret` in `query`'s `$select`
+    /// ancestor chain only. Selecting `value` in `query`'s `$select`
     /// switches to value mode (ADR-0004, "Bulk secret read").
     ///
     /// # Errors
@@ -217,7 +217,7 @@ impl Service {
                 &chain,
                 &refs,
                 parsed_filter,
-                actions::LIST,
+                &[actions::LIST],
                 false,
             )
             .await?;
@@ -320,6 +320,15 @@ impl Service {
             });
         }
 
+        // Value mode always requires `read_secret`; a record-only field
+        // named alongside `value` additionally requires `list` (ADR-0004
+        // Amendment A) — disclosing `sharing`/`inheritance`/... is `list`'s
+        // privilege, not `read_secret`'s, exactly as the point read's
+        // `get_item` splits the two.
+        let mut required_actions = vec![actions::READ_SECRET];
+        if list_filter::admin_field_selected(query.selected_fields()) {
+            required_actions.push(actions::LIST);
+        }
         let items = self
             .reduce_and_authorize(
                 ctx,
@@ -328,7 +337,7 @@ impl Service {
                 &chain,
                 &refs,
                 parsed_filter,
-                actions::READ_SECRET,
+                &required_actions,
                 true,
             )
             .await?;
@@ -348,6 +357,12 @@ impl Service {
     /// rows whole (unclamped by type), reduce each to one item, drop what
     /// the caller may not see, apply the in-memory filters, and — in value
     /// mode — read each winner's value.
+    ///
+    /// `required_actions` are evaluated per distinct type, each one gating
+    /// the type's inclusion in `allowed_types` (all must permit and include
+    /// the caller's tenant) — metadata mode always names `[list]`; value
+    /// mode names `[read_secret]`, plus `list` too when a record-only field
+    /// is selected alongside `value` (ADR-0004 Amendment A).
     #[allow(
         clippy::too_many_arguments,
         reason = "every input the shared reduction+authorization tail needs; splitting it into \
@@ -361,16 +376,16 @@ impl Service {
         chain: &[Uuid],
         references: &[String],
         parsed_filter: &ParsedFilter,
-        action: &str,
+        required_actions: &[&str],
         value_mode: bool,
     ) -> Result<Vec<CredentialListItem>, DomainError> {
         if references.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Authorization: one PDP evaluation per distinct type found under
-        // the SAME clamp step 1 applied (not a scan of every row of
-        // `references` regardless of type) — see
+        // Authorization: one PDP evaluation per (distinct type, required
+        // action) pair found under the SAME clamp step 1 applied (not a scan
+        // of every row of `references` regardless of type) — see
         // `list_candidate_types`'s doc comment for why this specific
         // clamping is what lets an override-type-consistency violation be
         // told apart from an ordinary denial below.
@@ -389,22 +404,31 @@ impl Service {
         let mut allowed_types: HashMap<Uuid, ResolvedSecretType> = HashMap::new();
         for type_uuid in type_uuids {
             let resolved = self.resolve_stored(type_uuid).await?;
-            let scope = match self
-                .scope_for_timed(
-                    ctx,
-                    &authz::credential_type_resource(&resolved.gts_id),
-                    action,
-                )
-                .await
-            {
-                Ok(scope) => scope,
-                Err(DomainError::AccessDenied { .. }) => continue,
-                Err(e) => return Err(e),
-            };
-            if self.repo.scope_includes_tenant(&scope, req.0).await? {
+            let mut denied = false;
+            for action in required_actions {
+                let scope = match self
+                    .scope_for_timed(
+                        ctx,
+                        &authz::credential_type_resource(&resolved.gts_id),
+                        action,
+                    )
+                    .await
+                {
+                    Ok(scope) => scope,
+                    Err(DomainError::AccessDenied { .. }) => {
+                        denied = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if !self.repo.scope_includes_tenant(&scope, req.0).await? {
+                    self.metrics.cross_tenant_denied();
+                    denied = true;
+                    break;
+                }
+            }
+            if !denied {
                 allowed_types.insert(type_uuid, resolved);
-            } else {
-                self.metrics.cross_tenant_denied();
             }
         }
         // A caller the gate refuses gets an empty page, never a refusal
@@ -473,7 +497,7 @@ impl Service {
             if !value_mode {
                 items.push(CredentialListItem {
                     credential,
-                    secret: None,
+                    value: None,
                 });
                 continue;
             }
@@ -506,7 +530,7 @@ impl Service {
             if let Some(secret) = secret {
                 items.push(CredentialListItem {
                     credential,
-                    secret: Some(secret.value),
+                    value: Some(secret.value),
                 });
             }
             // A refused/missing/fingerprint-mismatched value is omitted,

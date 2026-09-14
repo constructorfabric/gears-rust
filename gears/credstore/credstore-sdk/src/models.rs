@@ -398,8 +398,11 @@ pub struct Credential {
 
 /// The value, with exactly what is needed to use it (ADR-0004, "Two
 /// representations"): nothing administrative rides along — `sharing`,
-/// `inheritance`, `status` stay on [`Credential`]. `GET
-/// /credentials/{ref}/secret`'s response shape.
+/// `inheritance`, `status` stay on [`Credential`]. The SDK-side convenience
+/// envelope [`CredStoreClientV1::get_secret`](crate::CredStoreClientV1::get_secret)
+/// wraps, projecting `GET /credentials/{ref}?$select=reference,type,expires_at,value`
+/// to exactly these four fields (ADR-0004 Amendment A) — the shape the
+/// withdrawn `GET /credentials/{ref}/secret` used to return.
 #[derive(Debug)]
 #[allow(
     clippy::struct_field_names,
@@ -422,8 +425,15 @@ pub struct Secret {
 
 /// Body of [`CredStoreClientV1::put`](crate::CredStoreClientV1::put) — a
 /// whole-credential replace: fields absent reset to their defaults (ADR-0004,
-/// "Two write verbs"). `value` is always required; a `PUT` never produces a
-/// `declared` record.
+/// "Two write verbs"). `value` is required at the REST boundary (its
+/// *absence* on the wire is 400 `VALUE_REQUIRED`, before this type is even
+/// built), but once past that gate it is tri-state (ADR-0004 Amendment B,
+/// "The value-less record: reached only on purpose"): `Some(_)` writes a
+/// value (create, or replace/rotate), `None` is an explicit `null` — no value
+/// is written: on create the row is inserted `declared`; on replace of an
+/// `active` row the value is removed in the same one transaction
+/// `PATCH {"value": null}` uses; on replace of an already-`declared` row
+/// nothing about the value changes.
 #[derive(Debug)]
 pub struct CredentialWrite {
     /// Full GTS type id. Required on create (defaults are not inferred here —
@@ -439,9 +449,13 @@ pub struct CredentialWrite {
     /// exactly as an omitted field on today's shipped `PUT` already clears
     /// one.
     pub expires_at: Option<OffsetDateTime>,
-    /// The value to write. Always required — a `PUT` without one is a 400
-    /// (`VALUE_REQUIRED`) at the REST boundary.
-    pub value: SecretValue,
+    /// The value to write, or `None` for an explicit `null` (no value on
+    /// either side of the request — a value-less create, or a value removal/
+    /// no-op on replace, per the type's own doc above). The REST layer maps
+    /// the wire's *absent* `value` key to 400 (`VALUE_REQUIRED`) before this
+    /// type is ever constructed, so `None` here is unambiguously "explicit
+    /// null", never "the caller forgot the field".
+    pub value: Option<SecretValue>,
 }
 
 /// Tri-state field for an RFC 7396 JSON Merge Patch: absent (untouched),
@@ -507,9 +521,9 @@ impl CredentialPatch {
 
 /// One item of the collection read (`CredStoreClientV1::list`, ADR-0005): the
 /// reduced [`Credential`] a reference resolves to, plus its decrypted value
-/// (`secret`) when the request ran in **value mode**
-/// (`$select` containing `secret`, ADR-0004 "Bulk secret read: the collection
-/// in value mode"). `secret` is `None` in ordinary (metadata-mode) listing —
+/// (`value`) when the request ran in **value mode**
+/// (`$select` containing `value`, ADR-0004 "Bulk secret read: the collection
+/// in value mode"). `value` is `None` in ordinary (metadata-mode) listing —
 /// the collection never carries a value unless the caller opted into value
 /// mode, and even then only for the items whose value the caller may read.
 #[derive(Debug)]
@@ -522,7 +536,7 @@ pub struct CredentialListItem {
     /// the caller may read (`read_secret`); a refused, missing, or
     /// fingerprint-mismatched item is omitted from the page entirely rather
     /// than carrying `None` here.
-    pub secret: Option<SecretValue>,
+    pub value: Option<SecretValue>,
 }
 
 /// Outcome of one [`CredStoreMaintenanceV1::run_gc`](crate::CredStoreMaintenanceV1::run_gc)
@@ -723,8 +737,8 @@ mod models_tests {
         };
         let item = CredentialListItem {
             credential,
-            secret: None,
+            value: None,
         };
-        assert!(item.secret.is_none());
+        assert!(item.value.is_none());
     }
 }
