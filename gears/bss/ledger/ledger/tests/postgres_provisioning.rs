@@ -1,6 +1,6 @@
 //! Postgres-only integration tests for the transactional seller-provisioning
 //! seed (`ProvisioningService::provision`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_provisioning -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_provisioning -- --ignored`.
 //!
 //! Covers: (a) the seed is idempotent + additive across repeated calls
 //! (created-vs-existing counts + raw row counts hold); (b) a scale exceeding
@@ -27,8 +27,8 @@ use bss_ledger_sdk::{
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -41,7 +41,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// extraction idiom: `row.try_get::<i64>("", "count")`).
 async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     let row = db
-        .query_one(pg(sql))
+        .query_one_raw(pg(sql))
         .await
         .unwrap()
         .expect("count query must return a row");
@@ -90,7 +90,7 @@ fn utc_calendar() -> FiscalCalendarSpec {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn provision_is_idempotent_and_additive() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -106,7 +106,7 @@ async fn provision_is_idempotent_and_additive() {
     let service = ProvisioningService::new(provider.clone());
 
     let tenant_id = Uuid::new_v4();
-    let expected_period = chrono::Utc::now().format("%Y%m").to_string();
+    let expected_period = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc());
 
     // --- Call #1: seed everything fresh. ---
     let req1 = ProvisionRequest {
@@ -165,7 +165,7 @@ async fn provision_is_idempotent_and_additive() {
         1
     );
     let status_row = db
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{tenant_id}' AND legal_entity_id='{tenant_id}' \
                AND period_id='{expected_period}'"
@@ -262,7 +262,7 @@ async fn provision_is_idempotent_and_additive() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn provision_rolls_back_on_out_of_range_scale() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

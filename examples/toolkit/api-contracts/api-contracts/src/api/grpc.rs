@@ -102,6 +102,51 @@ impl PaymentApi for PaymentApiGrpcService {
         let boxed: Self::ListPaymentsStream = Box::pin(mapped);
         Ok(Response::new(boxed))
     }
+
+    type StreamPaymentsStream =
+        Pin<Box<dyn Stream<Item = Result<stubs::PaymentSummary, Status>> + Send + 'static>>;
+
+    /// The fallible-open counterpart of [`Self::list_payments`], and the reason
+    /// gRPC needs no special support for that shape: tonic's server trait
+    /// method is *already* `async fn(..) -> Result<Response<Self::Stream>,
+    /// Status>`. Returning `Err` here sends a `Status` in the response headers,
+    /// before any message — which the generated client surfaces as an `Err`
+    /// from its own awaited call rather than as the stream's first item.
+    ///
+    /// So the only difference from `list_payments` below the contract layer is
+    /// that the domain's own open (`open_feed`) is `?`-ed rather than folded
+    /// into the stream.
+    async fn stream_payments(
+        &self,
+        request: Request<stubs::ListPaymentsFilter>,
+    ) -> Result<Response<Self::StreamPaymentsStream>, Status> {
+        let ctx = require_security_context(request.metadata())?;
+        let proto = request.into_inner();
+        let filter = api_contracts_sdk::models::ListPaymentsFilter::try_from_proto(&proto)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // The open. A rejected filter becomes a `Status` in the response
+        // headers, so no stream is ever created.
+        let stream = self
+            .domain
+            .open_feed(&ctx, &filter)
+            .map_err(canonical_to_status)?;
+
+        let mapped = async_stream::try_stream! {
+            use futures_util::StreamExt as _;
+            let mut s = stream;
+            while let Some(item) = s.next().await {
+                match item {
+                    Ok(summary) => {
+                        let proto: stubs::PaymentSummary = summary.into();
+                        yield proto;
+                    }
+                    Err(e) => Err(canonical_to_status(e))?,
+                }
+            }
+        };
+        let boxed: Self::StreamPaymentsStream = Box::pin(mapped);
+        Ok(Response::new(boxed))
+    }
 }
 
 /// Bearer-token validation outcome for the inbound gRPC call.

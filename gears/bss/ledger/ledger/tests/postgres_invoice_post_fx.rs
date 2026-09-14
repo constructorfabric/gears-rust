@@ -35,11 +35,11 @@ use bss_ledger::infra::metrics::test_harness::MetricsHarness;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -50,7 +50,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -84,7 +84,7 @@ fn eur_account(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -117,14 +117,14 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
     }
     // The S5-F3 functional-currency source: a fiscal_calendar row carrying USD.
     // This is what ACTIVATES the S1 FX lock for this tenant (absent → single-ccy).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))
@@ -153,7 +153,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
             rate_micro: 1_100_000,
-            as_of: Utc::now(),
+            as_of: OffsetDateTime::now_utc(),
             fallback_order: 0,
         })
         .await

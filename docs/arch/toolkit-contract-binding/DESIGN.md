@@ -155,9 +155,9 @@ The four-type segregation encodes this asymmetry in the type system. A migration
 | `cpt-cf-binding-fr-naming-convention` | Every trait ends with its contract type suffix. Transport projections append `Rest` or `Grpc`. Hard rules enforced by convention and future lint. |
 | `cpt-cf-binding-fr-rest-client-gen` | `#[toolkit::rest_contract]` generates a `{Trait}Client` struct implementing both the base trait (HTTP dispatch) and the transport trait (default delegation). |
 | `cpt-cf-binding-fr-openapi-gen` | The macro generates an `{trait}_openapi_spec()` function returning a valid OpenAPI 3.1 spec with endpoint paths, HTTP methods, and JSON schemas (via `schemars`). |
-| `cpt-cf-binding-fr-sse-streaming` | Methods annotated with `#[streaming]` generate SSE-aware client code: `Accept: text/event-stream` header, SSE parser into typed `Stream`. |
+| `cpt-cf-binding-fr-sse-streaming` | Methods annotated with `#[streaming]` generate framing-aware client code: the framing's `Accept` header and its parser into a typed `Stream`. The framing is selected by the marker's argument — `#[streaming]` / `#[streaming(sse)]` is `text/event-stream`, `#[streaming(multipart_mixed)]` is `multipart/mixed` with one JSON item per part. A `#[streaming] async fn` additionally makes the *open* a distinct, fallible operation returning `Result<Stream, E>`. **Under `sse`, only the default (`message`) channel carries typed items**: `done` terminates the stream, `error` is decoded as a `Problem`, and every other named `event:` kind is deliberately ignored, so that a server's `ping`-style keepalive does not surface as a spurious item or a decode error. A protocol that carries its *frame kind* in the `event:` line consequently cannot be read by the generated SSE client at all — for such a protocol the generated client is **`multipart/mixed`-only**, and the frame union belongs in the method's item type (a `#[serde(tag = "…")]` enum), not in the framing. |
 | `cpt-cf-binding-fr-retryable` | Methods annotated with `#[retryable]` generate retry logic with exponential backoff. Retry policy configured via `ClientConfig`. |
-| `cpt-cf-binding-fr-contract-error` | `#[derive(ContractError)]` generates Problem Details conversion with `error_code` (UPPER_SNAKE_CASE from variant name) and `error_domain` (from attribute). Round-trip serialization preserves the original variant. |
+| `cpt-cf-binding-fr-contract-error` | `#[derive(ContractError)]` generates Problem Details conversion with `error_code` (UPPER_SNAKE_CASE from variant name) and `error_domain` (from attribute). Round-trip serialization preserves the original variant **only where the contract method's declared error type is the `ContractError` enum itself** (with a `#[contract_error(fallback)]` variant, which is what generates the total `From<TransportError>`). Declaring `CanonicalError` and relying on the `Problem` round-trip does **not** work: `CanonicalError` has no field for `error_code`, `error_domain` or `context["data"]`, so the domain identity is stripped in both directions — and for the categories whose context type has required fields (`FailedPrecondition`, `ResourceExhausted`, `InvalidArgument`, `Aborted`) the *category* is lost too, a `400` arriving as `Internal` / `500`. Branch on a typed payload ⇒ declare the enum. |
 | `cpt-cf-binding-fr-problem-details` | Runtime provides the `Problem` struct (`toolkit_canonical_errors`) for the RFC 9457 wire format with `error_code` and `error_domain` extension fields. |
 | `cpt-cf-binding-fr-client-config` | Runtime provides `ClientConfig` carrying base URL, timeout, and retry policy. Generated clients accept `ClientConfig` for construction. |
 | `cpt-cf-binding-fr-feature-gated` | REST client and its dependencies (`reqwest`, `schemars`) are behind a `rest-client` feature flag. SDK crates without the feature compile with no HTTP dependencies. |
@@ -167,6 +167,20 @@ The four-type segregation encodes this asymmetry in the type system. A migration
 | `cpt-cf-binding-fr-proxy-wiring` | Gear lifecycle includes a proxy wiring phase after plugin discovery and before post-init. REST proxies instantiated only for traits with no compile-time registration. |
 | `cpt-cf-binding-fr-consumer-agnostic` | Consumer code is binding-mode-agnostic. `hub.get::<dyn NotificationBackend>()` works identically whether backed by a compile-time plugin or a REST proxy. |
 | `cpt-cf-binding-fr-versioning` | `#[non_exhaustive]` on request/response structs. Default trait methods for new methods. Breaking changes require new major version. |
+
+> **Implementation note (streaming open shape, #4740).** For a `#[streaming]`
+> method the macro now derives the *open shape* from the method's `asyncness`:
+> a `#[streaming] async fn` selects the **fallible** open (emitted as
+> `async fn … -> Result<Stream, E>`), while a non-`async` `#[streaming] fn`
+> selects the **immediate** open (emitted as `fn … -> Stream`). The REST parser
+> previously ignored `asyncness` entirely and normalised `async` away via
+> `rewrite_streaming_signature`, so both spellings produced the immediate shape.
+> The consequence to audit: an author who left a stray `async` on a REST
+> streaming projection that was intended to be immediate now silently gets the
+> fallible signature (and vice-versa). Existing `#[streaming]` REST projections
+> should be checked so their `async`/non-`async` spelling matches the intended
+> open shape. This aligns the REST parser with the base macro's rule
+> (`parse.rs`) and with `cpt-cf-binding-fr-sse-streaming` above.
 
 ### 1.6 Architecture Layers
 
@@ -343,11 +357,11 @@ The cost is one `Box<dyn Future>` allocation per async method call — negligibl
 Every method on a remote-capable contract (Api, Backend, and their `*Rest`/`*Grpc` projections) MUST accept a **plane context** as its first non-self argument — either `SecurityContext` (tenant plane) or `PlatformSecurityContext` (platform plane). This is a hard rule enforced by the `#[toolkit::rest_contract]` macro.
 
 > **Implementation status.**
-> - The REST macro accepts the context **by value or by reference** (`SecurityContext` and `&SecurityContext` are equivalent; detection is reference-transparent). A remote projection method whose first non-self argument is *not* a plane context is a **compile error**.
+> - The REST and gRPC macros accept the context **by value or by reference** (`SecurityContext` and `&SecurityContext` are equivalent; detection is reference-transparent). A remote projection method whose first non-self argument is *not* a plane context is a **compile error**.
 > - **Tenant plane** (`SecurityContext`) is fully wired: the client forwards the raw bearer token as a *sensitive* `Authorization: Bearer` header, and the full context is never serialized onto the wire.
-> - **Platform plane** (`PlatformSecurityContext` → `X-ToolKit-Internal-Token`) over REST is **deferred**: `PlatformSecurityContext` is recognized as a plane marker and excluded from the wire payload, but the generated REST client does not yet inject the internal token (that carrier is transport-injected below the contract layer). Platform-plane system contracts are served today over gRPC via `InternalAuthInterceptor`, or by a manual client. See ADR-0004 / the two-plane model.
+> - **Platform plane** (`PlatformSecurityContext` → `X-ToolKit-Internal-Token`) is fully wired over **both REST and gRPC**: `PlatformSecurityContext` is recognized as a plane marker and excluded from the wire payload, and the generated client attaches the internal token — sourced from the process's bootstrap-selected `InternalCredential` via a runtime `InternalTokenProvider` on `ClientConfig`, **never** from the argument (which carries no secret). The credential is threaded in below the contract layer by `#[toolkit::provides]` from `GearCtx::internal_token_provider()`. The call is **permissive**: with no credential configured (`InternalCredential::None`, Profile 1 / in-process) the client attaches nothing, and the requirement is enforced server-side.
 
-**The context type is the plane marker.** `SecurityContext` and `PlatformSecurityContext` are distinct types (per the [two-plane model](../toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)), so plane selection is a compile-time property of the signature. The macro maps the type to its carrier: `&SecurityContext` → `Authorization: Bearer <jwt>`; `&PlatformSecurityContext` → `X-ToolKit-Internal-Token` (mTLS+SPIFFE next phase, [ADR-0006](../toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md)). A method takes exactly one. The client forwards the tenant bearer token but does **not** source the platform secret — the runtime injects that below the contract layer.
+**The context type is the plane marker.** `SecurityContext` and `PlatformSecurityContext` are distinct types (per the [two-plane model](../toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)), so plane selection is a compile-time property of the signature. The macro maps the type to its carrier: `&SecurityContext` → `Authorization: Bearer <jwt>`; `&PlatformSecurityContext` → `X-ToolKit-Internal-Token` (mTLS+SPIFFE next phase, [ADR-0006](../toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md)). A method takes exactly one. The client forwards the tenant bearer token but does **not** source the platform secret *from the argument* — the runtime injects it below the contract layer.
 
 ```rust
 // Remote-capable, tenant plane — SecurityContext required.
@@ -684,13 +698,13 @@ impl RestApiCapability for MyGear {
 - **Per-method opt-out**: a projection method marked `#[server_manual]` is skipped by the generator (but stays in the client + IR). The author registers it by hand and chains it onto the generated router. This is the escape hatch for routes the macro cannot (yet) express.
 - OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered — generated and manual routes contribute to the same registry.
 - Handler generation is synchronized with the IR — parameter binding order (`SecurityContext` → path → body → query) and error mapping (`CanonicalError: IntoResponse` → RFC 9457 `Problem`) follow from the binding metadata.
-- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). Complex authentication (license, OData, multipart) and base↔projection parity enforcement are follow-up work.
+- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred, under every framing** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). The hand-written side has a first-class runtime for both framings: `OperationBuilder::sse_json` + `toolkit::http::sse` for SSE, `OperationBuilder::multipart_json` + `toolkit::http::multipart::MultipartJsonStream` for `multipart/mixed`. Complex authentication (license, OData, multipart *uploads*) and base↔projection parity enforcement are follow-up work.
 
 **Trade-offs:**
 
 - The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
 - Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
-- For routes that cannot be expressed by the macro (streaming/SSE in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
+- For routes that cannot be expressed by the macro (streaming of any framing in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
 
 ## 4. Crate Structure
 

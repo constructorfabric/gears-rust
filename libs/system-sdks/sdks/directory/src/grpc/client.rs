@@ -7,12 +7,14 @@ use async_trait::async_trait;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
+use crate::ProtoInstanceState;
 use crate::api::{
-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, RegisterInstanceInfo,
-    ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, InstanceState, LabelSelector,
+    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
+use std::collections::BTreeMap;
 use toolkit_transport_grpc::InternalAuthInterceptor;
-use toolkit_transport_grpc::client::{GrpcClientConfig, connect_with_retry};
+use toolkit_transport_grpc::client::{GrpcClientConfig, connect_lazy, connect_with_retry};
 
 use crate::{
     DeregisterInstanceRequest, DirectoryServiceClient, GetOpenApiSpecRequest, GrpcServiceEndpoint,
@@ -49,15 +51,18 @@ fn lookup_error(resource: &str, status: &tonic::Status) -> anyhow::Error {
 
 /// Map a mutating RPC's `tonic::Status`, preserving the code in the message.
 ///
-/// These calls have no not-found semantics worth typing, but a bare
-/// `"gRPC call failed"` hides whether the directory was unreachable
-/// (`Unavailable`) or rejected the request (`Internal`).
+/// A bare `"gRPC call failed"` hides whether the directory was unreachable
+/// (`Unavailable`, transient) or rejected the request (`InvalidArgument`,
+/// permanent). `InvalidArgument` is typed as [`DirectoryInvalidArgument`] so a
+/// caller retrying a mutation (e.g. the presence loop) can distinguish a
+/// permanent rejection — which retrying can never fix — from a transient one.
 fn call_error(op: &str, status: &tonic::Status) -> anyhow::Error {
-    anyhow::anyhow!(
-        "directory {op} failed: gRPC {:?}: {}",
-        status.code(),
-        status.message()
-    )
+    match status.code() {
+        tonic::Code::InvalidArgument => {
+            DirectoryInvalidArgument::new(status.message().to_owned()).into()
+        }
+        code => anyhow::anyhow!("directory {op} failed: gRPC {code:?}: {}", status.message()),
+    }
 }
 
 /// gRPC client for Directory API
@@ -104,6 +109,51 @@ impl DirectoryGrpcClient {
     ) -> Result<Self> {
         let cfg = GrpcClientConfig::new("directory");
         let channel: Channel = connect_with_retry(uri, &cfg).await?;
+        Ok(Self::from_channel_with_interceptor(channel, interceptor))
+    }
+
+    /// Create a directory client with a **lazily-connecting** channel.
+    ///
+    /// Performs **no** eager connection: the channel connects on the first RPC
+    /// and transparently reconnects on failure. This is the eventual-readiness
+    /// entry point (`cpt-cf-adr-eventual-readiness`) for `OoP` bootstrap — the
+    /// process starts even when the `DirectoryService` is not yet reachable, and
+    /// the presence loop's backoff retry absorbs the startup window instead of
+    /// the process crashing (which would offload retries onto a k8s
+    /// `CrashLoopBackOff`).
+    ///
+    /// # Runtime context
+    /// Must be called from within a Tokio runtime context: building the lazy
+    /// channel initialises the hyper reactor. Calling it outside a runtime
+    /// returns an error rather than panicking (it still does not connect).
+    ///
+    /// # Errors
+    /// Returns an error if called outside a Tokio runtime context, or if `uri`
+    /// is malformed — never for an unreachable peer.
+    pub fn connect_lazy(uri: impl Into<String>) -> Result<Self> {
+        let cfg = GrpcClientConfig::new("directory");
+        let channel: Channel = connect_lazy(uri, &cfg)?;
+        Ok(Self::from_channel(channel))
+    }
+
+    /// Create a directory client with a **lazily-connecting** channel, attaching
+    /// `interceptor`'s platform-plane credential to every outbound call.
+    ///
+    /// The lazy counterpart of [`connect_with_interceptor`](Self::connect_with_interceptor);
+    /// see [`connect_lazy`](Self::connect_lazy) for the connection semantics.
+    /// The URI is validated before `interceptor` is consumed, so the credential
+    /// is only moved into the client on success.
+    ///
+    /// # Errors
+    /// Returns an error only if `uri` is malformed — never for an unreachable
+    /// peer.
+    pub fn connect_lazy_with_interceptor(
+        uri: impl Into<String>,
+        interceptor: InternalAuthInterceptor,
+    ) -> Result<Self> {
+        let cfg = GrpcClientConfig::new("directory");
+        // Validate the URI (build the channel) before consuming `interceptor`.
+        let channel: Channel = connect_lazy(uri, &cfg)?;
         Ok(Self::from_channel_with_interceptor(channel, interceptor))
     }
 
@@ -225,6 +275,7 @@ impl DirectoryClient for DirectoryGrpcClient {
         let mut client = self.inner.clone();
         let request = tonic::Request::new(ListInstancesRequest {
             gear_name: gear.to_owned(),
+            match_labels: std::collections::HashMap::new(),
         });
 
         let response = client
@@ -242,6 +293,47 @@ impl DirectoryClient for DirectoryGrpcClient {
         Ok(instances)
     }
 
+    async fn resolve_by_labels(
+        &self,
+        gear: &str,
+        selector: &LabelSelector,
+    ) -> Result<Vec<ServiceInstanceInfo>> {
+        // Push the selector server-side so the directory returns only matching
+        // instances. Every `list_instances` response is spec-free (only the
+        // `openapi_spec_hash` rides along; the document is fetched via
+        // `GetOpenApiSpec`), so an empty (match-all) selector never leaks a full
+        // OpenAPI document over the wire.
+        //
+        // cancel-safe: the single await is the unary `list_instances` RPC, which
+        // precedes any local state change; cancelling it just drops the in-flight
+        // response and leaves nothing partially applied.
+        let mut client = self.inner.clone();
+        let match_labels = selector
+            .match_labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let request = tonic::Request::new(ListInstancesRequest {
+            gear_name: gear.to_owned(),
+            match_labels,
+        });
+
+        let response = client
+            .list_instances(request)
+            .await
+            .map_err(|e| lookup_error(&format!("instances of gear {gear}"), &e))?;
+
+        let instances = response
+            .into_inner()
+            .instances
+            .into_iter()
+            .map(proto_instance_to_domain)
+            .filter(|i| selector.matches(&i.labels))
+            .collect();
+
+        Ok(instances)
+    }
+
     async fn list_all_instances(&self) -> Result<Vec<ServiceInstanceInfo>> {
         let mut client = self.inner.clone();
         let response = client
@@ -253,11 +345,7 @@ impl DirectoryClient for DirectoryGrpcClient {
             .into_inner()
             .instances
             .into_iter()
-            .map(|proto| {
-                let mut info = proto_instance_to_domain(proto);
-                info.openapi_spec = None;
-                info
-            })
+            .map(|proto| proto_instance_to_domain(proto).without_labels())
             .collect();
 
         Ok(instances)
@@ -283,6 +371,7 @@ impl DirectoryClient for DirectoryGrpcClient {
             version: info.version.unwrap_or_default(),
             rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
             openapi_spec: info.openapi_spec,
+            labels: info.labels.into_iter().collect(),
         };
 
         client
@@ -331,20 +420,60 @@ fn proto_instance_to_domain(proto: InstanceInfo) -> ServiceInstanceInfo {
     ServiceInstanceInfo {
         gear: proto.gear_name,
         instance_id: proto.instance_id,
-        endpoint: ServiceEndpoint::new(proto.endpoint_uri),
+        endpoint: if proto.endpoint_uri.is_empty() {
+            None
+        } else {
+            Some(ServiceEndpoint::new(proto.endpoint_uri))
+        },
         version: if proto.version.is_empty() {
             None
         } else {
             Some(proto.version)
         },
         rest_endpoint: proto.rest_endpoint_uri.map(ServiceEndpoint::new),
-        openapi_spec: proto.openapi_spec,
         openapi_spec_hash: proto.openapi_spec_hash,
-        // The list-instances proto response does not break the instance down
-        // per gRPC service, so nothing to carry back over the OoP directory
-        // transport. The in-process `LocalDirectoryClient` populates this from
-        // the live `GearInstance`.
+        // The `InstanceInfo` proto message carries no per-service gRPC
+        // breakdown, so nothing to reconstruct over the OoP directory transport;
+        // only the in-process `LocalDirectoryClient` populates this (from the
+        // live `GearInstance`). No consumer reads `grpc_services` off a
+        // gRPC-obtained instance today — a single gRPC endpoint is available via
+        // the primary `endpoint`. When a label-targeted gRPC client needs the
+        // full per-service map remotely (the TopologyView work), add a
+        // `repeated GrpcServiceEndpoint grpc_services` field to `InstanceInfo`.
         grpc_services: Vec::new(),
+        // Stable addressing labels cross the wire (ordering is normalized into a
+        // BTreeMap for deterministic selector matching).
+        labels: proto.labels.into_iter().collect::<BTreeMap<_, _>>(),
+        // Live serving state so label-targeted callers can filter on health.
+        state: proto_state_to_domain(proto.state),
+    }
+}
+
+/// Map the proto `InstanceState` (an open enum carried as `i32`) onto the
+/// domain [`InstanceState`].
+///
+/// `UNSPECIFIED` (a peer that never set the field, e.g. an older server) and
+/// any discriminant this build does not recognise map to the non-serving
+/// [`InstanceState::Unknown`] — kept distinct from
+/// [`InstanceState::Registered`] so "the state is unknown" is not silently read
+/// as a known pre-serving baseline. An unrecognised discriminant is logged so
+/// the version skew is observable rather than swallowed.
+fn proto_state_to_domain(state: i32) -> InstanceState {
+    match ProtoInstanceState::try_from(state) {
+        Ok(ProtoInstanceState::Ready) => InstanceState::Ready,
+        Ok(ProtoInstanceState::Healthy) => InstanceState::Healthy,
+        Ok(ProtoInstanceState::Quarantined) => InstanceState::Quarantined,
+        Ok(ProtoInstanceState::Draining) => InstanceState::Draining,
+        Ok(ProtoInstanceState::Registered) => InstanceState::Registered,
+        Ok(ProtoInstanceState::Unspecified) => InstanceState::Unknown,
+        Err(_) => {
+            tracing::warn!(
+                raw_state = state,
+                "directory returned an unrecognised InstanceState discriminant; \
+                 treating as Unknown (non-serving)"
+            );
+            InstanceState::Unknown
+        }
     }
 }
 
@@ -381,6 +510,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_lazy_succeeds_against_unreachable_peer() {
+        // The lazy constructor performs no eager connect, so an OoP gear can
+        // build its directory client before the `DirectoryService` is up
+        // (`cpt-cf-adr-eventual-readiness`). Nothing is listening on port 1, yet
+        // both the plain and interceptor-bearing constructors return `Ok`.
+        let plain = DirectoryGrpcClient::connect_lazy("http://127.0.0.1:1");
+        assert!(
+            plain.is_ok(),
+            "connect_lazy must not eagerly connect (unreachable peer -> Ok)"
+        );
+
+        let authed = DirectoryGrpcClient::connect_lazy_with_interceptor(
+            "http://127.0.0.1:1",
+            InternalAuthInterceptor::disabled(),
+        );
+        assert!(
+            authed.is_ok(),
+            "connect_lazy_with_interceptor must not eagerly connect (unreachable peer -> Ok)"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_lazy_rejects_malformed_uri() {
+        // A malformed endpoint is a static misconfiguration worth failing fast
+        // on — the only error path of the lazy constructors.
+        assert!(
+            DirectoryGrpcClient::connect_lazy(String::new()).is_err(),
+            "connect_lazy should fail on a malformed URI"
+        );
+        assert!(
+            DirectoryGrpcClient::connect_lazy_with_interceptor(
+                String::new(),
+                InternalAuthInterceptor::disabled(),
+            )
+            .is_err(),
+            "connect_lazy_with_interceptor should fail on a malformed URI"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_grpc_service_through_lazy_client_errors_not_hangs() {
+        // A lazy client builds against an unreachable directory; the first RPC
+        // returns a lookup/call error rather than hanging (outer timeout proves
+        // non-hang; nothing is listening on port 1).
+        let client =
+            DirectoryGrpcClient::connect_lazy("http://127.0.0.1:1").expect("lazy build ok");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.resolve_grpc_service("cf.directory.v1.DirectoryService"),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "resolve_grpc_service through a lazy client must not hang against an unreachable peer"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "resolve_grpc_service against an unreachable directory must return Err"
+        );
+    }
+
     #[test]
     fn proto_instance_maps_all_fields_to_domain() {
         let proto = InstanceInfo {
@@ -389,19 +580,30 @@ mod tests {
             endpoint_uri: "http://calc:8080".to_owned(),
             version: "1.2.3".to_owned(),
             rest_endpoint_uri: Some("http://calc:8080".to_owned()),
-            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
-            openapi_spec_hash: None,
+            openapi_spec_hash: Some("1a2b3c4d5e6f7a8b".to_owned()),
+            labels: [("shard".to_owned(), "7".to_owned())].into_iter().collect(),
+            state: ProtoInstanceState::Healthy as i32,
         };
         let domain = proto_instance_to_domain(proto);
         assert_eq!(domain.gear, "calc");
+        assert_eq!(domain.state, InstanceState::Healthy);
         assert_eq!(domain.instance_id, "calc-1");
-        assert_eq!(domain.endpoint.uri, "http://calc:8080");
+        assert_eq!(
+            domain.endpoint.as_ref().map(|e| e.uri.as_str()),
+            Some("http://calc:8080")
+        );
         assert_eq!(domain.version.as_deref(), Some("1.2.3"));
         assert_eq!(
             domain.rest_endpoint.map(|e| e.uri),
             Some("http://calc:8080".to_owned())
         );
-        assert!(domain.openapi_spec.is_some());
+        // Enumeration is spec-free: only the hash crosses the wire.
+        assert_eq!(
+            domain.openapi_spec_hash.as_deref(),
+            Some("1a2b3c4d5e6f7a8b")
+        );
+        // Labels cross the wire and land in a BTreeMap for deterministic matching.
+        assert_eq!(domain.labels.get("shard"), Some(&"7".to_owned()));
     }
 
     #[test]
@@ -412,13 +614,69 @@ mod tests {
             endpoint_uri: "http://worker:7000".to_owned(),
             version: String::new(),
             rest_endpoint_uri: None,
-            openapi_spec: None,
             openapi_spec_hash: None,
+            labels: std::collections::HashMap::new(),
+            state: ProtoInstanceState::Unspecified as i32,
         };
         let domain = proto_instance_to_domain(proto);
+        // A non-empty proto endpoint_uri maps to `Some`.
+        assert_eq!(
+            domain.endpoint.as_ref().map(|e| e.uri.as_str()),
+            Some("http://worker:7000")
+        );
         // An empty proto version string maps to `None` rather than an empty string.
         assert!(domain.version.is_none());
         assert!(domain.rest_endpoint.is_none());
-        assert!(domain.openapi_spec.is_none());
+        assert!(domain.openapi_spec_hash.is_none());
+        assert!(domain.labels.is_empty());
+        // An unset proto state (`UNSPECIFIED`) maps to the non-serving Unknown
+        // sentinel — distinct from the pre-serving Registered baseline.
+        assert_eq!(domain.state, InstanceState::Unknown);
+        assert!(!domain.state.is_serving());
+    }
+
+    #[test]
+    fn proto_instance_maps_empty_endpoint_to_none() {
+        // proto3 carries an absent primary endpoint as an empty string; it must
+        // map back to `None`, not an empty-URI sentinel a dialer could mistake
+        // for a real address.
+        let proto = InstanceInfo {
+            gear_name: "grpc-only".to_owned(),
+            instance_id: "g-1".to_owned(),
+            endpoint_uri: String::new(),
+            version: String::new(),
+            rest_endpoint_uri: None,
+            openapi_spec_hash: None,
+            labels: std::collections::HashMap::new(),
+            state: ProtoInstanceState::Ready as i32,
+        };
+        let domain = proto_instance_to_domain(proto);
+        assert!(
+            domain.endpoint.is_none(),
+            "an empty proto endpoint_uri must map to None"
+        );
+    }
+
+    #[test]
+    fn proto_state_unspecified_and_unrecognised_map_to_unknown() {
+        // `UNSPECIFIED` (peer never set the field) and any discriminant this
+        // build does not know (e.g. a newer server) both collapse to the
+        // non-serving Unknown sentinel rather than being read as Registered.
+        assert_eq!(
+            proto_state_to_domain(ProtoInstanceState::Unspecified as i32),
+            InstanceState::Unknown
+        );
+        assert_eq!(proto_state_to_domain(9999), InstanceState::Unknown);
+        assert!(!proto_state_to_domain(9999).is_serving());
+
+        // Known discriminants still map through unchanged.
+        assert_eq!(
+            proto_state_to_domain(ProtoInstanceState::Registered as i32),
+            InstanceState::Registered
+        );
+        assert_eq!(
+            proto_state_to_domain(ProtoInstanceState::Healthy as i32),
+            InstanceState::Healthy
+        );
     }
 }

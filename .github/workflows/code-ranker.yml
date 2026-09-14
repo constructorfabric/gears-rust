@@ -1,7 +1,13 @@
 name: code-ranker
 on:
   pull_request:
+    paths:
+      - '**/*.rs'
+      - '**/*.md'
   push:
+    paths:
+      - '**/*.rs'
+      - '**/*.md'
 jobs:
   code-ranker:
     uses: code-ranker-com/actions/.github/workflows/report.yml@v1

@@ -26,6 +26,8 @@ pub mod config;
 #[cfg(feature = "runtime-client")]
 pub mod http;
 #[cfg(feature = "runtime-client")]
+pub mod multipart;
+#[cfg(feature = "runtime-client")]
 pub mod retry;
 #[cfg(feature = "runtime-client")]
 pub mod sse;

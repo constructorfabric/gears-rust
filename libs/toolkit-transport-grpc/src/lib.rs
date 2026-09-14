@@ -1,6 +1,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 pub mod client;
 pub mod internal_auth;
+pub mod internal_auth_server;
 pub mod rpc_retry;
 pub mod sa_token;
 
@@ -13,6 +14,10 @@ pub use windows_named_pipe::{NamedPipeConnection, NamedPipeIncoming, create_name
 pub use internal_auth::{
     InternalAuthInterceptor, attach_internal_token_grpc, build_internal_auth_interceptor,
     extract_internal_token_grpc,
+};
+pub use internal_auth_server::{
+    DEFAULT_EXEMPT_PREFIXES, InternalAuthEnforcement, InternalAuthGrpcLayer,
+    InternalAuthGrpcService,
 };
 pub use sa_token::{DEFAULT_REFRESH_INTERVAL, ServiceAccountTokenReader};
 

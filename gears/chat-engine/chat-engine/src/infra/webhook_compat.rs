@@ -84,6 +84,50 @@ use chat_engine_sdk::plugin::{
     SessionPluginResponse, empty_stream, stream_from_events,
 };
 
+/// Outgoing body for the two message hooks.
+///
+/// `enabled_capabilities` is on the wire whenever the call carries values: an
+/// in-process plugin reads them straight off `ctx.call_ctx`, so the webhook
+/// transport has to forward them or a webhook backend can never observe a
+/// capability it declared itself. The key is omitted (rather than sent as
+/// `null`) when the call carries none, matching the optional
+/// `enabled_capabilities` in `schemas/webhook/*Event.json`.
+fn message_body(event: &str, ctx: &MessagePluginCtx) -> JsonValue {
+    let mut body = serde_json::json!({
+        "event": event,
+        "session_id": ctx.session_id,
+        "message_id": ctx.message_id,
+        "messages": ctx.messages,
+    });
+    attach_capabilities(&mut body, &ctx.call_ctx);
+    body
+}
+
+/// Outgoing body for the session-scoped hooks. Carries capability values on
+/// the same terms as [`message_body`].
+fn session_body(event: &str, ctx: &SessionPluginCtx) -> JsonValue {
+    let mut body = serde_json::json!({
+        "event": event,
+        "session_type_id": ctx.session_type_id,
+        "session_id": ctx.session_id,
+    });
+    attach_capabilities(&mut body, &ctx.call_ctx);
+    body
+}
+
+/// Insert `enabled_capabilities` into `body` when `call_ctx` carries values.
+fn attach_capabilities(body: &mut JsonValue, call_ctx: &PluginCallContext) {
+    let Some(caps) = call_ctx.enabled_capabilities.as_ref() else {
+        return;
+    };
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "enabled_capabilities".into(),
+            serde_json::to_value(caps).unwrap_or(JsonValue::Array(Vec::new())),
+        );
+    }
+}
+
 const CONFIG_KEY_ENDPOINT: &str = "endpoint";
 const CONFIG_KEY_AUTH: &str = "auth";
 const CONFIG_KEY_AUTH_VALUE: &str = "auth_value";
@@ -194,11 +238,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = serde_json::json!({
-            "event": "session_type_configured",
-            "session_type_id": ctx.session_type_id,
-            "session_id": ctx.session_id,
-        });
+        let body = session_body("session_type_configured", &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(
             &self.http,
@@ -215,11 +255,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = serde_json::json!({
-            "event": "session_created",
-            "session_type_id": ctx.session_type_id,
-            "session_id": ctx.session_id,
-        });
+        let body = session_body("session_created", &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_created").await?;
         parse_session_response(resp).await
@@ -229,11 +265,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = serde_json::json!({
-            "event": "session_updated",
-            "session_type_id": ctx.session_type_id,
-            "session_id": ctx.session_id,
-        });
+        let body = session_body("session_updated", &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_updated").await?;
         parse_session_response(resp).await
@@ -244,12 +276,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         // the returned `PluginStream` is `'static` and Chat Engine drives it
         // long after this `async fn` frame unwinds.
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = serde_json::json!({
-            "event": "message",
-            "session_id": ctx.session_id,
-            "message_id": ctx.message_id,
-            "messages": ctx.messages,
-        });
+        let body = message_body("message", &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,
@@ -265,12 +292,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         ctx: MessagePluginCtx,
     ) -> Result<PluginStream, PluginError> {
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = serde_json::json!({
-            "event": "message_recreate",
-            "session_id": ctx.session_id,
-            "message_id": ctx.message_id,
-            "messages": ctx.messages,
-        });
+        let body = message_body("message_recreate", &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,
@@ -283,11 +305,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
 
     async fn on_session_summary(&self, ctx: SessionPluginCtx) -> Result<PluginStream, PluginError> {
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = serde_json::json!({
-            "event": "session_summary",
-            "session_type_id": ctx.session_type_id,
-            "session_id": ctx.session_id,
-        });
+        let body = session_body("session_summary", &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,

@@ -1,4 +1,3 @@
-// Created: 2026-06-04 by Constructor Tech
 //! Distributed lock primitive — TTL-bounded mutual exclusion with non-blocking
 //! and blocking-with-timeout acquisition, explicit asynchronous release, and
 //! TTL extension for long-running operations.
@@ -27,8 +26,8 @@ pub mod types;
 
 pub(crate) use scoped::ScopedDistributedLockBackend;
 
-pub use backend::DistributedLockBackend;
+pub use backend::{DistributedLockBackend, STORE_OWNED_LEASES};
 pub use facade::DistributedLockV1;
 pub use guard::{LockCommandReceiver, LockGuard, LockRequest, LockResponder};
-pub use resolver::{LockResolverBuilder, validate_lock_capabilities};
+pub use resolver::{LockResolverBuilder, validate_lock_capabilities_from};
 pub use types::{LockCapability, LockFeatures};

@@ -53,8 +53,9 @@ use cf_system_sdks::directory::{DirectoryClient, DirectoryGrpcClient};
 
 use crate::config::{ApiGatewayConfig, GatewayProxyConfig, HealthServeMode};
 use crate::middleware::auth;
-use toolkit_security::SecurityContext;
+use toolkit_http_middleware::internal_auth_middleware;
 use toolkit_security::constants::{DEFAULT_SUBJECT_ID, DEFAULT_TENANT_ID};
+use toolkit_security::{DynInternalAuthenticator, InternalAuthConfig, SecurityContext};
 
 use crate::middleware;
 use crate::router_cache::RouterCache;
@@ -79,6 +80,11 @@ pub struct ApiGateway {
     pub(crate) final_router: Mutex<Option<axum::Router>>,
     // AuthN Resolver client (resolved during init, None when auth_disabled)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
+    // Inbound platform-plane authenticator (built in init from
+    // `config.internal_auth`, None in Profile 1). When present, the stack layers
+    // `internal_auth_middleware` ahead of the tenant plane so co-hosted internal
+    // routes get a validated `PlatformSecurityContext` (`cpt-cf-adr-two-plane-auth`).
+    pub(crate) internal_authenticator: Mutex<Option<DynInternalAuthenticator>>,
     // Readiness registry, set once from `rest_prepare`; `OnceLock` = lock-free reads.
     pub(crate) healthcheck_registry: OnceLock<Arc<toolkit::RestHealthcheckRegistry>>,
     // Built-once standalone health router. Served on the separate health listener in
@@ -94,6 +100,13 @@ pub struct ApiGateway {
     // task and read by the Forwarder fallback; empty/unused when
     // `gateway_proxy` is disabled.
     pub(crate) proxy_registry: Arc<toolkit_gateway::ProxyRegistry>,
+
+    // Base URL other pods use to reach this gateway, published once the main
+    // listener binds (from `serve`). Read by the runtime's directory-register
+    // phase (via `ApiGatewayCapability::bound_endpoint`) to advertise in-process
+    // REST providers. Write-once/read-many, so `OnceLock` (lock-free reads),
+    // matching `healthcheck_registry`/`health_router`; unset until the server binds.
+    pub(crate) bound_endpoint: OnceLock<String>,
 }
 
 impl Default for ApiGateway {
@@ -105,11 +118,13 @@ impl Default for ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
+            bound_endpoint: OnceLock::new(),
         }
     }
 }
@@ -196,11 +211,13 @@ impl ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
+            bound_endpoint: OnceLock::new(),
         }
     }
 
@@ -441,6 +458,13 @@ impl ApiGateway {
             return Err(anyhow::anyhow!(
                 "auth is enabled but no AuthN Resolver client is available; \
                  ensure `authn_resolver` gear is loaded or set `auth_disabled: true`"
+            ));
+        }
+
+        if let Some(internal) = self.internal_authenticator.lock().clone() {
+            router = router.layer(from_fn_with_state(
+                Arc::new(internal),
+                internal_auth_middleware::<DynInternalAuthenticator>,
             ));
         }
 
@@ -693,7 +717,10 @@ impl ApiGateway {
 
         // Bind the main socket.
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("HTTP server bound on {}", addr);
+        let bound_addr = listener.local_addr().unwrap_or(addr);
+        tracing::info!("HTTP server bound on {}", bound_addr);
+
+        self.publish_bound_endpoint(&cfg, bound_addr);
 
         // Bind the separate health listener (if `serve` = separate|both) BEFORE signalling
         // ready, so readiness reflects every listener the pod must accept traffic on.
@@ -729,6 +756,100 @@ impl ApiGateway {
         }
     }
 
+    /// Publish the endpoint other pods use to reach this gateway, so the
+    /// runtime's directory-register phase can advertise in-process REST
+    /// providers (via `#[toolkit::provides]`). Called from `serve` once the main
+    /// listener binds.
+    ///
+    /// The URL is chosen by
+    /// [`resolve_advertised_endpoint`](Self::resolve_advertised_endpoint);
+    /// nothing is published when it returns `None`. Write-once.
+    fn publish_bound_endpoint(&self, cfg: &ApiGatewayConfig, bound_addr: SocketAddr) {
+        let Some(advertised) = Self::resolve_advertised_endpoint(cfg, bound_addr) else {
+            return;
+        };
+        // Write-once: a second publish means `serve` ran twice, a lifecycle bug.
+        if self.bound_endpoint.set(advertised.clone()).is_err() {
+            tracing::warn!(
+                endpoint = %advertised,
+                "bound_endpoint already published; ignoring duplicate publish"
+            );
+            return;
+        }
+        tracing::info!(
+            endpoint = %advertised,
+            "REST host endpoint published for directory registration"
+        );
+    }
+
+    /// Resolve the base URL to advertise for directory registration.
+    ///
+    /// Prefers the explicitly configured `advertise_uri` (required in
+    /// Kubernetes, where the pod binds `0.0.0.0`), used verbatim; otherwise
+    /// falls back to the bound address plus the normalized `prefix_path`, so the
+    /// base URL matches the path under which `rest_finalize` serves the routes.
+    ///
+    /// Returns `None` (skipping publication) when `prefix_path` is invalid, or
+    /// when the bind address is a wildcard (`0.0.0.0`/`::`) with no
+    /// `advertise_uri` — an unspecified address is unreachable by other pods.
+    fn resolve_advertised_endpoint(
+        cfg: &ApiGatewayConfig,
+        bound_addr: SocketAddr,
+    ) -> Option<String> {
+        // Normalize the prefix once (see `normalized_prefix_or_skip`).
+        let prefix = Self::normalized_prefix_or_skip(&cfg.prefix_path)?;
+
+        match cfg.advertise_uri.as_deref() {
+            Some(uri) => {
+                // `advertise_uri` is used verbatim (the prefix is NOT appended).
+                Self::warn_if_advertise_uri_missing_prefix(uri, &prefix);
+                Some(uri.to_owned())
+            }
+            None if bound_addr.ip().is_unspecified() => {
+                tracing::warn!(
+                    bound_addr = %bound_addr,
+                    "REST host bound on a wildcard address with no `advertise_uri`; \
+                     skipping directory registration endpoint (set `advertise_uri`)"
+                );
+                None
+            }
+            // The router is served under `prefix_path` (see `rest_finalize`), so
+            // the fallback base URL must include it.
+            None => Some(format!("http://{bound_addr}{prefix}")),
+        }
+    }
+
+    /// Normalize `prefix_path`, or `None` (logged) when it is invalid.
+    /// `get_or_build_router` already validated it, but treat any error as a real
+    /// misconfiguration and skip publishing rather than silently advertising a
+    /// prefix-less — and therefore wrong — endpoint.
+    fn normalized_prefix_or_skip(raw: &str) -> Option<String> {
+        match Self::normalize_prefix_path(raw) {
+            Ok(prefix) => Some(prefix),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "invalid `prefix_path`; skipping directory registration endpoint"
+                );
+                None
+            }
+        }
+    }
+
+    /// Warn when a verbatim `advertise_uri` omits the `prefix_path` the routes
+    /// are actually served under, which would silently break out-of-process
+    /// requests.
+    fn warn_if_advertise_uri_missing_prefix(uri: &str, prefix: &str) {
+        if !prefix.is_empty() && !uri.trim_end_matches('/').ends_with(prefix) {
+            tracing::warn!(
+                advertise_uri = %uri,
+                prefix_path = %prefix,
+                "`advertise_uri` does not include the gateway's `prefix_path`; \
+                 out-of-process requests may not reach the prefixed routes"
+            );
+        }
+    }
+
     /// Start the embedded-edge reverse-proxy directory-sync task in the
     /// background. Returns immediately; connecting to the `DirectoryService` is
     /// retried with backoff until it succeeds or the runtime shuts down, so a
@@ -737,8 +858,17 @@ impl ApiGateway {
     /// throughout, and startup does not block on the first connection.
     fn start_proxy_sync(&self, cfg: &ApiGatewayConfig, cancel: CancellationToken) {
         let proxy_cfg = cfg.gateway_proxy.clone();
+        // The platform-plane credential is the single top-level `internal_auth`
+        // (outbound direction): the same block that gates inbound validation
+        // supplies the credential attached to directory polls.
+        let internal_auth = cfg.internal_auth.clone();
         let registry = Arc::clone(&self.proxy_registry);
-        tokio::spawn(Self::proxy_sync_supervisor(proxy_cfg, registry, cancel));
+        tokio::spawn(Self::proxy_sync_supervisor(
+            proxy_cfg,
+            internal_auth,
+            registry,
+            cancel,
+        ));
     }
 
     /// Retry the `DirectoryService` connection with exponential backoff until it
@@ -748,6 +878,7 @@ impl ApiGateway {
     /// spinning.
     async fn proxy_sync_supervisor(
         cfg: GatewayProxyConfig,
+        internal_auth: Option<InternalAuthConfig>,
         registry: Arc<toolkit_gateway::ProxyRegistry>,
         cancel: CancellationToken,
     ) {
@@ -759,7 +890,9 @@ impl ApiGateway {
         }
 
         let interval = Duration::from_secs(cfg.sync_interval_secs);
-        if let Some(directory) = Self::connect_with_backoff(&cfg, &cancel).await {
+        if let Some(directory) =
+            Self::connect_with_backoff(&cfg, internal_auth.as_ref(), &cancel).await
+        {
             // Drive the sync loop through the `GatewayProvider` trait so the
             // edge is pluggable (built-in reverse proxy here; a Kong/Tyk adapter
             // for Mode B). The built-in provider writes into the shared registry
@@ -776,6 +909,7 @@ impl ApiGateway {
     /// (returning `None`).
     async fn connect_with_backoff(
         cfg: &GatewayProxyConfig,
+        internal_auth: Option<&InternalAuthConfig>,
         cancel: &CancellationToken,
     ) -> Option<Arc<dyn DirectoryClient>> {
         const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -783,7 +917,7 @@ impl ApiGateway {
 
         let mut backoff = INITIAL_BACKOFF;
         loop {
-            match Self::connect_directory(cfg).await {
+            match Self::connect_directory(cfg, internal_auth).await {
                 Ok(directory) => return Some(directory),
                 Err(err) => tracing::warn!(
                     error = %err,
@@ -815,12 +949,13 @@ impl ApiGateway {
     /// Returns an error if `directory_endpoint` is unset or the connection fails.
     async fn connect_directory(
         cfg: &GatewayProxyConfig,
+        internal_auth: Option<&InternalAuthConfig>,
     ) -> anyhow::Result<Arc<dyn DirectoryClient>> {
         let endpoint = cfg.directory_endpoint.clone().ok_or_else(|| {
             anyhow::anyhow!("gateway_proxy.enabled but directory_endpoint is unset")
         })?;
 
-        let client = if let Some(internal_auth) = &cfg.internal_auth {
+        let client = if let Some(internal_auth) = internal_auth {
             let interceptor =
                 toolkit_transport_grpc::build_internal_auth_interceptor(internal_auth).await?;
             tracing::info!("attaching platform-plane credential to edge DirectoryService polls");
@@ -1009,12 +1144,22 @@ impl toolkit::Gear for ApiGateway {
             tracing::info!("AuthN Resolver client resolved from ClientHub");
         }
 
+        // Build the inbound platform-plane authenticator (None in Profile 1).
+        // Done here so a misconfigured `internal_auth` fails init rather than
+        // surfacing later as a per-request 500 on co-hosted internal routes.
+        *self.internal_authenticator.lock() =
+            build_internal_authenticator(cfg.internal_auth.as_ref()).await?;
+
         Ok(())
     }
 }
 
 // REST host role: prepare/finalize the router, but do not start the server here.
 impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
+    fn bound_endpoint(&self) -> Option<String> {
+        self.bound_endpoint.get().cloned()
+    }
+
     fn rest_prepare(
         &self,
         _ctx: &toolkit::context::GearCtx,
@@ -1136,6 +1281,59 @@ impl OpenApiRegistry for ApiGateway {
     }
 }
 
+/// Build the inbound platform-plane validator from configuration.
+///
+/// Shared-secret is built directly; kube (`TokenReview`) requires the
+/// `k8s-auth` feature and uses the shared
+/// `toolkit_k8s_auth::build_cached_k8s_authenticator` (also used by `grpc-hub`
+/// and the `OoP` bootstrap) so all three agree on what `provider: kube` means
+/// and how it is cached. Without the feature, `provider: kube` is a hard error
+/// rather than a silent enforcement downgrade. `Ok(None)` only when no
+/// `internal_auth` is configured (Profile 1).
+#[cfg_attr(not(feature = "k8s-auth"), allow(clippy::unused_async))]
+async fn build_internal_authenticator(
+    cfg: Option<&InternalAuthConfig>,
+) -> Result<Option<DynInternalAuthenticator>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+
+    // Shared-secret (and any future dependency-light provider) builds here.
+    if let Some(auth) = cfg.build_authenticator() {
+        tracing::info!("Initializing shared-secret platform-plane authenticator");
+        return Ok(Some(auth));
+    }
+
+    #[cfg(feature = "k8s-auth")]
+    {
+        if cfg.is_kube() {
+            tracing::info!("Initializing Kubernetes TokenReview platform-plane authenticator");
+            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
+            let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(
+                audiences,
+                Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}")
+            })?;
+            return Ok(Some(auth));
+        }
+    }
+    #[cfg(not(feature = "k8s-auth"))]
+    {
+        if cfg.is_kube() {
+            anyhow::bail!(
+                "api-gateway internal_auth provider=kube requires the `k8s-auth` feature"
+            );
+        }
+    }
+
+    anyhow::bail!(
+        "internal_auth is configured but no authenticator could be built for the selected provider"
+    )
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -1163,6 +1361,342 @@ mod tests {
         assert_eq!(info.get("title").unwrap(), "Test API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
         assert_eq!(info.get("description").unwrap(), "Test Description");
+    }
+
+    #[test]
+    fn bound_endpoint_is_none_before_serve() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+        assert_eq!(api.bound_endpoint(), None);
+    }
+
+    /// No `internal_auth` configured (Profile 1) yields no authenticator, so
+    /// the platform-plane middleware is never layered.
+    #[tokio::test]
+    async fn build_internal_authenticator_is_none_without_config() {
+        let auth = build_internal_authenticator(None).await.unwrap();
+        assert!(auth.is_none());
+    }
+
+    /// The dependency-light shared-secret provider is built in-crate (no feature
+    /// required), so a shared-secret config produces an inbound authenticator.
+    #[tokio::test]
+    async fn build_internal_authenticator_builds_shared_secret() {
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "dev-internal-token".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let auth = build_internal_authenticator(Some(&cfg)).await.unwrap();
+        assert!(auth.is_some());
+    }
+
+    /// Without the `k8s-auth` feature, `provider: kube` is a hard error rather
+    /// than a silent enforcement downgrade to an open platform plane.
+    #[cfg(not(feature = "k8s-auth"))]
+    #[tokio::test]
+    async fn build_internal_authenticator_rejects_kube_without_feature() {
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: None,
+        };
+        let err = build_internal_authenticator(Some(&cfg))
+            .await
+            .expect_err("kube provider must error without the k8s-auth feature");
+        assert!(err.to_string().contains("k8s-auth"));
+    }
+
+    /// Profile 1 (no inbound authenticator): the middleware stack still builds
+    /// and simply omits the platform-plane layer.
+    #[tokio::test]
+    async fn apply_middleware_stack_skips_platform_plane_when_absent() {
+        let config = ApiGatewayConfig {
+            auth_disabled: true,
+            ..Default::default()
+        };
+        let api = ApiGateway::new(config);
+        let _router = api
+            .apply_middleware_stack(Router::new(), None)
+            .expect("stack builds without a platform-plane authenticator");
+    }
+
+    /// When an inbound authenticator is installed, the platform-plane layer is
+    /// added to the stack (`cpt-cf-adr-two-plane-auth`).
+    #[tokio::test]
+    async fn apply_middleware_stack_layers_platform_plane_when_present() {
+        let config = ApiGatewayConfig {
+            auth_disabled: true,
+            ..Default::default()
+        };
+        let api = ApiGateway::new(config);
+
+        let auth = build_internal_authenticator(Some(&InternalAuthConfig::SharedSecret {
+            secret: "dev-internal-token".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        }))
+        .await
+        .unwrap()
+        .expect("shared-secret authenticator");
+        *api.internal_authenticator.lock() = Some(auth);
+
+        let _router = api
+            .apply_middleware_stack(Router::new(), None)
+            .expect("stack builds with the platform-plane layer");
+    }
+
+    /// `connect_directory` fails fast (before any network attempt) when the
+    /// directory endpoint is unset.
+    #[tokio::test]
+    async fn connect_directory_errors_without_endpoint() {
+        let cfg = GatewayProxyConfig {
+            enabled: true,
+            directory_endpoint: None,
+            ..Default::default()
+        };
+        let err = ApiGateway::connect_directory(&cfg, None)
+            .await
+            .err()
+            .expect("missing directory_endpoint must error");
+        assert!(err.to_string().contains("directory_endpoint"));
+    }
+
+    /// `connect_directory` takes the credential-attach branch when an
+    /// `internal_auth` config is supplied: the shared-secret interceptor is
+    /// built and attached before the connect attempt. The endpoint is
+    /// unreachable, so the connect itself fails after exhausting retries — but
+    /// the outbound platform-plane path (`cpt-cf-adr-two-plane-auth`) is
+    /// exercised.
+    #[tokio::test]
+    async fn connect_directory_attaches_internal_auth_credential() {
+        let cfg = GatewayProxyConfig {
+            enabled: true,
+            // Loopback port 1 refuses fast — the retry budget is small
+            // (3 attempts, sub-second backoff), so this stays quick without a
+            // live directory.
+            directory_endpoint: Some("http://127.0.0.1:1".to_owned()),
+            ..Default::default()
+        };
+        let internal = InternalAuthConfig::SharedSecret {
+            secret: "dev-internal-token".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let result = ApiGateway::connect_directory(&cfg, Some(&internal)).await;
+        assert!(
+            result.is_err(),
+            "connect must fail against an unreachable directory endpoint"
+        );
+    }
+
+    /// The reverse-proxy supervisor returns immediately (no connect attempt)
+    /// when `directory_endpoint` is unset, treating it as a permanent
+    /// misconfiguration rather than a transient failure.
+    #[tokio::test]
+    async fn proxy_sync_supervisor_exits_without_endpoint() {
+        let cfg = GatewayProxyConfig {
+            enabled: true,
+            directory_endpoint: None,
+            ..Default::default()
+        };
+        let registry = Arc::new(toolkit_gateway::ProxyRegistry::new());
+        ApiGateway::proxy_sync_supervisor(cfg, None, registry, CancellationToken::new()).await;
+    }
+
+    /// `start_proxy_sync` spawns the supervisor task; with no endpoint the task
+    /// exits promptly. Exercises the top-level credential-threading path.
+    #[tokio::test]
+    async fn start_proxy_sync_spawns_supervisor() {
+        let config = ApiGatewayConfig {
+            gateway_proxy: GatewayProxyConfig {
+                enabled: true,
+                directory_endpoint: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let api = ApiGateway::new(config.clone());
+        api.start_proxy_sync(&config, CancellationToken::new());
+        tokio::task::yield_now().await;
+    }
+
+    /// With an endpoint configured, the supervisor enters the connect path:
+    /// `connect_with_backoff` calls `connect_directory` (which fails fast
+    /// against an unreachable endpoint) and then honors the already-fired
+    /// cancellation, returning `None` so the supervisor exits without starting
+    /// the sync loop. Exercises the credential-threading connect/backoff branch
+    /// that the endpoint-less test skips over.
+    #[tokio::test]
+    async fn proxy_sync_supervisor_connect_path_exits_on_cancel() {
+        let cfg = GatewayProxyConfig {
+            enabled: true,
+            // Loopback port 1 refuses immediately; the retry budget is small so
+            // the failed connect stays quick without a live directory.
+            directory_endpoint: Some("http://127.0.0.1:1".to_owned()),
+            sync_interval_secs: 5,
+        };
+        let registry = Arc::new(toolkit_gateway::ProxyRegistry::new());
+        let cancel = CancellationToken::new();
+        // Pre-cancel so `backoff_or_cancel` returns immediately after the first
+        // failed connect attempt, keeping the test fast and deterministic.
+        cancel.cancel();
+        ApiGateway::proxy_sync_supervisor(cfg, None, registry, cancel).await;
+    }
+
+    #[test]
+    fn publish_bound_endpoint_falls_back_to_bound_addr() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+        let addr: SocketAddr = "127.0.0.1:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&ApiGatewayConfig::default(), addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://127.0.0.1:8087".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_prefers_advertise_uri() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let cfg = ApiGatewayConfig {
+            advertise_uri: Some("http://platform-host:8087".to_owned()),
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "0.0.0.0:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://platform-host:8087".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_fallback_includes_prefix_path() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let cfg = ApiGatewayConfig {
+            prefix_path: "cf/".to_owned(), // normalizes to "/cf"
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "127.0.0.1:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://127.0.0.1:8087/cf".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_skips_wildcard_without_advertise_uri() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        for wildcard in ["0.0.0.0:8087", "[::]:8087"] {
+            let api = ApiGateway::new(ApiGatewayConfig::default());
+            let addr: SocketAddr = wildcard.parse().unwrap();
+
+            api.publish_bound_endpoint(&ApiGatewayConfig::default(), addr);
+
+            assert_eq!(
+                api.bound_endpoint(),
+                None,
+                "wildcard {wildcard} must not publish an unusable endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_bound_endpoint_advertise_uri_used_verbatim_with_prefix() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        // With both `advertise_uri` and a non-empty `prefix_path`, the URI is
+        // published verbatim: the prefix is NOT appended, so the operator must
+        // include it themselves (here it does). The prefix is not doubled.
+        let cfg = ApiGatewayConfig {
+            advertise_uri: Some("http://platform-host:8087/cf".to_owned()),
+            prefix_path: "/cf".to_owned(),
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "0.0.0.0:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://platform-host:8087/cf".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_skips_invalid_prefix_path() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        // A `prefix_path` that fails normalization is a real misconfiguration:
+        // publishing is skipped rather than falling back to an empty prefix and
+        // advertising a wrong endpoint.
+        let cfg = ApiGatewayConfig {
+            prefix_path: "/../etc".to_owned(),
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "127.0.0.1:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            None,
+            "an invalid prefix_path must skip publishing, not default to empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_publishes_os_assigned_ephemeral_port() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        // Binding to `:0` lets the OS pick a free port; `serve` must publish the
+        // actual bound address (via `listener.local_addr()`), not the configured
+        // `:0`.
+        let cfg = ApiGatewayConfig {
+            bind_addr: "127.0.0.1:0".to_owned(),
+            ..Default::default()
+        };
+        let api = Arc::new(ApiGateway::new(cfg));
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let serve =
+            tokio::spawn(Arc::clone(&api).serve(cancel.clone(), ReadySignal::from_sender(tx)));
+
+        // `serve` publishes the endpoint before signalling ready.
+        rx.await.expect("serve should signal ready");
+
+        let endpoint = api
+            .bound_endpoint()
+            .expect("endpoint published once the listener binds");
+        let port: u16 = endpoint
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected endpoint format: {endpoint}"));
+        assert_ne!(
+            port, 0,
+            "must reflect the OS-assigned port, not the configured :0"
+        );
+
+        cancel.cancel();
+        let outcome = serve.await.expect("serve task should not panic");
+        assert!(
+            outcome.is_ok(),
+            "serve should exit cleanly on cancel: {outcome:?}"
+        );
     }
 
     #[test]

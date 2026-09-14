@@ -1,8 +1,13 @@
+//! `ToolKit` gear declaration, dependency wiring, and managed lifecycle.
+//!
+//! Initialization builds the domain service, registers its SDK client and REST
+//! routes, and the stateful lifecycle runs recovery and fence-backfill sweeps.
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use tenant_resolver_sdk::TenantResolverClient;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
@@ -104,8 +109,8 @@ impl Gear for CredStoreGear {
 
         let authz_client = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
-            .map_err(|e| anyhow::anyhow!("failed to get AuthZResolverClient: {e}"))?;
+            .get::<dyn AuthZResolverApi>()
+            .map_err(|e| anyhow::anyhow!("failed to get AuthZResolverApi: {e}"))?;
         // No PDP capabilities: credstore projects no authorization tables
         // (no `tenant_closure`), so the PDP hands it pre-expanded, flat
         // tenant predicates (AUTHZ_USAGE_SCENARIOS S09–S11).

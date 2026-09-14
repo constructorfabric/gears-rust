@@ -1,3 +1,8 @@
+//! Metrics vocabulary and recording port for credential-store operations.
+//!
+//! Defines bounded labels for outcomes, dependencies, lifecycle counts, and
+//! value-fingerprint verification.
+
 use toolkit_macros::domain_model;
 
 #[domain_model]

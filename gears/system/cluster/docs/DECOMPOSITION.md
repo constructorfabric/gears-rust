@@ -102,7 +102,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 - **Scope**:
   - `ClusterCacheBackend` plugin trait (get/put/delete/contains/put_if_absent/compare_and_swap/compare_and_delete/watch/watch_prefix) and `ClusterCacheV1` facade (same async surface minus the backend-only `compare_and_delete`; sync `consistency()`/`features()`/`resolver()`/`scoped()`). `compare_and_delete` is a value-guarded delete used by SDK-default coordination backends, not part of the public facade.
   - `CacheEntry` (version ≥ 1, 0 reserved), `CacheConsistency`, `CacheEvent` (key-only Changed/Deleted/Expired), `CacheWatchEvent` union (Event/Lagged/Reset/Closed), `CacheWatch`, `CacheFeatures`, `CacheCapability`.
-  - `CacheResolverBuilder` (profile/require/resolve) and `validate_cache_capabilities`; the canonical resolution + startup capability-validation pattern.
+  - `CacheResolverBuilder` (profile/require/resolve) and `validate_cache_capabilities_from`; the canonical resolution + startup capability-validation pattern.
   - Per-trait dyn-compat assertion.
 
 - **Out of scope**:
@@ -165,7 +165,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 - **Scope**:
   - `LeaderElectionBackend` trait and `LeaderElectionV1` facade (elect/elect_with_config; resolver/scoped).
   - `LeaderStatus` (Leader/Follower/Lost; Lost is transient), `LeaderWatch` (changed/status/is_leader/resign; no-op Drop), `LeaderWatchEvent` union, `ElectionConfig` (validates ttl & max_missed_renewals > 0; derives renewal interval), `LeaderElectionCapability`, `LeaderElectionFeatures`.
-  - `LeaderElectionResolverBuilder` and `validate_leader_election_capabilities`; per-trait dyn-compat assertion.
+  - `LeaderElectionResolverBuilder` and `validate_leader_election_capabilities_from`; per-trait dyn-compat assertion.
 
 - **Out of scope**:
   - The CAS-based default leader-election backend (separate SDK-default-backends feature).
@@ -207,7 +207,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 - **Scope**:
   - `DistributedLockBackend` trait and `DistributedLockV1` facade (try_lock/lock; resolver/scoped).
   - `LockGuard` (renew/release; no-op Drop), lock error variants (`LockContended`/`LockTimeout`/`LockExpired`), `LockCapability`, `LockFeatures`.
-  - `LockResolverBuilder` and `validate_lock_capabilities`; per-trait dyn-compat assertion.
+  - `LockResolverBuilder` and `validate_lock_capabilities_from`; per-trait dyn-compat assertion.
 
 - **Out of scope**:
   - The CAS-based default lock backend (separate SDK-default-backends feature).

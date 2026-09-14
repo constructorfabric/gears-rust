@@ -14,9 +14,13 @@
 //! 1. The URL parses as an **absolute** URL (`url::Url::parse` succeeds AND
 //!    the result has a host) — bare paths, scheme-relative URLs, and
 //!    `data:` / `file:` schemes are all rejected at this gate.
-//! 2. The scheme is `https`. `http` is rejected by default so a typo or
-//!    misconfiguration cannot silently downgrade an internal hop to
-//!    cleartext.
+//! 2. The scheme is `http` or `https`. Every other scheme — `file:`,
+//!    `data:`, `gopher:`, `ftp:` and friends — is rejected, since none of
+//!    them describe an outbound HTTP call. `http` is permitted so a backend
+//!    reachable only over cleartext (an in-cluster service behind the mesh,
+//!    a staging host without a certificate) can be configured; it carries
+//!    the attached auth header in the clear, so prefer `https` wherever the
+//!    endpoint terminates TLS.
 //! 3. The host is **not** a literal IP in any of the SSRF-sensitive ranges
 //!    (loopback, link-local incl. `169.254.169.254`, private RFC1918, ULA,
 //!    multicast, unspecified, broadcast, CGNAT, documentation,
@@ -64,9 +68,9 @@ pub fn validate_outbound_url(raw: &str, key_name: &str) -> Result<Url, PluginErr
         PluginError::invalid_input_with(format!("{key_name} is not a valid absolute URL"), e)
     })?;
 
-    if url.scheme() != "https" {
+    if !matches!(url.scheme(), "http" | "https") {
         return Err(PluginError::invalid_input(format!(
-            "{key_name} must use the https scheme; got `{}`",
+            "{key_name} must use the http or https scheme; got `{}`",
             url.scheme(),
         )));
     }

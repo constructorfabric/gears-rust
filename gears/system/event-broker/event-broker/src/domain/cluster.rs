@@ -8,6 +8,7 @@
 
 use cluster_sdk::{ClusterCacheV1, ClusterError, DistributedLockV1, LeaderElectionV1};
 use toolkit::client_hub::ClientHub;
+use toolkit::domain_model;
 
 /// Every Event Broker cache key / lock name / election name is scoped under
 /// this prefix (`DESIGN.md:756-764`'s `evbk.*` cache-key table).
@@ -19,6 +20,7 @@ pub const CLUSTER_SCOPE_PREFIX: &str = "evbk";
 /// same module wiring") - standalone is simply backed by the
 /// zero-dependency `standalone` cluster-gear provider instead of a
 /// network-backed one.
+#[domain_model]
 pub struct EventBrokerCluster {
     pub cache: ClusterCacheV1,
     pub leader_election: LeaderElectionV1,

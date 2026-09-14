@@ -3,7 +3,7 @@
 //! raw SQL, then runs the job and asserts it created the current + next
 //! `YYYYMM` periods (`status='OPEN'`) and is idempotent on a re-run.
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_period_open -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_period_open -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -17,11 +17,10 @@
 
 use bss_ledger::infra::jobs::period_open::PeriodOpenJob;
 use bss_ledger::infra::storage::migrations::Migrator;
-use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
@@ -33,7 +32,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// extraction idiom: `row.try_get::<i64>("", "count")`).
 async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     let row = db
-        .query_one(pg(sql))
+        .query_one_raw(pg(sql))
         .await
         .unwrap()
         .expect("count query must return a row");
@@ -43,7 +42,7 @@ async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn period_open_creates_current_and_next_and_is_idempotent() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -59,7 +58,7 @@ async fn period_open_creates_current_and_next_and_is_idempotent() {
 
     let tenant = Uuid::now_v7();
     let legal_entity = Uuid::now_v7();
-    let cur = Utc::now().format("%Y%m").to_string();
+    let cur = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc());
     let next = {
         // Local YYYYMM +1-month (mirrors `domain::period::next_period_id`) so
         // the assertion is independent of the job's own logic.
@@ -73,7 +72,7 @@ async fn period_open_creates_current_and_next_and_is_idempotent() {
     };
 
     // Seed a MONTH calendar for (tenant, le) via raw, bss-qualified SQL.
-    db.execute(pg(format!(
+    db.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month)
          VALUES ('{tenant}','{legal_entity}','UTC','MONTH',1)"
     )))

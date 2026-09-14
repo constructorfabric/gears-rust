@@ -5,7 +5,7 @@ use super::handler::{HandlerResult, LeasedHandler, OutboxMessage, TransactionalH
 use super::store::OutboxStore;
 use super::types::{LeaseConfig, OutboxError};
 use crate::Db;
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseExecutor, FromQueryResult, Statement, TransactionTrait};
 
 /// Context for processing a single partition's batch.
 pub struct ProcessContext<'a> {
@@ -138,13 +138,13 @@ async fn ack(
 
     match result {
         HandlerResult::Success => {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.advance_processed_seq(),
                 [last_seq.into(), partition_id.into()],
             ))
             .await?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.bump_vacuum_counter(),
                 [partition_id.into()],
@@ -152,7 +152,7 @@ async fn ack(
             .await?;
         }
         HandlerResult::Retry { reason } => {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.record_retry(),
                 [reason.as_str().into(), partition_id.into()],
@@ -161,7 +161,7 @@ async fn ack(
         }
         HandlerResult::Reject { reason } => {
             for msg in msgs {
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     store.backend(),
                     store.insert_dead_letter(),
                     [
@@ -177,13 +177,13 @@ async fn ack(
                 .await?;
             }
 
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.advance_processed_seq(),
                 [last_seq.into(), partition_id.into()],
             ))
             .await?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.bump_vacuum_counter(),
                 [partition_id.into()],
@@ -202,7 +202,7 @@ async fn try_lock_and_read_state(
 ) -> Result<Option<ProcessorRow>, OutboxError> {
     if let Some(lock_sql) = store.lock_processor() {
         let row = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 store.backend(),
                 lock_sql,
                 [partition_id.into()],
@@ -269,7 +269,10 @@ impl ProcessingStrategy for TransactionalStrategy {
         #[allow(clippy::cast_possible_truncation)]
         let count = msgs.len() as u32;
 
-        let result = self.handler.handle(&txn, &msgs).await;
+        let result = self
+            .handler
+            .handle(&DatabaseExecutor::Transaction(&txn), &msgs)
+            .await;
         #[allow(clippy::cast_possible_truncation)]
         let pc = self.handler.processed_count().map(|n| n as u32);
 
@@ -308,7 +311,12 @@ async fn acquire_lease_and_read(
 
     let proc_row = ctx
         .store
-        .exec_lease_acquire(&txn, lease_id, lease_secs, ctx.partition_id)
+        .exec_lease_acquire(
+            &DatabaseExecutor::Transaction(&txn),
+            lease_id,
+            lease_secs,
+            ctx.partition_id,
+        )
         .await?
         .map(|(processed_seq, attempts)| ProcessorRow {
             processed_seq,
@@ -342,7 +350,7 @@ async fn acquire_lease_and_read(
         // `lease_release` resets attempts so they do not accumulate across
         // empty cycles.
         let conn = ctx.db.sea_internal();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             ctx.store.backend(),
             ctx.store.lease_release(),
             [ctx.partition_id.into(), lease_id.into()],
@@ -379,7 +387,7 @@ async fn advance_cursor(
     lease_id: &str,
 ) -> Result<bool, OutboxError> {
     if seq == 0 {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             ctx.store.backend(),
             ctx.store.lease_release(),
             [ctx.partition_id.into(), lease_id.into()],
@@ -389,7 +397,7 @@ async fn advance_cursor(
     }
 
     let res = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             ctx.store.backend(),
             ctx.store.lease_ack_advance(),
             [seq.into(), ctx.partition_id.into(), lease_id.into()],
@@ -399,7 +407,7 @@ async fn advance_cursor(
         return Ok(false);
     }
 
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         ctx.store.backend(),
         ctx.store.bump_vacuum_counter(),
         [ctx.partition_id.into()],
@@ -417,7 +425,7 @@ async fn record_retry(
     lease_id: &str,
 ) -> Result<bool, OutboxError> {
     let res = txn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             ctx.store.backend(),
             ctx.store.lease_record_retry(),
             [reason.into(), ctx.partition_id.into(), lease_id.into()],
@@ -508,7 +516,7 @@ async fn insert_dead_letter(
     msg: &OutboxMessage,
     reason: &str,
 ) -> Result<(), OutboxError> {
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         ctx.store.backend(),
         ctx.store.insert_dead_letter(),
         [

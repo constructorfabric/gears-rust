@@ -1,3 +1,9 @@
+//! Types-registry-backed selection of the active value-store plugin.
+//!
+//! Resolves the configured vendor lazily and retrieves its scoped
+//! [`CredStorePluginClientV1`] from
+//! `ClientHub`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

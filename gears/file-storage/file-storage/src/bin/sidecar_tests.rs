@@ -877,7 +877,7 @@ fn multipart_part_token(
 /// backend's own `upload_part` (native multipart) for a
 /// `multipart_native` backend, instead of unconditionally falling back to
 /// the local-fs-style offset-object model. That bug was silent until the
-/// S3 e2e suite (`testing/e2e/gears/file_storage/lifecycle_s3/`) surfaced
+/// S3 e2e suite (`testing/e2e/suites/file_storage/lifecycle_s3/`) surfaced
 /// it: `CompleteMultipartUpload` 500s against a real S3-compatible
 /// endpoint because no part was ever uploaded via a real `UploadPart`
 /// call. `InMemoryBackend` is `multipart_native: true` too, so this

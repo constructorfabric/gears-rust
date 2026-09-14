@@ -1,3 +1,5 @@
+//! Stable SDK error taxonomy shared by consumers and storage plugins.
+
 use std::time::Duration;
 
 use thiserror::Error;

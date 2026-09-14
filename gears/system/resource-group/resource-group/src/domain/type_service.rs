@@ -8,17 +8,52 @@
 
 use std::sync::Arc;
 
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+use resource_group_sdk::TYPE_RESOURCE_TYPE;
 use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
+use toolkit_security::{SecurityContext, pep_properties};
 
 use tracing::{debug, warn};
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
 use crate::domain::repo::TypeRepositoryTrait;
-#[allow(unused_imports)]
 use crate::domain::validation;
+
+/// `AuthZ` resource type descriptor for GTS type definitions.
+///
+/// `gts_type` is a platform-global table (see `m20260306_000001_initial.rs`
+/// — no `tenant_id` column, no `#[secure(tenant_col = ...)]` on the entity),
+/// so there is no column here for a PDP constraint to filter row-level
+/// access on: the gate below (`TypeService::gate`) always discards the
+/// `AccessScope` it computes and only cares whether compilation succeeded
+/// at all, i.e. whether the PDP said yes.
+///
+/// ## Why `supported_properties` still lists `OWNER_TENANT_ID`
+///
+/// Every real `AuthZ` plugin in this repo attaches an unconditional
+/// baseline `In(OWNER_TENANT_ID, [tid])` constraint to **every** allow
+/// decision, for **every** resource, regardless of whether that resource
+/// even has a tenant column (see `static-authz-plugin`'s `Service::evaluate`
+/// — "Baseline `OWNER_TENANT_ID` clamp"). Declaring `OWNER_TENANT_ID` here
+/// lets that baseline constraint compile normally. That the constraint is
+/// tenant-shaped and this table has no tenant column is harmless: `gate()`
+/// never reads the resulting `AccessScope`'s filters, only whether
+/// compilation succeeded. Runtime safety comes from `gate()` unconditionally
+/// discarding whatever scope it gets back.
+///
+/// # Why every call site also uses `require_constraints(false)`
+///
+/// A PDP may separately permit with zero constraints (`decision: true,
+/// constraints: []`). Under the plain `PolicyEnforcer::access_scope` default
+/// (`require_constraints = true`), that shape compiles to
+/// `Err(ConstraintCompileError::ConstraintsRequiredButAbsent)` — a 500 for
+/// an allowed caller. `require_constraints(false)` is the documented escape
+/// hatch for this "permission check only, no constraints required" shape.
+pub const RG_TYPE_RESOURCE: ResourceType =
+    ResourceType::from_static(TYPE_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
@@ -26,26 +61,67 @@ use crate::domain::validation;
 #[derive(Clone)]
 pub struct TypeService<TR: TypeRepositoryTrait> {
     db: Arc<DbProvider>,
+    enforcer: PolicyEnforcer,
     type_repo: Arc<TR>,
 }
 
 impl<TR: TypeRepositoryTrait> TypeService<TR> {
-    /// Create a new `TypeService` with the given database provider.
+    /// Create a new `TypeService` with the given database provider and
+    /// `PolicyEnforcer` for `AuthZ` enforcement on the type-registry CRUD
+    /// surface.
     #[must_use]
-    pub fn new(db: Arc<DbProvider>, type_repo: Arc<TR>) -> Self {
-        Self { db, type_repo }
+    pub fn new(db: Arc<DbProvider>, enforcer: PolicyEnforcer, type_repo: Arc<TR>) -> Self {
+        Self {
+            db,
+            enforcer,
+            type_repo,
+        }
+    }
+
+    /// Permission-check-only `AuthZ` gate shared by every public type-CRUD
+    /// entry point. See [`RG_TYPE_RESOURCE`] for why its
+    /// `supported_properties` declares `OWNER_TENANT_ID` and why
+    /// `require_constraints(false)` is also needed. The returned
+    /// `AccessScope` is discarded: this resource has no columns to filter on.
+    async fn gate(&self, ctx: &SecurityContext, action: &str) -> Result<(), DomainError> {
+        self.enforcer
+            .access_scope_with(
+                ctx,
+                &RG_TYPE_RESOURCE,
+                action,
+                None,
+                &AccessRequest::new().require_constraints(false),
+            )
+            .await
+            .map_err(DomainError::from)?;
+        Ok(())
+    }
+
+    /// Create a new GTS type definition (`AuthZ`-gated: `create` on
+    /// [`RG_TYPE_RESOURCE`]).
+    pub async fn create_type(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "create").await?;
+        self.create_type_unscoped(req).await
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-create-type:p1
-    /// Create a new GTS type definition.
+    /// Create a new GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// [`crate::domain::seeding::seed_types`], which runs at gear init,
+    /// before any caller `SecurityContext` exists. Domain invariants
+    /// (placement invariant, parent/membership existence, metadata schema
+    /// validation) still run; only the `PolicyEnforcer` gate is skipped.
     ///
     /// The full INSERT-junction sequence (`type_repo.insert` →
     /// `insert_allowed_parent_types` → `insert_allowed_membership_types` →
-    /// `load_full_type`) runs inside one `SERIALIZABLE` transaction so that
-    /// a failure on any step rolls back the whole operation. Without this,
-    /// a partial insert (e.g. type row written but parent-types junction
-    /// failed) would leave the registry in an inconsistent state.
-    pub async fn create_type(
+    /// `load_full_type`) runs inside one transaction with bounded retry, so
+    /// a failure on any step rolls back the whole operation.
+    pub async fn create_type_unscoped(
         &self,
         req: CreateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
@@ -88,14 +164,41 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         let db = self.db.db();
         let type_repo = self.type_repo.clone();
 
-        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+        // Retry-aware, and no longer SERIALIZABLE.
+        //
+        // What this transaction protects is the atomicity of the row plus its
+        // junction inserts, and that is the transaction's job at any level.
+        // The one cross-row invariant -- no two types with the same
+        // `schema_id` -- is held by `UNIQUE(schema_id)` in the initial
+        // migration, on every backend, regardless of isolation. Until now the
+        // only thing turning a duplicate into a typed 409 was SERIALIZABLE
+        // aborting and retrying until one writer won; `TypeRepository::insert`
+        // classifies the constraint violation itself now, so the answer no
+        // longer depends on the level.
+        //
+        // Retry stays: it catches deadlocks, which are not an isolation-level
+        // concern. A `40001` here used to reach the caller as an unhandled
+        // database error and surface as HTTP 500 -- on a path
+        // account-management drives at gear init, so a startup failure rather
+        // than latent code. Each attempt gets its own clones: the closure runs
+        // more than once.
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
+            let req = req.clone();
+            let stored_schema = stored_schema.clone();
+            let type_repo = type_repo.clone();
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-8
                 // IF unique constraint violation → RETURN TypeAlreadyExists with
-                // conflicting schema_id. Performed in-tx so a concurrent create
-                // cannot slip a duplicate row in between this read and the
-                // insert below.
-                if type_repo.find_by_code(tx, &req.code).await?.is_some() {
+                // conflicting schema_id. This read does not close the window
+                // against a concurrent create -- at the backend default a
+                // duplicate can commit between it and the insert below. It is
+                // here for the message; the invariant is held by
+                // `UNIQUE(schema_id)` and the classification in
+                // `TypeRepository::insert`, as the block above explains.
+                // Existence only: `find_by_code` assembles the full type,
+                // reading both junction tables to answer a question that the
+                // surrogate id alone settles (RG-13).
+                if type_repo.resolve_id(tx, &req.code).await?.is_some() {
                     debug!(code = %req.code, "Type already exists, rejecting create");
                     return Err(DomainError::type_already_exists(&req.code));
                 }
@@ -186,8 +289,19 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         .await
     }
 
-    /// Get a GTS type definition by its code (GTS type path).
-    pub async fn get_type(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
+    /// Get a GTS type definition by its code (`AuthZ`-gated: `read` on
+    /// [`RG_TYPE_RESOURCE`]).
+    pub async fn get_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "read").await?;
+        self.get_type_unscoped(code).await
+    }
+
+    /// Get a GTS type definition by its code without `AuthZ` enforcement.
+    pub async fn get_type_unscoped(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
         let conn = self.db.conn()?;
         self.type_repo
             .find_by_code(&conn, code)
@@ -195,8 +309,26 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             .ok_or_else(|| DomainError::type_not_found(code))
     }
 
-    /// List GTS type definitions with `OData` filtering and pagination.
+    /// List GTS type definitions with `OData` filtering and pagination
+    /// (`AuthZ`-gated: `list` on [`RG_TYPE_RESOURCE`]).
+    ///
+    /// `list`, not `read`: the standard action vocabulary (`DESIGN.md`,
+    /// `AuthZ` matrix and the note under it) reserves `read` for a single
+    /// resource and `list` for a collection, and the sibling collection
+    /// endpoints on groups and memberships already gate on `list`. Gating
+    /// the catalog on `read` would hand the whole type registry to a policy
+    /// that was only meant to grant one type.
     pub async fn list_types(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupType>, DomainError> {
+        self.gate(ctx, "list").await?;
+        self.list_types_unscoped(query).await
+    }
+
+    /// List GTS type definitions without `AuthZ` enforcement.
+    pub async fn list_types_unscoped(
         &self,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupType>, DomainError> {
@@ -204,15 +336,28 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         self.type_repo.list_types(&conn, query).await
     }
 
+    /// Update a GTS type definition (`AuthZ`-gated: `update` on
+    /// [`RG_TYPE_RESOURCE`]).
+    pub async fn update_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+        req: UpdateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "update").await?;
+        self.update_type_unscoped(code, req).await
+    }
+
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-update-type:p1
-    /// Update a GTS type definition (full replacement).
+    /// Update a GTS type definition (full replacement) without `AuthZ`
+    /// enforcement.
     ///
     /// The `delete_allowed_*` / `insert_allowed_*` / `update_type` sequence
     /// runs inside one `SERIALIZABLE` transaction so a failure on any later
     /// step rolls back the partial junction rewrites — without it, a crash
     /// between the parent-types delete and the membership-types insert
     /// would leave the registry pointing at half the new definition.
-    pub async fn update_type(
+    pub async fn update_type_unscoped(
         &self,
         code: &str,
         req: UpdateTypeRequest,
@@ -238,16 +383,25 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         let type_repo = self.type_repo.clone();
         let code = code.to_owned();
 
-        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+        // Retry-aware for the same reason as `create_type`; see there.
+        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let req = req.clone();
+            let code = code.clone();
+            let stored_schema = stored_schema.clone();
+            let type_repo = type_repo.clone();
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
                 // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // IF type not found → RETURN NotFound
-                let existing = type_repo
-                    .find_by_code(tx, &code)
+                // One lookup for both the row and its surrogate id: the
+                // update path needs each, and resolving the code twice cost
+                // a second `gts_type` SELECT per update (RG-11).
+                let (type_model, existing) = type_repo
+                    .find_by_code_with_model(tx, &code)
                     .await?
                     .ok_or_else(|| DomainError::type_not_found(&code))?;
+                let type_id = type_model.id;
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
 
@@ -268,11 +422,6 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                         .await?
                 };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-
-                let type_id = type_repo
-                    .resolve_id(tx, &code)
-                    .await?
-                    .ok_or_else(|| DomainError::type_not_found(&code))?;
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
                 // Invoke hierarchy safety check algorithm for
@@ -313,8 +462,13 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // DB: UPDATE gts_type SET metadata_schema = {new}, updated_at = now().
+                //
+                // The repository assembles the updated row itself, from
+                // `type_model` plus the two columns it just wrote -- not read
+                // back (RG-08). Domain no longer needs to know which columns
+                // an UPDATE touches to answer that.
                 let updated_model = type_repo
-                    .update_type(tx, type_id, &code, Some(&stored_schema))
+                    .update_type(tx, type_model, Some(&stored_schema))
                     .await?;
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
@@ -326,43 +480,65 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         .await
     }
 
+    /// Delete a GTS type definition (`AuthZ`-gated: `delete` on
+    /// [`RG_TYPE_RESOURCE`]).
+    pub async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), DomainError> {
+        self.gate(ctx, "delete").await?;
+        self.delete_type_unscoped(code).await
+    }
+
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
-    /// Delete a GTS type definition.
-    pub async fn delete_type(&self, code: &str) -> Result<(), DomainError> {
+    /// Delete a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// Resolve, reference check and delete run in one transaction with
+    /// bounded retry (RG-02).
+    ///
+    /// At the backend default isolation, not `SERIALIZABLE`: what makes a
+    /// type undeletable while it is in use is `ON DELETE RESTRICT` on
+    /// `resource_group.gts_type_id`, which holds at any level.
+    pub async fn delete_type_unscoped(&self, code: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
-        let conn = self.db.conn()?;
+        let db = self.db.db();
+        let type_repo = self.type_repo.clone();
+        let code = code.to_owned();
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
-        let type_id = self
-            .type_repo
-            .resolve_id(&conn, code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(code))?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
+            let type_repo = type_repo.clone();
+            let code = code.clone();
+            Box::pin(async move {
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
+                let type_id = type_repo
+                    .resolve_id(tx, &code)
+                    .await?
+                    .ok_or_else(|| DomainError::type_not_found(&code))?;
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
-        // Check for active references
-        let count = self.type_repo.count_groups_of_type(&conn, type_id).await?;
-        if count > 0 {
-            warn!(code = %code, count, "Cannot delete type: active group references exist");
-            return Err(DomainError::conflict_active_references(format!(
-                "Cannot delete type '{code}': {count} group(s) of this type exist"
-            )));
-        }
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
+                // Check for active references
+                let count = type_repo.count_groups_of_type(tx, type_id).await?;
+                if count > 0 {
+                    warn!(code = %code, count, "Cannot delete type: active group references exist");
+                    return Err(DomainError::conflict_active_references(format!(
+                        "Cannot delete type '{code}': {count} group(s) of this type exist"
+                    )));
+                }
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
-        self.type_repo.delete_by_id(&conn, type_id).await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
-        Ok(())
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
+                type_repo.delete_by_id(tx, type_id).await?;
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+                Ok(())
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+            })
+        })
+        .await
     }
 
     // -- Validation helpers --
@@ -417,34 +593,53 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
         // Compute removed parent types: old_allowed_parent_types - new_allowed_parent_types
-        let removed_parents: Vec<&String> = existing
+        let removed_parents: Vec<String> = existing
             .allowed_parent_types
             .iter()
             .filter(|p| !req.allowed_parent_types.contains(p))
+            .cloned()
             .collect();
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
-        for removed_parent in &removed_parents {
+        if !removed_parents.is_empty() {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
-            let parent_id = type_repo.resolve_id(conn, removed_parent).await?;
-            if let Some(parent_id) = parent_id {
-                let violations = type_repo
-                    .find_groups_using_parent_type(conn, type_id, parent_id)
-                    .await?;
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
+            // One call for every removed parent, instead of a `resolve_id`
+            // plus a single-parent lookup per removed parent (N+1 audit
+            // finding (b): two SELECTs per element of the request). The
+            // instruction below covers the lookup step it replaces.
+            let violations = type_repo
+                .find_groups_violating_removed_parents(conn, type_id, &removed_parents)
+                .await?;
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
 
-                // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
-                if !violations.is_empty() {
-                    let names: Vec<String> =
-                        violations.iter().map(|(_, name)| name.clone()).collect();
-                    return Err(DomainError::allowed_parent_types_violation(format!(
-                        "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
-                        names.join(", ")
-                    )));
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // Group violations by parent code in one pass instead of
+            // rescanning `violations` once per removed parent
+            // (`removed_parents.iter().find(|p| violations.iter().any(...))`
+            // was O(removed_parents * violations)). `entry(...).or_default()`
+            // preserves each code's names in `violations`' original order, so
+            // the lookup below reports the same first-hit-in-request-order
+            // parent and the same name list the quadratic scan did.
+            let mut names_by_parent: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (code, _, name) in &violations {
+                names_by_parent
+                    .entry(code.as_str())
+                    .or_default()
+                    .push(name.as_str());
             }
+
+            if let Some((removed_parent, names)) = removed_parents
+                .iter()
+                .find_map(|p| names_by_parent.get(p.as_str()).map(|names| (p, names)))
+            {
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
+                    names.join(", ")
+                )));
+            }
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
 
@@ -470,6 +665,43 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
         // IF violations collected -> RETURN AllowedParentTypesViolation (handled inline above)
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
+
+        // Compute removed membership types and verify none are in use.
+        let removed_membership_types: Vec<String> = existing
+            .allowed_membership_types
+            .iter()
+            .filter(|m| !req.allowed_membership_types.contains(m))
+            .cloned()
+            .collect();
+
+        if !removed_membership_types.is_empty() {
+            let violations = type_repo
+                .find_groups_violating_removed_membership_types(
+                    conn,
+                    type_id,
+                    &removed_membership_types,
+                )
+                .await?;
+
+            if let Some((removed_mt, names)) = removed_membership_types.iter().find_map(|mt| {
+                let group_names: Vec<String> = violations
+                    .iter()
+                    .filter(|(code, _, _)| code == mt)
+                    .map(|(_, _, name)| name.clone())
+                    .collect();
+                if group_names.is_empty() {
+                    None
+                } else {
+                    Some((mt, group_names))
+                }
+            }) {
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed membership type '{removed_mt}': \
+                     groups of this type have active memberships: {}",
+                    names.join(", ")
+                )));
+            }
+        }
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-5
         Ok(())

@@ -3,7 +3,7 @@
 //! drives the full post sequence: a balanced post updates the truth tables
 //! and derived caches and stamps the dedup row; a re-post replays; a closed
 //! period and a negative-balance post are rejected with the right codes.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -28,14 +28,14 @@ use bss_ledger::infra::storage::entity::unallocated_balance;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{JournalRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, SecureInsertExt, SecureOnConflict};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -47,7 +47,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 
 /// Scalar i64 read of a single-column, single-row SELECT (bss-qualified).
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map(|r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -101,7 +101,7 @@ async fn setup(
         .unwrap();
 
     // OPEN fiscal period (raw, bss-qualified).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -175,7 +175,7 @@ fn balanced_entry(
         source_business_id: business_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -237,7 +237,7 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_balanced_replay_period_and_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -341,7 +341,7 @@ async fn post_balanced_replay_period_and_negative() {
     assert_eq!(line_count2, 2, "no duplicate journal lines on replay");
 
     // --- 3. Closed period ---
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
         f.tenant, f.legal_entity, f.period_id
@@ -359,7 +359,7 @@ async fn post_balanced_replay_period_and_negative() {
     );
 
     // Re-open for the next case.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='OPEN' \
          WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
         f.tenant, f.legal_entity, f.period_id
@@ -394,7 +394,7 @@ async fn post_balanced_replay_period_and_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_same_key_posts_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -465,7 +465,7 @@ async fn concurrent_same_key_posts_once() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn secure_orm_isolates_cross_tenant_entry_reads() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -517,7 +517,7 @@ async fn secure_orm_isolates_cross_tenant_entry_reads() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reverses_fields_persist_on_a_reversal_post() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -611,7 +611,7 @@ async fn reverses_fields_persist_on_a_reversal_post() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_overdraw_of_guarded_account_stays_non_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -668,7 +668,7 @@ async fn concurrent_overdraw_of_guarded_account_stays_non_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_close_never_certifies_a_period_a_post_landed_in() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -705,7 +705,7 @@ async fn concurrent_close_never_certifies_a_period_a_post_landed_in() {
     );
 
     let status = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{}' AND period_id='{}'",
             f.tenant, f.period_id
@@ -818,7 +818,7 @@ impl PostSidecar for RejectingSidecar {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_sidecar_commits_with_entry_and_rolls_back_on_err() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -911,7 +911,7 @@ fn cross_currency_entry(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_post_populates_functional_balance() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -987,7 +987,7 @@ async fn cross_currency_post_populates_functional_balance() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_with_request_hash_rejects_same_key_different_payload() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1053,7 +1053,7 @@ async fn post_with_request_hash_rejects_same_key_different_payload() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_with_request_hash_same_hash_replays() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1101,7 +1101,7 @@ async fn post_with_request_hash_same_hash_replays() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn single_currency_post_leaves_functional_null() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1134,7 +1134,7 @@ async fn single_currency_post_leaves_functional_null() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn tenant_posting_lock_blocks_posting() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1143,7 +1143,7 @@ async fn tenant_posting_lock_blocks_posting() {
     let ctx = SecurityContext::anonymous();
 
     // Set the kill switch for the tenant.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_posting_lock (tenant_id, locked, reason_code, set_at) \
          VALUES ('{}', true, 'TENANT_TERMINATED', now())",
         f.tenant
@@ -1174,7 +1174,7 @@ async fn tenant_posting_lock_blocks_posting() {
     assert_eq!(entries, 0, "a refused post writes nothing");
 
     // Clearing the lock lets the same tenant post again.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_tenant_posting_lock SET locked = false, cleared_at = now() \
          WHERE tenant_id = '{}'",
         f.tenant
@@ -1193,7 +1193,7 @@ async fn tenant_posting_lock_blocks_posting() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clock_skew_beyond_24h_is_quarantined() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1202,7 +1202,7 @@ async fn clock_skew_beyond_24h_is_quarantined() {
     let ctx = SecurityContext::anonymous();
 
     let (mut entry, lines) = balanced_entry(&f, "biz-skewed", 1000, false);
-    entry.posted_at_utc = Utc::now() - chrono::Duration::hours(48);
+    entry.posted_at_utc = OffsetDateTime::now_utc() - time::Duration::hours(48);
     let err = service
         .post(&ctx, &scope, entry, lines, None)
         .await

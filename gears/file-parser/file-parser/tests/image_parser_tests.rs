@@ -39,7 +39,7 @@ async fn test_image_parser_png() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -90,7 +90,7 @@ async fn test_image_parser_jpg() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -123,7 +123,7 @@ async fn test_image_parser_webp() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -159,7 +159,7 @@ async fn test_image_parser_gif() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -252,7 +252,7 @@ async fn test_image_parser_unsupported_extension() {
     // Create a temporary path with unsupported extension
     let temp_path = PathBuf::from("/tmp/test.bmp");
 
-    let result = parser.parse_local_path(&temp_path).await;
+    let result = parser.parse_local_path(&temp_path, None).await;
 
     // Should fail with unsupported file type error
     assert!(result.is_err(), "Should fail for unsupported extension");

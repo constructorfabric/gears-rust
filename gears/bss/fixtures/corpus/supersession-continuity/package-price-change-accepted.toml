@@ -1,0 +1,57 @@
+family     = "supersession-continuity"
+id         = "package-price-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-pk-window", "D-58", "D-82", "D-122"]
+
+# D-122's other half, and the half nothing was checking.
+#
+# `package-size-change-rejected` says "the block price may move freely; the block
+# size may not" - and it moves **both** fields on its successor: 1000 -> 500 and
+# 2500 -> 1400. So it cannot tell the two apart. A gear that had put
+# `package_price_minor` into the preserved set alongside `package_size` would
+# have reproduced that case exactly, and the corpus would have agreed with it,
+# because the only thing either side observes is that *something* moved and the
+# row was refused.
+#
+# That was `package`'s only publish case, so it was also the whole of what the
+# registry's `publish` half meant for the kind: one reproduced refusal. Nothing
+# said a `package` row could be published at all.
+#
+# This case moves the price and **only** the price. `package_size` is equal on
+# both sides, which is what makes the accepted verdict a statement about the
+# price lever rather than about a pair that happened to change nothing: the one
+# field under test is the one field that differs. The bracket around D-122 is now
+# closed on both ends - size guarded, price free - and neither case can be
+# deleted without the other collapsing into an untestable claim.
+#
+# The row is a whole row on both sides: `inst-pk-window` (D-58) requires
+# `tierAggregationWindow` on every `package` usage row, because block math is
+# non-linear in the window and `used` accumulates over it before the round-up.
+# The shape is `repeating-block-roundup`'s exactly - the same meter, the same
+# `whole_unit` granularity, the same 1000-unit block - so the predecessor **is**
+# the row that case prices, and the change reads as the one authoring move a
+# block price can make.
+
+[predecessor]
+model_kind              = "package"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+package_size            = 1000
+package_price_minor     = 2500
+
+[successor]
+model_kind              = "package"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+package_size            = 1000
+package_price_minor     = 3000
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "the block is still a thousand calls, so every block the window already counted still means what it meant - the cumulative ceil-diff rating computes is unaffected, which is the whole of D-122's reason for guarding the size. What each block costs from here is a price, and D-82 exists to let a price move on one key. Rejecting this would price-freeze every block-priced row in the catalog for the life of its plan revision"

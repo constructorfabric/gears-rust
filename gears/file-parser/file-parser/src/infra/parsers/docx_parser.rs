@@ -34,6 +34,7 @@ impl FileParserBackend for DocxParser {
     async fn parse_local_path(
         &self,
         path: &Path,
+        _resolved_content_type: Option<&str>,
     ) -> Result<crate::domain::ir::ParsedDocument, DomainError> {
         let path_buf = path.to_path_buf();
 

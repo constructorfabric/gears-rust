@@ -132,7 +132,7 @@ pub trait ApiGatewayCapability: Send + Sync + 'static {
 /// 1. **Graceful stop request**: When `stop(deadline_token)` is called, the `deadline_token`
 ///    is *not* cancelled. This is the signal to begin graceful shutdown.
 ///
-/// 2. **Hard-stop deadline**: After the runtime's `shutdown_deadline` expires (default 30s),
+/// 2. **Hard-stop deadline**: After the runtime's `shutdown_deadline` expires (default 35s),
 ///    the `deadline_token` is cancelled. This signals that graceful shutdown time is over
 ///    and the gear should abort immediately.
 ///

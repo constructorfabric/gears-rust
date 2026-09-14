@@ -4,7 +4,7 @@
 //! fee_share) / CR PSP_FEE_EXPENSE fee_share` — and decrements BOTH the original
 //! payment's `settled_minor` and `fee_minor` in the same txn. Ignored by default;
 //! run with
-//! `cargo test -p bss-ledger --test postgres_payment_returns -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payment_returns -- --ignored`.
 //!
 //! Covers: (a) a return after a settle decrements `settled_minor` and drains the
 //! pool by the returned amount; (b) a re-posted return (same `psp_return_id`)
@@ -39,11 +39,11 @@ use bss_ledger::infra::payment::settlement_return::SettlementReturnService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, Side};
-use chrono::{Datelike, Utc};
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -60,7 +60,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -102,13 +102,13 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// month, and the `CASH_CLEARING` / `UNALLOCATED` / `PSP_FEE_EXPENSE` chart
 /// accounts.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
         cash: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
     let reference = ReferenceRepo::new(provider.clone());
     reference
@@ -121,7 +121,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -156,7 +156,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account

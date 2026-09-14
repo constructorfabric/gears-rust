@@ -14,10 +14,10 @@
 //!
 //! Inbound server-side validation (e.g. protecting `DirectoryService`
 //! register/resolve RPCs) is **async** — it cannot use tonic's synchronous
-//! `Interceptor` trait — and its enforcement is installed at the bootstrap /
-//! orchestrator wiring layer, reusing
-//! [`extract_internal_token_grpc`] together with the
-//! `toolkit_security::InternalAuthenticator` trait.
+//! `Interceptor` trait — and is provided as a Tower layer,
+//! [`InternalAuthGrpcLayer`](crate::internal_auth_server::InternalAuthGrpcLayer),
+//! installed on the tonic `Server`. It reuses the same
+//! `toolkit_security::InternalAuthenticator` trait as the outbound path.
 
 use std::sync::Arc;
 

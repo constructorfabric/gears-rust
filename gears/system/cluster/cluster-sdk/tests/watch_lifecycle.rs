@@ -1,4 +1,3 @@
-// Created: 2026-06-10 by Constructor Tech
 // @cpt-dod:cpt-cf-clst-dod-smoke-tests-watch:p1
 //! Contract smoke tests: watch lifecycle across both watch types
 //! (`cpt-cf-clst-dod-smoke-tests-watch`).
@@ -19,9 +18,7 @@ use cluster_sdk::cache::{
 };
 use cluster_sdk::error::{ClusterError, ProviderErrorKind};
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
-use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::register_cache_backend;
-use common::{MemCacheBackend, SmokeProfile};
+use common::{MemCacheBackend, SmokeClusterClient, SmokeProfile};
 use toolkit::client_hub::ClientHub;
 
 #[tokio::test]
@@ -124,10 +121,11 @@ async fn leader_watch_surfaces_status_lagged_reset_closed() {
 async fn cache_watch_preserves_per_key_ordering_end_to_end() {
     let hub = ClientHub::new();
     let cache: Arc<dyn ClusterCacheBackend> = MemCacheBackend::linearizable();
-    assert!(register_cache_backend(&hub, SmokeProfile::NAME, cache).is_ok());
+    SmokeClusterClient::register(&hub, cache);
     let Ok(cache) = ClusterCacheV1::resolver(&hub)
         .profile(SmokeProfile)
         .resolve()
+        .await
     else {
         panic!("cache must resolve");
     };

@@ -2,7 +2,7 @@
 //! Group D): `ChargebackService::record_phase` drives the dispute state machine
 //! (`opened → {won, lost}`) over the foundation engine, in both variants
 //! (`CASH_HOLD` / `AR_RECLASS`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_chargebacks -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_chargebacks -- --ignored`.
 //!
 //! Mirrors `postgres_payment_returns.rs` (boot, `setup_seller`, a `settle`
 //! helper) + `postgres_payments.rs` (`seed_ar_invoice`, the over-cap
@@ -52,6 +52,7 @@
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::chargeback::{DisputePhase, FundsAtOpen};
@@ -68,11 +69,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -89,7 +91,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -136,9 +138,9 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// `DISPUTE_HOLD` / `DISPUTE_LOSS_EXPENSE` / `AR` are debit-normal; `UNALLOCATED`
 /// is credit-normal (settle parks cash there); `PSP_FEE_EXPENSE` is the unguarded
 /// counter the AR-invoice seed credits. settle/dispute derive `period_id` from
-/// `Utc::now()` when no `effective_at` is supplied, matching this OPEN period.
+/// `OffsetDateTime::now_utc()` when no `effective_at` is supplied, matching this OPEN period.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -147,7 +149,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         dispute_loss: Uuid::now_v7(),
         ar: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -161,7 +163,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -345,7 +347,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
@@ -360,7 +362,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -375,7 +377,7 @@ async fn ar_disputed_minor(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT disputed_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -391,7 +393,7 @@ async fn dispute_row(
     s: &Seller,
     dispute_id: &str,
 ) -> Option<(String, String, i32)> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT variant, last_phase, cycle FROM bss.ledger_dispute \
          WHERE tenant_id='{}' AND dispute_id='{}'",
         s.tenant, dispute_id
@@ -417,7 +419,7 @@ async fn queue_status(
     phase: DisputePhase,
 ) -> Option<String> {
     let business_id = format!("{dispute_id}:{cycle}:{}", phase.as_str());
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='CHARGEBACK' AND business_id='{business_id}'",
         s.tenant
@@ -446,7 +448,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -462,7 +464,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -609,7 +611,7 @@ async fn opened_ar_reclass_moves_disputed_slice() {
         &s,
         "INV-AR-2",
         1000,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     recorded(
@@ -725,7 +727,7 @@ async fn won_ar_reclass_clears_disputed_slice() {
         &s,
         "INV-AR-4",
         1000,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     record(
@@ -864,7 +866,7 @@ async fn lost_ar_reclass_writes_off_to_loss() {
         &s,
         "INV-AR-6",
         1000,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     record(
@@ -953,7 +955,7 @@ async fn lost_ar_reclass_write_off_without_settlement() {
         &s,
         "INV-AR-7",
         1000,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     record(
@@ -1828,7 +1830,7 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
     // the settlement counter (the refund path's own write; seeded directly so this
     // test owns the dispute lifecycle, mirroring the counter-seed idiom). 600 + 0
     // <= 1000 still satisfies the money-out cap, so the seed itself is admissible.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement SET refunded_minor = 600 \
          WHERE tenant_id='{}' AND payment_id='PAY-CBR-1'",
         s.tenant

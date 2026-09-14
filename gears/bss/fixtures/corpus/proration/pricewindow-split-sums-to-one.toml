@@ -1,0 +1,31 @@
+family     = "proration"
+id         = "pricewindow-split-sums-to-one"
+kind       = "evaluation"
+provenance = ["AC#61", "T-D-26"]
+
+# A mid-period PriceWindow split cuts one period into two slices priced from
+# different snapshots. Rating T-D-26 requires the slice fractions to sum to
+# exactly 1 - stated here as integers, so the equality is exact rather than a
+# float comparison: 15 + 16 = 31 = the basis.
+
+[snapshot]
+model_kind      = "flat"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 9900
+proration_basis = "calendar_days_actual"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z" }
+expect = { units_charged = 31, units_in_basis = 31 }
+why    = "the uncut period: actual days, so 31 of 31"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z", to = "2026-01-16T00:00:00Z" }
+expect = { units_charged = 15, units_in_basis = 31 }
+why    = "slice A, from the period start to the window cut at Jan 16"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z", from = "2026-01-16T00:00:00Z" }
+expect = { units_charged = 16, units_in_basis = 31 }
+why    = "slice B, from the cut to the period end. 15 + 16 = 31 = the basis - no day is billed twice and none is lost at the boundary"

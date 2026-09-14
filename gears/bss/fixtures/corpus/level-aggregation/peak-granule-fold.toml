@@ -1,0 +1,59 @@
+family     = "level-aggregation"
+id         = "peak-granule-fold"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17"]
+
+# `peak` folds each granule to the maximum of the *level* over it, and Q is the
+# sum of the folds - additive by construction, which is what lets band math,
+# supersession continuity and slice math carry over from the `sum` case
+# unchanged.
+#
+# The level carried in from an earlier sample competes with the samples inside
+# the granule. Reading "max sample in the granule" literally would be gameable:
+# a level held at 100 all hour folds to 100 while unsampled, but to 1 the moment
+# one sample of 1 arrives - an observation that cuts the bill a hundredfold
+# without the level having moved.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "cloudlet.count"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T03:00:00Z"
+
+  [[runtime.samples]]
+  at    = "2026-01-01T00:00:00Z"
+  level = 10
+  [[runtime.samples]]
+  at    = "2026-01-01T00:20:00Z"
+  level = 30
+  [[runtime.samples]]
+  at    = "2026-01-01T00:40:00Z"
+  level = 20
+  [[runtime.samples]]
+  at    = "2026-01-01T01:10:00Z"
+  level = 5
+  [[runtime.samples]]
+  at    = "2026-01-01T01:30:00Z"
+  level = 15
+  [[runtime.samples]]
+  at    = "2026-01-01T02:00:00Z"
+  level = 40
+
+[[assert]]
+given  = { }
+expect = { folded_q = 90 }
+why    = "hour 0 peaks at 30. Hour 1 observes 5 and 15, but the level carried in from 00:40 was 20 and really was the level until 01:10, so the granule peaks at 20. Hour 2 peaks at 40. Q = 30 + 20 + 40 = 90 - the sum of per-granule maxima, never the maximum over the window, which would have been 40"

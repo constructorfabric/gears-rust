@@ -15,6 +15,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Ident, Path, TraitItemFn, Type};
 
+use crate::model::{MethodShape, StreamOpen};
+
 /// Naming convention: `{TraitIdent}Client`. Shared between REST and gRPC.
 pub fn client_struct_ident(trait_ident: &Ident) -> Ident {
     format_ident!("{}Client", trait_ident)
@@ -51,11 +53,37 @@ pub fn is_security_context_type(ty: &Type) -> bool {
 
 /// Returns `true` when `ty` is the *platform*-plane context
 /// [`PlatformSecurityContext`], in value or reference form. The tenant
-/// [`SecurityContext`] is **not** matched. Used to reject platform-plane
-/// methods from the REST projection while internal-token injection is deferred
-/// (see `rest_contract_parse::parse_method`).
+/// [`SecurityContext`] is **not** matched. Used to select the platform-plane
+/// carrier (`X-ToolKit-Internal-Token`) and its route auth axis in the REST/gRPC
+/// codegen.
 pub fn is_platform_security_context_type(ty: &Type) -> bool {
     type_path_ends_with(ty, "PlatformSecurityContext")
+}
+
+/// Parameter-level helper attributes a projection macro consumes and must not
+/// leak into the emitted trait. Mirrors `parse::SECCTX_ATTRS` on the base
+/// `#[contract]` macro.
+const SECCTX_PARAM_ATTRS: &[&str] = &["secctx", "security_context"];
+
+/// Strip `#[secctx]` / `#[security_context]` from every parameter of `method`.
+///
+/// A proc-macro attribute cannot declare helper attributes the way a derive can,
+/// so the only thing that keeps `#[secctx]` from reaching the compiler is the
+/// macro removing it — exactly as the base `#[contract]` macro does when it builds
+/// its cleaned signature. Without this, a projection trait carrying the explicit
+/// attribute fails to resolve it at all, which is how a platform-plane contract
+/// has to be written: the `ctx:`-name heuristic matches only a type path ending in
+/// the segment `SecurityContext`, and `PlatformSecurityContext` does not.
+pub fn strip_param_attrs(method: &mut TraitItemFn) {
+    for arg in &mut method.sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = arg {
+            pat_type.attrs.retain(|attr| {
+                !SECCTX_PARAM_ATTRS
+                    .iter()
+                    .any(|name| attr.path().is_ident(name))
+            });
+        }
+    }
 }
 
 /// Strip method-level helper attributes by ident name (e.g. `get`, `post`,
@@ -66,56 +94,116 @@ pub fn strip_method_attrs(method: &mut TraitItemFn, attr_names: &[&str]) {
         .retain(|attr| !attr_names.iter().any(|name| attr.path().is_ident(name)));
 }
 
-/// Return type for a streaming projection method:
-/// `-> Pin<Box<dyn Stream<Item = Result<#ok, #err>> + Send + 'static>>`.
-pub fn streaming_return_type(ok: &Type, err: &Type) -> TokenStream {
+/// The bare stream type a streaming projection method yields:
+/// `Pin<Box<dyn Stream<Item = Result<#ok, #err>> + Send + 'static>>`.
+fn boxed_stream_type(ok: &Type, err: &Type) -> TokenStream {
     quote! {
-        -> ::std::pin::Pin<::std::boxed::Box<
+        ::std::pin::Pin<::std::boxed::Box<
             dyn ::futures_core::Stream<Item = ::std::result::Result<#ok, #err>>
                 + ::std::marker::Send + 'static
         >>
     }
 }
 
-/// Rewrite a method signature so its return type matches the streaming
-/// projection convention (`Pin<Box<dyn Stream>>`) and drops `async`.
-pub fn rewrite_streaming_signature(method: &mut TraitItemFn, ok: &Type, err: &Type) {
-    method.sig.asyncness = None;
-    method.sig.output = syn::parse_quote! {
-        -> ::std::pin::Pin<::std::boxed::Box<
-            dyn ::futures_core::Stream<Item = ::std::result::Result<#ok, #err>>
-                + ::std::marker::Send + 'static
-        >>
-    };
+/// Return type for a streaming projection method.
+///
+/// [`StreamOpen::Immediate`] yields the bare
+/// `-> Pin<Box<dyn Stream<Item = Result<#ok, #err>>>>`;
+/// [`StreamOpen::Awaited`] wraps it in the method's own `Result` so the open
+/// can fail before any item exists.
+pub fn streaming_return_type(ok: &Type, err: &Type, open: StreamOpen) -> TokenStream {
+    let stream = boxed_stream_type(ok, err);
+    match open {
+        StreamOpen::Immediate => quote! { -> #stream },
+        StreamOpen::Awaited => quote! { -> ::std::result::Result<#stream, #err> },
+    }
 }
 
-/// Build a default delegating body: `<Self as BaseTrait>::method(self, args).await?`
-/// (or sync `()` for streaming methods that return a non-async stream type).
+/// Rewrite a method signature so its return type matches the streaming
+/// projection convention.
 ///
-/// `streaming = true` skips the `.await` since streaming methods are non-async
-/// (they return a stream synchronously).
+/// [`StreamOpen::Immediate`] drops `async` and returns the stream directly.
+/// [`StreamOpen::Awaited`] **retains** `async` and returns
+/// `Result<Stream, #err>`.
+pub fn rewrite_streaming_signature(
+    method: &mut TraitItemFn,
+    ok: &Type,
+    err: &Type,
+    open: StreamOpen,
+) {
+    let stream = boxed_stream_type(ok, err);
+    match open {
+        StreamOpen::Immediate => {
+            method.sig.asyncness = None;
+            method.sig.output = syn::parse_quote! { -> #stream };
+        }
+        StreamOpen::Awaited => {
+            method.sig.output = syn::parse_quote! {
+                -> ::std::result::Result<#stream, #err>
+            };
+        }
+    }
+}
+
+/// How a projection method's delegating default body must call the base trait.
+///
+/// The distinction is only ever "is the base-trait method `async`", which is
+/// why an `Immediate` *stream* and a unary method land on opposite arms here
+/// despite both being "not streaming" in some other sense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delegation {
+    /// The base method is `async` — append `.await`. Covers unary methods and
+    /// [`StreamOpen::Awaited`] streams, whose signature is itself
+    /// `async fn -> Result<Stream, E>`.
+    Awaited,
+    /// The base method is a plain `fn` returning a stream — no `.await`.
+    /// [`StreamOpen::Immediate`] only.
+    Immediate,
+}
+
+impl Delegation {
+    /// Classify a projection method from its streaming flag and open shape.
+    ///
+    /// `.await` is omitted **only** for an immediate stream; every other
+    /// combination delegates to an `async` base method.
+    #[must_use]
+    pub fn for_method(shape: MethodShape) -> Self {
+        if shape == MethodShape::Stream(StreamOpen::Immediate) {
+            Self::Immediate
+        } else {
+            Self::Awaited
+        }
+    }
+}
+
+/// Build a default delegating body: `<Self as BaseTrait>::method(self, args)`,
+/// with `.await` appended unless the base method hands back a stream
+/// synchronously.
+///
+/// Note the `.await` is deliberately **not** `.await?`: both the unary form and
+/// the [`StreamOpen::Awaited`] form return the `Result` directly, so the
+/// projection method's own return type already is that `Result`.
 pub fn build_delegation_body<'a, I>(
     base_trait: &Path,
     method_ident: &Ident,
     arg_idents: I,
-    streaming: bool,
+    delegation: Delegation,
 ) -> syn::Block
 where
     I: IntoIterator<Item = &'a Ident>,
 {
     let args: Vec<&Ident> = arg_idents.into_iter().collect();
-    if streaming {
-        syn::parse_quote! {
+    match delegation {
+        Delegation::Immediate => syn::parse_quote! {
             {
                 <Self as #base_trait>::#method_ident(self, #(#args),*)
             }
-        }
-    } else {
-        syn::parse_quote! {
+        },
+        Delegation::Awaited => syn::parse_quote! {
             {
                 <Self as #base_trait>::#method_ident(self, #(#args),*).await
             }
-        }
+        },
     }
 }
 
@@ -151,9 +239,9 @@ where
 }
 
 /// Render the unary or streaming return type for a generated client method.
-pub fn render_method_return_ty(ok: &Type, err: &Type, streaming: bool) -> TokenStream {
-    if streaming {
-        streaming_return_type(ok, err)
+pub fn render_method_return_ty(ok: &Type, err: &Type, shape: MethodShape) -> TokenStream {
+    if let Some(open) = shape.stream_open() {
+        streaming_return_type(ok, err, open)
     } else {
         quote! { -> ::std::result::Result<#ok, #err> }
     }

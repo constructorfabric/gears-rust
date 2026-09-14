@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use sea_orm::ConnectionTrait;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 

@@ -1,0 +1,49 @@
+family     = "reserved"
+id         = "per-unit-capacity"
+kind       = "evaluation"
+provenance = ["inst-rv-fixture", "inst-fx-kinds", "D-53", "D-139", "T-D-25"]
+
+# A `capacity` reservation reads neither `Q` nor the price model it sits on.
+#
+# The family's other cases are `graduated`, which left it gating `graduated`
+# alone - so a `per_unit` row carrying a reservation was refused by name
+# (`FIXTURE_MISSING`, variant `reserved`) with no case to earn it. `capacity` is
+# the flavor that can earn it on any kind: under D-139 the charge is
+# `reservedRate x allocation x covered granules`, and the evaluator computes it
+# from those three operands alone.
+#
+# `consumption` could not have carried this case. It prices the matched quantity
+# at the reserved rate and then bands the remainder from zero, and the evaluator
+# spells the second half as a banded lookup - so on a `per_unit` row, whose
+# on-demand side is a single rate and not a ladder, the remainder has no
+# representation. That is a real hole rather than a choice made here, and it is
+# left named rather than papered over with a case that would fail.
+#
+# The unit rate below is deliberately non-zero and deliberately unread: the
+# second assertion moves the usage and the charge does not follow it, which is
+# the same property `capacity-on-level` pins for `graduated` and which would be
+# invisible if the row had no on-demand rate at all.
+
+[snapshot]
+model_kind          = "per_unit"
+charge_kind         = "usage"
+currency            = "USD"
+meter               = "storage.gb"
+amount_minor        = 7
+billing_granularity = "per_hour"
+reserved_rate_minor = 4
+reservation_flavor  = "capacity"
+
+[runtime]
+reserved_quantity = 250
+covered_granules  = 120
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 120000 }
+why    = "zero usage still bills the allocation: 4 x 250 x 120 = 120000. Dropping the covered-granules factor would bill 1000 and leave a mid-period allocation with no way to bill less than a whole one"
+
+[[assert]]
+given  = { q = 800 }
+expect = { charge_minor = 120000 }
+why    = "the usage moved and the charge did not. Capacity never touches Q, and the row's own unit rate of 7 is never consulted either - 800 units at 7 would have been 5600 of on-demand charge, which belongs to a separate line and not to this one"

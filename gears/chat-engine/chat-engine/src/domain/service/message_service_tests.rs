@@ -31,8 +31,8 @@ impl MockSessionRepo {
         Arc::new(Self {
             session: Mutex::new(Session {
                 session_id: Uuid::new_v4(),
-                tenant_id: "t".into(),
-                user_id: "u".into(),
+                tenant_id: OWNER_TENANT.to_string().into(),
+                user_id: OWNER_USER.to_string().into(),
                 client_id: None,
                 session_type_id,
                 enabled_capabilities: capabilities,
@@ -370,8 +370,14 @@ fn empty_stream_pending() -> PluginStream {
 
 // ----------------- Test fixtures -----------------
 
+/// Owner pair carried by every fixture session in this module. [`make_ctx`]
+/// builds a context for the same pair so the caller is the session owner —
+/// what `owner_guard::ensure_session_owner` requires of an authorized op.
+const OWNER_TENANT: Uuid = Uuid::from_u128(0x0A11);
+const OWNER_USER: Uuid = Uuid::from_u128(0x0B22);
+
 fn make_ctx() -> SecurityContext {
-    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
+    test_support::ctx_for_subject(OWNER_USER, OWNER_TENANT)
 }
 
 fn make_service(
@@ -411,6 +417,7 @@ fn make_request(session_id: Uuid) -> SendMessageRequest {
         file_ids: vec![],
         parent_message_id: None,
         capabilities: None,
+        metadata: None,
     }
 }
 
@@ -792,8 +799,8 @@ fn make_current_message() -> Message {
 fn make_session(metadata: Option<JsonValue>) -> Session {
     Session {
         session_id: Uuid::new_v4(),
-        tenant_id: SdkTenantId::new("t"),
-        user_id: SdkUserId::new("u"),
+        tenant_id: SdkTenantId::new(OWNER_TENANT.to_string()),
+        user_id: SdkUserId::new(OWNER_USER.to_string()),
         client_id: None,
         session_type_id: None,
         enabled_capabilities: None,
@@ -1933,8 +1940,8 @@ async fn internal_write_copies_owner_pair_from_session() {
 
 use crate::domain::ports::NewUserMessage;
 use crate::domain::service::test_support::{
-    build_message_service, ctx_for_subject, enforcer_allow, enforcer_deny, inmem_db, message_repo,
-    seed_session,
+    build_message_service, ctx_for_subject, enforcer_allow, enforcer_allow_tenant_only,
+    enforcer_allow_unconstrained, enforcer_deny, inmem_db, message_repo, seed_session,
 };
 
 fn harness_text_part(text: &str) -> MessagePartInput {
@@ -2141,5 +2148,177 @@ async fn list_active_messages_with_parent_filter_returns_direct_replies() {
         filtered
             .iter()
             .all(|m| m.parent_message_id == Some(root.assistant_message_id))
+    );
+}
+
+// ----------------- validate_message_metadata -----------------
+
+#[test]
+fn message_metadata_rejects_every_reserved_key() {
+    for key in RESERVED_MESSAGE_METADATA_KEYS {
+        let metadata = serde_json::json!({ *key: "spoofed" });
+        let err =
+            validate_message_metadata(Some(&metadata)).expect_err("reserved key must be rejected");
+        assert!(
+            matches!(err, ChatEngineError::BadRequest { .. }),
+            "reserved key '{key}' must map to 400, got {err:?}",
+        );
+    }
+}
+
+#[test]
+fn message_metadata_allows_client_keys_and_absent_metadata() {
+    validate_message_metadata(None).expect("absent metadata accepted");
+    let metadata = serde_json::json!({
+        "device": "ios",
+        "active_error": {"code": "E_OFFLINE"},
+        "time_remaining_s": 42,
+    });
+    validate_message_metadata(Some(&metadata)).expect("client metadata accepted");
+}
+
+#[test]
+fn message_metadata_enforces_the_serialized_size_cap() {
+    // `{"blob":"…"}` — the payload sits just under / just over the cap once
+    // the enclosing object and quotes are counted.
+    let overhead = r#"{"blob":""}"#.len();
+    let at_limit = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_METADATA_BYTES - overhead) });
+    validate_message_metadata(Some(&at_limit)).expect("payload at the cap is accepted");
+
+    let over_limit =
+        serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_METADATA_BYTES - overhead + 1) });
+    let err = validate_message_metadata(Some(&over_limit))
+        .expect_err("payload over the cap must be rejected");
+    assert!(
+        matches!(err, ChatEngineError::BadRequest { .. }),
+        "oversized metadata must map to 400, got {err:?}",
+    );
+}
+
+#[test]
+fn message_metadata_accepts_non_object_json() {
+    // Reserved-key filtering only applies to objects; a scalar or array is
+    // opaque client context and only the size cap governs it.
+    validate_message_metadata(Some(&serde_json::json!(["a", "b"]))).expect("array accepted");
+    validate_message_metadata(Some(&serde_json::json!("plain"))).expect("string accepted");
+}
+
+// ===========================================================================
+// Ownership guard: the PDP scopes the tenant, the gear scopes the owner.
+// `enforcer_allow_tenant_only` models the shipped policy plugins, neither of
+// which emits an `owner_id` predicate.
+// @cpt-cf-chat-engine-nfr-authentication
+// ===========================================================================
+
+/// Point-op read of a same-tenant stranger's message must 404, not resolve.
+#[tokio::test]
+async fn get_message_same_tenant_stranger_is_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let pair = harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let err = svc
+        .resolve_owned_message(
+            &ctx_for_subject(Uuid::new_v4(), tenant),
+            pair.user_message_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "a same-tenant stranger must not read another user's message, got: {err:?}",
+    );
+
+    // Control: the owner still reads it under the same PDP.
+    svc.resolve_owned_message(&ctx_for_subject(owner, tenant), pair.user_message_id)
+        .await
+        .expect("owner reads its own message");
+}
+
+/// The clamp rides into the `WHERE` clause, so a stranger's list is empty
+/// rather than a page of someone else's conversation.
+#[tokio::test]
+async fn list_active_messages_hides_other_users_rows_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let seen = svc
+        .list_active_messages(&ctx_for_subject(Uuid::new_v4(), tenant), sid, None)
+        .await
+        .expect("list is authorized, it is the rows that are scoped away");
+    assert!(
+        seen.is_empty(),
+        "a same-tenant stranger must not list another user's messages, got {} rows",
+        seen.len(),
+    );
+
+    let owned = svc
+        .list_active_messages(&ctx_for_subject(owner, tenant), sid, None)
+        .await
+        .expect("owner lists its own messages");
+    assert!(!owned.is_empty(), "the owner's own page must be intact");
+}
+
+/// Deletes are clamped the same way, and the row survives the attempt.
+#[tokio::test]
+async fn delete_message_by_same_tenant_stranger_is_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let root = harness_seed_pair(&db, sid, tenant, owner).await;
+    let child = message_repo(&db)
+        .insert_user_and_assistant_stub(NewUserMessage {
+            session_id: sid,
+            tenant_id: Some(tenant.to_string()),
+            user_id: Some(owner.to_string()),
+            parent_message_id: Some(root.assistant_message_id),
+            parts: vec![harness_text_part("child")],
+            file_ids: None,
+            metadata: None,
+        })
+        .await
+        .expect("seed child pair");
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let err = svc
+        .delete_message_cascade(
+            &ctx_for_subject(Uuid::new_v4(), tenant),
+            sid,
+            child.user_message_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    svc.resolve_owned_message(&ctx_for_subject(owner, tenant), child.user_message_id)
+        .await
+        .expect("the message must survive a stranger's delete");
+}
+
+/// Unlike the session point-ops, MESSAGE point-ops ask the PDP with
+/// `require_constraints = true`, so an allow carrying no constraints cannot
+/// compile a scope and fails closed before any row is touched. Pinned here so
+/// the fail-closed half of the contract does not silently become an
+/// `allow_all` fast path.
+#[tokio::test]
+async fn get_message_unconstrained_allow_fails_closed() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let pair = harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_unconstrained());
+    let err = svc
+        .resolve_owned_message(&ctx_for_subject(owner, tenant), pair.user_message_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "an allow with no constraints must fail closed on a MESSAGE point-op, got: {err:?}",
     );
 }

@@ -4,6 +4,7 @@ use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::user::{ActiveModel as UserAM, Column, Entity as UserEntity};
 use crate::infra::storage::odata_mapper::UserODataMapper;
 use crate::{domain::error::DomainError, domain::repos::UsersRepository};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};

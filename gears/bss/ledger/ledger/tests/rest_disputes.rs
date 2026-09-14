@@ -32,11 +32,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-use authz_resolver_sdk::error::AuthZResolverError;
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -59,16 +58,16 @@ use bss_ledger_sdk::posting::{
     RecordDisputePhase, SettlePayment, UnallocatedView,
 };
 use bss_ledger_sdk::{AccountClass, ProvisionOutcome, ProvisionRequest, Side};
-use chrono::{Datelike, Utc};
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -355,11 +354,12 @@ fn tenant_in_constraint(tenant_id: Uuid) -> Constraint {
 struct AllowAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAuthZ {
+impl AuthZResolverApi for AllowAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = subject_tenant_id(&request);
         Ok(EvaluationResponse {
             decision: true,
@@ -390,7 +390,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -431,13 +431,13 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// debit, UNALLOCATED credit, DISPUTE_HOLD debit). Mirrors
 /// `rest_payments.rs::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: SUBJECT_TENANT,
         payer: Uuid::now_v7(),
         cash: Uuid::now_v7(),
         dispute_hold: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -451,7 +451,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -595,7 +595,7 @@ async fn record_opened_cash_hold_returns_201() {
 
     // The dispute row was seeded with the chosen variant.
     let variant = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT variant FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-REST-1'",
             s.tenant
@@ -648,7 +648,7 @@ async fn record_into_foreign_tenant_is_denied_403() {
 
     // No dispute row was created for the foreign tenant.
     let count = raw
-        .query_one(pg(
+        .query_one_raw(pg(
             "SELECT COUNT(*) FROM bss.ledger_dispute WHERE dispute_id='DSP-FOREIGN'".to_owned(),
         ))
         .await
@@ -710,7 +710,7 @@ async fn out_of_order_won_returns_202_queued() {
 
     // Still queued, never posted: no dispute current-state row exists yet.
     let count = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT COUNT(*) FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-Q-REST'",
             s.tenant

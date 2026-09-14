@@ -39,9 +39,7 @@ impl ODataFieldMapping<TypeFilterField> for TypeODataMapper {
 
     fn extract_cursor_value(model: &TypeModel, field: TypeFilterField) -> sea_orm::Value {
         match field {
-            TypeFilterField::Code => {
-                sea_orm::Value::String(Some(Box::new(model.schema_id.clone())))
-            }
+            TypeFilterField::Code => sea_orm::Value::String(Some(model.schema_id.clone())),
         }
     }
 }
@@ -68,13 +66,13 @@ impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
 
     fn extract_cursor_value(model: &GroupModel, field: GroupFilterField) -> sea_orm::Value {
         match field {
-            GroupFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            GroupFilterField::Name => sea_orm::Value::String(Some(Box::new(model.name.clone()))),
+            GroupFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            GroupFilterField::Name => sea_orm::Value::String(Some(model.name.clone())),
             GroupFilterField::HierarchyParentId => match model.parent_id {
-                Some(pid) => sea_orm::Value::Uuid(Some(Box::new(pid))),
+                Some(pid) => sea_orm::Value::Uuid(Some(pid)),
                 None => sea_orm::Value::Uuid(None),
             },
-            GroupFilterField::TenantId => sea_orm::Value::Uuid(Some(Box::new(model.tenant_id))),
+            GroupFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             GroupFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
         }
     }
@@ -149,12 +147,12 @@ impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
         field: MembershipFilterField,
     ) -> sea_orm::Value {
         match field {
-            MembershipFilterField::GroupId => sea_orm::Value::Uuid(Some(Box::new(model.group_id))),
+            MembershipFilterField::GroupId => sea_orm::Value::Uuid(Some(model.group_id)),
             MembershipFilterField::ResourceType => {
                 sea_orm::Value::SmallInt(Some(model.gts_type_id))
             }
             MembershipFilterField::ResourceId => {
-                sea_orm::Value::String(Some(Box::new(model.resource_id.clone())))
+                sea_orm::Value::String(Some(model.resource_id.clone()))
             }
         }
     }

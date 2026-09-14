@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use tokio_util::sync::CancellationToken;
@@ -398,7 +399,7 @@ impl CatalogStore for PgCatalogStore {
             limit.saturating_add(1),
         );
 
-        let mut q = sqlx::query_as::<_, UsageTypeRow>(&sql);
+        let mut q = sqlx::query_as::<_, UsageTypeRow>(AssertSqlSafe(sql));
         for b in &ctx.binds {
             q = bind_one(q, b);
         }

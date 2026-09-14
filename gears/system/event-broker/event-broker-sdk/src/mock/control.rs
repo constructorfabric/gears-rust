@@ -26,6 +26,13 @@ pub struct MockBrokerHandle {
     faults: Arc<Mutex<FaultConfig>>,
 }
 
+/// Which event type to repoint, and where. A struct rather than two `&str`
+/// arguments, so neither can be passed in the other's place.
+pub struct PartitionKeyFixture<'a> {
+    pub event_type: &'a str,
+    pub pointer: &'a str,
+}
+
 impl MockBrokerHandle {
     pub fn from_broker(broker: &MockBroker) -> Self {
         Self {
@@ -36,12 +43,15 @@ impl MockBrokerHandle {
 
     // -- Setup -----------------------------------------------------------------
 
-    /// Register a topic. `id` must be a GTS topic identifier:
-    /// `gts.cf.core.events.topic.v1~<vendor>.<...>.v1`.
+    /// Register a topic. `id` must be a GTS topic **instance** identifier:
+    /// `gts.cf.core.events.topic.v1~<vendor>.<...>.v1`. What is stored is the
+    /// instance document `types-registry` would provision. `partitions` is the
+    /// mock's own fixture knob standing in for the broker's configuration, since
+    /// a topic carries no partition count.
     ///
     /// # Panics
-    /// Panics if `id` is not a valid GTS identifier (must start with `gts.` and contain `~`)
-    /// or if `partitions` is zero.
+    /// Panics if `id` is not a valid GTS instance identifier (must start with
+    /// `gts.` and not end with `~`) or if `partitions` is zero.
     pub async fn register_topic(&self, id: &str, partitions: u32) {
         assert_gts_topic(id);
         assert!(partitions > 0, "topic partitions must be greater than zero");
@@ -49,7 +59,28 @@ impl MockBrokerHandle {
         let mut core = self.core.lock().await;
         core.topics
             .entry(id.to_owned())
-            .or_insert_with(|| TopicState::new(partitions));
+            .or_insert_with(|| TopicState::new(id, partitions));
+    }
+
+    /// Repoints a registered event type's partition key, for fixtures that need
+    /// events spread across partitions. Under the default pointer every event of
+    /// one tenant lands on one partition, which is the contract - so a test
+    /// exercising several partitions declares a pointer at a member it varies.
+    ///
+    /// # Panics
+    /// Panics if no registered event type carries `event_type`.
+    pub async fn set_partition_key(&self, fixture: PartitionKeyFixture<'_>) {
+        let PartitionKeyFixture {
+            event_type,
+            pointer,
+        } = fixture;
+        let mut core = self.core.lock().await;
+        let reg = core
+            .topics
+            .values_mut()
+            .find_map(|state| state.event_types.get_mut(event_type))
+            .expect("mock: set_partition_key needs a registered event type");
+        reg.schema["x-gts-traits"]["partition_key"] = Value::String(pointer.to_owned());
     }
 
     /// Provision a NAMED consumer group - the `types_registry` startup-upsert
@@ -69,7 +100,11 @@ impl MockBrokerHandle {
         );
     }
 
-    /// Register an event type on an already-registered topic.
+    /// Register an event type on an already-registered topic. `data_schema` is
+    /// the payload contract; it is stored as the `data` narrowing of a derived
+    /// event-type schema document, together with `topic` and `allowed_subjects`
+    /// as that document's `x-gts-traits`.
+    ///
     /// Both `topic` and `type_id` must be GTS identifiers.
     ///
     /// # Panics
@@ -88,8 +123,12 @@ impl MockBrokerHandle {
             t.event_types.insert(
                 type_id.to_owned(),
                 EventTypeReg {
-                    data_schema,
-                    allowed_subject_types: allowed_subjects.iter().map(|s| s.to_string()).collect(),
+                    schema: crate::gts::derived_event_type_schema(
+                        type_id,
+                        topic,
+                        data_schema,
+                        allowed_subjects,
+                    ),
                 },
             );
         }
@@ -246,22 +285,38 @@ impl MockBrokerHandle {
 
 // -- GTS format validation -----------------------------------------------------
 
-/// Assert that a string is a valid GTS identifier, using the `gts-id` library.
+/// Assert that a string is a valid GTS identifier of the expected kind, using the
+/// `gts-id` library.
+///
+/// A wrong-kind identifier is a caller mistake worth failing on here rather than
+/// several layers down where the document is assembled.
 ///
 /// # Panics
-/// Panics with the parse error if `id` is not a valid GTS identifier.
-fn assert_gts(id: &str, context: &str) {
-    if let Err(e) = gts_id::GtsId::try_new(id) {
-        panic!("mock: {context} must be a GTS identifier, got {id:?}: {e}");
+/// Panics with the parse error if `id` is not a valid GTS identifier, or if its
+/// kind is not the expected one.
+fn assert_gts_kind(id: &str, context: &str, expect_type: bool) {
+    match gts_id::GtsId::try_new(id) {
+        Err(e) => panic!("mock: {context} must be a GTS identifier, got {id:?}: {e}"),
+        Ok(parsed) => {
+            let (kind, shape) = if expect_type {
+                ("type", "ending in `~`")
+            } else {
+                ("instance", "not ending in `~`")
+            };
+            assert!(
+                parsed.is_type() == expect_type,
+                "mock: {context} must be a GTS {kind} identifier {shape}, got {id:?}"
+            );
+        }
     }
 }
 
 pub(super) fn assert_gts_topic(id: &str) {
-    assert_gts(id, "topic id");
+    assert_gts_kind(id, "topic id", false);
 }
 
 pub(super) fn assert_gts_event_type(id: &str) {
-    assert_gts(id, "event type id");
+    assert_gts_kind(id, "event type id", true);
 }
 
 impl MockBroker {

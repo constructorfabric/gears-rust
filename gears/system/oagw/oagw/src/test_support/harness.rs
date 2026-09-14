@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use toolkit::client_hub::ClientHub;
 use toolkit_security::SecurityContext;
@@ -54,7 +54,7 @@ impl AppHarness {
 pub struct AppHarnessBuilder {
     credentials: Vec<(String, String)>,
     request_timeout: Option<Duration>,
-    authz_client: Option<Arc<dyn AuthZResolverClient>>,
+    authz_client: Option<Arc<dyn AuthZResolverApi>>,
     max_body_size: Option<usize>,
     skip_upstream_tls_verify: bool,
     websocket_idle_timeout: Option<Duration>,
@@ -73,7 +73,7 @@ impl AppHarnessBuilder {
     }
 
     /// Override the AuthZ client used by the data plane (useful for authz tests).
-    pub fn with_authz_client(mut self, client: Arc<dyn AuthZResolverClient>) -> Self {
+    pub fn with_authz_client(mut self, client: Arc<dyn AuthZResolverApi>) -> Self {
         self.authz_client = Some(client);
         self
     }

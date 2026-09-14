@@ -26,9 +26,19 @@
 //! # }
 //! ```
 
+// The short-lived positive/negative validation cache is generic over any
+// `InternalAuthenticator` and lives in `toolkit-security`, so a caller
+// wanting to cache a non-Kubernetes provider does not have to depend on this
+// crate's `kube`/`k8s-openapi` stack. Re-exported here for convenience.
+pub use toolkit_security::{
+    CachingInternalAuthenticator, DEFAULT_TOKEN_REVIEW_CACHE_TTL, MAX_TOKEN_REVIEW_CACHE_TTL,
+};
+
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
-use toolkit_security::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
+use toolkit_security::{
+    DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PlatformIdentity,
+};
 
 /// Prefix of the `user.username` returned by `TokenReview` for a
 /// `ServiceAccount`: `system:serviceaccount:<namespace>:<name>`.
@@ -40,13 +50,17 @@ const POD_NAME_EXTRA_KEY: &str = "authentication.kubernetes.io/pod-name";
 /// Per-request timeout for the Kubernetes `TokenReview` API call.
 const TOKEN_REVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Error constructing a [`K8sTokenReviewAuthenticator`].
+/// Error constructing a [`K8sTokenReviewAuthenticator`] (optionally wrapped in
+/// the cache, via [`build_cached_k8s_authenticator`]).
 #[derive(Debug, thiserror::Error)]
 pub enum K8sAuthError {
     /// The Kubernetes client could not be constructed (no in-cluster config or
     /// kubeconfig, or the config was invalid).
     #[error("failed to construct Kubernetes client: {0}")]
     Client(#[from] kube::Error),
+    /// The requested cache TTL was out of bounds.
+    #[error("invalid internal-auth cache TTL: {0}")]
+    InvalidCacheTtl(#[from] toolkit_security::InvalidCacheTtl),
 }
 
 /// A platform-plane authenticator backed by the Kubernetes `TokenReview` API.
@@ -190,6 +204,32 @@ impl K8sTokenReviewAuthenticator {
 impl InternalAuthenticator for K8sTokenReviewAuthenticator {
     async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
         self.review(token).await
+    }
+}
+
+/// Build a Kubernetes `TokenReview` platform-plane authenticator, optionally
+/// wrapped in [`CachingInternalAuthenticator`].
+///
+/// This is the **one** place `provider: kube` is constructed. Every caller
+/// that wires it (the gRPC hub, the `OoP` HTTP bootstrap) goes through this
+/// function so they cannot drift on caching behavior or on what a
+/// construction failure means.
+///
+/// # Errors
+/// Returns [`K8sAuthError`] if the Kubernetes client cannot be constructed,
+/// or a caching-TTL error (via [`InvalidCacheTtl`](toolkit_security::InvalidCacheTtl),
+/// converted with its `Display`) if `cache_ttl` is `Some` and out of bounds.
+pub async fn build_cached_k8s_authenticator(
+    audiences: Vec<String>,
+    cache_ttl: Option<std::time::Duration>,
+) -> Result<DynInternalAuthenticator, K8sAuthError> {
+    let validator = K8sTokenReviewAuthenticator::try_default(audiences).await?;
+    match cache_ttl {
+        Some(ttl) => {
+            let cached = CachingInternalAuthenticator::new(validator, ttl)?;
+            Ok(DynInternalAuthenticator::new(cached))
+        }
+        None => Ok(DynInternalAuthenticator::new(validator)),
     }
 }
 

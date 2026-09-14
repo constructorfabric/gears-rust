@@ -2,7 +2,7 @@
 //! projects normal-side-positive deltas into `account_balance` and
 //! `ar_payer_balance`; a follow-up CR AR beyond the AR balance trips the
 //! no-negative guard (`ProjectError::NegativeBalance`). Ignored by default;
-//! run with `cargo test -p bss-ledger -- --ignored`.
+//! run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -15,16 +15,17 @@
 
 use std::collections::HashMap;
 
+use bss_ledger::domain::instant::parse_rfc3339;
 use bss_ledger::domain::model::{AccountRow, NewEntry, NewLine};
 use bss_ledger::infra::posting::projector::{BalanceProjector, ProjectError};
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -58,7 +59,7 @@ fn entry(tenant: Uuid) -> NewEntry {
         source_business_id: "biz-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: tenant,
@@ -103,7 +104,7 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64, payer: Uuid
 }
 
 async fn balance(raw: &sea_orm::DatabaseConnection, sql: &str) -> Option<i64> {
-    raw.query_one(pg(sql.to_owned()))
+    raw.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|row| row.try_get_by_index::<i64>(0).unwrap())
@@ -115,9 +116,9 @@ async fn ar_invoice_stamps(
     raw: &sea_orm::DatabaseConnection,
     account: Uuid,
     invoice_id: &str,
-) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
+) -> (Option<OffsetDateTime>, Option<NaiveDate>) {
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT original_posted_at, due_date FROM bss.ledger_ar_invoice_balance \
              WHERE account_id='{account}' AND invoice_id='{invoice_id}'"
         )))
@@ -125,7 +126,7 @@ async fn ar_invoice_stamps(
         .unwrap()
         .expect("ar_invoice_balance row must exist");
     (
-        row.try_get_by_index::<Option<DateTime<Utc>>>(0).unwrap(),
+        row.try_get_by_index::<Option<OffsetDateTime>>(0).unwrap(),
         row.try_get_by_index::<Option<NaiveDate>>(1).unwrap(),
     )
 }
@@ -133,7 +134,7 @@ async fn ar_invoice_stamps(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_deltas_and_enforces_no_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -279,7 +280,7 @@ async fn run_project(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_ar_invoice_and_tax_subgrains() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -373,7 +374,7 @@ async fn projects_ar_invoice_and_tax_subgrains() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_unallocated_balance_and_enforces_no_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -513,7 +514,7 @@ async fn projects_unallocated_balance_and_enforces_no_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -540,9 +541,7 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     let projector = BalanceProjector::new();
 
     // First write: INVOICE_POST DR AR 1000 with due_date d at posted_at t1.
-    let t1 = DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let t1 = parse_rfc3339("2026-06-01T10:00:00Z").unwrap();
     let due = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
     let mut e1 = entry(tenant);
     e1.source_doc_type = SourceDocType::InvoicePost;
@@ -574,9 +573,7 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     assert_eq!(due_date, Some(due), "due_date stamped on first write");
 
     // Second write: a payment-allocation CR AR 400 net-down at t2 > t1.
-    let t2 = DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let t2 = parse_rfc3339("2026-06-15T10:00:00Z").unwrap();
     let mut e2 = entry(tenant);
     e2.source_doc_type = SourceDocType::PaymentAllocate;
     e2.posted_at_utc = t2;

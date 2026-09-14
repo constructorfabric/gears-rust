@@ -14,7 +14,7 @@ use crate::api::{
     AssignedPartition, EventBrokerApi, JoinRequest, ResolvedPosition, SubscriptionAssignment,
 };
 use crate::api::{
-    BarrierMode, ControlCode, Filter, PartitionPosition, PartitionSlot, SeekPosition,
+    BarrierMode, ControlCode, Filter, PartitionPosition, SeekPosition,
     SubscriptionInterest as BrokerSubscriptionInterest, TenantTraversalDepth, WireEvent, WireFrame,
 };
 use crate::consumer::builder::{
@@ -146,6 +146,7 @@ struct DispatchState<'a> {
 
 #[derive(Clone, Copy)]
 struct ActiveSubscription<'a> {
+    ctx: &'a SecurityContext,
     group_id: &'a ConsumerGroupId,
     sub_id: SubscriptionId,
     affected: &'a [AssignedPartition],
@@ -303,6 +304,8 @@ where
 {
     pub slot_idx: u32,
     pub broker: Arc<dyn EventBrokerApi>,
+    /// Shared across slots: every slot of one consumer resolves the same types.
+    pub type_cache: Arc<super::type_cache::ConsumerTypeCache>,
     pub offset_manager: Arc<OM>,
     pub handler: Arc<H>,
     pub group_ref: ConsumerGroupRef,
@@ -342,6 +345,8 @@ where
 {
     pub slot_idx: u32,
     pub broker: Arc<dyn EventBrokerApi>,
+    /// Shared across slots: every slot of one consumer resolves the same types.
+    pub type_cache: Arc<super::type_cache::ConsumerTypeCache>,
     pub offset_manager: Arc<OM>,
     pub handler: Arc<H>,
     pub group_ref: ConsumerGroupRef,
@@ -521,6 +526,7 @@ where
                                     slow_states: &slow_states,
                                 },
                                 ActiveSubscription {
+                                    ctx: &ctx,
                                     group_id: &group_id,
                                     sub_id,
                                     affected: &assignment.assigned,
@@ -587,6 +593,7 @@ where
                         slow_states: &slow_states,
                     },
                     ActiveSubscription {
+                        ctx: &ctx,
                         group_id: &group_id,
                         sub_id,
                         affected: &assignment.assigned,
@@ -622,16 +629,33 @@ where
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) -> bool {
-        let topic_id = TopicId::from_gts(&wire.topic);
-        let key = TopicPartitionKey::new(wire.topic.clone(), topic_id, wire.partition);
+        // A topic is what an event's type declares, so it is resolved rather than
+        // read off the frame. A type this consumer has not seen costs one call
+        // here and none afterwards.
+        let topic = match self
+            .type_cache
+            .topic_of(&self.broker, active.ctx, &wire.type_id)
+            .await
+        {
+            Ok(topic) => topic.as_ref().to_owned(),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    type_id = %wire.type_id,
+                    "cannot attribute a delivered event to a topic; skipping it"
+                );
+                return false;
+            }
+        };
+        let topic_id = TopicId::from_gts(&topic);
+        let key = TopicPartitionKey::new(topic.clone(), topic_id, wire.partition);
         let raw = RawEvent {
             id: wire.id,
             type_id: wire.type_id.clone(),
-            topic: wire.topic.clone(),
+            topic,
             tenant_id: wire.tenant_id,
             subject: wire.subject,
             subject_type: wire.subject_type,
-            partition_key: wire.partition_key,
             partition: wire.partition,
             sequence: wire.sequence,
             offset: wire.offset,
@@ -1059,8 +1083,8 @@ where
     async fn observe_positions(&self, positions: &[PartitionPosition]) {
         for p in positions {
             trace!(
-                topic_ix = p.slot.topic_ix,
-                partition = p.slot.partition,
+                topic = p.topic.as_ref(),
+                partition = p.partition,
                 offset = p.offset,
                 last_examined = p.last_examined,
                 "transactional position observed without out-of-tx commit"
@@ -1374,6 +1398,7 @@ where
                                     slow_states: &slow_states,
                                 },
                                 ActiveSubscription {
+                                    ctx: &ctx,
                                     group_id: &group_id,
                                     sub_id,
                                     affected: &assignment.assigned,
@@ -1460,6 +1485,7 @@ where
                         slow_states: &slow_states,
                     },
                     ActiveSubscription {
+                        ctx: &ctx,
                         group_id: &group_id,
                         sub_id,
                         affected: &assignment.assigned,
@@ -1499,17 +1525,34 @@ where
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) -> bool {
-        let topic_id = TopicId::from_gts(&wire.topic);
-        let key = TopicPartitionKey::new(wire.topic.clone(), topic_id, wire.partition);
+        // A topic is what an event's type declares, so it is resolved rather than
+        // read off the frame. A type this consumer has not seen costs one call
+        // here and none afterwards.
+        let topic = match self
+            .type_cache
+            .topic_of(&self.broker, active.ctx, &wire.type_id)
+            .await
+        {
+            Ok(topic) => topic.as_ref().to_owned(),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    type_id = %wire.type_id,
+                    "cannot attribute a delivered event to a topic; skipping it"
+                );
+                return false;
+            }
+        };
+        let topic_id = TopicId::from_gts(&topic);
+        let key = TopicPartitionKey::new(topic.clone(), topic_id, wire.partition);
 
         let raw = RawEvent {
             id: wire.id,
             type_id: wire.type_id.clone(),
-            topic: wire.topic.clone(),
+            topic,
             tenant_id: wire.tenant_id,
             subject: wire.subject,
             subject_type: wire.subject_type,
-            partition_key: wire.partition_key,
             partition: wire.partition,
             sequence: wire.sequence,
             offset: wire.offset,
@@ -1929,14 +1972,11 @@ where
         positions: &[PartitionPosition],
     ) {
         for p in positions {
-            let topic = match self.topic_for_slot(&p.slot) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let topic = p.topic.as_ref().to_owned();
             let topic_id = TopicId::from_gts(&topic);
             if let Err(e) = self
                 .offset_manager
-                .commit(group_id, &topic_id, p.slot.partition, p.last_examined)
+                .commit(group_id, &topic_id, p.partition, p.last_examined)
                 .await
             {
                 warn!(error = %e, "failed to commit control-frame position to offset store");
@@ -1944,7 +1984,7 @@ where
                 self.emit_runtime_event(ConsumerRuntimeEvent::OffsetCommitted {
                     topic_id,
                     topic: topic.clone(),
-                    partition: p.slot.partition,
+                    partition: p.partition,
                     offset: p.last_examined,
                 })
                 .await;
@@ -1953,29 +1993,13 @@ where
                     progress: vec![PartitionProgress {
                         topic_id,
                         topic,
-                        partition: p.slot.partition,
+                        partition: p.partition,
                         offset: p.last_examined,
                     }],
                 })
                 .await;
             }
         }
-    }
-
-    /// Look up a partition's topic name from the slot's `topic_ix`, indexed
-    /// into the dispatcher's declared topics. The broker assigns indices in
-    /// the order the SDK declared interests.
-    fn topic_for_slot(&self, slot: &PartitionSlot) -> Result<String, EventBrokerError> {
-        self.topics
-            .get(slot.topic_ix as usize)
-            .cloned()
-            .ok_or_else(|| {
-                EventBrokerError::Internal(format!(
-                    "topology returned topic_ix={} but only {} topics were declared",
-                    slot.topic_ix,
-                    self.topics.len()
-                ))
-            })
     }
 
     /// Translate `(topic, partition)` pairs reported by `409 PositionsNotSet`

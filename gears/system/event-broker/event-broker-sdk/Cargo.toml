@@ -1,14 +1,14 @@
 [package]
 name = "cf-gears-event-broker-sdk"
 description = "SDK for the Event Broker: high-level typed event publishing and consumption"
-version = "0.1.4"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-keywords = ["cyberfabric", "cf-gears", "event-broker"]
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
 categories = ["asynchronous"]
 
 [package.metadata.docs.rs]
@@ -21,7 +21,9 @@ path = "src/lib.rs"
 [features]
 default = []
 db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]
-outbox = ["db", "toolkit-db/preview-outbox"]
+# Gates this SDK's own transactional-outbox producer surface (see src/producer/).
+# `toolkit-db`'s outbox pipeline is unconditional, so `db` is all this needs.
+outbox = ["db"]
 integration = []
 test-util = ["dep:async-stream"]
 
@@ -44,7 +46,16 @@ toolkit-stable-hash = { workspace = true }
 jsonschema = { workspace = true }
 
 gts-id = { workspace = true }
+gts = { workspace = true }
 toolkit-gts = { workspace = true }
+# `Iso8601Duration` for the retention trait and its DTO: a validated duration
+# rather than a string, carrying its ISO 8601 wire form through serde and
+# emitting `format: "duration"` in the generated schema.
+toolkit-utils = { workspace = true, features = ["serde", "schemars"] }
+# JSON-Schema reflection backend behind `#[gts_type_schema]`: the base type
+# schemas in `src/gts.rs` are emitted from their Rust declarations, so the
+# per-field keywords (`pattern`, `readOnly`, ...) come from schemars attributes.
+schemars = { workspace = true }
 toolkit-db = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
 

@@ -142,6 +142,21 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
+  license-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Requires --features static-license.
+  static-license-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # Deny by default: no rule, no grant. Rules are left empty because no gear
+      # gates on a licence yet -- a rule must name registered Subject/Resource
+      # contract types, and the resolver rejects a check against an unregistered
+      # one. See the plugin README for a worked rule set.
+      grants: []
+
   account-management:
     database:
       server: "sqlite_users"
@@ -172,6 +187,12 @@ gears:
         # see the plugin — the operator then knows to investigate
         # rather than silently shipping a half-wired stack.
         required: true
+
+  chat-engine:
+    database:
+      server: "sqlite_users"
+      file: "chat_engine.db"
+    config: {}
 
   mini-chat:
     # Gear-specific database configuration
@@ -330,6 +351,29 @@ gears:
           parent_id: "00000000-0000-0000-0000-000000000005"
           status: active
 
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
+
+  types-registry:
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+
   credstore:
     database:
       server: "sqlite_users"
@@ -409,10 +453,13 @@ opentelemetry:
     # HTTP-specific options
     http:
       inject_request_id_header: "x-request-id"
-      # WARNING: "authorization" sends bearer tokens to the trace collector — dev/test only
-      record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+      # Credential-bearing headers ("authorization", "cookie", …) must never
+      # be listed here: whatever is recorded reaches the trace collector.
+      record_headers: [ "user-agent", "x-forwarded-for" ]
 
-    # Log correlation (future feature)
+    # Add top-level trace_id / span_id to JSON log records so a backend can
+    # link a log line to its span. Off by default: it costs a context lookup
+    # per event.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

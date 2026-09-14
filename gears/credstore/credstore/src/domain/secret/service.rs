@@ -1,3 +1,9 @@
+//! Credential-store domain service.
+//!
+//! Orchestrates authorization, typed-secret validation, hierarchy resolution,
+//! value-store calls, fingerprint verification, crash-safe write sagas, and
+//! recovery sweeps.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

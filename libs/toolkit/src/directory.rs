@@ -32,9 +32,60 @@ fn openapi_spec_hash(spec: &str) -> String {
 
 // Re-export all types from contracts - this is the single source of truth
 pub use cf_system_sdks::directory::{
-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo,
-    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, InstanceState,
+    LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
+
+/// Project the live runtime [`crate::runtime::InstanceState`] onto the domain
+/// [`InstanceState`] carried on `ServiceInstanceInfo`, so `resolve_by_labels`
+/// callers can apply their own health policy from a single resolve.
+fn runtime_state_to_domain(state: crate::runtime::InstanceState) -> InstanceState {
+    use crate::runtime::InstanceState as Rt;
+    match state {
+        Rt::Registered => InstanceState::Registered,
+        Rt::Ready => InstanceState::Ready,
+        Rt::Healthy => InstanceState::Healthy,
+        Rt::Quarantined => InstanceState::Quarantined,
+        Rt::Draining => InstanceState::Draining,
+    }
+}
+
+/// Project a live [`GearInstance`] into a [`ServiceInstanceInfo`].
+///
+/// `endpoint` prefers gRPC and falls back to REST; an instance advertising
+/// neither yields `endpoint: None` (never an empty-URI sentinel), which the
+/// label paths surface as *no-endpoint, not an error*. Always **spec-free**:
+/// only the `OpenAPI` spec *hash* rides along, never the document (fetched via
+/// `get_openapi_spec`).
+fn project_instance(gear: &str, inst: &GearInstance) -> ServiceInstanceInfo {
+    let endpoint = inst
+        .grpc_services
+        .values()
+        .next()
+        .or(inst.rest_endpoint.as_ref())
+        .map(|ep| ServiceEndpoint::new(ep.uri.clone()));
+
+    ServiceInstanceInfo::new(gear, inst.instance_id.to_string())
+        .with_endpoint(endpoint)
+        .with_version(inst.version.clone())
+        .with_rest_endpoint(
+            inst.rest_endpoint
+                .as_ref()
+                .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
+        )
+        .with_openapi_spec_hash(inst.openapi_spec.as_deref().map(openapi_spec_hash))
+        // Carry every published gRPC service back so the directory-register
+        // phase can augment (not clobber) this instance when it adds a REST
+        // endpoint.
+        .with_grpc_services(
+            inst.grpc_services
+                .iter()
+                .map(|(name, e)| (name.clone(), ServiceEndpoint::new(e.uri.clone())))
+                .collect(),
+        )
+        .with_labels(inst.labels.clone())
+        .with_state(runtime_state_to_domain(inst.state()))
+}
 
 /// Local implementation of `DirectoryClient` that delegates to `GearManager`
 ///
@@ -83,90 +134,76 @@ impl DirectoryClient for LocalDirectoryClient {
     }
 
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
-        let mut result = Vec::new();
+        // Base label-targeting enumeration: project every instance, including
+        // endpoint-less ones (no-endpoint contract; see `project_instance`).
+        Ok(self
+            .mgr
+            .instances_of(gear)
+            .iter()
+            .map(|inst| project_instance(gear, inst))
+            .collect())
+    }
 
-        for inst in self.mgr.instances_of(gear) {
-            if let Some((_, ep)) = inst.grpc_services.iter().next() {
-                result.push(ServiceInstanceInfo {
-                    gear: gear.to_owned(),
-                    instance_id: inst.instance_id.to_string(),
-                    endpoint: ServiceEndpoint::new(ep.uri.clone()),
-                    version: inst.version.clone(),
-                    rest_endpoint: inst
-                        .rest_endpoint
-                        .as_ref()
-                        .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
-                    openapi_spec_hash: inst.openapi_spec.as_deref().map(openapi_spec_hash),
-                    openapi_spec: inst.openapi_spec.clone(),
-                    // Carry every published gRPC service back so the
-                    // directory-register phase can augment (not clobber) this
-                    // instance when it adds a REST endpoint.
-                    grpc_services: inst
-                        .grpc_services
-                        .iter()
-                        .map(|(name, e)| (name.clone(), ServiceEndpoint::new(e.uri.clone())))
-                        .collect(),
-                });
-            }
-        }
-
-        Ok(result)
+    async fn resolve_by_labels(
+        &self,
+        gear: &str,
+        selector: &LabelSelector,
+    ) -> Result<Vec<ServiceInstanceInfo>> {
+        // Filter by selector only: no health/endpoint filtering, so a matched
+        // endpoint-less instance is still returned for the caller to fall back on.
+        Ok(self
+            .mgr
+            .instances_of(gear)
+            .iter()
+            .map(|inst| project_instance(gear, inst))
+            .filter(|i| selector.matches(&i.labels))
+            .collect())
     }
 
     async fn list_all_instances(&self) -> Result<Vec<ServiceInstanceInfo>> {
-        let result = self
+        // Edge snapshot: drop labels (shared `without_labels`) and, unlike the
+        // label paths, skip endpoint-less instances — the edge needs a dialable
+        // URI — with a `debug!` so the omission is observable.
+        Ok(self
             .mgr
             .all_instances()
-            .into_iter()
-            .map(|inst| {
-                // Prefer a gRPC endpoint for the primary `endpoint`; fall back to
-                // the REST endpoint (OoP gears often register REST-only).
-                let endpoint = inst
-                    .grpc_services
-                    .values()
-                    .next()
-                    .or(inst.rest_endpoint.as_ref())
-                    .map_or_else(
-                        || ServiceEndpoint::new(String::new()),
-                        |ep| ServiceEndpoint::new(ep.uri.clone()),
+            .iter()
+            .filter_map(|inst| {
+                let info = project_instance(&inst.gear, inst);
+                if info.endpoint.is_none() {
+                    tracing::debug!(
+                        gear = %inst.gear,
+                        instance_id = %inst.instance_id,
+                        "skipping instance with no gRPC or REST endpoint from cross-gear snapshot"
                     );
-                ServiceInstanceInfo {
-                    gear: inst.gear.clone(),
-                    instance_id: inst.instance_id.to_string(),
-                    endpoint,
-                    version: inst.version.clone(),
-                    rest_endpoint: inst
-                        .rest_endpoint
-                        .as_ref()
-                        .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
-                    // The document itself is deliberately omitted here: the
-                    // cross-gear discovery snapshot must stay small and bounded
-                    // (it is polled every sync interval). Consumers that need
-                    // the document fetch it per gear via `get_openapi_spec`.
-                    // The content hash *is* carried so the edge can detect spec
-                    // changes and skip the fetch + rebuild when unchanged.
-                    openapi_spec_hash: inst.openapi_spec.as_deref().map(openapi_spec_hash),
-                    openapi_spec: None,
-                    // Same rationale as `list_instances`: carry the published
-                    // gRPC services so a later register can augment rather than
-                    // clobber them. Available here because this reads the live
-                    // `GearInstance`.
-                    grpc_services: inst
-                        .grpc_services
-                        .iter()
-                        .map(|(name, e)| (name.clone(), ServiceEndpoint::new(e.uri.clone())))
-                        .collect(),
+                    return None;
                 }
+                Some(info.without_labels())
             })
-            .collect();
-
-        Ok(result)
+            .collect())
     }
 
     async fn register_instance(&self, info: RegisterInstanceInfo) -> Result<()> {
         // Parse instance_id from string to Uuid
-        let instance_id = Uuid::parse_str(&info.instance_id)
-            .map_err(|e| anyhow::anyhow!("Invalid instance_id '{}': {}", info.instance_id, e))?;
+        let instance_id = Uuid::parse_str(&info.instance_id).map_err(|e| {
+            // A malformed instance_id is a client error, not a server fault:
+            // return the typed `DirectoryInvalidArgument` so a gRPC front-end
+            // maps it to `InvalidArgument` (and the caller stops retrying)
+            // rather than a bare `anyhow!` reported as `Internal`.
+            anyhow::Error::from(DirectoryInvalidArgument::new(format!(
+                "invalid instance_id '{}': {e}",
+                info.instance_id
+            )))
+        })?;
+
+        // Validate labels at the store boundary, not just at the gRPC
+        // front-end: this is the single point every registration path (remote
+        // gRPC, in-process, or a future transport) funnels through, so
+        // enforcing the shared rules here means an invalid label can never be
+        // stored regardless of how it arrived. The typed error maps to
+        // `InvalidArgument` at the wire boundary.
+        cf_system_sdks::directory::validate_labels(&info.labels)
+            .map_err(|e| anyhow::Error::from(DirectoryInvalidArgument::new(e.to_string())))?;
 
         // Build a GearInstance from RegisterInstanceInfo
         let mut instance = GearInstance::new(info.gear.clone(), instance_id);
@@ -189,6 +226,11 @@ impl DirectoryClient for LocalDirectoryClient {
         // Apply OpenAPI spec if provided
         if let Some(spec) = info.openapi_spec {
             instance = instance.with_openapi_spec(spec);
+        }
+
+        // Apply stable addressing labels if provided
+        if !info.labels.is_empty() {
+            instance = instance.with_labels(info.labels);
         }
 
         // Register the instance with the manager
@@ -243,17 +285,12 @@ mod tests {
 
         let instance_id = Uuid::new_v4();
         // Register an instance through the API
-        let register_info = RegisterInstanceInfo {
-            gear: "test_gear".to_owned(),
-            instance_id: instance_id.to_string(),
-            grpc_services: vec![(
+        let register_info = RegisterInstanceInfo::new("test_gear", instance_id.to_string())
+            .with_grpc_services(vec![(
                 "test.Service".to_owned(),
                 ServiceEndpoint::http("127.0.0.1", 8001),
-            )],
-            version: Some("1.0.0".to_owned()),
-            rest_endpoint: None,
-            openapi_spec: None,
-        };
+            )])
+            .with_version("1.0.0");
 
         api.register_instance(register_info).await.unwrap();
 
@@ -266,19 +303,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_rejects_invalid_labels_at_store_boundary() {
+        // Validation is enforced at the store, not only at the gRPC front-end:
+        // an invalid label registered in-process must be rejected here (typed
+        // as DirectoryInvalidArgument) and never reach the manager.
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        let err = api
+            .register_instance(
+                RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                    .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080"))
+                    .with_labels(labels(&[("bad key", "7")])),
+            )
+            .await
+            .expect_err("an invalid label must be rejected at the store boundary");
+        assert!(
+            err.downcast_ref::<DirectoryInvalidArgument>().is_some(),
+            "store-boundary label rejection must be typed InvalidArgument, got: {err}"
+        );
+        assert!(
+            dir.instances_of("worker").is_empty(),
+            "a rejected registration must not be stored"
+        );
+    }
+
+    #[tokio::test]
     async fn test_register_and_resolve_rest_and_openapi() {
         let dir = Arc::new(GearManager::new());
         let api = LocalDirectoryClient::new(dir.clone());
 
         let instance_id = Uuid::new_v4();
-        let register_info = RegisterInstanceInfo {
-            gear: "billing".to_owned(),
-            instance_id: instance_id.to_string(),
-            grpc_services: vec![],
-            version: Some("1.0.0".to_owned()),
-            rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
-            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
-        };
+        let register_info = RegisterInstanceInfo::new("billing", instance_id.to_string())
+            .with_version("1.0.0")
+            .with_rest_endpoint(ServiceEndpoint::http("billing", 8080))
+            .with_openapi_spec("{\"openapi\":\"3.1.0\"}");
 
         api.register_instance(register_info).await.unwrap();
 
@@ -366,14 +425,12 @@ mod tests {
 
         // Two REST-only OoP gears (no gRPC services) + one gRPC-only gear.
         for (gear, port) in [("billing", 8080u16), ("catalog", 8081u16)] {
-            api.register_instance(RegisterInstanceInfo {
-                gear: gear.to_owned(),
-                instance_id: Uuid::new_v4().to_string(),
-                grpc_services: vec![],
-                version: Some("1.0.0".to_owned()),
-                rest_endpoint: Some(ServiceEndpoint::http(gear, port)),
-                openapi_spec: Some(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
-            })
+            api.register_instance(
+                RegisterInstanceInfo::new(gear, Uuid::new_v4().to_string())
+                    .with_version("1.0.0")
+                    .with_rest_endpoint(ServiceEndpoint::http(gear, port))
+                    .with_openapi_spec(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
+            )
             .await
             .unwrap();
         }
@@ -381,17 +438,14 @@ mod tests {
         // gRPC-only gear: gRPC service metadata and no REST endpoint / spec. This
         // exercises gRPC endpoint selection in `list_all_instances` (which prefers
         // a gRPC endpoint for the primary `endpoint`).
-        api.register_instance(RegisterInstanceInfo {
-            gear: "reporting".to_owned(),
-            instance_id: Uuid::new_v4().to_string(),
-            grpc_services: vec![(
-                "reporting.Service".to_owned(),
-                ServiceEndpoint::new("http://reporting:7000"),
-            )],
-            version: Some("1.0.0".to_owned()),
-            rest_endpoint: None,
-            openapi_spec: None,
-        })
+        api.register_instance(
+            RegisterInstanceInfo::new("reporting", Uuid::new_v4().to_string())
+                .with_grpc_services(vec![(
+                    "reporting.Service".to_owned(),
+                    ServiceEndpoint::new("http://reporting:7000"),
+                )])
+                .with_version("1.0.0"),
+        )
         .await
         .unwrap();
 
@@ -403,9 +457,10 @@ mod tests {
             billing.rest_endpoint.as_ref().map(|e| e.uri.as_str()),
             Some("http://billing:8080")
         );
-        // The cross-gear snapshot never inlines the OpenAPI document; consumers
-        // fetch it per gear via `get_openapi_spec`.
-        assert!(billing.openapi_spec.is_none());
+        // The cross-gear snapshot never inlines the OpenAPI document; it carries
+        // only the hash, and consumers fetch the document per gear via
+        // `get_openapi_spec`.
+        assert!(billing.openapi_spec_hash.is_some());
         assert!(
             api.get_openapi_spec("billing")
                 .await
@@ -419,8 +474,251 @@ mod tests {
             .iter()
             .find(|i| i.gear == "reporting")
             .expect("reporting");
-        assert_eq!(reporting.endpoint.uri.as_str(), "http://reporting:7000");
+        assert_eq!(
+            reporting.endpoint.as_ref().map(|e| e.uri.as_str()),
+            Some("http://reporting:7000")
+        );
         assert!(reporting.rest_endpoint.is_none());
-        assert!(reporting.openapi_spec.is_none());
+        assert!(reporting.openapi_spec_hash.is_none());
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn register_carries_labels_into_list_instances() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                .with_grpc_services(vec![(
+                    "worker.Svc".to_owned(),
+                    ServiceEndpoint::new("http://worker:7000"),
+                )])
+                .with_labels(labels(&[("shard", "7")])),
+        )
+        .await
+        .unwrap();
+
+        let listed = api.list_instances("worker").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].labels.get("shard"), Some(&"7".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn resolve_by_labels_selects_matching_instances() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        for (id, shard) in [("a", "7"), ("b", "8"), ("c", "7")] {
+            api.register_instance(
+                RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                    .with_grpc_services(vec![(
+                        format!("worker.{id}"),
+                        ServiceEndpoint::new(format!("http://worker-{id}:7000")),
+                    )])
+                    .with_labels(labels(&[("shard", shard)])),
+            )
+            .await
+            .unwrap();
+        }
+
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 2, "two instances carry shard=7");
+        assert!(
+            matched
+                .iter()
+                .all(|i| i.labels.get("shard") == Some(&"7".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn labelless_reregister_preserves_labels_through_api() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        let instance_id = Uuid::new_v4().to_string();
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", instance_id.clone())
+                .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080"))
+                .with_labels(labels(&[("shard", "7")])),
+        )
+        .await
+        .unwrap();
+
+        // A label-less re-registration (e.g. self-heal) must not wipe the shard.
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", instance_id)
+                .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080"))
+                .with_version("2.0.0"),
+        )
+        .await
+        .unwrap();
+
+        let listed = api.list_instances("worker").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].labels.get("shard"),
+            Some(&"7".to_owned()),
+            "label-less re-registration must not wipe stored labels"
+        );
+
+        // And it is still selectable by the shard label.
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_by_labels_carries_live_serving_state() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        let instance_id = Uuid::new_v4();
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", instance_id.to_string())
+                .with_grpc_services(vec![(
+                    "worker.Svc".to_owned(),
+                    ServiceEndpoint::new("http://worker:7000"),
+                )])
+                .with_labels(labels(&[("shard", "7")])),
+        )
+        .await
+        .unwrap();
+
+        // A freshly-registered instance is not yet serving.
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].state, InstanceState::Registered);
+        assert!(!matched[0].state.is_serving());
+
+        // A heartbeat transitions it to Healthy; the state must be projected
+        // onto the resolve result so a caller can filter on it.
+        dir.update_heartbeat("worker", instance_id, std::time::Instant::now());
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(matched[0].state, InstanceState::Healthy);
+        assert!(matched[0].state.is_serving());
+    }
+
+    #[tokio::test]
+    async fn resolve_by_labels_omits_openapi_spec() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080"))
+                .with_openapi_spec("{\"openapi\":\"3.1.0\"}")
+                .with_labels(labels(&[("shard", "7")])),
+        )
+        .await
+        .unwrap();
+
+        // The in-process label path is spec-free, matching the gRPC client.
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert!(
+            matched[0].openapi_spec_hash.is_some(),
+            "in-process resolve_by_labels carries only the spec hash, never the document"
+        );
+
+        // The plain enumeration path is spec-free too: only the hash rides
+        // along, the document is fetched via `get_openapi_spec`.
+        let listed = api.list_instances("worker").await.unwrap();
+        assert!(
+            listed[0].openapi_spec_hash.is_some(),
+            "list_instances must carry the spec hash, never the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_instances_skips_endpoint_less() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        // One instance advertises a REST endpoint; the other advertises neither
+        // gRPC nor REST and must be skipped (no empty-URI sentinel).
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080")),
+        )
+        .await
+        .unwrap();
+        api.register_instance(RegisterInstanceInfo::new(
+            "placeholder",
+            Uuid::new_v4().to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let all = api.list_all_instances().await.unwrap();
+        assert_eq!(all.len(), 1, "the endpoint-less instance is skipped");
+        assert_eq!(all[0].gear, "worker");
+        assert!(
+            all.iter()
+                .all(|i| i.endpoint.as_ref().is_some_and(|e| !e.uri.is_empty())),
+            "no instance may carry an absent or empty-URI endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_path_returns_endpoint_less_match() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        // A matched instance that has not advertised any endpoint yet: treated
+        // as no-endpoint (not an error), so the label-targeting paths must still
+        // return the match (endpoint absent) rather than dropping it — the
+        // caller owns the fall-back decision.
+        api.register_instance(
+            RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
+                .with_labels(labels(&[("shard", "7")])),
+        )
+        .await
+        .unwrap();
+
+        let matched = api
+            .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matched.len(),
+            1,
+            "resolve_by_labels must return a matched instance even with no endpoint"
+        );
+        assert!(
+            matched[0].endpoint.is_none(),
+            "a no-endpoint match carries endpoint = None, not an empty-URI sentinel"
+        );
+        assert!(matched[0].rest_endpoint.is_none());
+        assert_eq!(matched[0].labels.get("shard"), Some(&"7".to_owned()));
+
+        // The base per-gear enumeration upholds the same contract.
+        let listed = api.list_instances("worker").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "list_instances must not drop endpoint-less instances"
+        );
+        assert!(listed[0].endpoint.is_none());
     }
 }

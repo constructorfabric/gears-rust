@@ -926,7 +926,7 @@ No explicit NFR exclusions at this time. All listed NFRs are in scope.
 
 ### 7.1 Public API Surface
 
-See [api/README.md](../api/README.md) for the public HTTP REST and Webhook API specifications.
+See [openapi.json](openapi.json) for the public HTTP REST API and [WEBHOOK-PROTOCOL.md](WEBHOOK-PROTOCOL.md) for the Webhook protocol.
 
 See [schemas/README.md](../schemas/README.md) for JSON schema definitions.
 

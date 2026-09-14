@@ -36,7 +36,7 @@ async fn root_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -52,7 +52,7 @@ async fn root_type_with_memberships(
 #[tokio::test]
 async fn read_service_get_group_bypasses_authz() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
 
@@ -81,7 +81,7 @@ async fn read_service_get_group_bypasses_authz() {
 #[tokio::test]
 async fn read_service_list_memberships_bypasses_authz() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
 

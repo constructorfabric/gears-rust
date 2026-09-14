@@ -27,7 +27,7 @@ async fn detects_real_sqlite_uq_violation() {
     let session_id = uuid::Uuid::new_v4();
     let session_type_id = uuid::Uuid::new_v4();
     let now = OffsetDateTime::now_utc().to_string();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO session_types (session_type_id, name, plugin_instance_id, \
@@ -37,7 +37,7 @@ async fn detects_real_sqlite_uq_violation() {
     ))
     .await
     .expect("seed session_type");
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO sessions (session_id, tenant_id, user_id, client_id, \
@@ -57,7 +57,7 @@ async fn detects_real_sqlite_uq_violation() {
     // parent to ensure the constraint actually fires on the
     // duplicate INSERT below.
     let root_id = uuid::Uuid::new_v4();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO messages (message_id, session_id, parent_message_id, role, \
@@ -70,7 +70,7 @@ async fn detects_real_sqlite_uq_violation() {
     .await
     .expect("seed root message");
     let child_id = uuid::Uuid::new_v4();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO messages (message_id, session_id, parent_message_id, role, \
@@ -87,7 +87,7 @@ async fn detects_real_sqlite_uq_violation() {
     // must violate `uq_messages_session_parent_variant`.
     let dup_id = uuid::Uuid::new_v4();
     let err = db
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DatabaseBackend::Sqlite,
             format!(
                 "INSERT INTO messages (message_id, session_id, parent_message_id, \
@@ -131,7 +131,7 @@ async fn detects_real_sqlite_root_uq_violation() {
     let session_id = uuid::Uuid::new_v4();
     let session_type_id = uuid::Uuid::new_v4();
     let now = OffsetDateTime::now_utc().to_string();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO session_types (session_type_id, name, plugin_instance_id, \
@@ -141,7 +141,7 @@ async fn detects_real_sqlite_root_uq_violation() {
     ))
     .await
     .expect("seed session_type");
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         format!(
             "INSERT INTO sessions (session_id, tenant_id, user_id, client_id, \
@@ -167,11 +167,11 @@ async fn detects_real_sqlite_root_uq_violation() {
             ),
         )
     };
-    db.execute(insert_root(uuid::Uuid::new_v4()))
+    db.execute_raw(insert_root(uuid::Uuid::new_v4()))
         .await
         .expect("seed first root");
     let err = db
-        .execute(insert_root(uuid::Uuid::new_v4()))
+        .execute_raw(insert_root(uuid::Uuid::new_v4()))
         .await
         .expect_err("second root with same variant_index must violate the root UNIQUE index");
 

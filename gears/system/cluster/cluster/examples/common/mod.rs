@@ -11,10 +11,11 @@
 //! partition tolerance a real backend needs — production backends ship as
 //! separate plugin crates (DECOMPOSITION out-of-scope follow-ups).
 //!
-//! [`register_cache_and_siblings`] shows the "implement cache only, get all four
-//! primitives" guarantee: it registers the cache plus the three default
-//! backends (`CasBased*` / `CacheBased*`) under one profile, exactly as this
-//! wiring crate does.
+//! [`wire`] runs the real [`ClusterWiring`] over these fixtures, which
+//! makes a profile resolvable: since item `K4` a facade binds through the
+//! process's single `dyn ClusterClient`, and the wiring is what registers it.
+//! [`cache_profile`] shows the "implement cache only, get all three primitives"
+//! guarantee — one cache, and the omit-default auto-wrap supplies the rest.
 //!
 //! This module lives under `examples/common/` (a subdirectory), so Cargo treats
 //! it as a shared module included via `mod common;` rather than as a standalone
@@ -33,14 +34,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
+use cluster::{ClusterHandle, ClusterWiring, ProfileBackends};
 use cluster_sdk::cache::{
     CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, CacheWatch, CacheWatchEvent,
     CacheWatchSender, ClusterCacheBackend, PutRequest, Ttl,
 };
 use cluster_sdk::error::ClusterError;
-use cluster_sdk::registration::{
-    register_cache_backend, register_leader_election_backend, register_lock_backend,
-};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 use toolkit::client_hub::ClientHub;
@@ -398,29 +397,57 @@ impl ClusterCacheBackend for MemCacheBackend {
     }
 }
 
-/// Registers a cache backend under `profile_name` together with the two SDK
-/// default backends derived from it — leader election and distributed lock — so
-/// all three primitives resolve against one cache.
+/// One profile's bindings from a cache alone — the "implement cache only, get all
+/// three primitives" composition, as [`ClusterWiring`] performs it from operator
+/// config.
 ///
-/// This is exactly the "implement cache only, get all three primitives"
-/// composition the follow-up wiring crate performs from operator config.
+/// A linearizable cache needs nothing but itself: the omit-default auto-wrap
+/// supplies leader election and the lock over it. An **eventually-consistent**
+/// cache is a different matter — the two defaults reject one, which is the
+/// consistency guard doing its job — so this fixture binds them explicitly
+/// through the weak-consistency escape hatch. That keeps the guard honest in
+/// production while letting the examples that only exercise the *cache* run
+/// against a weaker one.
+pub fn cache_profile(cache: Arc<dyn ClusterCacheBackend>) -> ProfileBackends {
+    if cache.consistency() == CacheConsistency::Linearizable {
+        return ProfileBackends::new(cache);
+    }
+    // The lease backends get a `reserved_lease_cache` view, never the handle the
+    // cache API serves — the two keyspaces are physically one store, so sharing
+    // the raw handle makes the lease records reachable through the cache API.
+    // This mirrors the production wiring; an example must not demonstrate the
+    // aliased construction.
+    let lease_cache = cluster_sdk::reserved_lease_cache(Arc::clone(&cache));
+    let leader =
+        CasBasedLeaderElectionBackend::new_allow_weak_consistency(Arc::clone(&lease_cache));
+    let lock = CasBasedDistributedLockBackend::new_allow_weak_consistency(Arc::clone(&lease_cache));
+    ProfileBackends::new(cache)
+        .with_leader_election(Arc::new(leader))
+        .with_lock(Arc::new(lock))
+}
+
+/// Wires `profiles` through the real [`ClusterWiring`] and makes them resolvable
+/// in `hub`.
+///
+/// A facade resolves through the process's single `dyn ClusterClient`
+/// (DESIGN.md), which the wiring registers over the
+/// profile set it published — so binding a backend into the hub is not by itself
+/// enough for a consumer to reach it, and this is the one call that makes a
+/// profile usable.
+///
+/// The returned handle must be stopped before the process exits; dropping one
+/// unstopped is a programming error the handle reports loudly (ADR-006).
 ///
 /// # Errors
-/// Returns [`ClusterError::InvalidConfig`] if the consistency-sensitive default
-/// backends reject the cache's consistency class, or any registration error
-/// from the [`ClientHub`].
-pub fn register_cache_and_siblings(
-    hub: &ClientHub,
-    profile_name: &'static str,
-    cache: Arc<dyn ClusterCacheBackend>,
-) -> Result<(), ClusterError> {
-    // The two consistency-sensitive defaults reject an eventually-consistent
-    // cache via `new()`; over a linearizable cache they construct cleanly.
-    let leader = CasBasedLeaderElectionBackend::new(Arc::clone(&cache))?;
-    let lock = CasBasedDistributedLockBackend::new(Arc::clone(&cache))?;
-
-    register_cache_backend(hub, profile_name, cache)?;
-    register_leader_election_backend(hub, profile_name, Arc::new(leader))?;
-    register_lock_backend(hub, profile_name, Arc::new(lock))?;
-    Ok(())
+/// Propagates whatever the wiring rejects — an invalid profile name, or a default
+/// backend that refuses its cache's consistency class.
+pub fn wire(
+    hub: &Arc<ClientHub>,
+    profiles: Vec<(&'static str, ProfileBackends)>,
+) -> Result<ClusterHandle, ClusterError> {
+    let mut builder = ClusterWiring::builder(Arc::clone(hub));
+    for (name, backends) in profiles {
+        builder = builder.profile_named(name, backends);
+    }
+    builder.build_and_start()
 }

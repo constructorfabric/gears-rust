@@ -103,18 +103,26 @@ fn struct_via_string_field_round_trip() {
     let proto: stubs::ChargeResponse = dto.clone().into();
     assert_eq!(proto.payment_id, "42");
     assert_eq!(proto.status, 1); // Completed → 1
-    let back: ChargeResponse = proto.into();
+    // A `via_string`-bearing struct has no infallible `From<Proto>`; decoding
+    // goes through the fallible path only.
+    let back = ChargeResponse::try_from_proto(&proto).expect("valid input decodes");
     assert_eq!(back, dto);
 }
 
 #[test]
-#[should_panic(expected = "proto bridge: invalid string for field `payment_id`")]
-fn struct_via_string_unparseable_panics() {
+fn struct_via_string_unparseable_is_a_decode_error() {
+    // What used to panic through `From<Proto>` is now a structured error: the
+    // infallible impl is not emitted for a `via_string`-bearing struct, so a
+    // hostile peer's malformed string cannot take the process down.
     let proto = stubs::ChargeResponse {
         payment_id: "not-a-number".into(),
         status: 99,
     };
-    let _back: ChargeResponse = proto.into();
+    let err = ChargeResponse::try_from_proto(&proto).expect_err("malformed id must error");
+    let toolkit_contract::grpc_repr::ProtoDecodeError::ViaString(ref via) = err else {
+        panic!("a malformed via_string field must be the ViaString variant, got {err:?}");
+    };
+    assert_eq!(via.field, "payment_id");
 }
 
 #[test]
@@ -201,11 +209,12 @@ fn generic_struct_round_trips_with_phantom_skip() {
     assert_eq!(back_b.amount_cents, 7);
 }
 
-// --- try_from_proto: fallible alternative to `From<Proto>` ----------------
+// --- try_from_proto: the only decode path for a via_string struct ---------
 //
-// `From<Proto>` panics on a malformed `via_string` field — fine for trusted
-// in-process callers but a remote-DoS surface on a tonic server reading
-// peer-supplied input. `try_from_proto` returns a structured error instead.
+// A struct with a `via_string` field gets no infallible `From<Proto>` at all:
+// `FromStr` can fail on peer-supplied input, and panicking there would be a
+// remote-DoS surface on a tonic server. `try_from_proto` is the sole decode
+// path and returns a structured error on malformed input.
 
 mod stubs_uuid {
     #[derive(Debug, Clone, PartialEq, Default)]
@@ -230,9 +239,12 @@ fn try_from_proto_returns_error_for_malformed_uuid() {
         note: Some("hi".into()),
     };
     let err = UserMsg::try_from_proto(&proto).expect_err("malformed UUID must error");
-    assert_eq!(err.field, "id");
+    let toolkit_contract::grpc_repr::ProtoDecodeError::ViaString(ref via) = err else {
+        panic!("a malformed via_string field must be the ViaString variant, got {err:?}");
+    };
+    assert_eq!(via.field, "id");
     // The source error is the underlying `uuid::Error` — confirm it is
-    // wired through as the `#[source]` chain.
+    // wired through as the `#[source]` chain (transparent through the enum).
     let src = std::error::Error::source(&err).expect("error chain populated");
     assert!(
         !src.to_string().is_empty(),
@@ -250,16 +262,6 @@ fn try_from_proto_round_trips_valid_input() {
     let rust = UserMsg::try_from_proto(&proto).expect("valid input must succeed");
     assert_eq!(rust.id, id);
     assert_eq!(rust.note.as_deref(), Some("hi"));
-}
-
-#[test]
-#[should_panic(expected = "proto bridge: invalid string for field `id`")]
-fn from_proto_still_panics_on_malformed_uuid() {
-    let proto = stubs_uuid::UserMsg {
-        id: "not-a-uuid".into(),
-        note: None,
-    };
-    let _user: UserMsg = proto.into();
 }
 
 #[test]

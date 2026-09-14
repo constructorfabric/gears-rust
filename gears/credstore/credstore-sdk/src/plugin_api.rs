@@ -1,3 +1,8 @@
+//! Backend storage-plugin contract.
+//!
+//! Plugins store opaque values by tenant, reference, and optional owner; the
+//! host gear retains hierarchy, sharing, metadata, and authorization policy.
+
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 

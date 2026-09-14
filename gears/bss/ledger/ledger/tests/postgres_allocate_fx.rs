@@ -37,6 +37,7 @@
 use std::sync::Arc;
 
 use bss_ledger::config::{FxConfig, RecognitionConfig};
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
@@ -51,11 +52,11 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -66,7 +67,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -111,7 +112,7 @@ fn rate_locker(provider: &DBProvider<DbError>, fx_config: &FxConfig) -> RateLock
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -128,8 +129,8 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
     let cash = Uuid::now_v7();
     let unallocated = Uuid::now_v7();
     let fx_gl = Uuid::now_v7();
-    let now = Utc::now();
-    let period_id = format!("{:04}{:02}", now.year(), now.month());
+    let now = OffsetDateTime::now_utc();
+    let period_id = bss_ledger::domain::instant::yyyymm(now);
 
     let reference = ReferenceRepo::new(provider.clone());
     // Both the transaction (EUR) and functional (USD) scales must be registered.
@@ -146,14 +147,14 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
             .unwrap();
     }
     // S5-F3: the functional-currency source (USD) — what ACTIVATES the FX locks.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))
@@ -221,7 +222,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
         payer_tenant_id: payer,
         resource_tenant_id: None,
         seller_tenant_id: tenant,
-        effective_at: now.date_naive(),
+        effective_at: to_naive_date(now),
         due_date: Some(naive(2026, 12, 1)),
         period_id: period_id.clone(),
         items: vec![InvoiceItem {

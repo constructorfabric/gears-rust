@@ -28,8 +28,7 @@ use cluster_sdk::cache::{
 };
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::{deregister_cache_backend, register_cache_backend};
-use common::MemCacheBackend;
+use common::{MemCacheBackend, cache_profile, wire};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use toolkit::client_hub::ClientHub;
@@ -233,14 +232,20 @@ async fn main() -> Result<(), ClusterError> {
         .await?;
     println!("[plugin] started");
 
-    // Wiring step: register the plugin's backend in ClientHub under the profile.
-    let hub = ClientHub::new();
-    register_cache_backend(&hub, AppProfile::NAME, handle.backend())?;
+    // Wiring step: wire the plugin's backend under the profile. This is what the
+    // cluster gear does from operator config, and what registers the cluster
+    // client a consumer's `resolve()` goes through.
+    let hub = Arc::new(ClientHub::new());
+    let wiring = wire(
+        &hub,
+        vec![(AppProfile::NAME, cache_profile(handle.backend()))],
+    )?;
 
     // Consumers resolve and use it exactly as in the other examples.
     let cache = ClusterCacheV1::resolver(&hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     cache
         .put(PutRequest {
             key: "plugin/demo",
@@ -255,9 +260,11 @@ async fn main() -> Result<(), ClusterError> {
         );
     }
 
-    // Shutdown: deregister from ClientHub, then stop the plugin (single release
-    // path). After this, resolutions on the profile fail with ProfileNotBound.
-    deregister_cache_backend(&hub, AppProfile::NAME)?;
+    // Shutdown, outermost first: the wiring unbinds the profile - clearing the
+    // published set and deregistering the hub scopes - and then the plugin stops
+    // (single release path). After this, resolutions on the profile fail with
+    // ProfileNotBound.
+    wiring.stop().await;
     handle.stop().await;
     Ok(())
 }

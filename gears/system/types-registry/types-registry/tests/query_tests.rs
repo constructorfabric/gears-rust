@@ -102,7 +102,7 @@ async fn test_list_with_is_type_filter() {
 
 #[tokio::test]
 async fn test_rest_list_handler_integration() {
-    use axum::extract::{Extension, Query};
+    use axum::extract::Extension;
     use types_registry::api::rest::handlers::list_entities;
 
     let service = create_service();
@@ -118,7 +118,11 @@ async fn test_rest_list_handler_integration() {
         ..Default::default()
     };
 
-    let result = list_entities(Extension(service), Query(query)).await;
+    let result = list_entities(
+        Extension(service),
+        toolkit::api::rest::extract::Query(query),
+    )
+    .await;
     assert!(result.is_ok());
 
     let Json(response) = result.unwrap();
@@ -127,7 +131,7 @@ async fn test_rest_list_handler_integration() {
 
 #[tokio::test]
 async fn test_rest_list_empty_results() {
-    use axum::extract::{Extension, Query};
+    use axum::extract::Extension;
     use types_registry::api::rest::handlers::list_entities;
 
     let service = create_service();
@@ -138,7 +142,11 @@ async fn test_rest_list_empty_results() {
         ..Default::default()
     };
 
-    let result = list_entities(Extension(service), Query(query)).await;
+    let result = list_entities(
+        Extension(service),
+        toolkit::api::rest::extract::Query(query),
+    )
+    .await;
     assert!(result.is_ok());
 
     let Json(response) = result.unwrap();
@@ -152,7 +160,7 @@ async fn test_rest_list_empty_results() {
 
 #[tokio::test]
 async fn test_rest_get_handler_integration() {
-    use axum::extract::{Extension, Path};
+    use axum::extract::Extension;
     use types_registry::api::rest::handlers::get_entity;
 
     let service = create_service();
@@ -167,7 +175,7 @@ async fn test_rest_get_handler_integration() {
 
     let result = get_entity(
         Extension(service),
-        Path(gts_id!("acme.core.events.get_test.v1~").to_owned()),
+        toolkit::api::rest::extract::Path(gts_id!("acme.core.events.get_test.v1~").to_owned()),
     )
     .await;
     assert!(result.is_ok());
@@ -182,7 +190,7 @@ async fn test_rest_get_handler_integration() {
 
 #[tokio::test]
 async fn test_rest_get_handler_not_found() {
-    use axum::extract::{Extension, Path};
+    use axum::extract::Extension;
     use types_registry::api::rest::handlers::get_entity;
 
     let service = create_service();
@@ -190,7 +198,7 @@ async fn test_rest_get_handler_not_found() {
 
     let result = get_entity(
         Extension(service),
-        Path(gts_id!("nonexistent.pkg.ns.type.v1~").to_owned()),
+        toolkit::api::rest::extract::Path(gts_id!("nonexistent.pkg.ns.type.v1~").to_owned()),
     )
     .await;
 

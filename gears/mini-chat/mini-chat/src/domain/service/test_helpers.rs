@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, PolicyEnforcer,
+    AuthZResolverApi, PolicyEnforcer,
     constraints::{Constraint, EqPredicate, Predicate},
     models::{DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
@@ -12,7 +12,7 @@ use sea_orm_migration::MigratorTrait;
 use toolkit_db::{
     ConnectOpts, DBProvider, Db, connect_db, migration_runner::run_migrations_for_testing,
 };
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 
 use uuid::Uuid;
 
@@ -29,11 +29,12 @@ use crate::domain::service::AuditEnvelope;
 pub struct MockAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let subject_tenant_id = request
             .subject
             .properties
@@ -275,7 +276,7 @@ pub fn test_security_ctx_with_id(tenant_id: Uuid, subject_id: Uuid) -> SecurityC
 }
 
 pub fn mock_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(MockAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
     PolicyEnforcer::new(authz)
 }
 
@@ -287,11 +288,12 @@ pub fn mock_enforcer() -> PolicyEnforcer {
 struct TenantOnlyAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for TenantOnlyAuthZResolver {
+impl AuthZResolverApi for TenantOnlyAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let subject_tenant_id = request
             .subject
             .properties
@@ -329,7 +331,7 @@ impl AuthZResolverClient for TenantOnlyAuthZResolver {
 ///
 /// Use for services that operate on `no_owner` entities (e.g. `AttachmentService`).
 pub fn mock_tenant_only_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantOnlyAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantOnlyAuthZResolver);
     PolicyEnforcer::new(authz)
 }
 
@@ -337,11 +339,12 @@ pub fn mock_tenant_only_enforcer() -> PolicyEnforcer {
 struct DenyingAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyingAuthZResolver {
+impl AuthZResolverApi for DenyingAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -356,7 +359,7 @@ impl AuthZResolverClient for DenyingAuthZResolver {
 }
 
 pub fn mock_denying_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyingAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(DenyingAuthZResolver);
     PolicyEnforcer::new(authz)
 }
 

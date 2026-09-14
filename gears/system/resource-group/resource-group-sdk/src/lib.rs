@@ -3,9 +3,12 @@
 //! Resource Group SDK
 //!
 //! This crate provides the public API for the `resource-group` gear:
-//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` traits
-//!   (boundary returns [`toolkit_canonical_errors::CanonicalError`] per
-//!   [ADR 0005][adr])
+//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` /
+//!   `ResourceGroupTypeBootstrap` traits (boundary returns
+//!   [`toolkit_canonical_errors::CanonicalError`] per [ADR 0005][adr]).
+//!   `ResourceGroupTypeBootstrap` is a narrow, un-gated surface for
+//!   deployment-time type-registry bootstrap from another gear's `init` —
+//!   see its own doc comment for why it bypasses `PolicyEnforcer`.
 //! - Model types for GTS types, groups, memberships
 //! - [`ResourceGroupError`] — opt-in `From<CanonicalError>` projection
 //!   (see [`error`]) plus its co-located wire vocabulary ([`field`],
@@ -30,9 +33,11 @@ pub mod reason;
 pub mod odata;
 
 // Re-export main types at crate root for convenience
-pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy};
+pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTypeBootstrap};
 pub use error::ResourceGroupError;
-pub use gts::{GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
+pub use gts::{
+    GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH, TYPE_RESOURCE_TYPE,
+};
 pub use models::{
     CreateGroupRequest, CreateTypeRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
     ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,

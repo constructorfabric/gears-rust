@@ -1,0 +1,48 @@
+family     = "supersession-continuity"
+id         = "volume-counter-continues-across-supersession"
+kind       = "evaluation"
+provenance = ["inst-tb-window-continuity", "D-22", "D-89"]
+
+# The `volume` half of what the successor's bands are applied to.
+#
+# D-22 gates the first publish of both tiered kinds on this family, so both owe
+# an evaluation case: the publish pairs say which changes a supersession may
+# carry, and these say what the counter the successor prices is.
+#
+# The tier counter Q is keyed `(subscription, meter, dimensionKey, window)` and
+# is phase-blind, exactly as for `graduated`. What differs is the consequence of
+# getting it wrong. A graduated ladder charges each band its own slice, so a
+# reset moves the total; a `volume` row charges the **whole** quantity at the one
+# band the total lands in, so a reset can move the row into a different band and
+# reprice every unit already consumed.
+#
+# These are the successor's bands, and the same ones the graduated twin uses, so
+# the two cases differ in the kind and in nothing else.
+
+[snapshot]
+model_kind              = "volume"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 7
+
+  [[snapshot.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 4
+
+[[assert]]
+given  = { q = 1500 }
+expect = { charge_minor = 6000 }
+why    = "1500 is the continued window total: 600 accumulated under the predecessor plus 900 after. The whole 1500 prices at the second band's 4. Had the counter reset to 900 the row would have fallen in the *first* band and charged 900 at 7 = 6300 — more than the honest 6000, on less consumption, which is the direction a reset is least likely to be noticed in"
+
+[[assert]]
+given  = { q = 600 }
+expect = { charge_minor = 4200 }
+why    = "the pre-supersession accumulation alone, priced under the successor's bands — the predecessor's rates do not survive, only the counter does. Equal to the graduated twin here because 600 sits inside the first band either way, which is what makes the 1500 assertion the one that separates the two kinds"

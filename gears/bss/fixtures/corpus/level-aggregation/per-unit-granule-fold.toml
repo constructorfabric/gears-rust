@@ -1,0 +1,56 @@
+family     = "level-aggregation"
+id         = "per-unit-granule-fold"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17", "inst-la-fixture"]
+
+# The fold is a property of the meter, not of the price model over it.
+#
+# Every other case in this family folds a `graduated` row, which left the family
+# gating `graduated` alone - and a `per_unit` level row is refused by name
+# (`FIXTURE_MISSING`, variant `level_aggregation`) for as long as no case here
+# folds one, however well-defined its `Q` is. That refusal is what this case
+# removes, and the reason it is safe to remove is visible in the evaluator: the
+# granule fold reads `aggregationFunction`, `aggregationGranularity`,
+# `maxHoldGranules` and the samples, and reads neither the bands nor the unit
+# rate. So `Q` here is the same number the `graduated` cases pin, and the unit
+# rate below is carried only so the row is a row.
+#
+# Which is also why this asserts `folded_q` and not a charge, exactly like its
+# siblings: what a `per_unit` row does with `Q` once it has one is the
+# `per-unit` family's subject, and pinning it again here would couple two
+# families to one number.
+#
+# The hold is exercised in both directions in one window, because the two
+# directions are one rule: granule 1 has no sample of its own and takes the
+# level held from granule 0, while granule 2 is two granules from that same
+# sample and is past `maxHoldGranules = 1`, so the held level is dropped there.
+
+[snapshot]
+model_kind              = "per_unit"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "vm.count"
+amount_minor            = 4
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T03:00:00Z"
+
+  [[runtime.samples]]
+  at    = "2026-01-01T00:00:00Z"
+  level = 6
+  [[runtime.samples]]
+  at    = "2026-01-01T00:30:00Z"
+  level = 2
+  [[runtime.samples]]
+  at    = "2026-01-01T02:10:00Z"
+  level = 9
+
+[[assert]]
+given  = { }
+expect = { folded_q = 17 }
+why    = "hour 0 observes 6 then 2 and peaks at 6. Hour 1 observes nothing; the level held from 00:30 is one granule away, within maxHoldGranules = 1, so the granule peaks at the held 2 rather than at 0. Hour 2 observes 9, and the same held level is now two granules from its sample and past the hold, so it is dropped - the granule peaks at 9 on its own observation. Q = 6 + 2 + 9 = 17. The unit rate of 4 appears in none of that, which is the property this case is here for"

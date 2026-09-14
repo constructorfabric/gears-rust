@@ -1,0 +1,21 @@
+family     = "proration"
+id         = "none-and-by-second"
+kind       = "evaluation"
+provenance = ["AC#61", "PRD 1.4", "K1", "P1"]
+
+# `none` is the value seam P1 caught missing on the Tariffs side: pricing rejects
+# `creditOnDowngrade = true` together with `none` at publish, so Tariffs never
+# prorates such a row - but it must still recognise the value, precisely so this
+# conformance case can assert it.
+
+[snapshot]
+model_kind      = "flat"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 9900
+proration_basis = "none"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z", from = "2026-01-16T00:00:00Z" }
+expect = { units_charged = 1, units_in_basis = 1 }
+why    = "no proration at all: a full-period charge, no partial credit"

@@ -1,0 +1,7 @@
+[gear]
+name = "Static CredStore Plugin"
+description = "Static credential storage backend plugin for development and single-tenant deployments."
+category = "core-platform-integration"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

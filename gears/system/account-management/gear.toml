@@ -1,0 +1,7 @@
+[gear]
+name = "Account Management"
+description = "Reference multi-tenant account management with user and tenant lifecycle operations."
+category = "oss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

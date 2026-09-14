@@ -1,12 +1,15 @@
 [package]
 name = "cf-gears-toolkit-contract-macros"
-version = "0.1.0"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Proc macros for ToolKit contracts"
 rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 proc-macro = true

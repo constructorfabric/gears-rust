@@ -15,13 +15,14 @@
 //! [`gts_instance!`]: toolkit_gts::gts_instance
 
 use account_management_sdk::{
-    CONVERSION_REQUEST_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
-    USER_RESOURCE_TYPE,
+    CONVERSION_REQUEST_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE,
+    TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
 };
 use toolkit_gts::{AuthzPermissionV1, gts_instance};
 
 use crate::domain::conversion::service::pep::actions as conversion_actions;
 use crate::domain::metadata::service::pep::actions as metadata_actions;
+use crate::domain::service_account::service::pep::actions as service_account_actions;
 use crate::domain::tenant::service::pep::actions as tenant_actions;
 use crate::domain::user::service::pep::actions as user_actions;
 
@@ -189,13 +190,58 @@ gts_instance! {
     }
 }
 
+// ---- service_account (gts.cf.core.am.service_account.v1~) --------------
+// @cpt-begin:cpt-cf-account-management-dod-service-accounts-independent-permissions:p1:inst-dod-sa-independent-permissions-catalog
+//
+// Per-verb rather than a read/write/delete triad, and a separate
+// resource type from `user` on purpose: minting a machine credential is
+// not something a "manage users" grant should imply, and re-keying an
+// existing account (`rotate_secret`) is grantable without the power to
+// create new ones.
+
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_create.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::CREATE.to_owned(),
+        display_name: "Create service account".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_list.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::LIST.to_owned(),
+        display_name: "List service accounts".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_rotate_secret.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::ROTATE_SECRET.to_owned(),
+        display_name: "Rotate service-account secret".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_revoke.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::REVOKE.to_owned(),
+        display_name: "Revoke service account".to_owned(),
+    }
+}
+// @cpt-end:cpt-cf-account-management-dod-service-accounts-independent-permissions:p1:inst-dod-sa-independent-permissions-catalog
+
 #[cfg(test)]
 mod tests {
     use toolkit_gts::{InventoryInstance, gts_id};
 
     use super::{
-        CONVERSION_REQUEST_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
-        USER_RESOURCE_TYPE, conversion_actions, metadata_actions, tenant_actions, user_actions,
+        CONVERSION_REQUEST_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE,
+        TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
+        conversion_actions, metadata_actions, service_account_actions, tenant_actions,
+        user_actions,
     };
 
     const PERMISSION_TYPE_ID: &str = gts_id!("cf.toolkit.authz.permission.v1~");
@@ -226,6 +272,10 @@ mod tests {
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_list.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_delete.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_update.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_create.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_list.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_rotate_secret.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_revoke.v1"),
     ];
 
     fn am_permission_instances() -> Vec<&'static InventoryInstance> {
@@ -264,11 +314,12 @@ mod tests {
     /// restated by hand — the vocabularies are the same constants the
     /// `PolicyEnforcer` call sites pass.
     fn enforced_permission_pairs() -> std::collections::BTreeSet<(&'static str, &'static str)> {
-        let vocabularies: [(&'static str, &'static [&'static str]); 4] = [
+        let vocabularies: [(&'static str, &'static [&'static str]); 5] = [
             (TENANT_RESOURCE_TYPE, tenant_actions::ALL),
             (TENANT_METADATA_RESOURCE_TYPE, metadata_actions::ALL),
             (CONVERSION_REQUEST_RESOURCE_TYPE, conversion_actions::ALL),
             (USER_RESOURCE_TYPE, user_actions::ALL),
+            (SERVICE_ACCOUNT_RESOURCE_TYPE, service_account_actions::ALL),
         ];
         vocabularies
             .into_iter()

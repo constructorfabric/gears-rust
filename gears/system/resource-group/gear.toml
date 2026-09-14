@@ -1,0 +1,7 @@
+[gear]
+name = "Resource Groups Manager"
+description = "Group related resources into lifecycle-linked collections for bulk access and operations."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

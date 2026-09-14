@@ -43,6 +43,11 @@ pub(super) fn register_address_routes(mut router: Router, openapi: &dyn OpenApiR
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        // This handler's body is `extract::Json<T>`, which can additionally
+        // produce 413/415/422 beyond error_400's plain 400.
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .error_500(openapi)
         .register(router, openapi);
 

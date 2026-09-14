@@ -1,0 +1,30 @@
+family     = "flat"
+id         = "quantity-independent"
+kind       = "evaluation"
+provenance = ["AC#60", "PRD 17.2", "PRD 6.2"]
+
+# `flat` is valid on non-usage rows only; `flat` on a usage row fails publish
+# with MODEL_KIND_CHARGEKIND_MISMATCH, because the plain untiered metered rate is
+# `per_unit`, not `flat`. That makes these two kinds neighbours that get
+# confused, and `per_unit` is the one that multiplies. This case asserts the
+# opposite property for `flat`: the quantity changes nothing.
+
+[snapshot]
+model_kind   = "flat"
+charge_kind  = "recurring"
+currency     = "USD"
+amount_minor = 9900
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 9900 }
+why    = "a flat charge is owed whether or not anything was consumed - this is the case that separates flat from per_unit, where q=0 bills nothing"
+
+[[assert]]
+given  = { q = 1 }
+expect = { charge_minor = 9900 }
+
+[[assert]]
+given  = { q = 1000 }
+expect = { charge_minor = 9900 }
+why    = "the quantity does not scale a flat row; an evaluator that multiplies here has silently turned it into per_unit"

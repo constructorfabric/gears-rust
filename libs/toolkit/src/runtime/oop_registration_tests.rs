@@ -4,15 +4,18 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use cf_system_sdks::directory::{ServiceEndpoint, ServiceInstanceInfo};
+use cf_system_sdks::directory::{DirectoryInvalidArgument, ServiceEndpoint, ServiceInstanceInfo};
 
 /// Stub directory: fails `register`/`resolve` a configurable number of times,
-/// then succeeds; records register calls and heartbeats.
+/// then succeeds; records register calls and heartbeats. When
+/// `reject_register` is set, `register` always returns a permanent
+/// [`DirectoryInvalidArgument`] rejection.
 struct StubDirectory {
     fail_register: AtomicUsize,
     register_calls: AtomicUsize,
     heartbeats: AtomicUsize,
     fail_resolve: AtomicUsize,
+    reject_register: bool,
 }
 
 impl StubDirectory {
@@ -22,6 +25,16 @@ impl StubDirectory {
             register_calls: AtomicUsize::new(0),
             heartbeats: AtomicUsize::new(0),
             fail_resolve: AtomicUsize::new(fail_resolve),
+            reject_register: false,
+        }
+    }
+
+    /// A directory that permanently rejects every registration (as the gRPC
+    /// front-end does for a mis-configured label / endpoint URI).
+    fn rejecting() -> Self {
+        Self {
+            reject_register: true,
+            ..Self::new(0, 0)
         }
     }
 }
@@ -54,6 +67,9 @@ impl DirectoryClient for StubDirectory {
 
     async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_register {
+            return Err(DirectoryInvalidArgument::new("bad label").into());
+        }
         if self.fail_register.load(Ordering::SeqCst) > 0 {
             self.fail_register.fetch_sub(1, Ordering::SeqCst);
             anyhow::bail!("directory unavailable");
@@ -72,14 +88,10 @@ impl DirectoryClient for StubDirectory {
 }
 
 fn info() -> RegisterInstanceInfo {
-    RegisterInstanceInfo {
-        gear: "billing".to_owned(),
-        instance_id: "i-1".to_owned(),
-        grpc_services: vec![],
-        version: Some("1.0.0".to_owned()),
-        rest_endpoint: Some(ServiceEndpoint::new("http://billing:8080")),
-        openapi_spec: Some("{}".to_owned()),
-    }
+    RegisterInstanceInfo::new("billing", "i-1")
+        .with_version("1.0.0")
+        .with_rest_endpoint(ServiceEndpoint::new("http://billing:8080"))
+        .with_openapi_spec("{}")
 }
 
 #[test]
@@ -102,6 +114,23 @@ async fn registration_retries_until_success() {
     let cancel = CancellationToken::new();
     let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
     assert!(ok);
+}
+
+#[tokio::test]
+async fn registration_keeps_loop_alive_on_permanent_rejection() {
+    // A DirectoryInvalidArgument is permanent: the backoff retry must give up
+    // after a single attempt rather than retrying a request that can never
+    // succeed, yet still return `true` so the presence loop keeps running.
+    let stub = Arc::new(StubDirectory::rejecting());
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    assert!(ok, "a permanent rejection must not stop the presence loop");
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        1,
+        "a permanent rejection must not be retried"
+    );
 }
 
 #[tokio::test]
@@ -138,6 +167,37 @@ async fn presence_loop_registers_once_then_heartbeats_until_cancel() {
     assert!(
         stub.heartbeats.load(Ordering::SeqCst) >= 1,
         "the single presence task must send heartbeats"
+    );
+
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn presence_loop_survives_permanent_rejection() {
+    // A permanent DirectoryInvalidArgument must NOT tear the presence loop down:
+    // it keeps heartbeating and periodically retrying re-registration. Only
+    // cancellation stops it.
+    let stub = Arc::new(StubDirectory::rejecting());
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+
+    let task = tokio::spawn(presence_loop(
+        Arc::clone(&directory),
+        info(),
+        Duration::from_secs(1),
+        cancel.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(
+        !task.is_finished(),
+        "a permanent rejection must not stop the presence loop"
+    );
+    assert!(
+        stub.heartbeats.load(Ordering::SeqCst) >= 1,
+        "the loop must keep heartbeating despite a permanent rejection"
     );
 
     cancel.cancel();

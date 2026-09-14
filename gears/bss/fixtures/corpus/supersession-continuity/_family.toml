@@ -1,0 +1,41 @@
+family     = "supersession-continuity"
+role       = "publish"
+gates      = ["graduated", "volume"]
+provenance = ["inst-tb-supersession-units", "inst-tb-window-continuity", "D-22", "D-82", "D-98", "D-122", "D-127", "D-129"]
+
+# D-22, ratified 2026-07-10: the continuity fixture **gates the first publish of
+# any tiered usage kind**, alongside that kind's own fixture. Gating the first
+# publish rather than the first supersession is the fail-safe reading - by the
+# time a supersession happens the fixture must already have proven `Q`-
+# continuity - and it keeps one uniform FixtureGate trigger.
+#
+# So the tiered kinds, `graduated` and `volume`, and no others. The family also
+# carries `flat`, `per_unit` and `package` pairs, and deliberately does not gate
+# them: those cases say where the guard's boundary is (a `flat` row has no
+# counter; a `per_unit` recurring row has none either), and D-22 scoped the gate
+# to the kinds that do.
+#
+# It was recorded as `role = "conformance"` while the registry was keyed by
+# `modelKind` alone, and under that keying it could not have gated anything: a
+# tiered row's only question was "is `graduated` green", answered by
+# `tier-boundary`. The variant axis is what makes this row a row.
+
+# Every pair in this family is a whole authored row on each side, not a delta.
+#
+# The cases read as "the only difference is X", and that is what they assert -
+# but publish is asked of the *row*, and a row that would not publish on an
+# empty key does not publish on an occupied one either. So each side carries
+# everything its own kind requires: `billingGranularity` on every usage row and
+# `tierAggregationWindow` on every tiered (`inst-tb-window`) and `package`
+# (`inst-pk-window`, D-58) usage row. Authored short, the whole family stops at
+# `EVAL_POLICY_MISSING` and the unit guard is never reached - the pair guard
+# would go untested behind a row-shape rejection that has nothing to do with it.
+#
+# Where a field is not the subject of a case it is **equal on both sides**, so
+# the only thing the guard can see is the field the case is about.
+#
+# `invoice_period` is the window throughout, matching this family's own
+# evaluation case (`counter-continues-across-supersession`): the counter it
+# continues and the counter these rows are denominated against are the same
+# counter, and a family that disagreed with itself about which window that is
+# would be pinning two different mechanisms.

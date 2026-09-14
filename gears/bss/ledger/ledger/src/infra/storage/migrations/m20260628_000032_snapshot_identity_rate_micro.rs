@@ -68,14 +68,14 @@ impl MigrationTrait for Migration {
         let statements: &[&str] = match backend {
             sea_orm::DatabaseBackend::Postgres => PG_UP_STATEMENTS,
             sea_orm::DatabaseBackend::Sqlite => SQLITE_UP_STATEMENTS,
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Migration(
                     "MySQL not supported for bss-ledger".to_owned(),
                 ));
             }
         };
         for sql in statements {
-            conn.execute(Statement::from_string(backend, (*sql).to_owned()))
+            conn.execute_raw(Statement::from_string(backend, (*sql).to_owned()))
                 .await?;
         }
         Ok(())
@@ -87,14 +87,14 @@ impl MigrationTrait for Migration {
         let statements: &[&str] = match backend {
             sea_orm::DatabaseBackend::Postgres => PG_DOWN_STATEMENTS,
             sea_orm::DatabaseBackend::Sqlite => SQLITE_DOWN_STATEMENTS,
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Migration(
                     "MySQL not supported for bss-ledger".to_owned(),
                 ));
             }
         };
         for sql in statements {
-            conn.execute(Statement::from_string(backend, (*sql).to_owned()))
+            conn.execute_raw(Statement::from_string(backend, (*sql).to_owned()))
                 .await?;
         }
         Ok(())

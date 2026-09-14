@@ -1,0 +1,7 @@
+[gear]
+name = "API Gateway"
+description = "Single public API entrypoint with routing, auth, rate limiting, and OpenAPI publication."
+category = "api-ingress"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

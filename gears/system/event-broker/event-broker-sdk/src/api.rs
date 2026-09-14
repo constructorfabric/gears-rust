@@ -2,6 +2,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use gts::GtsInstanceId;
 use serde::{Deserialize, Serialize};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -136,15 +137,16 @@ pub struct JoinRequest {
 }
 
 /// An event received from the broker stream.
+///
+/// It names no topic: a topic is what the event's `type_id` declares, so the
+/// consumer resolves it rather than the broker repeating it on every frame.
 #[derive(Debug, Clone)]
 pub struct WireEvent {
     pub id: Uuid,
     pub type_id: String,
-    pub topic: String,
     pub tenant_id: Uuid,
     pub subject: String,
     pub subject_type: String,
-    pub partition_key: Option<String>,
     pub partition: u32,
     pub sequence: i64,
     pub offset: i64,
@@ -154,16 +156,15 @@ pub struct WireEvent {
     pub data: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PartitionSlot {
-    pub topic_ix: u16,
-    pub partition: u32,
-}
-
 /// A per-partition cursor position carried by stream topology/control frames.
+///
+/// The topic is named rather than indexed, so a position identifies its partition
+/// on its own - `partition` alone is ambiguous across the topics one subscription
+/// can be assigned.
 #[derive(Debug, Clone)]
 pub struct PartitionPosition {
-    pub slot: PartitionSlot,
+    pub topic: GtsInstanceId,
+    pub partition: u32,
     /// Session cursor - last processed offset.
     pub offset: i64,
     /// Highest offset the broker has scanned for this group/partition.

@@ -16,7 +16,7 @@
 //! Rows are seeded by RAW SQL `INSERT` directly into `bss.ledger_*` (the simplest
 //! reliable way to populate a read test — mirrors `postgres_refund_dispute_hold.rs`
 //! / `postgres_credit_note.rs`), for two tenants A and B. The shared harness
-//! (the `pg()` helper, `Postgres::default().start()`,
+//! (the `pg()` helper, `test_containers::postgres().start()`,
 //! `Migrator::up`, the `search_path=bss,public` provider) is duplicated from
 //! `postgres_refund.rs` per the established convention (no shared module across
 //! these test files). Ignored by default; run with `-- --ignored` (needs Docker).
@@ -40,10 +40,10 @@ use bss_ledger::infra::storage::repo::{
     AdjustmentRepo, ApprovalRepo, DisputeRepo, JournalRepo, RecognitionRepo,
 };
 use bss_ledger_sdk::ODataQuery;
-use chrono::{DateTime, Utc};
+
+use bss_ledger::domain::instant::parse_rfc3339;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -105,7 +105,7 @@ async fn seed_refund(
     payment_id: &str,
     amount: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
           amount_minor, clearing_state, created_at_utc) \
@@ -124,7 +124,7 @@ async fn seed_credit_note(
     origin_invoice_id: &str,
     amount: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_credit_note \
          (tenant_id, credit_note_id, origin_invoice_id, revenue_stream, currency, \
           amount_minor, reason_code, created_at_utc) \
@@ -143,7 +143,7 @@ async fn seed_debit_note(
     origin_invoice_id: &str,
     amount: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_debit_note \
          (tenant_id, debit_note_id, origin_invoice_id, currency, amount_minor, created_at_utc) \
          VALUES ('{tenant}','{debit_note_id}','{origin_invoice_id}','USD',{amount}, now())"
@@ -162,7 +162,7 @@ async fn seed_dispute(
     payment_id: &str,
     disputed: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
          (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
           disputed_amount_minor, cash_hold_minor, version) \
@@ -175,7 +175,7 @@ async fn seed_dispute(
 
 /// Seed a `ledger_recognition_run` row (3-col PK `(tenant, period_id, run_id)`).
 async fn seed_run(raw: &DatabaseConnection, tenant: Uuid, run_id: Uuid, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_recognition_run \
          (tenant_id, run_id, period_id, started_at_utc, status) \
          VALUES ('{tenant}','{run_id}','{period_id}', now(),'DONE')"
@@ -196,7 +196,7 @@ async fn seed_policy(
     a6: i32,
     ttl: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dual_control_policy \
          (tenant_id, version, effective_from, d2_threshold_minor, \
           a6_backdating_biz_days, pending_ttl_seconds, created_at_utc) \
@@ -218,7 +218,7 @@ async fn seed_journal_entry(
 ) -> Uuid {
     let entry_id = Uuid::now_v7();
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -230,7 +230,7 @@ async fn seed_journal_entry(
     .await
     .unwrap();
     for (side, amount) in [("DR", 1000_i64), ("CR", 1000_i64)] {
-        txn.execute(pg(format!(
+        txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
                  account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -252,7 +252,7 @@ async fn seed_journal_entry(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -304,7 +304,7 @@ async fn refund_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -348,7 +348,7 @@ async fn refund_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_cursor_paginates() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -425,7 +425,7 @@ async fn refund_list_cursor_paginates() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_filter_narrows() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -468,7 +468,7 @@ async fn refund_list_filter_narrows() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn credit_note_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -494,7 +494,7 @@ async fn credit_note_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn credit_note_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -525,7 +525,7 @@ async fn credit_note_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -551,7 +551,7 @@ async fn debit_note_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -582,7 +582,7 @@ async fn debit_note_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -608,7 +608,7 @@ async fn dispute_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -639,7 +639,7 @@ async fn dispute_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn recognition_run_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -666,7 +666,7 @@ async fn recognition_run_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn recognition_run_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -701,7 +701,7 @@ async fn recognition_run_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn journal_entries_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -748,7 +748,7 @@ async fn journal_entries_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -759,7 +759,7 @@ async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
     seed_policy(&raw, b, 1, "2026-06-01T00:00:00Z", 80_000, 5, 604_800).await;
 
     let repo = ApprovalRepo::new(provider.clone());
-    let now: DateTime<Utc> = "2026-06-25T00:00:00Z".parse().expect("ts");
+    let now = parse_rfc3339("2026-06-25T00:00:00Z").expect("ts");
 
     let versions = repo
         .read_policy_versions(&AccessScope::for_tenant(a), a)
@@ -789,14 +789,14 @@ async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dual_control_policy_absent_row_yields_no_effective_version() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider) = boot(&url).await;
     let a = Uuid::now_v7();
 
     let repo = ApprovalRepo::new(provider.clone());
-    let now: DateTime<Utc> = "2026-06-25T00:00:00Z".parse().expect("ts");
+    let now = parse_rfc3339("2026-06-25T00:00:00Z").expect("ts");
     let versions = repo
         .read_policy_versions(&AccessScope::for_tenant(a), a)
         .await

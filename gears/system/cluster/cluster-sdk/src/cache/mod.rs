@@ -1,4 +1,3 @@
-// Created: 2026-06-03 by Constructor Tech
 //! Distributed cache primitive — the universal compare-and-swap building block
 //! on which leader election and locks are layered.
 //!
@@ -17,9 +16,12 @@ pub mod watch;
 pub use backend::ClusterCacheBackend;
 pub use facade::ClusterCacheV1;
 pub use polyfill::PollingPrefixWatch;
-pub use resolver::{CacheResolverBuilder, validate_cache_capabilities};
+pub use resolver::{CacheResolverBuilder, validate_cache_capabilities_from};
 pub(crate) use scoped::ScopedCacheBackend;
+pub use scoped::reserved_lease_cache;
 pub use types::{
     CacheCapability, CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, PutRequest, Ttl,
 };
-pub use watch::{CacheWatch, CacheWatchEvent, CacheWatchSender, CacheWatchTrySendError};
+pub use watch::{
+    CacheTerminalPermit, CacheWatch, CacheWatchEvent, CacheWatchSender, CacheWatchTrySendError,
+};

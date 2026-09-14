@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS credstore_secrets (
 );
                 "
             ),
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };

@@ -16,6 +16,7 @@
 //
 // @cpt-cf-chat-engine-api-rest-handlers:p14
 
+pub mod docs;
 pub mod export;
 pub mod glue;
 pub mod intelligence;

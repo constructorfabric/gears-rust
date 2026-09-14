@@ -28,6 +28,24 @@ pub use chat_engine_sdk::models::{
     UserId, VariantInfo,
 };
 
+/// Message-metadata keys the engine writes itself on assistant rows — the
+/// `LlmMessageMetadata` fields plus the summarization bookkeeping key. A
+/// client that sets one of these on an outgoing user message is rejected, so
+/// a reader can always trust their meaning. Mirrors
+/// [`crate::domain::session::RESERVED_METADATA_KEYS`] for sessions.
+pub const RESERVED_MESSAGE_METADATA_KEYS: &[&str] = &[
+    "model_used",
+    "finish_reason",
+    "temperature_used",
+    "usage",
+    "summarized_message_ids",
+];
+
+/// Upper bound on the serialized size of client-supplied `Message.metadata`.
+/// The blob is persisted verbatim for the lifetime of the session's
+/// `retention_policy`, so it is capped rather than left client-controlled.
+pub const MAX_MESSAGE_METADATA_BYTES: usize = 8 * 1024;
+
 /// Concatenate the bodies of all `text`-typed parts of a message in `number`
 /// order, joined by newlines. Non-text parts contribute nothing. This is the
 /// canonical "plain text of a message" used by search matching, export

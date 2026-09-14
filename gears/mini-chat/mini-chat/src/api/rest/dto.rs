@@ -71,8 +71,13 @@ impl From<ChatDetail> for ChatDetailDto {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Response DTO for a message in the list endpoint.
+///
+/// Aliased to `MiniChatMessageDto` in the `OpenAPI`` schema: `chat-engine` also
+/// exposes a `MessageDto`, and both gears register into the same api-gateway
+/// `OpenAPI`` registry, so the bare ident would collide in `components.schemas`.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = MiniChatMessageDto)]
 pub struct MessageDto {
     pub id: Uuid,
     pub request_id: Uuid,
@@ -224,6 +229,7 @@ pub struct SetReactionReq {
 /// Response DTO for a reaction.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = MiniChatReactionDto)]
 pub struct ReactionDto {
     pub message_id: Uuid,
     pub reaction: String,

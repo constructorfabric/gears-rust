@@ -3,16 +3,20 @@
 //! Public contract that deployment-specific `IdP` plugins implement and
 //! that AM consumes through `ClientHub`. The trait carries two
 //! tenant-lifecycle methods ([`IdpPluginClient::provision_tenant`],
-//! [`IdpPluginClient::deprovision_tenant`]) and four user-lifecycle
+//! [`IdpPluginClient::deprovision_tenant`]), four user-lifecycle
 //! methods ([`IdpPluginClient::provision_user`],
 //! [`IdpPluginClient::update_user`],
 //! [`IdpPluginClient::deprovision_user`],
-//! [`IdpPluginClient::list_users`]) — together with the
+//! [`IdpPluginClient::list_users`]), and four service-account
+//! methods ([`IdpPluginClient::provision_service_account`],
+//! [`IdpPluginClient::rotate_service_account_secret`],
+//! [`IdpPluginClient::revoke_service_account`],
+//! [`IdpPluginClient::list_service_accounts`]) — together with the
 //! request / result / failure shapes they exchange. Every method
 //! ships a default impl that returns the `UnsupportedOperation`
 //! variant for its category so deployments that ship a partial
-//! adapter (e.g. tenant-only or user-only) only need to override the
-//! methods they implement.
+//! adapter (e.g. tenant-only, or users without machine identities)
+//! only need to override the methods they implement.
 //!
 //! There is no separate availability probe: `provision_tenant` IS the
 //! readiness signal. Plugins MUST return
@@ -67,7 +71,16 @@
 //! raw vendor text and AM owns the public-surface mapping.
 //!
 //! See [`crate::idp_user`] for the user-operations DTOs forwarded
-//! into the same trait's user-side methods.
+//! into the same trait's user-side methods, and
+//! [`crate::idp_service_account`] for the service-account DTOs.
+//! The service-account half deliberately does NOT reuse the
+//! digest-and-forward posture the tenant / user halves apply to
+//! provider `detail` text: it discards that text entirely and answers
+//! each category with a fixed AM-owned message, because a machine
+//! identity's failure paths are the ones most likely to carry a
+//! credential in a vendor error string. That module documents the
+//! reasoning and the obligation it places on adapters (log your own
+//! diagnostics in-process).
 
 use async_trait::async_trait;
 use gts::GtsTypeId;
@@ -77,6 +90,11 @@ use uuid::Uuid;
 
 use toolkit_odata::Page;
 
+use crate::idp_service_account::{
+    IdpListServiceAccountsRequest, IdpProvisionServiceAccountRequest,
+    IdpRevokeServiceAccountRequest, IdpRotateServiceAccountSecretRequest,
+    IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
+};
 use crate::idp_user::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpTenantContext,
     IdpUpdateUserRequest, IdpUser, IdpUserOperationFailure,
@@ -660,6 +678,138 @@ pub trait IdpPluginClient: Send + Sync + 'static {
         })
     }
     // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-contract-trait-surface:p1:inst-trait-user-ops-surface
+
+    // ---- Service-account lifecycle ---------------------------------
+    // @cpt-begin:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-trait-sa-ops-surface
+
+    /// Provision a confidential `client_credentials`-only client owned
+    /// by `req.tenant_context.tenant_id` — a tenant-scoped machine
+    /// identity. Issued tokens carry the owning `tenant_id` and a
+    /// service-subject `user_type`.
+    ///
+    /// Implementors **MUST** reject a request whose `req.name` is
+    /// already live in the tenant with
+    /// [`IdpServiceAccountFailure::InvalidInput`], and **MUST NOT**
+    /// resume, reveal, or modify the existing account — including when
+    /// that account is a half-created one left behind by an earlier
+    /// `Ambiguous` failure. So `(tenant_id, name)` identifies at most
+    /// one live account, which is precisely what makes the correlation
+    /// step below unambiguous: a name matches one listing entry or none,
+    /// never several. See
+    /// [`crate::idp_service_account::IdpServiceAccountSummary::name`].
+    ///
+    /// This check MUST be atomic with respect to concurrent calls: two
+    /// concurrent provisions for the same `(tenant_id, name)` MUST NOT
+    /// both succeed.
+    ///
+    /// Recovering from `Ambiguous` therefore starts with correlation,
+    /// not with a blind retry: list the tenant and look for the entry
+    /// whose `name` equals the submitted one. If it is present the
+    /// provision did land, and the caller resolves it by that entry's
+    /// `client_id` — either rotate to obtain usable credentials without
+    /// deleting, or revoke followed by a fresh provision. If it is
+    /// absent, the provision did not land and a plain retry is safe.
+    /// Accounts are deleted when their owning tenant is
+    /// deprovisioned.
+    ///
+    /// Rotate is the cheaper of the two recoveries but it is NOT
+    /// guaranteed to be available. An `Ambiguous` provision may have
+    /// stopped at any stage, and an implementor whose account is only
+    /// usable once several stages completed **MAY** reject a rotate
+    /// against such an account with
+    /// [`IdpServiceAccountFailure::InvalidInput`] rather than hand back
+    /// a secret for a partially provisioned identity. Callers MUST
+    /// therefore treat `InvalidInput` from the rotate leg as "this one
+    /// is not repairable" and fall through to revoke + provision, which
+    /// is always available. See `ServiceAccountFacade::rotate_secret` in
+    /// the Keycloak adapter for a concrete implementation of that
+    /// rejection.
+    ///
+    /// The secret in the returned
+    /// [`IdpServiceAccountCredentials`] is surfaced exactly once —
+    /// there is no read-back path, and recovery from loss is a rotate.
+    ///
+    /// Default impl returns
+    /// [`IdpServiceAccountFailure::UnsupportedOperation`] so tenant-
+    /// and user-only adapters compile without stubbing the
+    /// service-account methods.
+    async fn provision_service_account(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpProvisionServiceAccountRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        let _ = (ctx, req);
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "provision_service_account not implemented".to_owned(),
+        })
+    }
+
+    /// Regenerate the account's secret; the old one stops working.
+    ///
+    /// A `client_id` that does not resolve within
+    /// `req.tenant_context.tenant_id` MUST be reported as
+    /// [`IdpServiceAccountFailure::NotFound`] — AM answers `404`.
+    /// Unlike revoke, absence is NOT folded into success: rotating a
+    /// account that is not there produced no credential the caller
+    /// could use.
+    ///
+    /// Default impl returns
+    /// [`IdpServiceAccountFailure::UnsupportedOperation`].
+    async fn rotate_service_account_secret(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpRotateServiceAccountSecretRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        let _ = (ctx, req);
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "rotate_service_account_secret not implemented".to_owned(),
+        })
+    }
+
+    /// Delete the account.
+    ///
+    /// Idempotency by error-mapping, as on the tenant side: plugins map
+    /// a vendor-side "client does not exist" response 1:1 to
+    /// [`IdpServiceAccountFailure::NotFound`] rather than magic-mapping
+    /// it to `Ok(())`; AM treats that variant as success-equivalent so a
+    /// repeated `DELETE` still answers `204`.
+    ///
+    /// Default impl returns
+    /// [`IdpServiceAccountFailure::UnsupportedOperation`].
+    async fn revoke_service_account(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpRevokeServiceAccountRequest,
+    ) -> Result<(), IdpServiceAccountFailure> {
+        let _ = (ctx, req);
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "revoke_service_account not implemented".to_owned(),
+        })
+    }
+
+    /// List the tenant's service accounts (no secrets). Backs audit,
+    /// management surfaces, and the ambiguous-create reconciliation
+    /// path.
+    ///
+    /// Unpaginated by contract — see
+    /// [`IdpListServiceAccountsRequest`]. Each entry carries the
+    /// caller-supplied `name`, which implementors MUST report verbatim:
+    /// it is what lets a caller correlate an `Ambiguous` provision with
+    /// the account it may have produced.
+    ///
+    /// Default impl returns
+    /// [`IdpServiceAccountFailure::UnsupportedOperation`].
+    async fn list_service_accounts(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpListServiceAccountsRequest,
+    ) -> Result<Vec<IdpServiceAccountSummary>, IdpServiceAccountFailure> {
+        let _ = (ctx, req);
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "list_service_accounts not implemented".to_owned(),
+        })
+    }
+    // @cpt-end:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-trait-sa-ops-surface
 }
 
 #[cfg(test)]

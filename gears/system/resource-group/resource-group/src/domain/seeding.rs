@@ -43,7 +43,7 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
     // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2
     for seed in seeds {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2a
-        match type_service.get_type(&seed.code).await {
+        match type_service.get_type_unscoped(&seed.code).await {
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2a
             Ok(existing) => {
                 // Normalize allowed-type lists before diffing: `load_full_type()`
@@ -69,7 +69,9 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
                         allowed_membership_types: seed_allowed_membership_types,
                         metadata_schema: seed.metadata_schema.clone(),
                     };
-                    type_service.update_type(&seed.code, update_req).await?;
+                    type_service
+                        .update_type_unscoped(&seed.code, update_req)
+                        .await?;
                     result.updated += 1;
                     // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2c
                 } else {
@@ -80,7 +82,7 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
             }
             Err(DomainError::TypeNotFound { .. }) => {
                 // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2d
-                type_service.create_type(seed.clone()).await?;
+                type_service.create_type_unscoped(seed.clone()).await?;
                 result.created += 1;
                 // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2d
             }
@@ -152,13 +154,10 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2c
             Err(DomainError::GroupNotFound { .. }) => {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2d
-                let req = CreateGroupRequest {
-                    id: Some(seed.id),
-                    code: seed.code.clone(),
-                    name: seed.name.clone(),
-                    parent_id: seed.parent_id,
-                    metadata: seed.metadata.clone(),
-                };
+                let req = CreateGroupRequest::new(seed.code.clone(), seed.name.clone())
+                    .with_id(Some(seed.id))
+                    .with_parent_id(seed.parent_id)
+                    .with_metadata(seed.metadata.clone());
                 group_service
                     .create_group_unscoped(req, seed.tenant_id)
                     .await?;

@@ -45,11 +45,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-use authz_resolver_sdk::error::AuthZResolverError;
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -70,15 +69,17 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::AdjustmentRepo;
 use bss_ledger_sdk::{AccountClass, Side};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -99,11 +100,12 @@ const FOREIGN_TENANT: Uuid = uuid::uuid!("ffffffff-ffff-ffff-ffff-ffffffffffff")
 struct AllowInResolver;
 
 #[async_trait]
-impl AuthZResolverClient for AllowInResolver {
+impl AuthZResolverApi for AllowInResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -122,11 +124,12 @@ impl AuthZResolverClient for AllowInResolver {
 struct DenyResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyResolver {
+impl AuthZResolverApi for DenyResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -212,7 +215,7 @@ async fn boot() -> (
     DBProvider<DbError>,
     Seller,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -221,7 +224,7 @@ async fn boot() -> (
     let tdb = connect_db(&repo_url, ConnectOpts::default()).await.unwrap();
     let provider = DBProvider::<DbError>::new(tdb);
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: SUBJECT_TENANT,
         payer: Uuid::now_v7(),
@@ -236,7 +239,7 @@ async fn boot() -> (
         goodwill: Uuid::now_v7(),
         reusable_credit: Uuid::now_v7(),
         tax: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = bss_ledger::infra::storage::repo::ReferenceRepo::new(provider.clone());
@@ -250,7 +253,7 @@ async fn boot() -> (
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id

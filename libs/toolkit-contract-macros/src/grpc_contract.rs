@@ -20,10 +20,11 @@ use quote::{format_ident, quote};
 use syn::{TraitItem, Type};
 
 use crate::grpc_contract_parse::{GrpcContractModel, GrpcIdempotency, GrpcMethodModel, GrpcParam};
+use crate::model::StreamOpen;
 use crate::projection::{
-    build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
-    render_method_inputs, render_method_return_ty, rewrite_streaming_signature, strip_method_attrs,
-    type_path_ends_with,
+    Delegation, build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
+    is_platform_security_context_type, is_security_context_type, render_method_inputs,
+    render_method_return_ty, rewrite_streaming_signature, strip_method_attrs, strip_param_attrs,
 };
 use crate::support::contract_support_path;
 
@@ -70,7 +71,7 @@ fn generate_synthesized_request_from_impls(model: &GrpcContractModel) -> TokenSt
             let wire_params: Vec<&GrpcParam> = method
                 .params
                 .iter()
-                .filter(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+                .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
                 .collect();
             // Exactly one wire param of a proto-direct primitive type.
             let [param] = wire_params.as_slice() else {
@@ -142,7 +143,7 @@ fn generate_repr_guards(model: &GrpcContractModel, support: &TokenStream) -> Tok
             if param.ident == "self" {
                 continue;
             }
-            if type_path_ends_with(&param.ty, "SecurityContext") {
+            if is_security_context_type(&param.ty) {
                 let ty = &param.ty;
                 let key = quote!(#ty).to_string();
                 if seen_secctx_keys.insert(key) {
@@ -213,10 +214,15 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
     for trait_item in &mut item.items {
         if let TraitItem::Fn(method) = trait_item {
             strip_method_attrs(method, GRPC_ATTRS);
+            // `#[secctx]` is consumed by this macro; without stripping it the
+            // attribute reaches the compiler unresolved. The cluster contract
+            // needs the explicit form, since the `ctx:`-name heuristic does not
+            // match `PlatformSecurityContext`.
+            strip_param_attrs(method);
             if let Some(model_method) = model_methods.get(&method.sig.ident.to_string()) {
-                if model_method.server_streaming {
+                if let Some(open) = model_method.shape.stream_open() {
                     let (ok, err) = &model_method.result_types;
-                    rewrite_streaming_signature(method, ok, err);
+                    rewrite_streaming_signature(method, ok, err, open);
                 }
                 let arg_idents: Vec<&syn::Ident> = model_method
                     .params
@@ -228,7 +234,7 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
                     base_trait,
                     &model_method.ident,
                     arg_idents,
-                    model_method.server_streaming,
+                    Delegation::for_method(model_method.shape),
                 ));
             }
         }
@@ -277,7 +283,7 @@ fn generate_binding_fn(model: &GrpcContractModel, support: &TokenStream) -> Toke
 fn build_method_binding(method: &GrpcMethodModel, support: &TokenStream) -> TokenStream {
     let method_name = method.ident.to_string();
     let rpc_name = &method.rpc_name;
-    let server_streaming = method.server_streaming;
+    let server_streaming = method.shape.is_streaming();
     let retryable = method.retryable;
     let optional = method.optional;
     let idempotency = idempotency_tokens(method.idempotency, support);
@@ -348,6 +354,24 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
                 Self,
                 #support::runtime::transport_error::TransportError,
             > {
+                // Honor `require_tls`: refuse to build the channel over a
+                // plaintext (`http://`) scheme so the long-lived, process-scoped
+                // platform-plane credential is never sent over cleartext h2c
+                // (`cpt-cf-adr-two-plane-auth`). When it is unset, the platform's
+                // deliberate in-mesh plaintext service-to-service convention
+                // is preserved (see `ClientConfig::require_tls`).
+                if config.require_tls
+                    && !config.base_url.trim_start().starts_with("https://")
+                {
+                    return ::std::result::Result::Err(
+                        #support::runtime::transport_error::TransportError::network(
+                            ::std::format!(
+                                "require_tls is set but the gRPC endpoint scheme is not https: {}",
+                                config.base_url,
+                            ),
+                        ),
+                    );
+                }
                 let endpoint = ::tonic::transport::Endpoint::from_shared(config.base_url.clone())
                     .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
                 let endpoint = endpoint.timeout(config.timeout);
@@ -377,6 +401,61 @@ fn generate_client_impl(model: &GrpcContractModel, support: &TokenStream) -> Tok
     }
 }
 
+/// The prost type of a method's request message, computed the way
+/// `toolkit-contract-protogen` computes it rather than guessed.
+///
+/// protogen has two cases, and only the second yields `<Method>Request`:
+///
+/// - **exactly one wire parameter of a named (non-primitive) type** — the message
+///   *is* that type, reused. `put_if_absent(req: PutRequest)` therefore has input
+///   `PutRequest`, and `renew(req: LeaseRef)` has input `LeaseRef`;
+/// - **anything else** — protogen synthesizes `<UpperCamelCase(method)>Request`
+///   from the wire fields, which is the case a single primitive parameter or a
+///   multi-parameter method falls into.
+///
+/// Assuming the second case unconditionally happens to work only while every
+/// contract in the tree names its DTO after its method. The moment two methods
+/// share a request DTO — the shape the cluster design specifies, where
+/// `put`/`put_if_absent` share `PutRequest` and `renew`/`release` share `LeaseRef`
+/// — the macro refers to a prost type protogen never emitted.
+///
+/// The two must agree by construction, not by naming discipline: they are two
+/// halves of one pipeline, and a mismatch is a compile error in generated code
+/// pointing at the macro invocation rather than at the cause.
+fn proto_request_ident(method: &GrpcMethodModel) -> syn::Ident {
+    let wire_params: Vec<&GrpcParam> = method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
+        .collect();
+
+    if let [param] = wire_params.as_slice()
+        && !is_proto_direct_primitive(&param.ty)
+        && let Some(named) = named_type_ident(&param.ty)
+    {
+        return named;
+    }
+
+    format_ident!("{}Request", method.ident.to_string().to_upper_camel_case())
+}
+
+/// The last path segment of a type, when it is a plain path that protogen would
+/// render as `TypeRef::Named` — so not a container, whose element type protogen
+/// projects as `repeated` / `optional` rather than as a message of its own.
+fn named_type_ident(ty: &Type) -> Option<syn::Ident> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let last = path.path.segments.last()?;
+    if matches!(
+        last.ident.to_string().as_str(),
+        "Option" | "Vec" | "HashMap" | "BTreeMap"
+    ) {
+        return None;
+    }
+    Some(last.ident.clone())
+}
+
 fn generate_client_method(
     method: &GrpcMethodModel,
     model: &GrpcContractModel,
@@ -384,18 +463,16 @@ fn generate_client_method(
 ) -> TokenStream {
     let rpc_method_ident = format_ident!("{}", method.rpc_name.to_snake_case());
     let stubs = &model.stubs_module;
-    // Mirror `toolkit-contract-protogen`'s naming convention: the proto
-    // request type is `<UpperCamelCase(method.name)>Request`. Used to
-    // anchor type inference through the `Arc<T>` template in retryable
-    // bodies (where the chain `From → Arc::new → Arc::clone → deref →
-    // Request::new` would otherwise leave T ambiguous).
-    let request_ty_ident =
-        format_ident!("{}Request", method.ident.to_string().to_upper_camel_case());
+    // Computed to agree with protogen rather than guessed — see
+    // `proto_request_ident`. Also anchors type inference through the `Arc<T>`
+    // template in retryable bodies (where the chain `From → Arc::new →
+    // Arc::clone → deref → Request::new` would otherwise leave T ambiguous).
+    let request_ty_ident = proto_request_ident(method);
     let proto_request_ty = quote! { #stubs::#request_ty_ident };
 
     let sig_inputs = render_method_inputs(method.params.iter().map(|p| (&p.ident, &p.ty)));
     let (ok_ty, err_ty) = &method.result_types;
-    let return_ty = render_method_return_ty(ok_ty, err_ty, method.server_streaming);
+    let return_ty = render_method_return_ty(ok_ty, err_ty, method.shape);
     let err_convert = quote! {
         |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
     };
@@ -412,9 +489,14 @@ fn generate_client_method(
         );
         return quote::quote_spanned! { span => compile_error!(#msg); };
     };
-    let ctx_ident = security_context_param(method);
+    // A single value carries both the token-attachment ident and the plane
+    // classification, so a method can never attach a tenant bearer token while
+    // classifying itself as platform-plane (or vice versa): the two are no
+    // longer a separable `(Option<ident>, bool)` pair the three generators
+    // could receive inconsistently.
+    let plane = auth_plane(method);
 
-    if method.server_streaming {
+    if method.shape.is_streaming() {
         return generate_streaming_client_method(
             method,
             stubs,
@@ -423,7 +505,7 @@ fn generate_client_method(
             &sig_inputs,
             &return_ty,
             &body_ident,
-            ctx_ident.as_ref(),
+            plane,
             ok_ty,
             err_ty,
         );
@@ -436,7 +518,7 @@ fn generate_client_method(
             &sig_inputs,
             &return_ty,
             &body_ident,
-            ctx_ident.as_ref(),
+            plane,
             ok_ty,
             &proto_request_ty,
             support,
@@ -450,12 +532,41 @@ fn generate_client_method(
         &sig_inputs,
         &return_ty,
         &body_ident,
-        ctx_ident.as_ref(),
+        plane,
         ok_ty,
         &proto_request_ty,
         support,
         &err_convert,
     )
+}
+
+/// The authentication plane of a method, derived **once** from its single
+/// security-context parameter. Collapsing the former `(Option<&Ident>, bool)`
+/// pair into one value makes it impossible for the token-attachment ident and
+/// the plane classification to be passed inconsistently to the code generators
+/// (`cpt-cf-adr-two-plane-auth`).
+#[derive(Clone, Copy)]
+enum AuthPlane<'a> {
+    /// No security-context parameter: no credential is attached.
+    None,
+    /// Tenant plane (`SecurityContext`): attach the caller's bearer token,
+    /// sourced from the named argument.
+    Tenant(&'a syn::Ident),
+    /// Platform plane (`PlatformSecurityContext`): the off-wire marker (named by
+    /// the ident) is consumed and the runtime internal token is attached — never
+    /// from the argument.
+    Platform(&'a syn::Ident),
+}
+
+/// Classify a method's authentication plane from its (at most one)
+/// security-context parameter. `parse_params` rejects more than one such
+/// parameter, so the selection is unambiguous.
+fn auth_plane(method: &GrpcMethodModel) -> AuthPlane<'_> {
+    match security_context_param(method) {
+        Some(p) if is_platform_security_context_type(&p.ty) => AuthPlane::Platform(&p.ident),
+        Some(p) => AuthPlane::Tenant(&p.ident),
+        None => AuthPlane::None,
+    }
 }
 
 /// Emit a non-retryable unary method body. Converts the DTO to the proto
@@ -467,18 +578,32 @@ fn generate_one_shot_unary_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     proto_request_ty: &TokenStream,
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
     let method_ident = &method.ident;
-    let attach_metadata = match ctx_ident {
-        Some(ctx) => quote! {
+    let rpc_name = method.ident.to_string();
+    let attach_metadata = match plane {
+        // Platform plane: source the credential from the runtime provider on
+        // `self.config`, not from the `PlatformSecurityContext` argument (which
+        // carries no secret). The marker stays off the wire; `let _ = &#ctx`
+        // consumes it so it is not an unused parameter. Permissive when no
+        // provider is configured.
+        AuthPlane::Platform(ctx) => quote! {
+            let _ = &#ctx;
+            #support::grpc::attach_internal_token(
+                __request.metadata_mut(),
+                self.config.internal_token_provider.as_ref(),
+                #rpc_name,
+            )?;
+        },
+        AuthPlane::Tenant(ctx) => quote! {
             #support::grpc::attach_bearer(__request.metadata_mut(), &#ctx)?;
         },
-        None => quote! {},
+        AuthPlane::None => quote! {},
     };
 
     // Wrap the body in an inner closure that yields
@@ -496,9 +621,10 @@ fn generate_one_shot_unary_method(
                     .#rpc_method_ident(__request)
                     .await
                     .map_err(|__s| #support::grpc::map_tonic_status(&__s))?;
-                // Fallible conversion: the infallible `From<Proto>` panics on a
-                // malformed `via_string` field, which would let a peer take this
-                // process down with one bad response.
+                // Fallible conversion: a `via_string`-bearing response type has no
+                // infallible `From<Proto>` (a malformed field would otherwise let a
+                // peer take this process down with one bad response), so decode
+                // through the fallible path.
                 let __decoded = <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
                     __response.into_inner(),
                 )
@@ -524,25 +650,42 @@ fn generate_retryable_unary_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     proto_request_ty: &TokenStream,
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
     let method_ident = &method.ident;
+    let rpc_name = method.ident.to_string();
     // Inside the per-attempt async block we hold a CLONE of the context
     // (cheap if the context wraps an `Arc`). The outer binding of `__ctx`
     // captures by reference so the FnMut closure can re-clone on each retry.
-    let (ctx_outer, attempt_ctx_clone, attach_metadata) = match ctx_ident {
-        Some(ctx) => (
+    let (ctx_outer, attempt_ctx_clone, attach_metadata) = match plane {
+        // Platform plane: no per-attempt context clone — the credential comes
+        // from the runtime provider on `self.config` (accessible inside the
+        // per-attempt `async move`, which already borrows `self`). `let _ =
+        // &#ctx` consumes the off-wire marker so it is not unused. Permissive
+        // when no provider is configured.
+        AuthPlane::Platform(ctx) => (
+            quote! { let _ = &#ctx; },
+            quote! {},
+            quote! {
+                #support::grpc::attach_internal_token(
+                    __request.metadata_mut(),
+                    self.config.internal_token_provider.as_ref(),
+                    #rpc_name,
+                )?;
+            },
+        ),
+        AuthPlane::Tenant(ctx) => (
             quote! { let __ctx = #ctx; },
             quote! { let __ctx_attempt = __ctx.clone(); },
             quote! {
                 #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_attempt)?;
             },
         ),
-        None => (quote! {}, quote! {}, quote! {}),
+        AuthPlane::None => (quote! {}, quote! {}, quote! {}),
     };
 
     quote! {
@@ -594,16 +737,21 @@ fn body_param_ident(method: &GrpcMethodModel) -> Option<syn::Ident> {
     method
         .params
         .iter()
-        .find(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+        .find(|p| p.ident != "self" && !is_security_context_type(&p.ty))
         .map(|p| p.ident.clone())
 }
 
-fn security_context_param(method: &GrpcMethodModel) -> Option<syn::Ident> {
+/// The method's single security-context parameter, if any. `parse_params`
+/// (`grpc_contract_parse.rs`) rejects methods with more than one such
+/// parameter, so `.find` here is unambiguous — callers MUST derive both the
+/// token-attachment ident and the plane classification (via
+/// [`is_platform_security_context_type`]) from this same param, to avoid
+/// mixing tenant and platform auth.
+fn security_context_param(method: &GrpcMethodModel) -> Option<&GrpcParam> {
     method
         .params
         .iter()
-        .find(|p| type_path_ends_with(&p.ty, "SecurityContext"))
-        .map(|p| p.ident.clone())
+        .find(|p| is_security_context_type(&p.ty))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -615,67 +763,134 @@ fn generate_streaming_client_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     err_ty: &Type,
 ) -> TokenStream {
     let method_ident = &method.ident;
+    let rpc_name = method.ident.to_string();
 
-    let attach_metadata = match ctx_ident {
-        Some(_) => quote! {
-            if let Err(__e) = #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_clone) {
-                let __out_err: #err_ty = ::std::convert::From::from(__e);
-                Err(__out_err)?;
+    // The returned stream is `'static`, so it cannot borrow `self`; any credential
+    // source must be cloned out *before* the `try_stream!` block. For the tenant
+    // plane that is the context clone; for the platform plane it is the runtime
+    // provider (`Option<InternalTokenProvider>`, cheap `Arc` clone), with the
+    // off-wire marker consumed via `let _ = &#ctx`.
+    let (ctx_clone, attach_metadata) = match plane {
+        AuthPlane::Platform(ctx) => (
+            quote! {
+                let _ = &#ctx;
+                let __internal_token_provider =
+                    self.config.internal_token_provider.clone();
+            },
+            quote! {
+                if let Err(__e) = #support::grpc::attach_internal_token(
+                    __request.metadata_mut(),
+                    __internal_token_provider.as_ref(),
+                    #rpc_name,
+                ) {
+                    let __out_err: #err_ty = ::std::convert::From::from(__e);
+                    Err(__out_err)?;
+                }
+            },
+        ),
+        AuthPlane::Tenant(ctx) => (
+            quote! { let __ctx_clone = #ctx.clone(); },
+            quote! {
+                if let Err(__e) = #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_clone) {
+                    let __out_err: #err_ty = ::std::convert::From::from(__e);
+                    Err(__out_err)?;
+                }
+            },
+        ),
+        AuthPlane::None => (quote! {}, quote! {}),
+    };
+
+    // Steps shared by both open shapes, in wire order: build the request,
+    // attach credentials, then await the response *headers*. That await is the
+    // open — tonic's client call is `async fn(..) -> Result<Response<Streaming<T>>,
+    // Status>`, so a server that returns a `Status` before its first message
+    // fails exactly here.
+    let open_call = quote! {
+        let __proto: _ = ::std::convert::From::from(__body_owned);
+        #[allow(unused_mut)]
+        let mut __request = ::tonic::Request::new(__proto);
+        #attach_metadata
+        let __response = __client
+            .#rpc_method_ident(__request)
+            .await
+            .map_err(|__s| -> #err_ty {
+                ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
+            })?;
+        let mut __stream = __response.into_inner();
+    };
+
+    // Draining the message stream, once the open has succeeded.
+    let drain_items = quote! {
+        while let Some(__item) = __stream.next().await {
+            let __proto_item = __item.map_err(|__s| -> #err_ty {
+                ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
+            })?;
+            // Fallible decode per item: a malformed `via_string` in one
+            // frame ends the stream with an error instead of panicking
+            // through whatever task is polling it.
+            let __out: #ok_ty =
+                <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
+                    __proto_item,
+                )
+                .map_err(|__e| -> #err_ty {
+                    ::std::convert::From::from(
+                        #support::runtime::transport_error::TransportError::serialization(__e),
+                    )
+                })?;
+            yield __out;
+        }
+    };
+
+    // Only reached for a streaming method, so `stream_open()` is always `Some`;
+    // the unreachable `None` takes the awaited path (its `Result`-wrapped shape).
+    match method.shape.stream_open() {
+        // Historical shape: the open and the items are flattened into one
+        // stream, so an open-time `Status` arrives as that stream's first item.
+        // Byte-for-byte as before, since every existing `#[streaming] fn`
+        // method depends on it.
+        Some(StreamOpen::Immediate) => quote! {
+            fn #method_ident #sig_inputs #return_ty {
+                use ::futures_util::StreamExt as _;
+                let __body_owned = #body_ident;
+                let __client_arc = self.inner.clone();
+                #ctx_clone
+
+                ::std::boxed::Box::pin(::async_stream::try_stream! {
+                    let mut __client = __client_arc;
+                    #open_call
+                    #drain_items
+                })
             }
         },
-        None => quote! {},
-    };
+        // Fallible open. The same await, left where the wire puts it instead of
+        // being buried inside the stream, so an open-time `Status` is an `Err`
+        // from the call and no stream is produced. Credential attachment moves
+        // ahead of the open with it: attaching is part of opening, and a
+        // failure to attach should no more become a stream item than a `Status`
+        // should. (`None` — a unary method — is unreachable here and folds in.)
+        Some(StreamOpen::Awaited) | None => quote! {
+            async fn #method_ident #sig_inputs #return_ty {
+                use ::futures_util::StreamExt as _;
+                let __body_owned = #body_ident;
+                let mut __client = self.inner.clone();
+                #ctx_clone
 
-    let ctx_clone = match ctx_ident {
-        Some(ctx) => quote! { let __ctx_clone = #ctx.clone(); },
-        None => quote! {},
-    };
+                #open_call
 
-    quote! {
-        fn #method_ident #sig_inputs #return_ty {
-            use ::futures_util::StreamExt as _;
-            let __body_owned = #body_ident;
-            let __client_arc = self.inner.clone();
-            #ctx_clone
-
-            ::std::boxed::Box::pin(::async_stream::try_stream! {
-                let mut __client = __client_arc;
-                let __proto: _ = ::std::convert::From::from(__body_owned);
-                #[allow(unused_mut)]
-                let mut __request = ::tonic::Request::new(__proto);
-                #attach_metadata
-                let __response = __client
-                    .#rpc_method_ident(__request)
-                    .await
-                    .map_err(|__s| -> #err_ty {
-                        ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
-                    })?;
-                let mut __stream = __response.into_inner();
-                while let Some(__item) = __stream.next().await {
-                    let __proto_item = __item.map_err(|__s| -> #err_ty {
-                        ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
-                    })?;
-                    // Fallible decode per item: a malformed `via_string` in one
-                    // frame ends the stream with an error instead of panicking
-                    // through whatever task is polling it.
-                    let __out: #ok_ty =
-                        <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
-                            __proto_item,
-                        )
-                        .map_err(|__e| -> #err_ty {
-                            ::std::convert::From::from(
-                                #support::runtime::transport_error::TransportError::serialization(__e),
-                            )
-                        })?;
-                    yield __out;
-                }
-            })
-        }
+                // Past this point the open has succeeded and only per-message
+                // failures remain.
+                ::std::result::Result::Ok(::std::boxed::Box::pin(
+                    ::async_stream::try_stream! {
+                        #drain_items
+                    }
+                ))
+            }
+        },
     }
 }
 
@@ -685,4 +900,246 @@ fn generate_projection_impl(model: &GrpcContractModel) -> TokenStream {
         &client_struct_ident(&model.trait_ident),
         "grpc-client",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grpc_contract_parse::{self, GrpcContractAttr};
+    use quote::quote;
+
+    fn build_model(tokens: TokenStream) -> GrpcContractModel {
+        let attr: GrpcContractAttr = syn::parse2(quote! {
+            package = "test.v1",
+            stubs_module = "crate::stubs"
+        })
+        .unwrap();
+        let item: syn::ItemTrait = syn::parse2(tokens).unwrap();
+        grpc_contract_parse::parse(attr, item).unwrap()
+    }
+
+    fn expand(tokens: TokenStream) -> String {
+        generate(&build_model(tokens)).to_string()
+    }
+
+    /// Concatenate the token strings of every generated `fn` body whose ident
+    /// matches `method`, across all `impl` blocks in the expansion. Parsing the
+    /// expansion as a `syn::File` and locating the statement is robust against
+    /// proc-macro2 pretty-printing whitespace (`& ctx` vs `&ctx`) and lets a
+    /// per-method assertion detect cross-method plane leakage that a whole-file
+    /// `contains` on a single-method trait cannot.
+    fn method_bodies(tokens: TokenStream, method: &str) -> String {
+        use quote::ToTokens as _;
+        let file: syn::File =
+            syn::parse2(generate(&build_model(tokens))).expect("expansion parses as a syn::File");
+        let mut out = String::new();
+        for item in &file.items {
+            let syn::Item::Impl(imp) = item else { continue };
+            for impl_item in &imp.items {
+                if let syn::ImplItem::Fn(f) = impl_item
+                    && f.sig.ident == method
+                {
+                    out.push_str(&f.block.to_token_stream().to_string());
+                    out.push('\n');
+                }
+            }
+        }
+        assert!(!out.is_empty(), "no fn `{method}` found in expansion");
+        out
+    }
+
+    #[test]
+    fn tenant_plane_method_attaches_bearer_not_internal_token() {
+        let body = method_bodies(
+            quote! {
+                pub trait FooApiGrpc: FooApi {
+                    async fn get_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+                }
+            },
+            "get_thing",
+        );
+        assert!(body.contains("attach_bearer"), "got:\n{body}");
+        assert!(!body.contains("attach_internal_token"), "got:\n{body}");
+    }
+
+    #[test]
+    fn platform_plane_method_attaches_internal_token_not_bearer() {
+        let body = method_bodies(
+            quote! {
+                pub trait FooApiGrpc: FooApi {
+                    async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+                }
+            },
+            "get_thing",
+        );
+        assert!(body.contains("attach_internal_token"), "got:\n{body}");
+        assert!(!body.contains("attach_bearer"), "got:\n{body}");
+        // The credential is wired to the runtime provider on `self.config`, not
+        // sourced from the (off-wire) argument.
+        assert!(
+            body.contains("internal_token_provider"),
+            "attach must be wired to self.config.internal_token_provider; got:\n{body}"
+        );
+    }
+
+    /// A trait mixing a tenant method and a platform method: each generated body
+    /// must carry ONLY its own plane's attacher. This is the case a single-method
+    /// trait cannot cover — it detects plane classification derived from the
+    /// wrong method.
+    #[test]
+    fn mixed_trait_keeps_each_method_on_its_own_plane() {
+        let tokens = quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn tenant_call(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+                async fn platform_call(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        };
+        let tenant = method_bodies(tokens.clone(), "tenant_call");
+        assert!(tenant.contains("attach_bearer"), "got:\n{tenant}");
+        assert!(!tenant.contains("attach_internal_token"), "got:\n{tenant}");
+
+        let platform = method_bodies(tokens, "platform_call");
+        assert!(
+            platform.contains("attach_internal_token"),
+            "got:\n{platform}"
+        );
+        assert!(!platform.contains("attach_bearer"), "got:\n{platform}");
+    }
+
+    #[test]
+    fn platform_plane_retryable_method_attaches_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                #[idempotency_level(Idempotent)]
+                async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_internal_token"), "got:\n{out}");
+        assert!(!out.contains("attach_bearer"), "got:\n{out}");
+    }
+
+    #[test]
+    fn platform_plane_streaming_method_attaches_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                // `fn` — the infallible open. The `async fn` counterpart has
+                // its own test below, since it emits a different body.
+                #[streaming]
+                fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_internal_token"), "got:\n{out}");
+        assert!(!out.contains("attach_bearer"), "got:\n{out}");
+    }
+
+    #[test]
+    fn tenant_plane_streaming_method_attaches_bearer_not_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                // `fn` — see the sibling platform-plane test.
+                #[streaming]
+                fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_bearer"), "got:\n{out}");
+        assert!(!out.contains("attach_internal_token"), "got:\n{out}");
+    }
+
+    /// The fallible-open streaming body is a *different* emission from the
+    /// immediate one, so credential attachment needs pinning there separately.
+    ///
+    /// It matters more here than on the immediate path: the `Awaited` body
+    /// hoists the open out of the `async_stream::try_stream!`, and the attach
+    /// has to move with it. Left behind, the request would go out
+    /// unauthenticated and the attach would run against a request already sent.
+    #[test]
+    fn awaited_open_streaming_method_attaches_credentials_before_the_open() {
+        let platform = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming(open = fallible)]
+                async fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            platform.contains("attach_internal_token"),
+            "got:\n{platform}"
+        );
+        assert!(!platform.contains("attach_bearer"), "got:\n{platform}");
+        // The attach must precede the call that opens the stream.
+        let attach = platform
+            .find("attach_internal_token")
+            .expect("attach is emitted");
+        let open = platform
+            .find("watch_thing (__request)")
+            .or_else(|| platform.find("watch_thing(__request)"))
+            .expect("the open call is emitted");
+        assert!(
+            attach < open,
+            "credentials must be attached before the open; got:\n{platform}"
+        );
+
+        let tenant = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming(open = fallible)]
+                async fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(tenant.contains("attach_bearer"), "got:\n{tenant}");
+        assert!(!tenant.contains("attach_internal_token"), "got:\n{tenant}");
+    }
+
+    #[test]
+    fn method_with_no_wire_body_emits_compile_error() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("compile_error"), "got:\n{out}");
+        assert!(out.contains("no wire-body parameter"), "got:\n{out}");
+    }
+
+    #[test]
+    fn security_context_param_selects_the_only_secctx_param() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        let param = security_context_param(&model.methods[0]).expect("secctx present");
+        assert_eq!(param.ident, "ctx");
+        assert!(is_platform_security_context_type(&param.ty));
+    }
+
+    #[test]
+    fn security_context_param_is_none_when_absent() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(security_context_param(&model.methods[0]).is_none());
+    }
+
+    #[test]
+    fn body_param_ident_skips_security_context() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        let body = body_param_ident(&model.methods[0]).expect("body param present");
+        assert_eq!(body, "id");
+    }
+
+    #[test]
+    fn body_param_ident_none_when_only_security_context() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(body_param_ident(&model.methods[0]).is_none());
+    }
 }

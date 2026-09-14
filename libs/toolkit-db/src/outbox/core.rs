@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DatabaseExecutor, DbBackend, FromQueryResult, Statement,
+    TransactionTrait,
 };
 use tokio::sync::{Notify, RwLock};
 
@@ -146,7 +147,7 @@ impl Outbox {
 
         // First registration — insert partition rows
         for p in 0..num_partitions {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.register_queue_insert(),
                 #[allow(clippy::cast_possible_wrap)]
@@ -175,7 +176,7 @@ impl Outbox {
         ids: &[i64],
     ) -> Result<(), OutboxError> {
         for &id in ids {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.insert_processor_row(),
                 [id.into()],
@@ -193,7 +194,7 @@ impl Outbox {
         ids: &[i64],
     ) -> Result<(), OutboxError> {
         for &id in ids {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.insert_vacuum_counter_row(),
                 [id.into()],
@@ -320,20 +321,18 @@ impl Outbox {
 
         if let Some(c) = Self::conn_requiring_composite_write_tx(runner) {
             let txn = c.begin().await?;
-            let ids = Self::insert_batch_on_conn(&txn, statements, partition_ids, items).await?;
+            let exec = DatabaseExecutor::Transaction(&txn);
+            let ids = Self::insert_batch_on_conn(&exec, statements, partition_ids, items).await?;
             txn.commit().await?;
             return Ok(ids);
         }
 
-        let conn: &dyn ConnectionTrait = match runner {
-            SeaOrmRunner::Conn(c) => *c,
-            SeaOrmRunner::Tx(t) => *t,
-        };
-        Self::insert_batch_on_conn(conn, statements, partition_ids, items).await
+        let conn = runner.executor();
+        Self::insert_batch_on_conn(&conn, statements, partition_ids, items).await
     }
 
     async fn insert_batch_on_conn(
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         statements: &OutboxStatements,
         partition_ids: &[i64],
         items: &[EnqueueMessage<'_>],
@@ -386,19 +385,21 @@ impl Outbox {
             let txn = c.begin().await?;
             let store = OutboxStore::new(statements);
             let incoming_id = store
-                .exec_insert_body_and_incoming(&txn, partition_id, payload, payload_type)
+                .exec_insert_body_and_incoming(
+                    &DatabaseExecutor::Transaction(&txn),
+                    partition_id,
+                    payload,
+                    payload_type,
+                )
                 .await?;
             txn.commit().await?;
             return Ok(incoming_id);
         }
 
-        let conn: &dyn ConnectionTrait = match runner {
-            SeaOrmRunner::Conn(c) => *c,
-            SeaOrmRunner::Tx(t) => *t,
-        };
+        let conn = runner.executor();
         let store = OutboxStore::new(statements);
         let incoming_id = store
-            .exec_insert_body_and_incoming(conn, partition_id, payload, payload_type)
+            .exec_insert_body_and_incoming(&conn, partition_id, payload, payload_type)
             .await?;
 
         Ok(incoming_id)

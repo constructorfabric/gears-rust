@@ -14,12 +14,13 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use cluster_sdk::ClusterCacheV1;
 use cluster_sdk::cache::{CacheCapability, CacheConsistency, PutRequest, Ttl};
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::register_cache_backend;
-use common::MemCacheBackend;
+use common::{MemCacheBackend, cache_profile, wire};
 use toolkit::client_hub::ClientHub;
 
 /// Correctness-sensitive coordination — bound to a linearizable backend.
@@ -41,13 +42,21 @@ impl ClusterProfile for AnalyticsProfile {
 
 #[tokio::main]
 async fn main() -> Result<(), ClusterError> {
-    // Each profile binds its own, independent backend.
-    let hub = ClientHub::new();
-    register_cache_backend(&hub, PrimaryProfile::NAME, MemCacheBackend::linearizable())?;
-    register_cache_backend(
+    // Each profile binds its own, independent backend - wired together, since one
+    // cluster client serves every profile in the process.
+    let hub = Arc::new(ClientHub::new());
+    let handle = wire(
         &hub,
-        AnalyticsProfile::NAME,
-        MemCacheBackend::eventually_consistent(),
+        vec![
+            (
+                PrimaryProfile::NAME,
+                cache_profile(MemCacheBackend::linearizable()),
+            ),
+            (
+                AnalyticsProfile::NAME,
+                cache_profile(MemCacheBackend::eventually_consistent()),
+            ),
+        ],
     )?;
 
     // The primary profile requires linearizable CAS; the analytics profile does
@@ -55,10 +64,12 @@ async fn main() -> Result<(), ClusterError> {
     let primary = ClusterCacheV1::resolver(&hub)
         .profile(PrimaryProfile)
         .require(CacheCapability::Linearizable)
-        .resolve()?;
+        .resolve()
+        .await?;
     let analytics = ClusterCacheV1::resolver(&hub)
         .profile(AnalyticsProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
 
     // Write the same key in each profile; the namespaces are independent.
     primary
@@ -85,6 +96,8 @@ async fn main() -> Result<(), ClusterError> {
         consistency_label(&primary),
         consistency_label(&analytics)
     );
+
+    handle.stop().await;
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::get;
 use bss_ledger_sdk::{ProviderRate, RateProviderError};
-use chrono::DateTime;
+use time::OffsetDateTime;
 use toolkit_http::HttpClient;
 
 use super::fetch_and_parse;
@@ -113,7 +113,7 @@ fn parse_ok(n: usize) -> impl FnOnce(&[u8]) -> ParseResult {
                 base: "EUR".to_owned(),
                 quote: format!("Q{i}"),
                 rate_micro: 1_000_000,
-                as_of: DateTime::from_timestamp(AS_OF_UNIX, 0).unwrap(),
+                as_of: OffsetDateTime::from_unix_timestamp(AS_OF_UNIX).unwrap(),
                 provider: PROVIDER.to_owned(),
             })
             .collect();
@@ -228,15 +228,12 @@ async fn internal_parse_failure_is_labelled_internal() {
 
 #[tokio::test]
 async fn transport_failure_is_labelled_unreachable_and_records_no_status() {
-    // Bind then drop the listener: the port is free but nothing is listening, so
-    // the request fails before any response exists to count a status for.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
+    // A `.invalid` host (RFC 6761) can never resolve, so the request fails
+    // before any response exists to count a status for — deterministically,
+    // with no ephemeral port for another test's listener to race for.
     let metrics = RecordingMetrics::default();
     let err = fetch_and_parse(
-        client().get(&format!("http://{addr}/feed")),
+        client().get("http://unreachable.invalid/feed"),
         PROVIDER,
         &metrics,
         parse_ok(1),

@@ -124,7 +124,7 @@ impl Sequencer {
                 values.push(item.body_id.into());
                 values.push(seq.into());
             }
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &outgoing_sql,
                 values,
@@ -264,7 +264,7 @@ impl Sequencer {
         sql: &str,
     ) -> Result<bool, OutboxError> {
         let row = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 store.backend(),
                 sql,
                 [partition_id.into()],
@@ -302,7 +302,7 @@ impl Sequencer {
         // DELETE the selected rows by id
         let delete_sql = store.delete_incoming_batch(rows.len());
         let values: Vec<sea_orm::Value> = rows.iter().map(|r| r.id.into()).collect();
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             store.backend(),
             &delete_sql,
             values,
@@ -325,7 +325,7 @@ impl Sequencer {
             AllocSql::UpdateReturning(sql) => {
                 // Pg/SQLite: UPDATE ... RETURNING — $1 = partition_id, $2 = count
                 let row = txn
-                    .query_one(Statement::from_sql_and_values(
+                    .query_one_raw(Statement::from_sql_and_values(
                         store.backend(),
                         sql,
                         [partition_id.into(), count.into()],
@@ -344,14 +344,14 @@ impl Sequencer {
             AllocSql::UpdateThenSelect { update, select } => {
                 // MySQL: UPDATE then SELECT
                 // ? order: (count, partition_id) matching SQL occurrence
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     store.backend(),
                     update,
                     [count.into(), partition_id.into()],
                 ))
                 .await?;
                 let row = txn
-                    .query_one(Statement::from_sql_and_values(
+                    .query_one_raw(Statement::from_sql_and_values(
                         store.backend(),
                         select,
                         [count.into(), partition_id.into()],

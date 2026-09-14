@@ -1,12 +1,11 @@
-use std::pin::Pin;
 use std::sync::Arc;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use toolkit_macros::domain_model;
-use toolkit_sdk::odata::{QueryBuilder, items_stream_boxed};
+use toolkit_sdk::odata::{QueryBuilder, items_stream};
 use toolkit_security::SecurityContext;
 use users_info_sdk::odata::UserSchema;
-use users_info_sdk::{User, UsersInfoError, UsersStreamingClientV1};
+use users_info_sdk::{User, UsersInfoError, UsersInfoStream, UsersStreamingClientV1};
 
 use crate::gear::ConcreteAppServices;
 
@@ -27,26 +26,19 @@ impl UsersStreamingClientV1 for LocalUsersStreamingClient {
         &self,
         ctx: SecurityContext,
         query: QueryBuilder<UserSchema>,
-    ) -> Pin<Box<dyn Stream<Item = Result<User, UsersInfoError>> + Send + 'static>> {
+    ) -> UsersInfoStream<User> {
         let services = Arc::clone(&self.services);
-        let stream = items_stream_boxed(
-            query,
-            Box::new(move |q| {
-                let services = Arc::clone(&services);
-                let ctx = ctx.clone();
-                Box::pin(async move {
-                    services
-                        .users
-                        .list_users_page(&ctx, &q)
-                        .await
-                        .map_err(UsersInfoError::from)
-                })
-            }),
-        );
-        Box::pin(stream.map(|res| {
-            res.map_err(|err| {
-                UsersInfoError::internal(format!("streaming failure: {err}")).create()
-            })
-        }))
+        let stream = items_stream(query, move |q| {
+            let services = Arc::clone(&services);
+            let ctx = ctx.clone();
+            async move {
+                services
+                    .users
+                    .list_users_page(&ctx, &q)
+                    .await
+                    .map_err(UsersInfoError::from)
+            }
+        });
+        Box::pin(stream.map(|res| res.map_err(super::pager_to_users_info)))
     }
 }

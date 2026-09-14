@@ -7,7 +7,9 @@
 //!
 //! - Configuration loading using `toolkit-bootstrap`
 //! - Logging initialization with tracing
-//! - gRPC connection to `DirectoryService`
+//! - Lazy gRPC client to the `DirectoryService` (connects on first use, so a
+//!   cold `DirectoryService` never blocks or crashes bootstrap —
+//!   `cpt-cf-adr-eventual-readiness`)
 //! - Gear instance registration
 //! - Heartbeat management
 //! - Gear lifecycle execution
@@ -352,8 +354,9 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 /// 1. Creates a root `CancellationToken` for the process
 /// 2. Hooks OS signals (SIGTERM, SIGINT, Ctrl+C) to trigger cancellation
 /// 3. Loads configuration and initializes logging
-/// 4. Connects to the `DirectoryService`
-/// 5. Registers the gear instance
+/// 4. Creates a lazy `DirectoryService` client (connects on first use, not at
+///    bootstrap — `cpt-cf-adr-eventual-readiness`)
+/// 5. Registers the gear instance (background presence loop, with backoff)
 /// 6. Starts a background heartbeat loop (using a child token)
 /// 7. Runs the gear lifecycle with `ShutdownOptions::Token`
 /// 8. Deregisters from `DirectoryService` on shutdown
@@ -488,7 +491,20 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         .and_then(|cfg| crate::telemetry::init::init_metrics_provider(cfg).err());
 
     // Initialize logging with MERGED config (master base + local override)
-    init_logging_unified(&merged_logging, &config.server.home_dir, otel_layer);
+    // Trace-id injection follows the same rule as the other telemetry
+    // settings: it comes from the master's rendered config, never the local one.
+    #[cfg(feature = "otel")]
+    let inject_trace_ids =
+        otel_cfg.is_some_and(crate::telemetry::OpenTelemetryConfig::inject_trace_ids_into_logs);
+    #[cfg(not(feature = "otel"))]
+    let inject_trace_ids = false;
+
+    init_logging_unified(
+        &merged_logging,
+        &config.server.home_dir,
+        otel_layer,
+        inject_trace_ids,
+    );
 
     // Now that logging is available, report deferred metrics init error
     #[cfg(feature = "otel")]
@@ -534,27 +550,35 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Connect to DirectoryService. When the gear configures a platform-plane
-    // credential, attach it (as `x-toolkit-internal-token`) to every outbound
-    // system call via an InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
+    // Create the DirectoryService client on a LAZY channel. Per
+    // `cpt-cf-adr-eventual-readiness`, an OoP gear must start even when the
+    // DirectoryService is not yet reachable; blocking or crashing on it at
+    // bootstrap would make it a hard startup dependency (the SPOF the ADR
+    // rejects). A lazy channel performs no eager connection: it fails fast only
+    // on a malformed endpoint and defers the connect to the first RPC.
+    //
+    // Recovery from a cold directory differs by lifecycle:
+    // - `oop_http` configured: the presence loop retries registration with
+    //   exponential backoff (100ms -> 30s, forever).
+    // - Legacy path (no `oop_http`): only a fixed-interval heartbeat runs, with
+    //   no registration retry — it relies on an external orchestrator.
+    //
+    // When a platform-plane credential is configured, it is attached (as
+    // `x-toolkit-internal-token`) to outbound system calls via an
+    // InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
     info!(
-        "Connecting to directory service at {}",
+        "Creating directory service client (lazy connect) for {}",
         opts.directory_endpoint
     );
     let internal_auth_cfg = final_config
         .oop_http
         .as_ref()
         .and_then(|h| h.internal_auth.as_ref());
-    let directory_client = if let Some(cfg) = internal_auth_cfg {
-        let interceptor = toolkit_transport_grpc::build_internal_auth_interceptor(cfg).await?;
-        info!("Attaching platform-plane credential to outbound DirectoryService calls");
-        DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor).await?
-    } else {
-        DirectoryGrpcClient::connect(&opts.directory_endpoint).await?
-    };
+    let (directory_client, internal_token_provider) =
+        build_directory_client(&opts.directory_endpoint, internal_auth_cfg, &cancel).await?;
     let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
 
-    info!("Successfully connected to directory service");
+    info!("Directory service client ready (will connect on first use)");
 
     // Capture OoP HTTP config (if any) before moving the config into the provider.
     let oop_http = final_config.oop_http.clone();
@@ -563,17 +587,17 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     let config_provider = Arc::new(final_config);
 
     // The DirectoryClient (gRPC client) is injected into the ClientHub so gears can access it.
-    let run_options = RunOptions {
-        gears_cfg: config_provider,
-        db: db_options,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![ClientRegistration::new::<dyn DirectoryClient>(Arc::clone(
-            &directory_api,
-        ))],
+    // `oop` is left unset: OoP gears don't spawn other OoP gears.
+    let run_options = RunOptions::new(
+        config_provider,
+        db_options,
+        ShutdownOptions::Token(cancel.clone()),
         instance_id,
-        oop: None, // OoP gears don't spawn other OoP gears
-        shutdown_deadline: None,
-    };
+    )
+    .with_clients(vec![ClientRegistration::new::<dyn DirectoryClient>(
+        Arc::clone(&directory_api),
+    )])
+    .with_internal_token_provider(internal_token_provider);
 
     // When `oop_http` is configured, run the HTTP-serving lifecycle:
     // Axum server + probes + directory presence (registration + heartbeat +
@@ -629,6 +653,12 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         info!("Gear runtime completed successfully");
     }
 
+    // Graceful shutdown - flush remaining telemetry. An OoP gear is a separate
+    // OS process owning its own global providers, so the in-process host's
+    // flush in `bootstrap::run` does not cover it.
+    #[cfg(feature = "otel")]
+    crate::bootstrap::run::tracing_shutdown().await;
+
     result
 }
 
@@ -665,6 +695,22 @@ async fn build_oop_serve_options(
         .clone()
         .unwrap_or_else(|| default_advertise_uri(listen_addr));
 
+    // Fail fast on a malformed or unreachable advertise_uri rather than only
+    // when the directory rejects the registration — the same late-failure the
+    // label validation below avoids.
+    validate_advertise_uri(&advertise_uri, cfg.allow_loopback_advertise)?;
+
+    // Fail fast on a mis-configured label (bad charset, over-long, too many)
+    // at start-up, using the same shared rules the directory enforces. Without
+    // this the process would come up, attempt to register, and only then be
+    // permanently rejected by the directory — a confusing late failure for what
+    // is a static configuration error. Checked before authenticator init so a
+    // static config error is reported without any async backend setup.
+    cf_system_sdks::directory::validate_labels(&cfg.labels).with_context(|| {
+        "invalid oop_http.labels: label keys/values must be <=63 chars, <=64 entries, and use \
+         only ASCII alphanumerics plus '-', '_', '.' (starting and ending alphanumeric)"
+    })?;
+
     let internal_authenticator = build_internal_authenticator(cfg.internal_auth.as_ref()).await?;
 
     Ok(OopServeOptions {
@@ -680,16 +726,21 @@ async fn build_oop_serve_options(
         directory,
         bearer_authenticator: None,
         internal_authenticator,
+        labels: cfg.labels.clone(),
     })
 }
 
 /// Construct the inbound platform-plane authenticator from configuration.
 ///
 /// The `shared_secret` provider is built here directly (no external backend).
-/// The `kube` provider initializes the Kubernetes `TokenReview` authenticator
-/// and requires the `k8s-auth` feature; without it, `provider: kube` is an
-/// error rather than a silent enforcement downgrade. `Ok(None)` is returned
-/// only when no `internal_auth` is configured.
+/// The `kube` provider is built (with the default positive/negative
+/// validation cache) by the single shared
+/// `toolkit_k8s_auth::build_cached_k8s_authenticator` helper also used by
+/// `grpc-hub`, so the two never drift on what `provider: kube` means or how
+/// it is cached. The `kube` provider requires the `k8s-auth` feature; without
+/// it, `provider: kube` is an error rather than a silent enforcement
+/// downgrade, as is any other unrecognized provider value. `Ok(None)` is
+/// returned only when no `internal_auth` is configured at all (Profile 1).
 #[cfg_attr(not(feature = "k8s-auth"), allow(clippy::unused_async))]
 async fn build_internal_authenticator(
     cfg: Option<&toolkit_security::InternalAuthConfig>,
@@ -709,13 +760,13 @@ async fn build_internal_authenticator(
         if cfg.is_kube() {
             info!("Initializing Kubernetes TokenReview platform-plane authenticator");
             let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
-            let authenticator =
-                toolkit_k8s_auth::K8sTokenReviewAuthenticator::try_default(audiences)
-                    .await
-                    .context("failed to initialize Kubernetes TokenReview authenticator")?;
-            return Ok(Some(toolkit_security::DynInternalAuthenticator::new(
-                authenticator,
-            )));
+            let authenticator = toolkit_k8s_auth::build_cached_k8s_authenticator(
+                audiences,
+                Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+            )
+            .await
+            .context("failed to initialize Kubernetes TokenReview authenticator")?;
+            return Ok(Some(authenticator));
         }
     }
     #[cfg(not(feature = "k8s-auth"))]
@@ -725,7 +776,128 @@ async fn build_internal_authenticator(
         }
     }
 
-    Ok(None)
+    anyhow::bail!(
+        "internal_auth is configured but no authenticator could be built for the selected provider"
+    )
+}
+
+/// Build the `OoP` gear's `DirectoryService` client on a **lazy** channel, plus
+/// the outbound
+/// [`InternalTokenProvider`](toolkit_contract::runtime::config::InternalTokenProvider)
+/// when a platform-plane credential is configured (`None` => no credential).
+///
+/// The lazy channel performs no eager connection, so this succeeds even when
+/// `directory_endpoint` is unreachable (`cpt-cf-adr-eventual-readiness`).
+/// Interceptor and provider come from one credential source (see
+/// [`build_platform_credentials`]) so they can't diverge after a rotation.
+///
+/// # Errors
+/// Only if the endpoint is malformed or a configured credential source fails to
+/// initialise — never for an unreachable directory. The endpoint is validated
+/// before any credential work, so a malformed endpoint is reported ahead of a
+/// credential-source failure.
+async fn build_directory_client(
+    directory_endpoint: &str,
+    internal_auth_cfg: Option<&toolkit_security::InternalAuthConfig>,
+    cancel: &CancellationToken,
+) -> Result<(
+    DirectoryGrpcClient,
+    Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+)> {
+    // Validate the endpoint up front — before any credential-source work — so a
+    // malformed endpoint is reported ahead of a credential failure. The lazy
+    // client performs no connection, only URI validation; it is reused as-is on
+    // the no-credential path.
+    let client = DirectoryGrpcClient::connect_lazy(directory_endpoint)?;
+
+    let Some(cfg) = internal_auth_cfg else {
+        return Ok((client, None));
+    };
+
+    let (interceptor, provider) = build_platform_credentials(cfg, cancel).await?;
+    // Rebuild with the interceptor attached (it must be set at construction);
+    // the endpoint was already validated above.
+    let client =
+        DirectoryGrpcClient::connect_lazy_with_interceptor(directory_endpoint, interceptor)?;
+    Ok((client, provider))
+}
+
+/// Build the platform-plane credential material from config: the **outbound**
+/// gRPC [`InternalAuthInterceptor`] (for `DirectoryService` calls) and the
+/// transport-agnostic
+/// [`InternalTokenProvider`](toolkit_contract::runtime::config::InternalTokenProvider)
+/// that `#[toolkit::provides]` clients attach as `X-ToolKit-Internal-Token` on
+/// platform-plane methods (`cpt-cf-adr-two-plane-auth`).
+///
+/// Both derive from ONE credential source so they never disagree after a
+/// rotation:
+/// - `shared_secret` → a static token for both.
+/// - `kube` with `token_path` → one [`ServiceAccountTokenReader`] drives both;
+///   its "no token yet" maps to [`CredentialState::Unavailable`] so an attach
+///   site warns rather than silently sending nothing.
+/// - `kube` without `token_path` → inbound-only: disabled interceptor + `None`
+///   provider (warned).
+///
+/// The `match` is exhaustive so a future variant fails to compile here rather
+/// than silently downgrading to no outbound credential.
+async fn build_platform_credentials(
+    cfg: &toolkit_security::InternalAuthConfig,
+    cancel: &CancellationToken,
+) -> Result<(
+    toolkit_transport_grpc::InternalAuthInterceptor,
+    Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+)> {
+    use secrecy::SecretString;
+    use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
+    use toolkit_security::InternalAuthConfig;
+    use toolkit_transport_grpc::{
+        DEFAULT_REFRESH_INTERVAL, InternalAuthInterceptor, ServiceAccountTokenReader,
+    };
+
+    match cfg {
+        InternalAuthConfig::SharedSecret { secret, .. } => {
+            let token = SecretString::from(secret.clone());
+            Ok((
+                InternalAuthInterceptor::from_token(token.clone()),
+                Some(InternalTokenProvider::from_token(token)),
+            ))
+        }
+        InternalAuthConfig::Kube {
+            token_path: Some(path),
+            ..
+        } => {
+            let reader = ServiceAccountTokenReader::with_cancellation(
+                path,
+                DEFAULT_REFRESH_INTERVAL,
+                cancel.child_token(),
+            )
+            .await
+            .context("failed to read projected service-account token for outbound credential")?;
+            let interceptor = reader.interceptor();
+            // The reader yields `None` while the projected file is empty or the
+            // refresh has not populated it; surface that as `Unavailable` (warn)
+            // rather than `NotConfigured` (silent).
+            let token_fn = reader.token_provider();
+            let provider = InternalTokenProvider::new(move || match token_fn() {
+                Some(token) => CredentialState::Available(token),
+                None => CredentialState::Unavailable(
+                    "projected service-account token is currently unavailable \
+                     (file empty or not yet read)"
+                        .into(),
+                ),
+            });
+            Ok((interceptor, Some(provider)))
+        }
+        InternalAuthConfig::Kube {
+            token_path: None, ..
+        } => {
+            warn!(
+                "oop_http.internal_auth: provider=kube without token_path - this participant \
+                 validates inbound platform tokens but will attach NO outbound credential"
+            );
+            Ok((InternalAuthInterceptor::disabled(), None))
+        }
+    }
 }
 
 /// Derive a default advertise URI from the bind address. Unspecified hosts
@@ -740,6 +912,46 @@ fn default_advertise_uri(listen_addr: std::net::SocketAddr) -> String {
         std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
     };
     format!("http://{host}:{}", listen_addr.port())
+}
+
+/// Reject a malformed or unreachable `advertise_uri` at start-up (fail fast).
+///
+/// Checks shape (parseable `http`/`https` URL, non-empty host, no userinfo) and,
+/// unless `allow_loopback`, rejects a loopback / unspecified host - a
+/// registered-but-unreachable instance in multi-host Profile 2 / Profile 3
+/// (`cpt-cf-adr-instance-addressable-discovery` section 5). The default derives
+/// loopback from an unspecified bind, so this also covers an *unset* value. The
+/// directory enforces its full endpoint ruleset server-side.
+fn validate_advertise_uri(uri: &str, allow_loopback: bool) -> Result<()> {
+    let parsed = url::Url::parse(uri)
+        .with_context(|| format!("invalid oop_http.advertise_uri: not a valid URL: {uri}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "invalid oop_http.advertise_uri: scheme must be http or https (got '{}')",
+            parsed.scheme()
+        );
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        anyhow::bail!("invalid oop_http.advertise_uri: missing host: {uri}");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("invalid oop_http.advertise_uri: must not contain userinfo: {uri}");
+    }
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if !allow_loopback && is_loopback {
+        anyhow::bail!(
+            "invalid oop_http.advertise_uri: '{uri}' is a loopback/unspecified address, which is \
+             unreachable by other gears in multi-host Profile 2 / Profile 3 (a registered-but-\
+             unreachable instance). Set oop_http.advertise_uri to a routable host, or set \
+             oop_http.allow_loopback_advertise = true for single-host / local-dev."
+        );
+    }
+    Ok(())
 }
 
 #[allow(unknown_lints, de1301_no_print_macros)] // direct stdout config print before exit

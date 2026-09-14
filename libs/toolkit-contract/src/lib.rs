@@ -17,14 +17,14 @@ pub use contract::{Contract, ServiceContract};
 pub use descriptor::{ContractDescriptor, ContractKind, MethodDescriptor, ServiceDescriptor};
 pub use error::ContractError;
 pub use grpc_repr::{
-    GrpcRepr, GrpcReprScalar, SecurityContextMarker, TryFromProto, UnknownEnumDiscriminant,
-    ViaStringParseError, assert_security_context,
+    GrpcRepr, GrpcReprScalar, MissingRequiredMessage, ProtoDecodeError, SecurityContextMarker,
+    TryFromProto, UnknownEnumDiscriminant, ViaStringParseError, assert_security_context,
 };
 pub use ir::{
     ContractIr, FieldIr, FieldRole, GrpcBindingIr, GrpcIdempotency, GrpcMethodBindingIr,
     HttpBindingIr, HttpFieldBinding, HttpMethod, HttpMethodBindingIr, Idempotency, InputShape,
-    MethodIr, MethodKind, PrimitiveType, ServiceIr, TypeRef, ValidationError, validate_contract,
-    validate_grpc_binding, validate_http_binding,
+    MethodIr, MethodKind, PrimitiveType, ServiceIr, StreamFraming, TypeRef, ValidationError,
+    validate_contract, validate_grpc_binding, validate_http_binding,
 };
 pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use query::{QueryParamSpec, QueryParams, QueryScalar};

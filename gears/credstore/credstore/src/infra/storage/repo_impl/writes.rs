@@ -3,6 +3,7 @@
 //! `list_stale_pending`, `list_unfenced`, `reap_by_id`.
 
 use credstore_sdk::SharingMode;
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect};
 use time::OffsetDateTime;

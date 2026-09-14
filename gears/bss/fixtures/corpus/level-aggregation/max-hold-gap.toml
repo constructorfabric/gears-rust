@@ -1,0 +1,43 @@
+family     = "level-aggregation"
+id         = "max-hold-gap"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17"]
+
+# The sampling-gap bound. The last level legitimately carries across granule
+# boundaries for up to `max_hold_granules`; beyond the hold the level reads 0
+# and the `max_hold_exceeded` operator signal raises.
+#
+# The momentary under-billing this implies is the accepted product call: zero is
+# deliberately the customer-favourable floor, and it is provisional, because a
+# backfilled sample re-folds the affected granules. The alternative -
+# quarantining the granule - would block the whole window's rating on a metering
+# blip.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+aggregation_function    = "time_weighted"
+aggregation_granularity = "hour"
+max_hold_granules       = 2
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 2
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T04:00:00Z"
+
+  [[runtime.samples]]
+  at    = "2026-01-01T00:00:00Z"
+  level = 10
+
+[[assert]]
+given  = { }
+expect = { folded_q = 30 }
+why    = "one sample, then silence. Hour 0 integrates its own level to 10. Hours 1 and 2 are within max_hold_granules = 2 and hold 10 each. Hour 3 is past the hold and reads 0, not 10 - so Q = 30, not the 40 an unbounded hold would have billed"

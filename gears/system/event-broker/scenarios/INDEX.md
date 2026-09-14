@@ -143,7 +143,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 ### topics/ — Topic introspection
 
-- [positive-1.1 — List topics](topics/1.01-positive-list-topics.md) — `GET /v1/topics` → paged list; `partitions` field exposes partition count.
+- [positive-1.1 — List topics](topics/1.01-positive-list-topics.md) — `GET /v1/topics` → paged list of topic DTOs carrying `id`, `description`, `retention`.
 - [positive-1.2 — List topic segments](topics/1.02-positive-list-topic-segments.md) — `GET /v1/topics/segments?topic=...&partition=...` → segment manifest with RF/HWM per segment.
 - [positive-1.4 — List event types](topics/1.04-positive-list-event-types.md) — `GET /v1/event-types?topic=...` → paged list of event type registrations.
 

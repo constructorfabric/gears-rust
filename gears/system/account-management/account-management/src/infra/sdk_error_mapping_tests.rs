@@ -13,7 +13,7 @@ use toolkit_gts::gts_id;
 
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, UnsupportedResource};
 
 /// Run a `DomainError` through the single canonical ladder.
 fn round_trip(d: DomainError) -> CanonicalError {
@@ -201,6 +201,88 @@ fn user_not_found_maps_to_not_found_404_with_user_resource() {
     assert!(
         matches!(canonical, CanonicalError::NotFound { .. }),
         "UserNotFound MUST surface as the NotFound variant"
+    );
+}
+
+#[test]
+fn service_account_not_found_maps_to_not_found_404_with_its_own_resource_type() {
+    // A machine identity must not surface under the *user* resource
+    // type: a client keys "can I grant this?" off `resource_type`, and
+    // collapsing the two would advertise credential minting as user
+    // management. The `client_id` rides `resource_name`.
+    let client_id = "svc-abc";
+    let canonical = round_trip(DomainError::ServiceAccountNotFound {
+        detail: "service account not found in tenant".to_owned(),
+        resource: client_id.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 404);
+    assert_eq!(canonical.resource_name(), Some(client_id));
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::NotFound { .. }),
+        "ServiceAccountNotFound MUST surface as the NotFound variant"
+    );
+}
+
+#[test]
+fn service_account_invalid_input_maps_to_400_attributed_to_the_request() {
+    // The adapter's own field attribution is untrusted text and was
+    // dropped at the domain boundary, so the violation names `request`
+    // as a whole rather than a field the provider chose.
+    let canonical = round_trip(DomainError::ServiceAccountInvalidInput {
+        detail: crate::domain::idp::SA_INVALID_INPUT_MESSAGE.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 400);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    let CanonicalError::InvalidArgument { ctx, .. } = canonical else {
+        panic!("expected CanonicalError::InvalidArgument");
+    };
+    let InvalidArgument::FieldViolations { field_violations } = ctx else {
+        panic!("expected InvalidArgument::FieldViolations ctx");
+    };
+    assert_eq!(field_violations.len(), 1);
+    assert_eq!(
+        field_violations[0].field,
+        account_management_sdk::field::REQUEST_FIELD
+    );
+    assert_eq!(
+        field_violations[0].reason,
+        account_management_sdk::field::IDP_INVALID_INPUT
+    );
+}
+
+/// The ambiguous outcome is 409 with its own reason, not the 503 a clean
+/// failure gets: retrying the same request would collide with the
+/// account the uncertain call may have created, so the envelope must
+/// say "reconcile", not "retry".
+#[test]
+fn service_account_ambiguous_maps_to_409_aborted_with_ambiguous_reason() {
+    let canonical = round_trip(DomainError::ServiceAccountAmbiguous {
+        detail: crate::domain::idp::SA_AMBIGUOUS_MESSAGE.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 409);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::Aborted { .. }),
+        "ServiceAccountAmbiguous MUST surface as Aborted, not ServiceUnavailable"
+    );
+    let rendered = format!("{canonical:?}");
+    assert!(
+        rendered.contains(account_management_sdk::reason::aborted::AMBIGUOUS_OUTCOME),
+        "expected the AMBIGUOUS_OUTCOME reason token: {rendered}"
+    );
+    assert!(
+        rendered.contains("reconcile"),
+        "the detail must steer the caller to reconcile: {rendered}"
     );
 }
 
@@ -729,16 +811,54 @@ fn idp_unavailable_maps_to_503_without_retry_after() {
 // Unimplemented (HTTP 501)
 // ---------------------------------------------------------------------------
 
+/// A 501 must name the surface the caller actually addressed.
+///
+/// All three halves of `IdpPluginClient` collapse into one `DomainError`
+/// variant, so the boundary picks `resource_type` from the variant's
+/// `resource` discriminator. Asserting only the status code — which is
+/// identical for all three — is what previously allowed every 501 to claim
+/// `resource_type = tenant`, including on the machine-identity surface.
 #[test]
-fn unsupported_operation_maps_to_501() {
+fn unsupported_operation_maps_to_501_naming_the_addressed_resource() {
+    for (resource, expected) in [
+        (
+            UnsupportedResource::Tenant,
+            account_management_sdk::gts::TENANT_RESOURCE_TYPE,
+        ),
+        (
+            UnsupportedResource::User,
+            account_management_sdk::gts::USER_RESOURCE_TYPE,
+        ),
+        (
+            UnsupportedResource::ServiceAccount,
+            account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE,
+        ),
+    ] {
+        let canonical = round_trip(DomainError::UnsupportedOperation {
+            detail: "vendor x lacks profile-edit".to_owned(),
+            resource,
+        });
+        assert_eq!(canonical.status_code(), 501, "{resource:?} must be 501");
+        assert_eq!(
+            canonical.resource_type(),
+            Some(expected),
+            "{resource:?} must carry its own resource_type, not another surface's"
+        );
+    }
+}
+
+#[test]
+fn service_account_unsupported_uses_the_fixed_am_owned_detail() {
     let canonical = round_trip(DomainError::UnsupportedOperation {
-        detail: "vendor x lacks profile-edit".to_owned(),
+        detail: "provider detail must not reach the wire".to_owned(),
+        resource: UnsupportedResource::ServiceAccount,
     });
-    assert_eq!(canonical.status_code(), 501);
+
     assert_eq!(
-        canonical.resource_type(),
-        Some(account_management_sdk::gts::TENANT_RESOURCE_TYPE)
+        canonical.detail(),
+        crate::domain::idp::SA_UNSUPPORTED_MESSAGE
     );
+    assert!(!canonical.detail().contains("provider detail"));
 }
 
 // ---------------------------------------------------------------------------

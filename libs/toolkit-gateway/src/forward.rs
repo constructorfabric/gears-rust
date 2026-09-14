@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderName, Method, StatusCode};
-use toolkit_canonical_errors::Problem;
+use toolkit_canonical_errors::{ForeignPassthrough, Problem};
 use toolkit_http::{HttpClient, HttpError, HttpResponse, RequestBuilder};
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 
@@ -163,6 +163,13 @@ fn upstream_to_response(resp: HttpResponse) -> Response {
         }
         out.append(name.clone(), value.clone());
     }
+    // This is the owning gear's real response, relayed verbatim - it was
+    // never constructed via `CanonicalError` and was never meant to be.
+    // `canonical_error_middleware` (layered on every gear, including
+    // whichever gear mounts this fallback) must not rewrite or even read
+    // this body: doing so would destroy the owning gear's own error
+    // identity and force full buffering of what is still a streamed body.
+    response.extensions_mut().insert(ForeignPassthrough);
     response
 }
 
@@ -240,7 +247,7 @@ fn problem(status: StatusCode, detail: String) -> Response {
     Problem {
         problem_type: "about:blank".to_owned(),
         title: status.canonical_reason().unwrap_or("Error").to_owned(),
-        status: status.as_u16(),
+        status: Some(status.as_u16()),
         detail,
         instance: None,
         trace_id: None,

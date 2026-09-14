@@ -21,7 +21,7 @@ use crate::consumer::common::wait_until;
 const DLQ_QUEUE: &str = "showcase-consumer-dlq";
 const DLQ_PARTITIONS: u32 = 4;
 const TOPIC_GTS: &str = "gts.cf.core.events.topic.v1~example.showcase.outbox.dlq.v1";
-const EVENT_TYPE_GTS: &str = "gts.cf.core.events.event_type.v1~example.showcase.outbox.dlq.v1";
+const EVENT_TYPE_GTS: &str = "gts.cf.core.events.event.v1~example.showcase.outbox.dlq.v1~";
 const GROUP_GTS: &str = "gts.cf.core.events.consumer_group.v1~example.showcase.outbox.dlq.v1";
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -71,7 +71,7 @@ async fn fixture() -> DlqOutboxFixture {
     let dsn = format!("sqlite:file:evbk_showcase_outbox_dlq_{seq}?mode=memory&cache=shared");
     let raw = Database::connect(&dsn).await.expect("raw sqlite connect");
     let backend = raw.get_database_backend();
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         backend,
         LOCAL_DB_OFFSET_STORE_MIGRATION_SQL.to_owned(),
     ))
@@ -119,7 +119,6 @@ fn rejected_event(offset: i64) -> RawEvent {
         tenant_id: Uuid::nil(),
         subject: format!("dlq-order-{offset}"),
         subject_type: "order".to_owned(),
-        partition_key: Some(format!("dlq-order-{offset}")),
         partition: 0,
         sequence: offset,
         offset,

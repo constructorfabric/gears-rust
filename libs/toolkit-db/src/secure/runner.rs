@@ -26,6 +26,36 @@ pub enum SeaOrmRunner<'a> {
     Tx(&'a sea_orm::DatabaseTransaction),
 }
 
+impl<'a> SeaOrmRunner<'a> {
+    /// Erase the connection/transaction distinction into `SeaORM`'s own executor enum.
+    ///
+    /// `ConnectionTrait` gained generic methods in `SeaORM` 2.0 and is therefore no
+    /// longer dyn-compatible, so `&dyn ConnectionTrait` is not an option for code
+    /// that has to accept "either a pool or a transaction". `DatabaseExecutor` is
+    /// `SeaORM`'s replacement for exactly that: it implements `ConnectionTrait` (and
+    /// `TransactionTrait`), so callers keep using `.all(exec)` / `.exec(exec)` as
+    /// before, without this crate going generic over the executor.
+    pub(crate) fn executor(&self) -> sea_orm::DatabaseExecutor<'a> {
+        match *self {
+            Self::Conn(c) => sea_orm::DatabaseExecutor::Connection(c),
+            Self::Tx(t) => sea_orm::DatabaseExecutor::Transaction(t),
+        }
+    }
+
+    /// Which SQL dialect to render for.
+    ///
+    /// `DBRunner` is deliberately method-free, so callers that must build a
+    /// statement themselves (rather than letting `SeaORM` do it) have no other
+    /// way to learn the backend. Kept `pub(crate)` so no `SeaORM` type leaks.
+    pub(crate) fn backend(&self) -> sea_orm::DbBackend {
+        use sea_orm::ConnectionTrait;
+        match *self {
+            Self::Conn(c) => c.get_database_backend(),
+            Self::Tx(t) => t.get_database_backend(),
+        }
+    }
+}
+
 /// Internal-only bridge to `SeaORM`'s executor types.
 pub trait DBRunnerInternal: sealed::Sealed + Send + Sync {
     fn as_seaorm(&self) -> SeaOrmRunner<'_>;

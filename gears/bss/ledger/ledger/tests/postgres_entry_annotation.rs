@@ -10,7 +10,7 @@
 //!     `journal_entry` `row_hash` is byte-unchanged;
 //!   * a second set UPSERTs in place (one row) with the description updated.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -30,11 +30,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -46,19 +46,19 @@ fn pg(sql: impl Into<String>) -> Statement {
 
 /// Hex string of a single-column, single-row SELECT, `None` when absent/NULL.
 async fn scalar_hex(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
 /// Count rows matching a bss-qualified predicate.
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
 /// A single text column over one row, `None` when absent/NULL.
 async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
@@ -105,7 +105,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -172,7 +172,7 @@ fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec
         source_business_id: business_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -238,7 +238,7 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
     reason = "one container boot amortizes the full pre-write rejection matrix + happy-path upsert + journal-unchanged proof"
 )]
 async fn annotation_set_upserts_and_leaves_journal_unchanged() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

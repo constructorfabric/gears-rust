@@ -37,14 +37,25 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Install required components
 rustup component add clippy rustfmt
 
-# Build the project
+# Build the whole-project example server release binary
 make build
 
-# Run tests
+# Run workspace tests
 make test
+
+# Run the local quality gate
+make check
 
 # Start the development server (SQLite quickstart)
 make quickstart
+
+# Run the default example server
+make run
+
+# Build, test, or run one gear scope
+make build GEAR=file-parser
+make test GEAR=file-parser
+make run GEAR=file-parser
 
 # Start the development server with the example users_info gear
 cargo run --bin cf-gears-example-server --features users-info-example -- --config config/quickstart.yaml run
@@ -88,6 +99,27 @@ Follow the coding standards and guidelines:
 5. ToolKit architecture and invariants [docs/toolkit_unified_system/README.md](./docs/toolkit_unified_system/README.md)
 
 Gear directories under `gears/` must use kebab-case (validated by `tools/scripts/validate_gear_names.py` and enforced in CI).
+
+#### Building, running, and testing one gear
+
+The Makefile supports an optional `GEAR=<name>` scope for common top-level commands. Without `GEAR`, commands run at the whole-project or workspace level.
+
+```bash
+make build                    # whole-project example server release binary
+make test                     # workspace tests
+make run                      # default example server
+make all                      # build + check + SQLite integration + local E2E + OpenAPI
+
+make build GEAR=file-parser   # cf-gears-file-parser plus its SDK crate
+make test GEAR=file-parser    # tests for cf-gears-file-parser plus its SDK crate
+make run GEAR=file-parser     # example server with only this gear feature set
+make e2e-local SUITE=file-parser
+make coverage GEAR=file-parser
+```
+
+By default, `GEAR=<name>` maps to package names `cf-gears-<name>` and `cf-gears-<name>-sdk`, and `make run GEAR=<name>` enables the gear feature together with the static local development system gears. Override `GEAR_PKG`, `GEAR_SDK_PKG`, `GEAR_FEATURES`, `GEAR_BUILD_ARGS`, `GEAR_TEST_ARGS`, or `GEAR_RUN_ARGS` for non-standard package names, extra features, or runtime arguments.
+
+Runtime configuration is YAML-driven: each gear reads its settings under `gears:<gear_name>:` with a `config` section and, when needed, a gear-owned `database` section. Cargo feature selection decides which gear code is compiled into the example server; YAML decides the runtime settings for the compiled-in gears.
 
 #### Gear dependencies and `cargo-shear`
 
@@ -134,6 +166,11 @@ python tools/scripts/ci.py check # Windows
 # Run the full pipeline (includes build + e2e-local)
 make all # Linux/Mac
 python tools/scripts/ci.py all # Windows
+
+# Scope common Makefile targets to one gear when iterating locally
+make check GEAR=file-parser
+make test GEAR=file-parser
+make e2e-local SUITE=file-parser
 ```
 
 Note: CI workflows may not run for PRs that only touch `*.md` files or `docs/**` due to path filters.

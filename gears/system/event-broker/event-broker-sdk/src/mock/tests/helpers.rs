@@ -14,16 +14,32 @@ use uuid::Uuid;
 pub const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.audit.v1");
 pub const TOPIC2: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.notify.v1");
 pub const TOPIC3: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.analytics.v1");
-pub const EVT: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.event.v1");
-pub const EVT2: &str = gts_id!("cf.core.events.event_type.v1~example.mock.broker.event2.v1");
+pub const EVT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.event.v1~");
+pub const EVT2: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.event2.v1~");
+pub const EVT3: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.event3.v1~");
 
 // -- Helpers -------------------------------------------------------------------
 
 pub async fn broker_with_topic(topic: &str, partitions: u32) -> (MockBroker, MockBrokerHandle) {
     let broker = MockBroker::new();
     let h = broker.handle();
-    h.register_topic(topic, partitions).await;
+    register_topic_with_event_type(&h, topic, partitions, EVT).await;
     (broker, h)
+}
+
+/// Register a topic together with the event type published to it.
+///
+/// Ingest resolves an event's stream from its type, so a topic that declares no
+/// event type can receive nothing - the pair is the smallest publishable setup.
+pub async fn register_topic_with_event_type(
+    h: &MockBrokerHandle,
+    topic: &str,
+    partitions: u32,
+    type_id: &str,
+) {
+    h.register_topic(topic, partitions).await;
+    h.register_event_type(topic, type_id, serde_json::json!({ "type": "object" }), &[])
+        .await;
 }
 
 pub fn ctx() -> SecurityContext {
@@ -34,16 +50,14 @@ pub fn ctx2() -> SecurityContext {
     test_ctx_for_tenant(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
 }
 
-pub fn wire_event(topic: &str, type_id: &str, tenant_id: Uuid) -> Event {
+pub fn wire_event(type_id: &str, tenant_id: Uuid) -> Event {
     Event {
         id: Uuid::new_v4(),
         type_id: type_id.to_owned(),
-        topic: topic.to_owned(),
         tenant_id,
         source: "test.mock".to_owned(),
         subject: "test-subject".to_owned(),
         subject_type: "test-type".to_owned(),
-        partition_key: None,
         occurred_at: chrono::Utc::now(),
         trace_parent: None,
         data: None,

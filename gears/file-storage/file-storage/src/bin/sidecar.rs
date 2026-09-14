@@ -797,7 +797,7 @@ async fn report_part_with_control_plane(
 /// session was `initiate_multipart`'d but never actually received any
 /// `UploadPart` calls — `complete_multipart` then failed against the backend
 /// (proven by the P2 1.7 Stage 6 S3 e2e suite,
-/// `testing/e2e/gears/file_storage/lifecycle_s3/`, which is what surfaced
+/// `testing/e2e/suites/file_storage/lifecycle_s3/`, which is what surfaced
 /// this bug: `CompleteMultipartUpload` 500s against a real S3-compatible
 /// endpoint because none of its parts were ever uploaded).
 async fn write_multipart_part(

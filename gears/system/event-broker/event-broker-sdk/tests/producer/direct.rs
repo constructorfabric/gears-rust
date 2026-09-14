@@ -11,7 +11,7 @@ use event_broker_sdk::{
 };
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.producer.orders.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.sdk.producer.created.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.sdk.producer.created.v1~";
 const SUBJECT_TYPE: &str = "gts.cf.core.events.subject.v1~example.sdk.producer.order.v1";
 const TENANT_PARTITION: u32 = 2;
 
@@ -23,7 +23,6 @@ struct OrderCreated {
 
 impl TypedEvent for OrderCreated {
     const TYPE_ID: &'static str = EVENT_TYPE;
-    const TOPIC: &'static str = TOPIC;
     const SUBJECT_TYPE: &'static str = SUBJECT_TYPE;
     const SOURCE: &'static str = "order-service";
 
@@ -45,7 +44,7 @@ async fn stateless_publish_omits_producer_cursor_state() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DirectDeduplication::stateless())
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -56,8 +55,10 @@ async fn stateless_publish_omits_producer_cursor_state() {
     assert_eq!(handle.stored(TOPIC, TENANT_PARTITION).await.len(), 1);
 }
 
+/// The event type declares no partition key of its own, so the base's default
+/// applies and the event partitions by tenant.
 #[tokio::test]
-async fn stateless_publish_uses_tenant_when_partition_key_is_absent() {
+async fn stateless_publish_partitions_by_tenant_under_the_default_pointer() {
     let (broker, handle) = broker().await;
     let producer = Producer::builder()
         .broker(Arc::clone(&broker))
@@ -65,15 +66,15 @@ async fn stateless_publish_uses_tenant_when_partition_key_is_absent() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DirectDeduplication::stateless())
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
-    let subject_routed = OrderCreated {
+    let event = OrderCreated {
         order_id: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
         total_cents: 10,
     };
-    producer.publish(subject_routed).await.unwrap();
+    producer.publish(event).await.unwrap();
 
     assert_eq!(handle.stored(TOPIC, TENANT_PARTITION).await.len(), 1);
 }
@@ -89,7 +90,7 @@ async fn register_on_start_chained_mints_id_and_publishes_first_sequence() {
             ProducerMode::Chained,
         ))
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -123,7 +124,7 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
             producer_id,
         ))
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -138,7 +139,7 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
             producer_id,
         ))
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -160,7 +161,7 @@ async fn persisted_publish_returns_persisted() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DirectDeduplication::stateless())
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();
@@ -179,7 +180,7 @@ async fn batch_publish_routes_through_event_broker() {
         .identity(ProducerIdentity::new().source("order-service"))
         .deduplication(DirectDeduplication::stateless())
         .topics([TOPIC])
-        .event_type_patterns(["gts.cf.core.events.event_type.v1~example.sdk.producer.*"])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
         .prepare_all()
         .await
         .unwrap();

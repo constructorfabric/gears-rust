@@ -46,6 +46,7 @@ use cluster_sdk::observability::{self, ResourceId};
 use cluster_sdk::{ClusterError, ClusterMetrics};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -96,7 +97,7 @@ fn chunk_sql(table: &str) -> String {
 /// the table had nothing more to give.
 async fn sweep_chunk(pool: &PgPool, table: &str) -> Result<usize, ClusterError> {
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-    let expired_keys: Vec<String> = sqlx::query_scalar(&chunk_sql(table))
+    let expired_keys: Vec<String> = sqlx::query_scalar(AssertSqlSafe(chunk_sql(table)))
         .fetch_all(&mut *tx)
         .await
         .map_err(map_sqlx_error)?;

@@ -1544,10 +1544,9 @@ mod cleanup {
         // mandatory) succeeds for `seed_tenant` rows. Mirrors the
         // sibling `make_service` / `make_service_with_user_schema`
         // helpers above — without this, every cleanup test that goes
-        // through `delete_user` fails with
-        // `ServiceUnavailable { detail: "tenant_type resolution failed
-        // ... GTS type-schema not found ..." }` before the RG-cleanup
-        // path ever runs.
+        // through `delete_user` fails with the fixed
+        // `ServiceUnavailable { detail: "tenant type resolution is temporarily
+        // unavailable" }` before the RG-cleanup path ever runs.
         let types_registry =
             Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
         let rg: Arc<dyn ResourceGroupClient + Send + Sync> = rg;

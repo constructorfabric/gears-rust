@@ -1,0 +1,30 @@
+family     = "reserved"
+role       = "publish"
+gates      = ["graduated", "per_unit"]
+provenance = ["AC#60", "inst-rv-tier-q", "inst-rv-level", "inst-rv-fixture", "inst-fx-kinds", "D-53", "D-139"]
+
+# `inst-fx-kinds`: "the reservation variant of a usage row requires its own
+# fixture (Slice 10 registers it into this gate)". S3 design 6 lists it beside
+# the `modelKind`, `level-aggregation` and `trailing_tier` variants on the
+# `FixtureGate`'s input. Recorded as `role = "conformance"` it gated nothing.
+#
+# `graduated` and, since 2026-08-21, `per_unit` - earned by `per-unit-capacity`.
+# The `consumption` cases are `graduated` because the on-demand ladder the
+# remainder is banded by is what makes that flavor a reservation rather than a
+# flat allocation charge. `capacity` needs no ladder: under D-139 its charge is
+# `reservedRate x allocation x covered granules`, three operands and no price
+# model, so it is the flavor that can earn a kind whose on-demand side is a
+# single rate.
+#
+# **`consumption` on a `per_unit` row has no representation, and that is a real
+# hole.** The evaluator prices the remainder with a banded lookup, so on a row
+# whose on-demand side is one rate rather than a ladder there is nothing for the
+# remainder to be priced by. Named here rather than papered over with a case that
+# would fail - and a failing case in this family would take `graduated`'s
+# `oracle` flag down with it, because that half is earned per family.
+#
+# The gate is **reached** as of Slice 10: `reservedRateMinor` and
+# `reservationFlavor` landed, and `bss_pricing::infra::fixture_gate::
+# Reservation::of_slice3_row` reads them off the row with no call site having
+# moved. The note that stood here through Slice 3 said the opposite, and it said
+# so correctly at the time.

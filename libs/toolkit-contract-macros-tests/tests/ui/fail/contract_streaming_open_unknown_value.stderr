@@ -1,0 +1,5 @@
+error: unknown open selector `bogus`; expected fallible or immediate
+ --> tests/ui/fail/contract_streaming_open_unknown_value.rs:8:24
+  |
+8 |     #[streaming(open = bogus)]
+  |                        ^^^^^

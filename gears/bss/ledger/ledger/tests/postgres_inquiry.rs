@@ -11,7 +11,7 @@
 //!       ONE `cross-tenant-access` forensic record (asserted via the same
 //!       `bss.secured_audit_record` query `postgres_cross_tenant.rs` uses);
 //!       the own-tenant default writes none.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -40,7 +40,6 @@ use bss_ledger_sdk::{AccountClass, Side};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -52,7 +51,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -120,7 +119,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -216,7 +215,7 @@ fn svc(provider: &DBProvider<DbError>, metrics: &MetricsHarness) -> InvoicePostS
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn filter_export_and_drill() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -351,7 +350,7 @@ async fn filter_export_and_drill() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_pack_writes_forensic_record() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

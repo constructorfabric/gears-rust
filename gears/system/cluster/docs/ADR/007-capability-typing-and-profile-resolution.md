@@ -166,7 +166,7 @@ impl<'a> CacheResolverBuilder<'a> {
         let inner: Arc<dyn ClusterCacheBackend> = self.hub
             .get_scoped(profile_scope(profile))
             .map_err(|_| ClusterError::ProfileNotBound { profile })?;
-        validate_cache_capabilities(&*inner, &self.requirements)?;
+        validate_cache_capabilities_from(&*inner, &self.requirements)?;
         Ok(ClusterCacheV1 { inner })
     }
 }

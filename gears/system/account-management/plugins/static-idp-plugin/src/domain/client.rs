@@ -7,12 +7,15 @@ use toolkit_security::SecurityContext;
 
 use account_management_sdk::{
     IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest,
-    IdpListUsersRequest, IdpPluginClient, IdpProvisionFailure, IdpProvisionResult,
-    IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpUpdateUserRequest, IdpUser,
-    IdpUserDuplicateField, IdpUserFilterField, IdpUserOperationFailure,
+    IdpListServiceAccountsRequest, IdpListUsersRequest, IdpPluginClient, IdpProvisionFailure,
+    IdpProvisionResult, IdpProvisionServiceAccountRequest, IdpProvisionTenantRequest,
+    IdpProvisionUserRequest, IdpRevokeServiceAccountRequest, IdpRotateServiceAccountSecretRequest,
+    IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
+    IdpUpdateUserRequest, IdpUser, IdpUserDuplicateField, IdpUserFilterField,
+    IdpUserOperationFailure,
 };
 
-use super::service::{Service, UpdateUserOutcome};
+use super::service::{ProvisionAccountOutcome, RotateAccountOutcome, Service, UpdateUserOutcome};
 
 fn matches_filter(user: &IdpUser, filter: &FilterNode<IdpUserFilterField>) -> bool {
     match filter {
@@ -340,6 +343,102 @@ impl IdpPluginClient for Service {
                 limit: u64::from(req.pagination.top()),
             },
         ))
+    }
+
+    // ---- Service accounts ------------------------------------------
+    //
+    // Overriding these four is what turns AM's machine-identity surface
+    // from `501 Unimplemented` (the SDK defaults) into a working
+    // lifecycle for dev deploys and the E2E suite. The echo store is
+    // deliberately strict about the two obligations a caller can
+    // actually observe: `(tenant_id, name)` uniqueness over live
+    // accounts, and a secret that changes on rotation.
+
+    async fn provision_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpProvisionServiceAccountRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        match self.provision_account(req.tenant_context.tenant_id, &req.name, req.scopes.clone()) {
+            ProvisionAccountOutcome::Created(credentials) => Ok(credentials),
+            // `InvalidInput` is the contract's category for "rejected,
+            // nothing retained". AM discards this text and answers with
+            // its own fixed message, so it is an in-process diagnostic
+            // only — which is also why it names no client id: revealing
+            // the colliding account is exactly what the contract
+            // forbids.
+            ProvisionAccountOutcome::NameNotAddressable => {
+                Err(IdpServiceAccountFailure::InvalidInput {
+                    detail: format!(
+                        "service-account name {:?} must be non-empty and use only \
+                         unreserved URI characters (alphanumerics and -._~)",
+                        req.name
+                    ),
+                    field: Some("name".to_owned()),
+                })
+            }
+            ProvisionAccountOutcome::NameTaken => Err(IdpServiceAccountFailure::InvalidInput {
+                detail: format!(
+                    "a live service account named {:?} already exists in tenant {}",
+                    req.name, req.tenant_context.tenant_id
+                ),
+                field: Some("name".to_owned()),
+            }),
+        }
+    }
+
+    async fn rotate_service_account_secret(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpRotateServiceAccountSecretRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        match self.rotate_account_secret(req.tenant_context.tenant_id, &req.client_id) {
+            RotateAccountOutcome::Rotated(credentials) => Ok(credentials),
+            // Scoped addressing: a client id owned by another tenant is
+            // reported exactly as one that never existed, so rotation
+            // cannot probe for other tenants' accounts. AM surfaces
+            // this as 404 rather than folding it into success — unlike
+            // revoke, a rotation that found nothing minted no credential.
+            RotateAccountOutcome::NotFound => Err(IdpServiceAccountFailure::NotFound {
+                detail: format!(
+                    "service account {:?} not found in tenant {}",
+                    req.client_id, req.tenant_context.tenant_id
+                ),
+            }),
+        }
+    }
+
+    async fn revoke_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpRevokeServiceAccountRequest,
+    ) -> Result<(), IdpServiceAccountFailure> {
+        // Idempotency by error-mapping: report absence 1:1 and let AM
+        // decide it means success (it does, so a retried DELETE still
+        // answers 204). Folding it into `Ok(())` here would take that
+        // decision away from AM and hide the distinction from any other
+        // consumer of the contract.
+        if self.forget_account(req.tenant_context.tenant_id, &req.client_id) {
+            Ok(())
+        } else {
+            Err(IdpServiceAccountFailure::NotFound {
+                detail: format!(
+                    "service account {:?} not found in tenant {}",
+                    req.client_id, req.tenant_context.tenant_id
+                ),
+            })
+        }
+    }
+
+    async fn list_service_accounts(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpListServiceAccountsRequest,
+    ) -> Result<Vec<IdpServiceAccountSummary>, IdpServiceAccountFailure> {
+        // Unpaginated by contract, and name-ordered by the store so the
+        // sequence is stable across calls — a caller reconciling an
+        // ambiguous provision must be able to scan this reliably.
+        Ok(self.snapshot_accounts(req.tenant_context.tenant_id))
     }
 }
 

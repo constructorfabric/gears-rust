@@ -26,6 +26,19 @@ help: the trait `SecurityContextMarker` is not implemented for `SecurityContext`
    |
 13 | pub struct SecurityContext {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `SecurityContextMarker`
+  --> $WORKSPACE/libs/toolkit-contract/src/grpc_repr.rs
+   |
+   | impl<T: SecurityContextMarker + ?Sized> SecurityContextMarker for &T {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&T`
+   |
+  ::: $WORKSPACE/libs/toolkit-contract/src/grpc/mod.rs
+   |
+   | impl crate::grpc_repr::SecurityContextMarker for toolkit_security::SecurityContext {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `toolkit_security::context::SecurityContext`
+...
+   | impl crate::grpc_repr::SecurityContextMarker for toolkit_security::PlatformSecurityContext {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `toolkit_security::internal_auth::PlatformSecurityContext`
 note: required by a bound in `toolkit_contract::assert_security_context`
   --> $WORKSPACE/libs/toolkit-contract/src/grpc_repr.rs
    |

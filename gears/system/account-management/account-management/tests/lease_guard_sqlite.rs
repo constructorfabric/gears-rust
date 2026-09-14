@@ -15,6 +15,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;

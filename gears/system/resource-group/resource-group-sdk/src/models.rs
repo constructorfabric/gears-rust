@@ -225,8 +225,18 @@ pub struct ResourceGroupWithDepth {
 }
 
 /// Request body for creating a new resource group.
+///
+/// `code` and `name` are the only fields the API contract marks `required`
+/// (`type` and `name` in the `CreateGroupRequest` `OpenAPI` schema); every
+/// other field is optional. The struct is `#[non_exhaustive]`, so build it
+/// through [`CreateGroupRequest::new`] and the `with_*` setters rather than
+/// a struct literal -- the same pattern used by
+/// `directory::ServiceInstanceInfo`. That keeps a future optional field
+/// (as `tenant_id` was when it was added here) from breaking every existing
+/// call site the way a struct literal would.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct CreateGroupRequest {
     /// Optional caller-supplied ID (used by seeding for stable identity).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,9 +249,68 @@ pub struct CreateGroupRequest {
     /// Parent group ID (null for root groups).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
+    /// Optional target tenant for the created group.
+    ///
+    /// If omitted, the tenant scope is derived from the caller's own
+    /// `SecurityContext` -- today's unchanged default behavior. If present
+    /// and different from the caller's own tenant, the create succeeds only
+    /// when the caller's `create`-action `AccessScope` actually covers the
+    /// target tenant (platform-admin / onboarding use case); otherwise the
+    /// request is rejected.
+    ///
+    /// Rejected for tenant-typed groups (`code` starting with
+    /// `TENANT_RG_TYPE_PATH`): their effective tenant is always `group.id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+impl CreateGroupRequest {
+    /// Start a create request for the required `code` (GTS chained type
+    /// code) and `name`. Every optional field defaults to `None`; chain the
+    /// `with_*` setters to populate them.
+    #[must_use]
+    pub fn new(code: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            code: code.into(),
+            name: name.into(),
+            parent_id: None,
+            tenant_id: None,
+            metadata: None,
+        }
+    }
+
+    /// Set the caller-supplied ID (used by seeding for stable identity).
+    #[must_use]
+    pub fn with_id(mut self, id: Option<Uuid>) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Set the parent group ID (`None` for a root group).
+    #[must_use]
+    pub fn with_parent_id(mut self, parent_id: Option<Uuid>) -> Self {
+        self.parent_id = parent_id;
+        self
+    }
+
+    /// Set the target tenant for the created group. See the `tenant_id`
+    /// field doc for the scoping and rejection rules.
+    #[must_use]
+    pub fn with_tenant_id(mut self, tenant_id: Option<Uuid>) -> Self {
+        self.tenant_id = tenant_id;
+        self
+    }
+
+    /// Set the type-specific metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Request body for updating a resource group (full replacement via PUT).

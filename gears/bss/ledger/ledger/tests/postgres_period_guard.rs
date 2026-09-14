@@ -1,6 +1,6 @@
 //! Postgres-only: the fiscal-period guard. An `OPEN` period pins clean; a
 //! `CLOSED` period and a missing period both yield `PeriodError::Closed`.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -15,7 +15,6 @@ use bss_ledger::infra::posting::period::{FiscalPeriodGuard, PeriodError};
 use bss_ledger::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -27,7 +26,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pin_open_admits_open_rejects_closed_and_missing() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -44,7 +43,7 @@ async fn pin_open_admits_open_rejects_closed_and_missing() {
     let guard = FiscalPeriodGuard::new();
 
     // Seed an OPEN period.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -56,7 +55,7 @@ async fn pin_open_admits_open_rejects_closed_and_missing() {
     assert!(open.is_ok(), "open period must pin: {open:?}");
 
     // Flip to CLOSED → Closed.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED'
          WHERE tenant_id='{tenant}' AND legal_entity_id='{legal_entity}' AND period_id='{period_id}'"
     )))

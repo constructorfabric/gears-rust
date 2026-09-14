@@ -79,21 +79,29 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
     // OoP gears are spawned after the start phase (once grpc-hub has bound its port).
-    let run_options = RunOptions {
-        gears_cfg: Arc::new(config),
-        db: db_options,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
+    //
+    // No `internal_token_provider` is set here on purpose: this is the
+    // in-process (Profile 1) host. Gear-to-gear calls resolve to LOCAL trait
+    // objects through the `ClientHub` — there is no transport, so no
+    // `X-ToolKit-Internal-Token` header/metadata is ever emitted and no outbound
+    // platform credential is needed. The provider is only consulted inside the
+    // generated REST/gRPC transport clients, which the monolith does not use for
+    // co-hosted dependencies. A genuinely remote (directory-resolved) dependency
+    // is the resolving-client path, which threads its own provider
+    // (`cpt-cf-adr-two-plane-auth`).
+    let run_options = RunOptions::new(
+        Arc::new(config),
+        db_options,
+        ShutdownOptions::Token(cancel.clone()),
         instance_id,
-        oop: oop_options,
-        shutdown_deadline: None,
-    };
+    )
+    .with_oop(oop_options);
 
     let result = run(run_options).await;
 
     // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    tracing_shutdown();
+    tracing_shutdown().await;
 
     result
 }
@@ -169,7 +177,7 @@ pub async fn run_migrate(config: AppConfig) -> Result<()> {
 
     // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    tracing_shutdown();
+    tracing_shutdown().await;
 
     result?;
 
@@ -304,7 +312,12 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
     let otel_layer = None;
 
     // Initialize logging + otel in one Registry
-    init_logging_unified(&config.logging, &config.server.home_dir, otel_layer);
+    init_logging_unified(
+        &config.logging,
+        &config.server.home_dir,
+        otel_layer,
+        config.opentelemetry.inject_trace_ids_into_logs(),
+    );
 
     // Register custom panic hook to reroute panic backtrace into tracing.
     init_panic_tracing();
@@ -343,7 +356,17 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
 ///
 /// This delegates to the current telemetry shutdown helpers so callers can use a
 /// single bootstrap-level function during graceful shutdown.
-pub fn tracing_shutdown() {
-    crate::telemetry::init::shutdown_metrics();
-    crate::telemetry::init::shutdown_tracing();
+///
+/// `shutdown_metrics`/`shutdown_tracing` drain the SDK's batch processor, which
+/// blocks on exporting the final batch (real network I/O to the OTLP endpoint).
+/// Run that on a blocking-pool thread so it never stalls a Tokio worker thread.
+pub async fn tracing_shutdown() {
+    if let Err(e) = tokio::task::spawn_blocking(|| {
+        crate::telemetry::init::shutdown_metrics();
+        crate::telemetry::init::shutdown_tracing();
+    })
+    .await
+    {
+        tracing::warn!(error = %e, "Telemetry shutdown task panicked");
+    }
 }

@@ -145,7 +145,7 @@ async fn s1_02_flow_positions_not_set_recovery() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     let c = ctx();
     broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap();
     let gid = make_group(&c, &broker).await;
@@ -218,7 +218,7 @@ async fn s1_03_flow_path_a_consumer_with_db() {
     // 600 events so exact offsets like 510 are valid.
     for _ in 0..600 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }

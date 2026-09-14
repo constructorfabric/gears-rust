@@ -164,6 +164,15 @@ Why the leader two-step: a single `Closed(Shutdown)` event would tell the consum
 
 Why the union shape makes this clean: terminal errors are `Closed(err)`, a regular variant. The shutdown sequence above is just a defined emission order of regular variants — no special API required.
 
+### Watch events across a process boundary
+
+When cluster runs as a separate process (DESIGN.md §3.16), the same four-variant contract crosses a gRPC stream unchanged — the union lives in the Rust type on both sides, and the flat wire event exists only because protogen cannot express a `oneof` (DESIGN.md §3.20.6). Two lifecycle signals gain a transport source:
+
+- **Server buffering → `Lagged`.** The serving gear holds one upstream subscription per `(profile, key/prefix)` and fans it out to remote subscribers over per-stream bounded channels. A slow remote consumer that cannot keep up overflows its channel; the gear drops events and emits `Lagged { dropped }` rather than blocking the shared upstream — the same semantics a consumer already handles for an in-process broadcast overflow, now originating at the transport.
+- **Transport close → `Closed(Provider{ConnectionLost})` → `RestartingWatch`.** A dropped gRPC stream (pod rollover, network blip, or the gear draining — `Closed(Shutdown)`, DESIGN.md §3.17.6) surfaces to the `Remote*Backend` as a terminal `Closed`. A *retryable* close (`ConnectionLost`, `Timeout`, `ResourceExhausted`) is what the SDK's `auto_restart` combinator re-establishes against the next replica, synthesizing a `Reset` on each successful resubscribe so the consumer re-reads its state; a non-retryable close (`AuthFailure`, `CapabilityNotMet`, `Other`) and `Closed(Shutdown)` propagate unchanged. This is exactly the mapping the combinator already applies in-process — the process boundary only adds `ConnectionLost` as a new, retryable source of `Closed`.
+
+No new variant and no consumer-visible API change: a consumer written against the in-process contract compiles and behaves identically over the wire (invariant I1).
+
 ### Consequences
 
 - Consumers explicitly handle lag and reset at the `match` site. The natural `watch.changed().await?` idiom does not compile (infallible return type), eliminating the common footgun of propagating transient signals as errors.

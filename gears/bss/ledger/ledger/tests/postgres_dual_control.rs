@@ -1,6 +1,6 @@
 //! Postgres-only repo/service-level tests for the dual-control approval engine
 //! (`ApprovalRepo` + `ApprovalService`, VHP-1852). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_dual_control -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_dual_control -- --ignored`.
 //!
 //! These are the FAST (testcontainers) counterpart to the cluster-gated e2e
 //! `tests/e2e/tests/bss-ledger/test_dual_control.py`. The e2e drives the full
@@ -52,11 +52,13 @@ use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::approval::service::{ApprovalExecutor, ApprovalService};
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{ApprovalRepo, NewPendingApproval};
-use chrono::{DateTime, Duration, Utc};
+
 use sea_orm::{Database, DbErr};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::Duration;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
@@ -76,7 +78,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -135,7 +137,7 @@ async fn seed_pending(
     scope: &AccessScope,
     tenant: Uuid,
     prepared_by: Uuid,
-    expires_at: DateTime<Utc>,
+    expires_at: OffsetDateTime,
 ) -> (Uuid, ApprovalIntent) {
     let approval_id = Uuid::now_v7();
     let intent = ApprovalIntent::Reverse(ReverseIntent {
@@ -154,7 +156,7 @@ async fn seed_pending(
         threshold_snapshot: serde_json::json!({ "d2_threshold_minor": 100_000 }),
         reason_code: "unit-test".to_owned(),
         prepared_by,
-        prepared_at: Utc::now(),
+        prepared_at: OffsetDateTime::now_utc(),
         correlation_id: Uuid::now_v7(),
         expires_at,
     };
@@ -195,7 +197,7 @@ async fn seed_comment(
                     0,
                     author,
                     "thread note".to_owned(),
-                    Utc::now(),
+                    OffsetDateTime::now_utc(),
                 )
                 .await
                 .map_err(lift)
@@ -205,8 +207,8 @@ async fn seed_comment(
         .expect("seed approval comment");
 }
 
-fn in_one_hour() -> DateTime<Utc> {
-    Utc::now() + Duration::hours(1)
+fn in_one_hour() -> OffsetDateTime {
+    OffsetDateTime::now_utc() + Duration::hours(1)
 }
 
 /// SQL-level BOLA on the approval queue: an approval (and its comment thread)
@@ -282,7 +284,7 @@ async fn approvals_are_invisible_to_a_foreign_tenant_scope() {
             tenant_a,
             intent.kind().as_str(),
             &intent.business_key(),
-            Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         .expect("read_active foreign")
@@ -486,7 +488,7 @@ async fn an_expired_pending_is_not_actionable() {
         &scope,
         tenant,
         preparer,
-        Utc::now() - Duration::hours(1),
+        OffsetDateTime::now_utc() - Duration::hours(1),
     )
     .await;
 
@@ -976,7 +978,7 @@ async fn set_policy_persists_and_resolves() {
             250_000,
             10,
             3600,
-            Utc::now() - Duration::hours(1),
+            OffsetDateTime::now_utc() - Duration::hours(1),
         )
         .await
         .expect("set policy");
@@ -986,7 +988,7 @@ async fn set_policy_persists_and_resolves() {
         .read_policy_versions(&scope, tenant)
         .await
         .expect("read");
-    let policy = resolve_policy(&versions, Utc::now());
+    let policy = resolve_policy(&versions, OffsetDateTime::now_utc());
     assert_eq!(
         policy.d2_threshold_minor, 250_000,
         "resolver picks the written threshold"
@@ -1002,7 +1004,7 @@ async fn set_policy_persists_and_resolves() {
             500_000,
             5,
             7200,
-            Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         .expect("set policy 2");
@@ -1012,7 +1014,7 @@ async fn set_policy_persists_and_resolves() {
         .await
         .expect("read");
     assert_eq!(
-        resolve_policy(&versions, Utc::now()).d2_threshold_minor,
+        resolve_policy(&versions, OffsetDateTime::now_utc()).d2_threshold_minor,
         500_000
     );
 }
@@ -1029,7 +1031,14 @@ async fn set_policy_rejects_out_of_range() {
 
     // d2 below the floor (10_000 minor = 100 USD) → rejected.
     let err = svc
-        .set_policy(&ctx_for(admin, tenant), &scope, 5_000, 5, 7200, Utc::now())
+        .set_policy(
+            &ctx_for(admin, tenant),
+            &scope,
+            5_000,
+            5,
+            7200,
+            OffsetDateTime::now_utc(),
+        )
         .await
         .unwrap_err();
     assert!(

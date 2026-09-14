@@ -12,7 +12,7 @@
 //! The seed/post harness is copied from `tests/postgres_posting.rs` (each
 //! integration test is its own binary, so the helpers can't be shared).
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_tieout -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_tieout -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
@@ -38,11 +39,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -98,7 +99,7 @@ async fn setup(
         .unwrap();
 
     // OPEN fiscal period (raw, bss-qualified).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -163,7 +164,7 @@ fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec
         source_business_id: business_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -240,7 +241,7 @@ fn noop_publisher() -> Arc<LedgerEventPublisher> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clean_tenant_ties_out() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -265,7 +266,7 @@ async fn clean_tenant_ties_out() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn account_balance_drift_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -274,7 +275,7 @@ async fn account_balance_drift_is_detected() {
     // Corrupt exactly one grain's cached balance (the AR row). `account_balance`
     // carries no append-only trigger, so a plain UPDATE is fine; the no-negative
     // CHECK is satisfied by adding to the positive AR balance.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
@@ -302,7 +303,7 @@ async fn account_balance_drift_is_detected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ar_sub_grain_drift_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -310,7 +311,7 @@ async fn ar_sub_grain_drift_is_detected() {
     // that cache (no append-only trigger; balance stays positive) and confirm
     // the sub-grain recompute — not just `account_balance` — catches it.
     let (raw, provider, f) = setup_with_one_balanced_post(&url).await;
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_ar_payer_balance SET balance_minor = balance_minor + 1 \
          WHERE tenant_id='{}' AND account_id='{}'",
         f.tenant, f.ar_account
@@ -337,7 +338,7 @@ async fn ar_sub_grain_drift_is_detected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pending_mapping_is_flagged() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -350,10 +351,10 @@ async fn pending_mapping_is_flagged() {
     // setting and the UPDATE share one pinned connection — `Database::connect`
     // is a pool, so a plain `SET` lands on a different connection than the DML.
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg("SET LOCAL session_replication_role = replica"))
+    txn.execute_raw(pg("SET LOCAL session_replication_role = replica"))
         .await
         .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "UPDATE bss.ledger_journal_line SET mapping_status='PENDING' WHERE tenant_id='{}'",
         f.tenant
     )))
@@ -373,7 +374,7 @@ async fn pending_mapping_is_flagged() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn entry_balance_backstop_catches_imbalanced_entry() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -415,10 +416,10 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
     // inserts so the setting holds through the deferred-trigger fire at COMMIT
     // and shares one pinned connection (`Database::connect` is a pool).
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg("SET LOCAL session_replication_role = replica"))
+    txn.execute_raw(pg("SET LOCAL session_replication_role = replica"))
         .await
         .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -429,7 +430,7 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
     )))
     .await
     .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
              account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -465,7 +466,7 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn entry_backstop_catches_mixed_payer_entry() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -498,10 +499,10 @@ async fn entry_backstop_catches_mixed_payer_entry() {
     // BALANCED but cross-payer entry can land: DR 500 (payer A) + CR 500
     // (payer B). net = 0 (NOT imbalanced), but two distinct payers.
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg("SET LOCAL session_replication_role = replica"))
+    txn.execute_raw(pg("SET LOCAL session_replication_role = replica"))
         .await
         .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -513,7 +514,7 @@ async fn entry_backstop_catches_mixed_payer_entry() {
     .await
     .unwrap();
     for (payer, side) in [(payer_a, "DR"), (payer_b, "CR")] {
-        txn.execute(pg(format!(
+        txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
                  account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -565,7 +566,7 @@ async fn entry_backstop_catches_mixed_payer_entry() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_emits_negative_grain_and_entry_imbalance_arms() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -582,7 +583,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
 
     // The OPEN period so the would-be post target exists (and the tenant is
     // enumerated). Seed the two AR accounts via the secure repo.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -622,17 +623,17 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
     // simulates the cache-drift / bypassed-CHECK scenario the tie-out's independent
     // no-negative backstop is meant to catch (app-level detection is unaffected).
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg("SET LOCAL session_replication_role = replica"))
+    txn.execute_raw(pg("SET LOCAL session_replication_role = replica"))
         .await
         .unwrap();
     // (a) A NEGATIVE guarded (AR) account_balance grain — the no-negative
     // backstop's `NegativeBalanceViolation` defect. Drop the DB CHECK first
     // (replica role does not skip CHECKs); the container is throwaway.
-    txn.execute(pg("ALTER TABLE bss.ledger_account_balance \
+    txn.execute_raw(pg("ALTER TABLE bss.ledger_account_balance \
          DROP CONSTRAINT IF EXISTS chk_account_balance_no_negative"))
         .await
         .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
          VALUES ('{tenant}','{guarded_account}','USD','AR','DR',-500)"
@@ -641,7 +642,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
     .unwrap();
     // (b) A single, unbalanced DR line (net +700) — the entry-balance backstop's
     // `EntryImbalance` defect.
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -652,7 +653,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
     )))
     .await
     .unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
              account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -706,7 +707,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
 // `tie_out_tenant` (which wires `recompute_payment_counter_variances` over those
 // real rows). A `setup_seller` mirrors `postgres_payments.rs`: USD@2, an OPEN
 // period for the CURRENT month (settle/allocate derive `period_id` from
-// `Utc::now()`), and the four payment-flow chart accounts.
+// `OffsetDateTime::now_utc()`), and the four payment-flow chart accounts.
 
 struct Seller {
     tenant: Uuid,
@@ -733,7 +734,7 @@ fn seller_account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> 
 }
 
 async fn setup_seller(raw: &DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -741,7 +742,7 @@ async fn setup_seller(raw: &DatabaseConnection, provider: &DBProvider<DbError>) 
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
     let reference = ReferenceRepo::new(provider.clone());
     reference
@@ -754,7 +755,7 @@ async fn setup_seller(raw: &DatabaseConnection, provider: &DBProvider<DbError>) 
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -804,8 +805,8 @@ async fn seed_ar_invoice(
         source_business_id: invoice_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
-        effective_at: Utc::now().date_naive(),
+        posted_at_utc: OffsetDateTime::now_utc(),
+        effective_at: to_naive_date(OffsetDateTime::now_utc()),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -866,7 +867,7 @@ async fn seed_ar_invoice(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn payment_counter_reconcile_through_full_tie_out() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -952,7 +953,7 @@ async fn payment_counter_reconcile_through_full_tie_out() {
         before.allocated_minor, 300,
         "allocated counter seeded to 300"
     );
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement SET allocated_minor = 250 \
          WHERE tenant_id='{}' AND payment_id='PAY-TIE-1'",
         s.tenant
@@ -988,7 +989,7 @@ async fn payment_counter_reconcile_through_full_tie_out() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn incremental_tie_out_covers_reusable_credit_grain() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1029,7 +1030,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
             source_business_id: business_id.to_owned(),
             reverses_entry_id: None,
             reverses_period_id: None,
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: effective,
             origin: "SYSTEM".to_owned(),
             posted_by_actor_id: f.tenant,
@@ -1058,7 +1059,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
         1000,
     );
     service.post(&ctx, &scope, e1, l1, None).await.unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND period_id='{}'",
         f.tenant, f.period_id
@@ -1073,7 +1074,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
 
     // Period 2: open it, credit another 400 into the wallet (a second event-type
     // bucket would also work; the same bucket keeps the grain a single key).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
          VALUES ('{}','{}','202607','UTC','OPEN')",
         f.tenant, f.legal_entity
@@ -1113,7 +1114,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
     // The wallet cache carries the all-time total (1000 + 400 = 1400) — confirms
     // both credits projected onto the reusable_credit sub-grain.
     let wallet_balance = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
              WHERE tenant_id='{}' AND account_id='{wallet}' AND credit_grant_event_type='promo'",
             f.tenant

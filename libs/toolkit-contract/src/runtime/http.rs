@@ -9,8 +9,10 @@ use http_body::Body;
 use http_body_util::BodyStream;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use toolkit_canonical_errors::Problem;
+use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::{HttpFieldBinding, HttpMethod, HttpMethodBindingIr};
+use crate::runtime::config::InternalTokenProvider;
 use crate::runtime::transport_error::TransportError;
 
 // RFC 3986 path-segment encode set: encode everything except unreserved
@@ -64,6 +66,41 @@ where
             Err(e) => Some(Err(e)),
         }
     })
+}
+
+/// Maximum error-body prefix buffered when classifying a non-success streaming
+/// open. The body only feeds a diagnostic — an RFC 9457 [`Problem`], or a
+/// truncated `HttpStatus.body` — so a short prefix is all it is ever used for,
+/// mirroring toolkit-http's own `ERROR_BODY_PREVIEW_LIMIT`.
+pub(crate) const ERROR_BODY_PREVIEW_LIMIT: usize = 8 * 1024;
+
+/// Read at most [`ERROR_BODY_PREVIEW_LIMIT`] bytes of `body`'s data frames,
+/// abandoning the rest of the body unread once the cap is reached.
+///
+/// The streaming open's error path needs only a short prefix to build its
+/// diagnostic. `HttpResponse::bytes()` would instead buffer the whole body up
+/// to the client's `max_body_size` (megabytes by default), so a peer could make
+/// a failed open allocate far more than the message ever uses. Capping the read
+/// itself — not merely truncating the resulting string — is what bounds that
+/// allocation. A transport error encountered before the cap surfaces as `Err`.
+pub(crate) async fn read_error_body_prefix<B>(body: B) -> Result<Bytes, B::Error>
+where
+    B: Body<Data = Bytes>,
+{
+    use http_body_util::BodyExt as _;
+
+    let mut body = std::pin::pin!(body);
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < ERROR_BODY_PREVIEW_LIMIT {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        if let Ok(data) = frame?.into_data() {
+            let take = (ERROR_BODY_PREVIEW_LIMIT - buf.len()).min(data.len());
+            buf.extend_from_slice(&data[..take]);
+        }
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Build a fully-qualified URL by substituting path parameters and appending a
@@ -126,6 +163,24 @@ pub fn build_request_url(
     Ok(url)
 }
 
+/// Attach the platform-plane credential from `provider` (if any) to a REST
+/// [`RequestBuilder`] as the sensitive `X-ToolKit-Internal-Token` header.
+///
+/// The single audited REST emit point, shared by the unary-attempt closure and
+/// the SSE reconnect factory (so both re-resolve per attempt and pick up
+/// rotation). REST sibling of [`crate::grpc::attach_internal_token`]; both
+/// delegate the attach policy to [`InternalTokenProvider::resolve_for_attach`].
+pub fn attach_internal_token(
+    builder: RequestBuilder,
+    provider: Option<&InternalTokenProvider>,
+    rpc: &str,
+) -> RequestBuilder {
+    match InternalTokenProvider::resolve_for_attach(provider, rpc) {
+        Some(token) => builder.internal_token_auth(&token),
+        None => builder,
+    }
+}
+
 /// Map an HTTP method enum to [`http::Method`].
 #[must_use]
 pub fn to_http_method(method: HttpMethod) -> http::Method {
@@ -155,7 +210,10 @@ pub fn map_http_error(
     body: String,
     retry_after: Option<std::time::Duration>,
 ) -> TransportError {
-    if let Ok(problem) = serde_json::from_str::<Problem>(&body) {
+    if let Ok(mut problem) = serde_json::from_str::<Problem>(&body) {
+        // RFC 9457 §3.1 makes `status` advisory; if the peer omitted it,
+        // the real response status is right here.
+        problem.status.get_or_insert(status);
         return TransportError::Problem {
             problem: Box::new(problem),
             retry_after,
@@ -218,7 +276,36 @@ fn truncate(mut s: String, max: usize) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::ir::binding::{HttpFieldBinding, HttpMethodBindingIr};
+    use crate::ir::binding::{HttpFieldBinding, HttpMethodBindingIr, StreamFraming};
+
+    /// Build an `http_body::Body` whose data arrives across several frames, so
+    /// the prefix reader is exercised on the cross-frame accumulation path (not
+    /// just a single buffered chunk).
+    fn framed_body(chunks: Vec<Vec<u8>>) -> impl http_body::Body<Data = Bytes, Error = String> {
+        use http_body::Frame;
+        let frames = chunks
+            .into_iter()
+            .map(|c| Ok::<_, String>(Frame::data(Bytes::from(c))));
+        http_body_util::StreamBody::new(futures_util::stream::iter(frames))
+    }
+
+    #[tokio::test]
+    async fn error_prefix_returns_a_short_body_intact() {
+        let body = framed_body(vec![b"service ".to_vec(), b"unavailable".to_vec()]);
+        let bytes = read_error_body_prefix(body).await.unwrap();
+        assert_eq!(&bytes[..], b"service unavailable");
+    }
+
+    #[tokio::test]
+    async fn error_prefix_caps_an_oversized_body_at_the_limit() {
+        // Two frames that each fit under the cap but together exceed it: the
+        // reader must stop at exactly ERROR_BODY_PREVIEW_LIMIT and abandon the
+        // rest rather than buffering the whole body.
+        let big = vec![b'x'; ERROR_BODY_PREVIEW_LIMIT];
+        let body = framed_body(vec![big.clone(), big]);
+        let bytes = read_error_body_prefix(body).await.unwrap();
+        assert_eq!(bytes.len(), ERROR_BODY_PREVIEW_LIMIT);
+    }
 
     fn binding(template: &str, fields: Vec<HttpFieldBinding>) -> HttpMethodBindingIr {
         HttpMethodBindingIr {
@@ -228,6 +315,7 @@ mod tests {
             field_bindings: fields,
             retryable: false,
             streaming: false,
+            stream_framing: StreamFraming::default(),
             optional: false,
         }
     }
@@ -305,9 +393,36 @@ mod tests {
         let err = map_http_error(500, body, None);
         match err {
             TransportError::Problem { problem: p, .. } => {
-                assert_eq!(p.status, 500);
+                assert_eq!(p.status, Some(500));
                 assert_eq!(p.detail, "broke");
                 assert!(p.problem_type.contains("internal"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_a_minimal_spec_compliant_problem_envelope() {
+        // RFC 9457 §3.1 makes `detail` and `context` optional. A genuinely
+        // foreign peer's Problem can omit both and still be fully
+        // spec-compliant - it must still map to `TransportError::Problem`
+        // (preserving the real `type`/`title`), not silently degrade to the
+        // generic `HttpStatus` fallback meant for peers that don't speak the
+        // canonical-errors envelope at all.
+        let body = serde_json::json!({
+            "type": "https://example.com/probs/out-of-credit",
+            "title": "You do not have enough credit.",
+            "status": 409
+        })
+        .to_string();
+        let err = map_http_error(409, body, None);
+        match err {
+            TransportError::Problem { problem: p, .. } => {
+                assert_eq!(p.problem_type, "https://example.com/probs/out-of-credit");
+                assert_eq!(p.title, "You do not have enough credit.");
+                assert_eq!(p.status, Some(409));
+                assert_eq!(p.detail, "");
+                assert_eq!(p.context, serde_json::json!({}));
             }
             other => panic!("unexpected {other:?}"),
         }

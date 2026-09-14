@@ -1,4 +1,3 @@
-// Created: 2026-06-03 by Constructor Tech
 //! Typed cluster profile marker and profile-scope resolution.
 //!
 //! A consumer declares a profile once as a zero-sized type implementing
@@ -32,6 +31,82 @@ pub trait ClusterProfile: Copy + Send + Sync + 'static {
     const NAME: &'static str;
 }
 
+/// One inventoried [`ClusterProfile`] marker, submitted by
+/// [`register_cluster_profile!`](crate::register_cluster_profile).
+///
+/// The consumer-side counterpart of the gear's config `profiles` map: it is how a
+/// *process* states which profiles it intends to use, without the profile string
+/// appearing in a third place. Invariant I10 allows exactly two — the marker and
+/// the `.profile()` call — so the wiring enumerates these instead of reading a
+/// list (§4.9.2).
+///
+/// Unfeatured on purpose. Profile 1 has no consumer registration at all, and the
+/// readiness contributor (`K5`) needs the same enumeration to know which profiles
+/// this process cares about; a `grpc-client`-only registry would leave the
+/// embedded profile with no notion of an intended profile set.
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredProfile {
+    /// The marker's [`ClusterProfile::NAME`].
+    pub name: &'static str,
+}
+
+toolkit::inventory::collect!(RegisteredProfile);
+
+/// Every profile this process declared through
+/// [`register_cluster_profile!`](crate::register_cluster_profile), deduplicated
+/// and in a stable order.
+///
+/// Deduplicated because the same marker may legitimately be registered by two
+/// crates in one binary (a gear and its test fixture, say), and a duplicate would
+/// otherwise be reported as a second profile in every diagnostic built from this.
+/// Sorted so those diagnostics do not vary between runs — `inventory`'s iteration
+/// order is link order, which is not stable.
+#[must_use]
+pub fn registered_profiles() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = toolkit::inventory::iter::<RegisteredProfile>
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Declares a [`ClusterProfile`] marker to the process, so cluster's consumer
+/// wiring and readiness contributor can enumerate it (§4.9.2).
+///
+/// ```
+/// # use cluster_sdk::{ClusterProfile, register_cluster_profile};
+/// #[derive(Clone, Copy)]
+/// pub struct EventBrokerProfile;
+/// impl ClusterProfile for EventBrokerProfile {
+///     const NAME: &'static str = "event-broker";
+/// }
+/// register_cluster_profile!(EventBrokerProfile);
+/// ```
+///
+/// # What it is not
+///
+/// It is **not** a wiring call and not a prerequisite for resolving. A facade
+/// resolves whether or not its profile was registered here, in both deployment
+/// profiles — this exists so the process can say *which profiles it expects*,
+/// which lets the wiring warn about a profile the server does not bind
+/// and lets readiness gate on the profiles this consumer actually uses rather
+/// than on every profile the cluster gear happens to serve (§4.4).
+///
+/// Invoke it at module scope, once per marker. Registering the same marker twice
+/// is harmless: [`registered_profiles`] deduplicates.
+#[macro_export]
+macro_rules! register_cluster_profile {
+    ($marker:ty) => {
+        $crate::inventory::submit! {
+            $crate::profile::RegisteredProfile {
+                name: <$marker as $crate::ClusterProfile>::NAME,
+            }
+        }
+    };
+}
+
 /// Returns `true` if `name` satisfies [`CLUSTER_NAME_RULE`].
 #[must_use]
 pub fn is_valid_cluster_name(name: &str) -> bool {
@@ -55,6 +130,48 @@ pub fn validate_cluster_name(name: &str) -> Result<(), ClusterError> {
         Err(ClusterError::InvalidName {
             name: name.to_owned(),
             reason: CLUSTER_NAME_RULE,
+        })
+    }
+}
+
+/// The rule an *optionally scope-prefixed* coordination name must satisfy: one or
+/// more `/`-separated segments, each matching [`CLUSTER_NAME_RULE`], with no empty
+/// segment. Unlike [`CLUSTER_NAME_RULE`] this permits `/` because it is the scope
+/// separator (DESIGN §3.8): a scoped lock/leader name composes as `prefix/name`.
+pub const SCOPED_CLUSTER_NAME_RULE: &str = "[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)* (max 1024 chars)";
+
+/// The maximum length (in bytes) of a fully-composed scoped coordination name on
+/// the wire. Generous enough for stacked scopes (`a/b/c/name`); bounds a
+/// pathological wire name. Part of the frozen contract.
+pub const MAX_SCOPED_CLUSTER_NAME_LEN: usize = 1024;
+
+/// Validates an *optionally scope-prefixed* coordination name — the form the
+/// lock/leader **server** path receives after client-side `.scoped()` composes
+/// `prefix/name`. Each `/`-separated segment must satisfy [`CLUSTER_NAME_RULE`].
+///
+/// The facade validates the *unscoped* leaf name with [`validate_cluster_name`];
+/// the receiver must accept the composed name too, so it uses this scope-aware
+/// rule (mirroring how a scoped cache key is validated). Using
+/// [`validate_cluster_name`] here instead — which forbids `/` — rejects every
+/// scoped lock/leader operation on the wire even though `.scoped()` is public
+/// API, and it does so only in Profile 3 (the local backend never re-validates),
+/// violating the Profile-1/Profile-3 parity invariant (I1).
+///
+/// # Errors
+/// Returns [`ClusterError::InvalidName`] if `name` is empty, exceeds
+/// [`MAX_SCOPED_CLUSTER_NAME_LEN`], has an empty segment (a leading, trailing, or
+/// doubled `/`), or any segment contains a character outside [`CLUSTER_NAME_RULE`].
+pub fn validate_scoped_cluster_name(name: &str) -> Result<(), ClusterError> {
+    let ok = !name.is_empty()
+        && name.len() <= MAX_SCOPED_CLUSTER_NAME_LEN
+        && !name.split('/').any(str::is_empty)
+        && name.split('/').all(is_valid_cluster_name);
+    if ok {
+        Ok(())
+    } else {
+        Err(ClusterError::InvalidName {
+            name: name.to_owned(),
+            reason: SCOPED_CLUSTER_NAME_RULE,
         })
     }
 }
@@ -86,6 +203,29 @@ mod tests {
     struct OrdersProfile;
     impl ClusterProfile for OrdersProfile {
         const NAME: &'static str = "orders";
+    }
+
+    #[derive(Clone, Copy)]
+    struct InventoriedByProfileTests;
+    impl ClusterProfile for InventoriedByProfileTests {
+        const NAME: &'static str = "profile-tests-inventoried";
+    }
+    crate::register_cluster_profile!(InventoriedByProfileTests);
+
+    /// The macro and its enumeration must work with **no features enabled**.
+    ///
+    /// This is invariant I10's mechanism and `K5`'s input, and both have to exist
+    /// in Profile 1 — where there is no consumer registration at all, so a
+    /// `grpc-client`-gated registry would leave the embedded profile with no notion
+    /// of an intended profile set. `wiring_tests.rs` covers the same ground behind
+    /// the feature; this test is here so a default-feature build covers it too.
+    #[test]
+    fn a_marker_is_inventoried_without_any_feature_enabled() {
+        let profiles = super::registered_profiles();
+        assert!(
+            profiles.contains(&InventoriedByProfileTests::NAME),
+            "the unfeatured build must enumerate registered markers, got {profiles:?}"
+        );
     }
 
     #[test]
@@ -139,5 +279,39 @@ mod tests {
             validate_cluster_name("x y"),
             Err(ClusterError::InvalidName { .. })
         ));
+    }
+
+    #[test]
+    fn scoped_name_accepts_slash_separated_segments() {
+        use super::validate_scoped_cluster_name;
+        // A bare leaf and a scoped `prefix/name` must both be accepted — the
+        // latter is exactly what `.scoped()` composes and what a bare
+        // `validate_cluster_name` wrongly rejected on the server path.
+        assert!(validate_scoped_cluster_name("reservation").is_ok());
+        assert!(validate_scoped_cluster_name("cluster-consumer/reservation").is_ok());
+        assert!(validate_scoped_cluster_name("a/b/c/leaf").is_ok());
+    }
+
+    #[test]
+    fn scoped_name_rejects_empty_segments_and_bad_chars() {
+        use super::{MAX_SCOPED_CLUSTER_NAME_LEN, validate_scoped_cluster_name};
+        for bad in [
+            "",
+            "/leading",
+            "trailing/",
+            "a//b",
+            "has space",
+            "bad:colon/x",
+        ] {
+            assert!(
+                matches!(
+                    validate_scoped_cluster_name(bad),
+                    Err(ClusterError::InvalidName { .. })
+                ),
+                "`{bad}` must be rejected"
+            );
+        }
+        let over_cap = "a".repeat(MAX_SCOPED_CLUSTER_NAME_LEN + 1);
+        assert!(validate_scoped_cluster_name(&over_cap).is_err());
     }
 }

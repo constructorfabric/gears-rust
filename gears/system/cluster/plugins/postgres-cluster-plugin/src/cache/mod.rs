@@ -9,6 +9,7 @@ use cluster_sdk::{
     CacheConsistency, CacheEntry, CacheFeatures, CacheWatch, ClusterCacheBackend, ClusterError,
     ProviderErrorKind,
 };
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 
 pub mod reaper;
@@ -174,10 +175,10 @@ impl ClusterCacheBackend for PostgresCache {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CacheEntry>, ClusterError> {
-        let row: Option<(Vec<u8>, i64)> = sqlx::query_as(&format!(
+        let row: Option<(Vec<u8>, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT value, version FROM {} WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())",
             self.table
-        ))
+        )))
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -197,13 +198,13 @@ impl ClusterCacheBackend for PostgresCache {
         let ttl_millis = ttl_to_millis(req.ttl)?;
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {table} (key, value, version, expires_at) VALUES ($1, $2, 1, {expires_at}) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, \
              version = {table}.version + 1, expires_at = EXCLUDED.expires_at",
             table = self.table,
             expires_at = expires_at_sql(3),
-        ))
+        )))
         .bind(req.key)
         .bind(req.value)
         .bind(ttl_millis)
@@ -223,11 +224,11 @@ impl ClusterCacheBackend for PostgresCache {
         // remove it and emit `Expired`. Matching the filter keeps `delete`
         // consistent with the read path.
         let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let deleted: Option<i32> = sqlx::query_scalar(&format!(
+        let deleted: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
             "DELETE FROM {} WHERE key = $1 AND (expires_at IS NULL OR expires_at > now()) \
              RETURNING 1",
             self.table
-        ))
+        )))
         .bind(key)
         .fetch_optional(&mut *tx)
         .await
@@ -242,10 +243,10 @@ impl ClusterCacheBackend for PostgresCache {
     }
 
     async fn contains(&self, key: &str) -> Result<bool, ClusterError> {
-        let exists: Option<i32> = sqlx::query_scalar(&format!(
+        let exists: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT 1 FROM {} WHERE key = $1 AND (expires_at IS NULL OR expires_at > now())",
             self.table
-        ))
+        )))
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -270,7 +271,7 @@ impl ClusterCacheBackend for PostgresCache {
         // upsert overwrites an expired row (returning it as a freshly-created
         // version-1 entry) while a live entry still yields no row → `Ok(None)`.
         let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let inserted: Option<(Vec<u8>, i64)> = sqlx::query_as(&format!(
+        let inserted: Option<(Vec<u8>, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "INSERT INTO {table} (key, value, version, expires_at) VALUES ($1, $2, 1, {expires_at}) \
              ON CONFLICT (key) DO UPDATE \
                SET value = EXCLUDED.value, version = 1, expires_at = EXCLUDED.expires_at \
@@ -278,7 +279,7 @@ impl ClusterCacheBackend for PostgresCache {
              RETURNING value, version",
             table = self.table,
             expires_at = expires_at_sql(3),
-        ))
+        )))
         .bind(req.key)
         .bind(req.value)
         .bind(ttl_millis)
@@ -311,15 +312,66 @@ impl ClusterCacheBackend for PostgresCache {
         let expected_version_i64 = version_to_i64(expected_version)?;
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let updated: Option<i64> = sqlx::query_scalar(&format!(
+        let updated: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {table} SET value = $3, version = version + 1, expires_at = {expires_at} \
              WHERE key = $1 AND version = $2 AND (expires_at IS NULL OR expires_at > now()) \
              RETURNING version",
             table = self.table,
             expires_at = expires_at_sql(4),
-        ))
+        )))
         .bind(key)
         .bind(expected_version_i64)
+        .bind(new_value)
+        .bind(ttl_millis)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if let Some(version) = updated {
+            watch::notify(&mut *tx, NotifyEvent::Changed, key).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            Ok(CacheEntry {
+                value: new_value.to_vec(),
+                version: i64_to_version(version)?,
+            })
+        } else {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            let current = self.get(key).await?;
+            Err(ClusterError::CasConflict {
+                key: key.to_owned(),
+                current,
+            })
+        }
+    }
+
+    async fn compare_and_swap_value(
+        &self,
+        key: &str,
+        expected_value: &[u8],
+        new_value: &[u8],
+        ttl: Ttl,
+    ) -> Result<CacheEntry, ClusterError> {
+        // Overridden (not the default get-then-swap) for atomicity, per the
+        // trait doc's guidance for a backend with an atomic store. Guards on the
+        // exact `value` rather than the version so the delete+recreate
+        // version-reset scenario documented in
+        // `[cluster-cache-version-reset-caveat]` (DESIGN.md §2.2) cannot alias a
+        // successor's fresh claim — the in-place lease steal relies on this.
+        // Live-entry predicate (PGR-C5): an expired-but-unreaped row is logically
+        // absent, so a value match against it must not swap.
+        validate_key_len(key)?;
+        let ttl_millis = ttl_to_millis(ttl)?;
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
+        let updated: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "UPDATE {table} SET value = $3, version = version + 1, expires_at = {expires_at} \
+             WHERE key = $1 AND value = $2 AND (expires_at IS NULL OR expires_at > now()) \
+             RETURNING version",
+            table = self.table,
+            expires_at = expires_at_sql(4),
+        )))
+        .bind(key)
+        .bind(expected_value)
         .bind(new_value)
         .bind(ttl_millis)
         .fetch_optional(&mut *tx)
@@ -358,11 +410,11 @@ impl ClusterCacheBackend for PostgresCache {
         // row is logically absent, so a value match against it must not report a
         // successful delete or emit `Deleted`.
         let mut tx = self.pool.begin().await.map_err(map_sqlx_error)?;
-        let deleted: Option<i32> = sqlx::query_scalar(&format!(
+        let deleted: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
             "DELETE FROM {} WHERE key = $1 AND value = $2 \
              AND (expires_at IS NULL OR expires_at > now()) RETURNING 1",
             self.table
-        ))
+        )))
         .bind(key)
         .bind(expected_value)
         .fetch_optional(&mut *tx)
@@ -391,15 +443,34 @@ impl ClusterCacheBackend for PostgresCache {
 
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, ClusterError> {
         let pattern = format!("{}%", escape_like(prefix));
-        let keys: Vec<String> = sqlx::query_scalar(&format!(
+        let keys: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT key FROM {} WHERE key LIKE $1 ESCAPE '\\' AND (expires_at IS NULL OR expires_at > now())",
             self.table
-        ))
+        )))
         .bind(pattern)
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
         Ok(keys)
+    }
+
+    /// `SELECT 1` against the pool — the cheapest statement that proves a
+    /// connection can be acquired and the server answers on it, which is exactly
+    /// what "is this profile serving" means for a Postgres binding
+    /// (DESIGN.md).
+    ///
+    /// It touches no cluster table on purpose: a probe must not depend on the
+    /// migration state, the row count, or the reaper's progress, only on
+    /// reachability. Pool exhaustion surfaces here the same way it does on the
+    /// request path — as an acquire timeout mapped by
+    /// [`map_sqlx_error`](crate::pg_error::map_sqlx_error) — so a saturated pool
+    /// reports the profile degraded rather than silently passing.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(())
     }
 }
 

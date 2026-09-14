@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-db"
-version = "0.11.3"
+version = "0.14.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -53,12 +53,30 @@ mysql = [
     "sea-orm-migration/sqlx-mysql",
 ]
 
+# SQL/PGQ (GRAPH_TABLE) support. Implies `pg`, so a gear cannot even name the
+# secure graph builder on a build without a Postgres backend: `GRAPH_TABLE`
+# exists on PostgreSQL 19+ and nowhere else, and the CTE support this sits
+# beside is asserted on all three backends. A compile-time incompatibility is
+# deliberate — discovering non-portability from a runtime error in production
+# would be strictly worse (docs/arch/secure-orm/ADR/0002, "Backend gating").
+#
+# NB `metadata.docs.rs.all-features = true`, so the gated code has to compile in
+# the docs build too.
+pgq = ["pg", "dep:toolkit-sea-orm-pgq"]
+
 integration = []
 
-# Transactional outbox pipeline (preview — API may change)
-preview-outbox = ["dep:tokio-util", "dep:futures-util"]
+# Test-only surface for external integration-test suites that need to observe
+# transaction boundaries or attach a SeaORM query-metric callback (e.g. the
+# resource-group DB-behavior audit's `QueryRecorder`). Not used by production
+# code paths; see `connect_db_with_metric_callback` and
+# `secure::in_transaction_for_testing`.
+test-support = ["dep:regex"]
 
 [dependencies]
+# Only used by the `test-support` module's SQL normalizer; optional so a
+# production build never pulls it in.
+regex = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -74,51 +92,58 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 toolkit-security = { workspace = true }
+# SQL/PGQ syntax layer; optional, pulled in by the `pgq` feature. Nothing
+# outside that feature names its types: `ScopeError::GraphSyntax` carries the
+# syntax layer's message as a `String`, so a gear without a Postgres backend
+# never links this crate (docs/arch/secure-orm/ADR/0002, "Backend gating").
+toolkit-sea-orm-pgq = { workspace = true, optional = true }
 toolkit-odata = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 bigdecimal = { workspace = true }
 rust_decimal = { workspace = true }
 ryu = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
 figment = { workspace = true }
 sqlx = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+# Unconditional: the transactional outbox pipeline is always compiled in.
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
 
 [[example]]
 name = "outbox_transactional"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_retry_reject"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_dead_letters"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_batch_multi_queue"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_custom_prefix"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[bench]]
 name = "outbox_throughput"
 harness = false
 # `_any-backend` is a virtual OR over pg/mysql/sqlite (see [features] above).
 # The bench body compile-errors out if no backend is present.
-required-features = ["preview-outbox", "_any-backend"]
+required-features = ["_any-backend"]
 
 [[bench]]
 name = "worker_overhead"
 harness = false
-required-features = ["preview-outbox", "_any-backend"]
+required-features = ["_any-backend"]
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
@@ -127,6 +152,7 @@ toolkit-utils = { workspace = true, features = ["serde"] }
 serde-saphyr = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 anyhow = { workspace = true }
 temp-env = { workspace = true }

@@ -40,10 +40,10 @@
 //!
 //! **Run examples:**
 //!   ```sh
-//!   cargo bench --bench outbox_throughput --features preview-outbox,pg
-//!   cargo bench --bench outbox_throughput --features preview-outbox,pg -- "16p16c"
-//!   BENCH_LONGHAUL=1 cargo bench --bench outbox_throughput --features preview-outbox,pg
-//!   BENCH_STRESS=1 cargo bench --bench outbox_throughput --features preview-outbox,pg -- "2i"
+//!   cargo bench --bench outbox_throughput --features pg
+//!   cargo bench --bench outbox_throughput --features pg -- "16p16c"
+//!   BENCH_LONGHAUL=1 cargo bench --bench outbox_throughput --features pg
+//!   BENCH_STRESS=1 cargo bench --bench outbox_throughput --features pg -- "2i"
 //!   ```
 
 use std::collections::HashSet;
@@ -1198,17 +1198,17 @@ async fn cleanup_outbox_tables(db_url: &str, profile: &BenchProfile) {
         for table in table_family(prefix) {
             let sql = match backend {
                 sea_orm::DbBackend::Postgres => format!("TRUNCATE TABLE {table} CASCADE"),
-                sea_orm::DbBackend::Sqlite | sea_orm::DbBackend::MySql => {
-                    format!("DELETE FROM {table}")
-                }
+                // `DbBackend` is `#[non_exhaustive]` as of SeaORM 2.0; plain
+                // DELETE is the portable fallback for a bench cleanup.
+                _ => format!("DELETE FROM {table}"),
             };
-            db.execute(Statement::from_string(backend, sql))
+            db.execute_raw(Statement::from_string(backend, sql))
                 .await
                 .unwrap();
         }
         if backend == sea_orm::DbBackend::MySql {
             for table in sequence_tables(prefix) {
-                db.execute(Statement::from_string(
+                db.execute_raw(Statement::from_string(
                     backend,
                     format!("UPDATE {table} SET next_id = 1 WHERE slot = 1"),
                 ))
@@ -1307,7 +1307,7 @@ mod pg_container {
         ConnectOpts, Duration, OnceLock, Runtime, connect_db, outbox_migrations,
         run_migrations_for_testing, wait_for_tcp,
     };
-    use testcontainers::{ContainerAsync, ContainerRequest, ImageExt, runners::AsyncRunner};
+    use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
     use testcontainers_modules::postgres::Postgres;
 
     pub struct PgContainer {
@@ -1320,7 +1320,7 @@ mod pg_container {
     pub fn get_pg(rt: &Runtime) -> &'static PgContainer {
         PG.get_or_init(|| {
             rt.block_on(async {
-                let container = ContainerRequest::from(Postgres::default())
+                let container = test_containers::postgres()
                     .with_env_var("POSTGRES_PASSWORD", "pass")
                     .with_env_var("POSTGRES_USER", "user")
                     .with_env_var("POSTGRES_DB", "bench")
@@ -1353,7 +1353,7 @@ mod mysql_container {
         ConnectOpts, Duration, OnceLock, Runtime, connect_db, outbox_migrations,
         run_migrations_for_testing, wait_for_tcp,
     };
-    use testcontainers::{ContainerAsync, ContainerRequest, ImageExt, runners::AsyncRunner};
+    use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
     use testcontainers_modules::mysql::Mysql;
 
     pub struct MysqlContainer {
@@ -1373,7 +1373,7 @@ mod mysql_container {
                 //   (COMMIT is 105x slower with binlog enabled vs PG)
                 // - innodb-flush-log-at-trx-commit=2: flush redo log once/sec
                 //   instead of per-commit (safe for benchmarks, not production)
-                let container = ContainerRequest::from(Mysql::default())
+                let container = test_containers::mysql()
                     .with_env_var("MYSQL_ROOT_PASSWORD", "root")
                     .with_env_var("MYSQL_USER", "user")
                     .with_env_var("MYSQL_PASSWORD", "pass")
@@ -1428,7 +1428,7 @@ mod mariadb_container {
         // MariaDB prints "ready for connections" twice: once during the
         // temporary bootstrap server, once for the real server. We match
         // the version line that only appears in the final startup message.
-        GenericImage::new("mariadb", "lts")
+        test_containers::mariadb()
             .with_wait_for(WaitFor::message_on_stderr(
                 "mariadb.org binary distribution",
             ))

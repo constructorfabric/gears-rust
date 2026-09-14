@@ -2,7 +2,7 @@
 //!
 //! This crate provides the public API for the `authz_resolver` gear:
 //!
-//! - [`AuthZResolverClient`] - Public API trait for consumers
+//! - [`AuthZResolverApi`] - Public API contract for consumers
 //! - [`AuthZResolverPluginClient`] - Plugin API trait for implementations
 //! - [`EvaluationRequest`], [`EvaluationResponse`] - Evaluation models
 //! - [`Constraint`], [`Predicate`] - Constraint types
@@ -14,7 +14,7 @@
 //!
 //! ```ignore
 //! use authz_resolver_sdk::{
-//!     AuthZResolverClient,
+//!     AuthZResolverApi,
 //!     pep::{AccessRequest, PolicyEnforcer, ResourceType},
 //! };
 //!
@@ -24,7 +24,7 @@
 //! );
 //!
 //! // Get the client from ClientHub
-//! let authz = hub.get::<dyn AuthZResolverClient>()?;
+//! let authz = hub.get::<dyn AuthZResolverApi>()?;
 //!
 //! // Create an enforcer (once, during init - serves all resource types)
 //! let enforcer = PolicyEnforcer::new(authz);
@@ -50,8 +50,13 @@ pub mod models;
 pub mod pep;
 pub mod plugin_api;
 
-// Re-export main types at crate root
-pub use api::AuthZResolverClient;
+/// REST (HTTP) projection of the [`AuthZResolverApi`] contract
+pub mod rest;
+
+// Re-export the contract trait and its generated IR builder. The trait name
+// carries the `Api` suffix per the contract-kind convention.
+pub use api::{AuthZResolverApi, auth_z_resolver_api_ir};
+
 pub use constraints::{
     Constraint, EqPredicate, InGroupPredicate, InGroupSubtreePredicate, InPredicate,
     InTenantSubtreePredicate, Predicate,
@@ -64,3 +69,8 @@ pub use models::{
 };
 pub use pep::{AccessRequest, EnforcerError, IntoPropertyValue, PolicyEnforcer, ResourceType};
 pub use plugin_api::AuthZResolverPluginClient;
+// REST projection: base projection trait + HTTP binding builder (always), plus
+// the generated clients when `rest-client` is enabled.
+pub use rest::{AuthZResolverApiRest, auth_z_resolver_api_rest_http_binding};
+#[cfg(feature = "rest-client")]
+pub use rest::{AuthZResolverApiRestClient, AuthZResolverApiRestResolvingClient};

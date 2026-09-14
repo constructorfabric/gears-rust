@@ -9,7 +9,7 @@ use event_broker_sdk::{
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.remote.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.remote.v1";
+const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.remote.v1~";
 
 type RemoteCall = (String, &'static str);
 type RecordedRemoteCalls = Arc<Mutex<Vec<RemoteCall>>>;
@@ -61,7 +61,6 @@ async fn if_i_need_remote_calls_the_handler_owns_its_client_and_auth() {
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TOPIC,
         EVENT_TYPE,
         "remote-1",
         None,

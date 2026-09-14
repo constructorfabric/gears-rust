@@ -5,14 +5,34 @@ use crate::domain::error::DomainError;
 use crate::domain::ir::{DocumentBuilder, Inline, ParsedBlock, ParsedSource};
 use crate::domain::parser::FileParserBackend;
 
+use super::bounded_read::read_bounded;
+
 /// Stub parser that provides placeholder parsing for various file types
 /// This is a temporary implementation until proper parsers are integrated
-pub struct StubParser;
+pub struct StubParser {
+    max_bytes: u64,
+}
+
+/// Ceiling applied by [`StubParser::new`], matching `FileParserConfig`'s
+/// `max_file_size_mb` default. `Gear::init` replaces it with the configured
+/// value via [`StubParser::with_max_bytes`].
+const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl StubParser {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// Caps how much this parser reads from a local file into memory. The
+    /// service's up-front `metadata()` check is not atomic against the file
+    /// growing; this is what actually bounds the allocation.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
     }
 }
 
@@ -35,10 +55,9 @@ impl FileParserBackend for StubParser {
     async fn parse_local_path(
         &self,
         path: &Path,
+        _resolved_content_type: Option<&str>,
     ) -> Result<crate::domain::ir::ParsedDocument, DomainError> {
-        let content = tokio::fs::read(path)
-            .await
-            .map_err(|e| DomainError::io_error(format!("Failed to read file: {e}")))?;
+        let content = read_bounded(path, self.max_bytes).await?;
 
         let bytes = bytes::Bytes::from(content);
         let file_name = path

@@ -113,9 +113,10 @@ impl RestApiCapability for ApiContracts {
         let service_v2 = ctx.client_hub().get::<dyn PaymentApiV2>()?;
 
         // Three sources compose on one router: the macro-generated v1 routes
-        // plus the manual SSE route (`list_payments`, `#[server_manual]`) from
-        // `register_routes`, and the macro-generated v2 routes mounted under
-        // `/v2` (ADR-0007 parallel versions). Generated registration is
+        // plus the two manual streaming routes (`list_payments` over SSE and
+        // `stream_payments` over `multipart/mixed`, both `#[server_manual]`)
+        // from `register_routes`, and the macro-generated v2 routes mounted
+        // under `/v2` (ADR-0007 parallel versions). Generated registration is
         // additive both across versions and alongside hand-written
         // `OperationBuilder` calls.
         let router = routes::register_routes(router, openapi, service);

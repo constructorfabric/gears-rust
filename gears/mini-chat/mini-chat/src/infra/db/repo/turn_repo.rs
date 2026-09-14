@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveEnum, ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QuerySelect, Set,

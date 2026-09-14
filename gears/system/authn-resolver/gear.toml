@@ -1,0 +1,7 @@
+[gear]
+name = "Auth Resolver"
+description = "Authentication and authorization primitives with pluggable token validation backends."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

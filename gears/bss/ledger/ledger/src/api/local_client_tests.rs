@@ -21,7 +21,8 @@ use crate::domain::model::{EntryRecord, LineRecord};
 use crate::infra::storage::entity::{account_balance, ar_invoice_balance, journal_line};
 use crate::infra::storage::repo::journal_repo::OdataPageError;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -181,7 +182,7 @@ fn sample_ar_invoice_row() -> ar_invoice_balance::Model {
         disputed_minor: 0,
         functional_balance_minor: None,
         functional_currency: None,
-        original_posted_at: Some(Utc::now()),
+        original_posted_at: Some(OffsetDateTime::now_utc()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()),
         last_entry_seq: Some(7),
         version: 3,
@@ -272,7 +273,7 @@ fn sample_entry_record() -> EntryRecord {
         source_business_id: "BIZ-42".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::now_v7(),
@@ -339,11 +340,10 @@ mod pg {
 
     use async_trait::async_trait;
     use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-    use authz_resolver_sdk::error::AuthZResolverError;
     use authz_resolver_sdk::models::{
         EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
     };
-    use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+    use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
     use bss_ledger_sdk::api::LedgerClientV1;
     use bss_ledger_sdk::{
         AccountClass, AllocateOutcome, AllocatePayment, FiscalCalendarSpec, Granularity,
@@ -356,9 +356,10 @@ mod pg {
     use sea_orm_migration::MigratorTrait;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use toolkit::api::canonical_prelude::CanonicalError;
     use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
     use toolkit_gts::gts_id;
-    use toolkit_security::SecurityContext;
+    use toolkit_security::{PlatformSecurityContext, SecurityContext};
     use uuid::Uuid;
 
     use crate::api::local_client::LedgerLocalClient;
@@ -392,11 +393,12 @@ mod pg {
     pub(super) struct AllowAuthZ;
 
     #[async_trait]
-    impl AuthZResolverClient for AllowAuthZ {
+    impl AuthZResolverApi for AllowAuthZ {
         async fn evaluate(
             &self,
+            _ctx: PlatformSecurityContext,
             request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, AuthZResolverError> {
+        ) -> Result<EvaluationResponse, CanonicalError> {
             let tenant_id = subject_tenant_id(&request);
             Ok(EvaluationResponse {
                 decision: true,
@@ -414,11 +416,12 @@ mod pg {
     pub(super) struct DenyAuthZ;
 
     #[async_trait]
-    impl AuthZResolverClient for DenyAuthZ {
+    impl AuthZResolverApi for DenyAuthZ {
         async fn evaluate(
             &self,
+            _ctx: PlatformSecurityContext,
             _request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, AuthZResolverError> {
+        ) -> Result<EvaluationResponse, CanonicalError> {
             Ok(EvaluationResponse {
                 decision: false,
                 context: EvaluationResponseContext {
@@ -487,7 +490,7 @@ mod pg {
         LedgerLocalClient,
         Uuid,
     ) {
-        let container = Postgres::default().start().await.unwrap();
+        let container = test_containers::postgres().start().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -582,7 +585,7 @@ mod pg {
     /// A payment-shaped provision for `tenant`: the four money-flow chart
     /// accounts (CASH_CLEARING / UNALLOCATED / PSP_FEE_EXPENSE / AR) plus USD@2
     /// and a UTC monthly calendar. `provision` seeds the OPEN period for the
-    /// CURRENT month (settle/allocate derive `period_id` from `Utc::now()`).
+    /// CURRENT month (settle/allocate derive `period_id` from `OffsetDateTime::now_utc()`).
     pub(super) fn payment_provision_req(tenant: Uuid) -> ProvisionRequest {
         ProvisionRequest {
             tenant_id: tenant,
@@ -709,7 +712,7 @@ mod pg {
         LedgerLocalClient,
         Uuid,
     ) {
-        let container = Postgres::default().start().await.unwrap();
+        let container = test_containers::postgres().start().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -748,7 +751,7 @@ mod pg {
         LedgerLocalClient,
         Uuid,
     ) {
-        let container = Postgres::default().start().await.unwrap();
+        let container = test_containers::postgres().start().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1264,7 +1267,7 @@ mod pg {
 
     // ── Full-flow integration (real client + real Postgres; only the PDP +
     //    tenant-type reader are fakes). NOT the project e2e suite — those are the
-    //    pytest black-box tests under testing/e2e/gears/ledger/. ──
+    //    pytest black-box tests under testing/e2e/suites/ledger/. ──
 
     /// Full ledger flow: provision → post → read → reverse → tie-out.
     /// Drives the real `LedgerLocalClient` against a real database: provision a
@@ -1275,7 +1278,7 @@ mod pg {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn provision_post_read_reverse_ties_out() {
-        let container = Postgres::default().start().await.unwrap();
+        let container = test_containers::postgres().start().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
         let raw = Database::connect(&url).await.unwrap();

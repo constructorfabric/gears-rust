@@ -1,0 +1,7 @@
+[gear]
+name = "Subscriptions"
+description = "Subscription lifecycle state machine with versioned composition and entitlement management."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

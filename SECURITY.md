@@ -7,7 +7,7 @@
 Report vulnerabilities via:
 
 1. **GitHub Security Advisories**: Report privately at [constructorfabric/gears-rust/security/advisories/new](https://github.com/constructorfabric/gears-rust/security/advisories/new)
-2. **Direct Contact**: Email security team (security@acronis.com) and  [maintainers](MAINTAINERS.md) directly
+2. **Direct Contact**: Email the Constructor Fabric team (contact@constructorfabric.org) and [maintainers](MAINTAINERS.md) directly
 
 ### Required Information
 

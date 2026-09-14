@@ -9,6 +9,9 @@
 
 pub mod api;
 pub mod config;
+
+#[cfg(test)]
+mod config_tests;
 pub mod domain;
 pub mod infra;
 pub mod module;

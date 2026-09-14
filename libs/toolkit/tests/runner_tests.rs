@@ -366,15 +366,12 @@ async fn test_db_options_none() {
     let cancel = CancellationToken::new();
     cancel.cancel(); // Immediate shutdown for test
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     // This test requires registry discovery to work, which won't work in isolation
     // For now, let's test the individual components we can test
@@ -396,9 +393,8 @@ async fn test_db_options_manager() {
         cancel_clone.cancel();
     });
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new().with_config(
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new().with_config(
             "test_gear",
             serde_json::json!({
                 "database": {
@@ -407,12 +403,10 @@ async fn test_db_options_manager() {
                 "config": {}
             }),
         )),
-        db: DbOptions::Manager(create_mock_db_manager()),
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+        DbOptions::Manager(create_mock_db_manager()),
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = timeout(Duration::from_secs(1), run(opts)).await;
     assert!(result.is_ok());
@@ -425,15 +419,12 @@ async fn test_db_options_manager() {
 async fn test_shutdown_options_token() {
     let cancel = CancellationToken::new();
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel.clone()),
+        Uuid::new_v4(),
+    );
 
     // Start the runner in a background task
     let runner_handle = tokio::spawn(run(opts));
@@ -455,17 +446,14 @@ async fn test_shutdown_options_token() {
 async fn test_shutdown_options_future() {
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Future(Box::pin(async move {
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Future(Box::pin(async move {
             _ = rx.await;
         })),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+        Uuid::new_v4(),
+    );
 
     // Start the runner in a background task
     let runner_handle = tokio::spawn(run(opts));
@@ -496,15 +484,12 @@ async fn test_runner_with_config_provider() {
         }),
     );
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(config_provider),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(config_provider),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = timeout(Duration::from_millis(100), run(opts)).await;
     assert!(result.is_ok());
@@ -518,15 +503,12 @@ async fn test_complete_lifecycle_success() {
     let cancel = CancellationToken::new();
     cancel.cancel(); // Immediate shutdown
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = run(opts).await;
     assert!(result.is_ok());
@@ -536,15 +518,12 @@ async fn test_complete_lifecycle_success() {
 fn test_run_options_construction() {
     let cancel = CancellationToken::new();
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     // Test that we can construct RunOptions with all variants
     match opts.db {
@@ -563,15 +542,12 @@ fn test_run_options_construction() {
 async fn test_cancellation_during_startup() {
     let cancel = CancellationToken::new();
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel.clone()),
+        Uuid::new_v4(),
+    );
 
     // Start the runner in a background task
     let runner_handle = tokio::spawn(run(opts));
@@ -600,15 +576,12 @@ async fn test_multiple_config_provider_scenarios() {
 
     // Test with empty config
     let empty_config = MockConfigProvider::new();
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(empty_config),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(empty_config),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel.clone()),
+        Uuid::new_v4(),
+    );
 
     let result = run(opts).await;
     assert!(result.is_ok(), "Should handle empty config");
@@ -636,15 +609,12 @@ async fn test_multiple_config_provider_scenarios() {
     let cancel2 = CancellationToken::new();
     cancel2.cancel();
 
-    let opts2 = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(complex_config),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel2),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts2 = RunOptions::new(
+        Arc::new(complex_config),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel2),
+        Uuid::new_v4(),
+    );
 
     let result2 = run(opts2).await;
     assert!(result2.is_ok(), "Should handle complex config");
@@ -655,15 +625,12 @@ async fn test_runner_timeout_scenarios() {
     // Test that runner doesn't hang indefinitely
     let cancel = CancellationToken::new();
 
-    let opts = RunOptions {
-        instance_id: Uuid::new_v4(),
-        gears_cfg: Arc::new(MockConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(MockConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel.clone()),
+        Uuid::new_v4(),
+    );
 
     let runner_handle = tokio::spawn(run(opts));
 

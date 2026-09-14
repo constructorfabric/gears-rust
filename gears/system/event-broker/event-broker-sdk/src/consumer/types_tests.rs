@@ -72,12 +72,11 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     let payload = serde_json::json!({ "order_id": "order-1" });
     let raw = RawEvent {
         id: Uuid::new_v4(),
-        type_id: gts_id!("cf.core.events.event.v1~example.orders.order_created.x.v1").to_owned(),
+        type_id: gts_id!("cf.core.events.event.v1~example.orders.order_created.x.v1~").to_owned(),
         topic: topic.to_owned(),
         tenant_id: Uuid::new_v4(),
         subject: "order-1".to_owned(),
         subject_type: "order".to_owned(),
-        partition_key: Some("customer-1".to_owned()),
         partition: 3,
         sequence: 42,
         offset: 42,
@@ -96,7 +95,6 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.group_id, Some(group_id));
     assert_eq!(record.topic_id, Some(topic_id));
     assert_eq!(record.topic, topic);
-    assert_eq!(record.partition_key.as_deref(), Some("customer-1"));
     assert_eq!(record.partition, 3);
     assert_eq!(record.offset, 42);
     assert_eq!(record.payload, payload);
@@ -129,7 +127,7 @@ fn subscription_interest_builder_keeps_types_and_filter_per_topic() {
         )))
         .types([
             EventTypeRef::gts(gts_id!(
-                "cf.core.events.event.v1~example.orders.order_created.x.v1"
+                "cf.core.events.event.v1~example.orders.order_created.x.v1~"
             )),
             EventTypeRef::gts_pattern(format!(
                 "{GTS_ID_PREFIX}cf.core.events.event.v1~example.orders.*"

@@ -8,7 +8,7 @@ use toolkit_db::DBProvider;
 use toolkit_db::DbError;
 use tracing::info;
 
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 
 use simple_user_settings_sdk::SimpleUserSettingsClientV1;
 
@@ -59,7 +59,7 @@ impl Gear for SettingsGear {
         // Fetch AuthZ resolver from ClientHub
         let authz = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
+            .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
         let policy_enforcer = PolicyEnforcer::new(authz);
 

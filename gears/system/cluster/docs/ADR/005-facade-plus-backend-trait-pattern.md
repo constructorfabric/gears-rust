@@ -102,6 +102,7 @@ You cannot adopt one of the three and reject the others without losing the prope
 - **No bundled `Cluster` accessor** means consumers wanting all three primitives resolve three times. The fluent resolver (per ADR-007) makes each resolution a one-liner; ergonomics are not the bottleneck.
 - **ClientHub registration is per-primitive per profile**, not per-cluster. The wiring crate iterates the profile × primitive matrix and registers each `Arc<dyn _Backend>` independently. This is what makes mixed-backend profiles (Redis cache + K8s Lease elections) trivial.
 - **Dyn-compatibility** of the backend traits is enforced by compile-time assertions per trait. Any future change that breaks dyn-compatibility (e.g., adding a generic method, returning `impl Trait`) fails the build.
+- **Resolution is `async`; the facades are not.** `resolve()` is `async fn` on all three resolvers, because validating a declared capability against a *remote* binding needs a `ProfileDescriptor` that must be fetched, and a synchronous signature cannot await one (DESIGN §3.10.1). This is the **only** signature the remote-backend model changes — the facades themselves, `scoped()`, the watch-event unions and `auto_restart` are untouched, which is what keeps one consumer source file valid in both an embedded and a deployed cluster. The cost to a consumer is one `.await` in `start`, already an `async fn`. In-process resolution has nothing to await and validates inline, so the async-ness is a contract for the remote case rather than a change in local behaviour.
 
 ### Confirmation
 

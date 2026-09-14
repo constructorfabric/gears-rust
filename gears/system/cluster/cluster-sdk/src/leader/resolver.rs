@@ -1,16 +1,15 @@
-// Created: 2026-06-03 by Constructor Tech
 //! The fluent leader-election resolver and its startup capability-validation
 //! helper.
 
-use std::sync::Arc;
-
 use toolkit::client_hub::ClientHub;
 
+use crate::binding;
+use crate::dto::LeaderElectionDescriptor;
 use crate::error::ClusterError;
-use crate::leader::backend::LeaderElectionBackend;
+use crate::intern::intern;
 use crate::leader::facade::LeaderElectionV1;
 use crate::leader::types::LeaderElectionCapability;
-use crate::profile::{ClusterProfile, profile_scope};
+use crate::profile::{ClusterProfile, validate_cluster_name};
 
 /// A fluent builder that resolves a [`LeaderElectionV1`] for a profile and
 /// validates declared capabilities at startup.
@@ -45,35 +44,70 @@ impl<'a> LeaderElectionResolverBuilder<'a> {
 
     /// Resolves the leader-election facade for the bound profile.
     ///
+    /// # Why this is `async`
+    ///
+    /// A remote binding cannot validate a declared capability without a
+    /// [`ProfileDescriptor`](crate::ProfileDescriptor), and fetching one is I/O
+    /// (DESIGN.md, obstacle A). **This is the only SDK
+    /// signature the deployable model changes** (invariant I2) — the facades, the
+    /// typed-profile resolver, `scoped()`, the watch-event unions and
+    /// `auto_restart` all keep their shapes.
+    ///
+    /// It costs a consumer nothing beyond an `.await`: facades are resolved in a
+    /// gear's `start`, never its `init`, and both are already `async fn`.
+    ///
+    /// In Profile 1 the await is a formality — the local client's descriptor is
+    /// intrinsic, so its future is ready on the first poll and the bounded timeout
+    /// can never fire.
+    ///
+    /// # What it resolves through
+    ///
+    /// The process's single `dyn ClusterClient` (invariant I4), never a
+    /// per-profile hub registration — see the `binding` module for the four steps
+    /// and for what an empty hub yields (§4.9.1, §4.9.3).
+    ///
     /// # Errors
     /// - [`ClusterError::ProfileNotSpecified`] if no profile was set.
     /// - [`ClusterError::InvalidName`] if the bound profile's
     ///   [`NAME`](ClusterProfile::NAME) violates [`CLUSTER_NAME_RULE`](crate::CLUSTER_NAME_RULE).
-    /// - [`ClusterError::ProfileNotBound`] if no leader-election backend is
-    ///   registered for the profile scope.
-    /// - [`ClusterError::CapabilityNotMet`] if a declared capability is
-    ///   unsupported by the bound backend.
-    pub fn resolve(self) -> Result<LeaderElectionV1, ClusterError> {
+    /// - [`ClusterError::ProfileNotBound`] if a cluster client is registered but
+    ///   binds no leader-election backend for the profile.
+    /// - [`ClusterError::CapabilityNotMet`] if a declared capability is unsupported
+    ///   by the bound backend and the descriptor was obtainable in time; otherwise
+    ///   validation defers to readiness and this returns `Ok` (§4.7.1).
+    pub async fn resolve(self) -> Result<LeaderElectionV1, ClusterError> {
         let profile = self.profile_name.ok_or(ClusterError::ProfileNotSpecified)?;
-        let scope = profile_scope(profile)?;
-        let inner: Arc<dyn LeaderElectionBackend> = self.hub.get_scoped(&scope).map_err(|err| {
-            tracing::debug!(profile, error = %err, "cluster backend lookup failed for profile");
-            ClusterError::ProfileNotBound { profile }
-        })?;
-        validate_leader_election_capabilities(inner.as_ref(), &self.requirements)?;
-        Ok(LeaderElectionV1::from_backend(inner))
+        validate_cluster_name(profile)?;
+        let requirements = self.requirements;
+        let backend = binding::bind(
+            self.hub,
+            profile,
+            "leader_election",
+            |client| client.leader_election_backend(profile),
+            || binding::unbound_leader_election(profile),
+            move |descriptor| {
+                validate_leader_election_capabilities_from(
+                    &descriptor.leader_election,
+                    &requirements,
+                )
+            },
+        )
+        .await?;
+        Ok(LeaderElectionV1::from_backend(backend))
     }
 }
 
-/// Validates declared leader-election capabilities against a backend's actual
-/// characteristics (DESIGN §3.10).
+/// Validates declared leader-election capabilities against the profile's
+/// **descriptor** (DESIGN.md) — the form the resolve path uses
+/// in both deployment profiles. See
+/// `validate_cache_capabilities_from`.
 ///
 /// # Errors
-/// Returns [`ClusterError::CapabilityNotMet`] — naming the primitive, the
-/// unmet capability, and the bound provider — for the first unsatisfied
+/// Returns [`ClusterError::CapabilityNotMet`] — naming the primitive, the unmet
+/// capability, and the operator-facing provider name — for the first unsatisfied
 /// requirement.
-pub fn validate_leader_election_capabilities(
-    backend: &dyn LeaderElectionBackend,
+pub fn validate_leader_election_capabilities_from(
+    descriptor: &LeaderElectionDescriptor,
     reqs: &[LeaderElectionCapability],
 ) -> Result<(), ClusterError> {
     // Matched exhaustively (no catch-all): although `LeaderElectionCapability`
@@ -83,13 +117,12 @@ pub fn validate_leader_election_capabilities(
     for cap in reqs {
         match cap {
             LeaderElectionCapability::Linearizable => {
-                if !backend.features().linearizable {
+                if !descriptor.features.linearizable {
                     return Err(ClusterError::CapabilityNotMet {
                         primitive: "LeaderElectionV1",
                         capability: "Linearizable",
-                        // Resolve through the trait object so the error names
-                        // the concrete backend, not the `dyn` trait type.
-                        provider: backend.provider_name(),
+                        // Interned rather than the error widened (invariant I3).
+                        provider: intern(&descriptor.provider),
                     });
                 }
             }

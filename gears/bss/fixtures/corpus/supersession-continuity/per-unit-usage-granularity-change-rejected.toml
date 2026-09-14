@@ -1,0 +1,44 @@
+family     = "supersession-continuity"
+id         = "per-unit-usage-granularity-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-tb-units", "inst-mk-chargekind", "D-77", "D-82"]
+
+# The other side of the same boundary, on the same kind, one field apart from the
+# accepted case.
+#
+# `unit-change-rejected` already pins `billingGranularity` on a **tiered** row,
+# where the harm is visible at the band edge: a `per_hour` counter read against
+# `per_day` band bounds is the D-77 factor-of-24 class. This case says the rule
+# is not about bands. `per_unit` has no bands at all - the price is a single
+# `amount_minor` per billable unit - and the same change is just as wrong for a
+# simpler reason: `billingGranularity` is what one billable unit **is**
+# (`inst-tb-units`), so the continued `Q` and the successor's rate would be
+# denominated differently. 3600 metered seconds is 1 unit at `per_hour` and 3600
+# at `whole_unit`; the counter does not reset at supersession, so whichever way
+# the change ran, the accumulated quantity would be re-read in a unit it was
+# never counted in.
+#
+# The unit price is deliberately **unchanged** here. If it moved, a subject that
+# rejected for the wrong reason would still look right, and the case would stop
+# separating "the unit moved" from "the price moved" - which is the entire
+# distinction D-82 draws.
+
+[predecessor]
+model_kind          = "per_unit"
+charge_kind         = "usage"
+currency            = "USD"
+meter               = "compute.seconds"
+billing_granularity = "per_hour"
+amount_minor        = 40
+
+[successor]
+model_kind          = "per_unit"
+charge_kind         = "usage"
+currency            = "USD"
+meter               = "compute.seconds"
+billing_granularity = "per_day"
+amount_minor        = 40
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "nothing about the price changed - the successor charges 40 minor per billable unit exactly as the predecessor did - and the row is still unpublishable, because a billable unit stopped meaning the same thing mid-window. Changing what the key meters in is structural and routes through plan revisioning; that this row is untiered changes nothing, since the denomination is a property of the counter, not of the band set"

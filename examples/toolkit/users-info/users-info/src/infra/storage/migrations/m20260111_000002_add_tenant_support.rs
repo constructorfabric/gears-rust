@@ -89,6 +89,11 @@ CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
                     "
                 ),
                 sea_orm::DatabaseBackend::MySql => unreachable!("handled above"),
+                other => {
+                    return Err(DbErr::Custom(format!(
+                        "migration has no DDL for database backend {other:?}"
+                    )));
+                }
             };
 
             conn.execute_unprepared(&sql).await?;
@@ -166,6 +171,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
                     "
                 }
                 sea_orm::DatabaseBackend::MySql => unreachable!("handled above"),
+                other => {
+                    return Err(DbErr::Custom(format!(
+                        "migration has no DDL for database backend {other:?}"
+                    )));
+                }
             };
 
             conn.execute_unprepared(sql).await?;

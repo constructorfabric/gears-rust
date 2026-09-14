@@ -46,7 +46,7 @@ impl MigrationTrait for Migration {
         // violate the NOT NULL invariant; they are not caught by the cast guard).
         let null_count: i64 = {
             let row = db
-                .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                     backend,
                     "SELECT COUNT(*) AS cnt FROM sessions \
                      WHERE tenant_id IS NULL OR user_id IS NULL",
@@ -68,7 +68,7 @@ impl MigrationTrait for Migration {
             sea_orm::DatabaseBackend::Postgres => {
                 let bad_count: i64 = {
                     let row = db
-                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                        .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                             backend,
                             "SELECT COUNT(*) AS cnt FROM sessions \
                              WHERE tenant_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
@@ -104,7 +104,7 @@ impl MigrationTrait for Migration {
                 // key — its type is Uuid purely for storage consistency.)
                 let bad_reaction: i64 = {
                     let row = db
-                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                        .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                             backend,
                             "SELECT COUNT(*) AS cnt FROM message_reactions \
                              WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'",
@@ -130,7 +130,7 @@ impl MigrationTrait for Migration {
                 // enforcement mechanism. No DDL change is needed or possible.
                 let bad_count: i64 = {
                     let row = db
-                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                        .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                             backend,
                             "SELECT COUNT(*) AS cnt FROM sessions \
                              WHERE length(tenant_id) != 36 OR length(user_id) != 36 \
@@ -148,7 +148,7 @@ impl MigrationTrait for Migration {
                 }
                 // No DDL change for SQLite — typeless storage.
             }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(
                     "Migration m20260417_000006 does not support MySQL (ADR-0019).".into(),
                 ));
@@ -205,7 +205,7 @@ impl MigrationTrait for Migration {
                 .await?;
 
                 let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                    .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                         backend,
                         "SELECT COUNT(*) AS cnt FROM messages \
                          WHERE owner_tenant_id IS NULL",
@@ -232,7 +232,7 @@ impl MigrationTrait for Migration {
                 .await?;
 
                 let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                    .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                         backend,
                         "SELECT COUNT(*) AS cnt FROM message_parts \
                          WHERE owner_tenant_id IS NULL",
@@ -258,7 +258,7 @@ impl MigrationTrait for Migration {
                     .await?;
 
                     let orphans: i64 = db
-                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                        .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                             backend,
                             format!(
                                 "SELECT COUNT(*) AS cnt FROM {table} \
@@ -287,7 +287,7 @@ impl MigrationTrait for Migration {
                 .await?;
 
                 let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                    .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                         backend,
                         "SELECT COUNT(*) AS cnt FROM messages WHERE owner_tenant_id IS NULL",
                     ))
@@ -309,7 +309,7 @@ impl MigrationTrait for Migration {
                 .await?;
 
                 let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                    .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                         backend,
                         "SELECT COUNT(*) AS cnt FROM message_parts WHERE owner_tenant_id IS NULL",
                     ))
@@ -332,7 +332,7 @@ impl MigrationTrait for Migration {
                     .await?;
 
                     let orphans: i64 = db
-                        .query_one(sea_orm_migration::sea_orm::Statement::from_string(
+                        .query_one_raw(sea_orm_migration::sea_orm::Statement::from_string(
                             backend,
                             format!(
                                 "SELECT COUNT(*) AS cnt FROM {table} WHERE owner_tenant_id IS NULL"
@@ -348,7 +348,7 @@ impl MigrationTrait for Migration {
                     }
                 }
             }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(
                     "Migration m20260417_000006 does not support MySQL (ADR-0019).".into(),
                 ));
@@ -378,6 +378,11 @@ impl MigrationTrait for Migration {
                 // constraints (Phase 2 Scopable derive) and the backfill above.
             }
             sea_orm::DatabaseBackend::MySql => {}
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         }
 
         // Named composite indexes on owner pair for each child table.

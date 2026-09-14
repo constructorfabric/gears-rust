@@ -2,6 +2,7 @@
 //! `scope_includes_tenant`.
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use toolkit_db::secure::{ScopeError, SecureEntityExt};

@@ -14,9 +14,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use account_management_sdk::{
-    CreateTenantRequest, IdpNewUser, IdpUser, IdpUserPatch, MetadataEntry, Tenant, TenantStatus,
-    UpdateTenantRequest,
+    CreateTenantRequest, IdpNewUser, IdpServiceAccountCredentials, IdpServiceAccountSummary,
+    IdpUser, IdpUserPatch, MetadataEntry, Tenant, TenantStatus, UpdateTenantRequest,
 };
+use secrecy::ExposeSecret as _;
 use toolkit_security::SecurityContext;
 
 use crate::domain::conversion::model::{
@@ -311,6 +312,127 @@ impl UserDto {
             last_name: user.last_name,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service accounts (tenant-scoped machine identities)
+// ---------------------------------------------------------------------------
+
+/// Request body for
+/// `POST /account-management/v1/tenants/{tenant_id}/service-accounts`.
+/// `tenant_id` comes from the path.
+///
+/// `name` / `scopes` are not secret, so `Debug` is plain-derived —
+/// unlike [`ServiceAccountCredentialsDto`] below, which hand-writes a
+/// redacting one.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceAccountCreateRequestDto {
+    /// Short caller-chosen name, unique among the tenant's live
+    /// accounts. Adapters commonly derive the client id as
+    /// `svc-<tenant_id>-<name>`, but that format is a convention rather
+    /// than contract; the listing echoes this `name` back so callers
+    /// correlate without parsing client ids. AM bounds the length; the
+    /// charset and uniqueness are the provider's to enforce.
+    pub name: String,
+    /// Client scopes to attach; validated against the provider's
+    /// allowlist.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// Live credentials returned by create and rotate-secret.
+///
+/// The secret is returned ONLY here — there is no read-back endpoint.
+/// `Debug` is hand-written to redact it, and both handlers set
+/// `Cache-Control: no-store` so no intermediary retains the body.
+#[derive(Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ServiceAccountCredentialsDto {
+    /// The provider-assigned client id, used to address rotate-secret
+    /// and revoke. Opaque to callers.
+    pub client_id: String,
+    /// The `client_credentials` secret. Persist it immediately;
+    /// recovery from loss is a rotate, not a read.
+    pub client_secret: String,
+    /// OAuth token endpoint for the `client_credentials` grant.
+    pub token_url: String,
+    /// The account's subject id (`sub` of issued tokens) — use it for
+    /// RBAC bindings.
+    pub subject_id: Uuid,
+}
+
+impl std::fmt::Debug for ServiceAccountCredentialsDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccountCredentialsDto")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("token_url", &self.token_url)
+            .field("subject_id", &self.subject_id)
+            .finish()
+    }
+}
+
+impl From<IdpServiceAccountCredentials> for ServiceAccountCredentialsDto {
+    /// The single point where the secret leaves its
+    /// [`secrecy::SecretString`] wrapper: serialising it into the one
+    /// response that carries it. Nothing else in AM calls
+    /// `expose_secret`.
+    fn from(credentials: IdpServiceAccountCredentials) -> Self {
+        Self {
+            client_id: credentials.client_id,
+            client_secret: credentials.client_secret.expose_secret().to_owned(),
+            token_url: credentials.token_url,
+            subject_id: credentials.subject_id,
+        }
+    }
+}
+
+/// A listing entry (no secrets).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ServiceAccountDto {
+    /// The provider-assigned client id, used to address rotate-secret
+    /// and revoke.
+    pub client_id: String,
+    /// The caller-supplied `name` this account was created with,
+    /// reported verbatim by the provider. This is how a caller
+    /// correlates a name it submitted with an opaque `client_id` —
+    /// notably to reconcile a create that returned `409`
+    /// `AMBIGUOUS_OUTCOME`.
+    pub name: String,
+    /// Whether the client can currently authenticate.
+    pub enabled: bool,
+    /// Attached client scopes as reported by the `IdP` — includes
+    /// realm-default scopes, not only the requested ones.
+    pub scopes: Vec<String>,
+}
+
+impl From<IdpServiceAccountSummary> for ServiceAccountDto {
+    fn from(summary: IdpServiceAccountSummary) -> Self {
+        Self {
+            client_id: summary.client_id,
+            name: summary.name,
+            enabled: summary.enabled,
+            scopes: summary.scopes,
+        }
+    }
+}
+
+/// Response body for
+/// `GET /account-management/v1/tenants/{tenant_id}/service-accounts`.
+///
+/// Deliberately not a `toolkit_odata::Page` like the user listing: the
+/// contract is unpaginated (the provider returns the tenant's whole
+/// collection), because this listing is also the reconciliation path for
+/// an ambiguous create — "is my name already live here?" must not be a
+/// multi-round-trip question with a cursor to invalidate.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ServiceAccountListDto {
+    /// The tenant's service accounts, in provider order.
+    pub service_accounts: Vec<ServiceAccountDto>,
 }
 
 /// Authenticated subject identity for `GET /account-management/v1/me`.

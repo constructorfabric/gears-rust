@@ -49,8 +49,9 @@ pub use export::{
 };
 pub use memory_strategy::{MemoryStrategy, default_memory_strategy};
 pub use message::{
-    Message, MessageRole, StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent,
-    StreamingEvent, StreamingStartEvent, VariantInfo,
+    MAX_MESSAGE_METADATA_BYTES, Message, MessageRole, RESERVED_MESSAGE_METADATA_KEYS,
+    StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
+    StreamingStartEvent, VariantInfo,
 };
 pub use reaction::{MessageReaction, MessageReactionEvent, ReactionType};
 pub use retention::RetentionPolicy;

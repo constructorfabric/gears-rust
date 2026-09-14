@@ -236,7 +236,7 @@ struct ArcTransactionalHandler<H: TransactionalHandler>(Arc<H>);
 impl<H: TransactionalHandler> TransactionalHandler for ArcTransactionalHandler<H> {
     async fn handle(
         &self,
-        txn: &dyn sea_orm::ConnectionTrait,
+        txn: &sea_orm::DatabaseExecutor<'_>,
         msgs: &[super::handler::OutboxMessage],
     ) -> super::handler::HandlerResult {
         self.0.handle(txn, msgs).await

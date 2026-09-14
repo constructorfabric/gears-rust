@@ -14,6 +14,7 @@ fn cluster_config_applies_documented_defaults() {
     assert_eq!(config.lock_reaper_interval_ms, 5_000);
     assert!(!config.pgbouncer_transaction_mode);
     assert_eq!(config.lock_name_cardinality_warn_threshold, 1_000);
+    assert_eq!(config.fence_retention_ms, 3_600_000);
     assert_eq!(config.replication_mode, None);
 }
 
@@ -28,6 +29,7 @@ fn lock_config_applies_documented_defaults() {
     assert_eq!(config.lock_reaper_interval_ms, 5_000);
     assert!(!config.pgbouncer_transaction_mode);
     assert_eq!(config.lock_name_cardinality_warn_threshold, 1_000);
+    assert_eq!(config.fence_retention_ms, 3_600_000);
     assert_eq!(config.replication_mode, None);
 }
 
@@ -42,6 +44,7 @@ fn cluster_config_round_trips_every_field() {
         "lock_reaper_interval_ms": 3_333,
         "pgbouncer_transaction_mode": true,
         "lock_name_cardinality_warn_threshold": 42,
+        "fence_retention_ms": 900_000,
         "replication_mode": "sync",
     }))
     .expect("full config deserializes");
@@ -52,6 +55,7 @@ fn cluster_config_round_trips_every_field() {
     assert_eq!(config.lock_reaper_interval_ms, 3_333);
     assert!(config.pgbouncer_transaction_mode);
     assert_eq!(config.lock_name_cardinality_warn_threshold, 42);
+    assert_eq!(config.fence_retention_ms, 900_000);
     assert_eq!(config.replication_mode, Some(ReplicationMode::Sync));
 }
 
@@ -161,4 +165,49 @@ fn debug_masks_the_connection_string() {
         rendered.contains(REDACTED_DSN),
         "lock Debug must show the redaction marker"
     );
+}
+
+// `fence_retention_ms` (§5.8.1, item `L3`)
+
+/// Zero is not a short window, it is no window: the reaper's predicate collapses
+/// back to `expires_at <= now()` and a lapsed row's `fence` is deleted out from
+/// under the next acquisition of that name. Both config shapes refuse it at
+/// startup, beside the zero-interval and zero-pool checks.
+#[test]
+fn a_zero_fence_retention_is_rejected_by_both_config_shapes() {
+    let cluster: PostgresClusterConfig = serde_json::from_value(json!({
+        "connection_string": "postgres://u@h/db",
+        "fence_retention_ms": 0,
+    }))
+    .expect("config deserializes");
+    let err = cluster
+        .validate()
+        .expect_err("a zero window must not start");
+    assert!(
+        format!("{err:?}").contains("fence_retention"),
+        "the error must name the key: {err:?}"
+    );
+
+    let lock: PostgresLockConfig = serde_json::from_value(json!({
+        "connection_string": "postgres://u@h/db",
+        "fence_retention_ms": 0,
+    }))
+    .expect("lock config deserializes");
+    assert!(
+        lock.validate().is_err(),
+        "the standalone lock plugin has the same fence and the same rule"
+    );
+}
+
+/// The window is read as a `Duration` by the reaper's sweep predicate and by the
+/// `should_hint` gate; a mismatch between the two would be a silent scheduling
+/// bug, so the conversion has one home.
+#[test]
+fn fence_retention_converts_to_a_duration() {
+    let config: PostgresLockConfig = serde_json::from_value(json!({
+        "connection_string": "postgres://u@h/db",
+        "fence_retention_ms": 90_000,
+    }))
+    .expect("config deserializes");
+    assert_eq!(config.fence_retention(), std::time::Duration::from_secs(90));
 }

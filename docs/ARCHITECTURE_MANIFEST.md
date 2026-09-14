@@ -432,7 +432,7 @@ See more in: [arch/authorization/TENANT_MODEL.md](arch/authorization/TENANT_MODE
 Constructor Fabric Gears uses a PEP → PDP → `AccessScope` pipeline for authorization. Domain services act as the PEP: they receive `SecurityContext`, build an `AccessRequest`, and call `PolicyEnforcer`, which delegates to the AuthZ resolver client. The PDP returns a decision plus constraints, and those constraints are compiled into an `AccessScope` that the secure DB layer applies as scoped query conditions. In practice, this means gear business logic does not embed policy engines or hard-code role semantics; it consumes platform authorization results expressed as tenant, resource, owner, and type filters.
 
 - [x] `gears/system/authz-resolver/` provides a PDP client abstraction via `authz-resolver-sdk`.
-- [x] `PolicyEnforcer` wraps `AuthZResolverClient`; domain services call `policy_enforcer.access_scope_with(ctx, resource_type, action, resource_id, properties)`.
+- [x] `PolicyEnforcer` wraps `AuthZResolverApi`; domain services call `policy_enforcer.access_scope_with(ctx, resource_type, action, resource_id, properties)`.
 - [x] `AccessScope` carries four constraint dimensions: tenant, resource, owner, and type.
 - [x] `ScopableEntity` requires each DB entity to declare which column maps to each scope dimension.
 - [x] `pep_properties` defines `OWNER_TENANT_ID` and `RESOURCE_ID`, and these properties are used in current gears.
@@ -459,7 +459,7 @@ let scope = self
     .await?;
 ```
 
-> The `authz-resolver-sdk` crate defines the enforcement interface used by PEPs, including `AuthZResolverClient`, `PolicyEnforcer`, request/response models, and constraint compilation helpers. The PDP implementation is pluggable: Constructor Fabric Gears resolves it through `ClientHub` and plugin registration rather than bundling a single mandatory authorization engine in core.
+> The `authz-resolver-sdk` crate defines the enforcement interface used by PEPs, including `AuthZResolverApi`, `PolicyEnforcer`, request/response models, and constraint compilation helpers. The PDP implementation is pluggable: Constructor Fabric Gears resolves it through `ClientHub` and plugin registration rather than bundling a single mandatory authorization engine in core.
 
 See more details in: [arch/authorization/DESIGN.md](arch/authorization/DESIGN.md)
 

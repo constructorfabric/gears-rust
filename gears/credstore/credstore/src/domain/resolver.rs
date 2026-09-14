@@ -1,3 +1,5 @@
+//! Tenant hierarchy resolution boundary used by inherited-secret lookup.
+
 use async_trait::async_trait;
 use credstore_sdk::TenantId;
 use toolkit_security::SecurityContext;

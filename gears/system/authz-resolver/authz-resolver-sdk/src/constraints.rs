@@ -21,7 +21,7 @@ use tenant_resolver_sdk::TenantStatus;
 ///
 /// Multiple constraints within a response are `ORed`:
 /// a resource matches if it satisfies ANY constraint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct Constraint {
     /// The predicates within this constraint. All predicates are `ANDed`:
     /// a resource matches this constraint only if ALL predicates are satisfied.
@@ -29,7 +29,7 @@ pub struct Constraint {
 }
 
 /// A predicate comparing a resource property to a value or subquery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Predicate {
     /// Equality: `resource_property = value`
@@ -45,7 +45,7 @@ pub enum Predicate {
 }
 
 /// Equality predicate: `property = value`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct EqPredicate {
     /// Resource property name (e.g., `pep_properties::OWNER_TENANT_ID`, `pep_properties::RESOURCE_ID`).
     pub property: String,
@@ -65,7 +65,7 @@ impl EqPredicate {
 }
 
 /// Set membership predicate: `property IN (values)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InPredicate {
     /// Resource property name (e.g., `pep_properties::OWNER_TENANT_ID`, `pep_properties::RESOURCE_ID`).
     pub property: String,
@@ -93,7 +93,7 @@ impl InPredicate {
 /// Group membership predicate: resource is visible if it belongs to any of the listed groups.
 ///
 /// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership WHERE group_id IN (group_ids))`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupPredicate {
     /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
     pub property: String,
@@ -123,7 +123,7 @@ impl InGroupPredicate {
 ///
 /// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership
 ///   WHERE group_id IN (SELECT descendant_id FROM resource_group_closure WHERE ancestor_id IN (ancestor_ids)))`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupSubtreePredicate {
     /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
     pub property: String,
@@ -175,7 +175,7 @@ impl InGroupSubtreePredicate {
 /// `tenant_closure.descendant_status` column so the binding is unambiguous
 /// — the filter applies to the descendants reached via the closure, not
 /// to the ancestor root.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InTenantSubtreePredicate {
     /// Resource property to filter (e.g., `pep_properties::OWNER_TENANT_ID`,
     /// or `pep_properties::RESOURCE_ID` on the `tenants` entity itself).

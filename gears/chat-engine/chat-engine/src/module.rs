@@ -44,7 +44,7 @@ use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::DBProvider;
 use tracing::{error, info, warn};
 
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 use authz_resolver_sdk::pep::PolicyEnforcer;
 
 use crate::infra::db::repo::ChatEngineDb;
@@ -350,8 +350,8 @@ impl Gear for ChatEngineModule {
         // @cpt-cf-chat-engine-component-policy-enforcer
         // Resolve the AuthZ PDP client and build a single PolicyEnforcer Arc-cloned into
         // every domain service. No service constructs AccessScope manually.
-        let authz: Arc<dyn AuthZResolverClient> = client_hub
-            .get::<dyn AuthZResolverClient>()
+        let authz: Arc<dyn AuthZResolverApi> = client_hub
+            .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("chat-engine: failed to resolve AuthZ client: {e}"))?;
         let enforcer = PolicyEnforcer::new(authz);
         let webhook_compat = Arc::new(

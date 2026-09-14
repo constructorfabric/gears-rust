@@ -19,6 +19,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   gts_validate:
     name: Validate GTS Identifiers
@@ -33,7 +38,7 @@ jobs:
           rustup show
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # cache-bin caches ${CARGO_HOME}/bin, so the gts-validator binary is
           # restored across runs instead of being recompiled from source every

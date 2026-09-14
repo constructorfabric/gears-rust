@@ -1,0 +1,7 @@
+[gear]
+name = "HTTP-JSON Rate Source Plugin"
+description = "Generic HTTP-JSON feed source plugin for the FX Rate Provider gear."
+category = "bss"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

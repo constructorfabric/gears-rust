@@ -3,12 +3,15 @@
 //! `ADR/0004-idempotent-producer-protocol.md`). Signatures only.
 
 use async_trait::async_trait;
+use gts::GtsInstanceId;
+use toolkit::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
 /// Outcome of an idempotency check for one incoming event's producer
 /// chain (`meta.producer_id`, `meta.previous`, `meta.sequence`).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdempotencyOutcome {
     Accept,
@@ -34,7 +37,7 @@ pub trait IdempotencyGuard: Send + Sync {
     async fn check_and_record(
         &self,
         producer_id: Uuid,
-        topic: &str,
+        topic: &GtsInstanceId,
         partition: i32,
         previous: i64,
         sequence: i64,

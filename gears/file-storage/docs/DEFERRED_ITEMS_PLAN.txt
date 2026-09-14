@@ -44,7 +44,7 @@ cargo fmt --check
   counter + `maybe_delete_orphaned_file`, `src/domain/cleanup.rs:147-151,
   308-345`). Remaining 2.8 scope = **the age-only pending-version selection
   that can kill an active multipart session's backing version**.
-- **The E2E harness ALREADY EXISTS** (`testing/e2e/gears/file_storage/lifecycle/`
+- **The E2E harness ALREADY EXISTS** (`testing/e2e/suites/file_storage/lifecycle/`
   spawns its own server+sidecar off `FS_E2E_BINARY`/`FS_SIDECAR_BINARY`;
   `tools/scripts/ci.py:484-493` sets both). Remaining E2E scope = the backlog
   of promised cases + a second-principal (`E2E_AUTH_TOKEN_USER_B`) fixture.
@@ -430,7 +430,7 @@ token (`sign_url`, `src/domain/service/mod.rs:170-203`).
   token's payload (base64url JSON before the `.`) and assert the fields equal
   the version's stored MIME and `content_etag(file_id, version_id)`.
 - E2E: piggyback on the existing lifecycle download step
-  (`testing/e2e/gears/file_storage/lifecycle/test_file_storage_lifecycle.py::test_localfs_single_part_full_lifecycle`):
+  (`testing/e2e/suites/file_storage/lifecycle/test_file_storage_lifecycle.py::test_localfs_single_part_full_lifecycle`):
   assert the download response's `Content-Type` equals the created file's MIME
   and `ETag` is present (part of item E2E, case list below).
 
@@ -758,8 +758,8 @@ no missing-part list.
 8. **Compat callout in the commit message**: 204→200 is a breaking change for
    any client asserting 204. Repo-internal callers: e2e lifecycle tests (s3
    variant asserts complete status — update
-   `testing/e2e/gears/file_storage/lifecycle_s3/test_file_storage_s3_lifecycle.py`
-   if it checks 204) and `docs/` examples. Grep: `rg -n "complete" testing/e2e/gears/file_storage`.
+   `testing/e2e/suites/file_storage/lifecycle_s3/test_file_storage_s3_lifecycle.py`
+   if it checks 204) and `docs/` examples. Grep: `rg -n "complete" testing/e2e/suites/file_storage`.
 
 ### Tests / verification
 
@@ -967,7 +967,7 @@ objects).
 
 ### Current state vs gap
 
-The harness **exists and is CI-wired**: `testing/e2e/gears/file_storage/`
+The harness **exists and is CI-wired**: `testing/e2e/suites/file_storage/`
 has a seams suite (shared CI server), a `lifecycle/` suite that spawns its own
 server+sidecar pair (`lifecycle/conftest.py` — requires `FS_E2E_BINARY`, falls
 back to `target/debug/sidecar` for `FS_SIDECAR_BINARY`, fixed Ed25519 seed,
@@ -979,13 +979,13 @@ each plan step names its E2E case) and a **second-principal fixture**
 only single-token (`E2E_AUTH_TOKEN`, default `e2e-token-tenant-a`,
 `file_storage/conftest.py:40`) is supported; the master plan (line ~252-254)
 points at `E2E_AUTH_TOKEN_TENANT_B` in
-`testing/e2e/gears/resource_group/test_integration_seams.py:207` as the
+`testing/e2e/suites/resource_group/test_integration_seams.py:207` as the
 pattern to copy.
 
 ### Concrete approach
 
 **Slice A — env-only cases (no new auth infra), all in
-`testing/e2e/gears/file_storage/lifecycle/test_file_storage_lifecycle.py`
+`testing/e2e/suites/file_storage/lifecycle/test_file_storage_lifecycle.py`
 unless noted:**
 
 | Case | Source item | Notes |
@@ -1005,7 +1005,7 @@ suite — no action.)
 
 **Slice B — cross-user cases (needs the USER_B fixture):**
 
-1. Fixture work in `testing/e2e/gears/file_storage/conftest.py`: add
+1. Fixture work in `testing/e2e/suites/file_storage/conftest.py`: add
    `auth_headers_user_b` reading `E2E_AUTH_TOKEN_USER_B` (default mirroring
    the resource_group pattern — same tenant, different subject), `pytest.skip`
    when the server's test authenticator rejects it.
@@ -1022,7 +1022,7 @@ cargo build -p cf-gears-example-server --features file-storage   # or the ci.py 
 cargo build -p cf-gears-file-storage --bin sidecar
 FS_E2E_BINARY=target/debug/cf-gears-example-server \
 FS_SIDECAR_BINARY=target/debug/sidecar \
-pytest testing/e2e/gears/file_storage -q
+pytest testing/e2e/suites/file_storage -q
 ```
 
 (Exact server package/feature name: confirm against what
@@ -1075,7 +1075,7 @@ the 🛑 fixture question resolves. Both parallel-safe with 3.6.
 | `src/infra/storage/repo/version_repo.rs`, `src/domain/cleanup.rs` | 2.8 |
 | `src/infra/storage/migrations/` | 2.7 (new file; 2.8 only if the optional index rides along) |
 | `docs/features/`, `DECOMPOSITION.md`, `README.md` | 3.6 (+3.3/3.4 doc edits — 3.6 runs last) |
-| `testing/e2e/gears/file_storage/` | E2E only |
+| `testing/e2e/suites/file_storage/` | E2E only |
 
 Serialization rules: **1.6 → 1.11**; **1.10 → 3.3 → 3.4**; **0.1 after 3.4**
 (or rebase over it); everything else parallel. `tests/error_mapping_test.rs`

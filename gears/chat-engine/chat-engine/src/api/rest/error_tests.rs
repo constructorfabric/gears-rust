@@ -21,28 +21,28 @@ fn problem_from(err: ChatEngineError) -> Problem {
 #[test]
 fn not_found_maps_to_404() {
     let p = problem_from(ChatEngineError::not_found("session", "abc"));
-    assert_eq!(p.status, 404);
+    assert_eq!(p.status, Some(404));
     assert_eq!(p.problem_type, NOT_FOUND_TYPE);
 }
 
 #[test]
 fn forbidden_maps_to_403_with_permission_denied() {
     let p = problem_from(ChatEngineError::forbidden("missing scope"));
-    assert_eq!(p.status, 403);
+    assert_eq!(p.status, Some(403));
     assert_eq!(p.problem_type, PERMISSION_DENIED_TYPE);
 }
 
 #[test]
 fn conflict_maps_to_409_already_exists() {
     let p = problem_from(ChatEngineError::conflict("invalid lifecycle transition"));
-    assert_eq!(p.status, 409);
+    assert_eq!(p.status, Some(409));
     assert_eq!(p.problem_type, ALREADY_EXISTS_TYPE);
 }
 
 #[test]
 fn bad_request_maps_to_400_invalid_argument() {
     let p = problem_from(ChatEngineError::bad_request("missing 'content'"));
-    assert_eq!(p.status, 400);
+    assert_eq!(p.status, Some(400));
     assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
 }
 
@@ -54,7 +54,7 @@ fn backend_unavailable_without_plugin_err_maps_to_503() {
         source: None,
     };
     let p = problem_from(err);
-    assert_eq!(p.status, 503);
+    assert_eq!(p.status, Some(503));
     assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
 }
 
@@ -62,7 +62,7 @@ fn backend_unavailable_without_plugin_err_maps_to_503() {
 fn backend_unavailable_rate_limited_with_retry_after_emits_503_with_hint() {
     let err: ChatEngineError = PluginError::rate_limited(Some(Duration::from_secs(7))).into();
     let p = problem_from(err);
-    assert_eq!(p.status, 503);
+    assert_eq!(p.status, Some(503));
     assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
     assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(7));
 }
@@ -73,7 +73,7 @@ fn backend_unavailable_redacts_non_user_facing_detail() {
     // must be generic.
     let err: ChatEngineError = PluginError::transient("internal hostname leaked").into();
     let p = problem_from(err);
-    assert_eq!(p.status, 503);
+    assert_eq!(p.status, Some(503));
     assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
     // We can't assert detail == "Backend unavailable" verbatim — the
     // ServiceUnavailable builder constructs its own detail — but we
@@ -90,7 +90,7 @@ fn not_implemented_maps_to_501() {
     let p = problem_from(ChatEngineError::not_implemented(
         "export storage backend not configured",
     ));
-    assert_eq!(p.status, 501);
+    assert_eq!(p.status, Some(501));
     assert_eq!(p.problem_type, UNIMPLEMENTED_TYPE);
 }
 
@@ -101,7 +101,7 @@ fn internal_maps_to_500_and_redacts_reason() {
         source: None,
     };
     let p = problem_from(err);
-    assert_eq!(p.status, 500);
+    assert_eq!(p.status, Some(500));
     assert_eq!(p.problem_type, INTERNAL_TYPE);
     let body = serde_json::to_string(&p).unwrap();
     assert!(

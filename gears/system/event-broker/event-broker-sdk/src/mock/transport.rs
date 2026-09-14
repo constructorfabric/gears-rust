@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -509,7 +510,7 @@ impl EventBrokerApi for MockBroker {
             .unwrap_or(0);
         let max_partitions = topics
             .iter()
-            .filter_map(|t| core.topics.get(t).map(|ts| ts.partitions))
+            .filter_map(|t| core.topics.get(t).map(|state| state.partitions))
             .max();
         if let Some(partitions) = max_partitions
             && active_members >= partitions
@@ -590,8 +591,9 @@ impl EventBrokerApi for MockBroker {
             assigned: sub
                 .assigned
                 .iter()
-                .map(|(_, p)| crate::models::PartitionAssignment {
-                    topic_ix: 0,
+                .map(|(topic, p)| crate::models::PartitionAssignment {
+                    topic: GtsInstanceId::try_new(topic)
+                        .expect("registration asserts the topic id"),
                     partition: *p,
                 })
                 .collect(),
@@ -620,8 +622,9 @@ impl EventBrokerApi for MockBroker {
                     assigned: sub
                         .assigned
                         .iter()
-                        .map(|(_, p)| crate::models::PartitionAssignment {
-                            topic_ix: 0,
+                        .map(|(topic, p)| crate::models::PartitionAssignment {
+                            topic: GtsInstanceId::try_new(topic)
+                                .expect("registration asserts the topic id"),
                             partition: *p,
                         })
                         .collect(),
@@ -817,15 +820,8 @@ impl EventBrokerApi for MockBroker {
         let core = self.core.lock().await;
         Ok(core
             .topics
-            .keys()
-            .map(|id| Topic {
-                id: id.clone(),
-                description: None,
-                partitions: core.topics[id].partitions,
-                retention: None,
-                streaming: None,
-                created_at: Utc::now(),
-            })
+            .iter()
+            .map(|(id, state)| state.topic(id))
             .collect())
     }
 
@@ -883,16 +879,9 @@ impl EventBrokerApi for MockBroker {
         let core = self.core.lock().await;
         Ok(core
             .topics
-            .iter()
-            .flat_map(|(topic_id, t)| {
-                t.event_types.iter().map(move |(type_id, reg)| EventType {
-                    id: type_id.clone(),
-                    topic: topic_id.clone(),
-                    description: None,
-                    data_schema: reg.data_schema.clone(),
-                    created_at: Utc::now(),
-                })
-            })
+            .values()
+            .flat_map(|t| t.event_types.iter())
+            .map(|(type_id, reg)| reg.event_type(type_id))
             .collect())
     }
 
@@ -902,21 +891,15 @@ impl EventBrokerApi for MockBroker {
         id: &str,
     ) -> Result<EventType, EventBrokerError> {
         let core = self.core.lock().await;
-        for (topic_id, t) in &core.topics {
-            if let Some(reg) = t.event_types.get(id) {
-                return Ok(EventType {
-                    id: id.to_owned(),
-                    topic: topic_id.clone(),
-                    description: None,
-                    data_schema: reg.data_schema.clone(),
-                    created_at: Utc::now(),
-                });
-            }
-        }
-        Err(EventBrokerError::EventTypeUnknown {
-            type_id: id.to_owned(),
-            detail: format!("event type '{id}' not registered in mock"),
-            instance: String::new(),
-        })
+        let reg = core
+            .topics
+            .values()
+            .find_map(|t| t.event_types.get(id))
+            .ok_or_else(|| EventBrokerError::EventTypeUnknown {
+                type_id: id.to_owned(),
+                detail: format!("event type '{id}' not registered in mock"),
+                instance: String::new(),
+            })?;
+        Ok(reg.event_type(id))
     }
 }

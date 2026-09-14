@@ -15,7 +15,7 @@ xtask = "run --package xtask --"
 # lines and breaking the file_parser golden-markdown e2e tests on every open branch at once.
 #
 # Keep this pinned. To bump it, change the version and regenerate the goldens with
-# testing/e2e/gears/file_parser/generate_file_parser_golden.py in the same commit.
+# testing/e2e/suites/file_parser/generate_file_parser_golden.py in the same commit.
 # Deliberately not `force = true`, so `PDFIUM_VERSION=7988 cargo build` still overrides it
 # for testing a bump. Bare build number — the build script prepends "chromium/".
 [env]

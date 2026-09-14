@@ -50,7 +50,7 @@
 use std::{future::Future, pin::Pin};
 
 use sea_orm::{
-    AccessMode, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    AccessMode, ColumnTrait, DatabaseConnection, DatabaseTransaction, EntityTrait, ExprTrait,
     IsolationLevel, QueryFilter, TransactionTrait, sea_query::Expr,
 };
 use uuid::Uuid;
@@ -135,6 +135,7 @@ impl SecureConn {
             DbBackend::Postgres => "postgres",
             DbBackend::MySql => "mysql",
             DbBackend::Sqlite => "sqlite",
+            _ => "unknown",
         }
     }
 

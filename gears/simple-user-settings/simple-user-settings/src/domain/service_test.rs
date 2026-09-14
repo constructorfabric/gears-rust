@@ -9,14 +9,15 @@ mod tests {
 
     use async_trait::async_trait;
     use authz_resolver_sdk::{
-        AuthZResolverClient, AuthZResolverError, PolicyEnforcer,
+        AuthZResolverApi, PolicyEnforcer,
         constraints::{Constraint, InPredicate, Predicate},
         models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
     };
     use simple_user_settings_sdk::models::{SimpleUserSettingsPatch, SimpleUserSettingsUpdate};
+    use toolkit::api::canonical_prelude::CanonicalError;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
-    use toolkit_security::{SecurityContext, pep_properties};
+    use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
     use uuid::Uuid;
 
     use crate::domain::error::DomainError;
@@ -36,11 +37,12 @@ mod tests {
     struct MockAuthZResolver;
 
     #[async_trait]
-    impl AuthZResolverClient for MockAuthZResolver {
+    impl AuthZResolverApi for MockAuthZResolver {
         async fn evaluate(
             &self,
+            _ctx: PlatformSecurityContext,
             request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, AuthZResolverError> {
+        ) -> Result<EvaluationResponse, CanonicalError> {
             // Resolve tenant: explicit context > subject property (like a real PDP)
             let root_id = request
                 .context
@@ -56,7 +58,7 @@ mod tests {
                         .and_then(|s| Uuid::parse_str(s).ok())
                 })
                 .ok_or_else(|| {
-                    AuthZResolverError::Internal("tenant context is required".to_owned())
+                    CanonicalError::internal("tenant context is required".to_owned()).create()
                 })?;
 
             let mut predicates = vec![Predicate::In(InPredicate::new(
@@ -113,7 +115,7 @@ mod tests {
     fn build_service(db: Db, config: ServiceConfig) -> ConcreteService {
         let repo = Arc::new(SeaOrmSettingsRepository::new());
         let db: Arc<DBProvider<toolkit_db::DbError>> = Arc::new(DBProvider::new(db));
-        let authz: Arc<dyn AuthZResolverClient> = Arc::new(MockAuthZResolver);
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
         let policy_enforcer = PolicyEnforcer::new(authz);
         Service::new(db, repo, policy_enforcer, config)
     }

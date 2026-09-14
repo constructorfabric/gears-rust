@@ -1,0 +1,7 @@
+[gear]
+name = "Static Model Policy Plugin"
+description = "Static model policy plugin providing fixed model selection for MiniChat deployments."
+category = "gen-ai"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

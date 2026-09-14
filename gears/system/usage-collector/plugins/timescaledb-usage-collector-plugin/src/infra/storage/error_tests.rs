@@ -38,6 +38,29 @@ fn fk_violation_is_type_referenced() {
         DbErrorClass::ForeignKeyViolation
     );
 }
+
+/// `PostgreSQL` 18 reports `ON DELETE RESTRICT` as the standard 23001
+/// `restrict_violation`, where <= 17 reported 23503. Both are "the row is
+/// still referenced" for this plugin; dropping either one would turn a
+/// `UsageTypeReferenced` back into an opaque `Internal`.
+#[test]
+fn restrict_violation_is_also_type_referenced() {
+    assert_eq!(
+        classify_db("23001", Some("usage_records_gts_id_fk")),
+        DbErrorClass::ForeignKeyViolation
+    );
+}
+#[test]
+fn restrict_violation_is_type_referenced() {
+    // PostgreSQL 18 reports an `ON DELETE RESTRICT` refusal as `23001` rather
+    // than `23503`. Both must reach `ForeignKeyViolation`, or `delete` answers
+    // `Internal` instead of `UsageTypeReferenced` on one PostgreSQL major --
+    // which is exactly how this surfaced, as a version-dependent test failure.
+    assert_eq!(
+        classify_db("23001", Some("usage_records_gts_id_fk")),
+        DbErrorClass::ForeignKeyViolation
+    );
+}
 #[test]
 fn connection_class_is_transient() {
     assert_eq!(classify_db("08006", None), DbErrorClass::Transient);

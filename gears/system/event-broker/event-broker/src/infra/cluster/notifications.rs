@@ -3,6 +3,8 @@
 //! pub/sub primitive, see `docs/ADR/0007-service-decomposition.md` D3).
 //! Shell only - wiring lands with #4345/#4346.
 
+use gts::GtsInstanceId;
+
 use crate::domain::cluster::EventBrokerCluster;
 
 /// Notifies delivery shards that new events landed on `(topic, partition)`
@@ -14,7 +16,7 @@ use crate::domain::cluster::EventBrokerCluster;
 /// implemented.
 pub async fn notify_partition_appended(
     cluster: &EventBrokerCluster,
-    topic: &str,
+    topic: &GtsInstanceId,
     partition: i32,
 ) -> Result<(), cluster_sdk::ClusterError> {
     let _ = (cluster, topic, partition);

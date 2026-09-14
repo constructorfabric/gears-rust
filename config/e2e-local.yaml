@@ -117,6 +117,9 @@ gears:
 
   # --- Tenant Resolver example (gateway + plugins) ---
   types-registry:
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
     config:
       # The AM envelope type schemas (`gts.cf.core.am.tenant_type.v1~`
       # and `gts.cf.core.am.tenant_metadata.v1~`) are auto-seeded at
@@ -133,6 +136,8 @@ gears:
           $schema: "http://json-schema.org/draft-07/schema#"
           description: "Platform-root tenant type (no parents)."
           type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
           x-gts-traits:
             allowed_parent_types: []
             idp_provisioning: false
@@ -149,6 +154,8 @@ gears:
           $schema: "http://json-schema.org/draft-07/schema#"
           description: "Customer tenant under the platform root (E2E)."
           type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
           x-gts-traits:
             allowed_parent_types:
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
@@ -279,6 +286,20 @@ gears:
             # not check it are unaffected.
             subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
+        # A SECOND principal inside tenant A. Same tenant, different subject —
+        # which is the only shape that can exercise a two-person rule, because
+        # bss-pricing's `chk_pricing_approval_distinct_principals` compares
+        # principal IDENTITIES and everything else in this file is either the
+        # same subject or a different tenant. Without it the approval workflow's
+        # positive arm is unreachable end to end: the submitter's own approve is
+        # refused SELF_APPROVAL_FORBIDDEN, and tenant B cannot see the record at
+        # all. Additive — no existing token or test reads it.
+        - token: "e2e-token-tenant-a-reviewer"
+          identity:
+            subject_id: "44444444-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
         # Hierarchy tenant tokens — used by budget allocation e2e tests
         - token: "e2e-token-hierarchy-root"
           identity:
@@ -299,10 +320,18 @@ gears:
           identity:
             subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
             subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            # As on tenant A: a real AuthN resolver always sets a subject_type,
+            # and the gears that check it (bss-ledger, bss-pricing) refuse a
+            # context without one with 401 - before their PEP gate. Without this
+            # line the cross-tenant isolation tests read as "not authenticated"
+            # rather than as "authenticated and out of scope", which is the one
+            # thing they exist to tell apart. Additive; gears that do not check
+            # it are unaffected.
+            subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
         # Nil-tenant token: static-authz denies requests with the nil UUID
         # tenant, producing a clean 403 Forbidden. Used by
-        # testing/e2e/gears/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
+        # testing/e2e/suites/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
         - token: "e2e-token-nil-tenant"
           identity:
             subject_id: "33333333-6a88-4768-9dfc-6bcd5187d9ed"
@@ -316,6 +345,21 @@ gears:
     config:
       vendor: "constructorfabric"
       priority: 100
+
+  license-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Requires --features static-license.
+  static-license-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # Deny by default: no rule, no grant. Rules are left empty because no gear
+      # gates on a licence yet -- a rule must name registered Subject/Resource
+      # contract types, and the resolver rejects a check against an unregistered
+      # one. See the plugin README for a worked rule set.
+      grants: []
 
   mini-chat:
     # Gear-specific database configuration
@@ -420,12 +464,41 @@ gears:
       server: "sqlite_users"
       file: "bss_ledger.db"
 
+  bss-pricing:
+    # Gear-specific database (SQLite for E2E, like the other user gears; the
+    # gear ships dual PG/SQLite migrations). No config block needed — the
+    # defaults are correct for E2E, including the in-repository path of the
+    # joint conformance-fixture registry. That registry's nine rows all carry
+    # `oracle = true` and `publish = true`, so the gate is OPEN for every model
+    # kind here — pricing's validator has earned the corpus's `publish` half.
+    # (This comment said the opposite until 2026-08-03; it had been stale since
+    # the registry was regenerated.) Since Slice 5 the publish endpoint exists
+    # and the open gate is load-bearing here: the e2e walk's pre-check passes
+    # rather than refusing FIXTURE_MISSING per model kind.
+    #
+    # The publish still cannot COMPLETE in this deployment, and the reason is a
+    # different one: there is no CatalogVersion registry gear in this
+    # repository, so the module boots with UnconfiguredCatalogVersionRegistryV1
+    # and the commit's version request fails closed (503). There is deliberately
+    # no config key that would supply a registry — a locally invented version
+    # would make this gear a second incrementer.
+    database:
+      server: "sqlite_users"
+      file: "bss_pricing.db"
+
   simple-user-settings:
     # Gear-specific database configuration
     database:
       server: "sqlite_users"
       file: "settings.db"
     config: {}
+
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
 
   file-parser:
     config:
@@ -498,10 +571,13 @@ opentelemetry:
     # HTTP-specific options
     http:
       inject_request_id_header: "x-request-id"
-      # WARNING: "authorization" sends bearer tokens to the trace collector — dev/test only
-      record_headers: [ "user-agent", "x-forwarded-for", "authorization" ]
+      # Credential-bearing headers ("authorization", "cookie", …) must never
+      # be listed here: whatever is recorded reaches the trace collector.
+      record_headers: [ "user-agent", "x-forwarded-for" ]
 
-    # Log correlation (future feature)
+    # Add top-level trace_id / span_id to JSON log records so a backend can
+    # link a log line to its span. Off by default: it costs a context lookup
+    # per event.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

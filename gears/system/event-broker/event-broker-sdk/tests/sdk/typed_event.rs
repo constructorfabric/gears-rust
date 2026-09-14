@@ -14,8 +14,7 @@ struct OrderCreated {
 }
 
 impl TypedEvent for OrderCreated {
-    const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~example.orders.created.v1";
-    const TOPIC: &'static str = "gts.cf.core.events.topic.v1~example.orders.v1";
+    const TYPE_ID: &'static str = "gts.cf.core.events.event.v1~example.orders.created.v1~";
     const SUBJECT_TYPE: &'static str = "gts.cf.core.events.subject.v1~example.order.v1";
     const SOURCE: &'static str = "order-service";
 

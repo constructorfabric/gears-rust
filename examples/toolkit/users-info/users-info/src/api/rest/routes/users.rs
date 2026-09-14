@@ -72,6 +72,12 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .error_401(openapi)
         .error_403(openapi)
         .error_409(openapi)
+        // 413/415/422: this handler's body is `extract::Json<T>`, which
+        // can produce all three (oversized body, wrong `Content-Type`,
+        // schema violation) - not covered by `error_400` alone.
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -92,6 +98,11 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
+        // This handler's body is `extract::Json<T>` too - see the
+        // create_user registration above for why 413/415/422 apply.
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .error_500(openapi)
         .register(router, openapi);
 

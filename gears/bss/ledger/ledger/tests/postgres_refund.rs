@@ -57,11 +57,10 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, Side};
-use chrono::{DateTime, Datelike, Utc};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
@@ -73,7 +72,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -117,7 +116,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
     let tdb = connect_db(&repo_url, ConnectOpts::default()).await.unwrap();
     let provider = DBProvider::<DbError>::new(tdb);
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -127,7 +126,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         ar: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         suspense: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -141,7 +140,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -299,7 +298,7 @@ async fn refund_clearing_state(
     psp: &str,
     phase: &str,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT clearing_state FROM bss.ledger_refund \
          WHERE tenant_id='{}' AND psp_refund_id='{psp}' AND phase='{phase}'",
         s.tenant
@@ -321,7 +320,7 @@ async fn seed_allocation_refund(
     invoice_id: &str,
     allocated: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_payment_allocation_refund \
          (tenant_id, payment_id, invoice_id, allocated_minor, refunded_minor, version) \
          VALUES ('{}','{payment_id}','{invoice_id}',{allocated},0,0)",
@@ -336,7 +335,7 @@ async fn seed_allocation_refund(
 /// the spendable-headroom CHECK have a non-trivial allocated base). Mirrors what
 /// `add_allocated` does, without wiring the whole allocation flow.
 async fn bump_allocated(raw: &DatabaseConnection, s: &Seller, payment_id: &str, amount: i64) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement \
          SET allocated_minor = allocated_minor + {amount}, version = version + 1 \
          WHERE tenant_id='{}' AND payment_id='{payment_id}'",
@@ -409,7 +408,7 @@ fn clawback_req(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pattern_a_two_stage_drains_refund_clearing_to_zero() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -490,7 +489,7 @@ async fn pattern_a_two_stage_drains_refund_clearing_to_zero() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pattern_b_two_stage_restores_ar_then_drains_clearing() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -567,7 +566,7 @@ async fn pattern_b_two_stage_restores_ar_then_drains_clearing() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_against_unsettled_payment_is_origin_not_found() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -603,7 +602,7 @@ async fn refund_against_unsettled_payment_is_origin_not_found() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_currency_mismatch_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -636,7 +635,7 @@ async fn refund_currency_mismatch_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_stage_is_idempotent_on_psp_phase() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -690,7 +689,7 @@ async fn refund_stage_is_idempotent_on_psp_phase() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stage1_initiation_reserves_refunded_cap_both_patterns() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -760,7 +759,7 @@ async fn stage1_initiation_reserves_refunded_cap_both_patterns() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stage1_over_settled_is_refund_exceeds_settled() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -807,7 +806,7 @@ async fn stage1_over_settled_is_refund_exceeds_settled() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pattern_a_refund_consumes_unallocated_headroom() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -867,7 +866,7 @@ async fn pattern_a_refund_consumes_unallocated_headroom() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pattern_b_per_invoice_cap_blocks_over_allocated() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -931,7 +930,7 @@ async fn pattern_b_per_invoice_cap_blocks_over_allocated() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn rejected_stage1_reverses_and_frees_cap() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1059,7 +1058,7 @@ async fn rejected_stage1_reverses_and_frees_cap() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reject_without_stage1_is_invalid_request() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1200,7 +1199,7 @@ async fn pending_refund_approvals(raw: &DatabaseConnection, s: &Seller) -> i64 {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_over_threshold_gates_then_a_second_actor_approve_posts_it() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1304,7 +1303,7 @@ async fn refund_over_threshold_gates_then_a_second_actor_approve_posts_it() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn preparer_cannot_self_approve_their_refund() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1381,7 +1380,7 @@ async fn preparer_cannot_self_approve_their_refund() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_under_threshold_posts_inline_without_an_approval() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1447,7 +1446,7 @@ async fn clawback_queue_rows(raw: &DatabaseConnection, s: &Seller, status: &str)
 /// Force a REFUND_CLAWBACK queue row to look aged: backdate `queued_at` well past
 /// the 7-day aging horizon AND clear `apply_after` so it is immediately claimable.
 async fn age_clawback_row(raw: &DatabaseConnection, s: &Seller) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_pending_event_queue \
          SET queued_at = now() - interval '30 days', apply_after = NULL \
          WHERE tenant_id='{}' AND flow='REFUND_CLAWBACK'",
@@ -1463,7 +1462,7 @@ async fn age_clawback_row(raw: &DatabaseConnection, s: &Seller) {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clawback_after_outbound_decrements_net_refunded() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1535,7 +1534,7 @@ async fn clawback_after_outbound_decrements_net_refunded() {
     );
     // The claw-back refund row carries the relates_to link.
     let relates: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT relates_to_refund_id FROM bss.ledger_refund \
              WHERE tenant_id='{}' AND psp_refund_id='PSP-CB' AND phase='initiated'",
             s.tenant
@@ -1560,7 +1559,7 @@ async fn clawback_after_outbound_decrements_net_refunded() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn additional_outbound_refund_of_refund_increments_under_cap() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1624,7 +1623,7 @@ async fn additional_outbound_refund_of_refund_increments_under_cap() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn out_of_order_clawback_defers_then_applies_after_outbound() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1727,7 +1726,7 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn never_reconciled_clawback_is_cancelled_and_escalated() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1817,7 +1816,7 @@ impl SecuredAuditSink for SpyAuditSink {
         reason_code: Option<&str>,
         before_after: &serde_json::Value,
         _correlation_id: Option<Uuid>,
-        _retain_until: Option<DateTime<Utc>>,
+        _retain_until: Option<OffsetDateTime>,
     ) -> Result<Uuid, DbError> {
         self.count.fetch_add(1, Ordering::SeqCst);
         self.calls.lock().unwrap().push(AuditCall {
@@ -1840,7 +1839,7 @@ impl SecuredAuditSink for SpyAuditSink {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn unknown_final_parks_refund_clearing_to_suspense_and_audits() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2017,7 +2016,7 @@ async fn dispute_hold_queue_rows(raw: &DatabaseConnection, s: &Seller, status: &
 /// the 14-day quarantine aging horizon AND clear `apply_after` so it is immediately
 /// claimable. Mirrors `age_clawback_row`.
 async fn age_quarantine_row(raw: &DatabaseConnection, s: &Seller) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_pending_event_queue \
          SET queued_at = now() - interval '30 days', apply_after = NULL \
          WHERE tenant_id='{}' AND flow='REFUND_QUARANTINE'",
@@ -2036,7 +2035,7 @@ async fn open_dispute(
     payment_id: &str,
     disputed: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
          (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
           disputed_amount_minor, cash_hold_minor, version) \
@@ -2053,7 +2052,7 @@ async fn open_dispute(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_then_settle_drains_and_posts() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2125,7 +2124,7 @@ async fn quarantine_then_settle_drains_and_posts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_drain_still_missing_backs_off() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2179,7 +2178,7 @@ async fn quarantine_drain_still_missing_backs_off() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_aged_out_is_cancelled_and_escalated() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2235,7 +2234,7 @@ async fn quarantine_aged_out_is_cancelled_and_escalated() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_over_threshold_awaits_approval() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2304,7 +2303,7 @@ async fn quarantine_over_threshold_awaits_approval() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_drain_into_open_dispute_marks_applied() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2367,7 +2366,7 @@ async fn quarantine_drain_into_open_dispute_marks_applied() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn out_of_order_clawback_replay_resignals_deferred() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2437,7 +2436,7 @@ async fn out_of_order_clawback_replay_resignals_deferred() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn applied_clawback_replay_returns_posted() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -2537,7 +2536,7 @@ async fn applied_clawback_replay_returns_posted() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn quarantine_conflict_payload_is_idempotency_conflict() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

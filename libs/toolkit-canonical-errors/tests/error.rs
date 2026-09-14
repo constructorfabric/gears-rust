@@ -95,7 +95,7 @@ fn all_16_categories_convert_to_problem() {
         let problem = Problem::from(err);
         assert!(!problem.problem_type.is_empty());
         assert!(!problem.title.is_empty());
-        assert!(problem.status > 0);
+        assert!(problem.status > Some(0));
     }
 }
 

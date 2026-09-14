@@ -59,13 +59,6 @@ axis is solved by directory **labels + targeted resolution**. Concretely, today 
 We need to decide how (and whether) the platform supports targeting a specific instance, and where that lives
 relative to the directory contract and the REST contract-codegen client-wiring layer.
 
-> **This ADR is the platform's single service-discovery layer.** The cluster gear's in-SDK
-> `ServiceDiscoveryV1` (instance registration, serving intent, metadata filtering, TTL heartbeat, and topology
-> watch as a follow-up) is **superseded** by the directory and its capability consolidated here so there is exactly **one**
-> source of topology truth. The actual code removal is **out of scope for this ADR** - it is executed by the
-> cluster gear's own decomposition as a separate, coordinated change; this ADR is the *design* that replaces
-> it. See [Relationship to cluster `ServiceDiscoveryV1`](#relationship-to-cluster-servicediscoveryv1).
-
 ## Decision Drivers
 
 * **Correctness of split gears must be structural, not flag-dependent** - a role-split or sharded gear must
@@ -174,7 +167,14 @@ Add **one** targeted lookup to `DirectoryClient`, backed by selection in `GearMa
 clients:
 
 * `resolve_by_labels(name, selector)` - the set of instances of `name` matching a `LabelSelector` (see §6),
-  each carrying its `instance_id`, `labels`, readiness state, and endpoints.
+  each carrying its `instance_id`, `labels`, endpoints, and live serving `state` (`InstanceState`, §6). The
+  set is **not** health-filtered; the projected `state` is what lets the caller apply its own liveness policy
+  from a single resolve. It is likewise **not endpoint-filtered**: a matched instance that has not (yet)
+  advertised an endpoint is still returned with its `endpoint` / `rest_endpoint` **absent** (`None`, never an
+  empty-URI sentinel) - this is *no-endpoint, not an error*, leaving the caller to fall back or pick another
+  transport rather than silently hiding a match. The same holds for the underlying per-name enumeration
+  (`list_instances`); only the edge snapshot `list_all_instances`, which needs a dialable URI to reverse-proxy,
+  drops endpoint-less entries.
 
 There is deliberately **no** `resolve_instance(gear, instance_id)`. The only live `instance_id` a caller can
 hold comes from a prior `resolve_by_labels` result (which already carries the endpoint), so a
@@ -215,11 +215,11 @@ resolution is service-name-scoped"):
   service-name analogue of the role-qualified gear names in §1. A bare, shared service name is intentionally
   reachable across every advertising role.
 * **The edge exposes public routes of the resolved name.** The `api-gateway` reverse-proxy edge already keys its
-  route table on gear name; it exposes only the **public** routes (via the `.exposed()` / `x-toolkit-visibility`
-  visibility split the edge introduces - a prerequisite not yet in the tree, see Consequences) of the
-  names it syncs from the directory. An internal role never enters the edge's public route table because its
-  **name** is internal - a role-split gear simply does not register its internal role-names as edge-eligible, or
-  exposes no public routes on them. No `entrypoint` predicate is needed at the edge.
+  route table on gear name; it exposes only the **public** routes (via the `.exposed()` /
+  `x-toolkit-visibility` visibility split) of the names it syncs from the directory. An internal role never
+  enters the edge's public route table because its **name** is internal - a role-split gear simply does not
+  register its internal role-names as edge-eligible, or exposes no public routes on them. No `entrypoint`
+  predicate is needed at the edge.
 * **One public contract per directory name (constraint):** instances registered under **one** directory name
   MUST expose the **same logical public API** - a directory name *is* one logical service. This does **not**
   forbid **transient version skew** during a rolling deploy of the *same* contract: while v1 and v2 pods coexist
@@ -301,9 +301,15 @@ deployment profile (ADR-0001):
 reachable by *other* gears - never a bind-only address (`localhost` / `0.0.0.0`), nor a shared Service VIP for a
 targeted role. Because the bootstrap's own default rewrites an unspecified bind address to loopback
 (`libs/toolkit/src/bootstrap/oop.rs`), a silently-registered loopback endpoint is a registered-but-unreachable
-instance in multi-host Profile 2 and in Profile 3. The runtime therefore **MUST fail fast**: in OoP multi-host
-Profile 2 and in Profile 3, bootstrap **MUST refuse to start** when `advertise_uri` is unset or resolves to
-loopback / `0.0.0.0`, rather than registering it. (Single-node Profile 2 over UDS and Profile 1 are exempt.) Profile 2 uses the worker's configured UDS path or bound `host:port`; Profile 3 derives from the
+instance in multi-host Profile 2 and in Profile 3. The runtime therefore **fails fast**: the OoP HTTP bootstrap
+(`validate_advertise_uri` in `libs/toolkit/src/bootstrap/oop.rs`) **refuses to start** when the resolved
+`advertise_uri` is a loopback / unspecified host (`127.0.0.1`, `::1`, `localhost`, `0.0.0.0`, `[::]`). This
+also catches an *unset* `advertise_uri` **when the value derived from `listen_addr` is itself
+loopback/unspecified** (e.g. an unspecified `0.0.0.0` bind, which the default rewrites to loopback); an unset
+`advertise_uri` on a routable bind derives a routable endpoint and is accepted. The
+single-host / local-dev exemption is an explicit opt-out (`oop_http.allow_loopback_advertise = true`) the
+operator must consciously set; single-node Profile 2 over UDS (a non-HTTP endpoint) and Profile 1 (in-process,
+never reaches this check) are exempt structurally. Profile 2 uses the worker's configured UDS path or bound `host:port`; Profile 3 derives from the
 Kubernetes **downward API** - the stable per-pod FQDN `$(HOSTNAME).<service>.$(POD_NAMESPACE).svc` (+ container
 port) for targeted role-names, or the Service DNS name for a load-balanced front-door name. **Prefer stable DNS names /
 socket paths over raw IPs** (pod IPs churn on reschedule): `advertise_uri` is only the **routable transport
@@ -321,8 +327,8 @@ There is one targeted lookup (§2); its cardinality and health contract, and the
 contract, are:
 
 * **`resolve_by_labels(name, selector)` -> a set (array)** - effectively `list_instances(name)` filtered by the
-  selector, returning each match's `instance_id`, `labels`, readiness state, and endpoints (gRPC
-  `endpoint` and/or `rest_endpoint`). The selector is a **`LabelSelector` struct** wrapping a **map of equality
+  selector, returning each match's `instance_id`, `labels`, endpoints (gRPC
+  `endpoint` and/or `rest_endpoint`), and live serving `state` (`InstanceState`). The selector is a **`LabelSelector` struct** wrapping a **map of equality
   requirements matched with AND semantics** (Kubernetes `matchLabels` style): an instance matches only if it
   carries **every** requested `key=value` pair (e.g. `shard=7`); an empty selector matches
   all instances of the name. Passing a **struct rather than a bare map** keeps future filters (e.g.
@@ -348,16 +354,21 @@ contract, are:
 * **Empty-set semantics**: zero matches is `Ok(empty)`, kept distinct from a
   directory-backend error - preserving the not-found vs. failure contract of ADR-0005, so an empty result reads
   as "not ready yet," not "outage."
-* **Health contract (decision):** every lookup annotates each returned instance with its readiness state
-  (`InstanceState`: `Registered` / `Ready` / `Healthy` / `Quarantined` / `Draining`; only `Ready` / `Healthy`
-  are **serving**, the rest are **not-ready**). This is the **directory's annotation of a resolution result** and
-  is **derived from** the instance's readiness signal ([ADR-0005](0005-cpt-cf-adr-eventual-readiness.md)), not a
-  second health system; it is *not* the same enum as ADR-0005's readiness-probe `state`. Mapping to ADR-0005:
+* **Health contract (decision):** the two lookup modes handle health differently. **Name-based resolution**
+  (`resolve_rest_service` / `resolve_grpc_service`) selects over each instance's readiness state
+  (`InstanceState`: `Registered` / `Ready` / `Healthy` / `Quarantined` / `Draining` / `Unknown`; only
+  `Ready` / `Healthy` are **serving**, the rest are **not-ready**), **derived from** the instance's readiness
+  signal ([ADR-0005](0005-cpt-cf-adr-eventual-readiness.md)), not a second health system (it is *not* the same
+  enum as ADR-0005's readiness-probe `state`). Mapping to ADR-0005:
   `Ready`/`Healthy` correspond to ADR-0005 `Ready`/`Degraded` (serving / `200`); `Registered` to `Starting`
   (registered, deps not yet resolved); `Quarantined` to a failing readiness probe (`Unhealthy`->`Starting`); and
-  `Draining` to `Draining`. A caller can thus always distinguish **no match** (`Ok(empty)`)
-  from **matched-but-not-ready**. The two modes share these error semantics and differ only in health
-  *filtering*:
+  `Draining` to `Draining`. `Unknown` is the **safe default** for a state that could not be determined: the proto
+  `UNSPECIFIED` discriminant and any unrecognised (forward-compat) wire value decode to `Unknown` rather than
+  silently reading as `Registered`. It is **non-serving** and carries no ADR-0005 mapping; it exists only so an
+  undeterminable state can never be mistaken for a known one. **`resolve_by_labels`**, by contrast, does **not** filter on health: it returns
+  the full matched set with each instance's `state` **annotated** (`InstanceState`), leaving the caller to
+  apply its own liveness policy. Both modes preserve the **no match** (`Ok(empty)`) vs backend-error
+  distinction; they differ in health *filtering*:
   * **Name round-robin** (`resolve_rest_service` / `resolve_grpc_service`) rotates over the resolved name,
     **preferring** serving (`Ready` / `Healthy`) instances but, when none are serving, **falling back to RR
     over the full not-ready set - `Quarantined` *and* `Draining` included**. Draining instances are
@@ -366,11 +377,12 @@ contract, are:
     resolves to a quarantined endpoint, and a name whose instances are **all `Draining`** likewise resolves to a
     draining endpoint. `None` is returned **only** when the candidate set is **empty** - i.e. no instance
     registered under the name exposes the requested endpoint at all - never merely because every instance is
-    not-ready. *(One transport asymmetry - gRPC service-scoped resolution does **not** yet fall back and instead
-    returns `None` when none are serving - is tracked in Implementation notes.)*
+    not-ready. Both transports share this fallback: `resolve_rest_service` and `resolve_grpc_service` prefer
+    serving instances and fall back to the not-ready set, returning `None` only on an empty candidate set.
   * **`resolve_by_labels(name, selector)`** returns the **full** matching set **regardless of health**, each
-    entry carrying its readiness state; an all-unhealthy match is still `Ok(non-empty)`, distinct from
-    `Ok(empty)` and from a backend error.
+    entry carrying its `state` (`InstanceState`) so the caller can filter; a matched-but-unhealthy instance is
+    still returned (`Ok(non-empty)`, distinct from `Ok(empty)` and from a backend error), and applying the
+    liveness policy is the caller's responsibility.
 
 * **Stale-ownership correction path (required contract).** A poll-refreshed shard/owner map (§2) is inherently
   stale between refreshes, so ownership is **not** established by the directory result alone - it must be
@@ -408,21 +420,15 @@ REST contract codegen. This ADR fixes the **contract shape** (Layer 1) so it can
 with that codegen's directory edits (which also modify `ServiceInstanceInfo` / `grpc/client.rs`) rather than in
 a merge scramble.
 
-**Relationship to the event-broker's current primitive.** event-broker ADR-0007 (Accepted) has
-`domain/cluster.rs` resolve the cluster gear's `ServiceDiscoveryV1` via `ClientHub` under the `evbk` prefix -
-so the broker has a *working* targeting primitive today. That primitive is exactly the cluster
-`ServiceDiscoveryV1` this ADR **supersedes and replaces** (see [Relationship to cluster
-`ServiceDiscoveryV1`](#relationship-to-cluster-servicediscoveryv1)); Layer 1 is therefore not "unblocking
-something new" but **the successor substrate** the broker's dispatcher->ingest targeting must move onto once
-cluster discovery is retired (by the cluster gear's own decomposition, not this ADR). The broker's
-decomposition already assumes one binary with mode-selected wiring, so its `ingest` / `delivery` modes register
-their **role-qualified directory names** (§1) - no `entrypoint` marker is needed, and the wrong-role failure
-mode is structurally impossible.
+**Relationship to the event-broker's targeting.** `event-broker` runs its internal `dispatcher -> ingest` /
+`delivery` targeting on this directory: Layer 1 is the substrate that targeting sits on. The broker's
+decomposition assumes one binary with mode-selected wiring, so its `ingest` / `delivery` modes register their
+**role-qualified directory names** (§1) - no `entrypoint` marker is needed, and the wrong-role failure mode is
+structurally impossible.
 
-**Watch / change-notification (required follow-up, owned here).** The cluster `ServiceDiscoveryV1` being
-removed included a **topology `watch`** (unfiltered `Joined`/`Left`/`Updated` stream). Because this ADR is that
-capability's single successor, a directory-level change-notification API is a **required follow-up owned by
-this design** (not the cluster gear), so removing cluster discovery is not a silent regression. It is
+**Watch / change-notification (required follow-up, owned here).** The directory does not yet expose a
+**topology `watch`** (a `Joined`/`Left`/`Updated` change-notification stream). Because this ADR is the single
+service-discovery layer, that directory-level API is a **required follow-up owned by this design**. It is
 sequenced *after* Layer 1 (poll + the §6 fencing contract already make correctness *specified*); watch is a
 convergence-latency optimization, not a correctness prerequisite. Until it lands, consumers poll
 `list_instances` / `resolve_by_labels`.
@@ -445,13 +451,13 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
   endpoint (i.e. not a shared VIP); the *mechanism* - `StatefulSet` + headless Service, a self-registering
   `Deployment` advertising its pod IP / per-pod DNS, etc. - is the **gear developer's choice** and is **not**
   mandated here. Front-door role-names may keep a Service VIP.
-* **Ordering dependency on the edge work (these prerequisites do not exist today).** Layer 1's edge story and
-  the enumeration decision below depend on directory/edge changes that are **not yet in the tree** and are **not
-  specified by the current edge ADRs** (ADR-0003 defines only the `GatewayProvider` trait; ADR-0007 defines the
-  edge auth *modes*) - they are a separate, not-yet-written directory/edge work item: `directory.proto` has
-  **no `ListAllInstances` RPC**, `openapi_spec` lives on `RegisterInstanceRequest` only (not on `InstanceInfo`),
-  and there is **no `.exposed()` / `x-toolkit-visibility`** visibility split. Layer 1 therefore **must merge after
-  (or reconcile with) that edge implementation**; it is **not** available today and must not be read as such.
+* **Edge / directory ordering dependency (discharged).** Layer 1's edge story and the enumeration decision
+  below depended on directory/edge machinery that has since landed: `directory.proto` has `ListAllInstances`,
+  `InstanceInfo` carries `openapi_spec` (field 6), and the `.exposed()` / `x-toolkit-visibility` visibility
+  split is emitted by `OperationBuilder` and consumed by `toolkit-gateway`. ADR-0003 still defines only the
+  `GatewayProvider` trait and ADR-0007 the edge auth *modes*; the concrete crates (`toolkit-gateway`,
+  `api-gateway` directory-sync) exist in-tree even though those two ADRs have not been amended to specify
+  them. Layer 1 merged on top of that edge (#4540); the ordering dependency is satisfied.
 * **Requires amendments to sibling ADRs / PRD / DESIGN** (not just cross-references), because it changes shapes
   they assert - **ADR-0001**, **PRD `cpt-cf-fr-k8s-native`**, **DESIGN.md (§3 Profile 3)**, and **ADR-0004**
   (Helm); enumerated under
@@ -463,9 +469,10 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
 
 * Design review: `labels` and `resolve_by_labels` are additive; name-based resolution is **unchanged** (roles
   are separate names, not filtered instances).
-* Fail-fast test (§5): in OoP multi-host Profile 2 / Profile 3, bootstrap **refuses to start** when
-  `advertise_uri` is unset or loopback / `0.0.0.0` (no registered-but-unreachable instance); single-node UDS and
-  Profile 1 start normally.
+* Fail-fast test (§5): the OoP HTTP bootstrap **refuses to start** when the resolved `advertise_uri` is unset or
+  a loopback / unspecified host (no registered-but-unreachable instance), unless
+  `oop_http.allow_loopback_advertise = true` is set for single-host / local-dev; single-node UDS and Profile 1
+  (in-process) start normally. Covered by `validate_advertise_uri` unit tests.
 * Integration test (targeting, Profile 2/3 - see §5 coverage owner): distinct-`shard` instances of one name
   resolve deterministically via `resolve_by_labels` while a plain resolve round-robins; for a role-split gear
   (e.g. `event-broker`) resolving `event-broker` reaches only `dispatcher`, and `event-broker-ingest` /
@@ -475,9 +482,16 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
   "not the owner" response; the caller refreshes via `resolve_by_labels` and re-targets the current owner; the
   optional carried owner label short-circuits the re-enumeration.
 * Integration test (health, §6): name-based RR falls back to unhealthy when none are healthy (a non-empty name
-  never yields `None`); `resolve_by_labels` includes unhealthy matches annotated with `InstanceState`.
-* Integration test (enumeration): `list_instances` / `ListAllInstances` return **every** instance including
-  REST-only roles, round-tripping `labels` / `rest_endpoint` / `openapi_spec` (see Implementation
+  never yields `None`); `resolve_by_labels` includes unhealthy matches, each annotated with its `state`
+  (`InstanceState`) so the caller owns the liveness policy.
+* Integration test (enumeration): the per-gear and cross-gear paths differ on endpoint-less instances. Per-gear
+  `list_instances` (and `resolve_by_labels`) **include endpoint-less matches** (`endpoint: None`, never an
+  empty-URI sentinel) so the caller can fall back, and round-trip `labels` / `rest_endpoint` and the
+  `openapi_spec` **hash** - **never the document** - so a multi-instance response stays bounded regardless of
+  spec size. The broad cross-gear `ListAllInstances` edge snapshot instead includes **only instances with a
+  dialable endpoint** (gRPC or REST), dropping endpoint-less ones since it needs a URI to route; it carries each
+  instance's `rest_endpoint` but **omits `labels`** (the edge routes by name, not labels) and inlines only the
+  `openapi_spec` **hash**. Every path fetches the document out-of-band via `GetOpenApiSpec` (see Implementation
   notes).
 * Reconciliation review: the Layer 1 additions merge cleanly with the REST-codegen and edge directory changes.
 
@@ -536,41 +550,6 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
 
 ## More Information
 
-### Relationship to cluster `ServiceDiscoveryV1`
-
-**This ADR supersedes and absorbs the cluster gear's `ServiceDiscoveryV1`; the code removal is executed by the
-cluster gear's own decomposition as a separate, coordinated change, not by this ADR.** There is **one**
-service-discovery layer - the directory - not a directory layer plus a competing cluster layer. The prior
-concern that this ADR added a "second, weaker discovery layer next to a merged one" is resolved by
-*consolidation*: the cluster in-SDK discovery primitive
-(`gears/system/cluster/cluster-sdk/src/discovery/`, its default/standalone/Postgres backends, conformance
-suite, GTS specs, and wiring) will be **retired** by that decomposition work, after which the cluster gear
-keeps only its other three backend traits (cache, distributed lock, leader election). The dependency direction
-is therefore **not** inverted - cluster is not a shipped provider this ADR races; its discovery capability is
-the thing being consolidated here. The event-broker `domain/cluster.rs` `ServiceDiscoveryV1` handle and every
-cluster-side user are retired by that decomposition; until the directory replacement (Layer 1) lands the
-capability still exists in cluster, so there is **no functional gap** during the transition.
-
-Concept mapping (cluster -> directory):
-
-| Cluster `ServiceDiscoveryV1`                             | Directory (this ADR)                                             |
-|----------------------------------------------------------|------------------------------------------------------------------|
-| `ServiceRegistration.metadata: HashMap<String,String>`   | `labels` map on `InstanceInfo` / `ServiceInstanceInfo` (§2)      |
-| `DiscoveryFilter` (AND-conjoined `MetaMatch::{Equals,OneOf}`) | `resolve_by_labels` `LabelSelector` (equality-AND; `OneOf`/expressions are the deferred `matchExpressions`, §6) |
-| `InstanceState::{Enabled, Disabled}` (serving intent)    | readiness state on results (`Registered`/`Ready`/`Healthy`/`Quarantined`/`Draining`, §6) - `Draining` == cluster `Disabled` |
-| `StateFilter::{Enabled, Disabled, Any}` (server-side serving-state filter) | **caller-side** health filtering (§6) - `resolve_by_labels` returns the full set annotated with readiness state; there is no server-side `only_serving` flag |
-| `ServiceHandle::set_state` (runtime serving-intent flip / drain) | no dedicated intent-flip RPC; an instance signals `Draining` through **readiness** (ADR-0005), which name round-robin de-prefers (§6) - the deliberate "intent, not health" split (cluster ADR-008) is folded into the readiness axis |
-| `ServiceHandle::update_metadata` (runtime metadata mutation) | no dedicated update RPC; label changes ride **re-registration** (labels MUST survive re-registration, §2 / Implementation notes) |
-| `ServiceDiscoveryV1::scoped(prefix)` (name sub-namespacing) | not carried over - the directory uses flat, manifest-declared role-qualified names (§1); coordination-namespace scoping is a cluster-internal concern, not a directory primitive |
-| TTL heartbeat / lapse                                    | directory registration + heartbeat loop (§5) / readiness gating (ADR-0005) |
-| `ServiceDiscoveryBackend::watch` (topology stream)       | change-notification **follow-up owned here** (§7, Consequences) - poll `list_instances` / `resolve_by_labels` until it lands; **not** a cluster-scoped layer |
-
-**Boundary (why this is the directory's job, not a gear's):** the directory is a **toolkit-level** primitive
-that every gear (and the edge) already depends on; a gear cannot be the source of topology truth the toolkit
-resolves against without a dependency inversion (the toolkit cannot depend on a gear). Consolidating discovery
-here keeps a single source of truth **and** the correct layering; the cluster gear becomes a *consumer* of this
-layer for its coordinator's shard/leader targeting, like any other gear.
-
 ### Cross-references & required amendments
 
 **Sibling ADRs / PRD.** Some of these are true **amendments** (this ADR changes a shape they assert), not just
@@ -623,17 +602,17 @@ defines the `GatewayProvider` trait and [`cpt-cf-adr-edge-architecture`](0007-cp
 this ADR's edge story depends on: the `libs/toolkit-gateway` crate (`GatewayProvider`, `ProxyRegistry`,
 `ToolKitGatewayProvider`), the `api-gateway` embedded reverse-proxy with its directory-sync loop (poll ->
 reconcile -> register/prune), the `ListAllInstances` RPC and `InstanceInfo.openapi_spec` field, and the
-`.exposed()` / `x-toolkit-visibility` edge-visibility split. Those pieces are a **separate directory/edge work
-item, an ordering dependency not in the tree today** (enumerated in Consequences); if they are ultimately
-specified by amending ADR-0003 / ADR-0007 rather than a new ADR, those two move from *references* to
-*amendments*. This ADR is **additive on top of that edge** (`labels` ride on the `InstanceInfo` the edge
-extends; role exclusion is structural), so Layer 1 must merge **after** / reconcile with that edge
-implementation, extending its `ListAllInstances` mapper to carry `labels`.
+`.exposed()` / `x-toolkit-visibility` edge-visibility split. Those pieces have **landed in-tree** (see
+Consequences); if they are ultimately specified by amending ADR-0003 / ADR-0007 rather than a new ADR, those
+two move from *references* to *amendments*. This ADR is **additive on top of that edge** (`labels` ride on
+the `InstanceInfo` the edge extends; role exclusion is structural); Layer 1 merged after that edge
+implementation (#4540). Labels ride on `InstanceInfo` for the per-name paths (`list_instances` /
+`resolve_by_labels`); the `ListAllInstances` edge snapshot deliberately omits them (it routes by name - see
+Implementation notes), so its mapper is **not** extended to carry `labels`.
 
 ### Implementation notes
 
-For the implementing change (reconcile against the edge's directory rework - the separate edge/directory work
-item above, not the current ADR-0007):
+For the implementing change (reconcile against the landed edge directory rework - not the current ADR-0007):
 
 * **gRPC resolution is service-name-scoped, not gear-scoped.** `resolve_grpc_service` round-robins over every
   instance advertising a gRPC service *across all gears*, whereas `resolve_rest_service` is per-gear. Because
@@ -648,18 +627,29 @@ item above, not the current ADR-0007):
 * **Selector collision + missing service (decision).** `resolve_by_labels` returns the full set (§6) and the
   caller breaks ties. If a matched instance does not advertise the requested `service_name`, it is treated as
   no-endpoint (not an error), leaving the caller to fall back or pick another transport.
-* **Targeted resolve must not reuse RR's fallback-to-unhealthy.** The REST `pick_*` helpers fall back to
+* **Targeted resolve must not reuse RR's fallback-to-unhealthy.** The name-based `pick_*` helpers fall back to
   unhealthy instances when none are healthy; a targeted resolve must instead return matched-but-not-ready (§6).
-  The gRPC `pick_service_round_robin` does **not** currently fall back (returns `None`) - align it with the
-  REST helpers so name-based RR has one health contract across transports (§6).
+  Name-based RR shares one health contract across transports: both `pick_service_round_robin` (gRPC) and the
+  REST helpers prefer serving instances and fall back to the not-ready set (§6).
 * **New fields must survive re-registration.** `labels` must be threaded through the idempotent-refresh path
   (`RegisterInstanceInfo` -> `GearInstance` -> `GearManager::register_instance` / `with_metadata_of`), or a
   periodic self-heal re-register would silently drop them.
 * **Enumeration must include every instance, including REST-only roles (decision).** Today
   `LocalDirectoryClient::list_instances` skips instances with no gRPC service, dropping REST-only roles. Both it
-  and the edge's `ListAllInstances` MUST enumerate **all** instances regardless of transport and
-  preserve full metadata (`labels`, `rest_endpoint`, `openapi_spec`), so filtering and edge operate on complete
-  data.
+  and the edge's `ListAllInstances` MUST enumerate **all** instances regardless of transport - a REST-only
+  instance is projected from its `rest_endpoint`; only a genuinely endpoint-less instance is skipped. Metadata
+  is **scoped to what each path's consumer needs**, not blanket-preserved:
+  * **`list_instances(name)`** (and `resolve_by_labels`) carry per-name `labels` and `rest_endpoint` (their
+    consumers filter on labels), plus the `openapi_spec` **hash** - but **not the document**. Inlining the full
+    document here would let one multi-instance response carry N copies of a large spec (N shards of a gear), so
+    every such path is spec-free: the hash lets a consumer detect a spec change and fetch the document
+    out-of-band via `GetOpenApiSpec` (one spec, one message). This matches the `ListAllInstances` bounding
+    rule below rather than contradicting it.
+  * **`ListAllInstances`** (the broad cross-gear snapshot the edge polls) carries every instance and its
+    `rest_endpoint`, but **omits `labels`** (the edge routes by name, never by label) and inlines only the
+    `openapi_spec` **hash**, not the document: the edge detects a spec change from the hash and fetches the
+    document out-of-band via `GetOpenApiSpec`, keeping the polled payload bounded. Labels stay on the paths that
+    consume them (`list_instances` / `resolve_by_labels`), so this omission loses no capability.
 
 ## Traceability
 

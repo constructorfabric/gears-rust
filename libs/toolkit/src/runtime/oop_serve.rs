@@ -28,6 +28,7 @@
 //! gear routes. Self-registration and dependency resolution live in
 //! [`super::oop_registration`].
 
+use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +68,19 @@ const STARTING_RETRY_AFTER_SECONDS: u64 = 1;
 
 /// Configuration and collaborators for the `OoP` HTTP runtime, assembled by the
 /// bootstrap layer and consumed by `HostRuntime`'s `OoP` serving path.
+///
+/// `#[non_exhaustive]` so new fields (like `labels`) stay additive. Construct via
+/// [`OopServeOptions::new`] + the `with_*` builders rather than a struct literal,
+/// exactly as [`RunOptions`](super::RunOptions) is built: the five arguments to
+/// `new` are the fields with no meaningful default, and everything else defaults
+/// to the same values the bootstrap config layer uses. (A `Default` impl is still
+/// not provided — the `directory` collaborator is a required dependency.)
+///
+/// The builders are what keep [`run_oop_serving`](super::run_oop_serving)
+/// callable: it is `pub` and takes this type by value, so an out-of-crate caller
+/// — an integration test driving the real serve path, for instance — needs some
+/// way to build one.
+#[non_exhaustive]
 pub struct OopServeOptions {
     /// Logical gear name (used for registration + `OpenAPI` title).
     pub gear_name: String,
@@ -102,6 +116,97 @@ pub struct OopServeOptions {
     /// Platform-plane authenticator; when `Some`, `internal_auth_middleware` is
     /// installed on gear routes (runs before the tenant plane).
     pub internal_authenticator: Option<DynInternalAuthenticator>,
+    /// Stable addressing labels (k8s `matchLabels` style) advertised with this
+    /// instance's directory registration for label-based selection.
+    pub labels: BTreeMap<String, String>,
+}
+
+impl OopServeOptions {
+    /// Create `OopServeOptions` with the fields that have no meaningful default;
+    /// every optional field defaults to the bootstrap config layer's own default
+    /// (`drain_timeout` 30s, `heartbeat_interval` 5s, `healthcheck_timeout`
+    /// 500ms, no probe sidecar port, no authenticators, no labels). Layer the
+    /// rest on with the `with_*` builders.
+    #[must_use]
+    pub fn new(
+        gear_name: String,
+        instance_id: String,
+        advertise_uri: String,
+        listen_addr: std::net::SocketAddr,
+        directory: Arc<dyn DirectoryClient>,
+    ) -> Self {
+        Self {
+            gear_name,
+            instance_id,
+            version: None,
+            advertise_uri,
+            listen_addr,
+            probe_bind_addr: None,
+            drain_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(5),
+            healthcheck_timeout: Duration::from_millis(500),
+            directory,
+            bearer_authenticator: None,
+            internal_authenticator: None,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// Set the gear version (used for registration + `OpenAPI` version).
+    #[must_use]
+    pub fn with_version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Serve probes on a separate sidecar port *in addition to* the main listener.
+    #[must_use]
+    pub fn with_probe_bind_addr(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+        self.probe_bind_addr = addr;
+        self
+    }
+
+    /// Override how long in-flight requests may drain on shutdown.
+    #[must_use]
+    pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = timeout;
+        self
+    }
+
+    /// Override the `DirectoryService` heartbeat interval.
+    #[must_use]
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Override the per-check readiness healthcheck timeout.
+    #[must_use]
+    pub fn with_healthcheck_timeout(mut self, timeout: Duration) -> Self {
+        self.healthcheck_timeout = timeout;
+        self
+    }
+
+    /// Install the tenant-plane authenticator (`security_context_middleware`).
+    #[must_use]
+    pub fn with_bearer_authenticator(mut self, auth: Option<DynBearerAuthenticator>) -> Self {
+        self.bearer_authenticator = auth;
+        self
+    }
+
+    /// Install the platform-plane authenticator (`internal_auth_middleware`).
+    #[must_use]
+    pub fn with_internal_authenticator(mut self, auth: Option<DynInternalAuthenticator>) -> Self {
+        self.internal_authenticator = auth;
+        self
+    }
+
+    /// Advertise stable addressing labels for label-based selection.
+    #[must_use]
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
+    }
 }
 
 impl std::fmt::Debug for OopServeOptions {
@@ -121,6 +226,7 @@ impl std::fmt::Debug for OopServeOptions {
                 "internal_authenticator",
                 &self.internal_authenticator.is_some(),
             )
+            .field("labels", &self.labels)
             .finish_non_exhaustive()
     }
 }
@@ -632,14 +738,16 @@ impl OopHttpServer {
         // Single directory-presence task: registration + heartbeat + self-heal.
         // Dependency resolution is handled by the proxy-wiring phase (typed
         // `#[toolkit::consumes]` clients), which runs before serving.
-        let registration_info = RegisterInstanceInfo {
-            gear: self.options.gear_name.clone(),
-            instance_id: self.options.instance_id.clone(),
-            grpc_services: vec![],
-            version: self.options.version.clone(),
-            rest_endpoint: Some(ServiceEndpoint::new(self.options.advertise_uri.clone())),
-            openapi_spec: Some(openapi_arc.to_string()),
-        };
+        let mut registration_info = RegisterInstanceInfo::new(
+            self.options.gear_name.clone(),
+            self.options.instance_id.clone(),
+        )
+        .with_rest_endpoint(ServiceEndpoint::new(self.options.advertise_uri.clone()))
+        .with_openapi_spec(openapi_arc.to_string())
+        .with_labels(self.options.labels.clone());
+        if let Some(version) = self.options.version.clone() {
+            registration_info = registration_info.with_version(version);
+        }
         self.registration_task = Some(tokio::spawn(super::oop_registration::presence_loop(
             Arc::clone(&self.options.directory),
             registration_info,

@@ -2,26 +2,42 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::StorageBackendConfig;
+use gts::{GtsInstanceId, GtsTypeId};
+use toolkit_utils::iso8601_duration::Iso8601Duration;
+
+use crate::error::EventBrokerError;
 use crate::ids::ConsumerGroupId;
 
+/// A topic as the broker's API reports it.
+///
+/// A topic is an instance of the topic base type, so every field here is the
+/// instance's own data. How many partitions the broker gives the topic and which
+/// backend stores them are the broker's own configuration and are not reported
+/// here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topic {
-    pub id: String,
-    pub description: Option<String>,
-    pub partitions: u32,
-    pub retention: Option<String>,
-    pub streaming: Option<StorageBackendConfig>,
-    pub created_at: DateTime<Utc>,
+    pub id: GtsInstanceId,
+    /// Required on the topic instance, so always present on a projected topic.
+    pub description: String,
+    pub retention: Option<Iso8601Duration>,
 }
 
+/// An event type as the broker's API reports it.
+///
+/// Projected from the event type's resolved type schema. `data_schema` is the
+/// payload contract composed out of the schema's `data` narrowings, and
+/// `topic`, `allowed_subject_types` and `partition_key` are resolved traits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventType {
-    pub id: String,
-    pub topic: String,
+    pub id: GtsTypeId,
+    pub topic: GtsInstanceId,
     pub description: Option<String>,
+    pub allowed_subject_types: Vec<String>,
+    /// JSON Pointer into an event naming the member its partition is derived
+    /// from. Resolved from the type's trait, which the base defaults, so every
+    /// event type reports one.
+    pub partition_key: String,
     pub data_schema: serde_json::Value,
-    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,9 +66,12 @@ pub struct Subscription {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// One `(topic, partition)` pair a subscription owns. The topic is named rather
+/// than indexed, matching what the subscription's schema declares and what the
+/// `topology` and `control` frames carry, so an assignment is readable on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionAssignment {
-    pub topic_ix: u16,
+    pub topic: GtsInstanceId,
     pub partition: u32,
 }
 
@@ -157,7 +176,7 @@ pub enum ResetScope<'a> {
     Partition { topic: &'a str, partition: u32 },
 }
 
-/// The event envelope. Matches `event.v1.schema.json` in the design and is the
+/// The event envelope. Matches `gts.cf.core.events.event.v1~.schema.json` in the design and is the
 /// parameter/return type on the public [`EventBrokerApi`](crate::api::EventBrokerApi)
 /// (publish/storage side). Broker-stamped fields (`partition`, `sequence`,
 /// `sequence_time`, `offset`, `offset_time`) are `None` on publish payloads; the
@@ -171,12 +190,10 @@ pub enum ResetScope<'a> {
 pub struct Event {
     pub id: Uuid,
     pub type_id: String,
-    pub topic: String,
     pub tenant_id: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: String,
-    pub partition_key: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub trace_parent: Option<String>,
     pub data: Option<serde_json::Value>,
@@ -190,6 +207,60 @@ pub struct Event {
 
     // Publisher-only (writeOnly; stripped on read)
     pub meta: Option<ProducerMeta>,
+}
+
+impl Event {
+    /// Resolves an event type's partition-key JSON Pointer against this event,
+    /// yielding the value to hash for partition selection.
+    ///
+    /// A JSON string resolves to its contents; any other scalar to its JSON form,
+    /// so a numeric or boolean member is still hashable. The broker checks at
+    /// event-type registration that the pointer names a declared member, so a
+    /// pointer resolving to nothing here means the event omitted an optional one.
+    ///
+    /// # Errors
+    /// [`EventBrokerError::Internal`] when the pointer resolves to nothing, to
+    /// null, or to a container rather than a scalar.
+    pub fn partition_input(&self, pointer: &str) -> Result<String, EventBrokerError> {
+        let unusable = |detail: &str| {
+            EventBrokerError::Internal(format!("partition-key pointer `{pointer}` {detail}"))
+        };
+        match self
+            .addressable()
+            .pointer(pointer)
+            .ok_or_else(|| unusable("resolves to no member of the event"))?
+        {
+            serde_json::Value::String(text) => Ok(text.clone()),
+            serde_json::Value::Null => Err(unusable("resolves to null")),
+            value @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_)) => {
+                Ok(value.to_string())
+            }
+            _ => Err(unusable(
+                "resolves to an object or array, which has no stable hash input",
+            )),
+        }
+    }
+
+    /// The event as its base schema declares it.
+    ///
+    /// [`Event`] carries no serde derives, and a pointer addresses schema member
+    /// names rather than Rust field names, so the mapping lives here - one home
+    /// for it, shared by the producer computing a partition locally and by a
+    /// broker deriving one at ingest. Only publish-time members appear: a pointer
+    /// into a server-stamped one could never resolve on the way in.
+    fn addressable(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "type": self.type_id,
+            "tenant_id": self.tenant_id,
+            "source": self.source,
+            "subject": self.subject,
+            "subject_type": self.subject_type,
+            "occurred_at": self.occurred_at,
+            "trace_parent": self.trace_parent,
+            "data": self.data,
+        })
+    }
 }
 
 /// Publisher-only chain/idempotency metadata stamped onto an [`Event`] before

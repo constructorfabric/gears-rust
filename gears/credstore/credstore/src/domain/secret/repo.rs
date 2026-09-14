@@ -1,3 +1,8 @@
+//! Persistence port for secret metadata and lifecycle transitions.
+//!
+//! Repository operations accept explicit authorization scopes and preserve the
+//! provisioning, activation, optimistic update, and deprovisioning invariants.
+
 use async_trait::async_trait;
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
 use time::OffsetDateTime;
@@ -90,7 +95,7 @@ pub trait SecretRepo: Send + Sync {
 
     /// Find the row a write of `sharing` would target, by sharing-class identity
     /// (mirrors the partial unique indexes): `Private` → `(tenant, ref, owner)`,
-    /// `Tenant`/`Shared` → `(tenant, ref)` among non-private. Unlike [`find_own`]
+    /// `Tenant`/`Shared` → `(tenant, ref)` among non-private. Unlike [`Self::find_own`]
     /// this never crosses the private boundary, so a private write does not see a
     /// coexisting tenant/shared secret (and vice-versa) — they coexist per design.
     async fn find_for_write(

@@ -196,6 +196,7 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
+        labels: std::collections::BTreeMap::new(),
     };
 
     // 2. Drive the full OoP serving lifecycle on a background task.

@@ -24,7 +24,7 @@ fn problem_from_not_found_has_correct_fields() {
         gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
     );
     assert_eq!(problem.title, "Not Found");
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem.detail, "Resource not found");
     assert_eq!(problem.context["resource_type"], USER_RESOURCE);
     assert_eq!(problem.context["resource_name"], "user-123");
@@ -39,7 +39,7 @@ fn problem_from_error_reflects_http_status_override() {
         .with_override(Http::status_code(410))
         .create();
     let problem = Problem::from(err);
-    assert_eq!(problem.status, 410);
+    assert_eq!(problem.status, Some(410));
     assert_eq!(
         problem.problem_type,
         gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
@@ -537,7 +537,7 @@ fn try_from_unknown_problem_type_returns_error() {
     let problem = Problem {
         problem_type: FUTURE_PROBLEM_TYPE.to_owned(),
         title: "Future".to_owned(),
-        status: 599,
+        status: Some(599),
         detail: "Not in canonical taxonomy".to_owned(),
         instance: None,
         trace_id: None,
@@ -560,7 +560,7 @@ fn try_from_category_status_mismatch_returns_error() {
     let problem = Problem {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~").to_owned(),
         title: "Invalid Argument".to_owned(),
-        status: 500,
+        status: Some(500),
         detail: "bad request".to_owned(),
         instance: None,
         trace_id: None,
@@ -583,7 +583,7 @@ fn try_from_zero_status_returns_error() {
     let problem = Problem {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~").to_owned(),
         title: "Not Found".to_owned(),
-        status: 0,
+        status: Some(0),
         detail: "Resource not found".to_owned(),
         instance: None,
         trace_id: None,
@@ -603,7 +603,7 @@ fn try_from_out_of_range_status_returns_error() {
     let problem = Problem {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~").to_owned(),
         title: "Not Found".to_owned(),
-        status: 6000,
+        status: Some(6000),
         detail: "Resource not found".to_owned(),
         instance: None,
         trace_id: None,
@@ -623,7 +623,7 @@ fn try_from_unprefixed_problem_type_returns_error() {
     let problem = Problem {
         problem_type: "https://example.com/errors/foo".to_owned(),
         title: "Foo".to_owned(),
-        status: 500,
+        status: Some(500),
         detail: "non-gts URI".to_owned(),
         instance: None,
         trace_id: None,
@@ -646,7 +646,7 @@ fn try_from_malformed_context_returns_error() {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~")
             .to_owned(),
         title: "Resource Exhausted".to_owned(),
-        status: 429,
+        status: Some(429),
         detail: "Rate limit exceeded".to_owned(),
         instance: None,
         trace_id: None,

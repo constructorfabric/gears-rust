@@ -65,6 +65,11 @@ CREATE INDEX IF NOT EXISTS idx_addresses_tenant ON addresses(tenant_id);
                     "
                 }
                 sea_orm::DatabaseBackend::MySql => unreachable!("handled above"),
+                other => {
+                    return Err(DbErr::Custom(format!(
+                        "migration has no DDL for database backend {other:?}"
+                    )));
+                }
             };
 
             conn.execute_unprepared(sql).await?;
@@ -115,10 +120,20 @@ ALTER TABLE addresses DROP COLUMN IF EXISTS tenant_id;
                     sea_orm::DatabaseBackend::MySql | sea_orm::DatabaseBackend::Sqlite => {
                         unreachable!("handled above")
                     }
+                    other => {
+                        return Err(DbErr::Custom(format!(
+                            "migration has no DDL for database backend {other:?}"
+                        )));
+                    }
                 };
 
                 conn.execute_unprepared(sql).await?;
                 Ok(())
+            }
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
             }
         }
     }

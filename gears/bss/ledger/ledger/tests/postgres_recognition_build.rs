@@ -48,7 +48,6 @@ use bss_ledger_sdk::{AccountClass, Side};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -60,7 +59,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -138,7 +137,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -289,7 +288,7 @@ async fn schedule_count(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn deferred_invoice_materializes_schedule_in_one_txn() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -362,7 +361,7 @@ async fn deferred_invoice_materializes_schedule_in_one_txn() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn over_ceiling_derivation_rolls_back_the_whole_post() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -417,7 +416,7 @@ async fn over_ceiling_derivation_rolls_back_the_whole_post() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn duplicate_build_lands_on_existing_active_schedule() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -435,7 +434,7 @@ async fn duplicate_build_lands_on_existing_active_schedule() {
     assert!(!first.replayed);
     assert_eq!(schedule_count(&raw, &s, "INV-DUP").await, 1, "one schedule");
     let first_schedule_id: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT schedule_id FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='INV-DUP'",
             s.tenant
@@ -462,7 +461,7 @@ async fn duplicate_build_lands_on_existing_active_schedule() {
         "still exactly ONE schedule (no second schedule_id)"
     );
     let after_schedule_id: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT schedule_id FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='INV-DUP'",
             s.tenant
@@ -479,7 +478,7 @@ async fn duplicate_build_lands_on_existing_active_schedule() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn non_deferred_invoice_posts_with_no_schedule_or_cl_line() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -539,7 +538,7 @@ async fn non_deferred_invoice_posts_with_no_schedule_or_cl_line() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn list_schedules_filters_by_invoice_and_stream_and_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;

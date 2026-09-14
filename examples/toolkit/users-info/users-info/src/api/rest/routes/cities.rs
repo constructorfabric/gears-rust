@@ -72,6 +72,12 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .error_401(openapi)
         .error_403(openapi)
         .error_409(openapi)
+        // This handler's body is `extract::Json<T>`, which can additionally
+        // produce 413 (oversized body), 415 (wrong Content-Type), and 422
+        // (schema violation) beyond error_400's plain 400.
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -92,6 +98,9 @@ pub(super) fn register_city_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .error_500(openapi)
         .register(router, openapi);
 

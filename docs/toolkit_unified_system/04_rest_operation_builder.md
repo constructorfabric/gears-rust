@@ -253,6 +253,31 @@ pub async fn list_users(
 .error_500(openapi)
 ```
 
+### Response headers
+
+Declare response headers immediately after the response they belong to. Header
+types are restricted to the scalar variants supported by
+`ResponseHeaderType`, so an invalid or misspelled type cannot silently produce
+an incorrect contract.
+
+```rust
+use toolkit::api::{ResponseHeaderSpec, ResponseHeaderType};
+
+OperationBuilder::post("/jobs")
+    // ... auth, license, and handler ...
+    .json_response(StatusCode::ACCEPTED, "Job accepted")
+    .response_header(ResponseHeaderSpec::new(
+        "Location",
+        "URI of the accepted job",
+        ResponseHeaderType::String,
+    ))
+    .response_header(ResponseHeaderSpec::new(
+        "Retry-After",
+        "Delay in seconds before polling",
+        ResponseHeaderType::Integer,
+    ));
+```
+
 ### SSE schema
 
 ```rust
@@ -275,6 +300,7 @@ pub async fn list_users(
 - [ ] Add `.authenticated()` + `.require_license_features::<License>([])` for protected endpoints.
 - [ ] Add `.standard_errors(openapi)` or specific errors.
 - [ ] Use `.json_response_with_schema()` for typed responses.
+- [ ] Declare runtime response headers with `.response_header()`.
 - [ ] Use `Extension<Arc<Service>>` and attach once after all routes.
 - [ ] Use `Extension(ctx): Extension<SecurityContext>` to get `SecurityContext`.
 - [ ] Use `ApiResult<T>` and `?` for error propagation.

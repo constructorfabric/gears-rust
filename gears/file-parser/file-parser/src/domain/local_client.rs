@@ -1,19 +1,16 @@
 //! In-process implementation of `file_parser_sdk::FileParserClientV1`.
 //!
-//! Other gears (notably `scan-gateway`, so it can extract text from a raw
-//! attachment before running its detector fan-out — see
-//! `gears/scan-gateway/docs/DESIGN.md`) depend on `file-parser-sdk` and
-//! resolve this client from `ClientHub` instead of going over HTTP to
-//! `POST /file-parser/v1/upload`. This mirrors the in-process
-//! `ScanGatewayLocalClient` pattern used by `scan-gateway`
-//! (`gears/scan-gateway/scan-gateway/src/domain/local_client.rs`): the gear
-//! registers this client in `ClientHub` during `init()` (see `crate::gear`),
-//! and callers never see file-parser's own domain/infra types.
+//! Other gears depend on `file-parser-sdk` and resolve this client from
+//! `ClientHub` instead of going over HTTP to `POST /file-parser/v1/upload`.
+//! The gear registers this client in `ClientHub` during `init()` (see
+//! `crate::gear`), and callers never see file-parser's own domain/infra
+//! types.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use file_parser_sdk::{FileParserClientError, FileParserClientV1, ParseBytesRequest, ParsedText};
+use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
@@ -39,6 +36,7 @@ impl From<DomainError> for FileParserClientError {
 
 /// In-process implementation of [`FileParserClientV1`], registered in
 /// `ClientHub` by `FileParserGear::init`.
+#[domain_model]
 pub struct FileParserLocalClient {
     svc: Arc<FileParserService>,
 }
@@ -64,6 +62,7 @@ impl FileParserClientV1 for FileParserLocalClient {
                 req.filename.as_deref(),
                 req.content_type.as_deref(),
                 req.bytes,
+                req.detection,
             )
             .await
             .map_err(|e| {
@@ -83,6 +82,7 @@ mod tests {
     use std::path::PathBuf;
 
     use bytes::Bytes;
+    use file_parser_sdk::Detection;
     use uuid::Uuid;
 
     use super::*;
@@ -115,6 +115,7 @@ mod tests {
             filename: Some("notes.txt".to_owned()),
             content_type: None,
             bytes: Bytes::from_static(b"hello world"),
+            detection: Detection::Auto,
         };
 
         let result = client.parse_bytes(&ctx(), req).await;
@@ -134,6 +135,7 @@ mod tests {
             filename: Some("archive.zip".to_owned()),
             content_type: None,
             bytes: Bytes::from_static(b"not really a zip"),
+            detection: Detection::Auto,
         };
 
         let result = client.parse_bytes(&ctx(), req).await;

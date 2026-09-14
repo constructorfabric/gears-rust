@@ -5,7 +5,7 @@
 //! links onto the first; N concurrent posts form a single linear chain. The
 //! append-only trigger negatives (a re-seal, a business-column UPDATE, and a
 //! DELETE) are exercised with raw SQL against a posted-and-sealed entry.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -27,11 +27,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -44,7 +44,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// Hex string of a single-column, single-row SELECT (e.g. `encode(col,'hex')`),
 /// `None` when the row is absent or the value is NULL.
 async fn scalar_hex(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
@@ -60,7 +60,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 /// Count rows matching a bss-qualified predicate.
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -108,7 +108,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -176,7 +176,7 @@ fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec
         source_business_id: business_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -235,7 +235,7 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn seals_first_post_with_genesis_prev() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -323,7 +323,7 @@ async fn seals_first_post_with_genesis_prev() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn links_second_post_to_first() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -390,7 +390,7 @@ async fn links_second_post_to_first() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_posts_form_linear_chain() {
     const N: usize = 8;
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -525,7 +525,7 @@ async fn concurrent_posts_form_linear_chain() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn tip_rollback_orphaning_sealed_rows_freezes_tenant() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -548,7 +548,7 @@ async fn tip_rollback_orphaning_sealed_rows_freezes_tenant() {
 
     // Roll the visible tip back to entry1: entry2 is now a sealed row NEWER than
     // the tip — orphaned, never reached by the tip-to-genesis walk.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.chain_state SET last_entry_id='{e1_id}', last_period_id='{}' \
          WHERE tenant_id='{}'",
         f.period_id, f.tenant
@@ -589,7 +589,7 @@ async fn tip_rollback_orphaning_sealed_rows_freezes_tenant() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn verifier_freeze_writes_freeze_set_clear_audit_record() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -610,7 +610,7 @@ async fn verifier_freeze_writes_freeze_set_clear_audit_record() {
         .post(&ctx, &scope, e2, l2, None)
         .await
         .expect("post 2");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.chain_state SET last_entry_id='{e1_id}', last_period_id='{}' \
          WHERE tenant_id='{}'",
         f.period_id, f.tenant
@@ -655,7 +655,7 @@ async fn verifier_freeze_writes_freeze_set_clear_audit_record() {
 
 /// Collect a single text column over many rows into a `Vec<String>`.
 async fn fetch_hex_set(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
-    let rows = conn.query_all(pg(sql.to_owned())).await.unwrap();
+    let rows = conn.query_all_raw(pg(sql.to_owned())).await.unwrap();
     rows.into_iter()
         .map(|r| r.try_get_by_index::<String>(0).unwrap())
         .collect()
@@ -667,7 +667,7 @@ async fn fetch_hex_set(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn append_only_trigger_rejects_reseal_update_and_delete() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -685,7 +685,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
     // (a) Re-seal: a second from-non-NULL UPDATE of row_hash is rejected
     // (the row is already sealed).
     let reseal = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_journal_entry SET row_hash='\\x00' WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -697,7 +697,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
 
     // (b) Business-column UPDATE is rejected (only chain columns may change).
     let biz = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_journal_entry SET origin='X' WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -711,7 +711,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
 
     // (c) DELETE is rejected.
     let del = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "DELETE FROM bss.ledger_journal_entry WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -728,7 +728,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn frozen_scope_blocks_posting() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -737,7 +737,7 @@ async fn frozen_scope_blocks_posting() {
     let ctx = SecurityContext::anonymous();
 
     // The integrity verifier froze this tenant tenant-wide (period_id='ALL').
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.scope_freeze (tenant_id, scope, period_id, reason, set_by) \
          VALUES ('{}','tenant','ALL','test','Verifier')",
         f.tenant
@@ -757,7 +757,7 @@ async fn frozen_scope_blocks_posting() {
     );
 
     // Clearing the freeze lets the same tenant post again (refs already seeded).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.scope_freeze SET cleared_at = now(), cleared_by = 'Operator' \
          WHERE tenant_id = '{}' AND scope = 'tenant' AND period_id = 'ALL'",
         f.tenant
@@ -779,7 +779,7 @@ async fn frozen_scope_blocks_posting() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn verifier_passes_clean_chain() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -834,7 +834,7 @@ async fn verifier_passes_clean_chain() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn verifier_freezes_tampered_chain() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -859,19 +859,19 @@ async fn verifier_freezes_tampered_chain() {
     // forbids any post-seal UPDATE, so disable it for the tamper and re-enable
     // it after (a real attacker with direct DB access; the chain re-walk is what
     // catches it). `deadbeef` x8 = 64 hex chars = a 32-byte hash.
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry DISABLE TRIGGER trg_journal_entry_append_guard",
     ))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_journal_entry \
          SET row_hash = decode('deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef','hex') \
          WHERE entry_id = '{first_id}'"
     )))
     .await
     .unwrap();
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry ENABLE TRIGGER trg_journal_entry_append_guard",
     ))
     .await
@@ -929,7 +929,7 @@ async fn verifier_freezes_tampered_chain() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn journal_entry_column_set_is_pinned_for_trigger_drift() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

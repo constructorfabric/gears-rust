@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{Gear, GearCtx, RestApiCapability};
@@ -75,9 +75,9 @@ impl Gear for UsageCollectorModule {
         //    `cpt-cf-usage-collector-principle-pdp-centric-authorization`.
         // @cpt-dod:cpt-cf-usage-collector-dod-foundation-adr-pdp-centric-authorization:p2
         // @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-fail-closed:p2
-        let authz: Arc<dyn AuthZResolverClient> = ctx
+        let authz: Arc<dyn AuthZResolverApi> = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
+            .get::<dyn AuthZResolverApi>()
             .with_context(|| format!("{} requires an authz-resolver client", Self::MODULE_NAME))?;
         let enforcer = PolicyEnforcer::new(authz);
         info!(module = Self::MODULE_NAME, "authz-resolver wired");

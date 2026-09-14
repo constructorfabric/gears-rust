@@ -1,0 +1,7 @@
+[gear]
+name = "Tenant Resolver"
+description = "Abstraction layer for tenant relationship resolution in multi-tenant systems."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = false

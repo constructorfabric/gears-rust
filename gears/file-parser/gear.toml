@@ -1,0 +1,7 @@
+[gear]
+name = "File Parser"
+description = "Pluggable document parsing and content extraction for indexing and business workflows."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = false

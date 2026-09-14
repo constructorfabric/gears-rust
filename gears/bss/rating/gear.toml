@@ -1,0 +1,7 @@
+[gear]
+name = "Rating"
+description = "Deterministic usage rating engine converting metered consumption into auditable charges."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

@@ -18,11 +18,11 @@ use uuid::Uuid;
 use super::common::{publish_json, topic_fixture, wait_until};
 
 const TX_SINGLE_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.txsingle.v1";
-const TX_SINGLE_EVENT: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.txsingle.v1";
+const TX_SINGLE_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.txsingle.v1~";
 const TX_SINGLE_GROUP: &str =
     "gts.cf.core.events.consumer_group.v1~example.mock.showcase.txsingle.v1";
 const TX_BATCH_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.txbatch.v1";
-const TX_BATCH_EVENT: &str = "gts.cf.core.events.event_type.v1~example.mock.showcase.txbatch.v1";
+const TX_BATCH_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.txbatch.v1~";
 const TX_BATCH_GROUP: &str =
     "gts.cf.core.events.consumer_group.v1~example.mock.showcase.txbatch.v1";
 
@@ -69,6 +69,9 @@ mod dlq_row {
 
         fn resolve_property(_property: &str) -> Option<Self::Column> {
             None
+        }
+        fn scope_columns() -> Vec<Self::Column> {
+            Vec::new()
         }
     }
 }
@@ -149,13 +152,13 @@ async fn db_with_showcase_tables() -> (sea_orm::DatabaseConnection, toolkit_db::
     let dsn = format!("sqlite:file:evbk_showcase_db_tx_{seq}?mode=memory&cache=shared");
     let raw = Database::connect(&dsn).await.expect("raw sqlite connect");
     let backend = raw.get_database_backend();
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         backend,
         LOCAL_DB_OFFSET_STORE_MIGRATION_SQL.to_owned(),
     ))
     .await
     .expect("offset table");
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         backend,
         r#"
 CREATE TABLE IF NOT EXISTS showcase_dead_letters (
@@ -189,12 +192,11 @@ CREATE TABLE IF NOT EXISTS showcase_dead_letters (
 fn raw_event_for_dead_letter() -> event_broker_sdk::RawEvent {
     event_broker_sdk::RawEvent {
         id: Uuid::new_v4(),
-        type_id: "gts.cf.core.events.event_type.v1~example.showcase.db.dlq.v1".to_owned(),
+        type_id: "gts.cf.core.events.event.v1~example.showcase.db.dlq.v1~".to_owned(),
         topic: "gts.cf.core.events.topic.v1~example.showcase.db.dlq.v1".to_owned(),
         tenant_id: Uuid::nil(),
         subject: "db-dlq-1".to_owned(),
         subject_type: "test".to_owned(),
-        partition_key: Some("db-dlq-1".to_owned()),
         partition: 0,
         sequence: 42,
         offset: 42,
@@ -263,7 +265,6 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
     publish_json(
         &fixture.broker,
         &fixture.ctx,
-        TX_SINGLE_TOPIC,
         TX_SINGLE_EVENT,
         "tx-single-1",
         None,
@@ -314,7 +315,6 @@ async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset
         publish_json(
             &fixture.broker,
             &fixture.ctx,
-            TX_BATCH_TOPIC,
             TX_BATCH_EVENT,
             subject,
             Some(0),

@@ -1,0 +1,7 @@
+[gear]
+name = "Credentials Store"
+description = "Secure per-tenant secret storage with pluggable backends and hierarchical sharing."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

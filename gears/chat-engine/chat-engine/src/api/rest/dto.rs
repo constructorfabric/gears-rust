@@ -3,7 +3,7 @@
 //! These are the only types that derive `utoipa::ToSchema` — domain models
 //! in `domain/` and SDK models in `chat_engine_sdk::models` stay
 //! transport-agnostic. Each DTO carries the exact field names / optionality
-//! locked by `modules/chat-engine/api/http-protocol.json` and the SDK wire
+//! locked by the generated `gears/chat-engine/docs/openapi.json` and the SDK wire
 //! formats sealed in Phase 5.
 //!
 //! The streaming event DTOs ([`StreamingStartDto`], [`StreamingChunkDto`],
@@ -350,6 +350,13 @@ pub struct SendMessageRequestDto {
     pub parent_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<CapabilityValueDto>>,
+    /// Opaque per-turn client context (device, locale, active error state, …)
+    /// persisted on the user message row and echoed back on reads as the
+    /// message's `metadata`. Engine-reserved keys (`model_used`, `finish_reason`,
+    /// `temperature_used`, `usage`, `summarized_message_ids`) and payloads larger
+    /// than 8 KiB serialized are rejected with `400`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonValue>,
 }
 
 /// Body for `POST /chat-engine/v1/messages/{id}/recreate`.
@@ -603,7 +610,7 @@ pub struct StreamingErrorDto {
 
 /// Tagged-union of all streaming events. NDJSON serialization writes one
 /// `StreamingEventDto` per line. The discriminator field is `type` per
-/// the OpenAPI spec (`api/http-protocol.json`) — see
+/// the OpenAPI spec (`docs/openapi.json`) — see
 /// `StreamingStartEvent.type`, `StreamingChunkEvent.type`, …
 #[api_dto(request, response)]
 #[serde(tag = "type")]

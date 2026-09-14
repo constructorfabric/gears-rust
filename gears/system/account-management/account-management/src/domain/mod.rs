@@ -26,6 +26,7 @@ pub mod integrity_check;
 pub mod metadata;
 pub mod metrics;
 pub mod ports;
+pub mod service_account;
 pub mod system_actor;
 pub mod tenant;
 pub mod tenant_type;

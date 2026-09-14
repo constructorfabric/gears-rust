@@ -50,10 +50,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, PolicyEnforcer,
+    AuthZResolverApi, PolicyEnforcer,
     models::{Capability, EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_macros::domain_model;
+use toolkit_security::PlatformSecurityContext;
 
 /// Build a permit-with-subtree-clamp [`EvaluationResponse`] rooted at
 /// `root_tenant_id`. Centralises the production-shape predicate
@@ -92,11 +94,12 @@ fn permit_with_subtree(root_tenant_id: uuid::Uuid) -> EvaluationResponse {
 pub struct MockAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for MockAuthZResolver {
+impl AuthZResolverApi for MockAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         // Pluck the subject's tenant id out of the AuthZEN-spec
         // `subject.properties["tenant_id"]` slot the PEP builder
         // wrote. A missing / malformed slot is a test-wiring bug
@@ -127,7 +130,7 @@ impl AuthZResolverClient for MockAuthZResolver {
 /// service-level `#[tokio::test]` blocks.
 #[must_use]
 pub fn mock_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(MockAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
     // Mirror the production wiring in `gear.rs`: AM advertises
     // `TenantHierarchy` so the PDP returns the native
     // `InTenantSubtree` predicate. Without the capability the
@@ -155,11 +158,12 @@ pub struct ConstraintBearingAuthZResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for ConstraintBearingAuthZResolver {
+impl AuthZResolverApi for ConstraintBearingAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let _ = request;
         Ok(permit_with_subtree(self.root_tenant_id))
     }
@@ -172,7 +176,7 @@ impl AuthZResolverClient for ConstraintBearingAuthZResolver {
 /// rooted at `root_tenant_id`.
 #[must_use]
 pub fn constraint_bearing_enforcer(root_tenant_id: uuid::Uuid) -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> =
+    let authz: Arc<dyn AuthZResolverApi> =
         Arc::new(ConstraintBearingAuthZResolver { root_tenant_id });
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }
@@ -189,11 +193,12 @@ pub fn constraint_bearing_enforcer(root_tenant_id: uuid::Uuid) -> PolicyEnforcer
 pub struct DenyAllAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyAllAuthZResolver {
+impl AuthZResolverApi for DenyAllAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let _ = request;
         Ok(EvaluationResponse {
             decision: false,
@@ -209,7 +214,7 @@ impl AuthZResolverClient for DenyAllAuthZResolver {
 /// from caller-facing-method tests that pin the PEP-deny path.
 #[must_use]
 pub fn deny_all_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(DenyAllAuthZResolver);
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }
 
@@ -236,11 +241,12 @@ pub struct SchemaSelectiveAuthZResolver {
 }
 
 #[async_trait]
-impl AuthZResolverClient for SchemaSelectiveAuthZResolver {
+impl AuthZResolverApi for SchemaSelectiveAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let root_str = request
             .subject
             .properties
@@ -296,7 +302,7 @@ impl AuthZResolverClient for SchemaSelectiveAuthZResolver {
 /// denied. Drives the schema-deny silent-drop pin in `list_metadata`.
 #[must_use]
 pub fn schema_selective_enforcer(allowed_type_ids: Vec<String>) -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> =
+    let authz: Arc<dyn AuthZResolverApi> =
         Arc::new(SchemaSelectiveAuthZResolver { allowed_type_ids });
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }
@@ -313,11 +319,12 @@ pub fn schema_selective_enforcer(allowed_type_ids: Vec<String>) -> PolicyEnforce
 pub struct SchemaUnavailableAuthZResolver;
 
 #[async_trait]
-impl AuthZResolverClient for SchemaUnavailableAuthZResolver {
+impl AuthZResolverApi for SchemaUnavailableAuthZResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         // Outer gate (LIST + non-read actions) still permits so the
         // flow reaches the per-row recheck where the transport error
         // fires.
@@ -332,16 +339,18 @@ impl AuthZResolverClient for SchemaUnavailableAuthZResolver {
                 uuid::Uuid::parse_str(root_str).expect("SchemaUnavailableAuthZResolver: bad UUID");
             return Ok(permit_with_subtree(root));
         }
-        Err(AuthZResolverError::ServiceUnavailable(
-            "schema-unavailable test fake: simulated PDP transport failure on Metadata.read"
-                .to_owned(),
-        ))
+        Err(CanonicalError::service_unavailable()
+            .with_detail(
+                "schema-unavailable test fake: simulated PDP transport failure on Metadata.read"
+                    .to_owned(),
+            )
+            .create())
     }
 }
 
 /// Build a [`PolicyEnforcer`] backed by [`SchemaUnavailableAuthZResolver`].
 #[must_use]
 pub fn schema_unavailable_enforcer() -> PolicyEnforcer {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(SchemaUnavailableAuthZResolver);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(SchemaUnavailableAuthZResolver);
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }

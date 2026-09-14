@@ -18,7 +18,7 @@ The toolkit (`libs/`) is the low-level substrate every gear builds on.
 | `toolkit-db-macros` | Entity security-dimension derive | `#[derive(Scopable)]`, `#[secure(...)]` |
 | `toolkit-security` | Core security types | `SecurityContext`, `AccessScope`, `ScopableEntity` |
 | `toolkit-canonical-errors` | 16-category canonical errors + RFC-9457 rendering | `CanonicalError`, `Problem` |
-| `toolkit-auth` | AuthN/AuthZ integration types | `PolicyEnforcer`, `AuthZResolverClient` |
+| `toolkit-auth` | AuthN/AuthZ integration types | `PolicyEnforcer`, `AuthZResolverApi` |
 | `toolkit-http` | HTTP client with OpenTelemetry tracing | `HttpClient`, `.with_otel()` |
 | `toolkit-odata` | OData `$filter` / `$orderby` / `$select` + cursor pagination | `Page<T>`, OData extractors |
 | `toolkit-odata-macros` | OData-filterable DTO derive | `#[derive(ODataFilterable)]` |

@@ -26,7 +26,7 @@ use sea_orm::DbErr;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter};
 use toolkit_db::secure::{
-    DbTx, ScopeError, SecureDeleteExt, SecureInsertExt, SecureOnConflict, SecureUpdateExt,
+    DbTx, ScopeError, SecureDeleteExt, SecureInsertManyExt, SecureOnConflict, SecureUpdateExt,
     TxConfig, TxIsolationLevel,
 };
 use toolkit_security::AccessScope;

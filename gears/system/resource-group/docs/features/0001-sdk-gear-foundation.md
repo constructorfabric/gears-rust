@@ -216,7 +216,7 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 
 **Required behavior**:
 - Phase 1 (SystemCapability): register `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub. REST/gRPC endpoints NOT yet accepting traffic.
-- Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverClient` (available since AuthZ init in Phase 1).
+- Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverApi` (available since AuthZ init in Phase 1).
 - ClientHub registration: single `RgService` implementation registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`.
 - Query profile configuration loaded from gear config (`max_depth`, `max_width`).
 
@@ -490,7 +490,7 @@ Tests S1, S2, S8, S9 verify integration seams that unit tests (TC-DTO-*, TC-SDK-
 ### File Layout
 
 ```
-testing/e2e/gears/resource_group/
+testing/e2e/suites/resource_group/
 ├── conftest.py                          ← helpers, timeout config
 ├── test_authz_tenant_scoping.py         ← existing (9 tests) — keep as-is
 ├── test_mtls_auth.py                    ← (p2 — deferred, not implemented yet) 4 MTLS tests; do not run in current iteration

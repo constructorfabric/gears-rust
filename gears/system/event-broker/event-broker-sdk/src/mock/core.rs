@@ -5,17 +5,105 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
+use gts::{GtsInstanceId, GtsTypeId};
+
 use crate::api::{ProducerMode, SubscriptionInterest};
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::ConsumerGroupKind;
-use crate::models::Event;
+use crate::models::{Event, EventType, Topic};
 
 // --- Topic & event log --------------------------------------------------------
 
+/// A registered event type, held as the derived GTS type-schema document the
+/// registry would provision. Everything the broker needs - the topic binding,
+/// the allowed subject types, the payload contract - is read back out of it, so
+/// the mock cannot drift from the real governing metadata.
 #[derive(Debug, Clone)]
 pub(super) struct EventTypeReg {
-    pub data_schema: serde_json::Value,
-    pub allowed_subject_types: Vec<String>,
+    pub schema: serde_json::Value,
+}
+
+impl EventTypeReg {
+    /// The event-type DTO the introspection surface reports.
+    ///
+    /// Built from the stored document rather than by resolving it into a type
+    /// schema and projecting that: schema-to-DTO projection is broker-side
+    /// logic, and the mock wrote every value it needs here itself.
+    ///
+    /// # Panics
+    /// Panics if the stored document is missing a trait that
+    /// [`crate::gts::derived_event_type_schema`] always writes, which would be a
+    /// defect in this module.
+    pub(super) fn event_type(&self, type_id: &str) -> EventType {
+        let traits = self
+            .schema
+            .get("x-gts-traits")
+            .expect("a stored event-type schema fixes its governing traits");
+        let topic = traits
+            .get("topic")
+            .and_then(serde_json::Value::as_str)
+            .expect("a stored event-type schema fixes `topic` as a string trait");
+        let allowed_subject_types = traits
+            .get("allowed_subject_types")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        EventType {
+            id: GtsTypeId::new(type_id),
+            // Registration asserts both identifiers, so neither can fail here.
+            topic: GtsInstanceId::try_new(topic).expect("registration asserts the topic id"),
+            // The mock's registration surface carries no description.
+            description: None,
+            allowed_subject_types,
+            partition_key: traits
+                .get("partition_key")
+                .and_then(serde_json::Value::as_str)
+                .expect("a stored event-type schema fixes `partition_key` as a string trait")
+                .to_owned(),
+            data_schema: payload_contract(&self.schema),
+        }
+    }
+}
+
+/// The base event's `data` member: the branch every payload contract opens with,
+/// because a derived event type narrows the base rather than replacing it.
+///
+/// Read back from the broker's own declaration so the mock reports the same
+/// first branch a chain resolved through `types-registry` would.
+///
+/// # Panics
+/// Panics if the emitted base event schema is not JSON or declares no `data`
+/// member; either is a defect in [`crate::gts`].
+fn base_data_member() -> serde_json::Value {
+    let base: serde_json::Value =
+        serde_json::from_str(&crate::gts::EventV1::gts_schema_with_refs_as_string())
+            .expect("the emitted base event schema is valid JSON");
+    base.get("properties")
+        .and_then(|properties| properties.get("data"))
+        .cloned()
+        .expect("the base event schema declares a `data` member")
+}
+
+/// The payload contract of a stored derived event-type document: the base
+/// event's `data` member followed by the document's own narrowings of it, in
+/// ancestor-first order.
+fn payload_contract(schema: &serde_json::Value) -> serde_json::Value {
+    let mut branches = vec![base_data_member()];
+    if let Some(own) = schema.get("allOf").and_then(serde_json::Value::as_array) {
+        branches.extend(own.iter().filter_map(|branch| {
+            branch
+                .get("properties")
+                .and_then(|properties| properties.get("data"))
+                .cloned()
+        }));
+    }
+    serde_json::json!({ "allOf": branches })
 }
 
 /// Append-only event stored in the mock log.
@@ -24,8 +112,27 @@ pub struct StoredEvent {
     pub event: Event,
 }
 
+/// Assembles the topic instance document for `id`.
+///
+/// A topic is an instance of the topic base type, so the document carries the
+/// stream's own data and fixes no traits. `retention` is left absent, which the
+/// base reads as the broker's configured default. The description is synthesised
+/// because the base requires one and the mock's registration surface carries no
+/// value for it.
+pub(super) fn topic_instance(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "description": format!("Mock topic {id}"),
+    })
+}
+
+/// A registered topic, held as the instance document the registry would provision,
+/// together with the partition count the broker gives it and the mock's event log.
+/// The count sits beside the document rather than inside it, because a topic does
+/// not carry one.
 #[derive(Debug, Clone)]
 pub(super) struct TopicState {
+    pub document: serde_json::Value,
     pub partitions: u32,
     pub event_types: HashMap<String, EventTypeReg>, // type_id → reg
     pub log: HashMap<u32, Vec<StoredEvent>>,        // partition → events (offset == index)
@@ -33,12 +140,36 @@ pub(super) struct TopicState {
 }
 
 impl TopicState {
-    pub(super) fn new(partitions: u32) -> Self {
+    pub(super) fn new(id: &str, partitions: u32) -> Self {
         Self {
+            document: topic_instance(id),
             partitions,
             event_types: HashMap::new(),
             log: HashMap::new(),
             next_offset: HashMap::new(),
+        }
+    }
+
+    /// The topic DTO the introspection surface reports.
+    ///
+    /// Built from the stored document rather than by resolving and projecting it:
+    /// projection is broker-side logic, and the mock wrote every value it needs
+    /// here itself. `retention` is always absent, since the document fixes none.
+    ///
+    /// # Panics
+    /// Panics if the stored document carries no string `description`, which would
+    /// be a defect in this module.
+    pub(super) fn topic(&self, id: &str) -> Topic {
+        Topic {
+            // Registration asserts the identifier, so it cannot fail here.
+            id: GtsInstanceId::try_new(id).expect("registration asserts the topic id"),
+            description: self
+                .document
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .expect("a stored topic document carries a string `description`"),
+            retention: None,
         }
     }
 

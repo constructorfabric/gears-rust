@@ -2,7 +2,9 @@
 //! REST-layer concern (`api/rest/error.rs`), not decided here (#4346).
 
 use thiserror::Error;
+use toolkit::domain_model;
 
+#[domain_model]
 #[derive(Debug, Error)]
 pub enum DomainError {
     /// Client-supplied input failed validation (e.g.

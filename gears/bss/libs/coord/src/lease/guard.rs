@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, ExprTrait, QueryFilter};
 use toolkit_db::Db;
 use toolkit_db::secure::{DbTx, ScopeError, SecureUpdateExt, TxConfig};
 use toolkit_security::AccessScope;
@@ -240,7 +240,7 @@ impl LeaseGuard {
                         let fenced = coord_leases::Entity::update_many()
                             .col_expr(
                                 coord_leases::Column::LockedUntil,
-                                Expr::col(coord_leases::Column::LockedUntil).into(),
+                                Expr::col(coord_leases::Column::LockedUntil),
                             )
                             .filter(
                                 coord_leases::Column::Key

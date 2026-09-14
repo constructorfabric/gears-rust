@@ -398,7 +398,7 @@ mod tests {
     fn chat_not_found_uses_chat_resource_scope() {
         let id = Uuid::new_v4();
         let p: Problem = DomainError::ChatNotFound { id }.into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], CHAT_GTS);
         assert_eq!(p.context["resource_name"], id.to_string());
@@ -408,7 +408,7 @@ mod tests {
     fn message_not_found_uses_message_resource_scope() {
         let id = Uuid::new_v4();
         let p: Problem = DomainError::MessageNotFound { id }.into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], MESSAGE_GTS);
         assert_eq!(p.context["resource_name"], id.to_string());
@@ -423,7 +423,7 @@ mod tests {
             request_id,
         }
         .into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], TURN_GTS);
         assert_eq!(p.context["resource_name"], request_id.to_string());
@@ -437,7 +437,7 @@ mod tests {
             id,
         }
         .into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], ATTACHMENT_GTS);
         assert_eq!(p.context["resource_name"], id.to_string());
@@ -449,7 +449,7 @@ mod tests {
             model_id: "gpt-fake".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], MODEL_GTS);
         assert_eq!(p.context["resource_name"], "gpt-fake");
@@ -464,7 +464,7 @@ mod tests {
             mime: "application/x-msdownload".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         assert_eq!(p.context["resource_type"], ATTACHMENT_GTS);
         let v = p
@@ -480,7 +480,7 @@ mod tests {
     fn unsupported_media_now_maps_to_400() {
         // ⚠ wire change accepted in the migration plan: 415 → 400.
         let p: Problem = StreamError::UnsupportedMedia.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         let v = p
             .context
@@ -498,7 +498,7 @@ mod tests {
             message: "file exceeds 10MB".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
             .context
@@ -517,7 +517,7 @@ mod tests {
             sanitized_message: "provider failure".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
         assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
         assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(10));
     }
@@ -530,7 +530,7 @@ mod tests {
             available_tokens: 4000,
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
             .context
@@ -549,7 +549,7 @@ mod tests {
             max_input_tokens: 8000,
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
             .context
@@ -567,7 +567,7 @@ mod tests {
             message: "max 50 documents per chat".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 429);
+        assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
             .context
@@ -584,7 +584,7 @@ mod tests {
             message: "tenant storage quota reached".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 429);
+        assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
             .context
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn forbidden_carries_authz_denied_reason() {
         let p: Problem = DomainError::Forbidden.into_test_problem();
-        assert_eq!(p.status, 403);
+        assert_eq!(p.status, Some(403));
         assert_eq!(p.problem_type, PERMISSION_DENIED_TYPE);
         assert_eq!(p.context["reason"], "AUTHZ_DENIED");
     }
@@ -610,7 +610,7 @@ mod tests {
             message: "request is missing the required `content` field".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         // Format variant — no field_violations array, message surfaces in `format`.
         assert!(
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn web_search_calls_exceeded_emits_quota_violation() {
         let p: Problem = DomainError::WebSearchCallsExceeded.into_test_problem();
-        assert_eq!(p.status, 429);
+        assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
             .context
@@ -645,7 +645,7 @@ mod tests {
     fn invalid_reaction_target_emits_precondition_violation() {
         let id = Uuid::new_v4();
         let p: Problem = DomainError::InvalidReactionTarget { id }.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, FAILED_PRECONDITION_TYPE);
         let v = p
             .context
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn web_search_disabled_emits_precondition_violation() {
         let p: Problem = DomainError::WebSearchDisabled.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, FAILED_PRECONDITION_TYPE);
         let v = p
             .context
@@ -680,7 +680,7 @@ mod tests {
             message: "downstream timeout".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
         assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
         assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(5));
     }
@@ -691,7 +691,7 @@ mod tests {
             model: "gpt-fake".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         let v = p
             .context
@@ -709,7 +709,7 @@ mod tests {
             message: "alias already exists".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.context["resource_name"], "unique_violation");
     }
 
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn mutation_not_latest_turn_emits_aborted_with_reason() {
         let p: Problem = MutationError::NotLatestTurn.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.problem_type, ABORTED_TYPE);
         assert_eq!(p.context["reason"], "NOT_LATEST_TURN");
     }
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn mutation_generation_in_progress_emits_aborted_with_reason() {
         let p: Problem = MutationError::GenerationInProgress.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.problem_type, ABORTED_TYPE);
         assert_eq!(p.context["reason"], "GENERATION_IN_PROGRESS");
     }
@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn mutation_forbidden_emits_permission_denied_with_authz_reason() {
         let p: Problem = MutationError::Forbidden.into_test_problem();
-        assert_eq!(p.status, 403);
+        assert_eq!(p.status, Some(403));
         assert_eq!(p.problem_type, PERMISSION_DENIED_TYPE);
         assert_eq!(p.context["resource_type"], TURN_GTS);
         assert_eq!(p.context["reason"], "AUTHZ_DENIED");
@@ -749,7 +749,7 @@ mod tests {
             quota_scope: "tokens".into(),
         }
         .into_test_problem();
-        assert_eq!(p.status, 429);
+        assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
             .context
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn stream_too_many_images_emits_out_of_range_field_violation() {
         let p: Problem = StreamError::TooManyImages { count: 5, max: 3 }.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
             .context

@@ -858,7 +858,10 @@ impl ProxyHttp for PingoraProxy {
         // canonical error middleware does not reach it. Pre-populate
         // `instance` here so the wire body still carries the request URI.
         let problem: Problem = domain_error_to_problem(domain_err, &instance_for_problem);
-        let status = problem.status;
+        // `domain_error_to_problem` always populates `status` via
+        // `From<CanonicalError>`; 500 is a safe fallback that can't
+        // actually be reached.
+        let status = problem.status.unwrap_or(500);
         let body_bytes = Bytes::from(serde_json::to_vec(&problem).unwrap_or_default());
 
         if let Ok(mut resp) = ResponseHeader::build(status, Some(body_bytes.len())) {

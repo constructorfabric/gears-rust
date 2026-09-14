@@ -11,3 +11,8 @@ publish = false
 
 [dependencies]
 serde_json = { workspace = true }
+# `visit` on top of the workspace feature set: the pin checker walks the AST.
+syn = { workspace = true, features = ["visit"] }
+# `span-locations` is what makes `Span::start()` report a real line/column instead
+# of 0 — check-test-container-pins needs it to point at the offending call.
+proc-macro2 = { workspace = true, features = ["span-locations"] }

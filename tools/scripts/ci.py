@@ -1,4 +1,14 @@
 #!/usr/bin/env python
+"""Cross-platform Gears CI utility (fmt, clippy, test, security, fuzz, E2E).
+
+For E2E this is the *orchestration engine*: `e2e-local` / `e2e-docker` build (or
+reuse) the server binary, start it from a config file, wait for `/healthz`, run
+pytest against the live HTTP API, then tear the server down. Focused local runs
+are driven by `tools/scripts/run_e2e.py`, which calls this script's
+`e2e-local` subcommand for suites whose `launcher` is `e2e-launcher`.
+
+See `testing/e2e/README.md` ("How E2E Is Executed") for the full picture.
+"""
 import argparse
 import os
 import shutil
@@ -260,19 +270,27 @@ def wait_for_health(
 
 def check_pytest():
     step("Checking pytest")
-    # First try "python -m pytest"
     result = run_cmd_allow_fail([PYTHON, "-m", "pytest", "--version"])
-    if result.returncode == 0:
-        return
-    # Then try "pytest" directly
-    result = run_cmd_allow_fail(["pytest", "--version"])
-    if result.returncode == 0:
-        return
-    print(
-        "ERROR: pytest is not installed. Install with: "
-        "pip install -r testing/e2e/requirements.txt"
-    )
-    sys.exit(1)
+    if result.returncode != 0:
+        print(
+            "ERROR: pytest is not installed in the active Python environment. Install with: "
+            f"{PYTHON} -m pip install -r testing/e2e/requirements.txt"
+        )
+        sys.exit(1)
+
+    required_modules = ["cryptography"]
+    missing = []
+    for module in required_modules:
+        result = run_cmd_allow_fail([PYTHON, "-c", f"import {module}"])
+        if result.returncode != 0:
+            missing.append(module)
+    if missing:
+        print(
+            "ERROR: missing E2E Python dependencies: "
+            f"{', '.join(missing)}. Install with: "
+            f"{PYTHON} -m pip install -r testing/e2e/requirements.txt"
+        )
+        sys.exit(1)
 
 
 def kill_existing_server(port):
@@ -362,50 +380,44 @@ def cmd_e2e(args):
         server_process = None
         print("Starting cf-gears-server for local E2E...")
 
-        # Build only the release binary required for local execution.
-        # Invoke cargo directly (mirrors the Makefile `cargo-build` target)
-        # instead of shelling out to `make`, which is unavailable on Windows
-        # where this script is the documented entry point.
-        step("Building release binary for local E2E")
-        build_cmd = [
-            "cargo",
-            "build",
-            "--release",
-            "--bin",
-            "cf-gears-example-server",
-        ]
-        e2e_features = read_e2e_features(Path(PROJECT_ROOT))
-        if e2e_features:
-            build_cmd.extend(["--features", e2e_features])
-        run_cmd(build_cmd)
+        env_e2e_binary = os.environ.get("E2E_SERVER_BINARY") or os.environ.get("E2E_BINARY")
+        env_fs_sidecar_binary = os.environ.get("FS_SIDECAR_BINARY")
+        release_sidecar_bin = None
 
-        # Also build the file-storage sidecar binary (no feature flags needed —
-        # it is a standalone binary in the cf-gears-file-storage package).
-        step("Building release sidecar binary for local E2E")
-        run_cmd([
-            "cargo",
-            "build",
-            "--release",
-            "-p",
-            "cf-gears-file-storage",
-            "--bin",
-            "sidecar",
-        ])
+        if env_e2e_binary:
+            release_bin = env_e2e_binary
+            if not os.path.isfile(release_bin):
+                print(f"\nERROR: E2E server binary does not exist: {release_bin}")
+                sys.exit(1)
+        else:
+            step("Building release binary for local E2E")
+            build_cmd = [
+                "cargo",
+                "build",
+                "--release",
+                "--bin",
+                "cf-gears-example-server",
+            ]
+            e2e_features = read_e2e_features(Path(PROJECT_ROOT))
+            if e2e_features:
+                build_cmd.extend(["--features", e2e_features])
+            run_cmd(build_cmd)
 
-        # Use the release binary produced by the cargo build above
-        release_bin = str(find_binary(
-            Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
-        ))
+            release_bin = str(find_binary(
+                Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
+            ))
 
-        if not os.path.isfile(release_bin):
-            print(f"\nERROR: Release binary not found at: {release_bin}")
-            print("Build it first with:")
-            print("  make cargo-build")
-            sys.exit(1)
+            if not os.path.isfile(release_bin):
+                print(f"\nERROR: Release binary not found at: {release_bin}")
+                print("Build it first with:")
+                print("  make cargo-build")
+                sys.exit(1)
 
-        release_sidecar_bin = str(find_binary(
-            Path(PROJECT_ROOT) / "target", "release", "sidecar"
-        ))
+        if env_fs_sidecar_binary:
+            release_sidecar_bin = env_fs_sidecar_binary
+            if not os.path.isfile(release_sidecar_bin):
+                print(f"\nERROR: FS_SIDECAR_BINARY does not exist: {release_sidecar_bin}")
+                sys.exit(1)
 
         # Create logs directory if it doesn't exist
         logs_dir = os.path.join(PROJECT_ROOT, "testing", "e2e", "logs")
@@ -475,16 +487,6 @@ def cmd_e2e(args):
     env = os.environ.copy()
     env["E2E_BASE_URL"] = base_url
 
-    # Export the release server + sidecar paths so the orchestrator-based
-    # lifecycle suite (testing/e2e/gears/file_storage/lifecycle/) can start
-    # its own private server+sidecar pair.
-    #
-    # NOTE: we deliberately use DEDICATED vars (FS_E2E_BINARY / FS_SIDECAR_BINARY)
-    # rather than the shared E2E_BINARY.  Other gears (e.g. mini-chat) gate their
-    # own suites on E2E_BINARY and expect a scoped invocation (make e2e-mini-chat);
-    # setting E2E_BINARY here would un-skip them under generic e2e-local and they
-    # would fail/time-out without their bespoke fixtures.  The lifecycle conftest
-    # reads FS_E2E_BINARY for the server and FS_SIDECAR_BINARY for the sidecar.
     if release_bin is not None:
         env.setdefault("FS_E2E_BINARY", release_bin)
     if release_sidecar_bin is not None:

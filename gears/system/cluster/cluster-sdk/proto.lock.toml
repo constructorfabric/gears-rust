@@ -1,0 +1,209 @@
+version = 1
+
+[messages.AwaitChangeRequest.fields]
+election_id = 1
+profile = 2
+
+[messages.CacheDescriptor.fields]
+consistency = 1
+features = 2
+provider = 3
+
+[messages.CadRequest.fields]
+expected_value = 1
+key = 2
+profile = 3
+
+[messages.CadResponse.fields]
+deleted = 1
+
+[messages.CasRequest.fields]
+expected_version = 1
+key = 2
+new_value = 3
+profile = 4
+ttl_ms = 5
+
+[messages.CasResponse.fields]
+entry = 1
+
+[messages.ContainsRequest.fields]
+key = 1
+profile = 2
+
+[messages.ContainsResponse.fields]
+present = 1
+
+[messages.DeleteRequest.fields]
+key = 1
+profile = 2
+
+[messages.DeleteResponse.fields]
+existed = 1
+
+[messages.DescribeProfilesRequest.fields]
+profiles = 1
+
+[messages.DescribeProfilesResponse.fields]
+generation = 1
+profiles = 2
+
+[messages.GetRequest.fields]
+key = 1
+profile = 2
+
+[messages.GetResponse.fields]
+entry = 1
+
+[messages.JoinRequest.fields]
+client_request_id = 1
+max_missed_renewals = 2
+name = 3
+profile = 4
+ttl_ms = 5
+
+[messages.LeaderElectionDescriptor.fields]
+features = 1
+provider = 2
+
+[messages.LeaderJoined.fields]
+election_id = 1
+initial_status = 2
+token = 3
+
+[messages.LeaseRef.fields]
+client_request_id = 1
+profile = 2
+token = 3
+ttl_ms = 4
+
+[messages.LeaseToken.fields]
+fence = 1
+name = 2
+owner = 3
+
+[messages.LockAcquired.fields]
+token = 1
+
+[messages.LockDescriptor.fields]
+features = 1
+provider = 2
+
+[messages.LockRequest.fields]
+client_request_id = 1
+name = 2
+profile = 3
+timeout_ms = 4
+ttl_ms = 5
+
+[messages.ProfileDescriptor.fields]
+cache = 1
+health = 2
+leader_election = 3
+lock = 4
+name = 5
+
+[messages.PutIfAbsentResponse.fields]
+created = 1
+
+[messages.PutRequest.fields]
+client_request_id = 1
+key = 2
+profile = 3
+ttl_ms = 4
+value = 5
+
+[messages.PutResponse.fields]
+generation = 1
+
+[messages.ReleaseResponse.fields]
+generation = 1
+
+[messages.RenewResponse.fields]
+generation = 1
+
+[messages.ResignResponse.fields]
+generation = 1
+
+[messages.ScanRequest.fields]
+page_size = 1
+page_token = 2
+prefix = 3
+profile = 4
+
+[messages.ScanResponse.fields]
+keys = 1
+next_page_token = 2
+
+[messages.TryLockRequest.fields]
+client_request_id = 1
+name = 2
+profile = 3
+ttl_ms = 4
+
+[messages.WatchPrefixRequest.fields]
+prefix = 1
+profile = 2
+
+[messages.WatchRequest.fields]
+key = 1
+profile = 2
+
+[messages.WireCacheEntry.fields]
+expires_at_ms = 1
+value = 2
+version = 3
+
+[messages.WireCacheFeatures.fields]
+prefix_watch = 1
+
+[messages.WireCacheWatchEvent.fields]
+dropped = 1
+error = 2
+key = 3
+kind = 4
+
+[messages.WireError.fields]
+data = 1
+detail = 2
+error_code = 3
+error_domain = 4
+
+[messages.WireLeaderElectionFeatures.fields]
+linearizable = 1
+
+[messages.WireLeaderWatchEvent.fields]
+dropped = 1
+error = 2
+kind = 3
+status = 4
+
+[messages.WireLockFeatures.fields]
+linearizable = 1
+
+[enums.CacheWatchEventKind.variants]
+changed = 1
+closed = 6
+deleted = 2
+expired = 3
+lagged = 4
+reset = 5
+
+[enums.LeaderWatchEventKind.variants]
+closed = 4
+lagged = 2
+reset = 3
+status = 1
+
+[enums.ProfileHealth.variants]
+degraded = 2
+serving = 1
+
+[enums.WireCacheConsistency.variants]
+eventually_consistent = 2
+linearizable = 1
+
+[enums.WireLeaderStatus.variants]
+follower = 2
+leader = 1
+lost = 3

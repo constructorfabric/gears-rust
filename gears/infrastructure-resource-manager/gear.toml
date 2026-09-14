@@ -1,0 +1,7 @@
+[gear]
+name = "Infrastructure Resource Manager"
+description = "Unified resource orchestration with declarative deployments, diff engine, and adapter framework."
+category = "oss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

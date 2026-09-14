@@ -9,6 +9,7 @@
 //! `infra::sdk_error_mapping_tests` pin the full `CanonicalError`
 //! envelope (category, status, resource type, context tokens).
 
+use crate::domain::error::UnsupportedResource;
 use std::time::Duration;
 use toolkit_gts::gts_id;
 
@@ -178,7 +179,10 @@ fn service_unavailable_maps_to_503() {
 #[test]
 fn unsupported_operation_maps_to_501() {
     assert_eq!(
-        status_of(DomainError::UnsupportedOperation { detail: "x".into() }),
+        status_of(DomainError::UnsupportedOperation {
+            detail: "x".into(),
+            resource: UnsupportedResource::Tenant,
+        }),
         501
     );
 }
@@ -310,8 +314,11 @@ impl DomainError {
             Self::RootTenantCannotConvert => "root_tenant_cannot_convert",
             Self::RootTenantCannotChangeStatus => "root_tenant_cannot_change_status",
             Self::IdpInvalidInput { .. } => "idp_invalid_input",
+            Self::ServiceAccountInvalidInput { .. } => "service_account_invalid_input",
+            Self::ServiceAccountAmbiguous { .. } => "service_account_ambiguous",
             Self::NotFound { .. } => "not_found",
             Self::UserNotFound { .. } => "user_not_found",
+            Self::ServiceAccountNotFound { .. } => "service_account_not_found",
             Self::ConversionRequestNotFound { .. } => "conversion_request_not_found",
             Self::MetadataEntryNotFound { .. } => "metadata_entry_not_found",
             Self::MetadataVersionMismatch { .. } => "metadata_version_mismatch",
@@ -370,14 +377,17 @@ impl DomainError {
             | Self::Conflict { .. }
             | Self::IdpPasswordPolicy { .. }
             | Self::IdpFieldNotWritable { .. }
+            | Self::ServiceAccountInvalidInput { .. }
             | Self::FeatureDisabled { .. } => 400,
             Self::NotFound { .. }
             | Self::UserNotFound { .. }
             | Self::ConversionRequestNotFound { .. }
+            | Self::ServiceAccountNotFound { .. }
             | Self::MetadataEntryNotFound { .. } => 404,
             Self::AlreadyExists { .. }
             | Self::UserAlreadyExists { .. }
             | Self::Aborted { .. }
+            | Self::ServiceAccountAmbiguous { .. }
             | Self::MetadataVersionMismatch { .. } => 409,
             Self::CrossTenantDenied { .. } => 403,
             Self::ServiceUnavailable { .. } | Self::IdpUnavailable { .. } => 503,

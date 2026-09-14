@@ -1,0 +1,58 @@
+family     = "per-unit"
+id         = "untiered-included-allowance"
+kind       = "evaluation"
+provenance = ["inst-ac-band", "D-43", "D-45", "PRD §17.2"]
+
+# The untiered half of `inst-ac-band`, and the reason the rule has two arms: a
+# `per_unit` row has no band set to offset, so the allowance **synthesizes** one
+# - `[0, N) @ $0` and `[N, open) @ rate`. The row stops being a multiplication
+# and becomes a ladder, which is why the supersession guard's
+# `presented modelKind` clause exists: introducing or dropping an allowance on
+# such a row changes what prices the continued counter, under its own label.
+#
+# `usage` rather than `recurring` here, unlike this family's sibling: an
+# allowance on a non-usage row fails publish (`ALLOWANCE_ON_NON_USAGE`), so a
+# recurring row carrying one is not a row the catalog would publish and
+# `corpus_snapshot_shape.rs` would say so.
+#
+# It also carries `tierAggregationWindow`, which a bare `per_unit` row does not
+# need and this one does - the compile makes it tiered, and it is the allowance
+# counter that would otherwise never reset. Authored short first; the shape gate
+# refused it with exactly that sentence, which is the gate earning its keep on a
+# case written by someone who had just read the rule.
+#
+# The two readings agree everywhere on a flat rate - `(Q - N) × rate` is the
+# same number either way - which is precisely why this case cannot stand in for
+# the graduated one, and why both exist. What it does pin is the boundary: the
+# allowance is half-open, so `q = N` bills nothing and `q = N + 1` bills one
+# unit.
+
+[snapshot]
+model_kind              = "per_unit"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+amount_minor            = 250
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+included_allowance      = { quantity = 20, rollover_policy = "none" }
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 0 }
+why    = "no usage bills nothing, allowance or not"
+
+[[assert]]
+given  = { q = 20 }
+expect = { charge_minor = 0 }
+why    = "exactly at the allowance: [0,20) is half-open, so the twentieth unit is the last free one and the paid band opens at 20 with nothing in it yet"
+
+[[assert]]
+given  = { q = 21 }
+expect = { charge_minor = 250 }
+why    = "the first billable unit at the row's rate"
+
+[[assert]]
+given  = { q = 120 }
+expect = { charge_minor = 25000 }
+why    = "100 billable units at 250 — the free 20 are deducted from what the paid band sees, not from the rate"

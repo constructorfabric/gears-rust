@@ -1,0 +1,53 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked producer example: one concrete event type. It narrows the base event's `data` member to its own payload contract, and fixes its trait values. Nothing here is a field a publisher sends - the traits govern how the broker treats events of this type, and GTS forbids trait keywords in an instance.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+    "allowed_subject_types": [
+      "gts.fabrikam.shop.orders.order.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~",
+          "$comment": "Pins the identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "order_id",
+            "total_cents",
+            "currency"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "total_cents": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$"
+            },
+            "coupon_code": {
+              "type": "string",
+              "maxLength": 64
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -5,47 +5,44 @@ use toolkit_canonical_errors::resource_error;
 
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 
-#[resource_error(gts_id!("cf.core.event_broker.producer_options.v1~"))]
+#[resource_error(gts_id!("cf.core.events.producer_options.v1~"))]
 struct ProducerOptionsResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.consumer_options.v1~"))]
+#[resource_error(gts_id!("cf.core.events.consumer_options.v1~"))]
 struct ConsumerOptionsResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.event_type.v1~"))]
-struct EventTypeResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.topic.v1~"))]
+#[resource_error(gts_id!("cf.core.events.topic.v1~"))]
 struct TopicResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.consumer_group.v1~"))]
+#[resource_error(gts_id!("cf.core.events.consumer_group.v1~"))]
 struct ConsumerGroupResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.subscription.v1~"))]
+#[resource_error(gts_id!("cf.core.events.subscription.v1~"))]
 struct SubscriptionResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.producer.v1~"))]
+#[resource_error(gts_id!("cf.core.events.producer.v1~"))]
 struct ProducerResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.partition.v1~"))]
+#[resource_error(gts_id!("cf.core.events.partition.v1~"))]
 struct PartitionResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.event.v1~"))]
+#[resource_error(gts_id!("cf.core.events.event.v1~"))]
 struct EventResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.stream.v1~"))]
+#[resource_error(gts_id!("cf.core.events.stream.v1~"))]
 struct StreamResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.storage.v1~"))]
+#[resource_error(gts_id!("cf.core.events.storage.v1~"))]
 struct StorageResourceError;
-#[resource_error(gts_id!("cf.core.event_broker.offset.v1~"))]
+#[resource_error(gts_id!("cf.core.events.offset.v1~"))]
 struct OffsetResourceError;
 
 pub mod resources {
     use toolkit_gts::gts_id;
 
-    pub const PRODUCER_OPTIONS: &str = gts_id!("cf.core.event_broker.producer_options.v1~");
-    pub const CONSUMER_OPTIONS: &str = gts_id!("cf.core.event_broker.consumer_options.v1~");
-    pub const EVENT_TYPE: &str = gts_id!("cf.core.event_broker.event_type.v1~");
-    pub const TOPIC: &str = gts_id!("cf.core.event_broker.topic.v1~");
-    pub const CONSUMER_GROUP: &str = gts_id!("cf.core.event_broker.consumer_group.v1~");
-    pub const SUBSCRIPTION: &str = gts_id!("cf.core.event_broker.subscription.v1~");
-    pub const PRODUCER: &str = gts_id!("cf.core.event_broker.producer.v1~");
-    pub const PARTITION: &str = gts_id!("cf.core.event_broker.partition.v1~");
-    pub const EVENT: &str = gts_id!("cf.core.event_broker.event.v1~");
-    pub const STREAM: &str = gts_id!("cf.core.event_broker.stream.v1~");
-    pub const STORAGE: &str = gts_id!("cf.core.event_broker.storage.v1~");
-    pub const OFFSET: &str = gts_id!("cf.core.event_broker.offset.v1~");
-    pub const TRANSPORT: &str = gts_id!("cf.core.event_broker.transport.v1~");
+    pub const PRODUCER_OPTIONS: &str = gts_id!("cf.core.events.producer_options.v1~");
+    pub const CONSUMER_OPTIONS: &str = gts_id!("cf.core.events.consumer_options.v1~");
+    pub const TOPIC: &str = gts_id!("cf.core.events.topic.v1~");
+    pub const CONSUMER_GROUP: &str = gts_id!("cf.core.events.consumer_group.v1~");
+    pub const SUBSCRIPTION: &str = gts_id!("cf.core.events.subscription.v1~");
+    pub const PRODUCER: &str = gts_id!("cf.core.events.producer.v1~");
+    pub const PARTITION: &str = gts_id!("cf.core.events.partition.v1~");
+    pub const EVENT: &str = gts_id!("cf.core.events.event.v1~");
+    pub const STREAM: &str = gts_id!("cf.core.events.stream.v1~");
+    pub const STORAGE: &str = gts_id!("cf.core.events.storage.v1~");
+    pub const OFFSET: &str = gts_id!("cf.core.events.offset.v1~");
+    pub const TRANSPORT: &str = gts_id!("cf.core.events.transport.v1~");
 }
 
 pub mod reasons {
@@ -279,13 +276,16 @@ impl From<EventBrokerError> for CanonicalError {
             }
             EventBrokerError::EventTypeNotDeclared {
                 type_id, detail, ..
-            } => EventTypeResourceError::invalid_argument()
+            } => EventResourceError::invalid_argument()
                 .with_resource(type_id)
                 .with_field_violation("event_type", detail, reasons::EVENT_TYPE_NOT_DECLARED)
                 .create(),
+            // The only arm carrying no reason: a 404 whose `resource` names the
+            // unresolvable type already says everything a caller can act on, and
+            // no other arm reports not-found on this resource.
             EventBrokerError::EventTypeUnknown {
                 type_id, detail, ..
-            } => EventTypeResourceError::not_found(detail)
+            } => EventResourceError::not_found(detail)
                 .with_resource(type_id)
                 .create(),
             EventBrokerError::TypeNotInDeclaredTopic {
@@ -293,7 +293,7 @@ impl From<EventBrokerError> for CanonicalError {
                 expected_topic,
                 detail,
                 ..
-            } => EventTypeResourceError::failed_precondition()
+            } => EventResourceError::failed_precondition()
                 .with_resource(type_id.clone())
                 .with_precondition_violation(
                     type_id,
@@ -303,7 +303,7 @@ impl From<EventBrokerError> for CanonicalError {
                 .create(),
             EventBrokerError::SchemaNotPrepared {
                 type_id, detail, ..
-            } => EventTypeResourceError::failed_precondition()
+            } => EventResourceError::failed_precondition()
                 .with_resource(type_id.clone())
                 .with_precondition_violation(type_id, detail, reasons::SCHEMA_NOT_PREPARED)
                 .create(),
@@ -323,7 +323,7 @@ impl From<EventBrokerError> for CanonicalError {
                 } else {
                     format!("{detail}: {}", errors.join("; "))
                 };
-                EventTypeResourceError::invalid_argument()
+                EventResourceError::invalid_argument()
                     .with_resource(type_id)
                     .with_field_violation("data", description, reasons::EVENT_DATA_INVALID)
                     .create()

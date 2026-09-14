@@ -144,6 +144,7 @@ fn dto_create_group_no_id_maps_to_none() {
         type_path: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
         name: "X".to_owned(),
         parent_id: None,
+        tenant_id: None,
         metadata: None,
     };
     let req: CreateGroupRequest = dto.into();

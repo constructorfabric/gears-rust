@@ -17,7 +17,7 @@
 //! `row_hash` / `prev_hash` / `created_seq`, so a hand-seeded chain exercises it
 //! exactly and keeps the test fast and deterministic.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -37,7 +37,6 @@ use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -48,7 +47,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -93,12 +92,12 @@ async fn insert_entry(
     let entry_id = Uuid::now_v7();
     let actor = Uuid::now_v7();
     let correlation = Uuid::now_v7();
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry DISABLE TRIGGER trg_journal_entry_balanced",
     ))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
            (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
             source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -110,7 +109,7 @@ async fn insert_entry(
     )))
     .await
     .unwrap();
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry ENABLE TRIGGER trg_journal_entry_balanced",
     ))
     .await
@@ -126,7 +125,7 @@ fn bytea(hash: &[u8]) -> String {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkpoint_derives_count_and_rejects_noncontiguous() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -208,7 +207,7 @@ async fn checkpoint_derives_count_and_rejects_noncontiguous() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn detach_gate_requires_sealed_and_checkpoint_covered() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;

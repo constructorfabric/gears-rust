@@ -299,7 +299,11 @@ async fn test_rest_register_handler_integration() {
         })],
     };
 
-    let result = register_entities(Extension(service), Json(request)).await;
+    let result = register_entities(
+        Extension(service),
+        toolkit::api::rest::extract::Json(request),
+    )
+    .await;
     assert!(result.is_ok());
 
     let (status, Json(response)) = result.unwrap();
@@ -320,7 +324,11 @@ async fn test_rest_register_empty_request() {
 
     let request = RegisterEntitiesRequest { entities: vec![] };
 
-    let result = register_entities(Extension(service), Json(request)).await;
+    let result = register_entities(
+        Extension(service),
+        toolkit::api::rest::extract::Json(request),
+    )
+    .await;
     assert!(result.is_ok());
 
     let (status, Json(response)) = result.unwrap();
@@ -346,7 +354,11 @@ async fn test_rest_register_with_invalid_entities() {
         ],
     };
 
-    let result = register_entities(Extension(service), Json(request)).await;
+    let result = register_entities(
+        Extension(service),
+        toolkit::api::rest::extract::Json(request),
+    )
+    .await;
     assert!(result.is_ok());
 
     let (status, Json(response)) = result.unwrap();

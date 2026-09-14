@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
                 "
             }
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         };
 
         conn.execute_unprepared(sql).await?;

@@ -28,6 +28,14 @@ pub mod aborted {
     /// Storage serializable-transaction retry budget was exhausted; the
     /// operation may succeed on a fresh retry.
     pub const SERIALIZATION_CONFLICT: &str = "SERIALIZATION_CONFLICT";
+
+    /// A service-account call ended with the `IdP` outcome uncertain —
+    /// the provider may have retained state. Unlike
+    /// [`SERIALIZATION_CONFLICT`] this is **not** a retry-the-same
+    /// signal: the caller reconciles by listing the tenant's accounts
+    /// and matching the name it submitted, then either rotates that
+    /// entry's secret or revokes it and provisions again.
+    pub const AMBIGUOUS_OUTCOME: &str = "AMBIGUOUS_OUTCOME";
 }
 
 /// Wire `reason` values for [`CanonicalError::PermissionDenied`]

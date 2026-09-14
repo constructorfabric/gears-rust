@@ -9,7 +9,7 @@ The `cf-gears-authz-resolver` gear provides:
 - **Plugin discovery** — Finds AuthZ plugins via GTS types-registry
 - **Vendor-based selection** — Selects plugin by vendor and priority
 - **Policy evaluation routing** — Delegates AuthZEN-based evaluation requests to the active PDP plugin
-- **ClientHub integration** — Registers `AuthZResolverClient` for inter-gear use
+- **ClientHub integration** — Registers `AuthZResolverApi` for inter-gear use
 
 This is a **main gear** — it contains no authorization logic itself. All operations are delegated to the active plugin (e.g., `cf-gears-static-authz-plugin` for development, or a custom implementation).
 
@@ -22,7 +22,7 @@ Consumer Gear (PEP)
 PolicyEnforcer  (SDK helper — builds request, compiles response)
     │
     ▼
-AuthZResolverClient  (SDK trait, registered in ClientHub)
+AuthZResolverApi  (SDK trait, registered in ClientHub)
     │
     ▼
 authz-resolver gateway  (this crate — discovers & routes)
@@ -39,6 +39,7 @@ Plugin implementation  (PDP — evaluates policies, returns constraints)
 Services act as Policy Enforcement Points (PEPs) using the `PolicyEnforcer` from the SDK:
 
 ```rust
+use authz_resolver_sdk::AuthZResolverApi;
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use toolkit_security::pep_properties;
 
@@ -47,7 +48,7 @@ const USER: ResourceType = ResourceType {
     supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 };
 
-let authz = hub.get::<dyn AuthZResolverClient>()?;
+let authz = hub.get::<dyn AuthZResolverApi>()?;
 let enforcer = PolicyEnforcer::new(authz.clone());
 
 // Get access scope for a CRUD operation

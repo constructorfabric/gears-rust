@@ -201,6 +201,37 @@ impl RequestBuilder {
         self
     }
 
+    /// Attach a platform-plane internal `token` as a **sensitive**
+    /// `X-ToolKit-Internal-Token` header.
+    ///
+    /// Carried raw (no `Bearer`) and **never** on `Authorization`, to avoid
+    /// colliding with the tenant-plane JWT (`cpt-cf-adr-two-plane-auth`). The
+    /// value is marked sensitive so logging/redaction layers never emit it —
+    /// prefer this over `.header(..)`, which cannot. Takes a
+    /// [`secrecy::SecretString`] and exposes it only here at the transport
+    /// boundary, so callers never hold a bare `&str` of the token.
+    pub fn internal_token_auth(mut self, token: &secrecy::SecretString) -> Self {
+        use secrecy::ExposeSecret as _;
+        if self.error.is_some() {
+            return self;
+        }
+        match http::header::HeaderValue::try_from(token.expose_secret()) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                self.headers.push((
+                    http::header::HeaderName::from_static(
+                        toolkit_security::constants::INTERNAL_TOKEN_HEADER,
+                    ),
+                    value,
+                ));
+            }
+            Err(e) => {
+                self.error = Some(HttpError::InvalidHeaderValue(e));
+            }
+        }
+        self
+    }
+
     /// Add multiple headers to the request
     ///
     /// # Example
@@ -495,6 +526,7 @@ impl RequestBuilder {
 #[cfg(test)]
 mod tests {
     use crate::HttpClient;
+    use crate::error::HttpError;
 
     #[tokio::test]
     async fn bearer_auth_sets_sensitive_authorization_header() {
@@ -514,6 +546,67 @@ mod tests {
         assert!(
             value.is_sensitive(),
             "bearer Authorization header must be marked sensitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_token_auth_sets_sensitive_dedicated_header() {
+        let client = HttpClient::new().expect("default toolkit-http build");
+        let builder = client
+            .get("https://example.invalid/x")
+            .internal_token_auth(&secrecy::SecretString::from("sa.jwt.token".to_owned()));
+
+        assert!(builder.error.is_none(), "valid token must not set an error");
+
+        let header_name = http::header::HeaderName::from_static(
+            toolkit_security::constants::INTERNAL_TOKEN_HEADER,
+        );
+        let value = builder
+            .headers
+            .iter()
+            .find(|(name, _)| *name == header_name)
+            .map(|(_, value)| value)
+            .expect("internal-token header present");
+
+        assert_eq!(
+            value.to_str().unwrap(),
+            "sa.jwt.token",
+            "internal token is carried raw (no Bearer scheme)"
+        );
+        assert!(
+            value.is_sensitive(),
+            "internal-token header must be marked sensitive so logging layers never emit it"
+        );
+        // It must NEVER ride Authorization.
+        assert!(
+            !builder
+                .headers
+                .iter()
+                .any(|(name, _)| *name == http::header::AUTHORIZATION),
+            "internal token must not collide with the tenant-plane Authorization header"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_token_auth_records_error_and_does_not_add_header_for_invalid_value() {
+        let client = HttpClient::new().expect("default toolkit-http build");
+        // A newline is not a valid header value; the builder must record an
+        // error (so `.send()` fails) rather than sending the request
+        // unauthenticated.
+        let builder = client
+            .get("https://example.invalid/x")
+            .internal_token_auth(&secrecy::SecretString::from("bad\ntoken".to_owned()));
+
+        assert!(
+            matches!(builder.error, Some(HttpError::InvalidHeaderValue(_))),
+            "a malformed internal token must record InvalidHeaderValue"
+        );
+        let header_name = http::header::HeaderName::from_static(
+            toolkit_security::constants::INTERNAL_TOKEN_HEADER,
+        );
+        assert!(
+            !builder.headers.iter().any(|(name, _)| *name == header_name),
+            "no header must be added when the token is invalid"
         );
     }
 }

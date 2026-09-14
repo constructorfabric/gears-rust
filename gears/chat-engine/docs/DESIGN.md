@@ -777,7 +777,7 @@ Turns the authenticated `SecurityContext` into query-level authorization. It is 
 
 ##### Responsibility scope
 
-Owns construction of the `PolicyEnforcer` (built once in module init from `ctx.client_hub().get::<dyn AuthZResolverClient>()`, Arc-cloned into each domain service), the per-resource `ResourceType` descriptors and action constants (§3.5.3), the PDP call surface (`access_scope` / `access_scope_with`), constraint→`AccessScope` compilation, and `EnforcerError`→`ChatEngineError` fail-closed mapping (§3.5.5). Also owns the `internal_write_scope()` wrapper and the bypass registry (§3.5.7).
+Owns construction of the `PolicyEnforcer` (built once in module init from `ctx.client_hub().get::<dyn AuthZResolverApi>()`, Arc-cloned into each domain service), the per-resource `ResourceType` descriptors and action constants (§3.5.3), the PDP call surface (`access_scope` / `access_scope_with`), constraint→`AccessScope` compilation, and `EnforcerError`→`ChatEngineError` fail-closed mapping (§3.5.5). Also owns the `internal_write_scope()` wrapper and the bypass registry (§3.5.7).
 
 ##### Responsibility boundaries
 
@@ -792,13 +792,13 @@ Does not decide policy (that is the AuthZ Resolver PDP), does not authenticate (
 
 ### 3.3 API Contracts
 
-See [`api/README.md`](api/README.md) for comprehensive protocol documentation.
+See [`WEBHOOK-PROTOCOL.md`](WEBHOOK-PROTOCOL.md) for the webhook protocol documentation.
 
 #### 3.3.1 HTTP REST API (Client ↔ Chat Engine)
 
-**Specification**: [`api/http-protocol.json`](api/http-protocol.json) (OpenAPI 3.0.3)
+**Specification**: [`docs/openapi.json`](openapi.json) (OpenAPI 3.1, generated from the live routes by `make openapi-chat-engine`)
 
-**Base URL**: `https://chat-engine/api/v1`
+**Base URL**: `{host}{prefix}/chat-engine/v1` (`{prefix}` = the gateway's `prefix_path`)
 
 **Authentication**: JWT Bearer token in Authorization header
 
@@ -836,7 +836,7 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-interface-pep`
 
-**Interface**: `PolicyEnforcer` over `dyn AuthZResolverClient` (`authz-resolver-sdk`, `toolkit-security`). Consumed in-process; the `SecurityContext` is propagated on every call.
+**Interface**: `PolicyEnforcer` over `dyn AuthZResolverApi` (`authz-resolver-sdk`, `toolkit-security`). Consumed in-process; the `SecurityContext` is propagated on every call.
 
 **Call surface** (contract-level, not code):
 - `access_scope(ctx, resource_type, action, resource_id) -> Result<AccessScope, EnforcerError>` — constraints required (LIST and similar).
@@ -857,7 +857,7 @@ Chat Engine depends on the following internal gears at runtime.
 |-------------------|----------------|---------|
 | Plugin Registry | Internal registry | Resolve `ChatEngineBackendPlugin` implementations by `plugin_instance_id` at startup and on session type configuration |
 | Backend Plugin gears | `dyn ChatEngineBackendPlugin` (chat-engine-sdk) | Internal trait implementations that process messages, provide capabilities, and generate summaries |
-| AuthZ Resolver (`authz-resolver`) | `dyn AuthZResolverClient` via `PolicyEnforcer` (authz-resolver-sdk) | PDP for authorization decisions + query constraints; resolved from `ClientHub` at init, declared as `deps = ["authz-resolver"]` (`cpt-cf-chat-engine-component-policy-enforcer`) |
+| AuthZ Resolver (`authz-resolver`) | `dyn AuthZResolverApi` via `PolicyEnforcer` (authz-resolver-sdk) | PDP for authorization decisions + query constraints; resolved from `ClientHub` at init, declared as `deps = ["authz-resolver"]` (`cpt-cf-chat-engine-component-policy-enforcer`) |
 
 #### 3.3.5 External Dependencies
 
@@ -1666,9 +1666,16 @@ Chat Engine authorization is a **full PEP (Policy Enforcement Point)** built on 
 Authorization scopes along the two orthogonal platform dimensions:
 
 - **`owner_tenant_id`** (mandatory isolation key) — the tenant that owns a resource. The PEP MUST always enforce a tenant predicate; it is the hard cross-tenant isolation boundary and is never optional.
-- **`owner_id`** (optional per-subject scoping) — the **session owner user** (the subject who created the session). Enables "my sessions" scoping when the PDP policy chooses to apply it. `owner_id` refers to a subject within `owner_tenant_id`.
+- **`owner_id`** (mandatory per-subject scoping for sessions) — the **session owner user** (the subject who created the session), a subject within `owner_tenant_id`. The platform authz model treats per-subject scoping as optional, but `cpt-cf-chat-engine-nfr-authentication` does not: session access is restricted to the owning user, so Chat Engine enforces the owner half itself rather than depending on the PDP policy to apply it (see "Gear-enforced ownership invariant" below).
 
 Chat Engine scoped resources are `session`, `message`, and `reaction`; each carries the **owner pair** `(owner_tenant_id, owner_id)` on its own row so `SecureConn` compiles predicates against columns local to the row (no joins, no service-side gating).
+
+**Gear-enforced ownership invariant.** No shipped policy plugin constrains `owner_id`: `static-authz` and `tr-authz` both emit `owner_tenant_id` predicates only, so a compiled scope typically isolates tenants and nothing finer. Relying on the PDP alone therefore lets any authenticated subject reach a same-tenant stranger's session, which `cpt-cf-chat-engine-nfr-authentication` forbids. Every authenticated session point-op consequently runs `owner_guard::ensure_session_owner(ctx, &prefetch)` on the trusted prefetch **before** the PDP decision: the caller's `(subject_tenant_id, subject_id)` must equal the row's owner pair, and a mismatch fails closed as `NotFound` (anti-enumeration, consistent with §3.5.4). The PDP decision still runs and may only **narrow** access further — it can never widen it, including when it returns an unconstrained allow. Share-token reads are unaffected: they enter through the unauthenticated `.public()` route (`ExportService::access_shared`), where the token itself is the grant and no `SecurityContext` exists to check.
+
+The same invariant covers the two operation shapes that do not anchor on a prefetched session:
+
+- **Message row-scoped ops** (`resolve_owned_message`, `resolve_owned_message_for_delete`, `list_active_messages`, `delete_message_cascade`) hand an `AccessScope` straight to the repository, so the clamp must travel *with the scope* — post-filtering a page would corrupt paging. `owner_guard::caller_scope(ctx, &scope)` narrows the PDP scope before the query: `owner_id` via the platform's `AccessScope::ensure_owner` (injected where the PDP left it open, intersected where the PDP set it — a grant over someone else's rows drops the constraint and can become deny-all), and `owner_tenant_id` injected only into constraints that carry no tenant predicate of their own, so a PDP subtree or multi-tenant grant is preserved. These call sites use `access_scope` (`require_constraints = true`), so an allow carrying no constraints already fails closed before any row is touched.
+- **Reactions** are a trust-parent table: `message_reactions` is `#[secure(unrestricted)]` with no owner columns (`cpt-cf-chat-engine-dbtable-authz-owner-columns` excludes it), so nothing is scoped at the SQL layer and the parent session is the whole authorization boundary. Both `set_reaction` (SESSION `update`) and `list_reactions` (SESSION `get`) therefore authorize that parent through the guarded prefetch. `list_for_messages` keeps its documented contract — callers pass only ids returned by an already-authorized message read.
 
 **Owner pair vs. author.** The owner pair identifies the *session owner*, not the message author. `messages.user_id` (the authoring subject) and `message_reactions.user_id` (the reacting subject) remain **separate** columns and are not authorization keys — they support attribution, not access control. In multi-user and shared sessions the author/reactor may differ from the session owner (`cpt-cf-chat-engine-fr-share-session`).
 
@@ -1684,7 +1691,7 @@ Chat Engine scoped resources are `session`, `message`, and `reaction`; each carr
 
 ### 3.5.2 PEP wiring
 
-`deps = ["authz-resolver"]` is declared on the `#[toolkit::gear]` attribute. During module initialization Chat Engine resolves `dyn AuthZResolverClient` from `ctx.client_hub()` and constructs a **single** `PolicyEnforcer`; it is Arc-cloned into every domain service as an `enforcer` field (mirrors the `users-info` reference gear — `cpt-cf-chat-engine-component-policy-enforcer`). No service constructs `AccessScope` manually in production; every scoped operation obtains its scope from the enforcer.
+`deps = ["authz-resolver"]` is declared on the `#[toolkit::gear]` attribute. During module initialization Chat Engine resolves `dyn AuthZResolverApi` from `ctx.client_hub()` and constructs a **single** `PolicyEnforcer`; it is Arc-cloned into every domain service as an `enforcer` field (mirrors the `users-info` reference gear — `cpt-cf-chat-engine-component-policy-enforcer`). No service constructs `AccessScope` manually in production; every scoped operation obtains its scope from the enforcer.
 
 ### 3.5.3 Public PEP call surface (per resource)
 

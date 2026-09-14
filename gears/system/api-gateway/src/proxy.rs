@@ -442,14 +442,11 @@ mod tests {
 
     async fn register(dir: &dyn DirectoryClient, gear: &str, uri: &str, spec: String) -> String {
         let instance_id = uuid::Uuid::new_v4().to_string();
-        dir.register_instance(RegisterInstanceInfo {
-            gear: gear.to_owned(),
-            instance_id: instance_id.clone(),
-            grpc_services: vec![],
-            version: None,
-            rest_endpoint: Some(ServiceEndpoint::new(uri)),
-            openapi_spec: Some(spec),
-        })
+        dir.register_instance(
+            RegisterInstanceInfo::new(gear, instance_id.clone())
+                .with_rest_endpoint(ServiceEndpoint::new(uri))
+                .with_openapi_spec(spec),
+        )
         .await
         .unwrap();
         instance_id
@@ -519,14 +516,11 @@ mod tests {
         // The same instance re-publishes a changed document: /add removed,
         // /sub added. Because each poll re-fetches and fully rebuilds, the next
         // sync reflects the new document exactly (not a stale union of both).
-        dir.register_instance(RegisterInstanceInfo {
-            gear: "calc".to_owned(),
-            instance_id: id.clone(),
-            grpc_services: vec![],
-            version: None,
-            rest_endpoint: Some(ServiceEndpoint::new("http://calc:8080")),
-            openapi_spec: Some(public_spec("calc", "/calc/v1/sub")),
-        })
+        dir.register_instance(
+            RegisterInstanceInfo::new("calc", id.clone())
+                .with_rest_endpoint(ServiceEndpoint::new("http://calc:8080"))
+                .with_openapi_spec(public_spec("calc", "/calc/v1/sub")),
+        )
         .await
         .unwrap();
 
@@ -579,17 +573,13 @@ mod tests {
         let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
 
         // gRPC-only gear: no REST endpoint / spec -> not proxied.
-        dir.register_instance(RegisterInstanceInfo {
-            gear: "worker".to_owned(),
-            instance_id: uuid::Uuid::new_v4().to_string(),
-            grpc_services: vec![(
-                "worker.Svc".to_owned(),
-                ServiceEndpoint::new("http://worker:7000"),
-            )],
-            version: None,
-            rest_endpoint: None,
-            openapi_spec: None,
-        })
+        dir.register_instance(
+            RegisterInstanceInfo::new("worker", uuid::Uuid::new_v4().to_string())
+                .with_grpc_services(vec![(
+                    "worker.Svc".to_owned(),
+                    ServiceEndpoint::new("http://worker:7000"),
+                )]),
+        )
         .await
         .unwrap();
 
@@ -608,14 +598,10 @@ mod tests {
         // The gear advertises a REST endpoint but never published an OpenAPI
         // document. Since the slim discovery snapshot carries no spec, the edge
         // tries to fetch it via `get_openapi_spec`, which fails -> not proxied.
-        dir.register_instance(RegisterInstanceInfo {
-            gear: "specless".to_owned(),
-            instance_id: uuid::Uuid::new_v4().to_string(),
-            grpc_services: vec![],
-            version: None,
-            rest_endpoint: Some(ServiceEndpoint::new("http://specless:8080")),
-            openapi_spec: None,
-        })
+        dir.register_instance(
+            RegisterInstanceInfo::new("specless", uuid::Uuid::new_v4().to_string())
+                .with_rest_endpoint(ServiceEndpoint::new("http://specless:8080")),
+        )
         .await
         .unwrap();
 
@@ -642,9 +628,10 @@ mod tests {
         )
         .await;
 
-        // Precondition: the snapshot is spec-less.
+        // Precondition: the snapshot is spec-less — it carries only the hash,
+        // never the inlined document.
         let snapshot = dir.list_all_instances().await.unwrap();
-        assert!(snapshot.iter().all(|i| i.openapi_spec.is_none()));
+        assert!(snapshot.iter().all(|i| i.openapi_spec_hash.is_some()));
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
@@ -887,14 +874,11 @@ mod tests {
         assert_eq!(applies.load(Ordering::SeqCst), 1);
 
         // Re-publish a changed document for the same instance.
-        dir.register_instance(RegisterInstanceInfo {
-            gear: "calc".to_owned(),
-            instance_id: id,
-            grpc_services: vec![],
-            version: None,
-            rest_endpoint: Some(ServiceEndpoint::new("http://calc:8080")),
-            openapi_spec: Some(public_spec("calc", "/calc/v1/sub")),
-        })
+        dir.register_instance(
+            RegisterInstanceInfo::new("calc", id)
+                .with_rest_endpoint(ServiceEndpoint::new("http://calc:8080"))
+                .with_openapi_spec(public_spec("calc", "/calc/v1/sub")),
+        )
         .await
         .unwrap();
 
@@ -949,16 +933,10 @@ mod tests {
     }
 
     fn instance_with_hash(gear: &str, uri: &str, hash: Option<&str>) -> ServiceInstanceInfo {
-        ServiceInstanceInfo {
-            gear: gear.to_owned(),
-            instance_id: "inst-1".to_owned(),
-            endpoint: ServiceEndpoint::new(uri),
-            version: None,
-            rest_endpoint: Some(ServiceEndpoint::new(uri)),
-            openapi_spec: None,
-            openapi_spec_hash: hash.map(ToOwned::to_owned),
-            grpc_services: Vec::new(),
-        }
+        ServiceInstanceInfo::new(gear, "inst-1")
+            .with_endpoint(Some(ServiceEndpoint::new(uri)))
+            .with_rest_endpoint(Some(ServiceEndpoint::new(uri)))
+            .with_openapi_spec_hash(hash.map(ToOwned::to_owned))
     }
 
     #[test]

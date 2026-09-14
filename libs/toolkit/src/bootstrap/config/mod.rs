@@ -165,6 +165,13 @@ pub struct OopHttpConfig {
     /// unspecified host (`0.0.0.0`) rewritten to `127.0.0.1`.
     #[serde(default)]
     pub advertise_uri: Option<String>,
+    /// Allow a loopback / unspecified `advertise_uri` (`127.0.0.1`, `::1`,
+    /// `localhost`, `0.0.0.0`, `[::]`). Off by default: such an endpoint is
+    /// registered-but-unreachable in multi-host Profile 2 / Profile 3, so
+    /// bootstrap fails fast (`cpt-cf-adr-instance-addressable-discovery`).
+    /// Set `true` only for single-host / local-dev.
+    #[serde(default)]
+    pub allow_loopback_advertise: bool,
     /// Platform-plane (`InternalAuthenticator`) configuration. When present it
     /// drives both the *inbound* HTTP validator on the gear's own routes and
     /// the *outbound* credential attached to the gear's `DirectoryService`
@@ -173,6 +180,19 @@ pub struct OopHttpConfig {
     /// feature.
     #[serde(default)]
     pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
+    /// Stable addressing labels (k8s `matchLabels` style) advertised with this
+    /// instance's directory registration, for label-based instance selection
+    /// (`DirectoryClient::resolve_by_labels`).
+    ///
+    /// Sourced from config (`oop_http.labels.<key>`) or the environment
+    /// (`APP__OOP_HTTP__LABELS__<KEY>`). A bare-numeric env *value* (e.g. a
+    /// `StatefulSet` ordinal injected as `APP__OOP_HTTP__LABELS__SHARD=7`) is
+    /// coerced to a string here rather than aborting the config load. Note:
+    /// environment-sourced keys are still lower-cased by the config loader, so
+    /// keys that must preserve case or contain `.`/`-` should be set in the
+    /// config file rather than via env.
+    #[serde(default, deserialize_with = "de_labels_scalar_to_string")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -181,6 +201,50 @@ fn default_drain_timeout_secs() -> u64 {
 
 fn default_healthcheck_timeout_ms() -> u64 {
     500
+}
+
+/// Deserialize a label map, coercing scalar values (numbers, booleans) to
+/// strings.
+///
+/// The environment layer parses a bare-numeric value like
+/// `APP__OOP_HTTP__LABELS__SHARD=7` into an integer, which would otherwise fail
+/// to deserialize into a `String` and abort the entire `AppConfig::load_layered`
+/// — precisely on the path a k8s `StatefulSet` ordinal is injected. Accepting the
+/// scalar and rendering it as a string keeps that value load-able as a label.
+fn de_labels_scalar_to_string<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    // Ordering matters for `untagged`: a string input matches `Str`; an integer
+    // matches `I64`/`U64` before `F64`, so `7` renders as `"7"` not `"7.0"`.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scalar {
+        Str(String),
+        Bool(bool),
+        I64(i64),
+        U64(u64),
+        F64(f64),
+    }
+
+    let raw = std::collections::BTreeMap::<String, Scalar>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let value = match v {
+                Scalar::Str(s) => s,
+                Scalar::Bool(b) => b.to_string(),
+                Scalar::I64(i) => i.to_string(),
+                Scalar::U64(u) => u.to_string(),
+                Scalar::F64(f) => f.to_string(),
+            };
+            (k, value)
+        })
+        .collect())
 }
 
 impl ConfigProvider for AppConfig {
@@ -375,6 +439,45 @@ pub(crate) fn remap_gear_env_key(key: &str) -> String {
     }
 }
 
+/// Reject the pre-2026-03 top-level `tracing:` section with a migration hint.
+///
+/// The section moved under `opentelemetry:` in `8c2187bc4`, which also put
+/// `deny_unknown_fields` on [`AppConfig`] — so an unmigrated config already
+/// fails, but with a bare "unknown field" that says nothing about where the
+/// settings went. This turns that into an actionable error.
+///
+/// One check covers both shapes the old documentation taught: `Env::prefixed`
+/// splits on `__`, so `APP__TRACING__EXPORTER__ENDPOINT` lands on the same
+/// `tracing.*` path as the YAML block.
+///
+/// The nested `opentelemetry.tracing` is untouched — `find_value` resolves from
+/// the root — and `AppConfig::default()` contributes no `tracing` key.
+///
+/// # Errors
+/// Returns an error when a root-level `tracing` key is present.
+fn reject_legacy_tracing_key(figment: &figment::Figment) -> Result<()> {
+    if figment.find_value("tracing").is_err() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "the top-level `tracing:` section was replaced by `opentelemetry:`; \
+         move the settings across:\n\
+         \n\
+         \x20 tracing.enabled       -> opentelemetry.tracing.enabled\n\
+         \x20 tracing.service_name  -> opentelemetry.resource.service_name\n\
+         \x20 tracing.resource      -> opentelemetry.resource.attributes\n\
+         \x20 tracing.metrics       -> opentelemetry.metrics\n\
+         \x20 tracing.exporter      -> opentelemetry.exporter (shared) or \
+         opentelemetry.tracing.exporter\n\
+         \x20 tracing.sampler, .propagation, .http, .logs_correlation \
+         -> opentelemetry.tracing.*\n\
+         \n\
+         Environment overrides use the same path, so APP__TRACING__* becomes \
+         APP__OPENTELEMETRY__*. See docs/TRACING_SETUP.md."
+    );
+}
+
 impl AppConfig {
     /// Load configuration with layered loading: defaults → YAML file → environment variables.
     /// Also normalizes `server.home_dir` into an absolute path and creates the directory.
@@ -389,7 +492,7 @@ impl AppConfig {
 
         // For layered loading, start from AppConfig::default() which provides logging
         // defaults (via default_logging_config()); other optional sections (database,
-        // tracing, gears_dir) remain None unless overridden by YAML/ENV.
+        // opentelemetry, gears_dir) remain None unless overridden by YAML/ENV.
         let figment = Figment::new()
             .merge(Serialized::defaults(AppConfig::default()))
             .merge(StrictYaml::file(config_path))
@@ -399,6 +502,8 @@ impl AppConfig {
                     .split("__")
                     .map(|key| remap_gear_env_key(key.as_str()).into()),
             );
+
+        reject_legacy_tracing_key(&figment)?;
 
         let mut config: AppConfig = figment
             .extract()
@@ -1455,6 +1560,26 @@ mod tests {
 
         // Gears bag is empty by default
         assert!(config.gears.is_empty());
+    }
+
+    #[test]
+    fn oop_http_labels_coerce_numeric_and_bool_values_to_strings() {
+        // A bare-numeric env value (e.g. `APP__OOP_HTTP__LABELS__SHARD=7`) is
+        // parsed as an integer by the env layer; it must load as a string
+        // label rather than aborting the config parse.
+        let cfg: OopHttpConfig = serde_json::from_value(serde_json::json!({
+            "listen_addr": "0.0.0.0:8080",
+            "labels": {
+                "shard": 7,
+                "role": "ingest",
+                "canary": true,
+            }
+        }))
+        .expect("numeric/bool label values must deserialize");
+
+        assert_eq!(cfg.labels.get("shard").map(String::as_str), Some("7"));
+        assert_eq!(cfg.labels.get("role").map(String::as_str), Some("ingest"));
+        assert_eq!(cfg.labels.get("canary").map(String::as_str), Some("true"));
     }
 
     // `#[serial]`: calls load_layered, which reads the APP__ env layer; serialize
@@ -3031,6 +3156,49 @@ vendor:
 
     #[test]
     #[serial]
+    fn test_oop_http_labels_from_yaml_and_env() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_oop_labels"
+oop_http:
+  listen_addr: "0.0.0.0:8080"
+  labels:
+    role: "ingest"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        // Env layer adds a second label. Env keys are lower-cased by the loader,
+        // so `ZONE` lands as `zone`.
+        with_var("APP__OOP_HTTP__LABELS__ZONE", Some("us-east-1"), || {
+            let config = AppConfig::load_layered(&cfg_path).unwrap();
+            let oop = config.oop_http.expect("oop_http present");
+            assert_eq!(oop.labels.get("role"), Some(&"ingest".to_owned()));
+            assert_eq!(
+                oop.labels.get("zone"),
+                Some(&"us-east-1".to_owned()),
+                "APP__OOP_HTTP__LABELS__ZONE should populate labels[zone]"
+            );
+        });
+
+        // A bare-numeric env value (e.g. a StatefulSet ordinal injected as
+        // `APP__OOP_HTTP__LABELS__SHARD=7`) is coerced to its string
+        // representation by `de_labels_scalar_to_string` rather than failing the
+        // config load, so numeric-looking labels can be set via the environment.
+        with_var("APP__OOP_HTTP__LABELS__SHARD", Some("7"), || {
+            let config = AppConfig::load_layered(&cfg_path).unwrap();
+            let oop = config.oop_http.expect("oop_http present");
+            assert_eq!(
+                oop.labels.get("shard"),
+                Some(&"7".to_owned()),
+                "a bare-numeric env label value should be coerced to the string \"7\""
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn test_gear_config_env_override_underscore_gear_name() {
         // k8s-friendly form: gear name uses underscores in the env var name,
         // which should be remapped to the kebab-case gear key.
@@ -3283,9 +3451,108 @@ vendor: {}
         assert!(config.vendor.is_empty());
     }
 
+    // ========== Legacy `tracing:` section ==========
+
+    /// The pre-2026-03 shape must fail with a migration hint, not a bare
+    /// `unknown field` from `deny_unknown_fields`.
+    // `#[serial]`: sets `APP__TRACING__*` below (via the sibling env-override
+    // test), which lands on the same root-level `tracing` path this test
+    // asserts is absent; serialize against it and the other APP__-mutating tests.
+    #[test]
+    #[serial]
+    fn test_legacy_tracing_section_reports_migration() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_legacy_tracing"
+tracing:
+  enabled: true
+  service_name: "cf-gears-api"
+  exporter:
+    kind: "otlp_grpc"
+    endpoint: "http://127.0.0.1:4317"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let result = AppConfig::load_layered(&cfg_path);
+        assert!(result.is_err(), "legacy `tracing:` should be rejected");
+        let msg = format!("{:?}", result.unwrap_err());
+
+        for expected in [
+            "opentelemetry",
+            "opentelemetry.resource.service_name",
+            "docs/TRACING_SETUP.md",
+        ] {
+            assert!(msg.contains(expected), "missing {expected:?} in: {msg}");
+        }
+    }
+
+    /// The nested `opentelemetry.tracing` must not trip the root-level guard.
+    // `#[serial]`: see rationale on `test_legacy_tracing_section_reports_migration`.
+    #[test]
+    #[serial]
+    fn test_nested_opentelemetry_tracing_is_accepted() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_nested_tracing"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+  tracing:
+    enabled: true
+  metrics:
+    enabled: false
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let config = AppConfig::load_layered(&cfg_path).expect("nested form should load");
+        assert!(config.opentelemetry.tracing.enabled);
+        assert_eq!(config.opentelemetry.resource.service_name, "cf-gears-api");
+    }
+
+    /// `reject_legacy_tracing_key` must also catch the legacy shape when it
+    /// arrives through the `APP__` env layer rather than the YAML file —
+    /// `Env::prefixed` splits `APP__TRACING__ENABLED` onto the same
+    /// `tracing.enabled` path as the old YAML block.
+    // `#[serial]`: mutates the process-global `APP__TRACING__*` var.
+    #[test]
+    #[serial]
+    fn test_legacy_tracing_env_override_reports_migration() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_legacy_tracing_env"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var("APP__TRACING__ENABLED", Some("true"), || {
+            let result = AppConfig::load_layered(&cfg_path);
+            assert!(
+                result.is_err(),
+                "legacy `APP__TRACING__*` override should be rejected"
+            );
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("opentelemetry"),
+                "missing migration hint in: {msg}"
+            );
+        });
+    }
+
     // ========== Duplicate YAML key rejection tests ==========
 
+    // `#[serial]`: these call `load_layered`, which reads the process-global
+    // `APP__` env layer; serialize against the env-override tests that mutate
+    // `APP__*` vars via `with_var`.
     #[test]
+    #[serial]
     fn test_reject_duplicate_gear_names() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");
@@ -3312,6 +3579,7 @@ gears:
     }
 
     #[test]
+    #[serial]
     fn test_reject_duplicate_keys_in_gear_file() {
         let tmp = tempdir().unwrap();
         let gears_dir = tmp.path().join("gears.d");
@@ -3350,6 +3618,7 @@ gears_dir: "{}"
     }
 
     #[test]
+    #[serial]
     fn test_no_false_positive_on_unique_gears() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");

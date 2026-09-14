@@ -61,6 +61,8 @@ impl From<toolkit::plugins::ChoosePluginError> for DomainError {
     }
 }
 
+// Plugin clients (`AuthZResolverPluginClient`) still surface
+// `AuthZResolverError`; the domain `Service` maps it onto `DomainError`.
 impl From<AuthZResolverError> for DomainError {
     fn from(e: AuthZResolverError) -> Self {
         match e {
@@ -72,23 +74,6 @@ impl From<AuthZResolverError> for DomainError {
                 reason: msg,
             },
             AuthZResolverError::Internal(msg) => Self::Internal(msg),
-        }
-    }
-}
-
-impl From<DomainError> for AuthZResolverError {
-    fn from(e: DomainError) -> Self {
-        match e {
-            DomainError::PluginNotFound { .. } => Self::NoPluginAvailable,
-            DomainError::InvalidPluginInstance { gts_id, reason } => {
-                Self::Internal(format!("invalid plugin instance '{gts_id}': {reason}"))
-            }
-            DomainError::PluginUnavailable { gts_id, reason } => {
-                Self::ServiceUnavailable(format!("plugin not available for '{gts_id}': {reason}"))
-            }
-            DomainError::TypesRegistryUnavailable(reason) | DomainError::Internal(reason) => {
-                Self::Internal(reason)
-            }
         }
     }
 }

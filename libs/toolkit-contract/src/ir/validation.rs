@@ -418,6 +418,7 @@ fn extract_path_params(template: &str) -> Vec<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ir::binding::StreamFraming;
     use crate::ir::contract::{
         FieldIr, Idempotency, InputShape, MethodIr, MethodKind, PrimitiveType, ServiceIr, TypeRef,
     };
@@ -461,6 +462,7 @@ mod tests {
                 }],
                 retryable: false,
                 streaming: false,
+                stream_framing: StreamFraming::default(),
                 optional: false,
             }],
         };
@@ -485,6 +487,7 @@ mod tests {
                 field_bindings: vec![HttpFieldBinding::Body, HttpFieldBinding::Body],
                 retryable: false,
                 streaming: false,
+                stream_framing: StreamFraming::default(),
                 optional: false,
             }],
         };
@@ -507,6 +510,7 @@ mod tests {
                 field_bindings: vec![],
                 retryable: false,
                 streaming: false,
+                stream_framing: StreamFraming::default(),
                 optional: false,
             }],
         };
@@ -533,6 +537,7 @@ mod tests {
                 }],
                 retryable: false,
                 streaming: false,
+                stream_framing: StreamFraming::default(),
                 optional: false,
             }],
         };
@@ -560,6 +565,7 @@ mod tests {
                 }],
                 retryable: false,
                 streaming: false,
+                stream_framing: StreamFraming::default(),
                 optional: false,
             }],
         };

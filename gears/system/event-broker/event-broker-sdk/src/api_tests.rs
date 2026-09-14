@@ -27,7 +27,7 @@ fn subscription_interest_full_construction() {
         .tenant_depth(TenantTraversalDepth::direct_children())
         .barrier_mode(BarrierMode::Ignore)
         .types([format!(
-            "{GTS_ID_PREFIX}cf.core.events.event_type.v1~acme.orders.*"
+            "{GTS_ID_PREFIX}cf.core.events.event.v1~acme.orders.*"
         )])
         .filter(
             Filter::new(

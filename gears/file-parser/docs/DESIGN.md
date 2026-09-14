@@ -46,6 +46,10 @@ Five plugins are shipped with this version, covering PDFs, HTML, spreadsheets, p
 
 `kreuzberg` ≥ 4.8.0 uses Elastic License 2.0 (EL-2.0). The dependency is pinned at `=4.9.4`. An explicit exception is declared in `deny.toml` with rationale: Gears' document parsing is not sold as a standalone competing product. Any upgrade requires re-verifying the exception still applies.
 
+#### Architecture Decisions
+
+- `cpt-cf-file-parser-adr-content-based-type-detection` — [ADR-0001](./ADR/0001-cpt-cf-file-parser-adr-content-based-type-detection.md): routing may be driven by *content* rather than by the caller-supplied filename extension / `Content-Type`, behind the optional `magika` feature. Records the confidence threshold and fallback policy, why detection failure is a startup failure rather than a silent degradation, and the ONNX Runtime constraints that shape the implementation.
+
 ### 1.3 Architecture Layers
 
 ```
@@ -178,13 +182,15 @@ REST endpoints: `/file-parser/v1/info`, `/file-parser/v1/upload`, `/file-parser/
 **ID**: [ ] `p1` `fdd-file-parser-component-parser-v1`
 
 <!-- fdd-id-content -->
-`FileParserService` (`src/domain/service.rs`) — the parsing gateway. Holds an ordered registry of `FileParserBackend` plugins populated at gear startup. For each request:
+`FileParserService` (`src/domain/service.rs`) — the parsing gateway. Holds an ordered registry of `FileParserBackend` plugins populated at gear startup, plus an optional `ContentTypeDetector` (see
+`docs/ADR/0001-cpt-cf-file-parser-adr-content-based-type-detection.md`). For each request:
+0. If a detector is registered (only possible with the gear built with `--features magika`), runs content-based detection on every request — including over a present-but-wrong filename extension / `Content-Type`. A detection at ≥ 0.90 confidence overrides routing **only when its label maps to an extension a registered parser actually claims** — enforced by the gateway itself (`reconcile_extension` re-checks `find_parser_by_extension`), not only by the detector implementation, so a third-party `ContentTypeDetector` that reports an unregistered extension cannot turn a request the hint would have satisfied into `no_parser_available`. A disagreement with the hint is logged at `WARN`. Below that confidence, or when the label maps to no supported extension, or with no detector registered, falls through to step 1 using the hint-derived extension unchanged.
 1. Determines the file extension from the filename hint or Content-Type header.
 2. Iterates the plugin registry and selects the first plugin whose `supported_extensions()` contains the extension.
 3. Returns HTTP 400 if no plugin matches.
 4. Delegates to the selected plugin's `parse_bytes` or `parse_local_path` method.
 
-The gateway also enforces file size limits and path-traversal protection. It has no format-specific logic of its own.
+The gateway also enforces file size limits and path-traversal protection. It has no format-specific logic of its own. With no detector registered — the default, and the only possibility without the `magika` feature — steps 1-4 are the entire algorithm and behavior is unchanged from before content-based detection existed.
 <!-- fdd-id-content -->
 
 #### Parser Plugins
@@ -255,7 +261,15 @@ Internal Rust trait (`src/domain/parser.rs`) that every parser plugin must imple
 pub trait FileParserBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn supported_extensions(&self) -> &'static [&'static str];
-    async fn parse_local_path(&self, path: &Path) -> Result<ParsedDocument, DomainError>;
+    /// `resolved_content_type` is the canonical MIME for the extension the
+    /// gateway used to select this backend — which may come from content
+    /// detection overriding the file's own extension. When `Some`, use it
+    /// instead of re-deriving a MIME from `path`.
+    async fn parse_local_path(
+        &self,
+        path: &Path,
+        resolved_content_type: Option<&str>,
+    ) -> Result<ParsedDocument, DomainError>;
     async fn parse_bytes(
         &self,
         filename_hint: Option<&str>,
@@ -264,6 +278,11 @@ pub trait FileParserBackend: Send + Sync {
     ) -> Result<ParsedDocument, DomainError>;
 }
 ```
+
+Backends that read a whole local file into memory must do so through
+`infra::parsers::bounded_read::read_bounded`, not `tokio::fs::read`: the
+service's up-front size check reads `metadata()` and so is not atomic against
+the file growing afterwards.
 
 Plugin registration is done at gear startup in `src/gear.rs`. The gateway selects the first registered plugin whose `supported_extensions()` contains the requested extension. Future versions may add a `priority() -> i32` method to allow explicit priority-based selection when multiple plugins claim the same extension.
 
@@ -316,6 +335,24 @@ File Parser is stateless and does not own any database tables or persistent stor
 file_parser:
   max_file_size_mb: 100              # optional; default 100 MB
   allowed_local_base_dir: /data/uploads   # required; gear fails to start if absent
+  detection_confidence_threshold: 0.90  # optional; default 0.90. Minimum detector confidence, in
+                                      # [0.0, 1.0], at which content detection may override the
+                                      # caller's filename / Content-Type hint. Below it the hint
+                                      # wins. Configurable because ADR-0001 records 0.90 as an
+                                      # initial value rather than a tuned one; the gear fails to
+                                      # start on a value outside [0.0, 1.0] instead of clamping.
+                                      # Only has effect when a detector is registered.
+  magika_intra_op_threads: 2         # optional; leave unset (recommended). Only used with the
+                                      # `magika` feature — ONNX Runtime intra-op thread count for
+                                      # the detector's single magika::Session. Unset leaves ONNX
+                                      # Runtime's own default: measured ~6 threads and ~3.5 ms per
+                                      # detection on a 10-core host. Lower it only when detection
+                                      # must not contend with other CPU-bound work, and note the
+                                      # latency cost: ~5.6 ms at 2, ~9.3 ms at 1. There is no
+                                      # session-count setting: magika::Session needs &mut self per
+                                      # inference and each session brings its own thread pool and
+                                      # model copy, so detection is serialized through one session
+                                      # and tuned here.
 ```
 
 ### Error Mapping

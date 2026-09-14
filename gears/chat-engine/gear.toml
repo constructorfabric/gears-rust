@@ -1,0 +1,7 @@
+[gear]
+name = "Chat Engine"
+description = "Multi-tenant conversational infrastructure with plugin-driven backend message processing."
+category = "gen-ai"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

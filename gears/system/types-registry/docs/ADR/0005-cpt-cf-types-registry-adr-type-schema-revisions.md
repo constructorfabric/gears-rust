@@ -1,0 +1,273 @@
+---
+status: accepted
+date: 2026-07-23
+decision-makers: Constructor Fabric Steering Committee
+---
+
+# GTS Type Schema Revision, Concurrency, and Retention Model
+
+**ID**: `cpt-cf-types-registry-adr-type-schema-revisions`
+
+## Table of Contents
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Scope](#scope)
+- [Terminology](#terminology)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Revision identity and creation](#revision-identity-and-creation)
+  - [Admission and compatibility](#admission-and-compatibility)
+  - [Optimistic concurrency](#optimistic-concurrency)
+  - [Retention and deletion](#retention-and-deletion)
+  - [Resolution, caching, and historical access](#resolution-caching-and-historical-access)
+  - [Rollback direction](#rollback-direction)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Store only the current schema snapshot](#store-only-the-current-schema-snapshot)
+  - [Store current and previous snapshots](#store-current-and-previous-snapshots)
+  - [Retain every admitted immutable revision](#retain-every-admitted-immutable-revision)
+- [More Information](#more-information)
+  - [Industry Practice](#industry-practice)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
+## Context and Problem Statement
+
+ADR-0004 makes a managed major-only GTS Type Schema ID a mutable logical identity. Types Registry therefore needs to distinguish successive admitted definitions of that identity without changing its GTS ID or Registry Reference.
+
+The revision model must support compatibility checks against retained history, dependency-aware admission, cache invalidation, concurrent updates, multi-pod correctness, diagnostics, and a future rollback workflow. It must also prevent a candidate validated against stale schema or dependency state from becoming active.
+
+This ADR decides how managed GTS Type Schema definitions are revisioned and retained. Registered GTS Instance revisions are governed separately by ADR-0006.
+
+## Scope
+
+This ADR decides:
+
+* revision identity, immutability, ordering, and current-revision selection;
+* when a new revision is created;
+* Type Schema revision retention;
+* compatibility and dependency validation baselines;
+* optimistic concurrency for asynchronous schema updates;
+* cache and resolution metadata;
+* the P1 boundary and P2 direction for rollback.
+
+This ADR does not define concrete table names, route paths, cache transport, revision payload encoding, or the rollback API shape. It does not apply to Externally Managed Type Schemas, whose live revision and retention semantics belong to their Registry Source Plugins under ADR-0002.
+
+## Terminology
+
+| Term | Meaning |
+|---|---|
+| Logical Type Schema | The managed major-only GTS Type Schema entity identified by one stable GTS ID and Registry Reference. |
+| Schema revision | An immutable canonical Type Schema definition admitted for one logical Type Schema. |
+| Current revision | The admitted revision returned by ordinary resolution and used for new validations. |
+| Admission candidate | Proposed canonical content undergoing validation before initial admission or before it can replace the current revision. It is not yet a Schema revision. |
+| Candidate status | Per-candidate workflow and outcome state — `pending`, `running`, `succeeded`, `unchanged`, or `failed` under ADR-0012 — distinct from operation progress and logical-entity Lifecycle Status. |
+| Revision number | A server-assigned monotonically increasing integer scoped to one logical Type Schema. |
+| Content hash | A digest of the canonical schema content used to bind validation, idempotency, and diagnostics to exact bytes or canonical semantics. |
+| Dependency revision vector | The exact revisions or equivalent freshness tokens of registered dependencies used while validating a candidate. It is in-flight concurrency-control state held for the duration of one validation attempt, not part of the admitted revision. |
+
+## Decision Drivers
+
+* The GTS ID and Registry Reference must remain stable across compatible managed updates.
+* ADR-0003 compares an admission candidate against one baseline rather than against history, so retention is not required for compatibility checking. History is retained for diagnostics, provenance, and a future rollback.
+* A base or referenced Type Schema update can change the effective schema of registered dependents without changing their GTS IDs.
+* Compatibility checks and P2 semantic validation may be asynchronous and must not hold a database lock for their duration.
+* Concurrent schema updates must not overwrite each other or activate a candidate checked against stale dependencies.
+* SDK and server caches need an observable state token: a major-only managed GTS ID is not content-immutable, and even a minor-bearing one has a resolved effective form that moves with its dependencies.
+* Historical schemas are small relative to runtime domain data and are valuable for validation, diagnostics, and future rollback.
+* Revision history is a correctness mechanism, not a replacement for a complete business audit system.
+
+## Considered Options
+
+* Store only the current schema snapshot.
+* Store current and previous snapshots.
+* Retain every admitted immutable revision.
+
+## Decision Outcome
+
+Chosen option: every admitted managed GTS Type Schema definition is an immutable retained revision of one logical Type Schema.
+
+### Revision identity and creation
+
+* Initial successful admission atomically creates the logical Type Schema in lifecycle `ACTIVE`, creates revision `1`, and makes it current.
+* Each subsequent successful content update allocates the next monotonically increasing revision number for that logical Type Schema.
+* Revision numbering is scoped to the logical entity and never to a major. **A minor-bearing Type Schema is immutable under ADR-0004**, so it is admitted with revision `1` and never allocates another: it accepts no content update, its current-revision pointer never moves, and the model here applies to it as the degenerate case of one revision. What continues across the minors of a major is the compatibility chain of ADR-0003, not the numbering, and each minor counts from `1` because each is a separate logical entity. Everything below therefore describes a major-only entity unless it says otherwise.
+* A revision contains at least the logical entity reference, revision number, canonical content, content hash, creation and admission metadata, the GTS specification and platform GTS implementation versions in force when it was admitted, and whether ADR-0004's `force` waived its compatibility check. The versions are **admission-engine provenance rather than verdict provenance**: they are present on every revision, including the ones admitted with no comparison at all — a first admission, an `M.0`, and any major-0 candidate — and where a comparison did happen they are also the rules that produced it. The waiver records the same category of fact, that the verdict was not reached, and the waiver is recorded because it is the one property of the minor-version profile derivable from neither the identifier nor the retained content.
+* A revision does **not** retain the dependency revision vector it was validated against, nor the effective artifacts that resolution produced. **Nothing reads the admission-time resolution**: compatibility compares a candidate against its baseline, and no P1 operation looks backwards at all. Reconstructing a retained revision's historical resolved form would reproduce a shape no consumer ever validated against, since resolution has since moved with its dependencies.
+* Revision numbers are allocated only when admission succeeds. Only a `succeeded` candidate allocates one; a `pending`, `running`, `failed`, or `unchanged` candidate is not an admitted revision and consumes no revision number — `unchanged` because its content already equals the current revision (ADR-0012).
+* Once created, revision content, revision number, and content hash are immutable.
+* The logical Type Schema owns a current-revision pointer. Ordinary resolving returns only the current revision unless an authorized management or CI operation explicitly requests history.
+* Re-submitting content whose canonical content hash equals the current revision is an idempotent no-op and does not allocate a new revision.
+* Re-submitting content equal to an older non-current revision is a new update. If admitted, it allocates a new monotonically increasing revision rather than moving the current pointer backward.
+
+### Admission and compatibility
+
+An admission candidate becomes an admitted revision and current only after:
+
+1. canonical GTS and JSON Schema validation succeeds;
+2. the backward compatibility check defined by ADR-0003 succeeds against its baseline — the current revision of this logical Type Schema when it is major-only, or the definition of the preceding minor of its major when it is minor-bearing, unless ADR-0004's `force` waived the latter;
+3. derivation-chain, `$ref`, `x-gts-ref`, ownership, and lifecycle rules succeed;
+4. every affected registered dependent in the transitive dependency closure remains valid under the candidate and the exact dependency revision vector;
+5. every registered GTS Instance whose Type Schema dependency can be affected remains valid under ADR-0006;
+6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts the same candidate content hash;
+7. optimistic concurrency and dependency freshness preconditions still hold at commit time.
+
+Types Registry must not automatically rewrite dependent `$ref` values or create derived Type Schemas. Revalidation proves whether the existing floating dependency remains safe; an owner-driven update is required when a dependent definition itself must change.
+
+### Optimistic concurrency
+
+Every managed Type Schema content update must carry the caller-observed `resource_version` of the logical entity as an explicit precondition, in the form ADR-0012 defines for every candidate: `must_not_exist` for an identifier that was absent at read time, `match_resource_version(v)` for one that was present.
+
+The token is the entity's monotonic `resource_version` and **not** its authored revision number. Lifecycle transitions and other correctness-relevant changes advance the entity without creating a content revision, so a revision-based token cannot see them: a caller that read an entity, prepared an update, and had the entity deleted underneath would present a revision number that is still current.
+
+The update flow is:
+
+1. record the caller's precondition and the dependency revision vector observed during validation;
+2. validate the candidate without holding a long-lived database lock;
+3. enter a short commit transaction;
+4. verify that `entity.resource_version` still equals the caller's precondition, and that every correctness-relevant dependency token still matches the validated baseline;
+5. atomically insert the immutable revision, replace the current-state projection, and advance `resource_version`;
+6. fail the candidate with a structured `precondition_failed` when the caller's precondition no longer holds.
+
+The two baselines in step 4 fail differently, and ADR-0012 keeps them apart. A caller-precondition mismatch is terminal for that candidate: Types Registry does not silently rebase the update, and the caller re-reads and reconciles again. A dependency that moved during validation is internal concurrency control, and the worker revalidates the admission unit within a bounded retry policy without weakening the caller's precondition. Database-specific compare-and-swap syntax belongs in DESIGN.
+
+Creation of a new logical Type Schema carries `must_not_exist` instead. A retry submitted after the entity exists therefore fails `precondition_failed`; it is not absorbed as an idempotent no-op, whatever its content, because request-level retry safety is supplied by the `Idempotency-Key` replay of ADR-0012, which returns the original operation without consulting current state. Content equality answers a different question and is evaluated per candidate by the worker: content equal to the current authored revision creates no revision and does not advance `resource_version`, and that candidate terminates `unchanged`. An existing divergent identity follows ADR-0004's update or conflict rules.
+
+Before initial admission there is no public logical Type Schema and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `pending`, an existing logical Type Schema retains its current revision and its Lifecycle Status.
+
+### Retention and deletion
+
+* Every admitted Type Schema revision is retained for the lifetime of the registry identity, including after logical deletion, while Registry References or registered dependents may still exist. Retention after deletion is not only about resolving a reference, which a tombstone alone would satisfy: P1 permits deletion while live domain data still conforms, and the owning gear retiring that data needs the contract itself. ADR-0013 records the invariant and why it refuses to erase the payload.
+* Admitted revisions are never physically removed by a retention period, time-to-live, or background policy. Physical removal happens only through the explicit platform-level purge operation decided by ADR-0013, which is operator-invoked and never automatic.
+* Logical entity lifecycle is separate from candidate workflow and definition revisions. A `pending` candidate is not a logical entity state; the managed lifecycle contains `ACTIVE` and `DELETED` in P1 under ADR-0008. Admitting an internal Schema revision does not change Lifecycle Status, and neither does admitting a higher-major Version Successor. Lifecycle transitions do not duplicate unchanged schema content into new revisions, but they do advance registry state/cache metadata and produce the required operation or audit record.
+* Failed candidates may be retained as operation artifacts under a separate retention policy; they are not admitted revisions and never participate in ordinary resolution or compatibility history.
+* Whether a given class of content may be held under these terms is a platform data-classification question rather than a registry one. Types Registry stores what it admits and applies no content policy of its own.
+
+### Resolution, caching, and historical access
+
+Ordinary Type Schema resolution returns:
+
+* stable GTS ID and Registry Reference;
+* current content hash and the freshness validator;
+* lifecycle and tenant availability metadata.
+
+This list is the **default field projection**: what an ordinary read returns when the caller selects nothing. Field selection follows OData, so a caller may narrow below it as well as reach past it. What is never returned unasked is the schema documents — the authored definition, the resolved effective schema, and the trait artifacts are large and are not returned unless asked for, because the batch and discovery paths dominate and would otherwise transfer them by default.
+
+The enforced compatibility mode and per-level evolvability are **not selectable at all**, and that is a stronger statement than keeping them out of the default set. An ordinary read asked for no comparison, so it carries no compatibility reporting: the mode follows from the identifier the caller already holds, and the classification is an input to a verdict rather than something the registry reports (ADR-0003). What a read does carry, in the provenance group, is the one fact of the minor-version profile that a caller cannot derive: whether ADR-0004's `force` waived the cross-minor check for an admitted minor.
+
+The revision number is deliberately absent from the P1 contract. No operation accepts one:
+
+* reads take an identifier or Registry Reference;
+* write preconditions take `resource_version`;
+* conditional reads take the validator;
+* ordinary resolution cannot select historical revisions.
+
+Exposing an unusable number invites comparison across installations whose counters are unrelated. Content hash is the portable diagnostic handle because equal content hashes equally anywhere.
+
+Revision numbers remain internal identity, foreign-key targets, and ordering. They return to the contract only with a revision-history surface that accepts them.
+
+Client and server caches key logical identity separately from revision freshness. A cached schema is current only while its revision or ETag is current under the Types Registry cache protocol.
+
+P1 must retain and internally query revision history for compatibility and diagnostics. A public management `list/get revisions` surface may be phased separately, but ordinary domain-gear resolution must not select an arbitrary historical revision.
+
+Domain gears continue to store the stable Registry Reference selected by ADR-0001. They do not store a Type Schema revision in every domain row unless a separate owning-gear requirement explicitly needs schema-at-write provenance.
+
+### Rollback direction
+
+Rollback is P2. P1 only ensures that the revision model and retention policy make rollback possible.
+
+When introduced, rollback from current revision `N` to the content of historical revision `K` must:
+
+* run normal compatibility, dependency, semantic, and optimistic-concurrency checks;
+* create revision `N+1` with content equal to revision `K` and a new operation/admission record;
+* preserve the old revision numbers and monotonic sequence;
+* never move the current pointer backward to revision `K`.
+
+### Consequences
+
+* Type Schema storage is append-only for admitted revision content even though the logical GTS identity is mutable.
+* Every retained revision keeps its authored content, so a past definition can always be re-examined against the registry as it stands today. What is not reproducible is the exact resolution a past admission performed, because the dependency revisions it used are not recorded — deliberately, since no check wants that form.
+* All long-running update operations require stale-baseline detection before activation.
+* Caches can no longer treat a major-only GTS ID as immutable forever. A minor-bearing one is immutable in its authored content, which is not the same as static: its resolved form still moves when a floating dependency advances, so the freshness validator remains load-bearing for both shapes.
+* Revision retention grows without a P1 purge mechanism, but schema volume is expected to be bounded and materially smaller than runtime domain-object storage.
+* ADR-0001's stable Registry Reference continues to point at the logical Type Schema while revision metadata identifies its current definition.
+
+### Confirmation
+
+This decision is confirmed when:
+
+* successful initial admission atomically creates an `ACTIVE` logical Type Schema and revision `1`, while a compatible update creates the next immutable revision without changing GTS ID or Registry Reference;
+* a pending or rejected initial candidate is never returned as a logical entity, consumes no revision number, and does not permanently reserve the GTS ID;
+* a pending or rejected update leaves the existing logical entity lifecycle and current revision unchanged;
+* all admitted revisions remain retrievable by internal compatibility and diagnostic paths after subsequent updates and logical deletion;
+* the ADR-0003 backward check is run against one baseline, and admission cost does not grow with the number of retained revisions;
+* a minor-bearing Type Schema is numbered `1` and is checked against the preceding minor, while any content update submitted for it is refused and allocates no revision;
+* an update whose target `resource_version` changed after the caller read it fails `precondition_failed` and creates no revision, while a dependency that moved during validation is revalidated rather than reported to the caller;
+* a lifecycle transition that creates no content revision still advances `resource_version`, so an update prepared before it is rejected;
+* ordinary resolution returns the current content hash and the freshness validator while domain references remain logical, and returns no revision number, since §*Resolution, caching, and historical access* keeps it out of the contract;
+* dependency-closure and registered-Instance validation are exercised before a base or referenced schema revision becomes current;
+* P2 hook tests cover initial admission and content revisions, including Version Successor admission, which under ADR-0008 changes no other member of its family and therefore triggers no further hook;
+* rollback is documented as P2 and a future rollback creates a new monotonically increasing revision.
+
+## Pros and Cons of the Options
+
+### Store only the current schema snapshot
+
+* Good, because storage and reads are simple.
+* Bad, because full-history compatibility cannot be proved.
+* Bad, because rollback, historical diagnostics, and reproducible validation are impossible without an external archive.
+* Bad, because an older gear registering a known schema cannot be distinguished from a novel divergent definition after the old snapshot is discarded.
+
+### Store current and previous snapshots
+
+* Good, because adjacent compatibility and immediate rollback are possible.
+* Bad, because transitive compatibility and long-lived replay contracts cannot be proved.
+* Bad, because skipping revisions or diagnosing older data remains unsupported.
+
+### Retain every admitted immutable revision
+
+* Good, because a registered Instance revision can name the exact Type Schema revision it was validated against, as ADR-0006 requires.
+* Good, because validation baselines, dependency effects, and historical content remain explainable.
+* Good, because a future rollback operation can reuse known admitted content.
+* Bad, because retention is unbounded and requires authorization, indexing, and deletion semantics.
+* Bad, because what may be registered has to be governed before admission, since nothing after it can shorten retention.
+
+## More Information
+
+### Industry Practice
+
+* [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html) keeps a versioned schema history under a stable subject and applies compatibility rules to new versions.
+* [AWS Glue Schema Registry](https://docs.aws.amazon.com/glue/latest/dg/schema-registry.html) models a stable schema name with numbered schema versions, checkpoints, and configurable compatibility across previous versions.
+* [Google Cloud Pub/Sub schemas](https://docs.cloud.google.com/pubsub/docs/schemas) support multiple schema revisions under one schema resource.
+* [Google AIP-162 Resource Revisions](https://google.aip.dev/162) distinguishes a resource from historical revision snapshots and describes revision retrieval and rollback use cases. AIP-162 is a draft and is used here as a design precedent, not a mandatory standard.
+* [Google AIP-154 Resource Freshness Validation](https://google.aip.dev/154) uses ETags to prevent concurrent updates from overwriting changes made against a newer resource state.
+
+## Traceability
+
+- **PRD**: [../PRD.md](../PRD.md)
+- **DESIGN**: [../DESIGN.md](../DESIGN.md)
+- **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
+- **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
+- **ADR-0003**: [0003-cpt-cf-types-registry-adr-type-schema-evolution-compatibility.md](./0003-cpt-cf-types-registry-adr-type-schema-evolution-compatibility.md)
+- **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md)
+- **ADR-0006**: [0006-cpt-cf-types-registry-adr-registered-instance-revisions.md](./0006-cpt-cf-types-registry-adr-registered-instance-revisions.md)
+- **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — closes the managed–external boundary, so the dependency revision vector required here never has an external member and its conflict with ADR-0002's persistence prohibition cannot arise.
+- **ADR-0012**: [0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md](./0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md) — decides the write-path contract the optimistic-concurrency section rests on: `resource_version` preconditions rather than a revision token, per-candidate outcomes, and request-key replay.
+- **ADR-0013**: [0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md](./0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md) — decides the only mechanism that physically removes a retained revision, and keeps it out of every retention policy.
+
+This decision directly addresses:
+
+* `cpt-cf-types-registry-fr-register-schemas` - defines managed Type Schema content update semantics.
+* `cpt-cf-types-registry-fr-validate-schema-compat` - records the check baseline and the rule versions used, so a superseded verdict can be identified later.
+* `cpt-cf-types-registry-fr-validate-type-derivation` - revalidates derivation chains against the exact dependency revisions used for admission.
+* `cpt-cf-types-registry-fr-ref-tracking` - revalidates the affected dependency closure against exact revision baselines.
+* `cpt-cf-types-registry-fr-validation-hooks` - binds P2 owning-gear validation to the exact candidate content hash before admission.
+* `cpt-cf-types-registry-fr-cache-freshness-metadata` - provides the per-entity revision and content hash that validate a resolution result.
+* `cpt-cf-types-registry-fr-two-phase-init` - defines the per-schema candidate, initial revision, and publication semantics used by the dependency-aware partial batch admission of ADR-0012.
+* `cpt-cf-types-registry-nfr-multi-pod-correctness` - requires atomic current-revision publication after commit.
+* `cpt-cf-types-registry-usecase-validate-type-evolution` - makes CI compatibility and dependency reports reproducible against retained revisions.

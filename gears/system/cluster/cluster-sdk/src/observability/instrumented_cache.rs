@@ -1,4 +1,3 @@
-// Created: 2026-06-18 by Constructor Tech
 //! A telemetry-emitting [`ClusterCacheBackend`] decorator (ADR-004).
 //!
 //! [`InstrumentedCache`] wraps any cache backend and emits the contracted cache
@@ -156,6 +155,24 @@ impl ClusterCacheBackend for InstrumentedCache {
         out
     }
 
+    async fn compare_and_swap_value(
+        &self,
+        key: &str,
+        expected_value: &[u8],
+        new_value: &[u8],
+        ttl: Ttl,
+    ) -> Result<CacheEntry, ClusterError> {
+        // No cataloged span (it is a backend-only op, not a facade operation),
+        // but it is still a cache op for the metrics surface.
+        let started = Instant::now();
+        let out = self
+            .inner
+            .compare_and_swap_value(key, expected_value, new_value, ttl)
+            .await;
+        self.record("compare_and_swap_value", key, started, &out);
+        out
+    }
+
     async fn compare_and_delete(
         &self,
         key: &str,
@@ -203,6 +220,24 @@ impl ClusterCacheBackend for InstrumentedCache {
         let out = self.inner.scan_prefix(prefix).await;
         self.record("scan_prefix", prefix, started, &out);
         out
+    }
+
+    /// Forwarded, and deliberately *not* recorded.
+    ///
+    /// Forwarding is mandatory: both plugins wrap their cache in this decorator,
+    /// so the profile `Arc` the readiness healthcheck probes is an
+    /// `InstrumentedCache`. Inheriting the trait's `Ok(())` default here would
+    /// report every deployed backend healthy no matter its real state.
+    ///
+    /// It is not recorded because a probe is not a consumer operation.
+    /// [`record`](Self::record) emits `cluster_cache_ops_total` with a bounded
+    /// `method` label; adding a `probe` method would fold readiness traffic —
+    /// every couple of seconds, forever, from the pod itself — into the RED
+    /// metrics consumers are measured by. Probe outcomes belong on `/health` and
+    /// on the per-instance probe-failure metric that lands with the pool-saturation
+    /// gauge (DESIGN.md), not in the cache op counters.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        self.inner.probe().await
     }
 }
 

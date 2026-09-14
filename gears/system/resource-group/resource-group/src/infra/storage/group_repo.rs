@@ -11,16 +11,17 @@ use resource_group_sdk::models::{
     GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupWithDepth,
 };
 use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
+use toolkit_db::secure::{DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::{CursorV1, ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::GroupRepositoryTrait;
+use crate::infra::storage::FK_RESOURCE_GROUP_PARENT;
 use crate::infra::storage::entity::{
     gts_type::{self, Entity as GtsTypeEntity},
     resource_group::{self as rg_entity, Entity as ResourceGroupEntity},
@@ -28,7 +29,6 @@ use crate::infra::storage::entity::{
     resource_group_membership::{self as membership_entity, Entity as MembershipEntity},
 };
 use crate::infra::storage::odata_mapper::GroupODataMapper;
-use crate::infra::storage::type_repo::TypeRepository;
 
 /// Default `OData` pagination limits for groups.
 const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
@@ -116,16 +116,31 @@ impl GroupRepository {
             });
         }
 
-        let groups = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::Id.is_in(group_ids.clone()))
-            .secure()
-            .scope_with(scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        let group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
-            groups.into_iter().map(|g| (g.id, g)).collect();
+        // This id list is the whole subtree, bounded by the data rather than
+        // by the page size -- the pagination below happens in memory, after
+        // the read. One bind parameter per id fails in the driver on a large
+        // subtree, exactly as the batch deletes would without chunking.
+        //
+        // Half the ceiling, not all of it: `scope` compiles to predicates that
+        // bind parameters of their own -- `ScopeFilter::In` and `InGroup` both
+        // carry value lists -- and this call cannot see how many. A scope
+        // carrying more than half the ceiling in values is a scope-side
+        // problem that no chunk size chosen here can fix.
+        let id_budget = toolkit_db::secure::max_bind_params_for(db)
+            .div_euclid(2)
+            .max(1);
+        let mut group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
+            std::collections::HashMap::with_capacity(group_ids.len());
+        for chunk in group_ids.chunks(id_budget) {
+            let groups = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            group_map.extend(groups.into_iter().map(|g| (g.id, g)));
+        }
 
         let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
         let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
@@ -209,78 +224,139 @@ impl GroupRepository {
     /// numeric value is then handled by `filter_node_to_condition` which converts
     /// it to `sea_orm::Value::BigInt` — `PostgreSQL` implicitly casts to SMALLINT.
     #[allow(clippy::type_complexity)]
-    fn resolve_type_filter_node<'a>(
-        db: &'a (impl DBRunner + 'a),
-        node: &'a toolkit_odata::filter::FilterNode<GroupFilterField>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        toolkit_odata::filter::FilterNode<GroupFilterField>,
-                        DomainError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    /// Collect every GTS type path a `type` predicate references, anywhere
+    /// in the filter tree.
+    fn collect_type_filter_paths(
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+        out: &mut Vec<String>,
+    ) {
         use toolkit_odata::ast::Value as V;
         use toolkit_odata::filter::FilterNode as FN;
+        match node {
+            FN::Binary {
+                field: GroupFilterField::Type,
+                value: V::String(path),
+                ..
+            } => out.push(path.clone()),
+            FN::InList {
+                field: GroupFilterField::Type,
+                values,
+            } => {
+                for v in values {
+                    if let V::String(path) = v {
+                        out.push(path.clone());
+                    }
+                }
+            }
+            FN::Composite { children, .. } => {
+                for child in children {
+                    Self::collect_type_filter_paths(child, out);
+                }
+            }
+            FN::Not(inner) => Self::collect_type_filter_paths(inner, out),
+            _ => {}
+        }
+    }
 
-        Box::pin(async move {
-            match node {
-                FN::Binary {
-                    field: GroupFilterField::Type,
-                    op,
-                    value: V::String(path),
-                } => {
-                    let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                        DomainError::validation(format!("Unknown type in filter: {path}"))
-                    })?;
-                    Ok(FN::Binary {
-                        field: GroupFilterField::Type,
-                        op: *op,
-                        value: V::Number(id.into()),
-                    })
+    /// Rewrite every `type` predicate to compare against the surrogate id,
+    /// using an already-resolved path -> id map. Purely in memory.
+    fn substitute_type_filter_ids(
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+        ids: &std::collections::HashMap<String, i16>,
+    ) -> Result<toolkit_odata::filter::FilterNode<GroupFilterField>, DomainError> {
+        use toolkit_odata::ast::Value as V;
+        use toolkit_odata::filter::FilterNode as FN;
+        let unknown =
+            |path: &str| DomainError::validation(format!("Unknown type in filter: {path}"));
+        Ok(match node {
+            FN::Binary {
+                field: GroupFilterField::Type,
+                op,
+                value: V::String(path),
+            } => FN::Binary {
+                field: GroupFilterField::Type,
+                op: *op,
+                value: V::Number((*ids.get(path).ok_or_else(|| unknown(path))?).into()),
+            },
+            FN::InList {
+                field: GroupFilterField::Type,
+                values,
+            } => {
+                let mut resolved = Vec::with_capacity(values.len());
+                for v in values {
+                    if let V::String(path) = v {
+                        resolved.push(V::Number(
+                            (*ids.get(path).ok_or_else(|| unknown(path))?).into(),
+                        ));
+                    } else {
+                        resolved.push(v.clone());
+                    }
                 }
                 FN::InList {
                     field: GroupFilterField::Type,
-                    values,
-                } => {
-                    let mut resolved = Vec::with_capacity(values.len());
-                    for v in values {
-                        if let V::String(path) = v {
-                            let id =
-                                TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                                    DomainError::validation(format!(
-                                        "Unknown type in filter: {path}"
-                                    ))
-                                })?;
-                            resolved.push(V::Number(id.into()));
-                        } else {
-                            resolved.push(v.clone());
-                        }
-                    }
-                    Ok(FN::InList {
-                        field: GroupFilterField::Type,
-                        values: resolved,
-                    })
+                    values: resolved,
                 }
-                FN::Composite { op, children } => {
-                    let mut resolved_children = Vec::with_capacity(children.len());
-                    for child in children {
-                        resolved_children.push(Self::resolve_type_filter_node(db, child).await?);
-                    }
-                    Ok(FN::Composite {
-                        op: *op,
-                        children: resolved_children,
-                    })
-                }
-                FN::Not(inner) => Ok(FN::Not(Box::new(
-                    Self::resolve_type_filter_node(db, inner).await?,
-                ))),
-                other => Ok(other.clone()),
             }
+            FN::Composite { op, children } => FN::Composite {
+                op: *op,
+                children: children
+                    .iter()
+                    .map(|c| Self::substitute_type_filter_ids(c, ids))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            FN::Not(inner) => FN::Not(Box::new(Self::substitute_type_filter_ids(inner, ids)?)),
+            other => other.clone(),
         })
+    }
+
+    /// Resolve every `type` predicate in the tree to its surrogate id.
+    ///
+    /// Two passes in memory around a single query, rather than one query
+    /// per referenced path: a `type in (...)` filter with N values used to
+    /// cost N `gts_type` SELECTs before the page query even ran (N+1 audit
+    /// finding (b)).
+    async fn resolve_type_filter_node(
+        db: &impl DBRunner,
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+    ) -> Result<toolkit_odata::filter::FilterNode<GroupFilterField>, DomainError> {
+        let mut paths = Vec::new();
+        Self::collect_type_filter_paths(node, &mut paths);
+        if paths.is_empty() {
+            return Ok(node.clone());
+        }
+        paths.sort_unstable();
+        paths.dedup();
+
+        // These paths come straight out of the client's `$filter`, so their
+        // number is the caller's choice, but it is not unbounded: the HTTP
+        // extractor rejects the request before it gets here if the raw
+        // filter exceeds `MAX_FILTER_LEN` (8 KiB) or parses to more than
+        // `MAX_NODES` (2000) nodes (`libs/toolkit/src/api/odata.rs`).
+        // `toolkit_odata::ODataLimits::validate_filter` is a parallel
+        // mechanism that would enforce its own bound -- it is simply dead
+        // code, never called anywhere in this workspace, not a second layer
+        // actually protecting this path. The chunking below is
+        // defense-in-depth against the extractor's ceiling, not the only
+        // barrier standing between a client and an oversized `IN (...)`, but
+        // it's still needed: 2000 distinct paths is comfortably past most
+        // backends' per-statement bind limit. Chunked against the bind
+        // ceiling like every other client-fed list here -- `type_repo`'s
+        // `resolve_ids` and the removed-parent sweep already are, and this
+        // was the one that was not.
+        let scope = system_scope();
+        let mut ids: std::collections::HashMap<String, i16> = std::collections::HashMap::new();
+        for chunk in paths.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let rows = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            ids.extend(rows.into_iter().map(|t| (t.schema_id, t.id)));
+        }
+
+        Self::substitute_type_filter_ids(node, &ids)
     }
 
     /// Parse and extract hierarchy filters from an `OData` query.
@@ -422,6 +498,23 @@ impl GroupRepositoryTrait for GroupRepository {
         let scope = system_scope();
         ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.eq(id))
+            .secure()
+            .scope_with(&scope)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))
+    }
+
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError> {
+        use sea_orm::QuerySelect;
+        let scope = system_scope();
+        ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.eq(id))
+            .lock(sea_orm::sea_query::LockType::Update)
             .secure()
             .scope_with(&scope)
             .one(db)
@@ -649,23 +742,25 @@ impl GroupRepositoryTrait for GroupRepository {
             ..Default::default()
         };
 
-        // The group PK is global, so a caller-supplied `id` may already be taken.
+        // The group PK is global, so a caller-supplied `id` may already be
+        // taken. The insert returns the persisted row, so re-reading it by
+        // id afterwards was a second `resource_group` SELECT per create for
+        // data already in hand (RG-08).
         toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
             .await
-            .map_err(|e| {
-                if e.is_unique_violation() {
-                    DomainError::group_already_exists(id)
-                } else {
-                    DomainError::database(e.to_string())
-                }
-            })?;
-
-        self.find_model_by_id(db, id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but row not found"))
+            .map_err(|e| map_insert_error(&e, id, parent_id))
     }
 
     /// Update a resource group entity.
+    ///
+    /// Returns `rows_affected` from the `UPDATE ... WHERE id = ?` rather than
+    /// answering `RecordNotFound` itself: the previous shape loaded an
+    /// `ActiveModel` first to know that -- at the cost of the very read this
+    /// method exists to avoid. Both current callers read the row inside the
+    /// same transaction first -- `update_group_inner` with `FOR UPDATE`,
+    /// because its transaction may be at the backend default -- so a `0`
+    /// here is unreachable for them in practice, but the signature no longer
+    /// asks them to take that on faith.
     async fn update<C: DBRunner>(
         &self,
         db: &C,
@@ -674,11 +769,11 @@ impl GroupRepositoryTrait for GroupRepository {
         gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<rg_entity::Model, DomainError> {
+    ) -> Result<u64, DomainError> {
         let scope = system_scope();
 
         let parent_val: sea_orm::Value = match parent_id {
-            Some(pid) => sea_orm::Value::Uuid(Some(Box::new(pid))),
+            Some(pid) => sea_orm::Value::Uuid(Some(pid)),
             None => sea_orm::Value::Uuid(None),
         };
 
@@ -687,7 +782,7 @@ impl GroupRepositoryTrait for GroupRepository {
             None => sea_orm::Value::Json(None),
         };
 
-        ResourceGroupEntity::update_many()
+        let res = ResourceGroupEntity::update_many()
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
             .col_expr(rg_entity::Column::ParentId, Expr::value(parent_val))
@@ -703,9 +798,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        self.find_model_by_id(db, id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(id))
+        Ok(res.rows_affected)
     }
 
     /// Delete a resource group entity by ID.
@@ -748,26 +841,134 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
+        // `Expr`'s combinators (`eq`, `add`) live on `ExprTrait` as of
+        // sea-query 1.0. Imported here rather than file-wide: its `min`
+        // would shadow `Ord::min` for the paginating methods above.
+        use sea_orm::ExprTrait;
+
         let scope = system_scope();
+        // One statement for the whole ancestor chain: every row the parent
+        // has as a descendant becomes a row for the child, one deeper. The
+        // ancestors are neither fetched nor rebuilt here -- a create used to
+        // pay a round-trip to read them and a second to write them back,
+        // both inside the transaction that create holds open.
+        let mut source = Query::select();
+        source
+            .expr(Expr::col(closure_entity::Column::AncestorId))
+            .expr(Expr::val(child_id))
+            .expr(Expr::col(closure_entity::Column::Depth).add(1))
+            .from(ClosureEntity)
+            .and_where(Expr::col(closure_entity::Column::DescendantId).eq(parent_id));
 
-        // Get all ancestors of the parent (including parent's self-row)
-        let parent_ancestors = ClosureEntity::find()
-            .filter(closure_entity::Column::DescendantId.eq(parent_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        let written = toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+            [
+                closure_entity::Column::AncestorId,
+                closure_entity::Column::DescendantId,
+                closure_entity::Column::Depth,
+            ],
+            source,
+            &scope,
+            db,
+        )
+        .await
+        .map_err(|e| match e {
+            toolkit_db::secure::ScopeError::Db(db) => DomainError::Database(db),
+            // Keep the typed `DbErr`. `is_retryable_contention` does read
+            // `DbErr::Custom` now, so retry survives a stringify -- but
+            // `sql_err()` does not, and the give-up diagnostics and the
+            // constraint classifiers would be left matching on text.
+            other => DomainError::database(other.to_string()),
+        })?;
 
-        // For each ancestor of parent, create ancestor -> child with depth+1
-        for ancestor_row in parent_ancestors {
-            let model = closure_entity::ActiveModel {
-                ancestor_id: Set(ancestor_row.ancestor_id),
-                descendant_id: Set(child_id),
-                depth: Set(ancestor_row.depth + 1),
-            };
-            toolkit_db::secure::secure_insert::<ClosureEntity>(model, &scope, db)
+        Ok(written)
+    }
+
+    /// Delete every group in `ids` in one statement per bind-parameter
+    /// chunk, not one `delete_by_id` per node (RG-10).
+    async fn delete_by_id_many<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        // Chunk against the backend's bind-parameter ceiling, the same one
+        // `secure_insert_many` respects: one `IN (...)` predicate binds one
+        // parameter per id, so an unchunked delete of a large subtree fails
+        // in the driver rather than in the query.
+        for chunk in ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            ResourceGroupEntity::delete_many()
+                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete all memberships for every group in `group_ids` in a single
+    /// statement, not one per node (RG-10).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        // Chunk against the backend's bind-parameter ceiling, the same one
+        // `secure_insert_many` respects: one `IN (...)` predicate binds one
+        // parameter per id, so an unchunked delete of a large subtree fails
+        // in the driver rather than in the query.
+        for chunk in group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            MembershipEntity::delete_many()
+                .filter(membership_entity::Column::GroupId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in 2 statements per bind-parameter chunk
+    /// rather than 2 per group (RG-10). One chunk covers whatever
+    /// `max_bind_params_for` allows — 30 000 on `SQLite`, 60 000 on
+    /// `PostgreSQL`, both below the backends' own limits on purpose — so "2"
+    /// is the ordinary case, not the guarantee.
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        // Chunked for the same reason as the other batch deletes: one bind
+        // parameter per id, capped per backend.
+        for chunk in group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            ClosureEntity::delete_many()
+                .filter(closure_entity::Column::AncestorId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+
+            ClosureEntity::delete_many()
+                .filter(closure_entity::Column::DescendantId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
         }
@@ -775,15 +976,15 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
-    /// Get all descendants of a group (from closure table, excluding self-row).
-    ///
-    /// Results are ordered by depth ASC (root-to-leaf). Callers that need
-    /// leaf-to-root order (e.g. `force_delete_subtree`) reverse the list.
-    async fn get_descendant_ids<C: DBRunner>(
+    /// Every descendant of `group_id` (the self-row excluded) with its depth
+    /// relative to `group_id`, so callers don't re-derive the depth via a
+    /// second per-row query (RG-05/RG-10). Ordered by depth ascending;
+    /// callers needing leaf-to-root order reverse the list.
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-    ) -> Result<Vec<Uuid>, DomainError> {
+    ) -> Result<Vec<(Uuid, i32)>, DomainError> {
         use sea_orm::QueryOrder;
 
         let scope = system_scope();
@@ -797,7 +998,10 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        Ok(rows.into_iter().map(|r| r.descendant_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.descendant_id, r.depth))
+            .collect())
     }
 
     /// Get the depth of a group from its root (max depth in closure table where
@@ -813,6 +1017,53 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.depth).max().unwrap_or(0))
+    }
+
+    /// Deepest descendant of `group_id` relative to it, or `0` when it has
+    /// none.
+    ///
+    /// One `MAX(depth)` aggregate over the closure table -- see
+    /// `count_children` above for the same `SecureSelect` pattern applied to
+    /// `COUNT` -- instead of `get_descendant_ids_with_depth`'s whole row set
+    /// pulled into this process only to be folded down to this one number.
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError> {
+        // `Expr::max` (the SQL aggregate) lives on `ExprTrait` as of
+        // sea-query 1.0. Imported here rather than file-wide: its `max`
+        // would shadow `Ord::max` for the paginating methods above.
+        use sea_orm::ExprTrait;
+        use sea_orm::{FromQueryResult, QuerySelect};
+
+        #[derive(FromQueryResult)]
+        struct MaxDepth {
+            max_depth: Option<i32>,
+        }
+
+        let scope = system_scope();
+        let rows: Vec<MaxDepth> = ClosureEntity::find()
+            .filter(closure_entity::Column::AncestorId.eq(group_id))
+            .filter(closure_entity::Column::Depth.ne(0))
+            .secure()
+            .scope_with(&scope)
+            .project_all(db, |q| {
+                q.select_only()
+                    .column_as(Expr::col(closure_entity::Column::Depth).max(), "max_depth")
+                    .into_model::<MaxDepth>()
+            })
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        // `MAX` over zero rows is one row holding NULL, not zero rows -- but
+        // falling back to `0` either way keeps this the same "no
+        // descendants" answer `get_descendant_ids_with_depth(...).max()` gave.
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.max_depth)
+            .unwrap_or(0))
     }
 
     /// Count direct children of a group.
@@ -914,146 +1165,215 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
-        // Collect subtree: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = group_id
-        let scope = system_scope();
-        let subtree_rows = ClosureEntity::find()
-            .filter(closure_entity::Column::AncestorId.eq(group_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+    ) -> Result<u64, DomainError> {
+        // `Expr`'s combinators (`eq`, `add`) live on `ExprTrait` as of
+        // sea-query 1.0. Imported here rather than file-wide: its `min`
+        // would shadow `Ord::min` for the paginating methods above.
+        use sea_orm::ExprTrait;
 
-        let subtree_ids: Vec<Uuid> = subtree_rows.iter().map(|r| r.descendant_id).collect();
-        let subtree_internal: std::collections::HashMap<Uuid, i32> = subtree_rows
-            .iter()
-            .map(|r| (r.descendant_id, r.depth))
-            .collect();
+        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
+        // Collect subtree: SELECT descendant_id FROM resource_group_closure
+        // WHERE ancestor_id = group_id -- the group itself included, via its
+        // own self-row.
+        //
+        // Defined as a query and used by the steps below rather than
+        // materialized here. The subtree is exactly the input this operation
+        // must not be linear in, and none of the decisions taken from it need
+        // the rows in this process.
+        let scope = system_scope();
+        let subtree_query = Query::select()
+            .column(closure_entity::Column::DescendantId)
+            .from(ClosureEntity)
+            .and_where(Expr::col(closure_entity::Column::AncestorId).eq(group_id))
+            .to_owned();
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
         // Delete affected paths: DELETE FROM resource_group_closure
         // WHERE descendant_id IN (subtree) AND ancestor_id NOT IN (subtree)
-        let subtree_set: std::collections::HashSet<Uuid> = subtree_ids.iter().copied().collect();
-
-        let all_desc_rows = ClosureEntity::find()
-            .filter(closure_entity::Column::DescendantId.is_in(subtree_ids.clone()))
+        //
+        // Both predicates are that same subquery. The previous form read
+        // every closure row of the subtree back into the process only to
+        // decide which ancestors were external, then bound the survivors into
+        // two `IN (...)` lists -- one parameter per id, unbounded, so a large
+        // enough subtree failed in the driver rather than in the query.
+        //
+        // Each predicate wraps the subquery in a derived table instead of
+        // naming `resource_group_closure` directly: MySQL rejects a `DELETE`
+        // whose subquery reads the target table (ER 1093) but materializes a
+        // derived table before deleting, which lifts the restriction.
+        // PostgreSQL and SQLite accept either form unchanged.
+        //
+        // `NOT IN` here is only correct because `descendant_id` is `NOT NULL`
+        // in both backend branches of the migration. Were it ever nullable, a
+        // single NULL would make the predicate NULL for every row and this
+        // DELETE would quietly stop deleting -- no error, no rows, a closure
+        // table that keeps its stale ancestors.
+        //
+        // The DELETE runs before the INSERT below and cannot disturb either of
+        // its sources: it only removes rows whose ancestor is *outside* the
+        // subtree, while the `st` source ranges over `ancestor_id = group_id`
+        // (inside by definition) and the `pa` source over
+        // `descendant_id = parent_id`, whose ancestors are all outside --
+        // guaranteed by the `is_descendant` check the service makes before
+        // calling this.
+        let desc_alias = Alias::new("st_desc");
+        let subtree_for_descendants = Query::select()
+            .expr(Expr::col((
+                desc_alias.clone(),
+                closure_entity::Column::DescendantId,
+            )))
+            .from_subquery(subtree_query.clone(), desc_alias)
+            .to_owned();
+        let anc_alias = Alias::new("st_anc");
+        let subtree_for_ancestors = Query::select()
+            .expr(Expr::col((
+                anc_alias.clone(),
+                closure_entity::Column::DescendantId,
+            )))
+            .from_subquery(subtree_query, anc_alias)
+            .to_owned();
+        let deleted = ClosureEntity::delete_many()
+            .filter(closure_entity::Column::DescendantId.in_subquery(subtree_for_descendants))
+            .filter(closure_entity::Column::AncestorId.not_in_subquery(subtree_for_ancestors))
             .secure()
             .scope_with(&scope)
-            .all(db)
+            .exec(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Collect (ancestor_id, descendant_id) pairs where ancestor is outside subtree
-        let external_pairs: Vec<(Uuid, Uuid)> = all_desc_rows
-            .iter()
-            .filter(|r| !subtree_set.contains(&r.ancestor_id))
-            .map(|r| (r.ancestor_id, r.descendant_id))
-            .collect();
-
-        // Batch-delete: delete rows where ancestor is NOT in subtree for each subtree descendant.
-        // Group by descendant_id to minimize queries.
-        if !external_pairs.is_empty() {
-            // Delete all external ancestor rows for all subtree descendants in one query
-            // We delete rows where descendant_id IN (subtree) AND ancestor_id NOT IN (subtree)
-            let external_ancestor_ids: Vec<Uuid> = external_pairs
-                .iter()
-                .map(|(a, _)| *a)
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            ClosureEntity::delete_many()
-                .filter(closure_entity::Column::DescendantId.is_in(subtree_ids.clone()))
-                .filter(closure_entity::Column::AncestorId.is_in(external_ancestor_ids))
-                .secure()
-                .scope_with(&scope)
-                .exec(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            .map_err(|e| DomainError::database(e.to_string()))?
+            .rows_affected;
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
-        // Compute new ancestor paths from new parent
-        if let Some(parent_id) = new_parent_id {
-            let parent_ancestors = ClosureEntity::find()
-                .filter(closure_entity::Column::DescendantId.eq(parent_id))
-                .secure()
-                .scope_with(&scope)
-                .all(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
+        let inserted = if let Some(parent_id) = new_parent_id {
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
+            // Compute new ancestor paths from new parent: the closure rows
+            // whose descendant is the new parent, i.e. its ancestors and its
+            // own self-row. Named as a join side, not fetched.
+            let ancestors = Alias::new("pa");
+            let subtree = Alias::new("st");
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
-            let mut new_rows: Vec<closure_entity::ActiveModel> = Vec::new();
-            for ancestor_row in &parent_ancestors {
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
-                for &desc_id in &subtree_ids {
-                    // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
-                    let internal_depth = subtree_internal.get(&desc_id).copied().unwrap_or(0);
-                    let new_depth = ancestor_row.depth + 1 + internal_depth;
-                    new_rows.push(closure_entity::ActiveModel {
-                        ancestor_id: Set(ancestor_row.ancestor_id),
-                        descendant_id: Set(desc_id),
-                        depth: Set(new_depth),
-                    });
-                    // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
-            }
+            let mut source = Query::select();
 
-            for row in new_rows {
-                toolkit_db::secure::secure_insert::<ClosureEntity>(row, &scope, db)
-                    .await
-                    .map_err(|e| DomainError::database(e.to_string()))?;
-            }
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
+            // FOR EACH new_ancestor, FOR EACH subtree_node: the cross product
+            // of the two closure ranges. The database forms it; the pairs
+            // never exist as Rust values. For a 10 000-node subtree under a
+            // depth-10 parent that is 100 000 rows the process no longer
+            // builds, holds, or sends.
+            source
+                .from_as(ClosureEntity, ancestors.clone())
+                .from_as(ClosureEntity, subtree.clone())
+                .and_where(
+                    Expr::col((ancestors.clone(), closure_entity::Column::DescendantId))
+                        .eq(parent_id),
+                )
+                .and_where(
+                    Expr::col((subtree.clone(), closure_entity::Column::AncestorId)).eq(group_id),
+                );
+            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
+
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
+            // One row per pair: ancestor_id = new_ancestor, descendant_id =
+            // subtree_node, depth = new_ancestor_depth +
+            // subtree_node_relative_depth + 1. Column order here is the
+            // column order the insert declares.
+            source
+                .expr(Expr::col((
+                    ancestors.clone(),
+                    closure_entity::Column::AncestorId,
+                )))
+                .expr(Expr::col((
+                    subtree.clone(),
+                    closure_entity::Column::DescendantId,
+                )))
+                .expr(
+                    Expr::col((ancestors, closure_entity::Column::Depth))
+                        .add(Expr::col((subtree, closure_entity::Column::Depth)))
+                        .add(1),
+                );
+            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
+
+            let written = toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+                [
+                    closure_entity::Column::AncestorId,
+                    closure_entity::Column::DescendantId,
+                    closure_entity::Column::Depth,
+                ],
+                source,
+                &scope,
+                db,
+            )
+            .await
+            .map_err(|e| match e {
+                toolkit_db::secure::ScopeError::Db(db) => DomainError::Database(db),
+                // Keep the typed `DbErr`. `is_retryable_contention` does read
+                // `DbErr::Custom` now, so retry survives a stringify -- but
+                // `sql_err()` does not, and the give-up diagnostics and the
+                // constraint classifiers would be left matching on text.
+                other => DomainError::database(other.to_string()),
+            })?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
-        }
+            written
+        } else {
+            // Moving to root attaches no external ancestors, so there is
+            // nothing to insert.
+            0
+        };
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
         // RETURN: closure rows updated within transaction — commit handled by caller
-        Ok(())
+        tracing::debug!(%group_id, deleted, inserted, "closure subtree rebuilt");
+        if new_parent_id.is_some() && inserted == 0 {
+            // Mirrors the `NOT IN` + `NULL` silent-corruption mode the delete
+            // step's doc comment above describes: that one needs a null
+            // `descendant_id` to misfire, but the effect is the same shape --
+            // a reparent that looks like it succeeded while the closure table
+            // quietly keeps stale (or here, no new) ancestor rows. A `NULL`
+            // can't happen here (see that comment), but a parent with no
+            // closure rows of its own -- which should be unreachable, every
+            // group gets a self-row on create -- would leave this INSERT
+            // with nothing to insert, and the DELETE above would have
+            // already dropped the subtree's real ancestors on the strength of
+            // the reparent this claims to perform.
+            //
+            // Return an error so the transaction rolls back rather than
+            // committing a broken closure table.
+            return Err(DomainError::database(format!(
+                "closure rebuild for group {group_id} inserted no rows for reparent \
+                 (deleted {deleted}); parent has no closure rows"
+            )));
+        }
+        Ok(inserted)
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
     }
 
     /// Check if a group has any memberships.
+    ///
+    /// `LIMIT 1`, not `COUNT(*)`: the caller asks whether any row exists, and
+    /// the first one answers it. A count would read the whole set to produce
+    /// a number nobody looks at.
     async fn has_memberships<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
     ) -> Result<bool, DomainError> {
+        use sea_orm::QuerySelect;
+
         let scope = system_scope();
-        let count = MembershipEntity::find()
+        let first = MembershipEntity::find()
             .filter(membership_entity::Column::GroupId.eq(group_id))
+            .limit(1)
             .secure()
             .scope_with(&scope)
-            .count(db)
+            .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(count > 0)
+        Ok(first.is_some())
     }
 
     /// Delete all memberships for a group.
-    async fn delete_memberships<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<(), DomainError> {
-        let scope = system_scope();
-        MembershipEntity::delete_many()
-            .filter(membership_entity::Column::GroupId.eq(group_id))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(())
-    }
-
     /// Batch-resolve SMALLINT type IDs to GTS type path strings.
     ///
     /// Issues a single `SELECT ... WHERE id IN (...)` query for all distinct type IDs,
@@ -1086,6 +1406,54 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(models.into_iter().map(|m| (m.id, m.schema_id)).collect())
+    }
+}
+
+/// Map a `secure_insert::<ResourceGroupEntity>` failure to the `DomainError`
+/// it should surface as.
+///
+/// `id` is the group being inserted (used for the unique-violation answer);
+/// `parent_id` is the `parent_id` value that row was inserted with (used for
+/// the foreign-key answer below).
+fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> DomainError {
+    if e.is_unique_violation() {
+        DomainError::group_already_exists(id)
+    } else if e.is_foreign_key_violation() {
+        // The parent this create read a moment ago is gone: a
+        // concurrent non-force delete of it won the race, and
+        // `fk_resource_group_parent` is `ON DELETE RESTRICT`, so
+        // the loser learns about it here rather than from its own
+        // read. That read is the caller's snapshot; the FK check
+        // is not, which is exactly why this arm exists.
+        //
+        // It exists *now* because the non-force delete runs at the
+        // backend default. Under SERIALIZABLE on both sides the
+        // same race surfaced as a `40001` and the retry loop
+        // re-read a clean answer; with the delete lowered, SSI has
+        // no second serializable party to detect against and the
+        // foreign key answers instead. Unmapped it was a 500.
+        //
+        // Which foreign key, though: this table has two, and
+        // `fk_rg_gts_type` fails when a concurrent `delete_type`
+        // removes the type between this transaction resolving it
+        // and inserting. Answering *that* with "group not found,
+        // id = parent" would name the wrong resource and the wrong
+        // cause, so only the parent constraint maps. PostgreSQL
+        // puts the constraint name in the message; SQLite says
+        // only "FOREIGN KEY constraint failed", so there the
+        // answer stays a database error -- unhelpful, but not a
+        // confident lie, and the race needs concurrent writers
+        // SQLite does not have.
+        let msg = e.to_string();
+        if msg.contains(FK_RESOURCE_GROUP_PARENT)
+            && let Some(parent_id) = parent_id
+        {
+            DomainError::group_not_found(parent_id)
+        } else {
+            DomainError::database(msg)
+        }
+    } else {
+        DomainError::database(e.to_string())
     }
 }
 
@@ -1155,3 +1523,7 @@ impl TypeFilter {
     }
 }
 // @cpt-end:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
+
+#[cfg(test)]
+#[path = "group_repo_tests.rs"]
+mod tests;

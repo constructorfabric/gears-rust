@@ -3,9 +3,19 @@ name: ClusterFuzzLite PR Fuzzing
 on:
   pull_request:
     branches: [ main, develop ]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.clusterfuzzlite/**'
+      - 'tools/fuzz/**'
+      - '!**/tests/**'
+      - '!testing/**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!guidelines/**'
   workflow_dispatch:
 
 permissions:
@@ -49,7 +59,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzzing-crashes-${{ matrix.sanitizer }}-${{ github.sha }}
           path: |

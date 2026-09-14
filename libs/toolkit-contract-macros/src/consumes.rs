@@ -190,6 +190,9 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         fn #wire_fn(
             __hub: &::toolkit::ClientHub,
             __resolver: ::std::sync::Arc<dyn ::toolkit::discovery::EndpointResolver>,
+            __internal_token_provider: ::std::option::Option<
+                &::toolkit::contract_support::runtime::config::InternalTokenProvider,
+            >,
         ) -> ::anyhow::Result<::toolkit::discovery::WireOutcome> {
             // A compile-time (local) impl already registered wins — Profile 1.
             // Report `Local` so the runtime treats the dep as readiness-resolved
@@ -208,12 +211,17 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
             if __hub.has_remote_proxy::<dyn #contract_path>() {
                 return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote);
             }
-            // Otherwise register the directory-resolving REST client. `tuning`
-            // is `Default::default()` (inferred as `ClientTuning`).
+            // Otherwise register the directory-resolving REST client. The tuning
+            // carries the process's platform-plane credential source so the
+            // resolved client attaches `X-ToolKit-Internal-Token` on
+            // platform-plane methods (`cpt-cf-adr-two-plane-auth`); `None`
+            // (Profile 1 / no credential) attaches nothing.
+            let __tuning = ::toolkit::contract_support::wiring::ClientTuning::default()
+                .with_internal_token_provider(__internal_token_provider.cloned());
             let __client = #resolving_client_path::new(
                 __resolver,
                 #from,
-                ::core::default::Default::default(),
+                __tuning,
             );
             __hub.register_remote_proxy::<dyn #contract_path>(::std::sync::Arc::new(__client));
             ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote)

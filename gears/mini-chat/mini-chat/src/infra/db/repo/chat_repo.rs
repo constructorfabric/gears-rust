@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::domain::models::Chat;
 use async_trait::async_trait;
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::{Expr, LockType};
 use sea_orm::{EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Set};
 use time::OffsetDateTime;

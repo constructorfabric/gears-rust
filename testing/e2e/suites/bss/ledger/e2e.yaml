@@ -1,0 +1,14 @@
+suite: bss-ledger
+features:
+  - bss-ledger
+  - bss-rate-provider
+  - account-management
+  - static-idp
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - bss-ledger
+  - account-management
+  - static-idp-plugin

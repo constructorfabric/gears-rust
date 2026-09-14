@@ -102,7 +102,7 @@ pub use toolkit_contract::{
     ContractError, GrpcRepr, GrpcReprScalar, ProtoBridge, QueryParams, consumes, contract,
     grpc_contract, provides, rest_contract,
 };
-pub use toolkit_macros::{ExpandVars, gear, lifecycle};
+pub use toolkit_macros::{ExpandVars, domain_model, gear, lifecycle};
 
 pub mod contract_support {
     // Re-export only the items referenced from generated macro code (see
@@ -111,7 +111,7 @@ pub mod contract_support {
     #[cfg(feature = "contract-grpc-client")]
     pub use toolkit_contract::grpc;
     pub use toolkit_contract::{
-        contract, descriptor, error, grpc_repr, ir, policy, query, runtime,
+        contract, descriptor, error, grpc_repr, ir, policy, query, runtime, wiring,
     };
 }
 

@@ -65,7 +65,11 @@ fn test_error_conversion_mapping() {
     for (error, expected_status, expected_detail, expected_problem_type) in test_cases {
         let problem = wire(error);
 
-        assert_eq!(problem.status, expected_status, "Status code should match");
+        assert_eq!(
+            problem.status,
+            Some(expected_status),
+            "Status code should match"
+        );
         if let Some(expected_detail_content) = expected_detail {
             assert!(
                 problem.detail.contains(&expected_detail_content),
@@ -135,7 +139,7 @@ fn test_error_into_problem_trait() {
     let node_id = uuid::Uuid::new_v4();
     let problem = wire(DomainError::NodeNotFound(node_id));
 
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert!(problem.detail.contains(&node_id.to_string()));
     // `instance` is filled by the canonical error middleware on the way
     // out; at the conversion layer it stays None.

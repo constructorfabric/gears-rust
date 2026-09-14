@@ -1,0 +1,7 @@
+[gear]
+name = "Product & SKU Management"
+description = "Multi-tenant catalog registry for products, SKUs, taxonomy, and versioned snapshots."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

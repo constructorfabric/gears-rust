@@ -1,6 +1,6 @@
 use sea_orm::{
-    ColumnTrait, EntityTrait, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    Related, sea_query::Expr,
+    ColumnTrait, EntityTrait, ExprTrait, ModelTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Related, sea_query::Expr,
 };
 use std::sync::Arc;
 

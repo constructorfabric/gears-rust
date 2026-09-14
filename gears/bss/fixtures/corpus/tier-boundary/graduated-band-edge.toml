@@ -1,0 +1,60 @@
+family     = "tier-boundary"
+id         = "graduated-band-edge"
+kind       = "evaluation"
+provenance = ["AC#60", "PRD §17.2", "D-17"]
+
+# `graduated` is legal on `usage` rows only (`inst-mk-chargekind`, D-18), so
+# `usage` is the only honest chargeKind here.
+#
+# CLOSED (was OPEN, for the corpus owner). The row named no `meter`, and a usage
+# row's `Q` comes from one - `meter` is also one of the four fields the continued
+# tier counter is keyed on (`inst-tb-window-continuity`). It is the one repair in
+# this pass that was **not** forced by publishability: no Slice-3 row-local rule
+# requires `meter`, because meter injectivity is an aggregate publish check
+# (`inst-pr-return`) this gear does not implement, so the row published as
+# authored and `tests/corpus_snapshot_shape.rs` does not flag it. It was still a
+# case describing a metered row without saying what it meters, which is the same
+# under-authoring one rule short of being caught.
+#
+# `api.calls` reads directly against `whole_unit`: a call is counted whole, so
+# the band bound at 1000 is 1000 calls and not a quantization artefact - which is
+# the quantity this case's whole argument is about. It changes nothing the case
+# asserts: the oracle's `graduated` path reads the bands and `q`, and no other.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+tier_aggregation_window = "invoice_period"
+billing_granularity     = "whole_unit"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[snapshot.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 0 }
+why    = "no usage bills nothing; the open top band must not be reached"
+
+[[assert]]
+given  = { q = 999 }
+expect = { charge_minor = 4995 }
+why    = "the last unit inside band 1"
+
+[[assert]]
+given  = { q = 1000 }
+expect = { charge_minor = 5000 }
+why    = "half-open [from,to): q=1000 opens band 2, but graduated is marginal, so band 1 is consumed whole and band 2 contributes nothing"
+
+[[assert]]
+given  = { q = 1500 }
+expect = { charge_minor = 6500 }
+why    = "1000 units at 5 plus 500 at 3 — the marginal split"

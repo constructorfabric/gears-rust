@@ -49,6 +49,11 @@
 
 use std::sync::Arc;
 
+use account_management_sdk::idp_service_account::{
+    IdpListServiceAccountsRequest, IdpProvisionServiceAccountRequest,
+    IdpRevokeServiceAccountRequest, IdpRotateServiceAccountSecretRequest,
+    IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
+};
 use account_management_sdk::{
     IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest,
     IdpListUsersRequest, IdpPluginClient, IdpPluginSpecV1, IdpProvisionFailure, IdpProvisionResult,
@@ -295,6 +300,106 @@ impl IdpPluginClient for LazyIdpProvider {
             })
         } else {
             self.fallback.list_users(ctx, req).await
+        }
+    }
+
+    // ---- Service accounts ------------------------------------------
+    //
+    // These MUST be forwarded explicitly. `IdpPluginClient`'s
+    // service-account methods carry default bodies returning
+    // `UnsupportedOperation` so tenant/user-only adapters compile without
+    // stubbing them — which means an override omitted HERE is not a compile
+    // error, it silently answers 501 for every plugin, however capable.
+    // `ServiceAccountService` holds this wrapper (not the resolved plugin),
+    // so this is the only path the whole machine-identity REST surface has.
+
+    async fn provision_service_account(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpProvisionServiceAccountRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        if let Some(plugin) = self.resolve().await {
+            return plugin.provision_service_account(ctx, req).await;
+        }
+        if self.required {
+            // `CleanFailure` (503), not `Ambiguous`: nothing was sent, so
+            // retrying the same request once the catalogue settles is safe.
+            Err(IdpServiceAccountFailure::CleanFailure {
+                detail: format!(
+                    "idp provider plugin (vendor `{}`) not yet resolvable; retry once \
+                     types-registry catalogue settles",
+                    self.vendor
+                ),
+            })
+        } else {
+            self.fallback.provision_service_account(ctx, req).await
+        }
+    }
+
+    async fn rotate_service_account_secret(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpRotateServiceAccountSecretRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        if let Some(plugin) = self.resolve().await {
+            return plugin.rotate_service_account_secret(ctx, req).await;
+        }
+        if self.required {
+            Err(IdpServiceAccountFailure::CleanFailure {
+                detail: format!(
+                    "idp provider plugin (vendor `{}`) not yet resolvable; retry once \
+                     types-registry catalogue settles",
+                    self.vendor
+                ),
+            })
+        } else {
+            self.fallback.rotate_service_account_secret(ctx, req).await
+        }
+    }
+
+    async fn revoke_service_account(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpRevokeServiceAccountRequest,
+    ) -> Result<(), IdpServiceAccountFailure> {
+        if let Some(plugin) = self.resolve().await {
+            return plugin.revoke_service_account(ctx, req).await;
+        }
+        if self.required {
+            // NOT `NotFound`: AM treats that as success-equivalent, and an
+            // unresolvable plugin has proven nothing about whether the
+            // account exists. Reporting a successful revoke here would let a
+            // live machine credential survive a caller's DELETE.
+            Err(IdpServiceAccountFailure::CleanFailure {
+                detail: format!(
+                    "idp provider plugin (vendor `{}`) not yet resolvable; retry once \
+                     types-registry catalogue settles",
+                    self.vendor
+                ),
+            })
+        } else {
+            self.fallback.revoke_service_account(ctx, req).await
+        }
+    }
+
+    async fn list_service_accounts(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpListServiceAccountsRequest,
+    ) -> Result<Vec<IdpServiceAccountSummary>, IdpServiceAccountFailure> {
+        if let Some(plugin) = self.resolve().await {
+            return plugin.list_service_accounts(ctx, req).await;
+        }
+        if self.required {
+            Err(IdpServiceAccountFailure::CleanFailure {
+                detail: format!(
+                    "idp provider plugin (vendor `{}`) not yet resolvable; retry once \
+                     types-registry catalogue settles",
+                    self.vendor
+                ),
+            })
+        } else {
+            self.fallback.list_service_accounts(ctx, req).await
         }
     }
 }

@@ -1,0 +1,49 @@
+family     = "supersession-continuity"
+id         = "price-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-82"]
+
+# The positive case, and the one that keeps the guard honest. Supersession *is*
+# a price change on one key: new amounts, new bands. A guard that rejected this
+# too would have made the whole mechanism unusable, so the corpus has to pin
+# what stays allowed, not only what is forbidden.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[predecessor.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = 2000
+  unit_amount_minor = 7
+
+  [[successor.bands]]
+  from_qty = 2000
+  to_qty   = "open"
+  unit_amount_minor = 4
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "every unit/counter-determining field is unchanged; band bounds and amounts moved, which is exactly the lever supersession exists to pull"

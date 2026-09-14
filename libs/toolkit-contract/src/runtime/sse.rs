@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 
 use toolkit_canonical_errors::Problem;
 
+use crate::ir::binding::StreamFraming;
 use crate::runtime::transport_error::TransportError;
 
 /// Adapter that lifts a `Display`-only error into an `Error + Send + Sync + 'static`
@@ -76,22 +77,27 @@ impl LastEventId {
 /// Maximum bytes the parser accumulates for a not-yet-terminated line ([`SseStream::buf`])
 /// or for a not-yet-dispatched event's `data:` payload ([`SseStream::event_data`])
 /// before treating the peer as protocol-violating and terminating the stream
-/// with [`TransportError::sse`]. Generous enough for any realistic single
+/// with [`TransportError::Framing`]. Generous enough for any realistic single
 /// event; guards against unbounded memory growth from a misbehaving peer.
 const MAX_ACCUMULATED_BYTES: usize = 16 * 1024 * 1024;
 
-/// Shared monotonic counter bumped every time the parser receives a byte chunk
-/// from the wire — **including** chunks that carry only keepalive comments or
-/// other non-dispatching frames. Streaming clients snapshot it around an idle
-/// wait so a low-data-rate stream kept alive purely by `:keepalive` comments is
-/// recognised as *active* rather than *idle* (the idle timeout must be idle).
+/// Shared monotonic counter bumped every time a streaming parser receives a
+/// byte chunk from the wire — **including** chunks that dispatch no item (SSE
+/// keepalive comments, a multipart part header block arriving on its own).
+/// Streaming clients snapshot it around an idle wait so a low-data-rate stream
+/// kept alive purely by non-dispatching traffic is recognised as *active*
+/// rather than *idle* (the idle timeout must be idle).
+///
+/// Framing-neutral so the streaming driver can apply one idle rule to every
+/// framing: [`crate::runtime::multipart::MultipartStream`] exposes the same
+/// handle as [`SseStream`] does.
 ///
 /// Wraps `Arc<AtomicU64>` as a newtype so the atomic choice isn't part of the
 /// public surface.
 #[derive(Clone, Debug, Default)]
-pub struct SseActivity(Arc<AtomicU64>);
+pub struct StreamActivity(Arc<AtomicU64>);
 
-impl SseActivity {
+impl StreamActivity {
     /// Create a fresh activity counter at generation 0.
     #[must_use]
     pub fn new() -> Self {
@@ -105,8 +111,9 @@ impl SseActivity {
         self.0.load(Ordering::Relaxed)
     }
 
-    /// Record that a wire chunk arrived.
-    fn bump(&self) {
+    /// Record that a wire chunk arrived. Crate-visible so every framing
+    /// parser in [`crate::runtime`] can bump the same counter.
+    pub(crate) fn bump(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -151,7 +158,7 @@ where
         done: false,
         explicit_done: false,
         last_event_id,
-        activity: SseActivity::new(),
+        activity: StreamActivity::new(),
         _marker: std::marker::PhantomData,
     }
 }
@@ -186,7 +193,7 @@ pub struct SseStream<T, S> {
     /// latter as reconnect-eligible instead of a silent success.
     explicit_done: bool,
     last_event_id: LastEventId,
-    activity: SseActivity,
+    activity: StreamActivity,
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
@@ -210,9 +217,9 @@ impl<T, S> SseStream<T, S> {
 
     /// Returns a clone of the shared wire-activity counter. The streaming client
     /// snapshots it around an idle-timeout wait so keepalive-only traffic keeps
-    /// the stream alive (see [`SseActivity`]).
+    /// the stream alive (see [`StreamActivity`]).
     #[must_use]
-    pub fn activity_handle(&self) -> SseActivity {
+    pub fn activity_handle(&self) -> StreamActivity {
         self.activity.clone()
     }
 }
@@ -293,7 +300,8 @@ where
                         || this.event_data.len() > MAX_ACCUMULATED_BYTES
                     {
                         this.done = true;
-                        return Poll::Ready(Some(Err(TransportError::sse(
+                        return Poll::Ready(Some(Err(TransportError::framing(
+                            StreamFraming::ServerSentEvents,
                             "SSE frame exceeds maximum accumulated size; aborting stream",
                         ))));
                     }
@@ -332,9 +340,10 @@ fn drain_buffer<T: DeserializeOwned + 'static>(
                 }
             }
             Err(e) => {
-                out.push_back(Err(TransportError::sse(format!(
-                    "invalid UTF-8 in SSE frame: {e}"
-                ))));
+                out.push_back(Err(TransportError::framing(
+                    StreamFraming::ServerSentEvents,
+                    format!("invalid UTF-8 in SSE frame: {e}"),
+                )));
             }
         }
     }
@@ -471,7 +480,10 @@ fn dispatch_event<T: DeserializeOwned + 'static>(
 fn parse_problem(payload: &str) -> TransportError {
     match serde_json::from_str::<Problem>(payload) {
         Ok(p) => TransportError::problem(p),
-        Err(e) => TransportError::sse(format!("malformed error event: {e}")),
+        Err(e) => TransportError::framing(
+            StreamFraming::ServerSentEvents,
+            format!("malformed error event: {e}"),
+        ),
     }
 }
 
@@ -499,232 +511,5 @@ fn find_line_end(buf: &[u8], start: usize) -> Option<LineEnd> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use futures_util::stream::{self, StreamExt};
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
-    struct Item {
-        id: u32,
-    }
-
-    fn chunks(parts: &[&str]) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin + use<> {
-        let owned: Vec<Result<Bytes, std::io::Error>> = parts
-            .iter()
-            .map(|s| Ok(Bytes::from(s.to_string())))
-            .collect();
-        Box::pin(stream::iter(owned))
-    }
-
-    #[tokio::test]
-    async fn parses_data_events() {
-        let s = chunks(&[
-            "data: {\"id\":1}\n\n",
-            "data: {\"id\":2}\n\n",
-            "event: done\n\n",
-        ]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 1 }, Item { id: 2 }]);
-    }
-
-    #[tokio::test]
-    async fn handles_data_split_across_chunks() {
-        let s = chunks(&["data: {\"i", "d\":7}\n\nevent: done\n\n"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 7 }]);
-    }
-
-    #[tokio::test]
-    async fn finds_newline_after_many_chunks_with_none() {
-        // Regression test for the incremental `scan_from` optimization (#15):
-        // several chunks arrive with NO newline at all before one finally
-        // completes the line. If `scan_from` bookkeeping were wrong (e.g.
-        // never advanced, or advanced past the eventual `\n`), this would
-        // either loop scanning the same bytes forever or miss the newline.
-        let s = chunks(&["data: {\"i", "d\"", ":", "9", "}", "\n\nevent: done\n\n"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 9 }]);
-    }
-
-    #[tokio::test]
-    async fn finds_multiple_newlines_within_one_chunk_after_split() {
-        // After a successful split, `scan_from` must reset to 0 for the
-        // remainder — otherwise a `\n` arriving in the SAME chunk as the one
-        // that completed the prior event would be missed until a later poll
-        // (or never, if no more chunks arrive). Two full events delivered in
-        // ONE chunk exercises exactly that: both must be found and dispatched
-        // within this single `drain_buffer` call.
-        let s = chunks(&["data: {\"id\":1}\n\ndata: {\"id\":2}\n\nevent: done\n\n"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 1 }, Item { id: 2 }]);
-    }
-
-    #[tokio::test]
-    async fn aborts_on_unterminated_line_exceeding_max_size() {
-        // A single line with no terminating `\n` that exceeds the cap must
-        // abort the stream with a typed error rather than growing `buf`
-        // without bound (#3 — OOM/DoS guard).
-        let huge = "a".repeat(MAX_ACCUMULATED_BYTES + 1);
-        let s = chunks(&[huge.as_str()]);
-        let parsed: Vec<Result<Item, TransportError>> =
-            parse_sse_stream::<Item, _, _>(s).collect().await;
-        assert_eq!(parsed.len(), 1, "expected exactly one terminal error item");
-        assert!(
-            matches!(parsed[0], Err(TransportError::Sse(_))),
-            "expected TransportError::Sse, got {:?}",
-            parsed[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn saw_done_event_is_false_when_stream_ends_without_done() {
-        // The stream ends cleanly (no error) but WITHOUT an `event: done`
-        // frame — the streaming client relies on `saw_done_event()` to tell
-        // this apart from an explicit done so it can reconnect instead of
-        // silently treating a bare disconnect as success.
-        let s = chunks(&["data: {\"id\":1}\n\n"]);
-        let mut stream = parse_sse_stream::<Item, _, _>(s);
-        let first = stream.next().await;
-        assert!(matches!(first, Some(Ok(Item { id: 1 }))));
-        let second = stream.next().await;
-        assert!(second.is_none(), "expected clean end, got {second:?}");
-        assert!(
-            !stream.saw_done_event(),
-            "stream ended without an explicit `done` event"
-        );
-    }
-
-    #[tokio::test]
-    async fn saw_done_event_is_true_when_done_dispatched() {
-        let s = chunks(&["data: {\"id\":1}\n\n", "event: done\n\n"]);
-        let mut stream = parse_sse_stream::<Item, _, _>(s);
-        assert!(matches!(stream.next().await, Some(Ok(Item { id: 1 }))));
-        assert!(stream.next().await.is_none());
-        assert!(stream.saw_done_event());
-    }
-
-    #[tokio::test]
-    async fn surfaces_error_event_as_problem() {
-        // Canonical RFC 9457 Problem on the `event: error` channel.
-        let problem = serde_json::json!({
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
-            "title": "Internal",
-            "status": 500,
-            "detail": "broke",
-            "context": {}
-        });
-        let body = format!("event: error\ndata: {problem}\n\nevent: done\n\n");
-        let s = chunks(&[&body]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        assert_eq!(parsed.len(), 1);
-        match parsed.into_iter().next().unwrap() {
-            Err(TransportError::Problem { problem: p, .. }) => {
-                assert_eq!(p.detail, "broke");
-                assert!(p.problem_type.contains("internal"));
-            }
-            other => panic!("expected Problem, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ignores_comments_and_blank_lines() {
-        let s = chunks(&[":heartbeat\n\ndata: {\"id\":3}\n\nevent: done\n\n"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 3 }]);
-    }
-
-    #[tokio::test]
-    async fn ignores_named_control_events() {
-        // A named event (`ping`) with a JSON body must NOT be decoded as the
-        // typed item; only the implicit `message` channel yields items.
-        let s = chunks(&[
-            "event: ping\ndata: {\"id\":9}\n\n",
-            "data: {\"id\":1}\n\n",
-            "event: done\n\n",
-        ]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 1 }]);
-    }
-
-    #[tokio::test]
-    async fn discards_truncated_trailing_event_at_eof() {
-        // Stream ends mid-event (no terminating blank line): the incomplete
-        // event is discarded per spec — no item and no serialization error.
-        let s = chunks(&["data: {\"id\":", "5"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        assert!(parsed.is_empty(), "expected no items, got {parsed:?}");
-    }
-
-    #[tokio::test]
-    async fn malformed_json_yields_serialization_error() {
-        let s = chunks(&["data: not-json\n\nevent: done\n\n"]);
-        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
-        assert_eq!(parsed.len(), 1);
-        match parsed.into_iter().next().unwrap() {
-            Err(TransportError::Serialization(_)) => {}
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn captures_id_field_for_reconnect() {
-        let cell = LastEventId::empty();
-        let s = chunks(&[
-            "id: 42\ndata: {\"id\":1}\n\n",
-            "id: 43\ndata: {\"id\":2}\n\n",
-            "event: done\n\n",
-        ]);
-        let stream = parse_sse_stream_with_id::<Item, _, _>(s, cell.clone());
-        let parsed: Vec<_> = stream.collect().await;
-        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(parsed, vec![Item { id: 1 }, Item { id: 2 }]);
-        // After all events parsed, the cell holds the last seen id.
-        assert_eq!(cell.current().as_deref(), Some("43"));
-    }
-
-    #[tokio::test]
-    async fn joins_multiple_data_lines_with_newline() {
-        // Two `data:` lines combine to form a single valid JSON object.
-        #[derive(Debug, Deserialize, PartialEq, Eq)]
-        struct Multi {
-            text: String,
-        }
-        // Wire:
-        //   data: {"text":
-        //   data:  "hi"}
-        //   <blank>
-        // Joined payload: `{"text":\n "hi"}` — valid JSON.
-        let body = "data: {\"text\":\ndata:  \"hi\"}\n\nevent: done\n\n";
-        let s = chunks(&[body]);
-        let parsed: Vec<_> = parse_sse_stream::<Multi, _, _>(s).collect().await;
-        let parsed: Vec<Multi> = parsed.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(
-            parsed,
-            vec![Multi {
-                text: "hi".to_owned()
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_id_field_clears_saved_value() {
-        // Per HTML5 EventSource spec, an empty `id:` resets the
-        // Last-Event-ID to None (won't be sent on reconnect).
-        let cell = LastEventId::empty();
-        let s = chunks(&[
-            "id: 7\ndata: {\"id\":1}\n\n",
-            "id: \ndata: {\"id\":2}\n\n",
-            "event: done\n\n",
-        ]);
-        let stream = parse_sse_stream_with_id::<Item, _, _>(s, cell.clone());
-        let _: Vec<_> = stream.collect().await;
-        assert!(cell.current().is_none());
-    }
-}
+#[path = "sse_tests.rs"]
+mod tests;

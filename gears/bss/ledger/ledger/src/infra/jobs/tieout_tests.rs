@@ -4,7 +4,7 @@
 //! Uses `noop()` publisher (no broker/assert-via-report).
 //!
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --lib 'infra::jobs::tieout::tests' -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::tieout::tests' -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -18,10 +18,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -29,9 +28,9 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{
-    EntryBackstopAcc, ImbalancedEntry, NegativeGrain, PaymentCounterAcc, PaymentCounterVariance,
-    SubGrainAcc, SubGrainVariance, TieOutReport, cache_baseline_rows, cache_grains, fold_grains,
-    key_account, negative_grains, settle_index, verify_incremental,
+    AccountBalanceVariance, EntryBackstopAcc, ImbalancedEntry, NegativeGrain, PaymentCounterAcc,
+    PaymentCounterVariance, SubGrainAcc, SubGrainVariance, TieOutReport, cache_baseline_rows,
+    cache_grains, fold_grains, key_account, negative_grains, settle_index, verify_incremental,
 };
 use crate::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use crate::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
@@ -46,6 +45,7 @@ use crate::infra::storage::entity::{
 };
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo::ReferenceRepo;
+use time::OffsetDateTime;
 
 fn bal(account_id: u128, class: &str, balance_minor: i64) -> account_balance::Model {
     account_balance::Model {
@@ -132,21 +132,86 @@ fn clean_report() -> TieOutReport {
     }
 }
 
+/// Every defect vector on its own, because `is_clean` is a conjunction.
+///
+/// Seeding one vector leaves every other conjunct free, so a chain that has lost
+/// one still answers `false` for the vector that is populated. With only
+/// `negative_grains` seeded, `sub_grain_variances`, `imbalanced_entries` and
+/// `payment_counter_variances` can each be dropped from the `&&` with the whole
+/// suite green, and a diverged sub-grain cache then reads as clean books.
 #[test]
 fn is_clean_true_only_when_all_defect_vecs_empty() {
+    type Seed = fn(&mut TieOutReport);
+
     let clean = clean_report();
     assert!(clean.is_clean());
 
-    let mut dirty = clean_report();
-    dirty.negative_grains.push(NegativeGrain {
+    let seeds: Vec<(&str, Seed)> = vec![
+        ("account_balance_variances", |report| {
+            report
+                .account_balance_variances
+                .push(AccountBalanceVariance {
+                    account_id: Uuid::from_u128(1),
+                    currency: "USD".to_owned(),
+                    computed: 100,
+                    cached: 90,
+                });
+        }),
+        ("sub_grain_variances", |report| {
+            report.sub_grain_variances.push(SubGrainVariance {
+                grain: "ar_payer_balance",
+                key: "payer=1".to_owned(),
+                computed: 100,
+                cached: 90,
+            });
+        }),
+        ("imbalanced_entries", |report| {
+            report.imbalanced_entries.push(ImbalancedEntry {
+                entry_id: Uuid::from_u128(2),
+                currency: "USD".to_owned(),
+                net_minor: 10,
+                line_count: 2,
+                payer_count: 1,
+            });
+        }),
+        ("negative_grains", |report| {
+            report.negative_grains.push(NegativeGrain {
+                account_id: Uuid::from_u128(1),
+                currency: "USD".to_owned(),
+                balance_minor: -50,
+            });
+        }),
+        ("payment_counter_variances", |report| {
+            report
+                .payment_counter_variances
+                .push(PaymentCounterVariance {
+                    payment_id: "pay-1".to_owned(),
+                    counter: "allocated_minor",
+                    computed: 100,
+                    cached: 90,
+                });
+        }),
+    ];
+
+    for (vector, seed) in seeds {
+        let mut dirty = clean_report();
+        seed(&mut dirty);
+        assert!(
+            !dirty.is_clean(),
+            "a report carrying one {vector} entry is not clean"
+        );
+    }
+
+    let mut negative = clean_report();
+    negative.negative_grains.push(NegativeGrain {
         account_id: Uuid::from_u128(1),
         currency: "USD".to_owned(),
         balance_minor: -50,
     });
-    assert!(!dirty.is_clean());
     assert!(
-        dirty.summary().contains("negative"),
-        "summary must name the negative_grains count"
+        negative.summary().contains("negative_grains=1"),
+        "the summary carries the count, not just the word: {}",
+        negative.summary()
     );
 }
 
@@ -235,7 +300,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -298,7 +363,7 @@ fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec
         source_business_id: business_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -377,7 +442,7 @@ async fn setup_with_one_balanced_post(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_clean_tenant_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -418,7 +483,7 @@ async fn run_over_clean_tenant_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_drifted_tenant_emits_alarm() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -426,7 +491,7 @@ async fn run_over_drifted_tenant_emits_alarm() {
 
     // Corrupt the AR balance cache grain (add 1 so no-negative check stays
     // satisfied while creating a variance for the tie-out).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
@@ -771,7 +836,7 @@ fn settle_entry(entry_id: Uuid, payment_id: &str) -> journal_entry::Model {
         source_business_id: payment_id.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::from_u128(0xA1),
@@ -824,7 +889,7 @@ fn alloc_row(payment_id: &str, invoice_id: &str, amount_minor: i64) -> payment_a
         amount_minor,
         currency: "USD".to_owned(),
         precedence_policy_ref: "p".to_owned(),
-        allocated_at_utc: Utc::now(),
+        allocated_at_utc: OffsetDateTime::now_utc(),
     }
 }
 
@@ -1024,7 +1089,7 @@ fn cache_baseline_rows_roundtrip() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn incremental_tie_out_equals_full_across_periods() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, service, provider, f) = setup(&url).await;
@@ -1036,7 +1101,7 @@ async fn incremental_tie_out_equals_full_across_periods() {
     service.post(&ctx, &scope, e1, l1, None).await.unwrap();
 
     // Close period 1 and snapshot its verified baseline (mirrors period-close).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND period_id='{}'",
         f.tenant, f.period_id
@@ -1050,7 +1115,7 @@ async fn incremental_tie_out_equals_full_across_periods() {
         .expect("snapshot baseline at close");
 
     // Open period 2 and post into it.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
          VALUES ('{}','{}','202607','UTC','OPEN')",
         f.tenant, f.legal_entity

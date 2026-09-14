@@ -151,6 +151,11 @@ impl MigrationTrait for Migration {
                     .await?;
             }
             sea_orm::DatabaseBackend::MySql => {}
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         }
 
         manager
@@ -189,6 +194,11 @@ impl MigrationTrait for Migration {
                     .await?;
             }
             sea_orm::DatabaseBackend::MySql => {}
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         }
 
         // Message body lives in `message_parts` (ordered typed parts) rather
@@ -374,6 +384,11 @@ impl MigrationTrait for Migration {
                     .await?;
             }
             sea_orm::DatabaseBackend::MySql => {}
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         }
 
         manager

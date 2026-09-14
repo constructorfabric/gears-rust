@@ -6,7 +6,7 @@ SDK crate for the AuthZ Resolver gear, providing the authorization evaluation AP
 
 This crate defines the transport-agnostic interface for the AuthZ Resolver gear:
 
-- **`AuthZResolverClient`** — Async trait for evaluating authorization requests
+- **`AuthZResolverApi`** — Transport-agnostic `#[toolkit::contract]` for evaluating authorization requests (in-process via `ClientHub`, or out-of-process via the generated directory-resolving REST client).
 - **`AuthZResolverPluginClient`** — Async trait for PDP plugin implementations
 - **`PolicyEnforcer`** — High-level PEP helper (build request → evaluate → compile to `AccessScope`)
 - **`EvaluationRequest` / `EvaluationResponse`** — AuthZEN 1.0-based request/response models
@@ -29,8 +29,10 @@ const USER: ResourceType = ResourceType {
     supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 };
 
-// Create enforcer once during service init
-let authz = hub.get::<dyn AuthZResolverClient>()?;
+// Create enforcer once during service init.
+// In-process: resolve the client eagerly. Out-of-process consumers (the client
+// is wired after `init`) should use `PolicyEnforcer::from_hub(hub)` instead.
+let authz = hub.get::<dyn AuthZResolverApi>()?;
 let enforcer = PolicyEnforcer::new(authz.clone());
 
 // All CRUD operations return AccessScope for SecureORM
@@ -61,10 +63,12 @@ let scope = enforcer.access_scope_with(
 For cases where `PolicyEnforcer` is not suitable:
 
 ```rust
-use authz_resolver_sdk::{AuthZResolverClient, EvaluationRequest};
+use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest};
 
-let authz = hub.get::<dyn AuthZResolverClient>()?;
-let response = authz.evaluate(request).await?;
+// `ctx` is the caller's `SecurityContext`; over REST the generated client
+// attaches its bearer token so the PDP can authenticate the call.
+let authz = hub.get::<dyn AuthZResolverApi>()?;
+let response = authz.evaluate(ctx.clone(), request).await?;
 
 if response.decision {
     // Access granted; optionally compile constraints

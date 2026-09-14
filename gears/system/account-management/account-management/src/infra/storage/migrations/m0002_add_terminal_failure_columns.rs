@@ -48,7 +48,7 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE tenants ADD COLUMN terminal_failure_at TEXT NULL;",
                 "CREATE INDEX IF NOT EXISTS idx_tenants_provisioning_active_scan ON tenants (created_at) WHERE status = 0 AND terminal_failure_at IS NULL;",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.into()));
             }
         };
@@ -74,7 +74,7 @@ impl MigrationTrait for Migration {
                 // every supported AM SQLite target satisfies that.
                 "ALTER TABLE tenants DROP COLUMN terminal_failure_at;",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.into()));
             }
         };

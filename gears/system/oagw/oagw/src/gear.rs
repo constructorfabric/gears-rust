@@ -7,7 +7,7 @@ use crate::domain::type_catalog::oagw_gts_entities;
 use crate::domain::type_provisioning::TypeProvisioningService;
 use crate::infra::type_provisioning::TypeProvisioningServiceImpl;
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use tenant_resolver_sdk::TenantResolverClient;
@@ -84,7 +84,7 @@ impl Gear for OutboundApiGatewayGear {
         let credstore = ctx.client_hub().get::<dyn CredStoreClientV1>()?;
 
         // -- AuthZ resolver for permission checks --
-        let authz = ctx.client_hub().get::<dyn AuthZResolverClient>()?;
+        let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
         let policy_enforcer = PolicyEnforcer::new(authz);
 
         let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(

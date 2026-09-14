@@ -3,7 +3,15 @@
 //! Recognized attributes on trait methods:
 //! - `#[get("/path/{param}")]`, `#[post(...)]`, `#[put(...)]`, `#[delete(...)]`
 //! - `#[retryable]` — marks the method as safe to retry on transport failure.
-//! - `#[streaming]` — marks the method as server-streaming (SSE).
+//! - `#[streaming]`, `#[streaming(sse)]`, `#[streaming(multipart_mixed)]` —
+//!   marks the method as server-streaming and selects the wire framing. A bare
+//!   `#[streaming]` is SSE. The method's `asyncness` selects the *open shape*
+//!   (mirroring the base macro in `parse.rs`): a `#[streaming] async fn` emits
+//!   the fallible open `-> Result<Stream, E>`, a non-`async` `#[streaming] fn`
+//!   emits the immediate open `-> Stream`. This parser previously ignored
+//!   `asyncness` and normalised `async` away, so a stray `async` on a REST
+//!   streaming projection now silently changes the emitted signature — audit
+//!   existing projections (see DESIGN.md, #4740).
 //! - `#[server_manual]` — skip server-route generation for this method.
 //! - `#[exposed]` / `#[internal]` — edge visibility, overriding the trait-level
 //!   `visibility` default. Internal unless said otherwise.
@@ -15,6 +23,8 @@
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
+
+use crate::model::{MethodShape, StreamFraming, StreamOpen};
 
 pub struct RestContractAttr {
     pub base_path: String,
@@ -48,7 +58,16 @@ pub struct RestMethodModel {
     pub http_method: HttpVerb,
     pub path_template: String,
     pub retryable: bool,
-    pub streaming: bool,
+    /// Unary, or server-streaming with how its stream is opened
+    /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
+    /// `Stream(Awaited)`). Folds what was a `streaming: bool` + `open:
+    /// StreamOpen` pair, so an `open` exists exactly when the method streams
+    /// (#4740).
+    pub shape: MethodShape,
+    /// Wire framing selected by `#[streaming(sse | multipart_mixed)]`. A bare
+    /// `#[streaming]` means SSE, which is what it has always meant. Meaningless
+    /// for a `MethodShape::Unary` method, where it stays at its default.
+    pub stream_framing: StreamFraming,
     pub params: Vec<RestParam>,
     /// `Some((ok_ty, err_ty))` extracted from the method's `Result<T, E>`
     /// return type. Populated for **both** unary and streaming methods (a
@@ -252,6 +271,8 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     let mut http: Option<(HttpVerb, String, Span)> = None;
     let mut retryable = false;
     let mut streaming = false;
+    let mut stream_framing = StreamFraming::default();
+    let mut stream_open_arg: Option<StreamOpen> = None;
     let mut server_manual = false;
     let mut exposed: Option<bool> = None;
     let mut anonymous = false;
@@ -288,7 +309,22 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         } else if path.is_ident("retryable") {
             retryable = true;
         } else if path.is_ident("streaming") {
+            // Reject a SECOND `#[streaming]` before it overwrites the framing /
+            // open selectors — last-one-wins would silently change the emitted
+            // signature with no signal, exactly the hazard the verb dedup above
+            // guards against.
+            if streaming {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate `#[streaming]` attribute: a streaming method declares it exactly \
+                     once (all framing and open selectors go in that one attribute)",
+                ));
+            }
             streaming = true;
+            let args = crate::stream_attr::parse_streaming_args(attr)?;
+            // A bare `#[streaming]` is SSE — what the marker has always meant.
+            stream_framing = args.framing.unwrap_or_default();
+            stream_open_arg = args.open;
         } else if path.is_ident("server_manual") {
             server_manual = true;
         } else if path.is_ident("exposed") || path.is_ident("internal") {
@@ -327,23 +363,14 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     // (its base ends in `Api`/`Backend`, enforced above), so a missing context
     // is a hard error rather than a silently-unauthenticated call.
     match params.first() {
-        // Platform-plane REST is deferred: the client does not yet source the
-        // internal token (`X-ToolKit-Internal-Token`), so a generated client for
-        // such a method would emit an *unauthenticated* request. Reject it at
-        // compile time (rather than silently shipping a broken client) until the
-        // token carrier is wired below the contract layer. Platform-plane system
-        // contracts are served today over gRPC (`InternalAuthInterceptor`) or by
-        // a manual client. See DESIGN §2.2 "Security Context on Remote Contracts".
-        Some(first) if crate::projection::is_platform_security_context_type(&first.ty) => {
-            return Err(syn::Error::new_spanned(
-                &first.ty,
-                "platform-plane REST projections are not supported yet: the generated \
-                 client cannot source the internal token, so it would emit an \
-                 unauthenticated request. Serve this contract over gRPC \
-                 (`#[toolkit::grpc_contract]` + `InternalAuthInterceptor`) or write a \
-                 manual client. See DESIGN section 2.2 (cpt-cf-binding-constraint-security-context)",
-            ));
-        }
+        // Either plane is accepted. The context type is the compile-time plane
+        // marker: tenant `SecurityContext` routes to `Authorization: Bearer`
+        // (from the argument), platform `PlatformSecurityContext` routes to the
+        // transport-injected `X-ToolKit-Internal-Token` (sourced by the runtime
+        // from the process's `InternalCredential`, never from the argument). The
+        // generated client keeps whichever marker off the wire and fills the
+        // carrier below the contract layer — see `generate_client_method` in
+        // `rest_contract.rs` (cpt-cf-adr-two-plane-auth / -platform-plane-auth).
         Some(first) if crate::projection::is_security_context_type(&first.ty) => {}
         _ => {
             return Err(syn::Error::new(
@@ -365,12 +392,27 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     )?);
     let optional = method.default.is_some();
 
+    // The open shape is selected by `#[streaming(open = fallible)]` and
+    // cross-checked against `async` — the same rule as the base and gRPC
+    // parsers, shared in `stream_attr`.
+    let shape = if streaming {
+        let open = crate::stream_attr::resolve_stream_open(
+            stream_open_arg,
+            method.sig.asyncness.is_some(),
+            method.sig.ident.span(),
+        )?;
+        MethodShape::Stream(open)
+    } else {
+        MethodShape::Unary
+    };
+
     Ok(RestMethodModel {
         ident,
         http_method,
         path_template,
         retryable,
-        streaming,
+        shape,
+        stream_framing,
         params,
         result_types,
         optional,
@@ -447,6 +489,27 @@ fn parse_params(method: &TraitItemFn) -> syn::Result<Vec<RestParam>> {
             ty: (*pat_type.ty).clone(),
         });
     }
+
+    // Exactly one security-plane context per method: `capture_auth_credentials`
+    // (`rest_contract.rs`) picks a single param — via `.find`, unconditionally
+    // the first — to source the auth metadata from. A second context param
+    // (e.g. a stray `PlatformSecurityContext` alongside a tenant
+    // `SecurityContext`) would silently be dropped from the wire without ever
+    // being consulted for token attachment, mixing planes. Mirrors the same
+    // check in `grpc_contract_parse::parse_params`.
+    let secctx_count = params
+        .iter()
+        .filter(|p| crate::projection::is_security_context_type(&p.ty))
+        .count();
+    if secctx_count > 1 {
+        return Err(syn::Error::new(
+            method.sig.ident.span(),
+            "rest_contract method must take at most one security-plane context \
+             parameter (`SecurityContext` or `PlatformSecurityContext`); found more \
+             than one",
+        ));
+    }
+
     Ok(params)
 }
 
@@ -511,5 +574,41 @@ impl HttpVerb {
 
     pub fn allows_body(self) -> bool {
         matches!(self, HttpVerb::Post | HttpVerb::Put | HttpVerb::Patch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_params;
+    use syn::parse_quote;
+
+    #[test]
+    fn rejects_methods_with_two_security_context_params() {
+        let method: syn::TraitItemFn = parse_quote! {
+            async fn charge(
+                &self,
+                ctx: SecurityContext,
+                other: PlatformSecurityContext,
+                body: String,
+            ) -> Result<u32, std::io::Error>;
+        };
+        let err = parse_params(&method)
+            .map(|_| ())
+            .expect_err("two security-context params must be rejected");
+        assert!(
+            err.to_string()
+                .contains("at most one security-plane context"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_single_security_context_param() {
+        let method: syn::TraitItemFn = parse_quote! {
+            async fn charge(&self, ctx: SecurityContext, body: String) -> Result<u32, std::io::Error>;
+        };
+        let params = parse_params(&method).expect("a single security-context param is valid");
+        // `self` (a `Receiver`, not `FnArg::Typed`) never lands in `params`.
+        assert_eq!(params.len(), 2);
     }
 }

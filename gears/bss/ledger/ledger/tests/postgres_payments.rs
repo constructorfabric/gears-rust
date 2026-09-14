@@ -1,14 +1,18 @@
 //! Postgres-only repo-level tests for `PaymentRepo` (the payment counter
 //! tables + the allocation candidate / view reads). Ignored by default; run
-//! with `cargo test -p bss-ledger --test postgres_payments -- --ignored`.
+//! with `cargo test -p cf-gears-bss-ledger --test postgres_payments -- --ignored`.
 //!
 //! Covers: (a) `seed_settlement` then `read_settlement` round-trips
 //! `settled_minor`; (b) two `add_allocated` calls net; (c) `add_allocated`
 //! past `settled_minor` trips the cap CHECK → `MoneyOutCapExceeded`;
 //! (d) `insert_allocation_rows` then `list_payment_allocations` returns N
 //! rows; (e) `list_open_ar_invoices` filters `balance_minor > 0` and orders
-//! `original_posted_at, invoice_id`; (f) `bump_allocation_refund` nets and its
-//! refund-vs-allocated CHECK is enforced.
+//! `original_posted_at, invoice_id`, under the tenant's own scope; (f)
+//! `bump_allocation_refund` nets and its refund-vs-allocated CHECK is enforced.
+//!
+//! Every read a foreign tenant must not see is in
+//! `payment_grains_are_invisible_to_a_foreign_tenant_scope`, paired with a
+//! positive control: a negative arm over an empty seed proves nothing.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -24,6 +28,8 @@
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::format_rfc3339;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine, RepoError};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::Allocated;
@@ -39,11 +45,12 @@ use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::payment_repo::NewAllocationRow;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -67,7 +74,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -201,7 +208,7 @@ async fn insert_then_list_allocations() {
             amount_minor: 300,
             currency: "USD".to_owned(),
             precedence_policy_ref: "oldest-first.v1".to_owned(),
-            allocated_at_utc: chrono::Utc::now(),
+            allocated_at_utc: OffsetDateTime::now_utc(),
         },
         NewAllocationRow {
             tenant_id: tenant,
@@ -212,7 +219,7 @@ async fn insert_then_list_allocations() {
             amount_minor: 200,
             currency: "USD".to_owned(),
             precedence_policy_ref: "oldest-first.v1".to_owned(),
-            allocated_at_utc: chrono::Utc::now(),
+            allocated_at_utc: OffsetDateTime::now_utc(),
         },
     ];
 
@@ -248,7 +255,13 @@ async fn list_open_ar_invoices_filters_and_orders() {
     let tenant = Uuid::now_v7();
     let payer = Uuid::now_v7();
     let account = Uuid::now_v7();
-    let scope = AccessScope::allow_all();
+    // The tenant's own scope, not `allow_all()`: a wildcard scope makes the
+    // SecureORM tenant predicate a no-op, so this — the only test of the AR
+    // candidate read that drives every payment allocation — would have stayed
+    // green with `.secure().scope_with(scope)` dropped from the reader. The
+    // cross-tenant negative is in
+    // `payment_grains_are_invisible_to_a_foreign_tenant_scope`.
+    let scope = AccessScope::for_tenant(tenant);
 
     // Seed three AR-invoice cache rows: two open (different posted dates) and
     // one fully paid (balance 0, must be filtered out). inv-late posts AFTER
@@ -262,13 +275,13 @@ async fn list_open_ar_invoices_filters_and_orders() {
                      {balance}, '{posted}')"
         ))
     };
-    raw.execute(insert("inv-late", 800, "2026-02-01T00:00:00Z"))
+    raw.execute_raw(insert("inv-late", 800, "2026-02-01T00:00:00Z"))
         .await
         .unwrap();
-    raw.execute(insert("inv-early", 300, "2026-01-01T00:00:00Z"))
+    raw.execute_raw(insert("inv-early", 300, "2026-01-01T00:00:00Z"))
         .await
         .unwrap();
-    raw.execute(insert("inv-paid", 0, "2026-01-15T00:00:00Z"))
+    raw.execute_raw(insert("inv-paid", 0, "2026-01-15T00:00:00Z"))
         .await
         .unwrap();
 
@@ -315,7 +328,7 @@ async fn bump_allocation_refund_nets_and_caps() {
 
     let allocated: i64 = {
         let row = raw
-            .query_one(pg(format!(
+            .query_one_raw(pg(format!(
                 "SELECT allocated_minor FROM bss.ledger_payment_allocation_refund
                  WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
             )))
@@ -329,14 +342,14 @@ async fn bump_allocation_refund_nets_and_caps() {
     // Drive refunded_minor up to allocated (500) directly, then a further
     // refund would break refunded_minor <= allocated_minor — verifying the
     // CHECK exists on the table (the refund increment is Slice 3's path).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_allocation_refund SET refunded_minor = 500
          WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
     )))
     .await
     .expect("refunded_minor = allocated_minor is allowed");
     let err = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_payment_allocation_refund SET refunded_minor = 600
              WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
         )))
@@ -357,7 +370,7 @@ async fn bump_allocation_refund_nets_and_caps() {
 // both replay idempotently. `setup_seller` provisions the chart
 // (CASH_CLEARING / UNALLOCATED / PSP_FEE_EXPENSE / AR), USD@2, and an OPEN
 // fiscal period for the CURRENT month (settle/allocate derive `period_id` from
-// `Utc::now()` when no `effective_at` is supplied).
+// `OffsetDateTime::now_utc()` when no `effective_at` is supplied).
 
 /// Provisioned seller ids for the service tests.
 struct Seller {
@@ -389,7 +402,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// UNALLOCATED credit, PSP_FEE_EXPENSE debit, AR debit). Reuses the file's
 /// `boot()` for the container/provider.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -397,7 +410,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -411,7 +424,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -488,7 +501,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
@@ -503,7 +516,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -514,7 +527,7 @@ async fn ar_invoice_balance(
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_payment_allocation \
          WHERE tenant_id='{}' AND payment_id='{}'",
         s.tenant, payment_id
@@ -530,7 +543,7 @@ async fn allocation_refund(
     payment_id: &str,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT allocated_minor FROM bss.ledger_payment_allocation_refund \
          WHERE tenant_id='{}' AND payment_id='{}' AND invoice_id='{}'",
         s.tenant, payment_id, invoice_id
@@ -551,7 +564,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -568,7 +581,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -732,8 +745,8 @@ async fn allocate_oldest_first_drains_unallocated_into_ar() {
 
     // Two open AR invoices: INV-A (300) posted earlier, INV-B (800) later. The
     // explicit posted_at + lexical id both put INV-A first under oldest-first.
-    let earlier = Utc::now() - chrono::Duration::hours(2);
-    let later = Utc::now() - chrono::Duration::hours(1);
+    let earlier = OffsetDateTime::now_utc() - time::Duration::hours(2);
+    let later = OffsetDateTime::now_utc() - time::Duration::hours(1);
     seed_ar_invoice(&provider, &s, "INV-A", 300, earlier).await;
     seed_ar_invoice(&provider, &s, "INV-B", 800, later).await;
 
@@ -820,8 +833,8 @@ async fn caller_split_posts_exact_amounts_and_reduces_ar() {
         .settle(&ctx, &scope, settlement_input(&s, "PAY-CS-1", 1000, 0))
         .await
         .expect("settle");
-    let earlier = Utc::now() - chrono::Duration::hours(2);
-    let later = Utc::now() - chrono::Duration::hours(1);
+    let earlier = OffsetDateTime::now_utc() - time::Duration::hours(2);
+    let later = OffsetDateTime::now_utc() - time::Duration::hours(1);
     seed_ar_invoice(&provider, &s, "INV-A", 300, earlier).await;
     seed_ar_invoice(&provider, &s, "INV-B", 800, later).await;
 
@@ -915,7 +928,7 @@ async fn caller_split_over_open_is_rejected() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -985,7 +998,7 @@ async fn caller_split_replay_makes_no_duplicate_rows() {
         &s,
         "INV-A",
         1000,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1058,7 +1071,7 @@ async fn allocate_over_settled_cap_is_rejected() {
         &s,
         "INV-CAP",
         200,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1166,7 +1179,7 @@ async fn allocate_replay_makes_no_duplicate_rows() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(2),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
     )
     .await;
     seed_ar_invoice(
@@ -1174,7 +1187,7 @@ async fn allocate_replay_makes_no_duplicate_rows() {
         &s,
         "INV-B",
         800,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1272,7 +1285,7 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
                         amount_minor: 1000,
                         currency: "USD".to_owned(),
                         precedence_policy_ref: "oldest-first.v1".to_owned(),
-                        allocated_at_utc: Utc::now(),
+                        allocated_at_utc: OffsetDateTime::now_utc(),
                     }],
                 )
                 .await
@@ -1282,13 +1295,14 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         .await
         .expect("seed tenant A");
 
-    // Seed the other three scoped payment grains for tenant A via raw SQL (these
+    // Seed the remaining scoped payment grains for tenant A via raw SQL (these
     // are projector caches / a policy table with no repo seed helper). They are
     // exactly the grains the first negative test missed; the wallet
-    // (`reusable_credit_subbalance`) is the most sensitive.
+    // (`reusable_credit_subbalance`) is the most sensitive, and the AR candidate
+    // cache is the one every allocation starts from.
     let acct = Uuid::now_v7();
-    let ts = Utc::now().to_rfc3339();
-    raw.execute(pg(format!(
+    let ts = format_rfc3339(OffsetDateTime::now_utc());
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_reusable_credit_subbalance \
          (tenant_id, payer_tenant_id, account_id, currency, credit_grant_event_type, \
           first_granted_at, balance_minor, version) \
@@ -1296,20 +1310,32 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
     )))
     .await
     .expect("seed wallet sub-grain");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
          (tenant_id, payer_tenant_id, account_id, currency, balance_minor, version) \
          VALUES ('{tenant_a}','{payer}','{acct}','USD',700,0)"
     )))
     .await
     .expect("seed unallocated pool");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_precedence_policy \
          (tenant_id, version, effective_from, strategy, created_at_utc) \
          VALUES ('{tenant_a}',1,'{ts}','oldest-first.v1','{ts}')"
     )))
     .await
     .expect("seed precedence policy");
+    // The AR candidate cache: `list_open_ar_invoices` is the reader every payment
+    // allocation starts from, and until this row existed it was the one payment
+    // entry point with no cross-tenant negative anywhere in the crate — its only
+    // other test runs under a scope that makes the tenant predicate a no-op.
+    raw.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_ar_invoice_balance \
+         (tenant_id, payer_tenant_id, account_id, invoice_id, currency, \
+          balance_minor, original_posted_at) \
+         VALUES ('{tenant_a}','{payer}','{acct}','INV-BOLA','USD',400,'{ts}')"
+    )))
+    .await
+    .expect("seed ar candidate");
 
     let repo = PaymentRepo::new(provider.clone());
 
@@ -1346,7 +1372,7 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         "a foreign scope cannot read tenant A's allocations (SQL-level BOLA)"
     );
 
-    // The other three grains: own scope sees them; a foreign scope sees nothing.
+    // The remaining grains: own scope sees them; a foreign scope sees nothing.
     assert_eq!(
         repo.list_credit_subgrains(&own, tenant_a, payer, "USD")
             .await
@@ -1377,17 +1403,32 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         "a foreign scope reads zero unallocated for tenant A (SQL-level BOLA)"
     );
     assert!(
-        repo.read_effective_policy(&own, tenant_a, Utc::now())
+        repo.read_effective_policy(&own, tenant_a, OffsetDateTime::now_utc())
             .await
             .unwrap()
             .is_some(),
         "tenant A reads its own precedence policy"
     );
     assert!(
-        repo.read_effective_policy(&foreign, tenant_a, Utc::now())
+        repo.read_effective_policy(&foreign, tenant_a, OffsetDateTime::now_utc())
             .await
             .unwrap()
             .is_none(),
         "a foreign scope cannot read tenant A's precedence policy (SQL-level BOLA)"
+    );
+    assert_eq!(
+        repo.list_open_ar_invoices(&own, tenant_a, payer, "USD")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "tenant A reads its own open AR candidate"
+    );
+    assert!(
+        repo.list_open_ar_invoices(&foreign, tenant_a, payer, "USD")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a foreign scope cannot read tenant A's AR candidates (SQL-level BOLA)"
     );
 }

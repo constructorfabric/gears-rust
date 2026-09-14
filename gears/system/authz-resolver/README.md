@@ -15,9 +15,9 @@ The **authz_resolver** gear is an integration point for authorization policy eva
 
 ## Public API
 
-The gear registers [`AuthZResolverClient`](authz-resolver-sdk/src/api.rs) in ClientHub:
+The gear registers [`AuthZResolverApi`](authz-resolver-sdk/src/api.rs) in ClientHub:
 
-- `evaluate(request)` — Evaluate an authorization request and return a decision with constraints
+- `evaluate(ctx, request)` — Evaluate an authorization request (`ctx` carries the caller's `SecurityContext`) and return a decision with constraints
 
 ### Evaluation Model (AuthZEN-based)
 
@@ -138,9 +138,9 @@ Most gears should use `PolicyEnforcer` (see PEP section above) rather than calli
 
 ```rust
 // Direct evaluation (low-level)
-let authz = hub.get::<dyn AuthZResolverClient>()?;
+let authz = hub.get::<dyn AuthZResolverApi>()?;
 
-let response = authz.evaluate(EvaluationRequest {
+let response = authz.evaluate(ctx.clone(), EvaluationRequest {
     subject: Subject { id: ctx.subject_id, ..Default::default() },
     action: Action { name: "list".into() },
     resource: Resource { resource_type: "my_gear.entity".into(), ..Default::default() },

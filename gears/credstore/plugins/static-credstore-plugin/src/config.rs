@@ -1,4 +1,8 @@
 // Updated: 2026-04-07 by Constructor Tech
+//! Configuration and validation inputs for the static credential backend.
+//!
+//! Secrets may be seeded as private, tenant, shared, or global values; secret
+//! contents remain redacted from debug output.
 use serde::Deserialize;
 use uuid::Uuid;
 

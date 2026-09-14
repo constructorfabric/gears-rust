@@ -9,7 +9,9 @@
 //! # Features
 //! - `pg`, `mysql`, `sqlite`: enable `SQLx` backends
 //! - `sea-orm`: add `SeaORM` integration for type-safe operations
-//! - `preview-outbox`: enable the transactional outbox pipeline (experimental — API may change)
+//!
+//! The transactional outbox pipeline ([`outbox`]) is always available — it is no
+//! longer behind a preview feature flag.
 //!
 //! # New Architecture
 //! The crate now supports:
@@ -68,6 +70,13 @@
 )]
 
 // Re-export key types for public API
+// The `Scopable` derive emits `::toolkit_db::…` paths, which do not resolve
+// inside this crate. Aliasing it into the extern prelude for test builds lets
+// the derive's own output be tested next to the code that relies on it, rather
+// than only in downstream crates that happen to use it.
+#[cfg(test)]
+extern crate self as toolkit_db;
+
 pub use advisory_locks::{DbLockError, DbLockGuard, LockConfig};
 
 // Re-export sea_orm_migration for gears that implement DatabaseCapability
@@ -81,10 +90,12 @@ pub mod manager;
 pub mod migration_runner;
 pub mod odata;
 pub mod options;
-
-#[cfg(feature = "preview-outbox")]
 pub mod outbox;
 pub mod secure;
+/// Test-only helpers for DB-behavior audits (SQL query recorder). Gated behind
+/// the `test-support` feature; never part of a production build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 mod db_provider;
 
@@ -123,6 +134,32 @@ pub async fn connect_db(dsn: &str, opts: ConnectOpts) -> Result<Db> {
 /// Returns `DbError` if configuration is invalid or connection fails.
 pub async fn build_db(cfg: DbConnConfig, global: Option<&GlobalDatabaseConfig>) -> Result<Db> {
     let handle = options::build_db_handle(cfg, global).await?;
+    Ok(Db::new(handle))
+}
+
+/// **Test-only**: connect and attach a `SeaORM` metric callback before the
+/// connection is wrapped into `Db`.
+///
+/// `Db`/`DBProvider` never expose the inner `SeaORM` connection, and
+/// `SeaORM` captures the callback by value at connect time, so it can't be
+/// attached later. Lets suites like `QueryRecorder` observe every statement.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+///
+/// # Errors
+///
+/// Returns `DbError` under the same conditions as [`connect_db`].
+#[cfg(feature = "test-support")]
+pub async fn connect_db_with_metric_callback<F>(
+    dsn: &str,
+    opts: ConnectOpts,
+    callback: F,
+) -> Result<Db>
+where
+    F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,
+{
+    let mut handle = DbHandle::connect(dsn, opts).await?;
+    handle.set_metric_callback_for_testing(callback);
     Ok(Db::new(handle))
 }
 
@@ -556,6 +593,17 @@ impl DbHandle {
 
     // NOTE: We intentionally do not expose raw SQL transactions from `DbHandle`.
     // Use `SecureConn::transaction` for application-level atomic operations.
+
+    /// **Test-only**: attach a `SeaORM` metric callback to the underlying
+    /// connection. See [`connect_db_with_metric_callback`] for why this must
+    /// run before the handle is wrapped into `Db`.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_metric_callback_for_testing<F>(&mut self, callback: F)
+    where
+        F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,
+    {
+        self.sea.set_metric_callback(callback);
+    }
 }
 
 // ===================== tests =====================

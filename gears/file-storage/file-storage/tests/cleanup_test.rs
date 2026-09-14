@@ -53,11 +53,7 @@ const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cleanup_test.file.type.v1~
 async fn build_db() -> Arc<DBProvider<DbError>> {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-cleanup-test-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),

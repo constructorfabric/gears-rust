@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS tenant_metadata (
                 ",
                 "CREATE INDEX IF NOT EXISTS idx_tenant_metadata_tenant ON tenant_metadata (tenant_id);",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };

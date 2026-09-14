@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
@@ -51,11 +52,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -66,7 +67,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -100,7 +101,7 @@ fn account(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_revaluation_then_next_period_reversal() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -115,8 +116,8 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
     let ar = Uuid::now_v7();
     let revenue = Uuid::now_v7();
     let fx_unrealized = Uuid::now_v7();
-    let now = Utc::now();
-    let period_id = format!("{:04}{:02}", now.year(), now.month());
+    let now = OffsetDateTime::now_utc();
+    let period_id = bss_ledger::domain::instant::yyyymm(now);
     let next_period = next_period_id(&period_id).unwrap();
     // The period-end instant drives the rate `as_of` (so the resolve sees a fresh,
     // non-stale period-end rate) and the run's rate lookup.
@@ -136,14 +137,14 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
             .unwrap();
     }
     // S5-F3: USD functional currency — activates the cross-currency FX path.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))
@@ -207,7 +208,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
         payer_tenant_id: payer,
         resource_tenant_id: None,
         seller_tenant_id: tenant,
-        effective_at: now.date_naive(),
+        effective_at: to_naive_date(now),
         due_date: Some(naive(2026, 12, 1)),
         period_id: period_id.clone(),
         items: vec![InvoiceItem {
@@ -333,12 +334,12 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
     );
 
     // ── 4. Close the period, open the next ──────────────────────────────────────
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' WHERE tenant_id='{tenant}' AND period_id='{period_id}'"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{next_period}','UTC','OPEN')"
     )))
@@ -407,7 +408,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -422,8 +423,8 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
     let ar = Uuid::now_v7();
     let revenue = Uuid::now_v7();
     let fx_unrealized = Uuid::now_v7();
-    let now = Utc::now();
-    let period_id = format!("{:04}{:02}", now.year(), now.month());
+    let now = OffsetDateTime::now_utc();
+    let period_id = bss_ledger::domain::instant::yyyymm(now);
 
     let reference = ReferenceRepo::new(provider.clone());
     for ccy in ["EUR", "USD"] {
@@ -439,14 +440,14 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
             .unwrap();
     }
     // USD-functional seller — activates the cross-currency FX revaluation path.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))
@@ -493,7 +494,7 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: now,
-        effective_at: now.date_naive(),
+        effective_at: to_naive_date(now),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: tenant,
         correlation_id: Uuid::now_v7(),

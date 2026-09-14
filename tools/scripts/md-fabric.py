@@ -2477,7 +2477,7 @@ const options = {{
     guidelines: {{ color: {{ background: "#fff8db", border: "#c99a00" }} }},
     documents:  {{ color: {{ background: "#eaf3ff", border: "#3572b0" }} }},
     others:     {{ color: {{ background: "#eeeeee", border: "#777777" }} }},
-    cf-studio:  {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
+    "cf-studio":  {{ color: {{ background: "#f4eeff", border: "#7744cc" }} }},
     toolkit:     {{ color: {{ background: "#fff5e6", border: "#c07000" }} }},
     gears:    {{ color: {{ background: "#edfff4", border: "#28a060" }} }},
     other:      {{ color: {{ background: "#f4f4f4", border: "#888888" }} }},

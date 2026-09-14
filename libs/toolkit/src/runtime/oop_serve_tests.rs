@@ -269,9 +269,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Stub directory that fails `resolve_rest_service` a fixed number of times
 /// before succeeding, so `/readyz` can be observed transitioning 503 → 200.
+/// Registrations are captured so a test can assert the serve path forwards the
+/// configured deployment labels.
+#[derive(Default)]
 struct E2eDirectory {
     fail_resolve: AtomicUsize,
     deregistered: AtomicUsize,
+    registrations: std::sync::Mutex<Vec<RegisterInstanceInfo>>,
 }
 
 #[async_trait]
@@ -295,7 +299,8 @@ impl DirectoryClient for E2eDirectory {
     async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }
-    async fn register_instance(&self, _i: RegisterInstanceInfo) -> anyhow::Result<()> {
+    async fn register_instance(&self, i: RegisterInstanceInfo) -> anyhow::Result<()> {
+        self.registrations.lock().unwrap().push(i);
         Ok(())
     }
     async fn deregister_instance(&self, _g: &str, _i: &str) -> anyhow::Result<()> {
@@ -348,7 +353,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
     let addr = free_addr();
     let directory: Arc<dyn DirectoryClient> = Arc::new(E2eDirectory {
         fail_resolve: AtomicUsize::new(3),
-        deregistered: AtomicUsize::new(0),
+        ..Default::default()
     });
 
     let readiness = readiness(["dep"]);
@@ -369,6 +374,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         directory: Arc::clone(&directory),
         bearer_authenticator: None,
         internal_authenticator: None,
+        labels: std::collections::BTreeMap::new(),
     };
 
     let mut server = super::OopHttpServer::start(Arc::clone(&readiness), options, cancel.clone())
@@ -428,6 +434,65 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
 }
 
 #[tokio::test]
+async fn attach_forwards_configured_labels_to_directory_registration() {
+    let addr = free_addr();
+    let directory = Arc::new(E2eDirectory::default());
+    let readiness = readiness(Vec::<String>::new());
+    let cancel = CancellationToken::new();
+
+    let labels: std::collections::BTreeMap<String, String> =
+        [("shard".to_owned(), "7".to_owned())].into_iter().collect();
+
+    let options = OopServeOptions {
+        gear_name: "shard-gear".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: None,
+        labels: labels.clone(),
+    };
+
+    let mut server = super::OopHttpServer::start(readiness, options, cancel.clone())
+        .await
+        .expect("server should bind");
+
+    // `attach` spawns the presence loop, which registers immediately.
+    server.attach(
+        Router::new().route("/ping", get(|| async { "pong" })),
+        "{}".to_owned(),
+    );
+
+    // Poll until the registration is captured (registration is async).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let captured = loop {
+        if let Some(info) = directory.registrations.lock().unwrap().first().cloned() {
+            break Some(info);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    cancel.cancel();
+    let shutdown = tokio::time::timeout(Duration::from_secs(5), server.join()).await;
+    assert!(shutdown.is_ok(), "server should shut down promptly");
+
+    let captured = captured.expect("presence loop should register the instance");
+    assert_eq!(
+        captured.labels, labels,
+        "configured deployment labels must reach the directory registration"
+    );
+}
+
+#[tokio::test]
 async fn ephemeral_listen_port_updates_advertise_uri() {
     let readiness = readiness(Vec::<String>::new());
     let cancel = CancellationToken::new();
@@ -442,12 +507,10 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
-        directory: Arc::new(E2eDirectory {
-            fail_resolve: AtomicUsize::new(0),
-            deregistered: AtomicUsize::new(0),
-        }),
+        directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        labels: std::collections::BTreeMap::new(),
     };
 
     let server = super::OopHttpServer::start(readiness, options, cancel.clone())
@@ -488,12 +551,10 @@ async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
-        directory: Arc::new(E2eDirectory {
-            fail_resolve: AtomicUsize::new(0),
-            deregistered: AtomicUsize::new(0),
-        }),
+        directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        labels: std::collections::BTreeMap::new(),
     };
 
     let server = super::OopHttpServer::start(readiness, options, cancel.clone())
@@ -535,12 +596,10 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
-        directory: Arc::new(E2eDirectory {
-            fail_resolve: AtomicUsize::new(0),
-            deregistered: AtomicUsize::new(0),
-        }),
+        directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        labels: std::collections::BTreeMap::new(),
     };
 
     let mut server = super::OopHttpServer::start(readiness, options, cancel.clone())

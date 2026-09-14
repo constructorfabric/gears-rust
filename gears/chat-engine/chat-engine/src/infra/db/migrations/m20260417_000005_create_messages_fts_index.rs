@@ -59,6 +59,11 @@ impl MigrationTrait for Migration {
                 // see ADR-0019). The migration is a no-op so a misconfigured
                 // workspace MySQL doesn't fail outright.
             }
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         }
         Ok(())
     }

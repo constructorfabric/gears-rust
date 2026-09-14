@@ -13,31 +13,32 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
+use cluster::ClusterHandle;
 use cluster_sdk::cache::{
     CacheEvent, CacheWatchEvent, ClusterCacheBackend, ClusterCacheV1, PutRequest, Ttl,
 };
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::{LeaderElectionV1, LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use cluster_sdk::lock::DistributedLockV1;
-use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::{
-    register_cache_backend, register_leader_election_backend, register_lock_backend,
-};
-use common::{MemCacheBackend, SmokeProfile};
+use common::{MemCacheBackend, SmokeProfile, wire_smoke_profile};
 use toolkit::client_hub::ClientHub;
 
-/// Registers `backend` as the cache for the smoke profile and resolves the
-/// facade. Panics on setup failure (a fixture wiring bug is a test bug).
-fn cache_facade(hub: &ClientHub, backend: Arc<dyn ClusterCacheBackend>) -> ClusterCacheV1 {
-    assert!(register_cache_backend(hub, SmokeProfile::NAME, backend).is_ok());
+/// Wires `backend` as the smoke profile's cache and resolves the facade,
+/// returning the wiring handle the test must stop. Panics on setup failure (a
+/// fixture wiring bug is a test bug).
+async fn cache_facade(
+    hub: &Arc<ClientHub>,
+    backend: Arc<dyn ClusterCacheBackend>,
+) -> (ClusterCacheV1, ClusterHandle) {
+    let handle = wire_smoke_profile(hub, backend);
     let Ok(cache) = ClusterCacheV1::resolver(hub)
         .profile(SmokeProfile)
         .resolve()
+        .await
     else {
         panic!("cache must resolve against the bound backend");
     };
-    cache
+    (cache, handle)
 }
 
 /// Awaits the watch's first leadership status, skipping non-status signals.
@@ -53,8 +54,8 @@ async fn first_status(watch: &mut LeaderWatch) -> LeaderStatus {
 
 #[tokio::test]
 async fn cas_conflict_surfaces_on_stale_version() {
-    let hub = ClientHub::new();
-    let cache = cache_facade(&hub, MemCacheBackend::linearizable());
+    let hub = Arc::new(ClientHub::new());
+    let (cache, handle) = cache_facade(&hub, MemCacheBackend::linearizable()).await;
 
     // @cpt-begin:cpt-cf-clst-flow-cache-primitive-cas-update:p1:inst-cas-get
     let Ok(Some(created)) = cache
@@ -95,19 +96,21 @@ async fn cas_conflict_surfaces_on_stale_version() {
     assert_eq!(swapped.version, created.version + 1);
     // @cpt-end:cpt-cf-clst-flow-cache-primitive-cas-update:p1:inst-cas-return
     // @cpt-end:cpt-cf-clst-flow-cache-primitive-cas-update:p1:inst-cas-retry
+
+    handle.stop().await;
 }
 
 #[tokio::test]
 async fn single_leader_under_contention() {
-    let hub = ClientHub::new();
+    let hub = Arc::new(ClientHub::new());
     let cache: Arc<dyn ClusterCacheBackend> = MemCacheBackend::linearizable();
-    let Ok(backend) = CasBasedLeaderElectionBackend::new(Arc::clone(&cache)) else {
-        panic!("leader backend must construct over a linearizable cache");
-    };
-    assert!(register_leader_election_backend(&hub, SmokeProfile::NAME, Arc::new(backend)).is_ok());
+    // The omit-default leader election over that cache is what the wiring builds,
+    // and what a consumer therefore resolves.
+    let handle = wire_smoke_profile(&hub, cache);
     let Ok(leader) = LeaderElectionV1::resolver(&hub)
         .profile(SmokeProfile)
         .resolve()
+        .await
     else {
         panic!("leader election must resolve");
     };
@@ -133,19 +136,20 @@ async fn single_leader_under_contention() {
         leaders, 1,
         "exactly one candidate may lead (got {s1:?}, {s2:?})"
     );
+
+    handle.stop().await;
 }
 
 #[tokio::test]
 async fn lock_contended_times_out_then_releases_for_reacquire() {
-    let hub = ClientHub::new();
+    let hub = Arc::new(ClientHub::new());
     let cache: Arc<dyn ClusterCacheBackend> = MemCacheBackend::linearizable();
-    let Ok(backend) = CasBasedDistributedLockBackend::new(Arc::clone(&cache)) else {
-        panic!("lock backend must construct over a linearizable cache");
-    };
-    assert!(register_lock_backend(&hub, SmokeProfile::NAME, Arc::new(backend)).is_ok());
+    // The omit-default lock over that cache, as the wiring builds it.
+    let handle = wire_smoke_profile(&hub, cache);
     let Ok(lock) = DistributedLockV1::resolver(&hub)
         .profile(SmokeProfile)
         .resolve()
+        .await
     else {
         panic!("distributed lock must resolve");
     };
@@ -187,13 +191,16 @@ async fn lock_contended_times_out_then_releases_for_reacquire() {
         panic!("re-acquisition after an explicit release must succeed");
     };
     assert!(reacquired.release().await.is_ok());
+
+    handle.stop().await;
 }
 
 #[tokio::test]
 async fn composable_scoping_translates_prefixes_on_write_and_read() {
-    let hub = ClientHub::new();
+    let hub = Arc::new(ClientHub::new());
     let backend = MemCacheBackend::linearizable();
-    let cache = cache_facade(&hub, Arc::clone(&backend) as Arc<dyn ClusterCacheBackend>);
+    let (cache, handle) =
+        cache_facade(&hub, Arc::clone(&backend) as Arc<dyn ClusterCacheBackend>).await;
 
     // Composed scopes prefix the key as `a/b/<key>` on the backend (DESIGN §3.8).
     let Ok(scoped) = cache.scoped("a").and_then(|inner| inner.scoped("b")) else {
@@ -229,13 +236,16 @@ async fn composable_scoping_translates_prefixes_on_write_and_read() {
     let Ok(None) = cache.get("key").await else {
         panic!("the unscoped facade must not see the scoped key");
     };
+
+    handle.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn prefix_watch_polyfill_detects_a_new_key() {
-    let hub = ClientHub::new();
+    let hub = Arc::new(ClientHub::new());
     let backend = MemCacheBackend::linearizable_without_prefix_watch();
-    let cache = cache_facade(&hub, Arc::clone(&backend) as Arc<dyn ClusterCacheBackend>);
+    let (cache, handle) =
+        cache_facade(&hub, Arc::clone(&backend) as Arc<dyn ClusterCacheBackend>).await;
 
     // The backend declares no native prefix watch.
     assert!(matches!(
@@ -268,4 +278,6 @@ async fn prefix_watch_polyfill_detects_a_new_key() {
         panic!("the polyfill must surface the new key as a Changed event");
     };
     assert_eq!(key, "svc/a");
+
+    handle.stop().await;
 }

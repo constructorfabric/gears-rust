@@ -1,8 +1,11 @@
 [package]
-name = "bss-ledger"
+name = "cf-gears-bss-ledger"
 edition.workspace = true
 license.workspace = true
 description = "BSS Billing Ledger gear: double-entry posting foundation, Postgres persistence in the bss schema"
+
+[lib]
+name = "bss_ledger"
 
 [lints]
 workspace = true
@@ -24,6 +27,10 @@ coord = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+# Instants are `time::OffsetDateTime` end-to-end (entity, domain, REST), matching
+# AM and pricing. `serde-well-known` is the RFC 3339 wire form. `chrono` stays
+# for calendar `NaiveDate` (due dates, posting `effective_at`).
+time = { workspace = true, features = ["serde-well-known"] }
 # `FutureExt::catch_unwind`: flip a recognition-run row FAILED on a panic (not only
 # on `Err`), so a panicked pass leaves no stuck `RUNNING` row a retry would replay.
 futures = { workspace = true }
@@ -55,7 +62,7 @@ opentelemetry_sdk = { workspace = true, features = [
 # `db` enables the `DatabaseCapability` trait; the REST API layer is not
 # feature-gated, so no toolkit feature bump is needed for `rest`.
 toolkit = { workspace = true, features = ["db"] }
-toolkit-db = { workspace = true, features = ["pg", "sqlite", "preview-outbox"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
 toolkit-db-macros = { workspace = true }
 # Canonical OData list surface: the `FilterField` / `FieldKind` traits, the
 # `OData` query, `Page<T>` (with-utoipa for the `OpenAPI` response schema), and
@@ -95,7 +102,7 @@ toolkit-canonical-errors = { workspace = true }
 
 # REST surface (the gear's first): axum router/extractors + utoipa schemas.
 axum = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
 # Holds the per-process REST `ApiState` populated in `init()`.
 arc-swap = { workspace = true }
 
@@ -104,7 +111,7 @@ arc-swap = { workspace = true }
 # metrics-harness tests (and any integration test) can use
 # `infra::metrics::test_harness`. Cargo unifies the lib-under-test edge with
 # this dev-dep edge into a single `test-support = on` compilation (RBAC idiom).
-bss-ledger = { path = ".", features = ["test-support"] }
+bss-ledger = { package = "cf-gears-bss-ledger", path = ".", features = ["test-support"] }
 
 toolkit = { workspace = true, features = ["db"] }
 toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
@@ -121,6 +128,7 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `testcontainers` crate is not a direct dep. Raw SQL in tests goes through
 # sea-orm `Statement`, not `sqlx` directly.
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
 # `tower::ServiceExt` provides `.oneshot(...)` for the REST router tests.
 tower = { workspace = true }
 # TODO(broker): `jsonschema` validated event payloads against their vendored

@@ -75,6 +75,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-grpc-support` — HTTP/2 multiplexing with protocol detection
 - `cpt-cf-oagw-adr-rust-abi-client-library` — Rust ABI client for internal gear routing
 - `cpt-cf-oagw-adr-oauth2-client-credentials-auth-plugin` — OAuth2 Client Credentials auth plugin with internal token cache
+- `cpt-cf-oagw-adr-required-headers-guard-plugin` — Stateless builtin `GuardPlugin` enforcing required request/response headers, fail-open when unconfigured
 
 ### 1.3 Architecture Layers
 
@@ -265,10 +266,10 @@ One per upstream. Named auth plugins resolved via in-process registries, not sto
 Built-in auth plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1`
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1`
+
+`basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry` — using either as `auth.plugin_type` fails with `unknown auth plugin`.
 
 **Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~` — [schemas/guard_plugin.v1.schema.json](./schemas/guard_plugin.v1.schema.json)
 
@@ -276,10 +277,9 @@ Multiple per upstream/route. Can reject requests before they reach upstream.
 
 | Plugin ID | Description |
 |---|---|
-| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` | Request timeout enforcement |
-| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` | CORS origin validation (actual requests; preflight handled at handler level — see [ADR: CORS](./ADR/0006-cors.md)) |
+| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` | Required header enforcement (request/response) — see [ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md) |
 
-Circuit breaker is **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
+`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
 
 **Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~` — [schemas/transform_plugin.v1.schema.json](./schemas/transform_plugin.v1.schema.json)
 
@@ -287,9 +287,9 @@ Multiple per upstream/route, executed in order. Each plugin declares supported p
 
 | Plugin ID | Phase | Description |
 |---|---|---|
-| `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` | request, response, error | Request/response logging |
-| `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` | request, response | Prometheus metrics |
 | `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1` | request, response | X-Request-ID injection/propagation |
+
+`logging.v1` and `metrics.v1` are core Data Plane instrumentation (`infra/metrics.rs`, `tracing`), not `TransformPlugin` trait implementations. Their GTS identifiers exist for types-registry cataloging only and are not resolvable via `TransformPluginRegistry`.
 
 #### Plugin Identification Model
 
@@ -388,10 +388,15 @@ Execution order: Auth → Guards → Transform(on_request) → Upstream call →
 
 Plugin chain composition: upstream plugins execute before route plugins (`[U1, U2] + [R1, R2] => [U1, U2, R1, R2]`).
 
-**Built-in Plugins**:
-- Auth: `noop`, `apikey`, `basic`, `bearer`, `oauth2_client_cred`, `oauth2_client_cred_basic`
+**Built-in Plugins** (registered and resolvable via their plugin registry):
+- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`
+- Guard: `required_headers`
+- Transform: `request_id`
+
+**Catalog-only identifiers** (reserved GTS ids, not resolvable via a plugin registry — `basic`/`bearer` have no backing implementation; `timeout`/`cors`/`logging`/`metrics` are core Data Plane logic instead):
+- Auth: `basic`, `bearer`
 - Guard: `timeout`, `cors`
-- Transform: `logging`, `metrics`, `request_id`
+- Transform: `logging`, `metrics`
 
 **Custom Plugins**: Starlark scripts with sandboxed execution (no network/file I/O, timeout/memory limits enforced). Immutable after creation; GC for unlinked plugins after configurable TTL.
 

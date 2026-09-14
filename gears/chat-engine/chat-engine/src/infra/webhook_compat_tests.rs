@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use chat_engine_sdk::models::{TenantId, UserId};
+use chat_engine_sdk::models::{CapabilityValue, TenantId, UserId};
 
 fn make_call_ctx(cfg: Option<JsonValue>, cancel: CancellationToken) -> PluginCallContext {
     PluginCallContext {
@@ -212,4 +212,99 @@ async fn pre_flight_cancellation_short_circuits() {
         .await
         .unwrap_err();
     assert!(matches!(err, PluginError::Transient { .. }));
+}
+
+// ----------------- outgoing body: enabled_capabilities -----------------
+
+fn caps_ctx(caps: Option<Vec<CapabilityValue>>) -> PluginCallContext {
+    let mut ctx = make_call_ctx(None, CancellationToken::new());
+    ctx.enabled_capabilities = caps;
+    ctx
+}
+
+fn sample_caps() -> Vec<CapabilityValue> {
+    vec![CapabilityValue {
+        name: "web_search".into(),
+        value: serde_json::json!({ "max_results": 3 }),
+    }]
+}
+
+fn expected_caps_json() -> JsonValue {
+    serde_json::json!([{ "name": "web_search", "value": { "max_results": 3 } }])
+}
+
+fn message_ctx(caps: Option<Vec<CapabilityValue>>) -> MessagePluginCtx {
+    MessagePluginCtx {
+        session_id: Uuid::nil(),
+        message_id: Uuid::nil(),
+        messages: vec![],
+        call_ctx: caps_ctx(caps),
+    }
+}
+
+fn session_ctx(caps: Option<Vec<CapabilityValue>>) -> SessionPluginCtx {
+    SessionPluginCtx {
+        session_type_id: Uuid::nil(),
+        session_id: Some(Uuid::nil()),
+        call_ctx: caps_ctx(caps),
+    }
+}
+
+#[test]
+fn message_body_puts_capabilities_on_the_wire() {
+    let body = message_body("message", &message_ctx(Some(sample_caps())));
+    assert_eq!(body["event"], "message");
+    assert_eq!(
+        body["enabled_capabilities"],
+        expected_caps_json(),
+        "on_message must forward the call's capability values",
+    );
+}
+
+#[test]
+fn message_recreate_body_puts_capabilities_on_the_wire() {
+    let body = message_body("message_recreate", &message_ctx(Some(sample_caps())));
+    assert_eq!(body["event"], "message_recreate");
+    assert_eq!(
+        body["enabled_capabilities"],
+        expected_caps_json(),
+        "on_message_recreate must forward the call's capability values",
+    );
+}
+
+#[test]
+fn session_updated_body_puts_capabilities_on_the_wire() {
+    let body = session_body("session_updated", &session_ctx(Some(sample_caps())));
+    assert_eq!(body["event"], "session_updated");
+    assert_eq!(
+        body["enabled_capabilities"],
+        expected_caps_json(),
+        "on_session_updated must forward the call's capability values",
+    );
+}
+
+#[test]
+fn session_summary_body_puts_capabilities_on_the_wire() {
+    let body = session_body("session_summary", &session_ctx(Some(sample_caps())));
+    assert_eq!(body["event"], "session_summary");
+    assert_eq!(
+        body["enabled_capabilities"],
+        expected_caps_json(),
+        "on_session_summary must forward the call's capability values",
+    );
+}
+
+#[test]
+fn bodies_omit_capabilities_when_the_call_carries_none() {
+    // Omitted rather than serialised as `null`: the webhook event schemas
+    // type the field as an array, so a null would not validate.
+    for body in [
+        message_body("message", &message_ctx(None)),
+        session_body("session_updated", &session_ctx(None)),
+    ] {
+        assert!(
+            body.get("enabled_capabilities").is_none(),
+            "absent capabilities must not appear on the wire at all: {body}",
+        );
+    }
 }

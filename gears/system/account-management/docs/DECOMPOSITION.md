@@ -16,7 +16,8 @@
   - [2.6 User Groups (via Resource Group delegation) - HIGH](#26-user-groups-via-resource-group-delegation---high)
   - [2.7 Tenant Metadata - MEDIUM](#27-tenant-metadata---medium)
   - [2.8 Errors & Observability - HIGH](#28-errors--observability---high)
-  - [2.9 Tenant Resolver Plugin — defined in sub-system DECOMPOSITION](#29-tenant-resolver-plugin--defined-in-sub-system-decomposition)
+  - [2.9 Service Accounts - HIGH](#29-service-accounts---high)
+  - [2.10 Tenant Resolver Plugin — defined in sub-system DECOMPOSITION](#210-tenant-resolver-plugin--defined-in-sub-system-decomposition)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
@@ -40,8 +41,14 @@ cut was driven by three pillars described next.
 
 ### Decomposition strategy
 
-The 9 features reflect three independent grouping pillars applied to the
-same inventory, yielding the same partition under all three lenses:
+The 10 features reflect three independent grouping pillars applied to the
+same inventory, yielding the same partition under all three lenses.
+`service-accounts` was added after the original nine when the
+standalone service-account gear was folded into AM: it satisfies every
+lens below — it crystallizes into its own DESIGN component
+(`ServiceAccountService`), it owns a contiguous FR group inside PRD
+§5.5, and its public surface, resource type, and permission set are
+disjoint from every other feature's:
 
 1. **Service-aligned grouping** (DESIGN §3.2). AM's DESIGN defines five
    in-service components — `AccountManagementGear`, `TenantService`,
@@ -82,10 +89,14 @@ same inventory, yielding the same partition under all three lenses:
    schema), the PRD/DESIGN/feature spec boundary is maintained to keep
    the read-only SDK contract reviewable and releasable independently.
 
-All three lenses produce the same 9-feature partition, which is why the
-feature count, slugs, priorities, and prefixes were locked in Phase 2
+All three lenses produce the same partition, which is why the feature
+count, slugs, priorities, and prefixes were locked in Phase 2
 (`plan.toml [decisions]`) before the Phase 3-7 feature-entry authoring
-began.
+began. `service-accounts` (§2.9) is the one later addition, and it
+partitions cleanly under each lens rather than reopening the proof: its
+component is new, its FRs were appended to §5.5 rather than carved out of
+an existing group, and its resource type is deliberately disjoint from
+the user type so no permission is shared with `idp-user-operations-contract`.
 
 ### Mutual exclusivity rationale
 
@@ -685,7 +696,84 @@ upstream PRD/DESIGN definition, with no broken references.
 > This keeps the Phase 2 grand total of 151 inventoried IDs covered
 > with no gaps.
 
-### 2.9 Tenant Resolver Plugin — defined in sub-system DECOMPOSITION
+### 2.9 Service Accounts - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-feature-service-accounts`
+
+- **Purpose**: Define the machine-identity half of the pluggable IdP contract and expose it through Account Management's tenant-scoped REST and inter-gear `AccountManagementClient` surfaces. A service account is a tenant-owned confidential OAuth 2.0 `client_credentials` client for a workload that must authenticate without human credentials; issued tokens carry the owning tenant and a service-subject type. The feature owns four `IdpPluginClient` methods (provision, list, rotate-secret, revoke), the AM-side service that authorizes and delegates them, a managed-resource type distinct from the user type, and four independently grantable permissions. It holds no account table and no credential store — the IdP is the source of truth, exactly as for users. Concrete adapter crates are excluded: they conform to the contract but ship outside this gear.
+
+- **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
+
+- **Scope**:
+  - Four `IdpPluginClient` service-account methods on the same trait and the same scoped ClientHub resolution the user half uses, each with a default implementation that declines as unsupported so a partial adapter stays legal.
+  - Four corresponding `AccountManagementClient` methods on AM's global ClientHub registration, delegating through the same authorized service layer as REST so sibling gears need no HTTP loopback.
+  - Tenant-scoped provisioning: authorized request → contract call → one-time disclosure of client id, plaintext secret, token endpoint, and subject id, in a non-cacheable response with a `Location` header. A name already live in the tenant is rejected without resuming or revealing the existing account, atomically with respect to concurrent calls.
+  - Tenant-scoped, unpaginated, secret-free listing, each entry reporting the caller-supplied name verbatim alongside the provider-assigned client id — the correlation key that makes ambiguous-outcome recovery adapter-independent.
+  - Secret rotation as a named action on the item, disclosing a new one-time secret without changing the account's identity; an address that does not resolve within the tenant is `not_found`.
+  - Idempotent revocation: an account the provider reports absent yields the same success as a removed one, which also denies any signal about accounts owned by other tenants.
+  - Ambiguous-outcome signalling as its own category (409 `AMBIGUOUS_OUTCOME`), distinct from a safely retryable clean failure, plus the documented caller-side reconciliation path.
+  - Discard (not digest) of provider-supplied failure text, with fixed AM-owned messages per category and log records confined to category, length, and whether a field was attributed.
+  - Managed-resource type `gts://gts.cf.core.am.service_account.v1~` plus four permission instances, registered through the link-time GTS inventory.
+  - Four REST operations and four matching inter-gear SDK operations layered on the contract (the REST routes are listed under API below).
+
+- **Out of scope**:
+  - Conforming adapter implementations (Keycloak, Zitadel, Dex, …) — separate crates, outside this feature and this gear.
+  - Retrieval of an existing plaintext secret, account update, enable/disable, filtering, sorting, and pagination — not exposed in v1; the listing is unpaginated by contract.
+  - Long-term credential storage, secret distribution, and workload injection — caller and platform secret-management plane.
+  - Token issuance, validation, exchange, refresh, and workload-side token acquisition or caching — IdP and platform AuthN layer.
+  - Automatic reconciliation of an ambiguous outcome (idempotency keys, operation keys, retry workers) — the caller reconciles by matching its submitted name; holding reconciliation state would contradict `constraint-no-user-storage`.
+  - Name syntax, scope-allowlist membership, and per-tenant quota — the registered adapter owns client-id derivation and its own limits; AM applies only payload-size caps.
+  - Tenant-offboarding cleanup of accounts — discharged by the adapter through the `deprovision_tenant` hook owned by `tenant-hierarchy-management`.
+  - Human-user identity, password, session, MFA, and interactive-login management — owned by `idp-user-operations-contract`.
+  - Authorization policy authoring and evaluation — PEP / AuthZ Resolver concerns.
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-account-management-fr-service-account-provision`
+  - [ ] `p1` - `cpt-cf-account-management-fr-service-account-list`
+  - [ ] `p1` - `cpt-cf-account-management-fr-service-account-rotate`
+  - [ ] `p1` - `cpt-cf-account-management-fr-service-account-revoke`
+  - [ ] `p1` - `cpt-cf-account-management-fr-service-account-secret-confidentiality`
+
+  `nfr-authentication-context` (owned by `idp-user-operations-contract`) and
+  `nfr-data-classification` (owned by `errors-observability`) are satisfied by
+  this feature but deliberately **not** claimed here — the mutual-exclusivity
+  proof in §1 requires each inventoried ID to have exactly one owner.
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-account-management-principle-idp-agnostic`
+  - `cpt-cf-account-management-adr-idp-contract-separation`
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-account-management-constraint-no-user-storage`
+  - [ ] `p1` - `cpt-cf-account-management-constraint-legacy-integration`
+
+- **Domain Model Entities**:
+  - `ServiceAccount` (IdP-owned machine identity referenced through the managed-resource type `gts://gts.cf.core.am.service_account.v1~` — AM never persists this entity locally; `(tenant_id, client_id)` is its scoped address and `(tenant_id, name)` its uniqueness invariant)
+  - `ServiceAccountCredentials` (transient value object: client id, wrapped secret, token endpoint, subject id — crosses only successful provision/rotate results through REST or `AccountManagementClient`; never persisted or available for read-back)
+  - `TenantId` (value object consumed at the contract boundary to scope every operation to a tenant)
+
+- **Design Components**:
+
+  - [ ] `p2` - `cpt-cf-account-management-component-service-account-service`
+
+- **API**:
+  - POST /tenants/{tenant_id}/service-accounts (`createTenantServiceAccount`)
+  - GET /tenants/{tenant_id}/service-accounts (`listTenantServiceAccounts`)
+  - POST /tenants/{tenant_id}/service-accounts/{client_id}/rotate-secret (`rotateTenantServiceAccountSecret`)
+  - DELETE /tenants/{tenant_id}/service-accounts/{client_id} (`revokeTenantServiceAccount`)
+
+- **Sequences**:
+
+  - None.
+
+- **Data**:
+
+  - None. Per `cpt-cf-account-management-constraint-no-user-storage` — which this feature reads as covering machine identities as well as users — it owns no AM-side table: account state and credentials live in the IdP. The published managed-resource type is `gts://gts.cf.core.am.service_account.v1~`.
+
+### 2.10 Tenant Resolver Plugin — defined in sub-system DECOMPOSITION
 
 Feature `cpt-cf-tr-plugin-feature-tenant-resolver-plugin` is the sole feature of the `cf-tr-plugin` sub-system and is therefore **defined authoritatively** in the child [tr-plugin DECOMPOSITION](./tr-plugin/DECOMPOSITION.md), not here. This parent DECOMPOSITION references it only in §3 Feature Dependencies as a cross-system leaf on the `tenant-hierarchy-management` branch, preserving the whole-gear dependency view.
 
@@ -719,7 +807,9 @@ cpt-cf-account-management-feature-tenant-hierarchy-management (deps: platform-bo
     ├─→ cpt-cf-account-management-feature-idp-user-operations-contract
     │       (deps: tenant-hierarchy-management, errors-observability)
     │       ↓
-    │       └─→ cpt-cf-account-management-feature-user-groups
+    │       ├─→ cpt-cf-account-management-feature-user-groups
+    │       │       (deps: idp-user-operations-contract, tenant-hierarchy-management, errors-observability)
+    │       └─→ cpt-cf-account-management-feature-service-accounts
     │               (deps: idp-user-operations-contract, tenant-hierarchy-management, errors-observability)
 ```
 
@@ -748,6 +838,22 @@ cpt-cf-account-management-feature-tenant-hierarchy-management (deps: platform-bo
   (hierarchy emits `tenant_has_children`, `tenant_depth_exceeded`,
   audit events for status transitions and hard-delete/IdP-deprovision
   cleanup, and hierarchy-depth / retention metric families).
+
+- `cpt-cf-account-management-feature-service-accounts` requires
+  `idp-user-operations-contract` (it adds four methods to the same
+  `IdpPluginClient` trait, resolved through the same ClientHub
+  registration, and reuses the resolved `TenantContext` shape including
+  the plugin-private `metadata` replay), `tenant-hierarchy-management`
+  (the `AccessScope`-clamped tenant guard runs before every provider
+  call, and the `deprovision_tenant` hook is how a tenant's accounts
+  are removed at offboarding), and `errors-observability` (it emits
+  `invalid_argument`, `not_found`, `aborted` with the
+  `AMBIGUOUS_OUTCOME` reason, `unimplemented`, and `service_unavailable`
+  through the shared envelope, and its audit lines ride the `am.events`
+  target). The dependency on the user contract is structural rather than
+  behavioural: no service-account flow calls a user flow, and the two
+  resource types share no permission — a grant over users must never
+  confer machine-credential minting.
 
 - `cpt-cf-account-management-feature-tenant-type-enforcement` requires
   `tenant-hierarchy-management` (the type barrier is invoked inline by

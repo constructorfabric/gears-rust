@@ -200,7 +200,7 @@ async fn simulate_crash_for_tables(
     lease_secs: i64,
 ) {
     let conn = db.sea_internal();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         format!(
             "UPDATE {} \
@@ -222,7 +222,7 @@ async fn expire_lease(db: &Db, partition_id: i64) {
 
 async fn expire_lease_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64) {
     let conn = db.sea_internal();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         format!(
             "UPDATE {} \
@@ -520,7 +520,11 @@ struct CountingTxHandler {
 
 #[async_trait::async_trait]
 impl TransactionalHandler for CountingTxHandler {
-    async fn handle(&self, _txn: &dyn ConnectionTrait, msgs: &[OutboxMessage]) -> HandlerResult {
+    async fn handle(
+        &self,
+        _txn: &sea_orm::DatabaseExecutor<'_>,
+        msgs: &[OutboxMessage],
+    ) -> HandlerResult {
         #[allow(clippy::cast_possible_truncation)]
         self.count.fetch_add(msgs.len() as u32, Ordering::Relaxed);
         HandlerResult::Success
@@ -531,7 +535,11 @@ struct AlwaysRetryTxHandler;
 
 #[async_trait::async_trait]
 impl TransactionalHandler for AlwaysRetryTxHandler {
-    async fn handle(&self, _txn: &dyn ConnectionTrait, _msgs: &[OutboxMessage]) -> HandlerResult {
+    async fn handle(
+        &self,
+        _txn: &sea_orm::DatabaseExecutor<'_>,
+        _msgs: &[OutboxMessage],
+    ) -> HandlerResult {
         HandlerResult::Retry {
             reason: "transient tx failure".into(),
         }
@@ -542,7 +550,11 @@ struct AlwaysRejectTxHandler;
 
 #[async_trait::async_trait]
 impl TransactionalHandler for AlwaysRejectTxHandler {
-    async fn handle(&self, _txn: &dyn ConnectionTrait, _msgs: &[OutboxMessage]) -> HandlerResult {
+    async fn handle(
+        &self,
+        _txn: &sea_orm::DatabaseExecutor<'_>,
+        _msgs: &[OutboxMessage],
+    ) -> HandlerResult {
         HandlerResult::Reject {
             reason: "permanently bad tx".into(),
         }
@@ -723,7 +735,7 @@ async fn enqueue_tx_rollback_leaves_no_rows() {
     let conn = db.sea_internal();
     let txn = sea_orm::TransactionTrait::begin(&conn).await.unwrap();
     // Insert body + incoming manually through the transaction
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO toolkit_outbox_body (payload, payload_type) VALUES ($1, $2)",
         [b"data".to_vec().into(), "text/plain".into()],
@@ -1791,7 +1803,7 @@ async fn run_vacuum_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64
     // Fetch outgoing rows in bounded chunks.
     loop {
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &vacuum_sql.select_outgoing_chunk,
                 [
@@ -1818,7 +1830,7 @@ async fn run_vacuum_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64
         // Delete outgoing by ID
         let del_out = store.build_delete_outgoing_batch(outgoing_ids.len());
         let values: Vec<sea_orm::Value> = outgoing_ids.iter().map(|&id| id.into()).collect();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             store.backend(),
             &del_out,
             values,
@@ -1829,7 +1841,7 @@ async fn run_vacuum_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64
         if !body_ids.is_empty() {
             let del_body = store.build_delete_body_batch(body_ids.len());
             let values: Vec<sea_orm::Value> = body_ids.iter().map(|&id| id.into()).collect();
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &del_body,
                 values,
@@ -1840,7 +1852,7 @@ async fn run_vacuum_for_tables(db: &Db, tables: &OutboxTables, partition_id: i64
     }
 
     // Reset vacuum counter after cleanup.
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         store.backend(),
         store.reset_vacuum_counter(),
         [partition_id.into()],
@@ -1977,7 +1989,7 @@ async fn set_vacuum_counter_for_tables(
     value: i64,
 ) {
     let conn = db.sea_internal();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         format!(
             "UPDATE {} SET counter = $1 WHERE partition_id = $2",
@@ -3113,7 +3125,11 @@ struct TxPartialFailureHandler {
 
 #[async_trait::async_trait]
 impl TransactionalMessageHandler for TxPartialFailureHandler {
-    async fn handle(&self, _txn: &dyn ConnectionTrait, msg: &OutboxMessage) -> HandlerResult {
+    async fn handle(
+        &self,
+        _txn: &sea_orm::DatabaseExecutor<'_>,
+        msg: &OutboxMessage,
+    ) -> HandlerResult {
         self.seen_seqs.lock().unwrap().push(msg.seq);
         if msg.seq == self.poison_seq {
             if self.reject {
@@ -3486,7 +3502,7 @@ async fn insert_raw_incoming_for_tables(
     for _ in 0..count {
         // Insert a body row first
         let body_id = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 format!(
                     "INSERT INTO {} (payload, payload_type) VALUES (X'AA', 'raw') RETURNING id",
@@ -3499,7 +3515,7 @@ async fn insert_raw_incoming_for_tables(
             .try_get_by_index::<i64>(0)
             .expect("body_id");
 
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
                 "INSERT INTO {} (partition_id, body_id) VALUES ($1, $2)",
@@ -3929,7 +3945,7 @@ async fn vacuum_counter_decrement_is_idempotent() {
     let conn = db.sea_internal();
     let dialect = Dialect::from(conn.get_database_backend());
     let tables = OutboxTables::default();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         dialect.decrement_vacuum_counter(&tables),
         [5i64.into(), pid.into()],
@@ -3939,7 +3955,7 @@ async fn vacuum_counter_decrement_is_idempotent() {
     assert_eq!(read_vacuum_counter(&db, pid).await, 0);
 
     // Second decrement (stale snapshot): GREATEST(0 - 5, 0) = 0
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         dialect.decrement_vacuum_counter(&tables),
         [5i64.into(), pid.into()],
@@ -3964,7 +3980,7 @@ async fn vacuum_concurrent_workers_safe() {
 
     // Advance processed_seq to 3 (simulating processor progress)
     let conn = db.sea_internal();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE toolkit_outbox_processor SET processed_seq = 3 WHERE partition_id = $1",
         [pid.into()],
@@ -4388,7 +4404,7 @@ struct MaxBatchSizeHandler {
 impl TransactionalHandler for MaxBatchSizeHandler {
     async fn handle(
         &self,
-        _txn: &dyn sea_orm::ConnectionTrait,
+        _txn: &sea_orm::DatabaseExecutor<'_>,
         msgs: &[OutboxMessage],
     ) -> HandlerResult {
         #[allow(clippy::cast_possible_truncation)]

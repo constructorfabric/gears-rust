@@ -44,8 +44,8 @@ use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, Side};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -56,7 +56,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -128,17 +128,17 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .await
         .unwrap();
     // Seed BOTH the invoice's period (`s.period_id`) and the CURRENT period: the
-    // adjustment handlers post into `Utc::now()`'s period (credit/debit-note
-    // `eff_date = Utc::now()`), so a fixed historical period alone makes the test
+    // adjustment handlers post into `OffsetDateTime::now_utc()`'s period (credit/debit-note
+    // `eff_date = OffsetDateTime::now_utc()`), so a fixed historical period alone makes the test
     // date-dependent (green only in that calendar month). ON CONFLICT dedups when
     // `now` already equals `s.period_id`.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{t}','{t}','{p}','UTC','OPEN'), ('{t}','{t}','{cur}','UTC','OPEN')
          ON CONFLICT DO NOTHING",
         t = s.tenant,
         p = s.period_id,
-        cur = chrono::Utc::now().format("%Y%m")
+        cur = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc())
     )))
     .await
     .unwrap();
@@ -246,7 +246,7 @@ fn req(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn rounding_correction_posts_then_replays_idempotently() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -319,7 +319,7 @@ async fn rounding_correction_posts_then_replays_idempotently() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn class_outside_allow_list_is_not_allowed() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -362,7 +362,7 @@ async fn class_outside_allow_list_is_not_allowed() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn contra_revenue_write_off_is_not_allowed_and_does_not_post() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

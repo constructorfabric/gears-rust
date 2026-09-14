@@ -10,6 +10,77 @@ For security-scoped database access (`SecureConn`, `AccessScope`, `PolicyEnforce
 - **Rule**: Repository methods accept `runner: &impl DBRunner`, not `&SecureConn`.
 - **Rule**: Use `in_transaction_mapped` for transactional work.
 - **Rule**: Each gear gets its own isolated migration history table.
+- **Rule**: CTEs go through `with_ctes()` / `cte()` / `recursive_cte()`. A raw `WITH`
+  string — recursive or not — is forbidden in gear code, as is reaching a raw-SQL sink
+  via `into_inner()` / `into_query()`.
+- **Rule**: Recursive traversal must state a depth bound. There is no safe default.
+
+## Common Table Expressions (`WITH`)
+
+The full rationale is [ADR-0001](../arch/secure-orm/ADR/0001-secure-cte-policy.md); the
+rules that matter day to day:
+
+A CTE body is an independent `SELECT`, so the outer query's scope `WHERE` does **not**
+reach inside it. The Secure ORM therefore embeds scope into *every* CTE body rather than
+relying on the outer query. `with_ctes()` is only reachable from a scoped select, and each
+body inherits that query's `AccessScope` — a differently-scoped CTE cannot be built, so
+there is no check to remember and no error to handle.
+
+```rust
+let rows = order::Entity::find()
+    .secure()
+    .scope_with(&scope)          // required before with_ctes()
+    .with_ctes()
+    .cte::<line_item::Entity>("scoped_items", |q| {
+        q.filter(line_item::Column::Quantity.gt(0))
+    })
+    .join_cte("scoped_items", on_condition)   // define != use
+    .all(runner)
+    .await?;
+```
+
+Things to keep in mind:
+
+- **Attaching a CTE is not using it.** `cte()` only defines; without `join_cte()` the
+  `WITH` clause is valid SQL that computes nothing.
+- **The join predicate is yours to get right.** It is not compiler-verified. Getting it
+  wrong changes which rows return, but cannot cross a tenant boundary — the body never
+  held another tenant's rows.
+- **`join_cte` is an inner join**, so an outer row repeats once per matching CTE row. Use
+  `.distinct()` when the CTE is a membership set rather than a 1:1 join — and narrow the
+  projection first with `.select_only()`, because `SELECT DISTINCT` compares every selected
+  column and PostgreSQL's `json` has no equality operator (`jsonb` does).
+- **Ordering is split by where the column comes from.** `.order_by(E::Column, ..)` for an
+  entity column, `.order_by_cte("cte", "col", ..)` for a CTE's own column (e.g. a recursive
+  walk's depth). Only the first is combinable with `.distinct()`: PostgreSQL and MySQL both
+  reject `ORDER BY` on an expression that is not in a `SELECT DISTINCT` list, so pairing
+  `.distinct()` with `.order_by_cte()` returns `ScopeError::Invalid` on every backend rather
+  than working on SQLite and failing in production. "Distinct rows, shallowest first" needs
+  `GROUP BY … ORDER BY MIN(depth)`, which this API cannot express yet — dedup in the caller.
+- **The outer query selects every column of `E` by default.** `all_as::<T>()` narrows
+  *deserialization*, not the SQL — a hop needing only ids still transfers the wide columns,
+  and on PostgreSQL that turns an index-only scan into a heap visit per row (measured 0.371
+  ms against 0.079 ms). Use `.select_only()` plus `.column()` / `.column_from_cte()` /
+  `.expr_as()` to narrow it, and pair that with `all_as::<T>()` rather than `all()`.
+- **Don't `OR` two columns in a `join_cte` predicate.** `node.id = cte.src OR node.id =
+  cte.dst` drops the index and sequentially scans (15.2 ms against 0.30 ms on 199k nodes).
+  Put the alternation inside the CTE body instead, projecting one column that already holds
+  both endpoints.
+- **Recursive walks need a depth cap**, passed to `RecursiveCte::new`. PostgreSQL's `CYCLE`
+  clause is not portable (sea_query no-ops it on MySQL and SQLite), so the cap is the only
+  termination guarantee. Separately, the dedup mode decides how much work happens inside
+  that bound: the default `RecursiveDedup::Union` discards rows duplicating ones already
+  produced, bounding re-expansion by *(rows × depth)*; `UnionAll` keeps everything and
+  enumerates *paths*, which multiplies on hub-shaped graphs. Neither is a visited set.
+- **A recursive walk spans one self-referencing table.** The recursive member joins `J` to
+  the CTE on `J.link_col = cte.anchor_col`, so both endpoints must be columns of the same
+  entity — an edge table (`src`, `dst`) or a parent-pointer tree (`parent_id`, `id`). A hop
+  *through* a separate table (`node -> edge -> node`) needs a three-way join and is not
+  expressible; use one scoped query per hop instead.
+
+For a hierarchy that is traversed often, prefer a closure table (as `tenant_closure` does)
+over recursing on every read — `recursive_cte` is the right tool for rarely-walked or
+frequently-changing trees, where materializing is not worth the write-path cost.
 
 ## Executors: `DBRunner` and `SecureTx`
 
@@ -164,7 +235,11 @@ Raw SQL is **allowed only in migration infrastructure** (migration runner + migr
 
 - [ ] Use `runner: &impl DBRunner` in repository method signatures.
 - [ ] Use `in_transaction_mapped` for multi-step mutations.
-- [ ] Use raw SQL only in `migrations/*.rs`.
+- [ ] Use raw SQL only in migration infrastructure (migration runner + migration
+      definitions) — including raw `WITH`.
+- [ ] Build CTEs with `with_ctes()`/`cte()`/`recursive_cte()`, and reference them with
+      `join_cte()`.
+- [ ] Give every `recursive_cte` an explicit `max_depth`.
 - [ ] Add indexes on security columns (`tenant_id`, `resource_id`).
 - [ ] Provide `DatabaseCapability::migrations()` returning SeaORM migrations.
 

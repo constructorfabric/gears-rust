@@ -1,3 +1,8 @@
+//! `ToolKit` gear registration for the static credential backend.
+//!
+//! Loads and validates configuration, registers its GTS plugin instance, and
+//! publishes a scoped `CredStorePluginClientV1` through `ClientHub`.
+
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;

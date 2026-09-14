@@ -4,20 +4,28 @@
 // But for now we will manually maintain this file.
 #![allow(unused_imports)]
 
+#[cfg(feature = "oagw")]
 use api_egress as _;
 use api_gateway as _;
 use authn_resolver as _;
 use authz_resolver as _;
+#[cfg(feature = "credstore")]
 use credstore as _;
-#[cfg(not(feature = "oop-example"))]
+#[cfg(all(feature = "file-parser", not(feature = "oop-example")))]
 use file_parser as _;
 #[cfg(feature = "file-storage")]
 use file_storage as _;
 use gear_orchestrator as _;
+#[cfg(feature = "github-mirror")]
+use github_mirror as _;
+#[cfg(feature = "grpc-hub")]
 use grpc_hub as _;
+use license_resolver as _;
+#[cfg(feature = "nodes-registry")]
 use nodes_registry as _;
+#[cfg(feature = "resource-group")]
 use resource_group as _;
-#[cfg(not(feature = "oop-example"))]
+#[cfg(all(feature = "simple-user-settings", not(feature = "oop-example")))]
 use simple_user_settings as _;
 use tenant_resolver as _;
 use types_registry as _;
@@ -39,6 +47,9 @@ use static_authz_plugin as _;
 
 #[cfg(feature = "tr-authz")]
 use tr_authz_plugin as _;
+
+#[cfg(feature = "static-license")]
+use static_license_plugin as _;
 
 #[cfg(feature = "static-credstore")]
 use static_credstore_plugin as _;
@@ -89,3 +100,6 @@ use usage_collector as _;
 
 #[cfg(feature = "timescaledb-usage-collector")]
 use timescaledb_usage_collector_plugin as _;
+
+#[cfg(feature = "bss-pricing")]
+use bss_pricing as _;

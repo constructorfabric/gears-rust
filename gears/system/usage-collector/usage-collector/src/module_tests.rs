@@ -3,7 +3,7 @@
 //! Covers the three failure branches that previously had no direct
 //! coverage:
 //!
-//! 1. `init` returns an error when no `AuthZResolverClient` is registered
+//! 1. `init` returns an error when no `AuthZResolverApi` is registered
 //!    in `ClientHub` — and the `ClientHubError` is preserved as the
 //!    `anyhow::Error` source (regression for RUST-ERR-001).
 //! 2. A second `init` call surfaces the `OnceLock` "already initialized"
@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistryImpl;
@@ -83,8 +83,8 @@ async fn init_fails_when_authz_resolver_missing() {
 #[tokio::test]
 async fn init_fails_when_already_initialized() {
     let hub = Arc::new(ClientHub::new());
-    let resolver: Arc<dyn AuthZResolverClient> = CountingAllowAllResolver::new();
-    hub.register::<dyn AuthZResolverClient>(resolver);
+    let resolver: Arc<dyn AuthZResolverApi> = CountingAllowAllResolver::new();
+    hub.register::<dyn AuthZResolverApi>(resolver);
 
     let ctx = make_ctx(hub);
     let module = UsageCollectorModule::default();
@@ -124,8 +124,8 @@ fn register_rest_fails_when_service_not_initialized() {
 #[tokio::test]
 async fn serve_returns_when_cancelled() {
     let hub = Arc::new(ClientHub::new());
-    let resolver: Arc<dyn AuthZResolverClient> = CountingAllowAllResolver::new();
-    hub.register::<dyn AuthZResolverClient>(resolver);
+    let resolver: Arc<dyn AuthZResolverApi> = CountingAllowAllResolver::new();
+    hub.register::<dyn AuthZResolverApi>(resolver);
 
     let ctx = make_ctx(hub);
     let module = UsageCollectorModule::default();

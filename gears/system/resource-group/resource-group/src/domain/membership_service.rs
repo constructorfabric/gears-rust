@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
+use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -151,73 +152,131 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
 
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-        // Load group type's allowed_membership_types and validate
-        let allowed = self
-            .type_repo
-            .load_full_type_by_id(&conn, group_model.gts_type_id)
+        // Tenant compatibility, the allowed_membership_types check, and the
+        // membership insert all share one transaction, and that transaction
+        // is `SERIALIZABLE` (RG-01).
+        //
+        // The check reads a predicate -- "which tenants already own
+        // memberships of this pair" -- and the insert then writes into that
+        // same predicate. Run apart, as they were, two first memberships from
+        // different tenants each read an empty set and both commit, and the
+        // resource ends up owned by two tenants. Run together at the backend
+        // default, each still reads from its own snapshot and neither sees
+        // the other's uncommitted row: `READ COMMITTED` has nothing to say
+        // about rows that did not exist when the statement began.
+        //
+        // At `SERIALIZABLE` that shape is write skew, which is precisely what
+        // PostgreSQL's SSI cancels: the two read/write pairs form a cycle of
+        // rw-antidependencies, one side is cancelled as the pivot with
+        // `40001`, and the retry already wrapping this transaction re-runs
+        // it against the committed winner and rejects. On SQLite writes
+        // serialize regardless, so the same conclusion holds there for a
+        // different reason.
+        let db = self.db.db();
+        let membership_repo = self.membership_repo.clone();
+        let type_repo = self.type_repo.clone();
+        let resource_type_owned = resource_type.to_owned();
+        let resource_id_owned = resource_id.to_owned();
+        let target_tenant_id = group_model.tenant_id;
+        let group_type_id = group_model.gts_type_id;
+
+        let model = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let membership_repo = membership_repo.clone();
+                let type_repo = type_repo.clone();
+                let resource_type = resource_type_owned.clone();
+                let resource_id = resource_id_owned.clone();
+                Box::pin(async move {
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
+                    // Load group type's allowed_membership_types and validate.
+                    //
+                    // Moved inside this SERIALIZABLE transaction on purpose:
+                    // PostgreSQL's SSI only tracks rw-antidependencies between
+                    // reads and writes that both happen inside a serializable
+                    // transaction. `update_type` (which can remove this
+                    // resource type from `allowed_membership_types`) also runs
+                    // at `SERIALIZABLE`, but a read of the type made on the
+                    // pool -- outside any transaction -- is invisible to that
+                    // machinery. Such a read could see the type as still
+                    // allowing this membership, have `update_type` commit its
+                    // removal in the gap, and then have this function insert
+                    // the now-disallowed membership anyway, with neither side
+                    // ever seeing a `40001`. Reading it here, inside the same
+                    // transaction as the insert it gates, closes that gap.
+                    let allowed = type_repo.load_full_type_by_id(tx, group_type_id).await?;
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
+
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
+                    if !allowed
+                        .allowed_membership_types
+                        .iter()
+                        .any(|m| m == &resource_type)
+                    {
+                        return Err(DomainError::validation(format!(
+                            "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
+                            allowed.code
+                        )));
+                    }
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
+
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
+                    // DB: does this resource already have a membership owned
+                    // by another tenant? An existence check with `LIMIT 1`,
+                    // not a count and not a scan of the memberships
+                    // themselves. No memberships at all, or only this
+                    // tenant's, and the answer is "no conflict" -- the first
+                    // membership of a resource may come from any tenant.
+                    let owned_elsewhere = membership_repo
+                        .has_membership_in_other_tenant(
+                            tx,
+                            gts_type_id,
+                            &resource_id,
+                            target_tenant_id,
+                        )
+                        .await?;
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
+
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
+                    if owned_elsewhere {
+                        debug!(
+                            group_id = %group_id,
+                            resource_type = %resource_type,
+                            resource_id = %resource_id,
+                            "Tenant incompatibility on membership add"
+                        );
+                        // The message stays generic about *which* tenant owns
+                        // the resource: that id belongs to a tenant other than
+                        // the caller's, and this error reaches the caller
+                        // verbatim over the API (api/rest/error.rs), so it
+                        // must not name it.
+                        return Err(DomainError::tenant_incompatibility(format!(
+                            "Resource ({resource_type}, {resource_id}) is already \
+                             linked to a different tenant"
+                        )));
+                    }
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
+
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
+                    // Insert the membership (repo handles duplicate detection)
+                    membership_repo
+                        .insert(tx, group_id, gts_type_id, &resource_id)
+                        .await
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
+                })
+            })
             .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-        if !allowed
-            .allowed_membership_types
-            .iter()
-            .any(|m| m == resource_type)
-        {
-            return Err(DomainError::validation(format!(
-                "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
-                allowed.code
-            )));
-        }
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
-        // Tenant compatibility: check existing memberships for this resource
-        let existing_tenants = self
-            .membership_repo
-            .get_existing_membership_tenant_ids(&conn, gts_type_id, resource_id)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-        // IF no existing memberships → pass (first membership, any tenant allowed)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-        // Collect distinct tenant_ids from existing memberships (existing_tenants)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        if !existing_tenants.is_empty() && !existing_tenants.contains(&group_model.tenant_id) {
-            debug!(
-                group_id = %group_id,
-                resource_type = %resource_type,
-                resource_id = %resource_id,
-                "Tenant incompatibility on membership add"
-            );
-            return Err(DomainError::tenant_incompatibility(format!(
-                "Resource ({resource_type}, {resource_id}) is already linked in tenant {:?}, cannot add to tenant {}",
-                existing_tenants, group_model.tenant_id
-            )));
-        }
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
-
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
-        // Insert the membership (repo handles duplicate detection)
-        let model = self
-            .membership_repo
-            .insert(&conn, group_id, gts_type_id, resource_id)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-13
         // Resolve back to GTS path for the SDK model
@@ -275,7 +334,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             })?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-4
 
-        // Delete the membership
+        // Delete the membership. One row by primary key, and nothing is
+        // decided from a read: with tenant ownership derived from the
+        // memberships themselves there is no second piece of state to keep
+        // in step, so this needs neither its own transaction nor a level
+        // above the backend default. A concurrent `add_membership` either
+        // sees this row (its own `SERIALIZABLE` read, before this delete
+        // commits) and rejects, or does not (after) and is the resource's
+        // first membership again -- both outcomes correct.
         self.membership_repo
             .delete(&conn, group_id, gts_type_id, resource_id)
             .await?;

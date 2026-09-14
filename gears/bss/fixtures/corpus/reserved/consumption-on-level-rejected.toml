@@ -1,0 +1,88 @@
+family         = "reserved"
+id             = "consumption-on-level-rejected"
+kind           = "publish"
+provenance     = ["inst-rv-level", "D-53", "D-68"]
+# **`declined_until = "slice-10-advanced-primitives"` came out on 2026-08-08**,
+# when Slice 10 landed `reserved_rate_minor` / `reservation_flavor` on the row
+# and `domain::rules::reservation` landed the three rules that judge them. The
+# line said no subject could reach `LEVEL_RESERVATION_CONSUMPTION_FORBIDDEN`
+# because no price-row shape could hold either field; that is no longer true, so
+# by its own terms the case "starts earning its evidence again". Nothing about
+# the verdict below changed - it was authored and checked throughout.
+#
+# On a non-`sum` row the tier-counter exclusion has no single meaning: Q is a
+# sum of per-granule folds of a level, and "subtract the reserved quantity"
+# could net per granule or per window. Rather than pick, the catalog refuses to
+# author the flavor at all until per-granule netting is decided - a named Future
+# gate, and fail-closed rather than a guess that reaches an invoice.
+#
+# ## Why both rows are whole rows
+#
+# `declined_until` suspends the evidence; it does not suspend the row. Until this
+# pass both sides carried neither tier bands nor `tierAggregationWindow`, and a
+# `graduated` usage row without either is refused twice over by Slice 3 alone -
+# `TIER_BANDS_GAP` (`inst-tb-first`: no band prices any quantity) and
+# `EVAL_POLICY_MISSING` (`inst-tb-window`: the counter never resets). The
+# validator reports the **first** row-shape violation and reports it before it
+# considers the pair at all, so the day Slice 10 landed this case would have
+# gone red on `TIER_BANDS_GAP` - a verdict about a malformed row, and about
+# nothing D-53 says. The one rule the case exists to assert would have been
+# unreachable in the very run that was supposed to test it, and the failure would
+# have read as a D-53 disagreement.
+#
+# Both rows are therefore authored whole, and the shape is `capacity-on-level`'s
+# exactly: the predecessor **is** the row that case prices, so the pair reads as
+# the one authoring change a level reservation can make, and the successor is
+# that row with the flavor flipped. With the bands and the window in place every
+# Slice-3 rule passes on the successor - explicit kind; no `amount_minor` on a
+# `graduated` row; bands legal on the kind and `graduated` legal on `usage`; a
+# single band, ascending vacuously, starting at the origin, open at the top;
+# `billingGranularity` present and `tierAggregationWindow` present; no package
+# fields; `aggregationGranularity` paired with `per_hour` under D-77; and
+# `max_hold_granules` authored, as a non-`sum` row must. So the reservation rule
+# is the first thing the successor can fail on, which is what makes the case
+# test its own rule rather than its own authoring.
+#
+# Nothing else differs between the two rows. Every unit/counter-determining field
+# is equal, so even if the pair guard were reached it would find nothing - the
+# rejection can only be the flavor's.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+reserved_rate_minor     = 3
+reservation_flavor      = "capacity"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+reserved_rate_minor     = 3
+reservation_flavor      = "consumption"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[[assert]]
+expect = { publish = "rejected", error_code = "LEVEL_RESERVATION_CONSUMPTION_FORBIDDEN" }
+why    = "capacity is the only flavor authorable on a non-sum row; consumption fails publish until per-granule netting semantics exist. Both rows publish clean under every Slice-3 rule, so this is the first thing the successor can fail on rather than the second thing behind a malformed row"

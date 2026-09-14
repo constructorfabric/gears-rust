@@ -7,6 +7,7 @@ use crate::infra::storage::entity::address::{
     ActiveModel as AddressAM, Column as AddressColumn, Entity as AddressEntity,
 };
 use crate::infra::storage::odata_mapper::AddressODataMapper;
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};

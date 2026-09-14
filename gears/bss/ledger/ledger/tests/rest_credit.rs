@@ -34,15 +34,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-use authz_resolver_sdk::error::AuthZResolverError;
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bss_ledger::api::rest::credit::{ApiState, router};
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
@@ -63,16 +63,17 @@ use bss_ledger_sdk::{
     AccountClass, AllocationSplit, MappingStatus, ProvisionOutcome, ProvisionRequest, Side,
     SourceDocType,
 };
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -385,11 +386,12 @@ fn tenant_in_constraint(tenant_id: Uuid) -> Constraint {
 struct AllowAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAuthZ {
+impl AuthZResolverApi for AllowAuthZ {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = subject_tenant_id(&request);
         Ok(EvaluationResponse {
             decision: true,
@@ -420,7 +422,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -463,7 +465,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// for the current month, the four payment-flow chart accounts, and a stream-less
 /// REUSABLE_CREDIT credit account. Mirrors `rest_payments.rs::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: SUBJECT_TENANT,
         payer: Uuid::now_v7(),
@@ -472,7 +474,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
         reusable_credit: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -486,7 +488,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -594,7 +596,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -610,7 +612,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -811,7 +813,7 @@ async fn apply_returns_201() {
         &s,
         "inv-1",
         500,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -892,7 +894,7 @@ async fn apply_over_open_ar_returns_409_with_code() {
         &s,
         "inv-1",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -957,7 +959,7 @@ async fn cross_tenant_target_is_forbidden_403() {
 
     // No wallet sub-grain was created for the foreign tenant.
     let foreign_subgrain = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
              WHERE tenant_id='{foreign}'"
         )))

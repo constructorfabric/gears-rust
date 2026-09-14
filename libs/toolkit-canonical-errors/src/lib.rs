@@ -5,6 +5,7 @@ extern crate self as toolkit_canonical_errors;
 pub mod builder;
 pub mod context;
 pub mod error;
+pub mod passthrough;
 pub mod problem;
 pub mod transport;
 
@@ -19,6 +20,7 @@ pub use context::{
     Unauthenticated, UnauthenticatedV1, Unimplemented, UnimplementedV1, Unknown, UnknownV1,
 };
 pub use error::CanonicalError;
+pub use passthrough::ForeignPassthrough;
 pub use problem::{Problem, ProblemCategory, ProblemConversionError};
 pub use toolkit_canonical_errors_macro::resource_error;
 pub use transport::{Http, TransportOverride};

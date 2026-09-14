@@ -51,7 +51,7 @@ impl MigrationTrait for Migration {
                     attempts INTEGER NOT NULL DEFAULT 0 \
                 );",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };

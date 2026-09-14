@@ -6,7 +6,7 @@
 //! read of a B-owned account returns `None`. This closes the gap where the
 //! highest-value isolation guarantee was only covered at e2e (live cluster),
 //! never at the Rust layer. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_bola -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_bola -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -23,7 +23,6 @@ use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::ODataQuery;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -47,7 +46,7 @@ fn account_row(tenant: Uuid) -> AccountRow {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_reference_reads_are_sql_scoped_to_empty() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -114,5 +113,28 @@ async fn cross_tenant_reference_reads_are_sql_scoped_to_empty() {
     assert!(
         cross_b.items.is_empty(),
         "B's scope must NOT see A's accounts"
+    );
+
+    // The third reader, and the one with the most to lose: `all_accounts` is
+    // unpaginated by design, so a scope predicate that failed to apply here
+    // would hand the invoice-post chart resolver another tenant's whole chart
+    // rather than a first page of it.
+    let all_cross = repo
+        .all_accounts(&scope_a, tenant_b)
+        .await
+        .expect("all cross");
+    assert!(
+        all_cross.is_empty(),
+        "A's scope must NOT see B's chart (SQL-level BOLA); got {} row(s)",
+        all_cross.len()
+    );
+    let all_own = repo
+        .all_accounts(&scope_a, tenant_a)
+        .await
+        .expect("all own");
+    assert_eq!(
+        all_own.iter().map(|r| r.account_id).collect::<Vec<_>>(),
+        vec![a_id],
+        "and the empty answer above is the scope, not an empty table"
     );
 }

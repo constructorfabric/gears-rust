@@ -47,7 +47,6 @@ use bss_ledger_sdk::{AccountClass, RecognitionRunOutcome, Side};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -59,7 +58,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -106,7 +105,7 @@ fn account(
 }
 
 async fn open_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{period_id}','UTC','OPEN')",
         s.tenant, s.tenant
@@ -119,7 +118,7 @@ async fn open_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
 /// [`open_period`]; this flips one to CLOSED so an E-2 missed-close is observable:
 /// `fiscal_period` is mutable, unlike the append-only journal).
 async fn close_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND period_id='{period_id}'",
         s.tenant
@@ -303,7 +302,7 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -497,7 +496,7 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn missed_close_disaggregates_under_the_open_period() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await; // setup opens 202606 + seeds accounts

@@ -6,7 +6,7 @@
 
 // === MODULE DEFINITION ===
 pub mod gear;
-pub use gear::{GearOrchestrator, GearOrchestratorConfig};
+pub use gear::GearOrchestrator;
 
 // === INTERNAL MODULES (pub for integration tests) ===
 pub mod api;

@@ -78,7 +78,7 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE conversion_requests ADD COLUMN cancelled_comment TEXT NULL CONSTRAINT ck_conversion_requests_cancelled_comment_len CHECK (length(cancelled_comment) BETWEEN 1 AND 1000);",
                 "ALTER TABLE conversion_requests ADD COLUMN rejected_comment TEXT NULL CONSTRAINT ck_conversion_requests_rejected_comment_len CHECK (length(rejected_comment) BETWEEN 1 AND 1000);",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };
@@ -109,7 +109,7 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE conversion_requests DROP COLUMN approved_comment;",
                 "ALTER TABLE conversion_requests DROP COLUMN requested_comment;",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };

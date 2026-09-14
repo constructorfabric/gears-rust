@@ -1,3 +1,8 @@
+//! Internal credential-store error taxonomy.
+//!
+//! Domain failures retain operational causes while boundary adapters project
+//! only curated SDK and canonical HTTP errors.
+
 use std::time::Duration;
 
 use thiserror::Error;

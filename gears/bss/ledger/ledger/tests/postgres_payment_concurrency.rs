@@ -3,7 +3,7 @@
 //! Postgres and pin the invariants the per-payment cap, the candidate ceiling,
 //! and the payer-grain projector must preserve under contention. Ignored by
 //! default; run with
-//! `cargo test -p bss-ledger --test postgres_payment_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payment_concurrency -- --ignored`.
 //!
 //! Covers: (1) N concurrent `allocate`s of the SAME payment never push
 //! `allocated_minor` past `settled_minor` — the per-payment cap CHECK is the
@@ -33,6 +33,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
@@ -48,11 +49,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -69,7 +71,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -112,7 +114,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// UNALLOCATED credit, PSP_FEE_EXPENSE debit, AR debit). Mirrors
 /// `postgres_payments::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -120,7 +122,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -134,7 +136,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -204,7 +206,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -215,7 +217,7 @@ async fn ar_invoice_balance(
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_payment_allocation \
          WHERE tenant_id='{}' AND payment_id='{}'",
         s.tenant, payment_id
@@ -258,7 +260,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -275,7 +277,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -475,7 +477,7 @@ async fn concurrent_allocate_respects_per_payment_cap() {
             &s,
             invoice,
             100,
-            Utc::now() - chrono::Duration::hours(4 - i64::try_from(i).unwrap()),
+            OffsetDateTime::now_utc() - time::Duration::hours(4 - i64::try_from(i).unwrap()),
         )
         .await;
     }
@@ -584,7 +586,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -636,7 +638,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
         );
         let ctx = SecurityContext::anonymous();
         let scope = AccessScope::for_tenant(s_post.tenant);
-        let posted_at = Utc::now() - chrono::Duration::minutes(30);
+        let posted_at = OffsetDateTime::now_utc() - time::Duration::minutes(30);
         // The concurrent invoice-post serializes against the allocate at the
         // shared payer/AR grain; the same client retry lands it.
         retry_on_serialization(|| {
@@ -651,7 +653,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
                 reverses_entry_id: None,
                 reverses_period_id: None,
                 posted_at_utc: posted_at,
-                effective_at: posted_at.date_naive(),
+                effective_at: to_naive_date(posted_at),
                 origin: "SYSTEM".to_owned(),
                 posted_by_actor_id: s_post.tenant,
                 correlation_id: Uuid::now_v7(),
@@ -743,11 +745,13 @@ async fn allocate_too_large_is_rejected() {
         )
         .unwrap();
     }
-    raw.execute(pg(sql)).await.expect("bulk-seed 501 AR rows");
+    raw.execute_raw(pg(sql))
+        .await
+        .expect("bulk-seed 501 AR rows");
 
     // Sanity: exactly 501 open candidates exist for the payer.
     let seeded = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT COUNT(*) FROM bss.ledger_ar_invoice_balance \
              WHERE tenant_id='{}' AND payer_tenant_id='{}' AND currency='USD' \
              AND balance_minor > 0",
@@ -840,14 +844,16 @@ async fn large_backlog_small_lump_allocates() {
         )
         .unwrap();
     }
-    raw.execute(pg(sql)).await.expect("bulk-seed 501 AR rows");
+    raw.execute_raw(pg(sql))
+        .await
+        .expect("bulk-seed 501 AR rows");
 
     // The invoice-grain rows above are only part of the projection — a real
     // posting also maintains the AR account-level and per-payer aggregates, both
     // guarded no-negative. Seed them to the backlog total (501 × 100) so the
     // CR AR relief has headroom at every guarded grain, not just the invoice one.
     let ar_total = i64::try_from(count).unwrap() * 100;
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
          VALUES ('{}','{}','USD','AR','DR',{ar_total})",
@@ -855,7 +861,7 @@ async fn large_backlog_small_lump_allocates() {
     )))
     .await
     .expect("seed AR account_balance aggregate");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_ar_payer_balance \
             (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
          VALUES ('{}','{}','{}','USD',{ar_total})",

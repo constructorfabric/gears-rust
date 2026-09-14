@@ -14,4 +14,4 @@ pub mod models;
 
 pub use client::FileParserClientV1;
 pub use errors::FileParserClientError;
-pub use models::{ParseBytesRequest, ParsedText};
+pub use models::{Detection, ParseBytesRequest, ParsedText};

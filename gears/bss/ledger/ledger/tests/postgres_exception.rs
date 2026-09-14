@@ -2,7 +2,7 @@
 //! `ExceptionRouter` (additive, period-bound, deduped routing) + `ExceptionQueueRepo`
 //! (list / read / resolve) + the close-gate consumption of OPEN rows (incl. the
 //! `GL_WRITEOFF_VARIANCE` acknowledge-to-non-block path). Ignored by default; run
-//! with `cargo test -p bss-ledger --test postgres_exception -- --ignored`.
+//! with `cargo test -p cf-gears-bss-ledger --test postgres_exception -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -25,7 +25,6 @@ use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ExceptionQueueRepo;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -47,7 +46,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Uuid) {
     let provider = DBProvider::<DbError>::new(tdb);
 
     let tenant = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
          VALUES ('{tenant}','{tenant}','202606','UTC','OPEN')"
     )))
@@ -64,7 +63,7 @@ async fn count_rows(
     status: &str,
 ) -> i64 {
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT count(*) AS c FROM bss.ledger_exception_queue \
              WHERE tenant_id='{tenant}' AND exception_type='{exception_type}' AND status='{status}'"
         )))
@@ -79,7 +78,7 @@ async fn count_rows(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn route_opens_one_period_bound_row_and_dedups() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -97,7 +96,7 @@ async fn route_opens_one_period_bound_row_and_dedups() {
 
     // The row is bound to the current OPEN period (so the close gate sees it).
     let period = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT period_id FROM bss.ledger_exception_queue \
              WHERE tenant_id='{tenant}' AND exception_type='RECON_MISMATCH'"
         )))
@@ -123,7 +122,7 @@ async fn route_opens_one_period_bound_row_and_dedups() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn resolve_transitions_and_list_filters() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -160,7 +159,7 @@ async fn resolve_transitions_and_list_filters() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn gl_writeoff_approved_exception_does_not_block_close() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -209,7 +208,7 @@ async fn gl_writeoff_approved_exception_does_not_block_close() {
         .expect("an APPROVED_EXCEPTION GL-writeoff does not block close");
     assert!(!outcome.already_closed, "the period closes cleanly");
     let status = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{tenant}' AND period_id='202606'"
         )))

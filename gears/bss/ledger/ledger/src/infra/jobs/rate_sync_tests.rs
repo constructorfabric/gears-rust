@@ -7,7 +7,7 @@
 //! is a Docker-gated `#[ignore]` testcontainer test.
 //!
 //! Ignored Docker tests run with
-//! `cargo test -p bss-ledger --lib 'infra::jobs::rate_sync::tests' -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::rate_sync::tests' -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,15 +17,14 @@
 
 use async_trait::async_trait;
 use bss_ledger_sdk::{CurrencyPair, UnconfiguredRateProviderV1};
-use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, connect_db};
 
 use super::*;
 use crate::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 /// A configurable fake `RateProviderV1`: a stable id + a fixed fetch outcome.
 /// `id` is owned (not `&'static`) so `provider_id` returns a borrowed `&self.id`
@@ -91,7 +90,7 @@ fn rate(base: &str, quote: &str, rate_micro: i64) -> ProviderRate {
         base: base.to_owned(),
         quote: quote.to_owned(),
         rate_micro,
-        as_of: Utc::now(),
+        as_of: OffsetDateTime::now_utc(),
         provider: "unstamped".to_owned(),
     }
 }
@@ -188,7 +187,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fans_rates_out_to_every_provisioned_tenant() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -204,7 +203,7 @@ async fn fans_rates_out_to_every_provisioned_tenant() {
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     for t in [tenant_a, tenant_b] {
-        raw.execute(pg(format!(
+        raw.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_fiscal_calendar
                (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month)
              VALUES ('{t}','{t}','UTC','MONTH',1)"

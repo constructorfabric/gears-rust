@@ -1879,19 +1879,21 @@ mod tests {
     /// Build a minimal `DataPlaneServiceImpl` with the given `BackendSelector`.
     fn build_svc(selector: Arc<dyn EndpointSelector>) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
-            AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-            EvaluationResponseContext, PolicyEnforcer,
+            AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+            PolicyEnforcer,
         };
         use credstore_sdk::CredStoreClientV1;
-        use toolkit_security::SecurityContext;
+        use toolkit_canonical_errors::CanonicalError;
+        use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
         struct AllowAllAuthZ;
         #[async_trait]
-        impl AuthZResolverClient for AllowAllAuthZ {
+        impl AuthZResolverApi for AllowAllAuthZ {
             async fn evaluate(
                 &self,
+                _ctx: PlatformSecurityContext,
                 _request: EvaluationRequest,
-            ) -> Result<EvaluationResponse, AuthZResolverError> {
+            ) -> Result<EvaluationResponse, CanonicalError> {
                 Ok(EvaluationResponse {
                     decision: true,
                     context: EvaluationResponseContext {

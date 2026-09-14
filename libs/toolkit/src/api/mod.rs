@@ -11,6 +11,7 @@ pub mod odata;
 pub mod openapi_registry;
 pub mod operation_builder;
 pub mod response;
+pub mod rest;
 pub mod select;
 
 #[cfg(test)]
@@ -24,7 +25,7 @@ pub use error_layer::{
 pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, ensure_schema};
 pub use operation_builder::{
     Missing, OperationBuilder, OperationSpec, ParamLocation, ParamSpec, Present, RateLimitSpec,
-    ResponseSpec, state,
+    ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
 
@@ -47,6 +48,7 @@ pub mod canonical_prelude {
     // Same response sugar / OData / axum re-exports as the legacy prelude
     pub use super::odata::OData;
     pub use super::response::{JsonBody, JsonPage, created_json, no_content, ok_json};
+    pub use super::rest::extract;
     pub use super::select::apply_select;
     pub use axum::{Json, http::StatusCode, response::IntoResponse};
 }

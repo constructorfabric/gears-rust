@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS settings (
 );
                 "
             }
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         };
 
         conn.execute_unprepared(sql).await?;

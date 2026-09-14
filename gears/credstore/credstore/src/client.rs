@@ -1,3 +1,9 @@
+//! In-process SDK adapter for the credential store.
+//!
+//! [`CredStoreLocalClient`] maps the public SDK contract onto the domain
+//! [`Service`] and translates domain
+//! failures into stable SDK errors.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

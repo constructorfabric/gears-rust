@@ -171,6 +171,14 @@ The cluster gear is designed to work across the full range of Gears deployments:
 
 A consumer gear's code does not change between these shapes. The operator picks the backend per primitive in deployment YAML.
 
+**These five shapes vary the *backend*. Two further shapes vary *where cluster itself runs***, and they are the platform's deployment profiles rather than cluster's own vocabulary. The five above are all Profile 1; the deployable gear adds Profile 3 (see DESIGN.md §3.16):
+
+- **Profile 1 — Embedded (all five shapes above).** The `cluster` gear and its plugins are linked into the consumer's own binary. A consumer's `resolve()` hands back the real backend, so a coordination call is a function call and the hot path costs nothing extra.
+- **Profile 2 — Host + Workers.** **Not designed, and this is a scope limit rather than a deferral.** No endpoint-resolution mechanism exists for it, and its topology fork is unanswered: one cluster process per *deployment* is a single point of failure with no scheduler, while one per *host* silently makes locks and elections per-host instead of deployment-wide. When P2 is designed the shape has to be chosen explicitly and enforced, because a per-host misconfiguration looks like a scaling choice and fails quietly.
+- **Profile 3 — K8s Native.** Cluster runs as its own pod (`cluster-oop`), serving the coordination primitives over gRPC on the platform plane and the framework's probes over HTTP. Consumers link no plugins and no backend drivers; the framework's proxy-wiring phase gives them a remote client and their source is byte-for-byte the Profile 1 source. Kubernetes only — Profile 2's gap is the reason.
+
+**A consumer gear's code does not change across the profiles either**, which is the stronger claim: not merely that the backend is configurable, but that whether coordination is a function call or an RPC is invisible at the call site. What varies is a Cargo feature and the operator's deployment, never the consumer's source.
+
 ### 3.2 Gear-Specific Environment Constraints
 
 - The in-process backend has no external dependencies and is the default for development.
@@ -348,9 +356,9 @@ Consumers **MUST** release locks explicitly. If a consumer panics, crashes, or f
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-lock-no-remote`
 
 <!-- cpt-cf-id-content -->
-Consumers **MUST NOT** make remote calls inside the critical section protected by a cluster lock. All remote effects must happen before lock acquisition or after lock release. The system **MUST** include a static-analysis rule that flags violations at compile time so this rule is enforceable rather than aspirational.
+Consumers **MUST NOT** make **non-cluster** remote calls — database writes, HTTP to other services, any effect whose latency depends on a third party — inside the critical section protected by a cluster lock; those effects must happen before lock acquisition or after lock release. **Bounded cluster-primitive round trips are permitted** inside the critical section: in Profile 3 a consumer's own `cache.get` / `compare_and_swap` against cluster *is* a remote call, so the original blanket rule would forbid the design's own reference flow (UC-002). Such round trips are bounded by `rpc_timeout` and fail closed, so a holder whose lease has lapsed learns quickly. The system **MUST** include a static-analysis rule that flags *non-cluster* remote I/O inside the critical section, re-scoped to distinguish cluster coordination (permitted) from third-party I/O (forbidden) — a rule left flagging every cluster call would either fire on every correct Profile 3 consumer or be suppressed wholesale. For correctness-critical work, treat the lock as advisory and make the protected write conditional via cache CAS (DESIGN.md §3.3 pattern C).
 
-**Rationale**: Combined with async timeouts on every operation, this rule eliminates the unbounded-pause scenario that Kleppmann-style fencing tokens exist to protect against. The architectural constraint is strictly stronger than the fencing-token mitigation: there's no stale writer to fence because the critical section did no remote work.
+**Rationale**: Combined with async timeouts on every operation, this rule eliminates the unbounded-pause scenario that Kleppmann-style fencing tokens exist to protect against. The bounded cluster round-trip carve-out does not reopen it: a remote critical section has a wider window in which a lease can lapse unnoticed, which is exactly why the fix for correctness-critical work is pattern C (conditional write), not fencing. See ADR-002 (amended for the remote profile).
 **Actors**: `cpt-cf-clst-actor-oagw`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -430,7 +438,7 @@ Each plugin **MUST** honestly declare the characteristics of its backend — for
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-validation-startup-fail`
 
 <!-- cpt-cf-id-content -->
-When a consumer's declared capability requirements cannot be met by the operator-bound backend, the system **MUST** fail startup with a specific, actionable error naming the consumer gear's requirement, the primitive, and the bound backend. Startup **MUST NOT** complete with a silently-degraded primitive. The error message **MUST** be specific enough that an operator can either change the YAML binding or contact the consumer gear's owner without first having to read source code to figure out what failed.
+A consumer **MUST NOT serve traffic against an unmet requirement**. When a consumer's declared capability requirements cannot be met by the operator-bound backend, the mismatch **MUST** surface as a specific, actionable error naming the consumer's requirement, the primitive, and the bound backend — never as a silently-degraded primitive. *How* it surfaces depends on deployment profile: in Profile 1, and in Profile 3 whenever cluster is reachable within the resolve timeout, validation is **inline** — `resolve()` returns `Err(CapabilityNotMet)` and the consumer fails startup; during a platform cold start where cluster is not yet reachable, validation is **deferred to the readiness gate** and the pod reports **not-ready** rather than serving. The guarantee is identical on both paths; only the delivery differs. A consumer that branches on `CapabilityNotMet` at the resolve site is relying on the inline path — the readiness path delivers the same guarantee for a consumer that does not. The error message **MUST** be specific enough that an operator can change the YAML binding or contact the consumer's owner without reading source code.
 
 **Rationale**: Silent capability degradation produces production incidents that look like consumer bugs but are actually deployment configuration issues. Loud startup failure puts the error where the cause is — in deployment configuration — at the time the deployment is rolling out, not at 3am during traffic.
 **Actors**: `cpt-cf-clst-actor-operator`, `cpt-cf-clst-actor-platform-gear`
@@ -477,9 +485,9 @@ The cluster SDK **MUST** ship an opt-in watch-restart combinator that wraps the 
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-shutdown-revoke`
 
 <!-- cpt-cf-id-content -->
-On graceful shutdown, the system **MUST** revoke any active leader's claim before shutdown completes. A current leader **MUST** observe loss-of-leadership before any consumer code runs again on the assumption that the leader is still in charge. After loss has been observed, the watch then ends terminally (close signal). In-flight blocking operations (lock acquisitions, leader claims) **MUST** be cancelled with a specific shutdown error so consumers know the difference between "I lost my lock" and "the cluster is going down."
+The system **MUST** guarantee that a leader observes loss-of-leadership before any consumer code runs again on the assumption it still leads. Under store-owned leases (ADR-012) leadership is a fenced record in the backing store, not state held in a cluster replica, so *how* loss is observed depends on which process is stopping. **When the leader's own process shuts down** (embedded, or a Profile-3 consumer), it revokes its own claim before exit: the leader watch emits `Status(Lost)` then `Closed(Shutdown)` — two distinct events, `Lost` first so leader-only work stops before the watch ends — and an in-flight blocking `lock()` returns `Err(Shutdown)`, distinct from `LockTimeout`. **When the cluster gear (broker) shuts down or restarts**, it revokes nothing: a broker holds no lease of its own, and unseating a live leader in another pod would be wrong, so it **closes subscriptions only** (`Closed(Shutdown)`, which the SDK's `RestartingWatch` re-establishes against the next replica). A leader whose process keeps running retains its claim across a cluster restart (invariant I7); a crashed holder's lease lapses via TTL per `cpt-cf-clst-fr-shutdown-ttl-cleanup`. See DESIGN.md §3.17.6.
 
-**Rationale**: Without explicit revocation, a graceful shutdown can leave a leader-process believing it still leads while the cluster handle is gone — a stale-writer setup. Revoking confidence before shutdown completes prevents this.
+**Rationale**: Without explicit loss-observation, a graceful shutdown can leave a leader-process believing it still leads while its handle is gone — a stale-writer setup. Store-owned leases make the mechanism depend on *whose* process is stopping: an exiting leader revokes its own confidence, while a broker restart must NOT — doing so would falsely unseat a live leader, which is the failure store-owned leases exist to prevent.
 **Status (this change)**: Fully implemented (leader + in-flight lock + cache watch). `ClusterHandle::stop` revokes each wiring-created default backend before it returns: the leader-election backend latches `Status(Lost)` then emits `Closed(ClusterError::Shutdown)` to every active leader and awaits those tasks; an in-flight blocking `lock()` waiter returns `Err(ClusterError::Shutdown)` (not `LockTimeout`). Active **cache** watches are closed with `Closed(ClusterError::Shutdown)` via the standalone plugin's stop hook (`StandaloneCache::shutdown`), one phase after the leader/lock revocation but still within `stop()`. No remote release is performed — held claims and locks lapse via TTL per `cpt-cf-clst-fr-shutdown-ttl-cleanup`.
 **Actors**: `cpt-cf-clst-actor-host`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -610,6 +618,42 @@ The plugin contract — the interface a plugin author implements to adapt a back
 **Architecture Allocation**: See DESIGN.md.
 <!-- cpt-cf-id-content -->
 
+#### Remote-Transport Latency Budget (Deployable Profile)
+
+- [ ] `p1` - **ID**: `cpt-cf-clst-nfr-oop-transport-latency`
+
+<!-- cpt-cf-id-content -->
+When cluster runs out of process (Profile 3), each primitive operation crosses a gRPC boundary the embedded profile does not. That added hop MUST stay within the platform's OoP latency budget (`cpt-cf-nfr-oop-latency`): for every backend other than the in-memory standalone fixture cluster already pays a network round trip, so remoting adds one hop rather than converting memory access into network access.
+
+**Threshold**: The transport hop adds no more than the platform OoP budget of 5 ms (localhost) / 10 ms (intra-cluster) at p50 over the embedded path; `cache.get` against a real backend stays at or below ~0.6 ms p50, and a read-modify-write flow under contention (the OAGW rate-limiter reference case) stays roughly 2× its in-process cost, inside budget.
+**Rationale**: The deployable model is above all a performance change; the cost is concentrated (renewal is one hop per interval; watches get *better* via server-side fan-out) rather than spread, and is accepted rather than engineered away (invariant I13). Making the budget explicit keeps a future regression visible.
+**Architecture Allocation**: See DESIGN.md §6 and §3.20.
+<!-- cpt-cf-id-content -->
+
+#### Readiness Gating Under Eventual Reachability
+
+- [ ] `p1` - **ID**: `cpt-cf-clst-nfr-readiness-gating`
+
+<!-- cpt-cf-id-content -->
+A consumer MUST NOT serve traffic before its cluster-backed requirements are satisfiable. When capability validation cannot run inline because cluster is not yet reachable (platform cold start), the consumer's readiness probe MUST report not-ready until the deferred validation passes, so the failure surfaces as a pod that never enters rotation rather than one that serves against an unmet requirement (see `cpt-cf-clst-fr-validation-startup-fail`).
+
+**Threshold**: A consumer whose profile cannot be validated reports not-ready within its readiness probe period and enters rotation only after the same validation the inline path runs succeeds; a permanent configuration error escalates to process exit after a bounded grace window so it surfaces as `CrashLoopBackOff` rather than a permanently-not-ready pod.
+**Rationale**: Eventual reachability is the platform's readiness model; gating on it keeps the "never serve against an unmet requirement" guarantee without requiring cluster to be up before any dependent pod can start.
+**Architecture Allocation**: See DESIGN.md §3.10.1 and §3.17.3.
+<!-- cpt-cf-id-content -->
+
+#### Backend Connection Count Bounded by Cluster Config
+
+- [ ] `p1` - **ID**: `cpt-cf-clst-nfr-backend-connection-count`
+
+<!-- cpt-cf-id-content -->
+In the deployable profile the number of connections opened against each coordination backend MUST be a function of the cluster gear's own configuration (its replica count and per-profile pool sizing), NOT of the number of consumer replicas. Cluster is the single point that holds backend credentials and pools; consumers reach a backend only through cluster's API.
+
+**Threshold**: Adding consumer replicas adds no backend connections; backend connection count scales only with cluster replica count × configured per-profile pool size. This replaces the embedded profile's fan-in, where every consumer replica opened its own backend connections.
+**Rationale**: Concentrating connections in the cluster tier is a primary benefit of the deployable model (one upstream watch fanned out to many consumers; a bounded pool instead of consumer-count fan-in) and a capacity-planning input operators need stated explicitly.
+**Architecture Allocation**: See DESIGN.md §3.18.2 and §6.
+<!-- cpt-cf-id-content -->
+
 ### 6.2 NFR Exclusions
 
 The following non-functional concerns are deliberately NOT in scope for this change cycle:
@@ -647,6 +691,17 @@ The cluster gear exposes a public API consumed by Gears and a separate plugin-fa
 **Stability**: stable (V1)
 **Description**: Plugin authors implement one or more primitive contracts and declare their backend's characteristics so the platform can validate consumer capability requirements. Plugins ship as separate crates on independent release schedules. A plugin implementing only the cache primitive automatically gets working leader election and lock via cluster-provided defaults built on cache.
 **Breaking Change Policy**: Major version bump per primitive contract, ships independently; the prior major version remains supported during a migration window.
+<!-- cpt-cf-id-content -->
+
+#### Coordination Contract and Wire Projection
+
+- [ ] `p1` - **ID**: `cpt-cf-clst-interface-contract-wire`
+
+<!-- cpt-cf-id-content -->
+**Type**: Rust contract traits (`*Api`) + gRPC data-plane / REST lifecycle-plane wire projection
+**Stability**: stable (`cluster.v1`)
+**Description**: The deployable profile adds a third interface between the consumer API and the plugin interface: the coordination *contract* traits and their wire projection. The contract traits carry the security-context parameter that is kept off the wire; the projection turns each contract method into its gRPC (data plane) or REST (lifecycle/admin plane) form, with `CanonicalError` as the wire error form and an idempotency/retry model per method. A consumer never names these types — they exist so a `Remote*Backend` can satisfy the same three backend traits over a process boundary that a local backend satisfies in memory (I1).
+**Breaking Change Policy**: The wire contract is versioned `cluster.v1`; changes are additive within the version (new fields optional, field numbers pinned via `proto.lock.toml`), and an incompatible change is a new wire major that coexists with the prior one — mirroring the per-primitive versioning of the consumer and plugin surfaces. A peer of any vintage decodes an unrecognised error as the original `Problem` rather than panicking (rolling-deployment skew rule).
 <!-- cpt-cf-id-content -->
 
 ### 7.2 External Integration Contracts

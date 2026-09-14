@@ -22,6 +22,13 @@ fn default_gateway_sync_interval_secs() -> u64 {
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiGatewayConfig {
     pub bind_addr: String,
+
+    /// Base URL other pods use to reach this gateway's REST endpoint, published
+    /// for directory registration (required in Kubernetes, where the pod binds
+    /// `0.0.0.0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_uri: Option<String>,
+
     #[serde(default)]
     pub enable_docs: bool,
     #[serde(default)]
@@ -80,6 +87,24 @@ pub struct ApiGatewayConfig {
     /// monolith is unaffected).
     #[serde(default)]
     pub gateway_proxy: GatewayProxyConfig,
+
+    /// Platform-plane credential for the embedded platform-host, serving **both
+    /// directions** from one block:
+    ///
+    /// - **Inbound** — `internal_auth_middleware`, installed ahead of the tenant
+    ///   plane, validates the `X-ToolKit-Internal-Token` on co-hosted internal
+    ///   routes (e.g. `authz-resolver`'s `/evaluate`) into a
+    ///   `PlatformSecurityContext`. Permissive on a missing token, so tenant
+    ///   traffic is unaffected. Kube uses `audiences`.
+    /// - **Outbound** — the credential attached to the edge's own
+    ///   `DirectoryService` polls (when [`GatewayProxyConfig::enabled`]). Kube
+    ///   uses `token_path`; omit it to attach no outbound credential.
+    ///
+    /// Each direction reads only the fields it needs, so one block (e.g.
+    /// `Kube { audiences, token_path }`) configures the whole platform plane
+    /// (`cpt-cf-adr-two-plane-auth`). Default: `None` (Profile 1 monolith).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
 }
 
 /// Reverse-proxy (embedded edge) configuration.
@@ -100,12 +125,6 @@ pub struct GatewayProxyConfig {
     /// Interval (seconds) between directory polls that refresh the proxy route
     /// table.
     pub sync_interval_secs: u64,
-    /// Platform-plane credential attached to the edge's `DirectoryService`
-    /// polls (`x-toolkit-internal-token`). Required when the directory host
-    /// enforces the platform plane; the `secret` must match the host's
-    /// `gear-orchestrator.internal_auth`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
 }
 
 impl Default for GatewayProxyConfig {
@@ -114,7 +133,6 @@ impl Default for GatewayProxyConfig {
             enabled: false,
             directory_endpoint: None,
             sync_interval_secs: default_gateway_sync_interval_secs(),
-            internal_auth: None,
         }
     }
 }
@@ -189,6 +207,7 @@ impl Default for ApiGatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: String::default(),
+            advertise_uri: None,
             enable_docs: false,
             cors_enabled: false,
             cors: None,
@@ -202,6 +221,7 @@ impl Default for ApiGatewayConfig {
             healthcheck_timeout_ms: default_healthcheck_timeout_ms(),
             health: HealthConfig::default(),
             gateway_proxy: GatewayProxyConfig::default(),
+            internal_auth: None,
         }
     }
 }

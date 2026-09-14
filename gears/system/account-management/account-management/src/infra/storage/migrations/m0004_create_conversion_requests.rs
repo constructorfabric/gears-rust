@@ -222,7 +222,7 @@ CREATE TABLE IF NOT EXISTS tenant_idp_metadata (
 );
                 ",
             ],
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
             }
         };

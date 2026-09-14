@@ -21,12 +21,23 @@ use crate::config::RedirectConfig;
 use http::{Request, Uri, header};
 use tower_http::follow_redirect::policy::{Action, Attempt, Policy};
 
-/// Headers that are stripped on cross-origin redirects to prevent credential leakage
-const SENSITIVE_HEADERS: &[header::HeaderName] = &[
-    header::AUTHORIZATION,
-    header::COOKIE,
-    header::PROXY_AUTHORIZATION,
-];
+/// Headers stripped on cross-origin redirects to prevent credential leakage.
+/// Includes the platform-plane `X-ToolKit-Internal-Token`
+/// (`cpt-cf-adr-two-plane-auth`): being long-lived and process-scoped,
+/// forwarding it to a server-chosen redirect target would hand a peer the gear's
+/// platform-plane credential. `set_sensitive(true)` covers logging, not
+/// redirects — this does.
+///
+/// Not a `const` because `HeaderName::from_static` is not a `const fn`.
+static SENSITIVE_HEADERS: std::sync::LazyLock<[header::HeaderName; 4]> =
+    std::sync::LazyLock::new(|| {
+        [
+            header::AUTHORIZATION,
+            header::COOKIE,
+            header::PROXY_AUTHORIZATION,
+            header::HeaderName::from_static(toolkit_security::constants::INTERNAL_TOKEN_HEADER),
+        ]
+    });
 
 /// A security-hardened redirect policy
 ///
@@ -180,7 +191,7 @@ impl<B: Clone, E> Policy<B, E> for SecureRedirectPolicy {
         // This happens AFTER the redirect() decision, so we know we're following it
         if self.cross_origin_detected && self.config.strip_sensitive_headers {
             let headers = request.headers_mut();
-            for header_name in SENSITIVE_HEADERS {
+            for header_name in SENSITIVE_HEADERS.iter() {
                 if headers.remove(header_name).is_some() {
                     tracing::debug!(header = %header_name, "Stripped sensitive header on cross-origin redirect");
                 }

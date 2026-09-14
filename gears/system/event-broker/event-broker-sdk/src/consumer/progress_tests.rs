@@ -9,12 +9,11 @@ use super::{BatchHandlerOutcome, RawEvent};
 fn event_with_offset(offset: i64) -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: gts_id!("cf.core.events.event_type.v1~example.progress.test.x.v1").to_owned(),
+        type_id: gts_id!("cf.core.events.event.v1~example.progress.test.x.v1~").to_owned(),
         topic: gts_id!("cf.core.events.topic.v1~example.progress.test.x.v1").to_owned(),
         tenant_id: Uuid::nil(),
         subject: format!("event-{offset}"),
         subject_type: "test".to_owned(),
-        partition_key: None,
         partition: 0,
         sequence: offset,
         offset,

@@ -8,7 +8,7 @@
 //! scans find them and `run()` completes.
 //!
 //! Ignored Docker tests run with
-//! `cargo test -p bss-ledger --lib 'infra::jobs::aged_alarms::tests' -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::aged_alarms::tests' -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::Duration;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
@@ -38,6 +38,7 @@ use crate::infra::storage::entity::{
     account_balance, journal_entry, journal_line, refund, unallocated_balance,
 };
 use crate::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // Pure-function fixtures (no DB) — the age-proxy logic.
@@ -47,7 +48,7 @@ const TENANT: u128 = 0xA1;
 const PAYER: u128 = 0xB1;
 const ACCOUNT: u128 = 0xC1;
 
-fn entry(entry_id: Uuid, posted_at: DateTime<Utc>) -> journal_entry::Model {
+fn entry(entry_id: Uuid, posted_at: OffsetDateTime) -> journal_entry::Model {
     journal_entry::Model {
         entry_id,
         tenant_id: Uuid::from_u128(TENANT),
@@ -125,11 +126,11 @@ fn unalloc_cache(account: u128, balance_minor: i64) -> unallocated_balance::Mode
 
 #[test]
 fn aged_grains_flags_old_grain_with_positive_balance() {
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     // One UNALLOCATED line posted 2 days ago — older than the 1-day cutoff.
     let e = Uuid::now_v7();
-    let entries = vec![entry(e, now - ChronoDuration::days(2))];
+    let entries = vec![entry(e, now - Duration::days(2))];
     let lines = vec![unalloc_line(e, ACCOUNT)];
     let cache = vec![unalloc_cache(ACCOUNT, 1_000)];
 
@@ -157,11 +158,11 @@ fn aged_grains_uses_oldest_contributing_line_not_latest() {
     // Two lines for the SAME grain: one fresh (today), one old (3 days). The age
     // proxy is the OLDEST (3 days), NOT the latest — the resolved G-P5a decision
     // (NOT `last_entry_seq`, which would point at the fresh line).
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     let old = Uuid::now_v7();
     let fresh = Uuid::now_v7();
-    let entries = vec![entry(old, now - ChronoDuration::days(3)), entry(fresh, now)];
+    let entries = vec![entry(old, now - Duration::days(3)), entry(fresh, now)];
     let lines = vec![unalloc_line(old, ACCOUNT), unalloc_line(fresh, ACCOUNT)];
     let cache = vec![unalloc_cache(ACCOUNT, 1_000)];
 
@@ -177,10 +178,10 @@ fn aged_grains_uses_oldest_contributing_line_not_latest() {
 #[test]
 fn aged_grains_skips_fresh_grain() {
     // Oldest line is fresh (1h) — below the 1-day cutoff ⇒ not aged.
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     let e = Uuid::now_v7();
-    let entries = vec![entry(e, now - ChronoDuration::hours(1))];
+    let entries = vec![entry(e, now - Duration::hours(1))];
     let lines = vec![unalloc_line(e, ACCOUNT)];
     let cache = vec![unalloc_cache(ACCOUNT, 1_000)];
 
@@ -195,10 +196,10 @@ fn aged_grains_skips_zero_balance_grain() {
     // Old line, but the cache balance is 0 (fully allocated) ⇒ not aged (the
     // `balance_minor > 0` gate). A drained pool needs no alarm even if its lines
     // are old.
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     let e = Uuid::now_v7();
-    let entries = vec![entry(e, now - ChronoDuration::days(5))];
+    let entries = vec![entry(e, now - Duration::days(5))];
     let lines = vec![unalloc_line(e, ACCOUNT)];
     let cache = vec![unalloc_cache(ACCOUNT, 0)];
 
@@ -212,14 +213,14 @@ fn aged_grains_skips_zero_balance_grain() {
 fn aged_grains_keys_per_grain() {
     // Two distinct accounts: one old+parked (aged), one fresh+parked (not). Only
     // the old grain is flagged — confirms the (payer, account, currency) keying.
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     let e_old = Uuid::now_v7();
     let e_fresh = Uuid::now_v7();
     let other_account = 0xC2;
     let entries = vec![
-        entry(e_old, now - ChronoDuration::days(2)),
-        entry(e_fresh, now - ChronoDuration::minutes(5)),
+        entry(e_old, now - Duration::days(2)),
+        entry(e_fresh, now - Duration::minutes(5)),
     ];
     let lines = vec![
         unalloc_line(e_old, ACCOUNT),
@@ -237,8 +238,8 @@ fn aged_grains_keys_per_grain() {
 
 #[test]
 fn aged_grains_empty_inputs() {
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(86_400);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(86_400);
     assert!(aged_grains(&[], &[], &[], now, cutoff).is_empty());
 }
 
@@ -271,7 +272,7 @@ fn clearing_cache(account: u128, balance_minor: i64) -> account_balance::Model {
     }
 }
 
-fn refund_row(psp: &str, phase: &str, created_at: DateTime<Utc>) -> refund::Model {
+fn refund_row(psp: &str, phase: &str, created_at: OffsetDateTime) -> refund::Model {
     refund::Model {
         tenant_id: Uuid::from_u128(TENANT),
         refund_id: format!("rf-{psp}-{phase}"),
@@ -292,12 +293,12 @@ fn refund_row(psp: &str, phase: &str, created_at: DateTime<Utc>) -> refund::Mode
 
 #[test]
 fn refund_clearing_aged_flags_open_grain_past_7d_warn() {
-    let now = Utc::now();
-    let warn = now - ChronoDuration::seconds(WARN_SECS);
-    let page = now - ChronoDuration::seconds(PAGE_SECS);
+    let now = OffsetDateTime::now_utc();
+    let warn = now - Duration::seconds(WARN_SECS);
+    let page = now - Duration::seconds(PAGE_SECS);
     // Clearing line posted 8 days ago — past the 7d Warn, under the 14d Page.
     let e = Uuid::now_v7();
-    let entries = vec![entry(e, now - ChronoDuration::days(8))];
+    let entries = vec![entry(e, now - Duration::days(8))];
     let lines = vec![clearing_line(e, ACCOUNT)];
     let cache = vec![clearing_cache(ACCOUNT, 500)];
 
@@ -319,12 +320,12 @@ fn refund_clearing_aged_flags_open_grain_past_7d_warn() {
 
 #[test]
 fn refund_clearing_aged_marks_paged_past_14d() {
-    let now = Utc::now();
-    let warn = now - ChronoDuration::seconds(WARN_SECS);
-    let page = now - ChronoDuration::seconds(PAGE_SECS);
+    let now = OffsetDateTime::now_utc();
+    let warn = now - Duration::seconds(WARN_SECS);
+    let page = now - Duration::seconds(PAGE_SECS);
     // 15 days open — past BOTH thresholds ⇒ paged (STUCK_REFUND_CLEARING).
     let e = Uuid::now_v7();
-    let entries = vec![entry(e, now - ChronoDuration::days(15))];
+    let entries = vec![entry(e, now - Duration::days(15))];
     let lines = vec![clearing_line(e, ACCOUNT)];
     let cache = vec![clearing_cache(ACCOUNT, 500)];
 
@@ -347,17 +348,17 @@ fn refund_clearing_aged_marks_paged_past_14d() {
 
 #[test]
 fn refund_clearing_skips_fresh_and_drained_grains() {
-    let now = Utc::now();
-    let warn = now - ChronoDuration::seconds(WARN_SECS);
-    let page = now - ChronoDuration::seconds(PAGE_SECS);
+    let now = OffsetDateTime::now_utc();
+    let warn = now - Duration::seconds(WARN_SECS);
+    let page = now - Duration::seconds(PAGE_SECS);
     // Fresh (2 days) open grain + an old (10 days) but DRAINED (0) grain — neither
     // is aged (the 7d cutoff + the `balance_minor > 0` gate).
     let fresh = Uuid::now_v7();
     let drained = Uuid::now_v7();
     let other = 0xC2;
     let entries = vec![
-        entry(fresh, now - ChronoDuration::days(2)),
-        entry(drained, now - ChronoDuration::days(10)),
+        entry(fresh, now - Duration::days(2)),
+        entry(drained, now - Duration::days(10)),
     ];
     let lines = vec![clearing_line(fresh, ACCOUNT), clearing_line(drained, other)];
     let cache = vec![clearing_cache(ACCOUNT, 500), clearing_cache(other, 0)];
@@ -380,13 +381,13 @@ fn refund_clearing_skips_fresh_and_drained_grains() {
 
 #[test]
 fn stage1_orphan_flags_unmatched_aged_stage1() {
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(WARN_SECS);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(WARN_SECS);
     // A stage-1 `initiated` 8 days old with NO terminal phase ⇒ orphan.
     let rows = vec![refund_row(
         "psp-orphan",
         "initiated",
-        now - ChronoDuration::days(8),
+        now - Duration::days(8),
     )];
     let orphans = stage1_orphans(Uuid::from_u128(TENANT), &rows, now, cutoff);
     assert_eq!(orphans.len(), 1, "an unmatched aged stage-1 is an orphan");
@@ -397,18 +398,18 @@ fn stage1_orphan_flags_unmatched_aged_stage1() {
 
 #[test]
 fn stage1_orphan_skips_advanced_and_fresh_stage1() {
-    let now = Utc::now();
-    let cutoff = now - ChronoDuration::seconds(WARN_SECS);
+    let now = OffsetDateTime::now_utc();
+    let cutoff = now - Duration::seconds(WARN_SECS);
     let rows = vec![
         // Advanced: stage-1 + a matching `confirmed` (same psp) ⇒ NOT an orphan,
         // even though the stage-1 is old.
-        refund_row("psp-done", "initiated", now - ChronoDuration::days(9)),
-        refund_row("psp-done", "confirmed", now - ChronoDuration::days(8)),
+        refund_row("psp-done", "initiated", now - Duration::days(9)),
+        refund_row("psp-done", "confirmed", now - Duration::days(8)),
         // A stage-1 reversal also counts as advanced.
-        refund_row("psp-reversed", "initiated", now - ChronoDuration::days(9)),
-        refund_row("psp-reversed", "rejected", now - ChronoDuration::days(8)),
+        refund_row("psp-reversed", "initiated", now - Duration::days(9)),
+        refund_row("psp-reversed", "rejected", now - Duration::days(8)),
         // A FRESH unmatched stage-1 (2 days) is under the threshold ⇒ not yet.
-        refund_row("psp-fresh", "initiated", now - ChronoDuration::days(2)),
+        refund_row("psp-fresh", "initiated", now - Duration::days(2)),
     ];
     assert!(
         stage1_orphans(Uuid::from_u128(TENANT), &rows, now, cutoff).is_empty(),
@@ -472,7 +473,7 @@ async fn setup(container_url: &str) -> (DatabaseConnection, DBProvider<DbError>)
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_empty_ledger_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider) = setup(&url).await;
@@ -484,11 +485,20 @@ async fn run_over_empty_ledger_completes() {
 }
 
 /// An aged `QUEUED` `PAYMENT_ALLOCATE` row is surfaced by the cross-tenant queue
-/// scan, and `run()` (which emits the alarm) completes `Ok`.
+/// scan, and `run()` over it completes `Ok`.
+///
+/// **The emission is not observed here, by any test in this file.** An alarm
+/// reaches `LedgerEventPublisher::emit_invariant_alarm`, and the publisher these
+/// cases hand the job is `noop()`, whose `metrics` is `None` — so the counter
+/// mirror never fires and nothing records the alarm itself. A `run()` that
+/// emitted nothing at all would pass every case in this file identically. What
+/// the scan assertions above prove is the detector; observing the alarm needs a
+/// publisher built with `LedgerEventPublisher::with_metrics` over a recording
+/// port.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_queue_row_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -496,7 +506,7 @@ async fn aged_queue_row_is_detected_and_run_completes() {
     let tenant = Uuid::now_v7();
     // Seed one QUEUED PAYMENT_ALLOCATE row queued 3 days ago (older than the 1-day
     // threshold) — directly via SQL (the durable work-state row the scan reads).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_pending_event_queue \
          (tenant_id, flow, business_id, payload, queued_at, apply_after, status, attempts) \
          VALUES ('{tenant}', 'PAYMENT_ALLOCATE', 'alloc-aged-1', '{{}}'::jsonb, \
@@ -505,7 +515,7 @@ async fn aged_queue_row_is_detected_and_run_completes() {
     .await
     .unwrap();
     // A fresh row (queued now) must NOT be aged.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_pending_event_queue \
          (tenant_id, flow, business_id, payload, queued_at, apply_after, status, attempts) \
          VALUES ('{tenant}', 'PAYMENT_ALLOCATE', 'alloc-fresh-1', '{{}}'::jsonb, \
@@ -520,8 +530,8 @@ async fn aged_queue_row_is_detected_and_run_completes() {
     let aged = job
         .aged_queue_rows(
             "PAYMENT_ALLOCATE",
-            Utc::now(),
-            ChronoDuration::seconds(86_400),
+            OffsetDateTime::now_utc(),
+            Duration::seconds(86_400),
         )
         .await
         .expect("aged_queue_rows must succeed");
@@ -530,7 +540,8 @@ async fn aged_queue_row_is_detected_and_run_completes() {
     assert_eq!(aged[0].tenant_id, tenant);
     assert!(aged[0].age_secs >= 86_400);
 
-    // run() over the seeded ledger completes Ok (emits the Warn alarm).
+    // run() over the seeded ledger completes Ok. The Warn alarm it emits is not
+    // observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with an aged queue row");
@@ -541,13 +552,13 @@ async fn aged_queue_row_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_chargeback_queue_row_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
 
     let tenant = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_pending_event_queue \
          (tenant_id, flow, business_id, payload, queued_at, apply_after, status, attempts) \
          VALUES ('{tenant}', 'CHARGEBACK', 'cb-aged-1', '{{}}'::jsonb, \
@@ -558,7 +569,11 @@ async fn aged_chargeback_queue_row_is_detected() {
 
     let job = AgedAlarmJob::new(provider, Arc::new(LedgerEventPublisher::noop()));
     let aged = job
-        .aged_queue_rows("CHARGEBACK", Utc::now(), ChronoDuration::seconds(86_400))
+        .aged_queue_rows(
+            "CHARGEBACK",
+            OffsetDateTime::now_utc(),
+            Duration::seconds(86_400),
+        )
         .await
         .expect("aged_queue_rows(CHARGEBACK) must succeed");
     assert_eq!(aged.len(), 1, "the 2-day-old chargeback row is aged");
@@ -566,12 +581,16 @@ async fn aged_chargeback_queue_row_is_detected() {
 }
 
 /// Group F: an aged open `REFUND_CLEARING` balance is surfaced by the cross-tenant
-/// refund-clearing scan (8 days → Warn), and `run()` (which emits the alarm + the
-/// §9 gauges) completes `Ok`.
+/// refund-clearing scan (8 days → Warn), and `run()` over it completes `Ok`.
+/// The alarm is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why — and neither
+/// are the §9 gauges, for the separate reason that they run off the job's own
+/// metrics sink, which `AgedAlarmJob::new` defaults to the no-op and only
+/// `with_metrics` replaces.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_refund_clearing_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -587,7 +606,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     // seed would fire the deferred trigger at the entry's own COMMIT, before any
     // line exists, raising LEDGER_ENTRY_EMPTY.)
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
          (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, source_doc_type, \
           source_business_id, posted_at_utc, effective_at, origin, posted_by_actor_id, \
@@ -599,7 +618,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     .await
     .unwrap();
     // … its REFUND_CLEARING line (the grain the aged scan reads) …
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
           side, amount_minor, currency, currency_scale, mapping_status) \
@@ -612,7 +631,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     // … and its balancing DR leg (the money source a stage-1 refund reserves from),
     // making the entry zero-sum per (currency, currency_scale) so the deferred
     // balanced-trigger passes at COMMIT.
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
           side, amount_minor, currency, currency_scale, mapping_status) \
@@ -625,7 +644,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     txn.commit().await.unwrap();
     // … and the open cache grain (`balance_minor > 0`); `ledger_account_balance`
     // has no balanced-trigger, so a plain autocommit insert is fine here.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
          (tenant_id, account_id, currency, account_class, normal_side, balance_minor, version) \
          VALUES ('{tenant}', '{account}', 'USD', 'REFUND_CLEARING', 'CR', 500, 0)"
@@ -635,7 +654,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
 
     let job = AgedAlarmJob::new(provider, Arc::new(LedgerEventPublisher::noop()));
     let aged = job
-        .aged_refund_clearing_grains(Utc::now())
+        .aged_refund_clearing_grains(OffsetDateTime::now_utc())
         .await
         .expect("aged_refund_clearing_grains must succeed");
     assert_eq!(aged.len(), 1, "the 8-day-open clearing grain is aged");
@@ -653,14 +672,14 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stage1_orphan_refund_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
 
     let tenant = Uuid::now_v7();
     // An `initiated` stage-1 refund 8 days old, NO terminal phase ⇒ orphan.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
           amount_minor, clearing_state, created_at_utc, version) \
@@ -670,7 +689,7 @@ async fn stage1_orphan_refund_is_detected() {
     .await
     .unwrap();
     // A fully-advanced refund (initiated + confirmed) must NOT be flagged.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
           amount_minor, clearing_state, created_at_utc, version) \
@@ -679,7 +698,7 @@ async fn stage1_orphan_refund_is_detected() {
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
           amount_minor, clearing_state, created_at_utc, version) \
@@ -691,7 +710,7 @@ async fn stage1_orphan_refund_is_detected() {
 
     let job = AgedAlarmJob::new(provider, Arc::new(LedgerEventPublisher::noop()));
     let orphans = job
-        .stage1_orphan_refunds(Utc::now())
+        .stage1_orphan_refunds(OffsetDateTime::now_utc())
         .await
         .expect("stage1_orphan_refunds must succeed");
     assert_eq!(orphans.len(), 1, "only the unmatched stage-1 is an orphan");
@@ -719,7 +738,7 @@ async fn seed_unallocated_grain(
     let entry_id = Uuid::now_v7();
     let cash_account = Uuid::now_v7();
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
          (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, source_doc_type, \
           source_business_id, posted_at_utc, effective_at, origin, posted_by_actor_id, \
@@ -733,7 +752,7 @@ async fn seed_unallocated_grain(
     // The CR UNALLOCATED leg (the grain the aged-unallocated scan reads): its
     // owning entry's `posted_at_utc` is the age proxy (the resolved G-P5a oldest
     // contributing line's post time).
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
           side, amount_minor, currency, currency_scale, mapping_status) \
@@ -744,7 +763,7 @@ async fn seed_unallocated_grain(
     .await
     .unwrap();
     // … and its balancing DR CASH_CLEARING leg, so the entry is zero-sum at COMMIT.
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
           side, amount_minor, currency, currency_scale, mapping_status) \
@@ -756,7 +775,7 @@ async fn seed_unallocated_grain(
     .unwrap();
     txn.commit().await.unwrap();
     // The open cache grain (`balance_minor`), keyed (tenant, payer, currency).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
          (tenant_id, payer_tenant_id, account_id, currency, balance_minor, version) \
          VALUES ('{tenant}', '{payer}', '{unallocated_account}', 'USD', {balance_minor}, 0)"
@@ -770,12 +789,13 @@ async fn seed_unallocated_grain(
 /// the per-tenant DB scan `aged_unallocated_grains` — the read path that
 /// enumerates tenants from the cache, reads each tenant's journal entries +
 /// `UNALLOCATED` lines + cache, builds the `entry_id -> posted_at_utc` age map,
-/// and folds it through [`aged_grains`]. `run()` (which emits the `AGED_UNALLOCATED`
-/// Warn alarm) then completes `Ok`.
+/// and folds it through [`aged_grains`]. `run()` then completes `Ok`; the
+/// `AGED_UNALLOCATED` Warn alarm it emits is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_unallocated_grain_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -792,7 +812,7 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
     // from the contributing entry's posted_at (≥ the 1-day threshold) and the
     // parked balance carried through.
     let aged = job
-        .aged_unallocated_grains(Utc::now(), ChronoDuration::seconds(86_400))
+        .aged_unallocated_grains(OffsetDateTime::now_utc(), Duration::seconds(86_400))
         .await
         .expect("aged_unallocated_grains must succeed");
     assert_eq!(aged.len(), 1, "the 3-day-old parked pool is aged");
@@ -807,7 +827,8 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
         aged[0].age_secs
     );
 
-    // run() over the seeded ledger completes Ok (emits the AGED_UNALLOCATED Warn).
+    // run() over the seeded ledger completes Ok. The AGED_UNALLOCATED Warn it
+    // emits is not observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with an aged unallocated grain");
@@ -821,7 +842,7 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fresh_or_drained_unallocated_grain_is_not_aged() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -837,7 +858,7 @@ async fn fresh_or_drained_unallocated_grain_is_not_aged() {
 
     let job = AgedAlarmJob::new(provider, Arc::new(LedgerEventPublisher::noop()));
     let aged = job
-        .aged_unallocated_grains(Utc::now(), ChronoDuration::seconds(86_400))
+        .aged_unallocated_grains(OffsetDateTime::now_utc(), Duration::seconds(86_400))
         .await
         .expect("aged_unallocated_grains must succeed");
     assert!(
@@ -863,7 +884,7 @@ async fn seed_tax_subbalance(
     filing_period: &str,
     balance_minor: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tax_subbalance \
          (tenant_id, account_id, tax_jurisdiction, tax_filing_period, balance_minor, version) \
          VALUES ('{tenant}', '{account}', '{jurisdiction}', '{filing_period}', {balance_minor}, 0)"
@@ -877,19 +898,20 @@ async fn seed_tax_subbalance(
 /// coverage of its `is_beyond_filing_window` filter. A `tax_subbalance` that went
 /// negative in a CLOSED (prior) filing period is beyond its window and is flagged;
 /// an in-window (current-period) negative is a legitimate reversal and is NOT
-/// flagged; a non-negative prior-period grain is not flagged either. `run()` (which
-/// emits the `Critical` `NEGATIVE_TAX_SUBBALANCE` alarm per flagged grain) then
-/// completes `Ok`.
+/// flagged; a non-negative prior-period grain is not flagged either. `run()` then
+/// completes `Ok`; the `Critical` `NEGATIVE_TAX_SUBBALANCE` alarm it emits per
+/// flagged grain is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
 
-    let now = Utc::now();
-    let current_period = format!("{:04}{:02}", now.year(), now.month());
+    let now = OffsetDateTime::now_utc();
+    let current_period = crate::domain::instant::yyyymm(now);
     let tenant = Uuid::now_v7();
     let account = Uuid::now_v7();
 
@@ -920,7 +942,8 @@ async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
     assert_eq!(g.tax_filing_period, "200001");
     assert_eq!(g.balance_minor, -250);
 
-    // run() over the seeded ledger completes Ok (emits the Critical alarm).
+    // run() over the seeded ledger completes Ok. The Critical alarm it emits is
+    // not observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with a negative-beyond-window tax sub-balance");

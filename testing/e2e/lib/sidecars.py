@@ -15,6 +15,7 @@ reaper below.
 from __future__ import annotations
 
 import atexit
+import os
 import shutil
 import subprocess
 import time
@@ -29,6 +30,27 @@ READY_POLL_INTERVAL = 0.5
 # Consecutive successful query probes required before a container is called
 # ready. See TimescaleDbSidecar._wait_ready for why one success is not enough.
 REQUIRED_CONSECUTIVE_OK = 3
+
+# The TimescaleDB pin, mirrored from libs/test-containers/src/lib.rs (TIMESCALEDB_IMAGE,
+# TIMESCALEDB_TAG, ENV_TIMESCALEDB_TAG). Split into repo + tag rather than one composed
+# literal so the environment override below can reach this lane too; the Rust test
+# `e2e_sidecar_pins_the_same_timescaledb_image` fails the build if any of the three
+# drifts from its constant.
+TIMESCALEDB_IMAGE = "timescale/timescaledb"
+TIMESCALEDB_TAG = "2.29.2-pg18"
+ENV_TIMESCALEDB_TAG = "GEARS_TEST_TIMESCALEDB_TAG"
+
+
+def timescaledb_tag() -> str:
+    """Effective TimescaleDB tag, honoring GEARS_TEST_TIMESCALEDB_TAG.
+
+    Unset *or empty* means "use the pinned constant", matching
+    `test_containers::timescaledb_tag()` on the Rust side. Without this, a CI
+    version matrix would move the Rust plugin tests while leaving E2E on the
+    default -- migrations validated against one PostgreSQL major, E2E run
+    against another, with nothing in the diff to show it.
+    """
+    return os.environ.get(ENV_TIMESCALEDB_TAG, "").strip() or TIMESCALEDB_TAG
 
 
 class DockerUnavailable(RuntimeError):
@@ -69,13 +91,14 @@ def skip_without_docker() -> None:
 class TimescaleDbSidecar:
     """A throwaway TimescaleDB container with a dynamically mapped host port.
 
-    Keep IMAGE in sync with the Rust plugin integration tests:
-    gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/common/mod.rs
-    A skew between the two means the plugin's migrations are validated against
-    a different PostgreSQL major than E2E runs.
+    The image comes from the module-level pin (TIMESCALEDB_IMAGE) and
+    `timescaledb_tag()`, so GEARS_TEST_TIMESCALEDB_TAG moves this lane and the
+    Rust plugin tests together. Resolved once, at class-definition time: the
+    variable is set before pytest starts, and keeping IMAGE a plain attribute
+    spares every caller -- including test_sidecar_contract.py -- a method call.
     """
 
-    IMAGE = "timescale/timescaledb:2.17.2-pg16"
+    IMAGE = f"{TIMESCALEDB_IMAGE}:{timescaledb_tag()}"
     LABEL = "cf-gears-e2e=usage-collector"
 
     DB_USER = "uc"

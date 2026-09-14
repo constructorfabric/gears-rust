@@ -1,0 +1,38 @@
+family     = "reserved"
+id         = "tiered-remainder"
+kind       = "evaluation"
+provenance = ["inst-rv-tier-q", "AC#60"]
+
+# The money-affecting exclusion. The matched reserved quantity is excluded from
+# the on-demand tier counter, and the remainder is banded **from zero** - not
+# from the reserved quantity. The design set's own worked example: 150K used
+# against a 100K reservation bills 100K at the reserved rate, and the
+# remainder's Q starts at 0, not at 100K.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+reserved_rate_minor     = 2
+reservation_flavor      = "consumption"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = 100000
+  unit_amount_minor = 9
+
+  [[snapshot.bands]]
+  from_qty = 100000
+  to_qty   = "open"
+  unit_amount_minor = 6
+
+[runtime]
+reserved_quantity = 100000
+
+[[assert]]
+given  = { q = 150000 }
+expect = { charge_minor = 650000 }
+why    = "100000 matched at the reserved rate 2 = 200000, then the 50000 remainder banded from zero: all of it inside the first band at 9 = 450000. Total 650000. Banding the remainder from 100000 instead would have priced it in the second band at 6 = 300000, and billing the full 150000 through the bands without the exclusion would have priced 100000 at 9 plus 50000 at 6 = 1200000 - three readings, three different invoices"

@@ -60,11 +60,7 @@ const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 async fn build_db_with_dsn() -> (Arc<DBProvider<DbError>>, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-mp-test-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),
@@ -164,7 +160,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 async fn count_files_rows(dsn: &str) -> i64 {
     let conn = Database::connect(dsn).await.expect("raw connect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS c FROM files".to_owned(),
         ))
@@ -208,7 +204,7 @@ async fn tamper_request_hash(
              AND owner_id = X'{owner_hex}' AND idempotency_key = '{key}'"
     );
     let res = conn
-        .execute(Statement::from_string(conn.get_database_backend(), sql))
+        .execute_raw(Statement::from_string(conn.get_database_backend(), sql))
         .await
         .expect("tamper request_hash");
     assert_eq!(

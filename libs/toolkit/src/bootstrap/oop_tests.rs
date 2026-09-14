@@ -806,3 +806,254 @@ mod full_oop_config {
         assert_eq!(gear_config["config"]["master_setting"], "value");
     }
 }
+
+// =============================================================================
+// advertise_uri startup validation
+// =============================================================================
+
+mod advertise_uri {
+    use super::*;
+
+    #[test]
+    fn accepts_well_formed_routable_hosts() {
+        validate_advertise_uri("http://billing.default.svc.cluster.local:8080", false).unwrap();
+        validate_advertise_uri("https://billing:8080", false).unwrap();
+        // A routable IP passes without the loopback opt-out.
+        validate_advertise_uri("http://10.0.0.5:8080", false).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        // Missing scheme (parses without a host).
+        assert!(validate_advertise_uri("billing:8080", false).is_err());
+        // Unsupported scheme.
+        assert!(validate_advertise_uri("ftp://billing:8080", false).is_err());
+        // Not a URL at all.
+        assert!(validate_advertise_uri("not a uri", false).is_err());
+        // Embedded userinfo (credential smuggling).
+        assert!(validate_advertise_uri("http://billing@evil.com:8080", false).is_err());
+        assert!(validate_advertise_uri("http://user:pass@billing:8080", false).is_err());
+        // Missing-host authority.
+        assert!(validate_advertise_uri("http://", false).is_err());
+    }
+
+    #[test]
+    fn rejects_loopback_and_unspecified_by_default() {
+        // ADR-0009 section 5: a loopback / unspecified advertise_uri is a
+        // registered-but-unreachable instance in multi-host Profile 2 / 3.
+        for uri in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            // Fully-qualified `localhost.` (trailing dot) is DNS-equivalent to
+            // `localhost`, so it must still be treated as loopback.
+            "http://localhost.:8080",
+            "http://0.0.0.0:8080",
+            "http://[::1]:8080",
+            "http://[::]:8080",
+        ] {
+            assert!(
+                validate_advertise_uri(uri, false).is_err(),
+                "{uri} must be rejected without the loopback opt-out"
+            );
+        }
+        // The generated default (unspecified bind -> loopback) is exactly the
+        // unset-advertise_uri trap and must be rejected too.
+        let default = default_advertise_uri("0.0.0.0:8080".parse().unwrap());
+        assert!(validate_advertise_uri(&default, false).is_err());
+    }
+
+    #[test]
+    fn allows_loopback_when_opted_in() {
+        // Single-host / local-dev opt-out (oop_http.allow_loopback_advertise).
+        for uri in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://localhost.:8080",
+            "http://0.0.0.0:8080",
+            "http://[::1]:8080",
+        ] {
+            validate_advertise_uri(uri, true).unwrap();
+        }
+        // The default still passes its own validation with the opt-out.
+        let default = default_advertise_uri("0.0.0.0:8080".parse().unwrap());
+        validate_advertise_uri(&default, true).unwrap();
+    }
+}
+
+/// Tests for `build_platform_credentials` — the four outcomes that decide
+/// whether an `OoP` gear attaches any outbound platform-plane credential. Every
+/// wrong answer would otherwise be a silent "no credential", so these are
+/// exercised directly.
+mod platform_credentials {
+    use super::*;
+    use secrecy::ExposeSecret as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio_util::sync::CancellationToken;
+    use toolkit_contract::runtime::config::CredentialState;
+    use toolkit_security::InternalAuthConfig;
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("oop-cred-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn shared_secret_yields_provider_with_the_secret() {
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "shared-tok".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("shared secret builds");
+        let provider = provider.expect("shared secret yields a provider");
+        match provider.current() {
+            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "shared-tok"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn kube_with_token_path_yields_provider_reading_the_file() {
+        let dir = unique_dir("kube-ok");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("token");
+        tokio::fs::write(&path, "kube.sa.jwt").await.unwrap();
+
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(path),
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("kube with token path builds");
+        let provider = provider.expect("kube-with-path yields a provider");
+        match provider.current() {
+            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "kube.sa.jwt"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn kube_without_token_path_yields_no_provider() {
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: None,
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("kube without token path builds (inbound-only)");
+        assert!(
+            provider.is_none(),
+            "inbound-only kube participant must attach no outbound credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn kube_with_missing_token_file_is_an_error() {
+        let path = unique_dir("kube-missing").join("token");
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(path),
+        };
+        assert!(
+            build_platform_credentials(&cfg, &CancellationToken::new())
+                .await
+                .is_err(),
+            "a missing token file must surface a contextualized error, not Ok(None)"
+        );
+    }
+}
+
+/// Tests for `build_directory_client`: the bootstrap slice that must build a
+/// `DirectoryService` client even when the directory is unreachable
+/// (`cpt-cf-adr-eventual-readiness`).
+mod directory_client_bootstrap {
+    use super::*;
+    use cf_system_sdks::directory::DirectoryClient;
+    use tokio_util::sync::CancellationToken;
+    use toolkit_security::InternalAuthConfig;
+
+    #[tokio::test]
+    async fn builds_against_unreachable_directory_without_credential() {
+        // Nothing is listening on port 1, yet the client builds: bootstrap is
+        // not blocked on directory reachability.
+        let (client, provider) =
+            build_directory_client("http://127.0.0.1:1", None, &CancellationToken::new())
+                .await
+                .expect("lazy directory client must build against an unreachable directory");
+        assert!(
+            provider.is_none(),
+            "no internal_auth => no outbound credential"
+        );
+
+        // The deferred connect surfaces as an RPC error, not a hang.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.resolve_grpc_service("cf.directory.v1.DirectoryService"),
+        )
+        .await;
+        assert!(outcome.is_ok(), "first RPC must not hang");
+        assert!(
+            outcome.unwrap().is_err(),
+            "first RPC to an unreachable directory must return Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_against_unreachable_directory_with_credential() {
+        // Same guarantee on the credentialed path: the client still builds and
+        // a configured credential yields an outbound provider.
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "shared-tok".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let (_client, provider) =
+            build_directory_client("http://127.0.0.1:1", Some(&cfg), &CancellationToken::new())
+                .await
+                .expect("credentialed lazy client must build against an unreachable directory");
+        assert!(
+            provider.is_some(),
+            "shared secret must yield an outbound token provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_endpoint() {
+        // A malformed endpoint must still fail fast.
+        assert!(
+            build_directory_client("", None, &CancellationToken::new())
+                .await
+                .is_err(),
+            "a malformed directory endpoint must fail fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_endpoint_is_reported_before_credential_failure() {
+        // Both inputs are broken: a malformed endpoint AND a kube token_path
+        // that does not exist. The endpoint is validated first, so the error is
+        // the endpoint error — never the credential one (which would otherwise
+        // mask the misconfigured endpoint).
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(
+                std::env::temp_dir()
+                    .join("cf-oop-missing-token-regression")
+                    .join("token"),
+            ),
+        };
+        let Err(err) = build_directory_client("", Some(&cfg), &CancellationToken::new()).await
+        else {
+            panic!("a malformed endpoint must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("service-account token"),
+            "endpoint must be validated before credential work; got credential error: {msg}"
+        );
+    }
+}

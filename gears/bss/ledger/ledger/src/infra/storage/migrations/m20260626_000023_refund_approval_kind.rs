@@ -48,7 +48,7 @@ impl MigrationTrait for Migration {
             return Ok(());
         }
         for sql in PG_UP_STATEMENTS {
-            conn.execute(Statement::from_string(backend, (*sql).to_owned()))
+            conn.execute_raw(Statement::from_string(backend, (*sql).to_owned()))
                 .await?;
         }
         Ok(())
@@ -61,7 +61,7 @@ impl MigrationTrait for Migration {
             return Ok(());
         }
         for sql in PG_DOWN_STATEMENTS {
-            conn.execute(Statement::from_string(backend, (*sql).to_owned()))
+            conn.execute_raw(Statement::from_string(backend, (*sql).to_owned()))
                 .await?;
         }
         Ok(())

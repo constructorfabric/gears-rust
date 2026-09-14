@@ -29,7 +29,7 @@ use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
-use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -42,7 +42,7 @@ use bss_ledger_sdk::posting::{
 };
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_gts::gts_id;
-use toolkit_security::pep_properties;
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -320,11 +320,12 @@ impl LedgerClientV1 for StubClient {
 struct AllowInResolver;
 
 #[async_trait]
-impl AuthZResolverClient for AllowInResolver {
+impl AuthZResolverApi for AllowInResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -344,11 +345,12 @@ impl AuthZResolverClient for AllowInResolver {
 struct DenyResolver;
 
 #[async_trait]
-impl AuthZResolverClient for DenyResolver {
+impl AuthZResolverApi for DenyResolver {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {

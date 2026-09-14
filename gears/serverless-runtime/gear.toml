@@ -1,0 +1,7 @@
+[gear]
+name = "Serverless Runtime"
+description = "Pluggable serverless runtime for Starlark, serverlessworkflow, and Python function execution."
+category = "serverless"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

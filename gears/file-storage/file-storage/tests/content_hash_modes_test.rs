@@ -144,11 +144,7 @@ impl StorageBackend for CountingBackend {
 async fn build_db_with_dsn() -> (Arc<DBProvider<DbError>>, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-chm-test-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),
@@ -434,7 +430,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
     // self-contained record).
     let conn = Database::connect(&dsn).await.expect("raw connect");
     let deleted = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DELETE FROM multipart_upload_parts".to_owned(),
         ))
@@ -449,7 +445,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
     // alongside the multipart-composite one; migrate_backend only operates on
     // non-versioned files (exactly one version), so drop the leftover pending
     // row, leaving just the completed multipart-composite version.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM file_versions WHERE status = 'pending'".to_owned(),
     ))

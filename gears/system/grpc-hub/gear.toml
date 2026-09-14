@@ -1,0 +1,7 @@
+[gear]
+name = "gRPC Hub"
+description = "Internal gRPC transport hub for out-of-process inter-gear communication."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

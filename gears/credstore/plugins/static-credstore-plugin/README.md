@@ -1,6 +1,6 @@
-# Static CredStore Plugin
+# Static `CredStore` Plugin
 
-CredStore **value-store** backend for development and testing: an in-memory
+`CredStore` **value-store** backend for development and testing: an in-memory
 per-tenant secret store, optionally seeded from YAML configuration. Implements
 the `CredStorePluginClientV1` contract (`get`/`put`/`delete`) so the stateful
 `credstore` gear can use it as a backend without a full secrets vault.
@@ -11,7 +11,7 @@ The `cf-gears-static-credstore-plugin` module provides:
 
 - **Per-tenant value store** — `get`/`put`/`delete` keyed by `tenant_id` + `key`
   + optional `owner_id` (`Some` = private key class, `None` = tenant key class).
-  No sharing/hierarchy/policy here — that lives in the gear.
+    No sharing/hierarchy/policy here — that lives in the gear.
 - **Writable at runtime** — the gear's write saga (`put`/`delete`) mutates the
   in-memory store, so it works as a development backend, not just a read fixture.
 - **Config seeding** — secrets defined in YAML are loaded and validated at init.
@@ -28,9 +28,20 @@ The `cf-gears-static-credstore-plugin` module provides:
 
 The plugin registers itself via the types registry as a `CredStorePluginClientV1` implementation and is discovered by the `credstore` gear module.
 
+## Rust usage
+
+`ToolKit` normally discovers and instantiates the plugin through inventory. Direct
+construction is useful for host wiring tests:
+
+```rust
+use static_credstore_plugin::StaticCredStorePlugin;
+
+let plugin = StaticCredStorePlugin::default();
+```
+
 ## Configuration
 
-Add the plugin section under your module configuration:
+Add the plugin section under your gear configuration:
 
 ```yaml
 static-credstore-plugin:
@@ -112,12 +123,12 @@ resolving; they are never written by `put`. The plugin returns the raw
 ## Architecture
 
 ```text
-module.rs          ModKit module — init, config loading, GTS registration
-config.rs          YAML config model + resolve_sharing() + validation docs
+gear.rs            ToolKit gear — initialization and GTS/ClientHub registration
+config.rs          YAML config model, sharing inference, and validation
 domain/
-  service.rs       Service — from_config() seeder + get_value/put_value/delete_value (RwLock store)
-  client.rs        CredStorePluginClientV1 impl (get/put/delete -> SecretValue)
-  mod.rs           Re-exports
+  service.rs       In-memory key classes and runtime get/put/delete operations
+  client.rs        CredStorePluginClientV1 adapter
+  mod.rs           Domain exports
 ```
 
 ### Init sequence

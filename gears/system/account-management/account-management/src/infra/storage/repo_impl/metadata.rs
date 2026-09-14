@@ -98,11 +98,9 @@ impl ODataFieldMapping<MetadataEntryFilterField> for MetadataODataMapper {
     ) -> sea_orm::Value {
         match field {
             MetadataEntryFilterField::UpdatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.updated_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.updated_at))
             }
-            MetadataEntryFilterField::SchemaUuid => {
-                sea_orm::Value::Uuid(Some(Box::new(model.schema_uuid)))
-            }
+            MetadataEntryFilterField::SchemaUuid => sea_orm::Value::Uuid(Some(model.schema_uuid)),
         }
     }
 }

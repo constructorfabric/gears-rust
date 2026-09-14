@@ -320,6 +320,15 @@ What is **missing** and needs to be added:
     - **Probes MAY be exposed on a separate bind address** via `probe_bind_addr` config (default: same as main
       HTTP server). Operators typically route `/healthz`, `/readyz`, `/health`, `/metrics` to a sidecar port that is NOT
       mapped through the k8s Service so external traffic cannot reach them.
+    - **`advertise_uri` is fail-fast on loopback.** `oop_http.advertise_uri` is the REST endpoint registered with
+      DirectoryService. When unset, the bootstrap derives it from `listen_addr` and rewrites an unspecified host
+      (`0.0.0.0` / `[::]`) to loopback. `oop_http.allow_loopback_advertise` **defaults to `false`**: a loopback or
+      unspecified advertise host (`127.0.0.1`, `::1`, `localhost`, `0.0.0.0`, `[::]`) refuses to boot, so a gear
+      that previously started with no explicit `advertise_uri` on a `0.0.0.0` bind now fails. Production and
+      multi-host Profile 2 / Profile 3 must set a routable `advertise_uri` (prefer a stable DNS name). Single-host
+      / local-dev must set `oop_http.allow_loopback_advertise: true` (or a routable `advertise_uri`). Profile 1
+      (in-process) and single-node Profile 2 over UDS never reach this check. There are no checked-in `oop_http`
+      configs in this repo; Helm values and local scripts that start an OoP gear on loopback need the opt-out.
 - **Custom readiness checks**: readiness reuses the framework's standard healthcheck mechanism, so a gear expresses
   readiness once and it is honored identically whether the gear is hosted in-process by `api-gateway` or run OoP. A
   gear returns **one composite healthcheck** from its REST capability:
@@ -1498,17 +1507,17 @@ dependencies:
 
 ```bash
 # Minimal platform
-helm install my-platform oci://ghcr.io/cyberfabric/charts/toolkit-platform \
+helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
   -f values-minimal.yaml
 
 # Custom overrides
-helm install my-platform oci://ghcr.io/cyberfabric/charts/toolkit-platform \
+helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
   --set global.imageRegistry=my-registry.corp.com \
   --set mini-chat.enabled=true \
   --set mini-chat.replicaCount=3
 
 # Single gear standalone
-helm install mini-chat oci://ghcr.io/cyberfabric/charts/mini-chat \
+helm install mini-chat oci://ghcr.io/constructorfabric/charts/mini-chat \
   --set global.directoryEndpoint=dns:///flight-control.default.svc:50051
 ```
 
@@ -1520,7 +1529,7 @@ Every gear chart follows this `values.yaml` structure:
 replicaCount: 1
 
 image:
-  registry: ghcr.io/cyberfabric    # overridable by global.imageRegistry
+  registry: ghcr.io/constructorfabric    # overridable by global.imageRegistry
   repository: <gear-name>
   tag: ""                           # defaults to .Chart.AppVersion
 
@@ -1585,7 +1594,7 @@ chart change detected
   → helm dependency build (resolve toolkit-common)
   → helm lint
   → helm template (dry-run render)
-  → helm package → push to OCI registry (ghcr.io/cyberfabric/charts/<name>)
+  → helm package → push to OCI registry (ghcr.io/constructorfabric/charts/<name>)
 ```
 
 Published charts include the resolved `toolkit-common` library, so users install from the OCI registry without needing

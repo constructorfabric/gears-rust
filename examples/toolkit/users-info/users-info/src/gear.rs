@@ -15,7 +15,7 @@ use url::Url;
 use users_info_sdk::UsersInfoClientV1;
 
 // Import AuthZ resolver for authorization (PEP flow)
-use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::AuthZResolverApi;
 
 use crate::api::rest::dto::UserEvent;
 use crate::api::rest::routes;
@@ -94,7 +94,7 @@ impl Gear for UsersInfo {
         // Fetch AuthZ resolver from ClientHub
         let authz = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
+            .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
 
         let service_config = ServiceConfig {

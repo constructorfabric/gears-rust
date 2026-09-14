@@ -19,6 +19,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # `cargo publish` compiles every crate; CI does not want incremental churn
+  # (see [profile.dev] in Cargo.toml, which enables it for local dev).
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # `release-plz release` publishes only versions present in the manifests and absent
   # from crates.io, so running it on every push is safe and makes an interrupted release
@@ -82,15 +87,15 @@ jobs:
           swap-storage: true
 
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
           cache: false
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       - name: Install Rust toolchain from rust-toolchain.toml
         run: |

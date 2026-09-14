@@ -6,6 +6,7 @@
 // @cpt-cf-chat-engine-component-policy-enforcer
 
 pub mod bypass;
+pub mod owner_guard;
 pub mod resource_types;
 
 /// Canonical PEP action names, passed as the `action` argument to
@@ -15,7 +16,10 @@ pub mod resource_types;
 pub mod actions {
     pub const LIST: &str = "list";
     pub const CREATE: &str = "create";
-    pub const READ: &str = "read";
+    // Aligned with the authorization-engine action vocabulary
+    // ([list, get, create, update, delete]); the gear previously emitted
+    // "read", which is outside that enum and cannot back a read/get ACE.
+    pub const READ: &str = "get";
     pub const UPDATE: &str = "update";
     pub const DELETE: &str = "delete";
 }

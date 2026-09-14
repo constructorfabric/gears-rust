@@ -4,7 +4,9 @@
 //! - `#[rpc(name = "PascalCase")]` — explicit RPC name (default = `PascalCase` from method ident).
 //! - `#[idempotency_level(NoSideEffects | Idempotent | NotIdempotent)]` —
 //!   proto3 method option (default = `NotIdempotent`).
-//! - `#[streaming]` — server-streaming RPC (re-used from base contract).
+//! - `#[streaming]` — server-streaming RPC (re-used from base contract). On an
+//!   `async fn` the open is awaited and fallible, matching tonic's own client
+//!   and server shapes; on a plain `fn` it is the historical flattened form.
 //! - `#[retryable]` — wrap call in retry-with-backoff (re-used from base).
 //!
 //! Attribute on the trait itself: `#[grpc_contract(package = "...",
@@ -19,6 +21,8 @@ use heck::ToUpperCamelCase as _;
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
+
+use crate::model::{MethodShape, StreamOpen};
 
 pub struct GrpcContractAttr {
     pub package: String,
@@ -40,7 +44,12 @@ pub struct GrpcMethodModel {
     pub ident: Ident,
     pub rpc_name: String,
     pub idempotency: GrpcIdempotency,
-    pub server_streaming: bool,
+    /// Unary, or server-streaming with how its stream is opened
+    /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
+    /// `Stream(Awaited)`). Folds what was a `server_streaming: bool` + `open:
+    /// StreamOpen` pair, so an `open` exists exactly when the method streams
+    /// (#4740).
+    pub shape: MethodShape,
     pub retryable: bool,
     pub optional: bool,
     pub params: Vec<GrpcParam>,
@@ -212,6 +221,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
     let mut rpc_name = default_rpc_name;
     let mut idempotency = GrpcIdempotency::NotIdempotent;
     let mut server_streaming = false;
+    let mut stream_open_arg: Option<StreamOpen> = None;
     let mut retryable = false;
 
     for attr in &method.attrs {
@@ -224,7 +234,33 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
         } else if path.is_ident("idempotency_level") {
             idempotency = parse_idempotency_level(attr)?;
         } else if path.is_ident("streaming") {
+            // Reject a SECOND `#[streaming]` before it overwrites the open
+            // selector — last-one-wins would silently change the emitted open
+            // shape with no signal.
+            if server_streaming {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate `#[streaming]` attribute: a streaming method declares it exactly \
+                     once (the open selector goes in that one attribute)",
+                ));
+            }
+            // A framing selector (`#[streaming(multipart_mixed)]`) names an
+            // HTTP media type, and gRPC has none — its framing is length-prefixed
+            // protobuf, fixed by the transport. Reject it rather than accept and
+            // silently ignore it, so a framing argument is never written
+            // somewhere it does nothing. `open = fallible` is allowed.
+            let args = crate::stream_attr::parse_streaming_args(attr)?;
+            if args.framing.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[grpc_contract]: `#[streaming]` takes no framing selector here. A framing \
+                     such as `multipart_mixed` names an HTTP media type, and gRPC has none. \
+                     Declare the framing on the `#[rest_contract]` projection instead. \
+                     `open = fallible` is allowed here.",
+                ));
+            }
             server_streaming = true;
+            stream_open_arg = args.open;
         } else if path.is_ident("retryable") {
             retryable = true;
         }
@@ -251,11 +287,30 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
     let result_types = parse_return_type(&method.sig.output, method.sig.ident.span())?;
     let optional = method.default.is_some();
 
+    // `async fn` on a streaming method selects the fallible-open shape, exactly
+    // as it does for the base contract and the REST projection. gRPC carries it
+    // natively rather than by emulation: tonic's client call is already
+    // `async fn(..) -> Result<Response<Streaming<T>>, Status>` and its server
+    // trait method is already `async fn(..) -> Result<Response<Self::Stream>,
+    // Status>`, so the open and the items are two phases on the wire whether or
+    // not the contract says so. `Immediate` flattens them, reporting an
+    // open-time `Status` as the stream's first item; `Awaited` keeps them apart.
+    let shape = if server_streaming {
+        let open = crate::stream_attr::resolve_stream_open(
+            stream_open_arg,
+            method.sig.asyncness.is_some(),
+            method.sig.ident.span(),
+        )?;
+        MethodShape::Stream(open)
+    } else {
+        MethodShape::Unary
+    };
+
     Ok(GrpcMethodModel {
         ident,
         rpc_name,
         idempotency,
-        server_streaming,
+        shape,
         retryable,
         optional,
         params,
@@ -314,6 +369,26 @@ fn parse_params(method: &TraitItemFn) -> syn::Result<Vec<GrpcParam>> {
             ty: (*pat_type.ty).clone(),
         });
     }
+
+    // Exactly one security-plane context per method: the client codegen
+    // (`security_context_param` / plane detection in `grpc_contract.rs`)
+    // picks a single param to source the auth metadata from. A second
+    // context param (e.g. a stray `PlatformSecurityContext` alongside a
+    // tenant `SecurityContext`) would silently be dropped from the wire
+    // without ever being consulted for token attachment, mixing planes.
+    let secctx_count = params
+        .iter()
+        .filter(|p| crate::projection::is_security_context_type(&p.ty))
+        .count();
+    if secctx_count > 1 {
+        return Err(syn::Error::new(
+            method.sig.ident.span(),
+            "grpc_contract method must take at most one security-plane context \
+             parameter (`SecurityContext` or `PlatformSecurityContext`); found more \
+             than one",
+        ));
+    }
+
     Ok(params)
 }
 
@@ -368,5 +443,160 @@ impl GrpcIdempotency {
             GrpcIdempotency::Idempotent => "Idempotent",
             GrpcIdempotency::NotIdempotent => "NotIdempotent",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn parse_trait(tokens: proc_macro2::TokenStream) -> syn::Result<GrpcContractModel> {
+        let attr: GrpcContractAttr = syn::parse2(quote! {
+            package = "test.v1",
+            stubs_module = "crate::stubs"
+        })?;
+        let item: syn::ItemTrait = syn::parse2(tokens)?;
+        parse(attr, item)
+    }
+
+    /// Like [`parse_trait`], but discards the (non-`Debug`) model on success
+    /// so the error path can use `.expect_err`.
+    fn parse_trait_err(tokens: proc_macro2::TokenStream) -> syn::Error {
+        parse_trait(tokens)
+            .map(|_| ())
+            .expect_err("expected a parse error")
+    }
+
+    #[test]
+    fn rejects_methods_with_two_security_context_params() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(
+                    &self,
+                    ctx: SecurityContext,
+                    other: PlatformSecurityContext,
+                    id: String,
+                ) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            err.to_string()
+                .contains("at most one security-plane context"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_single_security_context_param() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("a single security-context param is valid");
+        assert_eq!(model.methods.len(), 1);
+        // `self` (a `Receiver`, not `FnArg::Typed`) never lands in `params`.
+        assert_eq!(model.methods[0].params.len(), 2);
+    }
+
+    #[test]
+    fn accepts_platform_security_context_param() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("a single platform security-context param is valid");
+        // Assert the CLASSIFICATION, not just the param count: counting params
+        // cannot tell a `PlatformSecurityContext` recognized as a plane marker
+        // from one mistakenly treated as an ordinary wire param.
+        assert_eq!(model.methods[0].params.len(), 2);
+        assert!(
+            crate::projection::is_platform_security_context_type(&model.methods[0].params[0].ty),
+            "first param must be recognized as the platform-plane marker"
+        );
+        // And the wire body is the OTHER param (`id`) — a non-context payload,
+        // i.e. the platform context is excluded from the wire message.
+        assert_eq!(model.methods[0].params[1].ident, "id");
+        assert!(
+            !crate::projection::is_security_context_type(&model.methods[0].params[1].ty),
+            "the wire body param must not be classified as a security context"
+        );
+    }
+
+    #[test]
+    fn methods_without_a_security_context_are_still_valid() {
+        // gRPC parsing does not itself require a security-context parameter
+        // (unlike the REST projection) — absence just means no auth metadata
+        // is attached by the generated client.
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("no security-context param is valid");
+        assert_eq!(model.methods[0].params.len(), 1);
+    }
+
+    #[test]
+    fn retryable_non_idempotent_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("NotIdempotent"), "got: {err}");
+    }
+
+    #[test]
+    fn retryable_idempotent_is_accepted() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                #[idempotency_level(Idempotent)]
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("retryable + Idempotent is valid");
+        assert!(model.methods[0].retryable);
+        assert_eq!(model.methods[0].idempotency, GrpcIdempotency::Idempotent);
+    }
+
+    #[test]
+    fn duplicate_rpc_names_are_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[rpc(name = "Shared")]
+                async fn one(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+                #[rpc(name = "Shared")]
+                async fn two(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            err.to_string().contains("duplicate gRPC rpc_name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wrong_projection_name_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait NotTheRightNameGrpc: FooApi {
+                async fn do_it(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("FooApiGrpc"), "got: {err}");
+    }
+
+    #[test]
+    fn non_remote_capable_base_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooEmbeddedGrpc: FooEmbedded {
+                async fn do_it(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("not allowed"), "got: {err}");
     }
 }

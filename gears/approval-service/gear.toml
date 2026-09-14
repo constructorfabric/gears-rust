@@ -1,0 +1,7 @@
+[gear]
+name = "Approval Service"
+description = "Generic approval workflow with configurable policies, conditions, and access controls."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

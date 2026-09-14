@@ -1,12 +1,15 @@
 [package]
 name = "cf-gears-toolkit-contract-protogen"
-version = "0.1.1"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Generate idiomatic .proto files from ToolKit ContractIr + JsonSchema"
 rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "toolkit_contract_protogen"

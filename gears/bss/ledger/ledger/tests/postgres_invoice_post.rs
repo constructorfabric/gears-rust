@@ -45,11 +45,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, EntryView, LineView, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -60,7 +60,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -132,7 +132,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -243,7 +243,7 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn posts_balanced_invoice_and_emits_metrics() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -325,7 +325,7 @@ async fn posts_balanced_invoice_and_emits_metrics() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn closed_payer_is_rejected_but_a_reversal_still_posts() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -438,7 +438,7 @@ async fn closed_payer_is_rejected_but_a_reversal_still_posts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -450,7 +450,7 @@ async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
     // Close the provisioned AR account (the post's DR leg targets it). The chart
     // of accounts is `bss.ledger_tenant_account`; `find_account` reads lifecycle_state
     // from it during the post.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_tenant_account SET lifecycle_state='CLOSED' \
          WHERE tenant_id='{}' AND account_id='{}'",
         s.tenant, s.ar
@@ -481,7 +481,7 @@ async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn revenue_line_missing_revenue_stream_is_rejected_by_the_foundation() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -510,7 +510,7 @@ async fn revenue_line_missing_revenue_stream_is_rejected_by_the_foundation() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_pending_suspense_line_blocks_period_close() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -569,7 +569,7 @@ async fn a_pending_suspense_line_blocks_period_close() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn mapping_correction_retry_replays_idempotently() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -664,7 +664,7 @@ async fn mapping_correction_retry_replays_idempotently() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reverse_of_a_reversal_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider, s) = setup(&url).await;
@@ -762,7 +762,7 @@ async fn reverse_of_a_reversal_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_same_invoice_posts_exactly_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -851,7 +851,7 @@ async fn concurrent_same_invoice_posts_exactly_once() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_reversals_of_one_entry_post_exactly_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1001,7 +1001,7 @@ fn original_view(
     entry_id: Uuid,
     lines: &[(Uuid, AccountClass, Side, i64, Option<&str>, Option<&str>)],
 ) -> EntryView {
-    let now: DateTime<Utc> = Utc::now();
+    let now: OffsetDateTime = OffsetDateTime::now_utc();
     EntryView {
         entry_id,
         tenant_id: s.tenant,
@@ -1065,7 +1065,7 @@ fn bad_revenue_entry(s: &Seller) -> (NewEntry, Vec<NewLine>) {
         source_business_id: "INV-BAD".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: naive(2026, 6, 1),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
@@ -1116,7 +1116,7 @@ fn correction_entry(
         source_business_id: business_id.to_owned(),
         reverses_entry_id: Some(reversal_entry_id),
         reverses_period_id: Some(s.period_id.clone()),
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: naive(2026, 6, 2),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,

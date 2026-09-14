@@ -1,7 +1,7 @@
 //! Postgres-only **concurrency** tests for the deferred-apply queue (Slice 2b,
 //! Phase 3, Group F): two appliers racing the SAME queued allocation must apply
 //! it EXACTLY ONCE. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_queue_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_queue_concurrency -- --ignored`.
 //!
 //! Run discipline (controller): testcontainer `#[ignore]` tests; run the bin
 //! sequentially (each test boots its own container).
@@ -34,6 +34,7 @@
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine, RepoError};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
@@ -46,11 +47,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -74,7 +76,7 @@ async fn boot() -> (
     sea_orm::DatabaseConnection,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();
@@ -116,7 +118,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// month, and the four payment-flow chart accounts. Mirrors
 /// `postgres_payment_concurrency::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -124,7 +126,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -138,7 +140,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -238,7 +240,7 @@ async fn queue_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -253,7 +255,7 @@ async fn dedup_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<(String, Option<Uuid>)> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status, result_entry_id FROM bss.ledger_idempotency_dedup \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -273,7 +275,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -284,7 +286,7 @@ async fn ar_invoice_balance(
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_payment_allocation \
          WHERE tenant_id='{}' AND payment_id='{}'",
         s.tenant, payment_id
@@ -302,7 +304,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -318,7 +320,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -416,7 +418,7 @@ async fn queue_with_seeded_settlement(
         s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -458,7 +460,7 @@ async fn queue_with_seeded_settlement(
     // `unallocated_balance` pool. Without `account_balance` the projector's
     // guarded no-negative pre-check on the aggregate drives it to -amount and the
     // allocation is (correctly) blocked.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
          VALUES ('{}','{}','USD','UNALLOCATED','CR',1000)",
@@ -466,7 +468,7 @@ async fn queue_with_seeded_settlement(
     )))
     .await
     .expect("seed unallocated account_balance");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
             (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
          VALUES ('{}','{}','{}','USD',1000)",
@@ -587,7 +589,7 @@ async fn drain_and_sweep_race_without_deadlock() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     let allocation_id = Uuid::now_v7();

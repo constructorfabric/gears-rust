@@ -6,7 +6,7 @@
 //! bill-run-finished close gate (un-asserted blocks, asserted passes). K5: inert until
 //! the feed lands. Control feeds are exercised through the real in-process store (the
 //! push → framework / close-gate read path). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_reconciliation -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_reconciliation -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -38,7 +38,6 @@ use bss_ledger_sdk::{
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -63,7 +62,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Uuid) {
     let provider = DBProvider::<DbError>::new(tdb);
 
     let tenant = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
          VALUES ('{tenant}','{tenant}','{PERIOD}','UTC','OPEN')"
     )))
@@ -77,7 +76,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Uuid) {
 /// (the completeness test must isolate `MISSED_POSTING` from the AR↔derived tie-out).
 async fn seed_ar_account(raw: &DatabaseConnection, tenant: Uuid) -> Uuid {
     let account = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_account \
             (account_id, tenant_id, legal_entity_id, account_class, currency, normal_side, \
              may_go_negative, lifecycle_state) \
@@ -106,7 +105,7 @@ async fn seed_invoice_post(
     // Inserting the header on its own connection autocommit would commit an empty entry and
     // trip `LEDGER_ENTRY_EMPTY`.
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -119,7 +118,7 @@ async fn seed_invoice_post(
     .unwrap();
     for side in ["DR", "CR"] {
         let line_id = Uuid::now_v7();
-        txn.execute(pg(format!(
+        txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
                  account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -146,7 +145,7 @@ async fn seed_payment_settle(
     use sea_orm::TransactionTrait;
     let entry_id = Uuid::now_v7();
     let txn = raw.begin().await.unwrap();
-    txn.execute(pg(format!(
+    txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
              source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -160,7 +159,7 @@ async fn seed_payment_settle(
     for (class, side) in [("CASH_CLEARING", "DR"), ("UNALLOCATED", "CR")] {
         let line_id = Uuid::now_v7();
         let nil = Uuid::nil();
-        txn.execute(pg(format!(
+        txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
                  account_class, side, amount_minor, currency, currency_scale, mapping_status) \
@@ -181,7 +180,7 @@ async fn count_exceptions(
     status: &str,
 ) -> i64 {
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT count(*) AS c FROM bss.ledger_exception_queue \
              WHERE tenant_id='{tenant}' AND exception_type='{exception_type}' AND status='{status}'"
         )))
@@ -194,7 +193,7 @@ async fn count_exceptions(
 /// Count `reconciliation_run` rows for `(tenant, check_type)`.
 async fn count_runs(raw: &DatabaseConnection, tenant: Uuid, check_type: &str) -> i64 {
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT count(*) AS c FROM bss.ledger_reconciliation_run \
              WHERE tenant_id='{tenant}' AND check_type='{check_type}'"
         )))
@@ -206,7 +205,7 @@ async fn count_runs(raw: &DatabaseConnection, tenant: Uuid, check_type: &str) ->
 
 /// The latest `within_tolerance` flag for `(tenant, check_type)`.
 async fn latest_within_tolerance(raw: &DatabaseConnection, tenant: Uuid, check_type: &str) -> bool {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT within_tolerance FROM bss.ledger_reconciliation_run \
          WHERE tenant_id='{tenant}' AND check_type='{check_type}' ORDER BY at_utc DESC LIMIT 1"
     )))
@@ -260,7 +259,7 @@ async fn boot(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Uuid) {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k1_ar_variance_opens_recon_mismatch_and_blocks_close() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -268,7 +267,7 @@ async fn k1_ar_variance_opens_recon_mismatch_and_blocks_close() {
     // A stray `account_balance` cache row with no journal → the recompute disagrees
     // with the cache (computed 0 ≠ cached 50_000): an out-of-tolerance tie-out variance.
     let account = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor, version) \
          VALUES ('{tenant}','{account}','USD','AR','DR', 50000, 1)"
@@ -324,7 +323,7 @@ async fn k1_ar_variance_opens_recon_mismatch_and_blocks_close() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k2_missed_posting_blocks_then_idempotent_repost_clears() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -426,7 +425,7 @@ async fn k2_missed_posting_blocks_then_idempotent_repost_clears() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k3_psp_variance_opens_exception() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -477,13 +476,13 @@ async fn k3_psp_variance_opens_exception() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k6_psp_check_is_period_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
 
     // A second OPEN fiscal period alongside the default one.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
          VALUES ('{tenant}','{tenant}','{PERIOD2}','UTC','OPEN')"
     )))
@@ -533,7 +532,7 @@ async fn k6_psp_check_is_period_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k7_fx_revaluation_gate_blocks_until_marker() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -562,7 +561,7 @@ async fn k7_fx_revaluation_gate_blocks_until_marker() {
     );
 
     // The period-end revaluation records the COMPLETE marker ⇒ the gate passes.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fx_revaluation_run \
             (tenant_id, period_id, scope, status, completed_at_utc) \
          VALUES ('{tenant}','{PERIOD}','PERIOD','COMPLETE', now())"
@@ -589,7 +588,7 @@ async fn k7_fx_revaluation_gate_blocks_until_marker() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k4_bill_run_gate_blocks_until_asserted() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -642,7 +641,7 @@ async fn k4_bill_run_gate_blocks_until_asserted() {
         "the period closes once the bill run is asserted"
     );
     let status = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{tenant}' AND period_id='{PERIOD}'"
         )))
@@ -660,7 +659,7 @@ async fn k4_bill_run_gate_blocks_until_asserted() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k5_inert_until_feed_lands() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;
@@ -720,7 +719,7 @@ async fn k5_inert_until_feed_lands() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn k5b_unconfigured_psp_check_is_inert() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, tenant) = boot(&url).await;

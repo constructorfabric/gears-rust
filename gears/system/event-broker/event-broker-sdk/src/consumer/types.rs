@@ -24,7 +24,6 @@ pub struct RawEvent {
     pub tenant_id: Uuid,
     pub subject: String,
     pub subject_type: String,
-    pub partition_key: Option<String>,
     pub partition: u32,
     pub sequence: i64,
     pub offset: i64,

@@ -1,0 +1,36 @@
+family     = "supersession-continuity"
+id         = "package-size-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-122", "D-58"]
+
+# `package_size` joined the preserved set as D-122. Block math is non-linear in
+# the window and rating counts blocks by a cumulative ceil-diff, which
+# presupposes one block size per window - so a mid-window size change re-buckets
+# the already-accumulated `used` exactly like the D-98 kind flip.
+#
+# `package_price_minor` is deliberately different here too, and that half is
+# legitimate: the price of a block is the lever, the size of it is not.
+
+[predecessor]
+model_kind              = "package"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+package_size            = 1000
+package_price_minor     = 2500
+
+[successor]
+model_kind              = "package"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+package_size            = 500
+package_price_minor     = 1400
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "the block price may move freely; the block size may not, because the window's accumulated usage was already bucketed at the old size"

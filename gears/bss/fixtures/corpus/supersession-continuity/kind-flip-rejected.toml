@@ -1,0 +1,49 @@
+family     = "supersession-continuity"
+id         = "kind-flip-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-98"]
+
+# `model_kind` joined the preserved set as D-98. A graduated to volume flip
+# mid-window re-prices the *already accumulated* window total under new math:
+# Variant A applies the selected band's single rate to the whole Q, including
+# units already rated marginally under the predecessor.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[predecessor.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[successor]
+model_kind              = "volume"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[successor.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "same bands, different formula: the units already rated marginally would be re-priced at the selected band's flat rate. Which formula prices the key is structural, not a price lever"

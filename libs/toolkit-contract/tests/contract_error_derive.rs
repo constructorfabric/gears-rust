@@ -45,8 +45,40 @@ fn to_problem_sets_extension_fields_and_category() {
         "got {}",
         problem.problem_type
     );
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.title, "Failed precondition");
+}
+
+#[test]
+fn category_returns_the_declared_canonical_for_each_variant() {
+    use toolkit_canonical_errors::ProblemCategory;
+
+    // Named-field variant.
+    assert_eq!(
+        BillingError::InsufficientFunds {
+            available: 1,
+            required: 2,
+        }
+        .category(),
+        ProblemCategory::FailedPrecondition,
+    );
+    assert_eq!(
+        BillingError::RateLimit { retry_after_sec: 1 }.category(),
+        ProblemCategory::ResourceExhausted,
+    );
+    // Unit variant.
+    assert_eq!(
+        BillingError::Maintenance.category(),
+        ProblemCategory::ServiceUnavailable,
+    );
+
+    // The generated accessor cannot disagree with the generated `Problem`: both
+    // read the same `#[canonical(..)]`.
+    let err = BillingError::RateLimit { retry_after_sec: 3 };
+    let category = err.category();
+    let problem: Problem = err.into();
+    assert_eq!(problem.status, Some(category.http_status()));
+    assert!(problem.problem_type.ends_with(category.gts_fragment()));
 }
 
 #[test]
@@ -66,7 +98,7 @@ fn to_problem_unit_variant_has_empty_data() {
     let err = BillingError::Maintenance;
     let problem: Problem = err.into();
     assert_eq!(problem.error_code.as_deref(), Some("MAINTENANCE"));
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
     assert!(problem.context["data"].is_object());
     assert_eq!(
         problem.context["data"].as_object().expect("object").len(),
@@ -100,7 +132,7 @@ fn try_from_problem_returns_envelope_for_unknown_code() {
     let mut problem = Problem {
         problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~".into(),
         title: "Internal".into(),
-        status: 500,
+        status: Some(500),
         detail: "synthetic".into(),
         instance: None,
         trace_id: None,
@@ -124,7 +156,7 @@ fn try_from_problem_returns_envelope_when_data_field_missing() {
     let problem = Problem {
         problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~".into(),
         title: "Failed precondition".into(),
-        status: 400,
+        status: Some(400),
         detail: "missing data payload".into(),
         instance: None,
         trace_id: None,
@@ -270,7 +302,59 @@ mod transport_fallback {
     fn non_problem_transport_error_routes_to_fallback() {
         let err: OrderError = TransportError::network("dns fail").into();
         match err {
-            OrderError::Unknown { problem } => assert!(problem.status >= 500),
+            OrderError::Unknown { problem } => assert!(problem.status >= Some(500)),
+            other => panic!("expected fallback Unknown, got {other:?}"),
+        }
+    }
+
+    /// The fallback field may be `Box<Problem>` as well as `Problem`, which is
+    /// what a real contract should use: the variant sets the size of the whole
+    /// enum, and hence of every `Result<_, MyError>` the contract returns, so
+    /// an unboxed ~208-byte `Problem` trips `clippy::result_large_err` on each
+    /// generated method.
+    ///
+    /// The derive assigns the field through `From::from` to support both, so
+    /// this pins that the boxed form still receives the original `Problem` and
+    /// still lets a typed variant win first. Note the absence of the
+    /// `#[allow(clippy::large_enum_variant)]` that `OrderError` above needs.
+    #[derive(Debug, Clone, Serialize, Deserialize, ContractError)]
+    #[error_domain("shipping.v1")]
+    #[non_exhaustive]
+    pub enum ShippingError {
+        #[error_code("NO_ROUTE")]
+        #[canonical(FailedPrecondition)]
+        NoRoute { origin: String, destination: String },
+
+        #[error_code("UNKNOWN")]
+        #[canonical(Internal)]
+        #[contract_error(fallback)]
+        Unknown { problem: Box<Problem> },
+    }
+
+    #[test]
+    fn boxed_fallback_field_receives_the_problem_and_typed_variants_still_win() {
+        // A typed variant is reconstructed with its payload, boxing or not.
+        let typed: Problem = ShippingError::NoRoute {
+            origin: "LHR".into(),
+            destination: "SFO".into(),
+        }
+        .into();
+        let back: ShippingError = TransportError::problem(typed).into();
+        match back {
+            ShippingError::NoRoute {
+                origin,
+                destination,
+            } => {
+                assert_eq!(origin, "LHR");
+                assert_eq!(destination, "SFO");
+            }
+            other => panic!("expected typed NoRoute, got {other:?}"),
+        }
+
+        // And an un-typeable failure lands in the boxed fallback intact.
+        let err: ShippingError = TransportError::network("dns fail").into();
+        match err {
+            ShippingError::Unknown { problem } => assert!(problem.status >= Some(500)),
             other => panic!("expected fallback Unknown, got {other:?}"),
         }
     }

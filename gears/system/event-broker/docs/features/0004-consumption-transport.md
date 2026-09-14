@@ -139,7 +139,7 @@ The SSE endpoint serves `text/event-stream`. Same four frame kinds; the kind is 
 All transports carry the same four frame kinds. Each frame is a JSON object with a top-level `kind` field. On `/v1/events:stream` each frame is one multipart part with `Content-Type: application/json`. On `/v1/events:sse` each frame is one SSE event record with the kind in the `event:` line and the JSON in the `data:` line.
 
 ```
-{ "kind": "event",     "payload": { /* one EventEnvelope (id, type, topic, partition, offset, sequence, data, …) */ } }
+{ "kind": "event",     "payload": { /* one EventEnvelope (id, type, partition, offset, sequence, data, …) */ } }
 { "kind": "heartbeat", "at": "<iso8601>" }
 { "kind": "control",   "code": "<control_code>",   /* "reason": "<…>" on terminal */
                        "positions": [ { "topic": "...", "partition": <int>, "offset": <i64>, "last_examined": <i64> }, ... ] }

@@ -1,7 +1,7 @@
 //! Tests for `LedgerApprovalExecutor` — the concrete `ApprovalExecutor` that
 //! replays an approved `ApprovalIntent` against the real mutation surfaces
 //! (VHP-1852, Group E). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_executor -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_executor -- --ignored`.
 //!
 //! Drives `execute` per intent kind against a recording stub `LedgerClientV1` +
 //! stub `InvoicePoster` and a real `PayerStateRepo` (testcontainers, for the
@@ -55,7 +55,7 @@ async fn boot() -> (
     testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     DBProvider<DbError>,
 ) {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let raw = Database::connect(&url).await.unwrap();

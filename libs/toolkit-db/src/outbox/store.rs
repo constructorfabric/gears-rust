@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseExecutor, DbBackend, DbErr, Statement};
 
 use super::dialect::{AllocSql, ClaimSql, Dialect, VacuumSql};
 use super::statements::{MySqlIdReservationStatements, OutboxStatements};
@@ -37,7 +37,7 @@ impl<'a> OutboxStore<'a> {
 
     pub(super) async fn exec_insert_body_batch(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         payloads: &[(&[u8], &str)],
     ) -> Result<Vec<i64>, DbErr> {
         if payloads.is_empty() {
@@ -59,7 +59,7 @@ impl<'a> OutboxStore<'a> {
                 values.push(payload.to_vec().into());
                 values.push(payload_type.into());
             }
-            conn.execute(Statement::from_sql_and_values(self.backend(), &sql, values))
+            conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             return Ok(ids);
         }
@@ -75,7 +75,7 @@ impl<'a> OutboxStore<'a> {
 
         if self.dialect().supports_returning() {
             let rows = conn
-                .query_all(Statement::from_sql_and_values(self.backend(), &sql, values))
+                .query_all_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             rows.iter()
                 .map(|r| {
@@ -84,10 +84,10 @@ impl<'a> OutboxStore<'a> {
                 })
                 .collect()
         } else {
-            conn.execute(Statement::from_sql_and_values(self.backend(), &sql, values))
+            conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     self.backend(),
                     Dialect::last_insert_id(),
                 ))
@@ -105,7 +105,7 @@ impl<'a> OutboxStore<'a> {
 
     pub(super) async fn exec_insert_incoming_batch(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         entries: &[(i64, i64)],
     ) -> Result<Vec<i64>, DbErr> {
         if entries.is_empty() {
@@ -129,7 +129,7 @@ impl<'a> OutboxStore<'a> {
                 values.push(partition_id.into());
                 values.push(body_id.into());
             }
-            conn.execute(Statement::from_sql_and_values(self.backend(), &sql, values))
+            conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             return Ok(ids);
         }
@@ -145,7 +145,7 @@ impl<'a> OutboxStore<'a> {
 
         if self.dialect().supports_returning() {
             let rows = conn
-                .query_all(Statement::from_sql_and_values(self.backend(), &sql, values))
+                .query_all_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             rows.iter()
                 .map(|r| {
@@ -154,10 +154,10 @@ impl<'a> OutboxStore<'a> {
                 })
                 .collect()
         } else {
-            conn.execute(Statement::from_sql_and_values(self.backend(), &sql, values))
+            conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     self.backend(),
                     Dialect::last_insert_id(),
                 ))
@@ -178,14 +178,14 @@ impl<'a> OutboxStore<'a> {
     /// Encapsulates RETURNING (Postgres/SQLite) vs `LAST_INSERT_ID` (`MySQL`).
     async fn exec_insert_returning_id(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         sql: &str,
         params: Vec<sea_orm::Value>,
         context: &str,
     ) -> Result<i64, DbErr> {
         if self.dialect().supports_returning() {
             let row = conn
-                .query_one(Statement::from_sql_and_values(self.backend(), sql, params))
+                .query_one_raw(Statement::from_sql_and_values(self.backend(), sql, params))
                 .await?
                 .ok_or_else(|| {
                     DbErr::Custom(format!("INSERT RETURNING returned no row for {context}"))
@@ -193,10 +193,10 @@ impl<'a> OutboxStore<'a> {
             row.try_get_by_index(0)
                 .map_err(|e| DbErr::Custom(format!("{context} id column: {e}")))
         } else {
-            conn.execute(Statement::from_sql_and_values(self.backend(), sql, params))
+            conn.execute_raw(Statement::from_sql_and_values(self.backend(), sql, params))
                 .await?;
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     self.backend(),
                     Dialect::last_insert_id(),
                 ))
@@ -212,7 +212,7 @@ impl<'a> OutboxStore<'a> {
     /// Execute a single body INSERT and return the generated ID.
     async fn exec_insert_body(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         payload: Vec<u8>,
         payload_type: &str,
     ) -> Result<i64, DbErr> {
@@ -232,7 +232,7 @@ impl<'a> OutboxStore<'a> {
     /// Execute a single incoming INSERT and return the generated ID.
     async fn exec_insert_incoming(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         partition_id: i64,
         body_id: i64,
     ) -> Result<i64, DbErr> {
@@ -256,7 +256,7 @@ impl<'a> OutboxStore<'a> {
 
     pub(super) async fn exec_insert_body_and_incoming(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         partition_id: i64,
         payload: Vec<u8>,
         payload_type: &str,
@@ -327,7 +327,7 @@ impl<'a> OutboxStore<'a> {
 
     pub(super) async fn exec_lease_acquire(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         lease_id: &str,
         lease_secs: i64,
         partition_id: i64,
@@ -335,7 +335,7 @@ impl<'a> OutboxStore<'a> {
         let lease_acquire = self.statements.processor().lease_acquire();
         if self.dialect().supports_returning() {
             let row = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     self.backend(),
                     lease_acquire,
                     [lease_id.into(), lease_secs.into(), partition_id.into()],
@@ -355,7 +355,7 @@ impl<'a> OutboxStore<'a> {
             }
         } else {
             let result = conn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     self.backend(),
                     lease_acquire,
                     [lease_id.into(), lease_secs.into(), partition_id.into()],
@@ -366,7 +366,7 @@ impl<'a> OutboxStore<'a> {
             }
             let read_processor = self.read_processor();
             let row = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     self.backend(),
                     read_processor,
                     [partition_id.into()],
@@ -433,7 +433,10 @@ impl<'a> OutboxStore<'a> {
         self.statements.vacuum().decrement_counter()
     }
 
-    #[cfg(test)]
+    /// Only the `SQLite` integration suite resets the counter, so the gate
+    /// matches that module's (`#[cfg(test)] #[cfg(feature = "sqlite")]`) —
+    /// otherwise this is dead code in a pg- or mysql-only build.
+    #[cfg(all(test, feature = "sqlite"))]
     pub(super) fn reset_vacuum_counter(&self) -> &str {
         self.statements.vacuum().reset_counter()
     }
@@ -456,7 +459,7 @@ impl<'a> OutboxStore<'a> {
 
     async fn reserve_mysql_ids(
         &self,
-        conn: &dyn ConnectionTrait,
+        conn: &DatabaseExecutor<'_>,
         reservation: &MySqlIdReservationStatements,
         count: usize,
         context: &str,
@@ -464,7 +467,7 @@ impl<'a> OutboxStore<'a> {
         let count = i64::try_from(count)
             .map_err(|e| DbErr::Custom(format!("{context} batch too large: {e}")))?;
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 self.backend(),
                 reservation.select_next_id_for_update(),
             ))
@@ -478,7 +481,7 @@ impl<'a> OutboxStore<'a> {
             .try_get_by_index(0)
             .map_err(|e| DbErr::Custom(format!("{context} next_id column: {e}")))?;
 
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             self.backend(),
             reservation.advance_next_id(),
             [count.into()],

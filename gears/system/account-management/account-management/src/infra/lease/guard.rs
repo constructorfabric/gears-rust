@@ -14,6 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::Db;

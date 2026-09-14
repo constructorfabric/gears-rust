@@ -6,7 +6,7 @@ use super::super::helpers::*;
 use super::super::helpers::{broker_with_topic, ctx, wire_event};
 use crate::api::{EventBrokerApi, IngestOutcome};
 use crate::error::EventBrokerError;
-use crate::mock::{MockBrokerHandle, stubs::test_ctx_for_tenant};
+use crate::mock::{MockBrokerHandle, PartitionKeyFixture, stubs::test_ctx_for_tenant};
 use uuid::Uuid;
 
 async fn populated_partition(handle: &MockBrokerHandle, topic: &str, partition_count: u32) -> u32 {
@@ -28,7 +28,7 @@ async fn s1_01_publish_single_async() {
     let (broker, h) = broker_with_topic(TOPIC, 4).await;
     let c = ctx();
     let outcome = broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap();
     assert_eq!(outcome, IngestOutcome::Accepted);
@@ -46,7 +46,7 @@ async fn s1_02_publish_sync_wait_persisted() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     let c = ctx();
     let outcome = broker
-        .publish_sync(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish_sync(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap();
     assert_eq!(outcome, IngestOutcome::Persisted);
@@ -75,7 +75,7 @@ async fn s1_03_schema_validation_failure() {
     )
     .await;
     let c = ctx();
-    let mut ev = wire_event(TOPIC, EVT, c.subject_tenant_id());
+    let mut ev = wire_event(EVT, c.subject_tenant_id());
     // Missing the required `total_cents`.
     ev.data = Some(serde_json::json!({ "order_id": "order-bad" }));
     let err = broker.publish(&c, &ev).await.unwrap_err();
@@ -101,13 +101,13 @@ async fn registered_event_type_allowed_subjects_are_enforced() {
     )
     .await;
     let c = ctx();
-    let accepted = wire_event(TOPIC, EVT, c.subject_tenant_id());
+    let accepted = wire_event(EVT, c.subject_tenant_id());
     assert_eq!(
         broker.publish(&c, &accepted).await.unwrap(),
         IngestOutcome::Accepted
     );
 
-    let mut rejected = wire_event(TOPIC, EVT, c.subject_tenant_id());
+    let mut rejected = wire_event(EVT, c.subject_tenant_id());
     rejected.subject_type = "other-type".to_owned();
     let err = broker.publish(&c, &rejected).await.unwrap_err();
     assert!(
@@ -132,7 +132,7 @@ async fn s1_04_rate_limited() {
     handle.set_publish_rate_limit(Some(0)).await;
     let c = ctx();
     let err = broker
-        .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+        .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
         .await
         .unwrap_err();
     let msg = format!("{err:?}");
@@ -149,8 +149,7 @@ async fn s1_04_rate_limited() {
 async fn s1_05_readonly_partition_rejected() {
     let (broker, h) = broker_with_topic(TOPIC, 4).await;
     let c = ctx();
-    let mut ev = wire_event(TOPIC, EVT, c.subject_tenant_id());
-    ev.partition_key = Some("customer-42".to_owned());
+    let mut ev = wire_event(EVT, c.subject_tenant_id());
     ev.partition = Some(3);
 
     let err = broker.publish(&c, &ev).await.unwrap_err();
@@ -168,14 +167,15 @@ async fn s1_05_readonly_partition_rejected() {
 
 /// Scenario: producer/single/1.01-positive-publish-single-async.md
 #[tokio::test]
-async fn s1_01_tenant_default_routes_by_tenant() {
-    // No partition_key set -> routes by tenant per ADR-0002.
+async fn s1_01_the_default_pointer_routes_by_tenant() {
+    // The type declares no pointer, so the base's default applies: routes by
+    // tenant per ADR-0002.
     let (broker, h) = broker_with_topic(TOPIC, 8).await;
     let t1 = Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000001").unwrap();
     let c1 = test_ctx_for_tenant(t1);
-    let mut first = wire_event(TOPIC, EVT, c1.subject_tenant_id());
+    let mut first = wire_event(EVT, c1.subject_tenant_id());
     first.subject = "first-subject".to_owned();
-    let mut second = wire_event(TOPIC, EVT, c1.subject_tenant_id());
+    let mut second = wire_event(EVT, c1.subject_tenant_id());
     second.subject = "different-subject".to_owned();
 
     broker.publish(&c1, &first).await.unwrap();
@@ -189,24 +189,27 @@ async fn s1_01_tenant_default_routes_by_tenant() {
             .iter()
             .all(|event| event.event.partition == Some(partition))
     );
-    assert!(
-        stored
-            .iter()
-            .all(|event| event.event.partition_key.is_none())
-    );
 }
 
 /// Scenario: producer/single/1.01-positive-publish-single-async.md
 #[tokio::test]
-async fn s1_01_explicit_partition_key_selects_partition_input() {
+async fn s1_01_a_declared_pointer_selects_the_partition_input() {
+    // The type points at `/subject` rather than the default tenant, so two events
+    // from *different* tenants sharing a subject share a partition - which is the
+    // point: the key is the type's choice, not the publisher's.
     let (broker, h) = broker_with_topic(TOPIC2, 4).await;
+    h.set_partition_key(PartitionKeyFixture {
+        event_type: EVT,
+        pointer: "/subject",
+    })
+    .await;
     let c = ctx();
-    let mut ev = wire_event(TOPIC2, EVT, c.subject_tenant_id());
-    ev.partition_key = Some("explicit-key".to_owned());
+    let mut ev = wire_event(EVT, c.subject_tenant_id());
+    ev.subject = "explicit-key".to_owned();
     let other =
         test_ctx_for_tenant(Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000001").unwrap());
-    let mut other_ev = wire_event(TOPIC2, EVT, other.subject_tenant_id());
-    other_ev.partition_key = Some("explicit-key".to_owned());
+    let mut other_ev = wire_event(EVT, other.subject_tenant_id());
+    other_ev.subject = "explicit-key".to_owned();
 
     broker.publish(&c, &ev).await.unwrap();
     broker.publish(&other, &other_ev).await.unwrap();
@@ -216,7 +219,7 @@ async fn s1_01_explicit_partition_key_selects_partition_input() {
     assert_eq!(
         stored.len(),
         2,
-        "same explicit key must select one partition"
+        "one pointed-at value must select one partition"
     );
     assert!(
         stored
@@ -226,7 +229,7 @@ async fn s1_01_explicit_partition_key_selects_partition_input() {
     assert!(
         stored
             .iter()
-            .all(|event| event.event.partition_key.as_deref() == Some("explicit-key"))
+            .all(|event| event.event.subject == "explicit-key")
     );
 }
 
@@ -237,7 +240,7 @@ async fn s1_01_same_tenant_events_same_partition() {
     let c = ctx();
     for _ in 0..5 {
         broker
-            .publish(&c, &wire_event(TOPIC3, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }
@@ -253,7 +256,7 @@ async fn s1_01_offsets_are_monotonic_per_partition() {
     let c = ctx();
     for _ in 0..5 {
         broker
-            .publish(&c, &wire_event(TOPIC, EVT, c.subject_tenant_id()))
+            .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
             .await
             .unwrap();
     }

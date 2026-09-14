@@ -139,7 +139,7 @@ impl VacuumTask {
         // those rows become orphaned (no mechanism to rediscover them).
         if !cancel.is_cancelled() {
             let conn = db.sea_internal();
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.decrement_vacuum_counter(),
                 [snapshot_counter.into(), partition_id.into()],
@@ -168,7 +168,7 @@ impl VacuumTask {
             let conn = db.sea_internal();
             let page = DIRTY_PAGE_LIMIT;
             let rows = conn
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     store.backend(),
                     store.fetch_dirty_partitions(),
                     [cursor.into(), page.into()],
@@ -215,7 +215,7 @@ impl VacuumTask {
         // Read processed_seq (PK lookup, cheap).
         let row = {
             let conn = db.sea_internal();
-            conn.query_one(Statement::from_sql_and_values(
+            conn.query_one_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.read_processor(),
                 [partition_id.into()],
@@ -281,7 +281,7 @@ impl VacuumTask {
         let limit = batch_limit;
 
         let rows = txn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &vacuum_sql.select_outgoing_chunk,
                 [partition_id.into(), processed_seq.into(), limit.into()],
@@ -311,7 +311,7 @@ impl VacuumTask {
         if !outgoing_ids.is_empty() {
             let delete_sql = store.build_delete_outgoing_batch(outgoing_ids.len());
             let values: Vec<sea_orm::Value> = outgoing_ids.iter().map(|&id| id.into()).collect();
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &delete_sql,
                 values,
@@ -323,7 +323,7 @@ impl VacuumTask {
         if !body_ids.is_empty() {
             let delete_sql = store.build_delete_body_batch(body_ids.len());
             let values: Vec<sea_orm::Value> = body_ids.iter().map(|&id| id.into()).collect();
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 &delete_sql,
                 values,

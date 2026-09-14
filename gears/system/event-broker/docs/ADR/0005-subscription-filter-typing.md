@@ -37,7 +37,7 @@ decision-makers: Event Broker Team
 
 ## Context and Problem Statement
 
-The current consumer subscription API (`POST /v1/subscriptions`, per `schemas/subscription.v1.schema.json`) carries `topics: [string]` and `filters: [string]` as **two parallel arrays**. Three problems with that surface:
+The current consumer subscription API (`POST /v1/subscriptions`, per `schemas/gts.cf.core.events.subscription.v1~.schema.json`) carries `topics: [string]` and `filters: [string]` as **two parallel arrays**. Three problems with that surface:
 
 1. **Parallel arrays with no declared mapping.** The JSON Schema does not specify whether `filters[i]` applies to `topics[i]`, to all of `topics`, or to none. Prose in `features/0002-consumer-subscription-lifecycle.md` is ambiguous; the rolling-deploy scenario (v1 with `(topics=T1, filters=F1)`, v2 with `(T2, F2)`) becomes guess-work as soon as a member subscribes to more than one topic.
 2. **Untyped filter expressions.** `filters[i]` is a bare string, implicitly CEL, with no declared expression language, no engine-extensibility story, no validation contract. Adding a second engine (starlark, rego, jsonpath) would break the wire.
@@ -74,7 +74,7 @@ Adopt **topic-anchored `interests[]` with GTS-typed filter engines**. The JOIN b
     {
       "topic":           "gts.cf.core.events.topic.v1~yourorg.orders.v1",
       "tenant_id":       "<uuid>",
-      "types":           ["gts.cf.core.events.event.v1~yourorg.orders.placed.v1"],
+      "types":           ["gts.cf.core.events.event.v1~yourorg.orders.placed.v1~"],
       "filter": {
         "engine":     "gts.cf.core.events.filter.v1~cf.core.expression.cel.v1",
         "expression": "event.data.amount > 100"
@@ -125,8 +125,8 @@ gts_prefix       = canonical GTS prefix ending at a segment boundary
 
 Valid examples (under topic `~yourorg.orders.v1`):
 
-- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1` — exact match.
-- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1` matches every `placed.v1.x` (minor-version-omitted matching; see below).
+- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1~` — exact match.
+- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1~` matches every `placed.v1.x` (minor-version-omitted matching; see below).
 - `gts.cf.core.events.event.v1~yourorg.orders.placed.v*` — all versions of `placed` (rule 4).
 - `gts.cf.core.events.event.v1~yourorg.orders.placed.*` — broader: all continuations of `placed.`.
 - `gts.cf.core.events.event.v1~yourorg.orders.*` — all event types under `yourorg.orders` namespace.
@@ -196,19 +196,17 @@ pub enum FilterError {
 
 ### CEL Engine Filter Context (v1)
 
-The CEL engine binds one variable `event` whose fields are the read-side event (the same `event.v1.schema.json` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
+The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~.schema.json` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
 
 | CEL identifier | Type | Source |
 |---|---|---|
 | `event.id` | string (UUID) | publish input |
 | `event.type` | string (GTS) | publish input |
-| `event.topic` | string (GTS) | publish input |
 | `event.tenant_id` | string (UUID) | publish input (authz-validated) |
 | `event.source` | string | publish input |
 | `event.subject` | string | publish input |
 | `event.subject_type` | string (GTS) | publish input |
 | `event.occurred_at` | timestamp | publish input |
-| `event.partition_key` | string (optional) | publish input |
 | `event.partition` | int | broker-derived |
 | `event.sequence` | int (i64) | backend-assigned |
 | `event.sequence_time` | timestamp | backend-assigned |
@@ -390,8 +388,8 @@ External references:
 - **Scenario and test coverage**: JOIN shape, interest body, pattern syntax, version resolution, topic / tenant / type authz, filter-engine resolution, expression compilation, per-event delivery, limits, and rolling deploy are covered by repository scenarios and tests.
 - **Related ADRs**:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation; the subscription rebalance still operates on `(topic, partition)`.
-  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `event.v1.schema.json` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
+  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~.schema.json` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
   - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — `client_agent` field convention on resource-creating endpoints; JOIN reuses the consumer-group's `client_agent` rather than re-declaring per subscription.
 - **Feature doc**: [`docs/features/0002-consumer-subscription-lifecycle.md`](../features/0002-consumer-subscription-lifecycle.md) — CDSL flows, ACs, test plans.
 - **Schemas**:
-  - [`schemas/subscription.v1.schema.json`](../schemas/subscription.v1.schema.json) — subscription resource (updated for interests[]).
+  - [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](../schemas/gts.cf.core.events.subscription.v1~.schema.json) — subscription resource (updated for interests[]).

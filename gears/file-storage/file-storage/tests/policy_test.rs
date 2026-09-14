@@ -37,11 +37,7 @@ const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 async fn build_store() -> (Store, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-policy-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),

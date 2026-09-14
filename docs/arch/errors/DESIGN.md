@@ -163,9 +163,11 @@ See [§ 4. Category Reference](#4-category-reference) for full definitions inclu
 
 - [ ] `p1` - **ID**: `cpt-cf-errors-principle-single-error-gateway`
 
-There is no alternative path for returning errors. Every REST error response is produced from a `CanonicalError` via `From<CanonicalError> for Problem`. This eliminates inconsistent error formats across gears.
+There is no alternative path for returning errors. Every REST error response *this platform produces* is built from a `CanonicalError` via `From<CanonicalError> for Problem`. This eliminates inconsistent error formats across gears.
 
-**ADRs**: `cpt-cf-errors-adr-typed-enum-impl`
+This is a producer guarantee, not a claim about what's accepted on ingestion: a response received from a genuinely foreign peer (proxied through `toolkit-gateway::Forwarder`, or returned by a contract-generated RPC client) was never constructed via `CanonicalError` and is not required to be - `canonical_error_middleware`'s fallback (`cpt-cf-errors-adr-error-middleware-catchall`) and `toolkit-contract`'s transport-error mapping both parse it as a plain RFC 9457 `Problem` instead. `Problem`'s own `Deserialize` accordingly follows RFC 9457 §3.1's actual optionality (`detail`/`context`/`title`/`type` all default, and `status` is `Option<u16>` rather than required, since the fields this platform always happens to emit aren't a requirement it can place on foreign peers) - the Base Error Schema below documents this platform's own emission contract, not a requirement placed on foreign peers. A response tagged `ForeignPassthrough` is a separate case still: it is relayed by a reverse-proxy/passthrough layer without being parsed as a `Problem` at all, so its original body (whatever shape that is) reaches the client unchanged - the guarantees in this section apply once a response is parsed and rewritten by the middleware, not to a passthrough response that bypasses that step entirely (`cpt-cf-errors-adr-error-middleware-catchall`).
+
+**ADRs**: `cpt-cf-errors-adr-typed-enum-impl`, `cpt-cf-errors-adr-error-middleware-catchall`
 
 #### Fixed Context Structures
 
@@ -187,9 +189,9 @@ Every canonical category has a GTS identifier assigned before any code is writte
 
 - [ ] `p2` - **ID**: `cpt-cf-errors-principle-fail-safe-fallback`
 
-Any error that does not match a canonical category is mapped to `internal` with a trace ID. No error escapes the system without a canonical category.
+Any 5xx error that does not match a canonical category is mapped to `internal` with a trace ID - a 5xx is unambiguous (it's this platform's own fault regardless of specifics), so `internal` is a correct answer, not a guess. A 4xx that does not match a canonical category instead uses RFC 9457 §4.2.1's `about:blank` convention, since a bare 4xx genuinely does not determine one canonical category over another (e.g. a 400 could be `invalid_argument`, `failed_precondition`, or `out_of_range`) - asserting a specific GTS category there would misrepresent unrelated failures as one thing. Every error that reaches the middleware and is rewritten by it still becomes a syntactically valid `Problem` carrying a trace ID; "with a canonical category" is guaranteed for 5xx, and deliberately declined for an unattributable 4xx. A response tagged `ForeignPassthrough`, or a non-error (2xx/3xx) response that merely mislabeled its `Content-Type` as `application/problem+json`, is outside this guarantee - neither is rewritten by the middleware, so its body is whatever it originally was.
 
-> **Note**: Full enforcement of this principle (catching panics, unhandled rejections, and unknown error types in middleware) depends on the error middleware catch-all capability, which is out of scope for the current phase (see PRD §4.2). In the current phase, the principle is upheld by compile-time enforcement (typed enum, Architecture lint rules) and the single `From<CanonicalError> for Problem` conversion path.
+> **Note**: Enforced by `toolkit::api::canonical_error_middleware`'s generic-wrap fallback (`cpt-cf-errors-fr-middleware-catchall`, see `cpt-cf-errors-adr-error-middleware-catchall`) for any response that reaches it without already being `CanonicalError`-typed, and by compile-time enforcement (typed enum, Architecture lint rules) plus the single `From<CanonicalError> for Problem` conversion path for everything constructed via the typed API.
 
 ### 2.2 Constraints
 
@@ -197,9 +199,9 @@ Any error that does not match a canonical category is mapped to `internal` with 
 
 - [ ] `p1` - **ID**: `cpt-cf-errors-constraint-rfc9457`
 
-All REST error responses use `Content-Type: application/problem+json` and include the RFC 9457 fields: `type`, `title`, `status`, `detail`, and `instance`. The `type` field carries the GTS URI for the error category.
+All REST error responses this platform produces or rewrites use `Content-Type: application/problem+json` and include the RFC 9457 fields: `type`, `title`, `status`, `detail`, and `instance`. The `type` field carries the GTS URI for the error category, except for a response the platform could not attribute to any canonical category at all (an unattributable foreign 4xx caught only by the error-middleware catch-all fallback) - RFC 9457 §4.2.1's `"about:blank"` sentinel is used there instead, since asserting a specific GTS category from a bare, unattributable status code would be a guess, not a contract. A `ForeignPassthrough`-tagged response is excluded from this constraint entirely - it is relayed verbatim and was never a candidate for rewriting.
 
-**ADRs**: `cpt-cf-errors-adr-rfc9457-wire-format`
+**ADRs**: `cpt-cf-errors-adr-rfc9457-wire-format`, `cpt-cf-errors-adr-error-middleware-catchall`
 
 #### GTS Code Format
 
@@ -415,13 +417,11 @@ Only handles REST (HTTP). Does not handle gRPC or SSE. Does not add `trace_id` o
 
 **Responsibility scope**:
 
-Axum middleware that catches any `CanonicalError` returned from handlers, calls `Problem::from_error()`, sets `trace_id` from the request span, sets `instance` from the request URI, and returns the `application/problem+json` response.
+Axum middleware that catches any `CanonicalError` returned from handlers, calls `Problem::from_error()`, sets `trace_id` from the request span, sets `instance` from the request URI, and returns the `application/problem+json` response. Also catches any error-status response that never went through `CanonicalError` at all (an axum extractor rejection, a tower-layer short-circuit, an unmatched route) and wraps it into a valid `Problem`: a foreign 5xx becomes a real `internal` category error, a foreign 4xx becomes an `about:blank` `Problem` (see `cpt-cf-errors-adr-error-middleware-catchall`). Exception: a response tagged `ForeignPassthrough` is returned unchanged, regardless of status or `Content-Type` - a reverse-proxy/passthrough layer relaying a genuine upstream response verbatim.
 
 **Responsibility boundaries**:
 
-Does not construct domain errors. Does not decide which category to use — that is the handler's job.
-
-> **Out of scope (current phase)**: Catch-all behavior (intercepting panics, unhandled rejections, and unknown error types and wrapping them as `CanonicalError::internal(...)`) depends on the foundation phase and is deferred per PRD §4.2.
+Does not construct domain errors. Does not decide which category to use for a `CanonicalError` already returned by a handler — that is the handler's job. For a response it never typed as `CanonicalError`, deciding `internal` (5xx) vs. `about:blank` (4xx) is exactly this middleware's job, since no handler ever saw the failure.
 
 #### Resource Error Macro
 
@@ -467,11 +467,11 @@ Architecture lint rules are static analysis only. They do not modify code, do no
 
 **Technology**: JSON (`application/problem+json`)
 
-Every REST error response follows this structure:
+Every REST error response the canonical middleware produces or rewrites follows this structure. A `ForeignPassthrough`-tagged response is exempt - it retains its original body verbatim.
 
 | Field | Source | Part | Description |
 |-------|--------|------|-------------|
-| `type` | GTS URI from category | **Contract** | Error type URI (e.g., `gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~`) |
+| `type` | GTS URI from category, or `"about:blank"` for an unattributable foreign 4xx | **Contract** | Error type URI (e.g., `gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~`); `"about:blank"` per RFC 9457 §4.2.1 when the error-middleware catch-all fallback could not attribute a canonical category |
 | `title` | Static per category | **Contract** | Human-readable summary (e.g., "Not Found") |
 | `status` | HTTP status from mapping, or a per-occurrence `TransportOverride` | **Contract** (default) / Variable (override) | HTTP status code as integer — see [§2.2 Transport Overrides](#transport-overrides) |
 | `detail` | `CanonicalError.detail` | Variable | Human-readable explanation of this occurrence |
@@ -481,7 +481,7 @@ Every REST error response follows this structure:
 
 **Base Error Schema**
 
-The base error schema defines the common structure for all error categories.
+The base error schema defines the common structure for all error categories, for a response the platform itself produces or rewrites via the canonical middleware - not a `ForeignPassthrough`-tagged response, which retains its original, unrelated shape.
 
 ```json
 {
@@ -492,7 +492,7 @@ The base error schema defines the common structure for all error categories.
   "properties": {
     "type": {
       "type": "string",
-      "description": "GTS type identifier for the error category"
+      "description": "GTS type identifier for the error category, or \"about:blank\" (RFC 9457 §4.2.1) for an error the platform could not attribute to any canonical category - see the error-middleware catch-all ADR"
     },
     "title": {
       "type": "string",

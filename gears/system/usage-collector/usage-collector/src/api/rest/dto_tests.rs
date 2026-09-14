@@ -392,7 +392,7 @@ fn create_usage_record_result_dto_serialises_rejected_with_lowercase_tag() {
     let problem = Problem {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~").to_owned(),
         title: "Invalid argument".to_owned(),
-        status: 400,
+        status: Some(400),
         detail: "test rejection".to_owned(),
         instance: None,
         trace_id: None,

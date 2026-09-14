@@ -9,6 +9,9 @@ refs:
   - bss/prd/PRD-subscriptions-entitlements-202601120119/PRD-subscriptions-entitlements-202601120119.md
 ---
 
+Created:  2026-06-11 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- migration-note: migrated from legacy Virtuozzo PRD format to virtuozzo-sdlc kit layout (cpt-* sub-IDs, 17-section outline). Original preserved unchanged at docs/bss/prd/PRD-billing-ledger-balances-202604041200/. Confluence metadata preserved below. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger & Balances — Double-Entry, AR, ASC 606-Compatible Posting -->
 <!-- Related: bss/prd/PRD-billing-ledger-balances-202604041200 | Upstream: Rating, Subscriptions, Catalog, Contracts | Downstream: ERP/GL, Payments -->
@@ -483,7 +486,7 @@ For each posted invoice, a new credit note (incl. tax) **MUST NOT** exceed avail
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-ledger-fr-allocation-precedence`
 
-Multi-invoice allocation order **MUST** be deterministic: default oldest posting date first, ties broken by smallest invoice id; tenant overrides allowed; statutory jurisdiction rules (e.g. UK Consumer Credit Act) **MUST** take precedence over both tenant overrides and the platform default.
+Multi-invoice allocation order **MUST** be deterministic: default oldest posting date first, ties broken by smallest invoice id; tenant overrides allowed. Statutory jurisdiction rules (e.g. UK Consumer Credit Act) are **🔄 out of v1 scope (amended 2026-06-11, superseding the 2026-06-10 "UK CCA only" ratification)**: the customer-instructed tenant override is the B2B compliance path, and a data-driven jurisdiction→rule registry — which **would** take precedence over both tenant overrides and the platform default — is added post-MVP only if Legal names a market whose payers a statutory regime binds. Owners: Legal + PM. Design: `design/03-payments-allocation.md` § Needs Discussion, "Statutory allocation-rule registry"; statutory rules **MUST NEVER** live in the ledger when the registry arrives (external AR-policy component issues an explicit split; the ledger validates and records).
 
 **Rationale**: Deterministic, statute-compliant allocation is required for correct AR and disputes.
 

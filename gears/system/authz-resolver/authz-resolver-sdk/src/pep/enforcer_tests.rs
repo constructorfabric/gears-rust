@@ -5,7 +5,7 @@ use super::*;
 use crate::constraints::{Constraint, InPredicate, Predicate};
 use crate::models::{EvaluationResponse, EvaluationResponseContext};
 use toolkit_gts::gts_id;
-use toolkit_security::pep_properties;
+use toolkit_security::{PlatformIdentity, PlatformSecurityContext, pep_properties};
 
 fn uuid(s: &str) -> Uuid {
     Uuid::parse_str(s).expect("valid test UUID")
@@ -23,11 +23,12 @@ const RESOURCE: &str = "33333333-3333-3333-3333-333333333333";
 struct AllowAllMock;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAllMock {
+impl AuthZResolverApi for AllowAllMock {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         // Resolve tenant: explicit context first, then subject fallback.
         let tenant_id = req
             .context
@@ -92,11 +93,12 @@ impl DenyMock {
 }
 
 #[async_trait]
-impl AuthZResolverClient for DenyMock {
+impl AuthZResolverApi for DenyMock {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -111,12 +113,77 @@ impl AuthZResolverClient for DenyMock {
 struct FailMock;
 
 #[async_trait]
-impl AuthZResolverClient for FailMock {
+impl AuthZResolverApi for FailMock {
     async fn evaluate(
         &self,
+        _ctx: PlatformSecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::Internal("boom".to_owned()))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::internal("boom").create())
+    }
+}
+
+/// Mock that never responds in time — models a hung/slow PDP.
+struct SlowMock;
+
+#[async_trait]
+impl AuthZResolverApi for SlowMock {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        std::future::pending::<()>().await;
+        unreachable!("SlowMock should never complete before the PEP deadline");
+    }
+}
+
+/// Shared slot holding the last `(ctx, request)` the PEP passed to `evaluate`.
+type CapturedCall = Arc<std::sync::Mutex<Option<(PlatformSecurityContext, EvaluationRequest)>>>;
+
+/// Mock that captures the arguments the PEP passes to `evaluate`, so tests can
+/// assert the caller identity actually reaches the resolver. Returns an
+/// allow-all decision constrained to the request's resolved tenant.
+#[derive(Clone)]
+struct CapturingMock {
+    captured: CapturedCall,
+}
+
+impl CapturingMock {
+    fn new() -> Self {
+        Self {
+            captured: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for CapturingMock {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let tenant = req
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or_default();
+        *self.captured.lock().unwrap() = Some((ctx, req));
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [tenant],
+                    ))],
+                }],
+                ..Default::default()
+            },
+        })
     }
 }
 
@@ -133,8 +200,62 @@ const TEST_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
-fn enforcer(mock: impl AuthZResolverClient + 'static) -> PolicyEnforcer {
+fn enforcer(mock: impl AuthZResolverApi + 'static) -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(mock))
+}
+
+// ── from_hub (lazy resolution) ───────────────────────────────────
+
+#[tokio::test]
+async fn from_hub_resolves_registered_client() {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn AuthZResolverApi>(Arc::new(AllowAllMock));
+    let e = PolicyEnforcer::from_hub(hub);
+    let ctx = test_ctx();
+
+    let scope = e
+        .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect("lazy resolution should succeed once the client is registered");
+
+    assert_eq!(
+        scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+        &[uuid(TENANT)]
+    );
+}
+
+#[tokio::test]
+async fn from_hub_errors_when_client_unregistered() {
+    let hub = Arc::new(ClientHub::new());
+    let e = PolicyEnforcer::from_hub(hub);
+    let ctx = test_ctx();
+
+    let err = e
+        .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect_err("an unregistered client should surface a transport error");
+
+    assert!(matches!(err, EnforcerError::EvaluationFailed(_)));
+}
+
+// ── evaluate deadline (fail-fast on a slow PDP) ──────────────────
+
+#[tokio::test]
+async fn evaluate_times_out_when_pdp_is_slow() {
+    let e = enforcer(SlowMock).with_deadline(std::time::Duration::from_millis(20));
+    let ctx = test_ctx();
+
+    let start = std::time::Instant::now();
+    let err = e
+        .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect_err("a PDP slower than the deadline must fail fast");
+
+    assert!(matches!(err, EnforcerError::EvaluationFailed(_)));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "the deadline must bound the call to well under the PDP's response time"
+    );
 }
 
 // ── build_request ────────────────────────────────────────────────
@@ -181,6 +302,51 @@ fn build_request_with_overrides_tenant() {
 }
 
 // ── access_scope ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn access_scope_threads_caller_identity_into_subject() {
+    // The core behaviour: the caller's SecurityContext must reach the resolver.
+    // Post two-plane-auth it travels in `req.subject` (+ context), while the
+    // `PlatformSecurityContext` argument is a credential-free plane marker.
+    let mock = CapturingMock::new();
+    let captured = Arc::clone(&mock.captured);
+    let e = enforcer(mock);
+    let ctx = SecurityContext::builder()
+        .subject_id(uuid(SUBJECT))
+        .subject_tenant_id(uuid(TENANT))
+        .token_scopes(vec!["users:read".to_owned()])
+        .bearer_token("caller-jwt".to_owned())
+        .build()
+        .unwrap();
+
+    e.access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect("allow-all mock should succeed");
+
+    let (plane_ctx, req) = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("evaluate must have been called");
+
+    // Caller identity is threaded via the request, not the ctx argument.
+    assert_eq!(req.subject.id, uuid(SUBJECT));
+    assert_eq!(
+        req.subject
+            .properties
+            .get("tenant_id")
+            .and_then(|v| v.as_str()),
+        Some(TENANT),
+    );
+    assert_eq!(req.context.token_scopes, vec!["users:read".to_owned()]);
+    assert!(
+        req.context.bearer_token.is_some(),
+        "caller bearer token must reach the PDP"
+    );
+
+    // The ctx argument is a credential-free plane marker carrying no identity.
+    assert!(matches!(plane_ctx.identity(), PlatformIdentity::Unknown));
+}
 
 #[tokio::test]
 async fn access_scope_pdp_resolves_tenant_from_subject() {

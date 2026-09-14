@@ -1,0 +1,7 @@
+[gear]
+name = "Types Registry"
+description = "Central GTS schema registry for type contracts, validation, and cross-gear discovery."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

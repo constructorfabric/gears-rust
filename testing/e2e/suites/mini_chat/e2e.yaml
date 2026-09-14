@@ -1,0 +1,12 @@
+suite: mini-chat
+features:
+  - mini-chat
+  - static-authn
+  - static-authz
+  - single-tenant
+  - static-credstore
+launcher: pytest
+pytest_args:
+  - --mode
+  - offline
+  - -vv

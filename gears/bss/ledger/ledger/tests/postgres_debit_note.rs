@@ -51,8 +51,8 @@ use bss_ledger_sdk::{AccountClass, Side};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -63,7 +63,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -140,17 +140,17 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .await
         .unwrap();
     // Seed BOTH the invoice's period (`s.period_id`) and the CURRENT period: the
-    // adjustment handlers post into `Utc::now()`'s period (credit/debit-note
-    // `eff_date = Utc::now()`), so a fixed historical period alone makes the test
+    // adjustment handlers post into `OffsetDateTime::now_utc()`'s period (credit/debit-note
+    // `eff_date = OffsetDateTime::now_utc()`), so a fixed historical period alone makes the test
     // date-dependent (green only in that calendar month). ON CONFLICT dedups when
     // `now` already equals `s.period_id`.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{t}','{t}','{p}','UTC','OPEN'), ('{t}','{t}','{cur}','UTC','OPEN')
          ON CONFLICT DO NOTHING",
         t = s.tenant,
         p = s.period_id,
-        cur = chrono::Utc::now().format("%Y%m")
+        cur = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc())
     )))
     .await
     .unwrap();
@@ -452,7 +452,7 @@ async fn debit_note_against_unposted_invoice_is_note_invoice_not_found() {
     // F4 (design §4.3 / §5): a debit note MUST link an originating posted invoice.
     // No `INVOICE_POST` entry for the referenced invoice ⇒ `NOTE_INVOICE_NOT_FOUND`
     // (404), BEFORE any ledger effect — no orphan charge entry, no exposure row.
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -509,7 +509,7 @@ async fn debit_note_against_unposted_invoice_is_note_invoice_not_found() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn deferred_debit_note_books_ar_revenue_cl_and_builds_schedule() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -592,7 +592,7 @@ async fn deferred_debit_note_books_ar_revenue_cl_and_builds_schedule() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_raises_headroom_for_a_later_credit_note() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -676,7 +676,7 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fully_recognized_debit_note_books_no_contract_liability() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -736,7 +736,7 @@ async fn deferred_debit_note_extends_the_live_schedule_not_a_second() {
     // total_deferred grows, overlapping-period segments fold in, and there is still
     // exactly ONE schedule_id. Without the fix the note's SCHEDULE_BUILD claim
     // collided with the base build → replay → skip, and its 600 deferred was lost.
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -802,7 +802,7 @@ async fn deferred_debit_note_extends_the_live_schedule_not_a_second() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_for_closed_payer_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
