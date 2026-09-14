@@ -44,6 +44,13 @@ use crate::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for resource groups.
+///
+/// Groups have a canonical GTS policy type, but they are not RG membership
+/// resources: group nesting is modeled through `resource_group.parent_id` and
+/// `resource_group_closure`, never through `resource_group_membership` rows.
+/// This descriptor therefore does not opt in to native group predicates, and
+/// production RG wiring also advertises no group capabilities. A PDP must
+/// expand group scopes to explicit `in` predicates on `id`, or deny.
 pub const RG_GROUP_RESOURCE: ResourceType = ResourceType::from_static(
     GROUP_RESOURCE_TYPE,
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],

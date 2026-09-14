@@ -197,7 +197,7 @@ WHERE owner_tenant_id IN ('T1')
 **`cond.rs`** (3 planned unit tests): InGroup subquery condition, InGroupSubtree nested subquery, tenant + InGroup AND condition
 
 **`tenant_filtering_db_test.rs`** (2 planned DB tests):
-- `group_based_in_group_predicate_produces_combined_scope` — mock AuthZ with InGroup + tenant → correct AccessScope with 2 filters
+- `group_based_in_group_predicate_against_groups_fails_closed` — mock AuthZ with InGroup + tenant against `RG_GROUP_RESOURCE` → typed unadvertised-capability compile error (the enforcer has table-level group capability, but the group resource does not opt in to membership predicates, so the capability is suppressed and an unsolicited native predicate is rejected fail-closed)
 - `group_based_membership_data_correctly_stored` — full S14 data: ProjectA/B, task memberships, verify isolation
 
 ### What remains for production use
