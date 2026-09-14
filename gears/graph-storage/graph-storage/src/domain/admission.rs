@@ -127,6 +127,27 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
     Ok(())
 }
 
+/// The page bound on the type catalogue.
+///
+/// Every other paged read is bounded and this one was not: a caller could ask
+/// for the whole catalogue in one response, which is a tenant's entire
+/// ontology in one allocation. Bounded by the same page size the projection
+/// uses, since it is the same question asked of a different collection.
+pub fn admit_type_query(
+    cfg: &GraphStorageConfig,
+    query: &graph_storage_sdk::models::TypeQuery,
+) -> Result<(), DomainError> {
+    if let Some(top) = query.top
+        && (top == 0 || top > cfg.projection_max_page)
+    {
+        return Err(exceeded(format!(
+            "limit {top} is outside 1..={}",
+            cfg.projection_max_page
+        )));
+    }
+    Ok(())
+}
+
 pub fn admit_traverse(
     cfg: &GraphStorageConfig,
     request: &TraverseRequest,

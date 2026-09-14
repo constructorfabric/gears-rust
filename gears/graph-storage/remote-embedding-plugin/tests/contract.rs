@@ -277,3 +277,59 @@ async fn an_empty_input_still_gets_its_own_vector() {
         "the endpoint never sees an empty string"
     );
 }
+
+/// A gateway having a bad second does not cost an ingest batch its vectors.
+///
+/// One 503 used to drop the whole chunk, and the nodes in it stayed
+/// unembedded until something touched them again — a quiet loss of recall
+/// rather than a visible failure. The endpoint here refuses twice and then
+/// answers; the provider must come back with vectors.
+#[tokio::test]
+async fn a_transient_refusal_is_retried_within_the_budget() {
+    let server = MockServer::start().await;
+    // Two refusals, then the real answer. wiremock serves mounts in order and
+    // `up_to_n_times` retires one after its quota, so this is a script rather
+    // than a race.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(HashingEndpoint {
+            drop_last: false,
+            force_width: None,
+        })
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server, |_| {});
+    let response = provider
+        .embed(request(&["a", "b"]))
+        .await
+        .expect("the third attempt answers");
+    assert_eq!(response.vectors.len(), 2);
+}
+
+/// Retries are bounded, and a refusal that outlives them is reported.
+#[tokio::test]
+async fn a_persistent_refusal_gives_up_and_says_so() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server, |config| config.max_retries = 1);
+    let error = provider
+        .embed(request(&["a"]))
+        .await
+        .err()
+        .expect("a persistently unwell endpoint fails the batch");
+    assert!(
+        matches!(error, EmbeddingProviderError::Unavailable { .. }),
+        "{error}"
+    );
+    // Two requests: the attempt and its one retry.
+    assert_eq!(server.received_requests().await.map(|r| r.len()), Some(2));
+}

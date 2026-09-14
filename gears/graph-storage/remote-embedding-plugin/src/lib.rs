@@ -69,6 +69,15 @@ pub struct RemoteProviderConfig {
     pub batch_size: usize,
     /// Per-request timeout. The caller's budget shortens it, never lengthens.
     pub timeout: Duration,
+    /// How many times a chunk is re-sent after a *transient* refusal — a
+    /// rate limit or a gateway that is briefly unwell.
+    ///
+    /// One 503 otherwise drops a whole ingest batch's vectors, and the nodes
+    /// stay unembedded until something touches them again. Zero turns retries
+    /// off. The caller's remaining budget is the real ceiling: a retry that
+    /// would start after the deadline is not attempted, so this can never
+    /// make a request outlive the request that asked for it.
+    pub max_retries: u32,
 }
 
 impl RemoteProviderConfig {
@@ -85,6 +94,7 @@ impl RemoteProviderConfig {
             normalize: true,
             batch_size: 64,
             timeout: Duration::from_mins(1),
+            max_retries: 2,
         }
     }
 
@@ -101,6 +111,12 @@ impl RemoteProviderConfig {
 pub enum RemoteConfigError {
     #[error("base_url {0:?} is not an absolute http(s) URL")]
     BaseUrl(String),
+    #[error(
+        "base_url carries credentials in its userinfo; put the key in the environment variable \
+         `embedding_remote_api_key_env` names instead, where it is not part of a URL that gets \
+         logged, echoed in an error, or copied into a bug report"
+    )]
+    CredentialsInUrl,
     #[error("model must not be empty")]
     Model,
     #[error("dimension must be positive")]
@@ -142,6 +158,13 @@ impl RemoteEmbeddingProvider {
             .ok()
             .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
             .ok_or_else(|| RemoteConfigError::BaseUrl(config.base_url.clone()))?;
+        // `https://user:key@host/v1` parses, and the userinfo then rides on
+        // the endpoint this provider hands out and prints. A credential
+        // belongs in the environment variable the configuration names, which
+        // is the one place this plugin already reads one from.
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err(RemoteConfigError::CredentialsInUrl);
+        }
         if config.model.trim().is_empty() {
             return Err(RemoteConfigError::Model);
         }
@@ -194,10 +217,15 @@ impl RemoteEmbeddingProvider {
 
 /// `host[:port]/path` — what distinguishes one endpoint from another.
 fn endpoint_name(endpoint: &Url) -> String {
+    // The scheme is part of the identity, not decoration: `http://host/v1`
+    // and `https://host/v1` are different endpoints, and without it a
+    // downgrade or a routing change that keeps the host and path would reuse
+    // vectors from what is, as far as this gear can tell, another provider.
+    let scheme = endpoint.scheme();
     let host = endpoint.host_str().unwrap_or("unknown-host");
     match endpoint.port() {
-        Some(port) => format!("{host}:{port}{}", endpoint.path()),
-        None => format!("{host}{}", endpoint.path()),
+        Some(port) => format!("{scheme}://{host}:{port}{}", endpoint.path()),
+        None => format!("{scheme}://{host}{}", endpoint.path()),
     }
 }
 
@@ -250,11 +278,7 @@ impl EmbeddingProviderV1 for RemoteEmbeddingProvider {
             if remaining.is_zero() {
                 return Err(EmbeddingProviderError::Deadline);
             }
-            let call = self.embed_chunk(chunk, remaining.min(self.config.timeout));
-            let batch = tokio::select! {
-                () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
-                result = call => result?,
-            };
+            let batch = self.embed_chunk_with_retries(chunk, &req).await?;
             vectors.extend(batch);
         }
 
@@ -277,6 +301,65 @@ impl EmbeddingProviderV1 for RemoteEmbeddingProvider {
 }
 
 impl RemoteEmbeddingProvider {
+    /// One chunk, re-sent while the refusal is transient and the budget has
+    /// room for another attempt.
+    ///
+    /// Without this a single 503 or rate limit drops the vectors of a whole
+    /// ingest batch, and those nodes stay unembedded until something touches
+    /// them again — a quiet loss of recall rather than a visible failure.
+    /// Only the refusals a retry can fix are retried, and the caller's
+    /// remaining budget bounds the whole sequence: an attempt that would
+    /// start after the deadline is not made, so a retry can never make a
+    /// request outlive the one that asked for it.
+    async fn embed_chunk_with_retries(
+        &self,
+        chunk: &[String],
+        req: &EmbedRequest,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
+        let mut backoff = Duration::from_millis(200);
+        for attempt in 0..=self.config.max_retries {
+            let remaining = req.budget.remaining();
+            if remaining.is_zero() {
+                return Err(EmbeddingProviderError::Deadline);
+            }
+            let call = self.embed_chunk(chunk, remaining.min(self.config.timeout));
+            let outcome = tokio::select! {
+                () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
+                result = call => result,
+            };
+            let error = match outcome {
+                Ok(vectors) => return Ok(vectors),
+                Err(error) => error,
+            };
+            // A credential the endpoint refuses, a malformed answer or a
+            // width that does not match are not going to be different next
+            // time; a deadline is the caller's, not the endpoint's.
+            if attempt == self.config.max_retries || !is_transient(&error) {
+                return Err(error);
+            }
+            let wait = backoff.min(req.budget.remaining());
+            if wait.is_zero() {
+                return Err(error);
+            }
+            warn!(
+                endpoint = %endpoint_name(&self.endpoint),
+                attempt = attempt + 1,
+                wait_ms = wait.as_millis(),
+                "the embeddings endpoint answered transiently; retrying"
+            );
+            tokio::select! {
+                () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
+                () = tokio::time::sleep(wait) => {}
+            }
+            backoff = backoff.saturating_mul(2);
+        }
+        // `0..=max_retries` always runs at least once, so this is unreachable
+        // — stated rather than `unwrap`ped.
+        Err(EmbeddingProviderError::Internal(
+            "the retry loop ended without an attempt".to_owned(),
+        ))
+    }
+
     /// One request for one chunk, aligned to the inputs by the response's
     /// `index` field.
     async fn embed_chunk(
@@ -401,6 +484,18 @@ impl RemoteEmbeddingProvider {
 /// A credential problem and a capacity problem are both "not now, and not
 /// because of the input": the caller cannot repair either by changing the
 /// batch, and neither says anything about the space.
+/// Whether another attempt could plausibly answer differently.
+///
+/// `Unavailable` is the endpoint saying "not now" — a rate limit, a gateway,
+/// a connection that did not open. Everything else is either the caller's
+/// (a deadline, a cancellation) or a disagreement no repetition resolves (a
+/// refused credential is reported as unavailable by this provider, and is the
+/// one case a retry cannot fix — but retrying it a couple of times costs two
+/// requests and keeps the classification simple, which is the trade taken).
+fn is_transient(error: &EmbeddingProviderError) -> bool {
+    matches!(error, EmbeddingProviderError::Unavailable { .. })
+}
+
 fn classify_status(status: reqwest::StatusCode) -> EmbeddingProviderError {
     match status.as_u16() {
         401 | 403 => EmbeddingProviderError::Unavailable {
@@ -493,6 +588,48 @@ mod tests {
         assert_ne!(hash(&base), hash(&other_model));
         assert_ne!(hash(&base), hash(&other_host));
         assert_ne!(hash(&base), hash(&narrow));
+    }
+
+    /// A credential in the URL is refused, not carried.
+    ///
+    /// `https://user:key@host/v1` parses and the userinfo then rides on the
+    /// endpoint this provider hands out and prints — into logs, error
+    /// messages and bug reports. The key belongs in the environment variable
+    /// the configuration already names.
+    #[test]
+    fn a_base_url_carrying_credentials_is_refused() {
+        for url in [
+            "https://user:secret@embeddings.test/v1",
+            "https://tokenonly@embeddings.test/v1",
+        ] {
+            let error = RemoteEmbeddingProvider::new(RemoteProviderConfig::new(url, "m"))
+                .err()
+                .expect("a URL with userinfo is refused");
+            assert!(
+                matches!(error, RemoteConfigError::CredentialsInUrl),
+                "{url}: {error}"
+            );
+        }
+        // The same host without them is fine.
+        let ok = provider("https://embeddings.test/v1", "m");
+        assert_eq!(ok.endpoint().username(), "");
+    }
+
+    /// Two endpoints that differ only by transport are two endpoints.
+    ///
+    /// The identity is what decides whether stored vectors may be ranked
+    /// against a new query. Without the scheme, a downgrade to `http` — or a
+    /// routing change that keeps host and path — would silently reuse vectors
+    /// from what is, as far as this gear can tell, a different provider.
+    #[test]
+    fn the_transport_is_part_of_the_identity() {
+        let secure = provider("https://embeddings.test/v1", "m");
+        let plain = provider("http://embeddings.test/v1", "m");
+        assert_ne!(
+            secure.embedding_space().identity_hash,
+            plain.embedding_space().identity_hash,
+            "http and https must not share an embedding space"
+        );
     }
 
     #[test]

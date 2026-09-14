@@ -18,9 +18,14 @@
 #     -t pg19-pgvector:latest gears/graph-storage/docker
 #   GEARS_TEST_PG_GRAPH_IMAGE=pg19-pgvector:latest make test-graph-storage-pg
 #
-# The pgvector revision is pinned: a lane whose extension moves underneath it
-# is a lane whose failures nobody can date.
-FROM postgres:19beta3 AS build
+# Both the extension and the base are pinned. The tag is a beta label Docker
+# Hub can move at any time, and a base that changes between the build stage
+# and the runtime stage — or between two CI runs — gives a `vector.so`
+# compiled against one set of server headers and loaded into another. A lane
+# whose server moves underneath it is a lane whose failures nobody can date.
+# Refresh with: docker buildx imagetools inspect postgres:19beta3
+ARG PG_BASE=postgres:19beta3@sha256:a48b19841e04b35b72a25e9a94314ac80546d32b5e2e3cd9279390cbd8a99572
+FROM ${PG_BASE} AS build
 ARG PGVECTOR_REF=5219575
 RUN set -eux; \
     apt-get update; \
@@ -35,6 +40,6 @@ RUN set -eux; \
 # The runtime image is the official one plus the built extension: the
 # entrypoint, the initdb behaviour and the server arguments are all the stock
 # ones, which is what `test-containers` drives.
-FROM postgres:19beta3
+FROM ${PG_BASE}
 COPY --from=build /usr/share/postgresql/19/extension/vector* /usr/share/postgresql/19/extension/
 COPY --from=build /usr/lib/postgresql/19/lib/vector.so /usr/lib/postgresql/19/lib/

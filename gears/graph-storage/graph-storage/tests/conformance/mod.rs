@@ -3161,31 +3161,42 @@ pub async fn scope_replacement_preserves_analysis_edges_and_their_endpoints(
 /// as stale; if the lower lands first, the higher one's removal takes what it
 /// wrote. Either way the scope ends up holding exactly one snapshot — never
 /// both — and the recorded generation is the higher one.
-pub async fn two_replacements_of_one_scope_serialize(store: &dyn GraphStoreV1, tenant: Uuid) {
+pub async fn two_replacements_of_one_scope_serialize(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
     let scope = AccessScope::for_tenant(tenant);
     let reader = ctx(tenant, &scope, None);
-    let lower = ctx(tenant, &scope, None);
-    let higher = ctx(tenant, &scope, None);
     store
         .register_types(&reader, ontology_batch())
         .await
         .expect("the ontology registers");
-    let (first, second) = tokio::join!(
-        ingest_batch(
-            store,
-            &higher,
-            batch_replacing(
-                vec![scoped_node("from-higher", "acme/infra")],
-                Vec::new(),
-                2
-            ),
-        ),
-        ingest_batch(
-            store,
-            &lower,
-            batch_replacing(vec![scoped_node("from-lower", "acme/infra")], Vec::new(), 1),
-        ),
-    );
+
+    // Two *tasks*, not two futures joined on one. `tokio::join!` polls both on
+    // the same task, so whatever runtime flavour the test asks for, one of
+    // them can run its whole fence-check-and-write path before the other is
+    // polled at all — which is the sequential case, and the sequential case
+    // passes whether the fence is a lock or three unguarded statements. Two
+    // spawned tasks on a multi-threaded runtime can genuinely be inside the
+    // store at once; the barrier holds them until both are ready to enter, so
+    // they start together rather than one ingest after another.
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let replace = |generation: i64, key: &'static str| {
+        let store = std::sync::Arc::clone(&store);
+        let gate = std::sync::Arc::clone(&gate);
+        tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = ctx(tenant, &scope, None);
+            let request =
+                batch_replacing(vec![scoped_node(key, "acme/infra")], Vec::new(), generation);
+            gate.wait().await;
+            ingest_batch(store.as_ref(), &ctx, request).await
+        })
+    };
+    let higher_task = replace(2, "from-higher");
+    let lower_task = replace(1, "from-lower");
+    let first = higher_task.await.expect("the task does not panic");
+    let second = lower_task.await.expect("the task does not panic");
 
     assert!(
         first.is_ok(),
@@ -3213,7 +3224,7 @@ pub async fn two_replacements_of_one_scope_serialize(store: &dyn GraphStoreV1, t
     // And the fence records the higher generation, so a replay of the lower
     // one is refused from now on.
     let error = ingest_batch(
-        store,
+        store.as_ref(),
         &reader,
         batch_replacing(vec![scoped_node("from-lower", "acme/infra")], Vec::new(), 1),
     )

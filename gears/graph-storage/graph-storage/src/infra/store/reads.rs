@@ -597,6 +597,20 @@ async fn project_over_payload(
                 "the cursor was minted under a different $filter".to_owned(),
             ));
         }
+        // And under the same *ordering*. A keyset cursor carries one value
+        // per ordering term, and the statement compares them positionally
+        // against the terms of the current plan — so a cursor minted under
+        // `$orderby=name` and replayed under `$orderby=payload/score` of the
+        // same arity would compare a score against a name. The filter hash
+        // does not catch it: the filter can be identical while the ordering
+        // is not. Neither half of the pair is optional, which is why this is
+        // checked rather than clamped: there is no page the caller could
+        // sensibly be given.
+        if cursor.s != sql::signed_tokens(&plan) {
+            return Err(invalid(
+                "the cursor was minted under a different $orderby".to_owned(),
+            ));
+        }
     }
 
     let mut statement = select;

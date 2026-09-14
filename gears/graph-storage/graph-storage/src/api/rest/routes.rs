@@ -115,6 +115,11 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("kind", false, "node / edge / attribute")
         .query_param("pattern", false, "GTS identifier pattern")
         .query_param_typed("limit", false, "Maximum rows", "integer")
+        .query_param(
+            "cursor",
+            false,
+            "Continuation token from a previous page's `next_cursor`",
+        )
         .handler(handlers::list_types)
         .json_response_with_schema::<dto::GraphTypeListDto>(
             openapi,
@@ -445,8 +450,11 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             http::StatusCode::OK,
             "Per-capability readiness",
         )
-        .error_500(openapi)
-        .error_503(openapi)
+        // No error responses: this route answers 200 whatever the state, and
+        // advertising 500 or 503 would have a generated client handle
+        // failures it can never receive — the opposite of what the readiness
+        // matrix promises, which is that the health endpoints answer
+        // precisely when other things are down.
         .register(router, openapi);
 
     OperationBuilder::get(format!("{BASE}/revision"))

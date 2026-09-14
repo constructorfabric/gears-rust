@@ -16,6 +16,41 @@ use crate::models::{
 };
 
 /// Object-safe client for in-process consumption by other gears (version 1).
+///
+/// # Errors
+///
+/// Every method returns the same `CanonicalError` taxonomy the REST surface
+/// renders (DESIGN § Error Model), and the same category for the same
+/// failure, because both adapters call one service. Documented once here
+/// rather than per method: the vocabulary is the contract, and repeating it
+/// twelve times would let the copies drift.
+///
+/// - `invalid_argument` — a malformed request, a per-item schema violation
+///   (`SCHEMA_VIOLATION`, addressed by JSON pointer), a request the gear
+///   cannot interpret (`INVALID_ARGUMENT`), or two bounds that cannot hold at
+///   once (`LIMIT_COMBINATION`).
+/// - `out_of_range` (`LIMIT_EXCEEDED`) — a value outside a documented hard
+///   range: batch size, depth, page size, an oversized key or query.
+/// - `not_found` — the row is absent *or* the caller may not see it. The two
+///   are indistinguishable by contract (anti-enumeration), so a client must
+///   not read absence as permission to create.
+/// - `permission_denied` (`SOURCE_NAMESPACE_FORBIDDEN`) — the one denial that
+///   names itself, because the caller wrote under a source namespace another
+///   producer owns, and that owner is a fact about the tenant rather than
+///   about them.
+/// - `aborted` — `CAS_CONFLICT` (a same-key type change, a stale
+///   `expected_version`, a scope owned by another producer),
+///   `SERIALIZATION`, or `IDEMPOTENCY_MISMATCH`. Re-read and retry.
+/// - `failed_precondition` — `STALE_GENERATION`, `IDEMPOTENCY_KEY_EXPIRED`,
+///   `SCOPE_UNSERVABLE`, `EMBEDDING_SPACE_MISMATCH`. Not retryable unchanged.
+/// - `unavailable` — a dependency is down: the PDP, the database, the
+///   embedding provider. Retry later.
+/// - `deadline_exceeded`, `cancelled` — the operation ran out of the budget
+///   it started with, or the caller went away.
+/// - `unimplemented` — a capability the selected engine or store does not
+///   provide (traversal on an engine without it, labels, topology).
+/// - `unknown`, `data_loss` — an unexpected internal failure, or detected
+///   corruption. Escalate rather than retry.
 #[async_trait]
 pub trait GraphStorageClientV1: Send + Sync {
     // --- ontology ---------------------------------------------------------

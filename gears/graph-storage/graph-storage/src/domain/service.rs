@@ -420,6 +420,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::READ)
             .await?;
+        admission::admit_type_query(&self.config, &query)?;
         Ok(self
             .store
             .list_types(&self.store_ctx(&auth, None), query)

@@ -69,3 +69,52 @@ pub async fn scope_for(
         .await
         .map_err(|error| map_enforcer_err(&error))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three PDP outcomes must not be swapped, and this is the whole of
+    /// what separates them.
+    ///
+    /// A denial that reported as an outage would tell a caller to retry
+    /// something they will never be allowed to do, and would page an operator
+    /// for a working system. An outage that reported as a denial is worse:
+    /// the authorization resolver being unreachable would read, to every
+    /// caller and every dashboard, as "you may not", and a fail-closed
+    /// decision would be indistinguishable from a policy one. Neither is
+    /// visible in a passing integration test, because both answer *some*
+    /// error.
+    #[test]
+    fn a_denial_and_an_outage_are_not_the_same_answer() {
+        let denied = map_enforcer_err(&EnforcerError::Denied { deny_reason: None });
+        assert!(
+            matches!(denied, DomainError::AccessDenied),
+            "a denial is a denial: {denied:?}"
+        );
+
+        // A scope the PDP returned but the gear cannot compile is also a
+        // refusal, deliberately: serving it would mean serving a scope nobody
+        // authorized. Fail closed, never wider.
+        let uncompilable = map_enforcer_err(&EnforcerError::CompileFailed(
+            authz_resolver_sdk::pep::ConstraintCompileError::AllConstraintsFailed {
+                reason: "unrepresentable constraint".to_owned(),
+            },
+        ));
+        assert!(
+            matches!(uncompilable, DomainError::AccessDenied),
+            "a scope that cannot be compiled fails closed: {uncompilable:?}"
+        );
+
+        // An evaluation failure is the resolver itself being unavailable. It
+        // is *not* a grant and *not* a denial: it is an outage, and it has to
+        // reach the caller as one so a retry is the right reaction.
+        let outage = map_enforcer_err(&EnforcerError::EvaluationFailed(
+            toolkit_canonical_errors::CanonicalError::internal("connection refused").create(),
+        ));
+        assert!(
+            matches!(outage, DomainError::Unavailable { .. }),
+            "an unreachable PDP is an outage, not a decision: {outage:?}"
+        );
+    }
+}

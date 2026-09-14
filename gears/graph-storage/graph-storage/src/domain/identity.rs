@@ -33,6 +33,14 @@ pub fn derive_edge_key(type_uuid: Uuid, edge: &EdgeSpec) -> String {
 /// Reference-node key, derived from the full source-qualified canonical
 /// identity `(system, kind, native_id)` — a native id alone is not
 /// collision-safe (ADR-0002).
+///
+/// The two leading members act as delimiters, so they may not contain the
+/// delimiter themselves: `("a:b", "c", "d")` and `("a", "b:c", "d")` would
+/// otherwise both derive `a:b:c:d` and two distinct upstream objects would
+/// converge on one node — silently, since each producer's key matches its own
+/// triple. [`reference_key_complaint`] refuses that at the door. The *native
+/// id* is free to contain colons: everything after the second one is it, so
+/// URLs and URNs keep working, which is what a native id often is.
 #[must_use]
 pub fn reference_node_key(system: &str, kind: &str, native_id: &str) -> String {
     format!("{system}:{kind}:{native_id}")
@@ -53,6 +61,15 @@ pub fn reference_key_complaint(node_key: &str, payload: Option<&Value>) -> Optio
     let (system, kind, native_id) = (member("system"), member("kind"), member("native_id"));
     if system.is_empty() || kind.is_empty() || native_id.is_empty() {
         return None;
+    }
+    for (member, value) in [("system", system), ("kind", kind)] {
+        if value.contains(':') {
+            return Some(format!(
+                "`source.{member}` may not contain `:`; it is the separator the reference key is \
+                 derived with, and a colon there makes two different source triples derive one \
+                 key (`native_id` may contain them freely)"
+            ));
+        }
     }
     let expected = reference_node_key(system, kind, native_id);
     (node_key != expected).then(|| {
@@ -122,6 +139,41 @@ pub fn ingest_request_hash(request: &IngestRequest) -> String {
 mod tests {
     use super::*;
     use graph_storage_sdk::models::NodeSpec;
+
+    /// Two different source triples must not derive one key.
+    ///
+    /// The edge key length-prefixes every part for exactly this reason; the
+    /// reference key is a readable `system:kind:native_id` instead, so the
+    /// two members that act as separators may not contain the separator.
+    /// `native_id` may: everything after the second colon is it, and a native
+    /// id is often a URL.
+    #[test]
+    fn a_source_triple_cannot_borrow_the_key_separator() {
+        let node = |system: &str, kind: &str, native: &str| serde_json::json!({ "source": { "system": system, "kind": kind, "native_id": native } });
+
+        // The collision the rule exists to prevent: both of these would
+        // derive `a:b:c:d`, and each producer's key matches its own triple.
+        let first = node("a:b", "c", "d");
+        let second = node("a", "b:c", "d");
+        assert_eq!(
+            reference_node_key("a:b", "c", "d"),
+            reference_node_key("a", "b:c", "d"),
+            "the fixture is the collision, or this test asserts nothing"
+        );
+        for payload in [&first, &second] {
+            let complaint = reference_key_complaint("a:b:c:d", Some(payload))
+                .expect("a separator inside the leading members is refused");
+            assert!(complaint.contains("may not contain"), "{complaint}");
+        }
+
+        // A native id may carry them, which is what a URL or a URN needs.
+        let url = node("scm", "commit", "https://example.test/r/commit/abc");
+        assert!(
+            reference_key_complaint("scm:commit:https://example.test/r/commit/abc", Some(&url))
+                .is_none(),
+            "a native id may contain colons"
+        );
+    }
 
     #[test]
     fn edge_keys_do_not_collide_across_field_boundaries() {
