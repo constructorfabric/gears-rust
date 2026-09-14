@@ -1389,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn build_internal_authenticator_builds_shared_secret() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
         let auth = build_internal_authenticator(Some(&cfg)).await.unwrap();
@@ -1436,7 +1436,7 @@ mod tests {
         let api = ApiGateway::new(config);
 
         let auth = build_internal_authenticator(Some(&InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         }))
         .await
@@ -1482,7 +1482,7 @@ mod tests {
             ..Default::default()
         };
         let internal = InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
         let result = ApiGateway::connect_directory(&cfg, Some(&internal)).await;

@@ -102,63 +102,6 @@ pub mod pep_properties {
     pub const OWNER_ID: &str = "owner_id";
 }
 
-/// Well-known resource-group table and column names for subquery construction.
-///
-/// Used by the `SecureORM` condition builder to translate `InGroup`/`InGroupSubtree`
-/// scope filters into SQL subqueries without depending on entity types.
-///
-/// **Note:** These tables are canonical to the RG gear's database.
-/// `resource_group_membership` is not projected to domain services.
-/// `InGroup`/`InGroupSubtree` predicates are only executable within the RG gear.
-pub mod rg_tables {
-    /// Membership table (RG-internal, not projected to domain services).
-    pub const MEMBERSHIP_TABLE: &str = "resource_group_membership";
-    /// Column in membership table: the resource's external ID.
-    pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
-    /// Column in membership table: the group the resource belongs to.
-    pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
-
-    /// Closure table for group hierarchy.
-    pub const CLOSURE_TABLE: &str = "resource_group_closure";
-    /// Column in closure table: the ancestor group.
-    pub const CLOSURE_ANCESTOR_ID: &str = "ancestor_id";
-    /// Column in closure table: the descendant group.
-    pub const CLOSURE_DESCENDANT_ID: &str = "descendant_id";
-}
-
-/// Well-known tenant-closure table and column names for subquery construction.
-///
-/// Used by the `SecureORM` condition builder to translate `InTenantSubtree`
-/// scope filters into SQL subqueries without depending on entity types.
-///
-/// **Note:** This table is canonical to the Account Management gear's
-/// database. `InTenantSubtree` predicates are only executable in gears
-/// that share the AM database (or replicate `tenant_closure` from it).
-///
-/// Nothing here can verify these names still match that schema: the migrations
-/// that create `tenant_closure` live in a gear that depends on this crate, so a
-/// rename on the migration side is a runtime failure rather than a build one.
-/// The assertion belongs with the migration that owns the table.
-pub mod tenant_tables {
-    /// Closure table for tenant hierarchy.
-    pub const CLOSURE_TABLE: &str = "tenant_closure";
-    /// Column in closure table: the ancestor tenant.
-    pub const CLOSURE_ANCESTOR_ID: &str = "ancestor_id";
-    /// Column in closure table: the descendant tenant.
-    pub const CLOSURE_DESCENDANT_ID: &str = "descendant_id";
-    /// Column in closure table: barrier flag.
-    ///
-    /// AM materializes `barrier = 1` on every closure row whose strict path
-    /// `(ancestor, descendant]` crosses a self-managed tenant. Subtree
-    /// queries that should stop at delegation boundaries clamp the
-    /// subquery with `AND barrier = 0`.
-    pub const CLOSURE_BARRIER: &str = "barrier";
-    /// Column in closure table: status of the descendant tenant (SMALLINT,
-    /// canonically `{1 = active, 2 = suspended, 3 = deleted}` — see
-    /// `tenant_resolver_sdk::TenantStatus::as_smallint`).
-    pub const CLOSURE_DESCENDANT_STATUS: &str = "descendant_status";
-}
-
 /// A single scope filter — a typed predicate on a named resource property.
 ///
 /// The property name (e.g., `"owner_tenant_id"`, `"id"`) is an authorization
@@ -925,12 +868,24 @@ impl AccessScope {
     /// **Reports on the constraint list only**, so an allow-all scope answers
     /// `false` despite permitting the value. Use [`AccessScope::allows_value`]
     /// for an authorization decision.
+    ///
+    /// A UUID matches whichever representation the scope carries. `ScopeValue`
+    /// admits the same id as either [`ScopeValue::Uuid`] or a
+    /// [`ScopeValue::String`] holding its text, and those two are not equal
+    /// under `PartialEq` — so a plain equality check answered `false` here for
+    /// an id that [`AccessScope::contains_uuid`], which parses through
+    /// [`ScopeValue::as_uuid`], answered `true` for. One identity, one answer.
     #[must_use]
     pub fn contains_value(&self, property: &str, value: &ScopeValue) -> bool {
+        // Resolve once, outside the scan.
+        let as_uuid = value.as_uuid();
         self.constraints.iter().any(|c| {
-            c.filters()
-                .iter()
-                .any(|f| f.property() == property && f.values().contains(value))
+            c.filters().iter().any(|f| {
+                f.property() == property
+                    && f.values().iter().any(|v| {
+                        v == value || (as_uuid.is_some() && v.as_uuid() == as_uuid)
+                    })
+            })
         })
     }
 
@@ -1230,6 +1185,55 @@ mod tests {
                 "a subquery filter's empty value view is not a negative"
             );
         }
+    }
+
+    #[test]
+    fn contains_value_and_contains_uuid_agree_on_a_uuid_held_as_a_string() {
+        // The same id can sit in a scope as either variant, and they are not
+        // equal under `PartialEq` -- so the two predicates used to disagree
+        // about whether the scope contains it.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            ScopeValue::String(uid(T1).to_string()),
+        )]));
+
+        assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(
+            scope.contains_value(
+                pep_properties::OWNER_TENANT_ID,
+                &ScopeValue::Uuid(uid(T1))
+            ),
+            "a UUID must match the scope's string rendering of the same id"
+        );
+
+        // And the reverse: a scope holding the typed variant, queried by text.
+        let typed = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            uid(T1),
+        )]));
+        assert!(typed.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::String(uid(T1).to_string())
+        ));
+
+        // A different id still does not match, in either direction.
+        assert!(!typed.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::String(uid(T2).to_string())
+        ));
+    }
+
+    #[test]
+    fn contains_value_still_distinguishes_non_uuid_values() {
+        // The UUID equivalence must not blur values that are not UUIDs.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            "status",
+            ScopeValue::String("active".to_owned()),
+        )]));
+
+        assert!(scope.contains_value("status", &ScopeValue::String("active".to_owned())));
+        assert!(!scope.contains_value("status", &ScopeValue::String("suspended".to_owned())));
+        assert!(!scope.contains_value("status", &ScopeValue::Int(1)));
     }
 
     #[test]
@@ -1664,13 +1668,10 @@ mod tests {
     }
 
     // `tenant_tables_constants_are_stable` used to live here, comparing each
-    // constant to the literal it is defined as a few hundred lines above. That
-    // can only fail if someone edits one and forgets the other, which is not
-    // the risk: the risk is these names drifting from the `tenant_closure`
-    // schema they mirror. That schema is owned by the account-management gear,
-    // which depends on this crate, so the assertion cannot be made from here
-    // without a dependency cycle -- it belongs to the migration that owns the
-    // table. See the `tenant_tables` module documentation.
+    // constant to the literal it was defined as a few hundred lines above --
+    // which can only fail if someone edits one and forgets the other. The
+    // constants themselves have since moved to `toolkit-db`, next to the code
+    // that emits SQL against those tables.
 
     // --- contains_uuid string matching ---
 

@@ -1,10 +1,9 @@
 use sea_orm::sea_query::{Alias, Query, SelectStatement};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, IdenStatic, sea_query::Expr};
 
+use crate::secure::schema::{rg_tables, tenant_tables};
 use crate::secure::{AccessScope, ScopableEntity, ScopeError};
-use toolkit_security::access_scope::{
-    ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
-};
+use toolkit_security::access_scope::{ScopeConstraint, ScopeFilter, ScopeValue};
 
 /// How a resolved column is written into SQL.
 ///
