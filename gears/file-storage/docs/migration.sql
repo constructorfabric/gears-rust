@@ -426,6 +426,14 @@ CREATE TABLE file_storage.audit_outbox (
                                                    -- 'finalize_version' | 'retention_delete' | 'backend_migrate' |
                                                    -- 'orphan_reconcile' | 'transfer_ownership'
                                                    -- (exhaustive: see `AuditOperation::as_str`, src/domain/audit.rs)
+                                                   -- Deliberately NOT CHECK-constrained, unlike the closed
+                                                   -- domains above (owner_kind, hash_mode, file_versions.status,
+                                                   -- multipart_uploads.state) — and the executable migrations
+                                                   -- leave it unconstrained too. This is an append-only journal
+                                                   -- written solely by the gear from a Rust enum, so the values
+                                                   -- are already closed at the type level, while the set grows
+                                                   -- with every new audited operation: a CHECK would force a
+                                                   -- schema migration per added variant for no added safety.
     outcome         text         NOT NULL,        -- 'success' | 'failure'
     detail          jsonb        NOT NULL,        -- arbitrary structured detail
     occurred_at     timestamptz  NOT NULL  DEFAULT now(),
@@ -459,6 +467,9 @@ CREATE TABLE file_storage.events_outbox (
                                                    -- 'file.deleted'
                                                    -- (exhaustive: see every `make_file_event`/`FileEvent{...}`
                                                    -- call site under src/domain/service/ and src/domain/cleanup.rs)
+                                                   -- Deliberately NOT CHECK-constrained, for the same reason as
+                                                   -- `audit_outbox.operation` above: gear-written append-only
+                                                   -- journal, closed at the type level, open-ended over time.
     payload         jsonb        NOT NULL,
     occurred_at     timestamptz  NOT NULL  DEFAULT now(),
     published_at    timestamptz
