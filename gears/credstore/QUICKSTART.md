@@ -91,8 +91,9 @@ The examples in this section describe a **proposed** direction — [ADR-0004](do
 and [ADR-0005](docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) —
 and are **not implemented**. Nothing below will work against the server today;
 the current surface is `/credstore/v1/secrets…`, shown above. Under the
-proposed model a credential record and its secret value become separate
-resources, addressed under `/credstore/v1/credentials…`.
+proposed model a credential and its optional value share one item shape,
+addressed under `/credstore/v1/credentials…`; the value is a `$select`able
+field of that same item, not a separate resource.
 
 > **Creating a credential is one request:** `PUT .../credentials/{ref}` with
 > `If-None-Match: *` carries the record and its value together, written
@@ -126,14 +127,15 @@ curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" 
 # → 200, body has no "value" field; response carries an ETag header
 ```
 
-**Read the secret value** — demonstrates the value read moved to its own
-sub-resource address, distinct from the record; the body carries the value
-with its type and expiry only, and the record's `ETag` in the header.
-Requires the `read_secret` PDP action.
+**Read the secret value** — demonstrates reading the value by naming it in
+`$select` on the point read; there is no separate sub-resource address. The
+body carries only the fields selected — here the value with its type and
+expiry — and the record's `ETag` in the header. Requires the `read_secret`
+PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key?\$select=reference,type,expires_at,value" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -202,14 +204,14 @@ curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-open
 ```
 
 **Bulk read secret values, explicit selector** — demonstrates the bounded,
-non-paginated bulk value read: selecting `secret` on the collection switches
-it into value mode, scoped here by an explicit `reference in (...)` list.
-Requires `read_secret`, evaluated per item; `limit`/`cursor` are rejected;
-cap 25.
+non-paginated bulk value read: naming `value` in `$select` on the collection
+switches it into value mode, scoped here by an explicit `reference in (...)`
+list. Requires `read_secret`, evaluated per item; `limit`/`cursor` are
+rejected; cap 25.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key','webhook-signing')&\$select=reference,type,expires_at,secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key','webhook-signing')&\$select=reference,type,value" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -220,6 +222,26 @@ still per-item authorized. Requires `read_secret`, evaluated per item;
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=type+eq+'<gts id>'&\$select=reference,type,expires_at,secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=type+eq+'<gts id>'&\$select=reference,type,value" \
   -H "Authorization: Bearer $TOKEN"
+```
+
+**Suppress an inherited credential you do not own** — demonstrates blocking
+a partner's shared credential in one request, without ever holding a value
+of your own: a create-only `PUT` whose `value` is an explicit `null`
+creates the record directly in the value-less `declared` state with
+`fallback: none` — no backend call is made, since there is no value to
+write. Requires only the `write` PDP action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H 'If-None-Match: *' \
+  -i \
+  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "fallback": "none", "value": null}'
+
+# 201 Created
+# { "reference": "partner-openai-key", "status": "declared", "inheritance": "suppressed", … }
 ```
