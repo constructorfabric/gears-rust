@@ -218,6 +218,15 @@ CREATE UNIQUE INDEX file_versions_version_id_unique_idx
 -- hash_value = sha256(manifest) was derived from. No row for a
 -- 'whole-sha256' version.
 
+-- Rollback note: the migration's `down()` drops this table (and the unique
+-- index it added) while deliberately leaving `hash_mode`/`part_count` and the
+-- presence CHECK in place. Dropping it is lossy in a way the columns are not:
+-- the manifest is the only thing a composite version's `hash_value` can be
+-- re-derived from, so every such version becomes unverifiable. A rollback is
+-- therefore safe only before the first completion of a plan with two or more
+-- parts; past that point, unwinding this in production needs a dedicated
+-- forward migration rather than `down()`.
+
 CREATE TABLE file_storage.version_hash_manifest (
     version_id  uuid         NOT NULL  PRIMARY KEY
                              REFERENCES file_storage.file_versions (version_id) ON DELETE CASCADE,
