@@ -184,10 +184,11 @@ CREATE TABLE file_storage.file_versions (
 COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
--- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL.
+-- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL; a composite row always has >= 2 parts (a one-part plan degenerates to whole-sha256).
 ALTER TABLE file_storage.file_versions
     ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
+               AND (part_count IS NULL OR part_count >= 2));
 
 -- At most one current version per file.
 CREATE UNIQUE INDEX file_versions_current_idx

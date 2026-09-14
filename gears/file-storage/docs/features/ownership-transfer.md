@@ -112,11 +112,16 @@ owner changed but no audit trail exists for it, or vice versa.
   deltas are reported for the old and new owner; the caller receives the
   updated `File` representation, reflecting the new owner and bumped
   `last_modified_at` — both the `File` row and its custom metadata are
-  captured **before** the transfer and the known post-transfer field changes
-  applied locally, rather than re-read from the DB afterward, since an
-  owner-constrained `AccessScope` captured before the swap would no longer
-  match the row under its new owner and a successful transfer would otherwise
-  incorrectly surface as `404`
+  **re-read after the commit**, under the tenant-only scope used for the
+  initial prefetch (not the authz `AccessScope`, which may be owner-constrained
+  and would no longer match the row under its new owner, incorrectly surfacing
+  a successful transfer as `404`). The re-read means the response also
+  reflects any concurrent metadata write that landed between the prefetch and
+  the commit, rather than echoing a stale `meta_version`/`content_id`/custom
+  metadata. If the row has disappeared by the time of the re-read (a
+  concurrent delete racing the already-committed transfer), the response
+  falls back to the pre-transfer row with the owner fields patched in, since
+  the transfer itself is already committed and a `404` for it would be wrong
 
 **Error Scenarios**:
 - `new_owner_id` is the nil UUID — `400` (`Validation`, field `new_owner_id`)
@@ -132,15 +137,13 @@ owner changed but no audit trail exists for it, or vice versa.
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/transfer with body {new_owner_kind, new_owner_id} - `inst-transfer-request`
 2. [x] - `p1` - API: reject `new_owner_id == Uuid::nil()` with `400` before touching the DB (**the only target-owner validation implemented — see the §1.2 caveat**) - `inst-transfer-nil-check`
 3. [x] - `p1` - API: parse `new_owner_kind`; reject anything other than `"user"`/`"app"` with `400` - `inst-transfer-kind-parse`
-4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant; authorize `WRITE` on `file_id` - `inst-transfer-authz`
-5. [x] - `p1` - Control plane: capture the file's custom metadata **before** the transfer, so a caller who loses read access under the new owner still receives accurate metadata in the response - `inst-transfer-capture-meta`
-
-   The `File` row itself is already held from step 4's prefetch; it is *not* re-read after the commit — the response is built by applying the known post-transfer field changes (`owner_kind`, `owner_id`, `last_modified_at`) to that pre-transfer row, avoiding a post-commit re-read under a now-stale, potentially owner-constrained `AccessScope`.
-6. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
-7. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
-8. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
-9. [x] - `p1` - Compute the file's total available-version bytes; fire (fire-and-forget) a usage-delta debit for the old owner and a credit for the new owner using `cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance` - `inst-transfer-usage-rebalance`
-10. [x] - `p1` - RETURN `200` with the updated `File` (+ the pre-captured metadata) - `inst-transfer-return`
+4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant (`prefetch`); authorize `WRITE` on `file_id`, yielding the (possibly owner-constrained) authz `AccessScope` - `inst-transfer-authz`
+5. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
+6. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
+7. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
+8. [x] - `p1` - Compute the file's total available-version bytes; fire (fire-and-forget) a usage-delta debit for the old owner and a credit for the new owner using `cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance` - `inst-transfer-usage-rebalance`
+9. [x] - `p1` - Control plane, now that the swap has committed: re-read the `File` row under the tenant-only `prefetch` scope from step 4 (**not** the authz `AccessScope` from that step, which may be owner-constrained and would no longer match the row under its new owner, falsely surfacing `404` for an already-committed transfer) and re-read the custom metadata, so the response reflects the committed state — including any concurrent metadata write that landed between the prefetch and the commit. **IF** the row has disappeared by the time of this re-read (a concurrent delete racing the already-committed transfer): fall back to the pre-transfer row with `owner_kind`/`owner_id`/`last_modified_at` patched in, since the transfer already committed and a `404` for it would be wrong - `inst-transfer-post-commit-read`
+10. [x] - `p1` - RETURN `200` with the re-read `File` and custom metadata (or the step 9 fallback, if the row raced a concurrent delete) - `inst-transfer-return`
 
 ## 3. Processes / Business Logic (CDSL)
 

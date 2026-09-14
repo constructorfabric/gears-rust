@@ -208,7 +208,9 @@ independently-computed reference `root`.
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-content-hash-modes-schema`
 
 The system **MUST** add `hash_mode` (`'whole-sha256'` | `'multipart-composite-sha256'`, default `'whole-sha256'`) and
-`part_count` (`NOT NULL` only for the multipart mode) to `file_versions`, plus a new `version_hash_manifest` table
+`part_count` (`NOT NULL`, and `>= 2`, only for the multipart mode — a one-part multipart plan degenerates to
+`whole-sha256` instead, so a composite row never carries fewer than 2 parts) to `file_versions`, plus a new
+`version_hash_manifest` table
 (`version_id` PK/FK into `file_versions`, `manifest text NOT NULL`, `created_at`). Existing rows backfill to
 `hash_mode = 'whole-sha256'`, `part_count = NULL`, no `version_hash_manifest` row — correct, since every extant row
 is a P1 single-part SHA-256 upload requiring no re-hash. The existing `hash_algorithm` CHECK
@@ -708,9 +710,10 @@ part count; **`hash_algorithm`'s CHECK is unchanged** — it stays locked to
 ALTER TABLE file_versions
     ADD COLUMN hash_mode  text NOT NULL DEFAULT 'whole-sha256'
         CHECK (hash_mode IN ('whole-sha256', 'multipart-composite-sha256')),
-    ADD COLUMN part_count integer,  -- NOT NULL only for hash_mode = 'multipart-composite-sha256'
+    ADD COLUMN part_count integer,  -- NOT NULL, and >= 2, only for hash_mode = 'multipart-composite-sha256'
     ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
+               AND (part_count IS NULL OR part_count >= 2));
     -- hash_algorithm CHECK (hash_algorithm = 'SHA-256') is NOT touched — both
     -- modes use SHA-256 as the only underlying primitive; there is nothing
     -- to widen.
