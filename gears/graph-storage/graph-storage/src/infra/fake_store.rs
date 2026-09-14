@@ -278,6 +278,16 @@ impl GraphStoreV1 for FakeGraphStore {
         batch: Vec<TypeRegistration>,
         options: TypeRegistrationOptions,
     ) -> Result<Vec<RegisteredType>, GraphStoreError> {
+        if let Some(duplicate) =
+            ontology::duplicate_type_id(batch.iter().map(|r| r.type_id.as_str()))
+        {
+            return Err(GraphStoreError::InvalidQuery {
+                what: format!(
+                    "`{duplicate}` is registered twice in one batch; a batch is one act and \
+                     cannot name a type twice"
+                ),
+            });
+        }
         let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let tenant = tenants.entry(ctx.tenant).or_default();
 
@@ -521,37 +531,7 @@ impl GraphStoreV1 for FakeGraphStore {
                 },
             });
         };
-        // Keyset paging over the identifier, as the built-in store does: the
-        // map is ordered, so "after this identifier" is a range.
-        let limit = query.top.map_or(usize::MAX, |top| top as usize);
-        let mut page: Vec<TypeRecord> = tenant
-            .types
-            .values()
-            .filter(|record| {
-                query
-                    .cursor
-                    .as_ref()
-                    .is_none_or(|cursor| &record.type_id > cursor)
-            })
-            .filter(|record| query.kind.is_none_or(|kind| kind == record.kind))
-            .take(limit.saturating_add(1))
-            .cloned()
-            .collect();
-        let has_more = page.len() > limit;
-        page.truncate(limit);
-        // Minted before the pattern filter, as in the built-in store.
-        let next_cursor = has_more
-            .then(|| page.last().map(|record| record.type_id.clone()))
-            .flatten();
-        let items = page
-            .into_iter()
-            .filter(|record| {
-                query.pattern.as_ref().is_none_or(|pattern| {
-                    ontology::matches_any_pattern(&record.type_id, std::slice::from_ref(pattern))
-                        .unwrap_or(false)
-                })
-            })
-            .collect();
+        let (items, next_cursor) = catalogue_page(tenant, &query);
         Ok(Page {
             items,
             next_cursor,
@@ -732,44 +712,18 @@ impl GraphStoreV1 for FakeGraphStore {
         // drawn about it survives the re-import of the thing it was drawn
         // about.
         if let Some(replace) = &req.replace_scope {
-            let written: BTreeSet<&str> = req
-                .nodes
-                .iter()
-                .map(|spec| spec.node_key.as_str())
-                .collect();
-            let dropped: Vec<i64> = nodes
-                .iter()
-                .filter(|node| {
-                    !node.deleted
-                        && managed_node_types.contains(&node.type_id)
-                        && !written.contains(node.key.as_str())
-                        && node
-                            .payload
-                            .as_ref()
-                            .and_then(|payload| payload.get(&replace.attribute))
-                            .and_then(serde_json::Value::as_str)
-                            == Some(replace.value.as_str())
-                })
-                .map(|node| node.id)
-                .collect();
-            if !dropped.is_empty() {
-                let before = edges.len();
-                edges.retain(|edge| {
-                    !(static_edge_types.contains(&edge.type_id)
-                        && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
-                });
-                tally.counts.scope_removed_edges = (before - edges.len()) as u64;
-
-                let referenced: BTreeSet<i64> =
-                    edges.iter().flat_map(|edge| [edge.src, edge.dst]).collect();
-                let before = nodes.len();
-                nodes.retain(|node| !dropped.contains(&node.id) || referenced.contains(&node.id));
-                tally.counts.scope_removed_nodes = (before - nodes.len()) as u64;
-                changed |=
-                    tally.counts.scope_removed_nodes > 0 || tally.counts.scope_removed_edges > 0;
-            }
+            changed |= replace_scope(
+                ScopeReplacement {
+                    nodes: &mut nodes,
+                    edges: &mut edges,
+                    managed_node_types: &managed_node_types,
+                    static_edge_types: &static_edge_types,
+                },
+                &req,
+                replace,
+                &mut tally,
+            );
         }
-
         tenant.nodes = nodes;
         tenant.edges = edges;
         self.next_id
@@ -2399,6 +2353,118 @@ fn apply_edge(
     };
     changed |= state.tally.edge(&outcome);
     Ok(changed)
+}
+
+/// The working copies a scope replacement rewrites, and the types that decide
+/// what it may touch.
+struct ScopeReplacement<'a> {
+    nodes: &'a mut Vec<FakeNode>,
+    edges: &'a mut Vec<FakeEdge>,
+    managed_node_types: &'a BTreeSet<String>,
+    static_edge_types: &'a BTreeSet<String>,
+}
+
+/// Remove the scope's static content that the batch no longer names.
+///
+/// Static edges first, then only those nodes nothing references any more — a
+/// node a *live* analysis edge still points at stays, because the conclusion
+/// drawn about it survives the re-import of the thing it was drawn about.
+/// Returns whether anything was removed.
+fn replace_scope(
+    working: ScopeReplacement<'_>,
+    req: &IngestRequest,
+    replace: &graph_storage_sdk::models::ReplaceScope,
+    tally: &mut IngestTally,
+) -> bool {
+    let ScopeReplacement {
+        nodes,
+        edges,
+        managed_node_types,
+        static_edge_types,
+    } = working;
+    let written: BTreeSet<&str> = req
+        .nodes
+        .iter()
+        .map(|spec| spec.node_key.as_str())
+        .collect();
+    let dropped: Vec<i64> = nodes
+        .iter()
+        .filter(|node| {
+            !node.deleted
+                && managed_node_types.contains(&node.type_id)
+                && !written.contains(node.key.as_str())
+                && node
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get(&replace.attribute))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(replace.value.as_str())
+        })
+        .map(|node| node.id)
+        .collect();
+    if dropped.is_empty() {
+        return false;
+    }
+
+    let before = edges.len();
+    edges.retain(|edge| {
+        !(static_edge_types.contains(&edge.type_id)
+            && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
+    });
+    tally.counts.scope_removed_edges = (before - edges.len()) as u64;
+
+    // A tombstoned edge is a deleted conclusion and must not keep a departing
+    // node alive on its behalf; left in place it would make the scope stop
+    // converging, permanently. Purged with the node, as the built-in store
+    // purges it.
+    edges.retain(|edge| {
+        !(edge.deleted && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
+    });
+
+    let referenced: BTreeSet<i64> = edges.iter().flat_map(|edge| [edge.src, edge.dst]).collect();
+    let before = nodes.len();
+    nodes.retain(|node| !dropped.contains(&node.id) || referenced.contains(&node.id));
+    tally.counts.scope_removed_nodes = (before - nodes.len()) as u64;
+    tally.counts.scope_removed_nodes > 0 || tally.counts.scope_removed_edges > 0
+}
+
+/// One page of the type catalogue, as the built-in store builds it.
+///
+/// Keyset over the identifier — the map is ordered, so "after this
+/// identifier" is a range — and the page is *filled* rather than cut: the GTS
+/// pattern is matched here rather than in a query, so a slice can lose every
+/// row to it, and a page that came back empty with a continuation token is a
+/// page every client stops at.
+fn catalogue_page(tenant: &Tenant, query: &TypeQuery) -> (Vec<TypeRecord>, Option<String>) {
+    let limit = query.top.map_or(usize::MAX, |top| top as usize);
+    let mut items: Vec<TypeRecord> = Vec::new();
+    let mut next_cursor = None;
+    let mut walked = tenant
+        .types
+        .values()
+        .filter(|record| {
+            query
+                .cursor
+                .as_ref()
+                .is_none_or(|cursor| &record.type_id > cursor)
+        })
+        .filter(|record| query.kind.is_none_or(|kind| kind == record.kind))
+        .peekable();
+    while let Some(record) = walked.next() {
+        let admitted = query.pattern.as_ref().is_none_or(|pattern| {
+            ontology::matches_any_pattern(&record.type_id, std::slice::from_ref(pattern))
+                .unwrap_or(false)
+        });
+        if admitted {
+            items.push(record.clone());
+            if items.len() >= limit {
+                // A cursor only when something follows it.
+                next_cursor = walked.peek().map(|_| record.type_id.clone());
+                break;
+            }
+        }
+    }
+    (items, next_cursor)
 }
 
 /// A single-page envelope: the fake never paginates, so neither cursor is set.

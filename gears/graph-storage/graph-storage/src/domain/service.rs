@@ -217,8 +217,20 @@ impl GraphServices {
         store: &dyn GraphStoreV1,
         batch: Vec<TypeRegistration>,
     ) -> Result<Vec<TypeRegistration>, DomainError> {
+        // A base schema the caller sent itself is already in the batch, and
+        // prepending it too would make the gear hand the store the same
+        // identifier twice — one act naming a type twice, which the store
+        // refuses. Producers that mirror the base ontology do send them, and
+        // so does the conformance suite.
+        let carried: std::collections::BTreeSet<&str> = batch
+            .iter()
+            .map(|registration| registration.type_id.as_str())
+            .collect();
         let mut prefix: Vec<TypeRegistration> = Vec::new();
         for (type_id, raw) in ontology::BASE_SCHEMAS {
+            if carried.contains(type_id) {
+                continue;
+            }
             if store.get_type(store_ctx, &type_id.to_owned()).await.is_ok() {
                 continue;
             }
@@ -261,8 +273,12 @@ impl GraphServices {
 
         let mut rows = self.store.probe_readiness().await;
 
-        // The provider answers for itself; a provider that cannot say it is
-        // healthy degrades the paths that need it and nothing else.
+        // The provider answers for itself, from what the last real exchange
+        // showed rather than from a probe of its own: this endpoint is
+        // anonymous and polled on a schedule, and asking a remote provider
+        // costs the deployment a billable inference request every time.
+        // A provider that cannot say it is healthy degrades the paths that
+        // need it and nothing else.
         match self.embedding.health().await {
             Ok(()) => rows.push(Row::healthy(EMBEDDING_PROVIDER)),
             Err(error) => rows.push(Row::new(
@@ -947,9 +963,27 @@ impl GraphServices {
             true
         });
 
+        // An edge whose endpoint the filter removed goes with it. The
+        // filter's whole purpose is that those nodes are not part of the
+        // answer, and an edge naming one both dangles — a caller drawing the
+        // result has a line to nothing — and says the node exists, which for
+        // the phantom toggle is precisely what the caller asked not to be
+        // told. Same rule as the edge read: an edge is a statement about two
+        // nodes, and it is returned when both are visible.
+        let surviving: std::collections::BTreeSet<&str> =
+            nodes.iter().map(|view| view.node_key.as_str()).collect();
+        let edges: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| {
+                surviving.contains(edge.src.as_str()) && surviving.contains(edge.dst.as_str())
+            })
+            .cloned()
+            .collect();
+
         Ok(TraversalResponse {
             nodes,
-            edges: result.edges,
+            edges,
             seeds: admitted,
             truncated: result.truncated,
             revision: snapshot.revision,

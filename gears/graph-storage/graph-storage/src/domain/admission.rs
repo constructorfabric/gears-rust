@@ -33,6 +33,41 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
             cfg.ingest_max_edges
         )));
     }
+    // The two caller-controlled strings a node carries outside its payload.
+    // Bounding the payload and not these leaves the cheapest oversized field
+    // unbounded: `node_key` and `name` are indexed columns, and every read of
+    // the row carries them back to every consumer.
+    for (index, node) in request.nodes.iter().enumerate() {
+        for (what, value) in [("node_key", &node.node_key)]
+            .into_iter()
+            .chain(node.name.as_ref().map(|name| ("name", name)))
+        {
+            if value.len() > cfg.identifier_max_bytes as usize {
+                return Err(exceeded(format!(
+                    "node[{index}] {what} is {} bytes; identifier_max_bytes is {}",
+                    value.len(),
+                    cfg.identifier_max_bytes
+                )));
+            }
+        }
+    }
+    for (index, edge) in request.edges.iter().enumerate() {
+        for (what, value) in [
+            ("src_node_key", &edge.src_node_key),
+            ("dst_node_key", &edge.dst_node_key),
+        ]
+        .into_iter()
+        .chain(edge.discriminator.as_ref().map(|d| ("discriminator", d)))
+        {
+            if value.len() > cfg.identifier_max_bytes as usize {
+                return Err(exceeded(format!(
+                    "edge[{index}] {what} is {} bytes; identifier_max_bytes is {}",
+                    value.len(),
+                    cfg.identifier_max_bytes
+                )));
+            }
+        }
+    }
     for (index, node) in request.nodes.iter().enumerate() {
         if let Some(payload) = &node.payload {
             let bytes = serde_json::to_vec(payload).map_or(usize::MAX, |v| v.len());
@@ -79,6 +114,15 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
         return Err(DomainError::limit_combination(
             "this search mode requires `query`",
         ));
+    }
+    if let Some(query) = &request.query
+        && query.len() > cfg.search_query_max_bytes as usize
+    {
+        return Err(exceeded(format!(
+            "query is {} bytes; search_query_max_bytes is {}",
+            query.len(),
+            cfg.search_query_max_bytes
+        )));
     }
     Ok(())
 }

@@ -95,6 +95,11 @@ jobs:
             onnx_embedding:
               - 'gears/graph-storage/onnx-embedding-plugin/**'
               - 'gears/graph-storage/graph-storage-sdk/**'
+              # This lane also runs `cargo check -p cf-gears-graph-storage
+              # --features onnx`, which compiles the core gear's own
+              # `#[cfg(feature = "onnx")]` wiring. A change there that breaks
+              # it would otherwise reach main unbuilt.
+              - 'gears/graph-storage/graph-storage/**'
             graph_storage:
               - 'gears/graph-storage/**'
             dylint:
@@ -619,7 +624,13 @@ jobs:
       # margin. Codecov merges uploads per commit, so sending this job's report
       # as well is what makes the repository's own number true for this gear
       # rather than an artefact of which lane happened to run.
+      # `if: always()` because the step above both writes the report and
+      # enforces the floor: a run that falls below 85% exits non-zero, and
+      # without this the report it just wrote — the one that shows *where* the
+      # coverage went — would never be uploaded. The job still fails; the
+      # evidence arrives anyway.
       - name: Upload to Codecov
+        if: always()
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           use_oidc: ${{ github.event_name != 'pull_request' }}

@@ -91,6 +91,17 @@ pub struct GraphStorageConfig {
     pub ingest_max_nodes: u32,
     pub ingest_max_edges: u32,
     pub payload_max_bytes: u32,
+    /// Ceiling on a producer-supplied `node_key` and on a node's `name`.
+    ///
+    /// Both are caller-controlled, both are stored in indexed columns, and
+    /// both are echoed back by every surface that returns the node — so an
+    /// oversized one is paid for on every later read of that row, by every
+    /// consumer, not only by the request that wrote it.
+    pub identifier_max_bytes: u32,
+    /// Ceiling on a search query's text. The lexical arm parses it and the
+    /// vector arm embeds it; neither is work a caller should be able to ask
+    /// for in unbounded quantity.
+    pub search_query_max_bytes: u32,
     pub item_max_bytes: u32,
     pub node_read_max_adjacency: u32,
     pub traversal_max_depth: u8,
@@ -159,6 +170,8 @@ impl Default for GraphStorageConfig {
             ingest_max_nodes: 10_000,
             ingest_max_edges: 20_000,
             payload_max_bytes: 64 * 1024,
+            identifier_max_bytes: 2 * 1024,
+            search_query_max_bytes: 8 * 1024,
             item_max_bytes: 256 * 1024,
             node_read_max_adjacency: 100,
             traversal_max_depth: 5,
@@ -201,6 +214,7 @@ impl GraphStorageConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errors: Vec<String> = Vec::new();
         self.check_embedding_ranges(&mut errors);
+        self.check_write_ranges(&mut errors);
         self.check_graph_ranges(&mut errors);
         if errors.is_empty() {
             Ok(())
@@ -220,12 +234,18 @@ impl GraphStorageConfig {
         check_range!(errors, self, embedding_remote_timeout_secs, 1u64, 600u64);
     }
 
-    /// Every bound on what one request may ask of the graph.
-    fn check_graph_ranges(&self, errors: &mut Vec<String>) {
+    /// What one request may ask the graph to write.
+    fn check_write_ranges(&self, errors: &mut Vec<String>) {
         check_range!(errors, self, ingest_max_nodes, 1u32, 50_000u32);
         check_range!(errors, self, ingest_max_edges, 1u32, 100_000u32);
         check_range!(errors, self, payload_max_bytes, 1_024u32, 1_048_576u32);
+        check_range!(errors, self, identifier_max_bytes, 64u32, 65_536u32);
+        check_range!(errors, self, search_query_max_bytes, 64u32, 1_048_576u32);
         check_range!(errors, self, item_max_bytes, 4_096u32, 4_194_304u32);
+    }
+
+    /// What one request may ask the graph to read.
+    fn check_graph_ranges(&self, errors: &mut Vec<String>) {
         check_range!(errors, self, node_read_max_adjacency, 1u32, 1_000u32);
         check_range!(errors, self, traversal_max_depth, 1u8, 8u8);
         check_range!(errors, self, traversal_max_nodes, 1u32, 10_000u32);

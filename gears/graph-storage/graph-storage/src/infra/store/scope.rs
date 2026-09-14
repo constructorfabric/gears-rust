@@ -160,6 +160,36 @@ pub(crate) async fn remove_stale(
             .rows_affected
     };
 
+    // A tombstoned edge is a deleted conclusion, and it must not keep a node
+    // alive on behalf of one. Left in place it does exactly that: the row is
+    // still there, so the endpoint foreign key still refuses to let the node
+    // go, and no later replacement can ever clean it up — the scope stops
+    // converging, quietly and permanently.
+    //
+    // So the tombstoned edges of a departing node are purged with it. That is
+    // narrower than it sounds: only edges incident to a node this replacement
+    // has already decided to remove, and only ones somebody deleted earlier.
+    // A *live* analysis edge still keeps its endpoint, which is the rule this
+    // whole predicate exists to enforce. (Adding `deleted_at IS NULL` to the
+    // reference query instead — the obvious reading — would leave the row
+    // behind and have the foreign key refuse the delete, turning a silent
+    // leak into a failed transaction.)
+    edge::Entity::delete_many()
+        .filter(
+            Condition::all()
+                .add(edge::Column::DeletedAt.is_not_null())
+                .add(
+                    Condition::any()
+                        .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
+                        .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
+                ),
+        )
+        .secure()
+        .scope_with(scope)
+        .exec(tx)
+        .await
+        .map_err(map_scope_err)?;
+
     // Then the nodes that nothing references any more. A node still carrying
     // an analysis edge stays: removing it would destroy the provenance the
     // edge holds, and the `ON DELETE RESTRICT` foreign key would refuse it in

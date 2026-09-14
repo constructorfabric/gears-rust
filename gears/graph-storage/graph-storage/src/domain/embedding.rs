@@ -10,7 +10,8 @@
 //! declares does, which is what finally makes that trait load-bearing rather
 //! than decorative.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
 use graph_storage_sdk::models::{EmbeddingSpaceId, NodeSpec, RemainingBudget, TypeRecord};
@@ -38,7 +39,34 @@ pub struct EmbeddingCoordinator {
     state: SpaceState,
     /// Ceiling on the bytes of composed text handed to the provider.
     input_max_bytes: usize,
+    /// What is known about the provider's health, and when it was learned.
+    ///
+    /// Readiness is anonymous and probed on a schedule — Kubernetes defaults
+    /// to every ten seconds — while `health()` on a remote provider is a real
+    /// inference request the deployment pays for. Asking the provider once per
+    /// probe therefore turns an unauthenticated endpoint into a cost
+    /// amplifier: anyone who can reach the port spends the deployment's
+    /// money, as fast as they can poll.
+    ///
+    /// So health is *observed* rather than polled. Every real embedding call
+    /// records its outcome here, and readiness answers from that when it is
+    /// recent enough. Only when nothing has been observed within the window
+    /// does readiness ask the provider, and then at most once per window
+    /// however many probes arrive.
+    observed: Mutex<Option<Observation>>,
 }
+
+/// One outcome of talking to the provider, and when.
+#[derive(Clone)]
+struct Observation {
+    at: Instant,
+    failure: Option<String>,
+}
+
+/// How long an observation answers for. Long enough that a probe schedule
+/// cannot drive provider traffic, short enough that a recovery or an outage
+/// shows up in readiness within a probe or two.
+const HEALTH_WINDOW: Duration = Duration::from_secs(30);
 
 impl EmbeddingCoordinator {
     #[must_use]
@@ -51,6 +79,7 @@ impl EmbeddingCoordinator {
             provider,
             state,
             input_max_bytes: input_max_bytes as usize,
+            observed: Mutex::new(None),
         }
     }
 
@@ -67,13 +96,41 @@ impl EmbeddingCoordinator {
     /// The epoch new vectors are stamped with, if any may be written.
     /// Whether the provider can answer at all.
     ///
-    /// Asked by readiness, and asked of the provider rather than inferred
-    /// from the last failure: a provider that recovered between requests is
-    /// healthy, and one that has never been called is not assumed to be.
-    pub async fn health(
-        &self,
-    ) -> Result<(), graph_storage_sdk::plugin_api::EmbeddingProviderError> {
-        self.provider.health().await
+    /// Answered from the last real exchange with the provider when that is
+    /// within [`HEALTH_WINDOW`], and by asking the provider otherwise — at
+    /// most once per window, because the caller is an anonymous probe and the
+    /// question costs money to ask (see `observed`).
+    pub async fn health(&self) -> Result<(), String> {
+        if let Some(fresh) = self.recent_observation() {
+            return fresh.failure.map_or(Ok(()), Err);
+        }
+        let outcome = self
+            .provider
+            .health()
+            .await
+            .map_err(|error| error.to_string());
+        self.record(outcome.as_ref().err().cloned());
+        outcome
+    }
+
+    /// The last observation, if it still speaks for now.
+    fn recent_observation(&self) -> Option<Observation> {
+        let guard = self.observed.lock().ok()?;
+        guard
+            .as_ref()
+            .filter(|seen| seen.at.elapsed() < HEALTH_WINDOW)
+            .cloned()
+    }
+
+    /// Remember how the provider just answered. Called on every real
+    /// exchange, so a busy deployment never probes at all.
+    fn record(&self, failure: Option<String>) {
+        if let Ok(mut guard) = self.observed.lock() {
+            *guard = Some(Observation {
+                at: Instant::now(),
+                failure,
+            });
+        }
     }
 
     #[must_use]
@@ -212,15 +269,18 @@ impl EmbeddingCoordinator {
             return Ok(Vec::new());
         }
         let declared = self.provider.dimension() as usize;
-        let response = self
+        let answered = self
             .provider
             .embed(EmbedRequest {
                 inputs,
                 budget,
                 cancel,
             })
-            .await
-            .map_err(provider_failure)?;
+            .await;
+        // Every real exchange is evidence about the provider, which is what
+        // readiness reports instead of paying for a probe of its own.
+        self.record(answered.as_ref().err().map(ToString::to_string));
+        let response = answered.map_err(provider_failure)?;
 
         // The contract says a provider fails rather than returning a short
         // answer, and this is the gear's own check that it did: a silent
@@ -590,6 +650,7 @@ mod tests {
     struct CountingProvider {
         inner: crate::infra::embedding::fake::FakeEmbeddingProvider,
         inputs: std::sync::Mutex<Vec<Vec<String>>>,
+        health_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingProvider {
@@ -597,11 +658,16 @@ mod tests {
             Self {
                 inner: crate::infra::embedding::fake::FakeEmbeddingProvider::new(8),
                 inputs: std::sync::Mutex::new(Vec::new()),
+                health_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
             self.inputs.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+
+        fn health_calls(&self) -> usize {
+            self.health_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -626,8 +692,60 @@ mod tests {
         }
 
         async fn health(&self) -> Result<(), EmbeddingProviderError> {
+            self.health_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// Readiness must not spend money, however often it is asked.
+    ///
+    /// `GET /health/ready` is anonymous and polled on a schedule, while
+    /// `health()` on a remote provider is a real inference request the
+    /// deployment is billed for. Asking the provider per probe therefore
+    /// makes an unauthenticated endpoint into a cost amplifier — the faster
+    /// someone polls, the more it costs. So: one question per window at the
+    /// very most, and none at all while real traffic is answering the same
+    /// question for free.
+    #[tokio::test]
+    async fn readiness_does_not_pay_the_provider_for_every_probe() {
+        let provider = Arc::new(CountingProvider::new());
+        let coordinator = EmbeddingCoordinator::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProviderV1>,
+            SpaceState::Active { epoch: 1 },
+            8 * 1024,
+        );
+
+        // Nothing observed yet, so the first probe asks. The next hundred
+        // answer from that one.
+        for _ in 0..100 {
+            coordinator.health().await.expect("healthy");
+        }
+        assert_eq!(
+            provider.health_calls(),
+            1,
+            "a hundred probes must cost one question, not a hundred"
+        );
+
+        // A real embedding call is evidence about the same provider, so
+        // readiness has no reason to ask again.
+        let before = provider.health_calls();
+        coordinator
+            .embed_query(
+                "anything",
+                RemainingBudget::starting_now(Duration::from_secs(30)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the fake always embeds");
+        for _ in 0..10 {
+            coordinator.health().await.expect("healthy");
+        }
+        assert_eq!(
+            provider.health_calls(),
+            before,
+            "traffic already answered the question readiness was going to ask"
+        );
     }
 
     fn keyed(key: &str, name: &str) -> NodeSpec {

@@ -171,7 +171,23 @@ fn node_instance(model: &node::Model) -> serde_json::Value {
         "node_key": model.node_key,
         "type": serde_json::Value::Null,
     });
-    instance["name"] = serde_json::Value::String(model.name.clone());
+    // Ingest sets `name` only when the producer sent one, and the column is
+    // `NOT NULL DEFAULT ''`, so an absent name and an empty one are the same
+    // row. Presenting `""` unconditionally would show a *different document*
+    // to the validator than the one ingest admitted: a schema with a
+    // `minLength` on the name, or one that merely distinguishes absence,
+    // would refuse a row nobody could have written any other way. Treating
+    // the empty string as absence is the reading that matches ingest for
+    // every name a producer would actually send.
+    if !model.name.is_empty() {
+        instance["name"] = serde_json::Value::String(model.name.clone());
+    }
+    // `payload` is presented as stored, including the `{}` that ingest writes
+    // for a node sent without one. That is also not byte-for-byte what ingest
+    // validated, and it is left alone deliberately: it can only make a
+    // re-validation *stricter* than the write was, and a refusal that names
+    // the row is a far better failure for an admission decision than a
+    // permission granted on a document the store does not hold.
     instance["payload"] = model.payload.clone();
     instance
 }

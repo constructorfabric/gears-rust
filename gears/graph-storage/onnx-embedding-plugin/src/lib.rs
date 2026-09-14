@@ -295,11 +295,34 @@ impl EmbeddingProviderV1 for OnnxEmbeddingProvider {
         let encoded = self.encode(&req.inputs)?;
         let mut session = self.session.lock().await;
         // Checked again after the queue: a batch that waited out its deadline
-        // behind another one should not then spend CPU on it.
+        // -- or whose caller gave up -- behind another one should not then
+        // spend CPU on it.
         if req.budget.is_exhausted() {
             return Err(EmbeddingProviderError::Deadline);
         }
-        let vectors = self.run(&mut session, &encoded)?;
+        if req.cancel.is_cancelled() {
+            return Err(EmbeddingProviderError::Cancelled);
+        }
+        // `Session::run` is synchronous CPU work measured in tens to hundreds
+        // of milliseconds. Calling it directly would hold a Tokio worker
+        // thread for that long, starving every other task scheduled on it --
+        // in a gear whose other work is database round trips, that is the
+        // difference between a slow embedding and a stalled request.
+        //
+        // `block_in_place` rather than `spawn_blocking` because the session
+        // guard borrows `self`: moving it into a `'static` task would mean
+        // cloning the `Arc` and re-locking inside, which is the same work
+        // with more moving parts. It needs a multi-threaded runtime, which is
+        // what the gear runs on; a current-thread runtime (some tests) gets
+        // the direct call, which is correct there because there are no other
+        // tasks to starve.
+        let vectors = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(|| self.run(&mut session, &encoded))?
+        } else {
+            self.run(&mut session, &encoded)?
+        };
 
         Ok(EmbedResponse {
             vectors,
@@ -404,11 +427,25 @@ impl OnnxEmbeddingProvider {
                 "expected a [batch, tokens, hidden] output, got {out_shape:?}"
             )));
         }
-        let hidden = out_shape
-            .last()
-            .copied()
-            .and_then(|width| usize::try_from(width).ok())
-            .ok_or_else(|| internal(format!("the model reported a shape of {out_shape:?}")))?;
+        let dim = |axis: usize| {
+            out_shape
+                .get(axis)
+                .copied()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| internal(format!("the model reported a shape of {out_shape:?}")))
+        };
+        // Every axis, not only the last. `pool` walks the buffer with the
+        // *encoded* batch and token counts, so a model whose output disagrees
+        // with them on either axis would be read at the wrong offsets —
+        // panicking on a short buffer, and silently mixing rows on a long one.
+        // The width is checked below against what the deployment declared.
+        let (batch, tokens, hidden) = (dim(0)?, dim(1)?, dim(2)?);
+        if batch != encoded.rows || tokens != encoded.columns {
+            return Err(internal(format!(
+                "the model answered a [{batch}, {tokens}, _] batch for a [{}, {}, _] input",
+                encoded.rows, encoded.columns
+            )));
+        }
         // The declared width against the width the model actually emits.
         // A configuration that names one and loads another would write
         // vectors nothing can rank, and the column would refuse them anyway.

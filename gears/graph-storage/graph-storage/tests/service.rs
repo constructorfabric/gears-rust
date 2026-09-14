@@ -738,6 +738,78 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
     );
 }
 
+/// The strings a caller controls are bounded like everything else.
+///
+/// `payload_max_bytes` bounded the payload and nothing bounded `node_key` or
+/// `name`, which are the cheaper fields to abuse: both are stored in indexed
+/// columns and both come back on every later read of the row, so the cost of
+/// an oversized one is paid by every consumer for as long as the node lives.
+/// The same for a search query, which the lexical arm parses and the vector
+/// arm embeds.
+#[tokio::test]
+async fn the_caller_controlled_strings_are_bounded() {
+    let harness = Harness::allowed();
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let bound = harness.services.config().identifier_max_bytes as usize;
+    let long = "k".repeat(bound + 1);
+
+    let refused = harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node(&long, "fine")], vec![]),
+        )
+        .await
+        .expect_err("an oversized node_key is refused");
+    assert!(
+        matches!(refused, DomainError::LimitExceeded { .. }),
+        "expected a bound refusal, got {refused}"
+    );
+
+    let refused = harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("fine", &long)], vec![]),
+        )
+        .await
+        .expect_err("an oversized name is refused");
+    assert!(matches!(refused, DomainError::LimitExceeded { .. }));
+
+    let query = "q".repeat(harness.services.config().search_query_max_bytes as usize + 1);
+    let refused = harness
+        .services
+        .search(
+            &ctx,
+            SearchRequest {
+                mode: SearchMode::Lexical,
+                query: Some(query),
+                arm_limit: 10,
+                limit: 10,
+                type_patterns: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("an oversized query is refused");
+    assert!(matches!(refused, DomainError::LimitExceeded { .. }));
+
+    // And the ordinary sizes still pass, so the bound is a bound and not a
+    // wall.
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![conformance::node("ordinary", "an ordinary name")],
+                vec![],
+            ),
+        )
+        .await
+        .expect("an ordinary node commits");
+}
+
 /// A hub's neighbourhood keeps the structural core when the budget cuts it,
 /// not whichever leaves happened to be reached first.
 ///

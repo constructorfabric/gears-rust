@@ -1185,9 +1185,13 @@ node projection is an OData collection.
 
 Its `cursor` is an ordinary parameter for the same reason: the platform's
 `CursorV1` belongs to the OData binding, so the catalogue pages by keyset over
-the identifier it already orders by. The token is minted before the pattern
-filter runs — a page whose rows the pattern then removes is still a page, and a
-caller that stopped at an empty one would miss every match after it.
+the identifier it already orders by. The GTS pattern is matched in the gear
+rather than in the query — an identifier must never reach a `LIKE` — so a page
+is *filled* rather than cut: the scan continues past rows the pattern excludes
+until the page is full or the catalogue ends. Answering with an empty page and
+a continuation token would be a page nobody reads, since the convention every
+client follows is to stop when the items are empty. A cursor means only that
+more rows may follow, so a continuation may still come back short.
 
 **Found while building the prototype: `CursorV1` cannot be extended with the
 revision.** An earlier draft said continuation tokens were "the platform
@@ -2805,6 +2809,8 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Ingest batch: edges | `ingest_max_edges` | 20,000 | 1 – 100,000 | Admission |
 | REST request body | `rest_max_body_bytes` | 32 MiB | 1 – 128 MiB | REST edge |
 | Node payload size | `payload_max_bytes` | 64 KiB | 1 KiB – 1 MiB | Admission (ADR-0003 ceiling) |
+| Producer key or node name | `identifier_max_bytes` | 2 KiB | 64 B – 64 KiB | Admission, per node key, name, edge endpoint and discriminator |
+| Search query text | `search_query_max_bytes` | 8 KiB | 64 B – 1 MiB | Admission |
 | Node content size | `content_max_bytes` | 2 MiB | 64 KiB – 16 MiB | Admission |
 | Total size of one node or edge (envelope + name + payload + content) | `item_max_bytes` | 256 KiB | 4 KiB – 4 MiB | Admission, per item |
 | Adjacency returned on node read | `node_read_max_adjacency` | 100 | 1 – 1,000 | Admission |

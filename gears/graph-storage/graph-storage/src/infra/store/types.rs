@@ -301,6 +301,14 @@ async fn register_in_tx(
         scope,
         ref subject,
     } = actor;
+    if let Some(duplicate) = ontology::duplicate_type_id(batch.iter().map(|r| r.type_id.as_str())) {
+        return Err(GraphStoreError::InvalidQuery {
+            what: format!(
+                "`{duplicate}` is registered twice in one batch; a batch is one act and cannot \
+                 name a type twice"
+            ),
+        });
+    }
     let update = options.on_existing == OnExisting::Update;
     // A migration naming a type this batch does not carry would silently do
     // nothing, which is the worst possible answer to a typo.
@@ -897,60 +905,104 @@ pub async fn list_types(
     query: TypeQuery,
 ) -> Result<Page<TypeRecord>, GraphStoreError> {
     let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-    let mut select = gts_type::Entity::find()
-        .secure()
-        .scope_with(ctx.scope)
-        .order_by(gts_type::Column::GtsTypeId, sea_orm::Order::Asc);
-    if let Some(kind) = query.kind {
-        select = select.filter(Condition::all().add(gts_type::Column::Kind.eq(kind_to_str(kind))));
-    }
+    let limit = query.top.unwrap_or(store.config().projection_max_page) as usize;
+
     // Keyset paging on the ordering column. The catalogue is deliberately not
     // an `OData` collection (§ 3.3), so the token is not `CursorV1`: it is the
-    // last identifier of the page, which the caller has already been shown.
-    if let Some(cursor) = &query.cursor {
-        select =
-            select.filter(Condition::all().add(gts_type::Column::GtsTypeId.gt(cursor.clone())));
-    }
-    let limit = query.top.unwrap_or(store.config().projection_max_page);
-    // One row past the page, to know whether there is another one.
-    let mut models = select
-        .limit(u64::from(limit) + 1)
-        .all(&conn)
-        .await
-        .map_err(map_scope_err)?;
-    let has_more = models.len() > limit as usize;
-    models.truncate(limit as usize);
-    // Minted before the pattern filter runs: a page whose rows the pattern
-    // then removes is still a page, and a caller that stopped there would
-    // miss every match after it.
-    let next_cursor = has_more.then(|| models.last().map(|m| m.gts_type_id.clone()));
-
-    // The pattern is resolved through the platform GTS implementation, never
-    // compiled into SQL: no identifier ever reaches a LIKE pattern.
+    // last identifier the page reached, which the caller has already been
+    // shown.
+    //
+    // The page is *filled* rather than merely cut. The GTS pattern is matched
+    // in Rust — an identifier must never reach a `LIKE` — so a slice of rows
+    // can lose all of them to the filter, and returning that as an empty page
+    // with a continuation token would be a page nobody reads: the convention
+    // every client follows is to stop when `items` is empty, and it would
+    // then miss every match after the gap. So the scan continues until the
+    // page is full or the rows run out.
     let mut items = Vec::new();
-    for model in models {
-        if let Some(pattern) = &query.pattern {
-            let patterns = vec![pattern.clone()];
-            let matches =
-                ontology::matches_any_pattern(&model.gts_type_id, &patterns).map_err(|error| {
-                    GraphStoreError::LimitExceeded {
-                        what: error.to_string(),
-                    }
-                })?;
-            if !matches {
-                continue;
-            }
+    let mut after = query.cursor.clone();
+    let mut next_cursor = None;
+    // Bounded: each pass reads at least one row or ends the loop, and the
+    // pass count is capped so a pathological pattern cannot walk a huge
+    // catalogue inside one request.
+    for _ in 0..MAX_CATALOGUE_PASSES {
+        if items.len() >= limit {
+            break;
         }
-        items.push(to_record(model)?);
+        let mut select = gts_type::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .order_by(gts_type::Column::GtsTypeId, sea_orm::Order::Asc);
+        if let Some(kind) = query.kind {
+            select =
+                select.filter(Condition::all().add(gts_type::Column::Kind.eq(kind_to_str(kind))));
+        }
+        if let Some(cursor) = &after {
+            select =
+                select.filter(Condition::all().add(gts_type::Column::GtsTypeId.gt(cursor.clone())));
+        }
+        // A slice the size of what is still wanted, plus one row of
+        // lookahead so the loop can tell "the catalogue ends here" from
+        // "there is more after this".
+        let wanted = limit - items.len();
+        let slice = select
+            .limit(u64::try_from(wanted).unwrap_or(u64::MAX) + 1)
+            .all(&conn)
+            .await
+            .map_err(map_scope_err)?;
+        if slice.is_empty() {
+            next_cursor = None;
+            break;
+        }
+        let exhausted = slice.len() <= wanted;
+
+        // Only the wanted rows are *examined*; the lookahead row is read and
+        // put back. Advancing past a row the filter never saw would skip
+        // every match it carried — which is how the first version of this
+        // loop lost types silently.
+        let mut examined = slice;
+        examined.truncate(wanted);
+        let reached = examined
+            .last()
+            .map(|model| model.gts_type_id.clone())
+            .unwrap_or_default();
+
+        for model in examined {
+            if let Some(pattern) = &query.pattern {
+                let patterns = vec![pattern.clone()];
+                let matches = ontology::matches_any_pattern(&model.gts_type_id, &patterns)
+                    .map_err(|error| GraphStoreError::LimitExceeded {
+                        what: error.to_string(),
+                    })?;
+                if !matches {
+                    continue;
+                }
+            }
+            next_cursor = Some(model.gts_type_id.clone());
+            items.push(to_record(model)?);
+        }
+
+        if exhausted {
+            // Nothing beyond this slice, so nothing to continue to.
+            next_cursor = None;
+            break;
+        }
+        after = Some(reached);
     }
 
     let revision = crate::infra::store::reads::revision(store, ctx).await?;
     Ok(Page {
         items,
-        next_cursor: next_cursor.flatten(),
+        next_cursor,
         revision,
     })
 }
+
+/// How many slices one catalogue page may read before it answers with what it
+/// has. A pattern that matches nothing would otherwise walk the whole
+/// catalogue inside one request; the caller gets a short page and a cursor,
+/// which is the same contract as any other short page.
+const MAX_CATALOGUE_PASSES: usize = 16;
 
 pub async fn resolve_type_set(
     store: &PgGraphStore,

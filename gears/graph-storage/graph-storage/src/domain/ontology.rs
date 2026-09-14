@@ -286,6 +286,25 @@ fn kind_of_property(property: &Value) -> Result<ScalarKind, String> {
     }
 }
 
+/// The identifier a batch registers twice, if any.
+///
+/// A batch is one atomic act, so naming a type twice in it is a question
+/// without an answer: the second entry would be read against the row the
+/// first just wrote, making the outcome depend on the order the caller
+/// happened to list them in — evolution against a definition that did not
+/// exist when the request was made, or a conflict with itself. Refusing is
+/// the only reading that is the same for every ordering.
+#[must_use]
+pub fn duplicate_type_id<'a>(ids: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
 /// The derivation chain of a GTS identifier, outermost base first, the
 /// identifier itself last. `a.v1~b.v1~c.v1~` -> `[a.v1~, a.v1~b.v1~, ...]`.
 #[must_use]

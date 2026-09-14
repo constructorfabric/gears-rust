@@ -432,3 +432,13 @@ async fn deleting_an_already_tombstoned_row_is_a_no_op() {
 async fn the_type_catalogue_pages_through_its_own_cursor() {
     conformance::the_type_catalogue_pages_through_its_own_cursor(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn a_deleted_conclusion_stops_pinning_its_endpoint() {
+    conformance::a_deleted_conclusion_stops_pinning_its_endpoint(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_batch_that_names_one_type_twice_is_refused() {
+    conformance::a_batch_that_names_one_type_twice_is_refused(&store(), Uuid::now_v7()).await;
+}

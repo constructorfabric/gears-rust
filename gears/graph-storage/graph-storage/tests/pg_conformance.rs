@@ -367,6 +367,14 @@ pg_case!(
     conformance::the_type_catalogue_pages_through_its_own_cursor
 );
 pg_case!(
+    a_deleted_conclusion_stops_pinning_its_endpoint,
+    conformance::a_deleted_conclusion_stops_pinning_its_endpoint
+);
+pg_case!(
+    a_batch_that_names_one_type_twice_is_refused,
+    conformance::a_batch_that_names_one_type_twice_is_refused
+);
+pg_case!(
     an_unchanged_re_ingest_embeds_nothing,
     conformance::an_unchanged_re_ingest_embeds_nothing
 );

@@ -4627,4 +4627,213 @@ pub async fn the_type_catalogue_pages_through_its_own_cursor(
         walked, whole,
         "paging sees every type exactly once, and no other"
     );
+
+    // A page narrowed by a pattern is filled, not merely cut. The GTS pattern
+    // is matched in Rust rather than in SQL, so a slice of the catalogue can
+    // lose every row to it — and answering with an empty page plus a cursor
+    // would be a page nobody reads: every client stops when `items` is empty,
+    // and would then miss every match beyond the gap. The pattern here admits
+    // exactly one type, which sorts after several that it excludes.
+    let narrowed = store
+        .list_types(
+            &ctx,
+            graph_storage_sdk::models::TypeQuery {
+                top: Some(1),
+                pattern: Some(LINK.to_owned()),
+                ..graph_storage_sdk::models::TypeQuery::default()
+            },
+        )
+        .await
+        .expect("the narrowed page lists");
+    assert_eq!(
+        narrowed
+            .items
+            .iter()
+            .map(|item| item.type_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![LINK],
+        "the page carries the one matching type rather than an empty slice"
+    );
+    // A cursor may still come back — it means "there may be more", and rows
+    // the pattern excludes do follow. What must hold is that following it
+    // terminates and finds nothing further, so the walk neither loops nor
+    // hides a match.
+    let mut cursor = narrowed.next_cursor;
+    let mut further = 0usize;
+    for _ in 0..20 {
+        let Some(token) = cursor else { break };
+        let page = store
+            .list_types(
+                &ctx,
+                graph_storage_sdk::models::TypeQuery {
+                    top: Some(1),
+                    pattern: Some(LINK.to_owned()),
+                    cursor: Some(token),
+                    ..graph_storage_sdk::models::TypeQuery::default()
+                },
+            )
+            .await
+            .expect("the continuation lists");
+        further += page.items.len();
+        cursor = page.next_cursor;
+    }
+    assert_eq!(further, 0, "the one match was on the first page");
+    assert!(cursor.is_none(), "the narrowed walk terminates");
+}
+
+/// A deleted conclusion stops keeping its subject alive.
+///
+/// The rule that a node an analysis edge points at survives a re-sync is the
+/// whole of `principle-provenance-survives-resync` — and it has to stop
+/// applying when the conclusion itself has been deleted. Otherwise the row is
+/// still there, the endpoint foreign key still refuses to let the node go,
+/// and no later replacement can ever remove it: the scope stops converging,
+/// silently and for good. The obvious fix, ignoring tombstoned edges when
+/// deciding what is still referenced, is worse than the bug — the row would
+/// remain and the delete would fail instead. The edges depart with the node.
+pub async fn a_deleted_conclusion_stops_pinning_its_endpoint(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(TypeRegistration {
+        type_id: ANALYSIS.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{ANALYSIS}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~" }]
+        }),
+    });
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    // Two scoped nodes and a conclusion drawn about them.
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("pinned", "acme/infra"),
+                scoped_node("pinning", "acme/infra"),
+            ],
+            vec![analysis_edge("pinning", "pinned", "static-analysis")],
+            1,
+        ),
+    )
+    .await
+    .expect("the scope is imported");
+
+    // The conclusion is withdrawn.
+    let edge_key = store
+        .get_node(&ctx, &"pinned".to_owned(), 10)
+        .await
+        .expect("the node reads")
+        .adjacency
+        .first()
+        .expect("the analysis edge is adjacent")
+        .edge_key
+        .clone();
+    store
+        .soft_delete(&ctx, DeleteRequest::Edge(edge_key))
+        .await
+        .expect("the conclusion is deleted");
+
+    // A re-import that names neither node must now remove both. Before this,
+    // `pinned` stayed for ever, held by an edge nobody could see.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![scoped_node("kept", "acme/infra")], Vec::new(), 2),
+    )
+    .await
+    .expect("the replacement commits");
+    assert_eq!(
+        outcome.counts.scope_removed_nodes, 2,
+        "both nodes leave: the conclusion that held one of them was deleted"
+    );
+    for gone in ["pinned", "pinning"] {
+        assert!(
+            store.get_node(&ctx, &gone.to_owned(), 10).await.is_err(),
+            "`{gone}` is gone"
+        );
+    }
+
+    // And a *live* conclusion still pins its subject, which is the rule this
+    // case narrows rather than replaces.
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("live-subject", "acme/infra"),
+                scoped_node("live-author", "acme/infra"),
+            ],
+            vec![analysis_edge(
+                "live-author",
+                "live-subject",
+                "static-analysis",
+            )],
+            3,
+        ),
+    )
+    .await
+    .expect("the second import commits");
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![scoped_node("kept", "acme/infra")], Vec::new(), 4),
+    )
+    .await
+    .expect("the replacement commits");
+    assert!(
+        store
+            .get_node(&ctx, &"live-subject".to_owned(), 10)
+            .await
+            .is_ok(),
+        "a live conclusion still keeps its subject"
+    );
+}
+
+/// A batch that names one type twice is refused, whatever the order.
+///
+/// A registration batch is one atomic act, so the second entry would be read
+/// against the row the first had just written — evolving against a definition
+/// that did not exist when the request was made, or conflicting with itself.
+/// The outcome would depend on the order the caller happened to list them in,
+/// which is not an outcome at all.
+pub async fn a_batch_that_names_one_type_twice_is_refused(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+
+    let mut batch = ontology_batch();
+    let repeated = batch
+        .iter()
+        .find(|registration| registration.type_id == OWNED)
+        .cloned()
+        .expect("the producer type is in the batch");
+    batch.push(repeated);
+
+    let refused = store.register_types(&ctx, batch).await;
+    assert!(
+        matches!(refused, Err(GraphStoreError::InvalidQuery { .. })),
+        "a duplicate identifier is refused, got {refused:?}"
+    );
+
+    // Nothing of the batch was written: the refusal is a refusal, not a
+    // partial registration.
+    assert!(
+        store.get_type(&ctx, &OWNED.to_owned()).await.is_err(),
+        "the refused batch registered nothing"
+    );
+
+    // The same batch without the repetition registers.
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers once it names each type once");
 }
