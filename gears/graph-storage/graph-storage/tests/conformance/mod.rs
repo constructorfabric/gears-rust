@@ -4690,6 +4690,81 @@ pub async fn the_type_catalogue_pages_through_its_own_cursor(
     }
     assert_eq!(further, 0, "the one match was on the first page");
     assert!(cursor.is_none(), "the narrowed walk terminates");
+
+    a_match_beyond_the_scan_cap_is_still_reachable(store, &ctx).await;
+}
+
+/// A match that lies beyond however many slices one request is willing to read
+/// is still reachable.
+///
+/// The scan is capped so a pattern matching nothing cannot walk a whole
+/// catalogue inside one request — and a cap that answered "no cursor" would
+/// tell the client it had reached the end, losing every match past that point
+/// for good. The page comes back empty and the cursor says where to resume.
+async fn a_match_beyond_the_scan_cap_is_still_reachable(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+) {
+    /// Sorts after every filler, so a walk of one row per request has to get
+    /// past all of them to see it.
+    const FAR: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.zz_far.v1~";
+
+    let mut filler = Vec::new();
+    for index in 0..24 {
+        let type_id = format!(
+            "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.filler_{index:02}.v1~"
+        );
+        filler.push(TypeRegistration {
+            schema: serde_json::json!({
+                "$id": format!("gts://{type_id}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "allOf": [
+                    { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" }
+                ]
+            }),
+            type_id,
+        });
+    }
+    filler.push(TypeRegistration {
+        type_id: FAR.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{FAR}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" }]
+        }),
+    });
+    store
+        .register_types(ctx, filler)
+        .await
+        .expect("the filler types register");
+
+    let mut cursor = None;
+    let mut found = false;
+    for _ in 0..60 {
+        let page = store
+            .list_types(
+                ctx,
+                graph_storage_sdk::models::TypeQuery {
+                    top: Some(1),
+                    pattern: Some(FAR.to_owned()),
+                    cursor: cursor.clone(),
+                    ..graph_storage_sdk::models::TypeQuery::default()
+                },
+            )
+            .await
+            .expect("the page lists");
+        found |= page.items.iter().any(|item| item.type_id == FAR);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        found,
+        "a match beyond the scan cap is still reachable by following the cursor"
+    );
 }
 
 /// A deleted conclusion stops keeping its subject alive.

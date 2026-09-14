@@ -2918,7 +2918,17 @@ its own pools in the `graph-analytics` gear (its ADR-0002) under the same three
 rules; this section governs ingest, queries, provider calls, index builds and
 re-embedding inside this gear.
 
-**Index and DDL admission.** Authorization to register a type is not a resource
+**Index and DDL admission — specified, not built.** Nothing below this
+paragraph exists in the gear: there is no DDL queue, no capacity reservation,
+no index-activation lifecycle and no `ddl_*` configuration key, and a declared
+`index` path is filterable the moment it is declared (PRD
+`cpt-cf-graph-storage-fr-index-admission`, still unchecked; ADR-0003's two
+platform asks, still unraised). It is written out because the shape of the
+admission is the decision, and because the first thing anyone building it will
+need is the reason each bound exists. Read it as the design it is, not as a
+description of this build.
+
+Authorization to register a type is not a resource
 bound: an ontology administrator acting entirely within permission can publish
 type versions whose accepted `index`, `full_text_search` and `vector_search`
 traits each commit durable index intent, launch `CREATE INDEX CONCURRENTLY` and

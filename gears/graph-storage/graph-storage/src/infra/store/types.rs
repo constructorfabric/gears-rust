@@ -921,7 +921,13 @@ pub async fn list_types(
     // page is full or the rows run out.
     let mut items = Vec::new();
     let mut after = query.cursor.clone();
-    let mut next_cursor = None;
+    // Where the scan got to, whether or not anything matched. This is what a
+    // continuation has to be built from: a cursor taken from the last
+    // *matching* row would be right for a page that filled and wrong for one
+    // that ran out of passes, and the second case is the one that loses
+    // types.
+    let mut reached_overall = None;
+    let mut exhausted_catalogue = false;
     // Bounded: each pass reads at least one row or ends the loop, and the
     // pass count is capped so a pathological pattern cannot walk a huge
     // catalogue inside one request.
@@ -951,7 +957,7 @@ pub async fn list_types(
             .await
             .map_err(map_scope_err)?;
         if slice.is_empty() {
-            next_cursor = None;
+            exhausted_catalogue = true;
             break;
         }
         let exhausted = slice.len() <= wanted;
@@ -978,17 +984,30 @@ pub async fn list_types(
                     continue;
                 }
             }
-            next_cursor = Some(model.gts_type_id.clone());
             items.push(to_record(model)?);
         }
+        reached_overall = Some(reached.clone());
 
         if exhausted {
             // Nothing beyond this slice, so nothing to continue to.
-            next_cursor = None;
+            exhausted_catalogue = true;
             break;
         }
         after = Some(reached);
     }
+
+    // A continuation is offered whenever rows remain — including the case the
+    // cap creates, where sixteen passes examined nothing the pattern admits
+    // and the page is empty. Reporting no cursor there would tell a client
+    // walking a large catalogue that it had reached the end, and every match
+    // beyond that point would be invisible for good. An empty page with a
+    // cursor is the lesser answer: the client continues, and the next request
+    // resumes exactly where this one stopped looking.
+    let next_cursor = if exhausted_catalogue {
+        None
+    } else {
+        reached_overall
+    };
 
     let revision = crate::infra::store::reads::revision(store, ctx).await?;
     Ok(Page {

@@ -88,6 +88,36 @@ fn cosine(one: &[f32], other: &[f32]) -> f64 {
         .sum()
 }
 
+/// The same contract on the runtime a deployment actually uses.
+///
+/// `embed` hands the synchronous inference to `block_in_place` when it finds
+/// a multi-threaded runtime, and calls it directly otherwise — and every
+/// other test here runs on the current-thread runtime, so the branch a gear
+/// takes in production was the one nothing exercised. `block_in_place`
+/// panics on a current-thread runtime and requires the guard it holds to
+/// behave across the hand-off, so "it compiles" is not evidence about it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_onnx_provider_honours_the_contract_on_a_threaded_runtime() {
+    let Some(provider) = provider().await else {
+        return;
+    };
+    graph_storage_sdk::contract::assert_embedding_provider(&provider).await;
+
+    // And two batches at once, which is the shape that makes the session
+    // mutex and the blocking hand-off meet.
+    let batch = |texts: &[&str]| EmbedRequest {
+        inputs: texts.iter().map(|t| (*t).to_owned()).collect(),
+        budget: RemainingBudget::starting_now(Duration::from_mins(1)),
+        cancel: CancellationToken::new(),
+    };
+    let (first, second) = tokio::join!(
+        provider.embed(batch(&["one sentence", "another"])),
+        provider.embed(batch(&["a third"])),
+    );
+    assert_eq!(first.expect("the first batch embeds").vectors.len(), 2);
+    assert_eq!(second.expect("the second batch embeds").vectors.len(), 1);
+}
+
 #[tokio::test]
 async fn the_onnx_provider_honours_the_contract() {
     let Some(provider) = provider().await else {

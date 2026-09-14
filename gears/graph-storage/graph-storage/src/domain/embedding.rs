@@ -54,6 +54,12 @@ pub struct EmbeddingCoordinator {
     /// does readiness ask the provider, and then at most once per window
     /// however many probes arrive.
     observed: Mutex<Option<Observation>>,
+    /// Held while a probe is in flight, so concurrent probes ask once.
+    ///
+    /// The window alone is check-then-act: a burst of probes that all find it
+    /// stale would each start their own paid request, and a burst is what a
+    /// load balancer and a liveness schedule produce together.
+    probing: tokio::sync::Mutex<()>,
 }
 
 /// One outcome of talking to the provider, and when.
@@ -80,6 +86,7 @@ impl EmbeddingCoordinator {
             state,
             input_max_bytes: input_max_bytes as usize,
             observed: Mutex::new(None),
+            probing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -101,6 +108,16 @@ impl EmbeddingCoordinator {
     /// most once per window, because the caller is an anonymous probe and the
     /// question costs money to ask (see `observed`).
     pub async fn health(&self) -> Result<(), String> {
+        if let Some(fresh) = self.recent_observation() {
+            return fresh.failure.map_or(Ok(()), Err);
+        }
+        // One probe at a time, and the loser of the race asks nothing: by the
+        // time it holds this, the winner has recorded an answer that is by
+        // definition inside the window. Reading the observation and then
+        // deciding to probe is check-then-act, and a burst of probes — which
+        // is what a load balancer and a liveness schedule produce together —
+        // would otherwise each start their own paid request.
+        let _probing = self.probing.lock().await;
         if let Some(fresh) = self.recent_observation() {
             return fresh.failure.map_or(Ok(()), Err);
         }
@@ -694,6 +711,11 @@ mod tests {
         async fn health(&self) -> Result<(), EmbeddingProviderError> {
             self.health_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A real provider's health is a network round trip. Without a
+            // wait here the answer lands before the next caller is even
+            // polled, and a test of concurrent probes would pass whether or
+            // not anything serialized them.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(())
         }
     }
@@ -707,7 +729,7 @@ mod tests {
     /// someone polls, the more it costs. So: one question per window at the
     /// very most, and none at all while real traffic is answering the same
     /// question for free.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_does_not_pay_the_provider_for_every_probe() {
         let provider = Arc::new(CountingProvider::new());
         let coordinator = EmbeddingCoordinator::new(
@@ -725,6 +747,29 @@ mod tests {
             provider.health_calls(),
             1,
             "a hundred probes must cost one question, not a hundred"
+        );
+
+        // Concurrent probes ask once between them. A load balancer and a
+        // liveness schedule arrive together, not in turn, and the window
+        // alone would let each of them start its own paid request.
+        let racing = Arc::new(EmbeddingCoordinator::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProviderV1>,
+            SpaceState::Active { epoch: 1 },
+            8 * 1024,
+        ));
+        let before = provider.health_calls();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let coordinator = Arc::clone(&racing);
+            tasks.spawn(async move { coordinator.health().await });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.expect("the task does not panic").expect("healthy");
+        }
+        assert_eq!(
+            provider.health_calls() - before,
+            1,
+            "eight probes at once must cost one question between them"
         );
 
         // A real embedding call is evidence about the same provider, so
