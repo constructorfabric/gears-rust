@@ -524,7 +524,10 @@ avoid leaving this unswept sibling behind.
 - **Ed25519-signed compact token, asymmetric, stateless — codec-equivalent to PASETO `v4.public`, not literal
   PASETO.** ADR-0004 specifies PASETO `v4.public`; the wire format is `base64url(JSON payload).base64url(signature)`
   (`infra::signed_url::Issuer`/`Verifier`) — same asymmetric control-signs/sidecar-verifies property and the same
-  opaque, evolvable claim-set, but **no PASETO footer and no `kid`** (no key rotation; a single static keypair). The
+  opaque, evolvable claim-set, but **no PASETO footer and no `kid`** — key rotation is instead handled by the
+  sidecar verifying against a small ordered set of public keys (active + previously-active,
+  `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), so no `kid` is needed to select one; see `docs/operations.md`'s
+  `signing_key_seed` → Rotation section for the zero-outage procedure. The
   control plane signs with the Ed25519 private key (sole minter); the sidecar verifies with the public key and can
   never mint. **Not JWT** (no `alg` field → no algorithm-confusion). No DB lookup to verify. No per-token
   revocation — emergency revocation is the platform auth module's token revocation. See
