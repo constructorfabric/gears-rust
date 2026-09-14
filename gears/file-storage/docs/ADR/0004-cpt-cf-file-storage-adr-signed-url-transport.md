@@ -75,8 +75,9 @@ liability that would couple intermediaries to a layout we want free to change.
   resource (`file_id`, `content_id`/`version_id`), `exp` (required, capped at `max_url_ttl`, recommended 7 days), the
   constraints (`ip`, token-claim predicates, upload `max_size`/`exact_size`/`expected_hash`; P2 `max_rate`/`max_conns`),
   and the baked response-header set — with **one signature over the whole set**. The PASETO **footer** carries a key id
-  (`kid`) for P2 rotation. **Implemented as a codec-equivalent bespoke format, not literal PASETO** — no footer, no
-  `kid` — see [Implementation note](#implementation-note-p2-2026-07) below.
+  (`kid`) for rotation. **Implemented as a codec-equivalent bespoke format, not literal PASETO** — no footer, no
+  `kid`; key rotation is instead solved by the sidecar verifying against a small ordered set of public keys — see
+  [Implementation note](#implementation-note-p2-2026-07) below.
 * **Transport = both query and header**, chosen by access intent; the **token bytes are identical** either way:
   * **query** — `?fs-token=<token>` — for bare, embeddable URLs (browser, `<img>`/`<video>`, `curl`, media `Range`; the caller
     cannot set headers). Because a query token can leak via server/proxy logs, browser history, and the `Referer`
@@ -109,8 +110,10 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
   not a literal PASETO library**; all claims live inside the token.
 * **No PASETO token-library dependency (bespoke codec):** the shipped token is
   `base64url(json(claims)).base64url(ed25519_signature)` built on the already-present `base64` and `ring`/Ed25519
-  primitives through the in-house `SignatureProvider`/`SignatureVerifier` abstraction — **no `kid` footer** (a single
-  static sidecar public key; key rotation is a forward P2 concern), and no new third-party token format crate. Ed25519
+  primitives through the in-house `SignatureProvider`/`SignatureVerifier` abstraction — **no `kid` footer** (the
+  sidecar instead verifies against a small ordered set of public keys, primary + previously-active, giving a
+  rotation crossover window without needing to select a key by id — see the Implementation note below), and no new
+  third-party token format crate. Ed25519
   keys as before (private → control, public → sidecar). Literal PASETO `v4.public` is not adopted in P1; it remains a
   possible future wrapper over the same `SignatureProvider` seam (the format is opaque and codec-evolvable per the
   Token Opacity Contract).
@@ -157,22 +160,29 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
 **Implemented as** a bespoke, codec-equivalent format rather than literal PASETO `v4.public`
 (`src/infra/signed_url/mod.rs:9-12`): `base64url(json(claims)).base64url(ed25519_signature)` — the JSON claim-set and
 an Ed25519 signature over its serialized bytes, each base64url-encoded and joined with a `.`. There is **no `kid`
-field** anywhere in the token (no footer, no key-id claim); the sidecar is configured with a single static public key
-and cannot select among multiple keys.
+field** anywhere in the token (no footer, no key-id claim); instead, the sidecar's `Verifier` checks a token's
+signature against a small **ordered** set of public keys — the primary (`FS_SIDECAR_PUBLIC_KEY`) plus, optionally,
+a short list of previously-active keys retained during a rotation (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — trying each
+in turn until one matches. This is what gives a `signing_key_seed` rotation a zero-outage crossover window without
+needing a `kid` claim to select a key at all: see `docs/operations.md`'s `signing_key_seed` → **Rotation** section
+for the operational procedure.
 
 This is an accepted interim measure, not a silent deviation: every property this ADR actually cares about holds —
 the token is opaque per the Token Opacity Contract below (only control and sidecar parse it), signed with Ed25519
 through the in-house `SignatureProvider`/`SignatureVerifier` abstraction (`Ed25519Provider`) exactly as the FIPS
 posture above requires (not a hard-wired crate call, so it satisfies the *replaceability* requirement), and the
 control plane remains the sole minter with the sidecar verify-only. What differs is only the concrete codec (bespoke
-vs. the PASETO `v4.public` wire format) and the absence of `kid`-based key rotation — and the FIPS posture is
+vs. the PASETO `v4.public` wire format) and the absence of `kid`-based key *selection* — and the FIPS posture is
 otherwise unchanged: Ed25519 approval under FIPS 186-5 still requires the signing/verifying primitive to run inside a
 **FIPS-validated cryptographic module**, and the current `Ed25519Provider` is a generic (non-validated)
 implementation, so this codec **MUST NOT** be used in any FIPS-constrained deployment until the provider behind it is
 swapped for a FIPS-validated module (or a FIPS-approved alternative such as ECDSA P-256 over a validated module) —
 which, because the codec is opaque and evolvable, requires no change to the token format or claim-set, only to the
-provider implementation. Migrating the codec to a literal PASETO `v4.public` library, and adding a `kid`/key-rotation
-story, remains a tracked P3/Tier-4 follow-up with no dedicated ticket in this repo yet.
+provider implementation. Key rotation itself is no longer deferred: it is solved operationally by the sidecar's
+ordered multi-key `Verifier` described above, with the full zero-outage procedure in `docs/operations.md`'s
+`signing_key_seed` → **Rotation** section. Migrating the codec to a literal PASETO `v4.public` library and adding
+`kid`-based key *selection* (an optimization once the key set stops being small enough to try linearly, not a
+correctness gap) remain deferred — tracked as a "Deferred item" in `DECOMPOSITION.md`.
 
 ### Claim-set evolution (P2 1.11, 2026-07)
 

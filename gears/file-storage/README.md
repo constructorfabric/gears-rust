@@ -137,8 +137,9 @@ cargo build -p cf-gears-file-storage                 # control-plane gear (lib)
 cargo build -p cf-gears-file-storage --bin sidecar   # data-plane sidecar
 cargo test  -p cf-gears-file-storage -p cf-gears-file-storage-sdk
 
-# Sidecar env (4 of 9 — see docs/operations.md for the rest): FS_SIDECAR_ADDR,
-# FS_SIDECAR_PUBLIC_KEY (base64url Ed25519), FS_SIDECAR_BACKEND_ROOT,
+# Sidecar env (4 of 12 — see docs/operations.md for the rest): FS_SIDECAR_ADDR,
+# FS_SIDECAR_PUBLIC_KEY (primary, base64url Ed25519 -- FS_SIDECAR_PREVIOUS_PUBLIC_KEYS
+# adds a rotation-window set of additional keys), FS_SIDECAR_BACKEND_ROOT,
 # FS_SIDECAR_CONTROL_URL (control-plane base URL for the finalize/report-part
 # callbacks -- without it, uploads default to http://localhost:8080 and stay
 # `pending` forever against any other control-plane address)

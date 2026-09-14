@@ -919,11 +919,14 @@ The control plane **MUST** issue short-lived **signed URLs** that authorize a si
 - optionally carry a set of response headers the sidecar **MUST** echo verbatim on the served response (e.g.
   `Content-Disposition`, `Content-Type` override, `Cache-Control`), so the sidecar needs no control-plane round-trip.
 
-In P1 a single static signing keypair is used (a `kid` in a future PASETO footer is reserved for P2 rotation; the bespoke format carries no `kid` in P1; no per-token
-revocation and no key rotation in P1; emergency access revocation is the platform auth module's token revocation). Key
-rotation and a multi-key set are deferred to P2, as is enforcement
-of the `max_rate` / `max_conns` constraints (which additionally require coordinating the multi-instance sidecar fleet
-on a shared backend).
+The control plane signs with a single active keypair at a time (the bespoke format carries no `kid`, in P1 or later);
+the sidecar verifies against a small ordered set of public keys — the active one plus, during a rotation window,
+previously-active ones (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — which lets a `signing_key_seed` rotation happen without
+an outage or invalidating already-issued signed URLs, with no `kid` needed to select among them (see
+`docs/operations.md`'s `signing_key_seed` → Rotation section for the procedure). There is no per-token revocation;
+emergency access revocation is the platform auth module's token revocation. Enforcement
+of the `max_rate` / `max_conns` constraints is deferred to P2 (it additionally requires coordinating the
+multi-instance sidecar fleet on a shared backend).
 
 **Rationale**: Signed URLs let the control plane delegate the byte transfer to the sidecar without exposing backends
 and without a per-request control round-trip on the data path. AND-combined constraints give per-link access control

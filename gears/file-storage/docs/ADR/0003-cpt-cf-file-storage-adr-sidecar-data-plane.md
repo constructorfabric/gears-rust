@@ -129,9 +129,13 @@ Constraints are AND-combined into the signed payload — `exp` (required, capped
 `ip`/CIDR, optional predicates over token claims (`tok.typ`, `tok.sub`, `tok.tenant_id`, …), and — on
 upload URLs — an optional size bound (`max_size` or `exact_size`, mutually exclusive) and
 `expected_hash`. Bandwidth (`max_rate`) and connection (`max_conns`) caps are declared but enforced in
-P2. In P1 there is one static keypair (private in control config, public in sidecar config);
-rotation/keyset is deferred to P2; there is no per-URL revocation — emergency revocation is the
-platform auth module's token revocation, not the URL layer.
+P2. The control plane signs with one active keypair at a time (private in control config, public in
+sidecar config); the sidecar verifies against a small ordered **set** of public keys — the active one
+plus, during a rotation window, previously-active ones (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — which is
+what lets `signing_key_seed` be rotated without an outage or invalidating already-issued signed URLs
+(see [ADR-0004](./0004-cpt-cf-file-storage-adr-signed-url-transport.md)'s Implementation note and
+`docs/operations.md`'s `signing_key_seed` → Rotation section); there is no per-URL revocation —
+emergency revocation is the platform auth module's token revocation, not the URL layer.
 
 ### Consequences
 

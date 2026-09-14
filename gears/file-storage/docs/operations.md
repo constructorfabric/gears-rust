@@ -134,6 +134,41 @@ is configured with only one public key via `FS_SIDECAR_PUBLIC_KEY`) — this loo
 upload/download failures. `require_signing_key_seed` (below) exists specifically to fail fast on this misconfiguration
 instead of degrading silently into that failure mode.
 
+**Rotation is zero-outage**, unlike `finalize_internal_secret`'s rotation below: the sidecar verifies a token
+against a small ordered set of public keys (`FS_SIDECAR_PUBLIC_KEY` plus, optionally,
+`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), trying each in turn, so it can accept tokens from an old and a new seed at the
+same time. Procedure:
+
+1. Generate the new seed and get its public key **before** touching the control plane. The reliable way to do this
+   without a dedicated derivation utility: start (or restart, in staging) one control-plane replica with the new
+   seed and read its own startup log — `gear.rs::init` always logs
+   `sidecar_public_key = <base64url>` (`"file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with
+   this)"`) derived from whichever seed it booted with, precisely so this key never has to be computed by hand.
+2. Roll out the sidecar fleet with the new key added to its set — either as the new `FS_SIDECAR_PUBLIC_KEY` with the
+   old key moved into `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, or left as `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` alongside the
+   still-current primary. Order only changes verification cost (the primary is tried first), never correctness —
+   every sidecar now accepts tokens signed by either key.
+3. Restart the control plane on the new seed — **every replica at once** (see the multi-replica warning above: a
+   mixed-seed control-plane fleet is exactly the failure mode that warns about). Tokens already issued under the old
+   seed keep verifying, because step 2 already taught the sidecars the old key too. This is the invariant that makes
+   the whole procedure safe: **the control plane must never sign with a key no sidecar accepts**, which is why the
+   sidecar fleet is always updated first, never the other way round.
+4. Once `max_url_ttl_secs` (default 7 days) has passed since step 3, no token signed with the old seed can still be
+   unexpired — remove the old key from every sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`/`FS_SIDECAR_PUBLIC_KEY`.
+
+**Compromise** follows the same four steps, except step 4 happens immediately, as a deliberate invalidation of every
+URL the old key could still authorize rather than something to wait out: a holder of the private key can mint a
+token for *any* `file_id`/`op`/`backend_path`, so containing that risk outweighs preserving in-flight URLs signed
+under it. Concretely:
+- Outstanding **download** URLs simply get re-issued (a fresh `GET`/`HEAD` against the control plane mints a new one
+  under the new key).
+- An in-flight **single-part upload** resumes via a repeat `POST /files` with the same `idempotency_key` — the
+  replay re-signs the returned upload URL under the current (new) key rather than replaying the old one (see F1 in
+  [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)).
+- An in-flight **multipart session** survives the rotation through its existing resume path: `GET
+  /files/{id}/multipart/{upload_id}` re-signs the remaining parts' URLs under the current key, still capped by the
+  session's own `expires_at` — no special-casing needed for a key rotation specifically.
+
 ### `require_signing_key_seed`
 When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is
 absent, instead of silently minting an ephemeral per-boot key. **Production recommendation**: leave at `true`
@@ -205,13 +240,17 @@ is tested regardless, but merging it to `main` is conditioned on that review. **
 (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) instead of embedding them in gear YAML. **Misconfiguration risk**: a bad
 endpoint or missing credentials with no env fallback fails gear init (fail-fast, not a runtime surprise).
 
-**Set an `AbortIncompleteMultipartUpload` lifecycle rule on every bucket used here**, with a threshold comfortably
-above `multipart_session_ttl_secs`. FileStorage aborts backend multipart handles on a best-effort basis only, and
-two windows are not covered by any sweep: a control-plane crash between `initiate_multipart` and the session-row
-insert leaves a handle with no persisted correlation at all, and a backend abort that fails after the session has
-already flipped to `aborted` is never retried (later passes list only `in_progress` and lease-expired `completing`
-sessions). No object bytes are at stake in either case, but S3 bills for incomplete multipart uploads, so the
-lifecycle rule is the backstop reaper — see `concurrency-and-failure-model.md` §5.
+**Set an `AbortIncompleteMultipartUpload` lifecycle rule on every bucket used here** — this is **required**, not a
+recommendation. The rule's `DaysAfterInitiation` parameter only accepts whole days, minimum 1, so set
+`DaysAfterInitiation >= ceil(multipart_session_ttl_secs / 86400) + 1` (2 days at the default 24h TTL). This is safe
+because no session outlives its `expires_at` (a resume re-caps `exp` at the same `expires_at`), so a handle still
+open once that many days have passed is by construction already abandoned. FileStorage aborts backend multipart
+handles on a best-effort basis only, and two windows are not covered by any sweep: a control-plane crash between
+`initiate_multipart` and the session-row insert leaves a handle with no persisted correlation at all, and a backend
+abort that fails after the session has already flipped to `aborted` is never retried (later passes list only
+`in_progress` and lease-expired `completing` sessions). No object bytes are at stake in either case, but S3 bills for
+incomplete multipart uploads. The sweep remains the primary reclamation path; the lifecycle rule is only the
+backstop for these two uncorrelated windows — see `concurrency-and-failure-model.md` §5.
 
 ### `default_backend_id`
 Backend id `build_backend_registry` designates as the registry's default — the backend new `create`/
@@ -266,10 +305,12 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | Variable | Default | Notes |
 |---|---|---|
 | `FS_SIDECAR_ADDR` | `0.0.0.0:8087` | Bind address. |
-| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
+| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 **primary** public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
+| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
 | `FS_SIDECAR_BACKEND_ROOT` | `./.file-storage-data` | Local-fs backend root — same durability caveat as the control plane's `storage_root`; the two should point at the **same** underlying storage for a single-backend deployment, or the sidecar will read/write blobs the control plane's metadata doesn't expect to find there. |
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus, when configured, the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
+| `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` | `60` | Maximum pause the sidecar tolerates between two consecutive chunks of a client's request body — and before the first one — on the single-part `PUT` upload and on `upload_multipart_part`; `0` disables the guard. This is a **per-chunk idle** bound, not a deadline on the whole stream: a slow-but-steady multi-GiB upload that never pauses longer than this between chunks still completes, no matter how long it takes overall. It closes a gap neither of the other two body-related controls covers: the signed token's `exp` is checked exactly once, before any body bytes are read, and `FS_SIDECAR_MAX_BODY_BYTES` bounds bytes, not time — without this timeout, a client that opens the connection and then stalls (or never sends at all) could hold the request open indefinitely (CWE-400). A client that goes idle past the deadline gets `408 Request Timeout`; the partial object is cleaned up exactly like any other broken upload stream (see F2 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Independent of `FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` below, which bound the sidecar→control-plane callback *after* the body stream has already finished. **Misconfiguration risk**: too low rejects legitimate uploads from clients on slow or lossy links (a real, live upload that merely pauses between chunks) with a `408` that looks like a client bug; too high re-opens the held-open-connection exposure this control exists to close. |
 | `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks, applied **per attempt** (up to `CALLBACK_MAX_ATTEMPTS = 3`). The control plane re-reads and re-hashes the whole object inside this window on the single-part finalize path, so the budget has to cover a full read-back, not just the round trip. **Misconfiguration risk**: a single-part object whose read-back reliably exceeds the timeout never finalizes — every attempt is cut short and the client sees `502` even though the bytes landed (F5 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Raise the timeout for such workloads, or use multipart, whose `complete` performs no full read-back (ADR-0006). |
 | `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane — without these timeouts, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
 | `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` | `2` | Caps how many `upload_multipart_part` requests take the `multipart_native` write path (`write_multipart_part_native`) concurrently. Each in-flight request on that path buffers up to `MAX_PART_SIZE` (5 GiB) in memory before writing it out, so with no cap N concurrent part uploads could drive memory to roughly `N * MAX_PART_SIZE`; at the default of `2` that is up to 10 GiB. A request that cannot immediately acquire a slot waits briefly (`PART_UPLOAD_ACQUIRE_TIMEOUT`, 200ms) for one to free up before it is rejected with `503`/`Retry-After: 1` — not queued indefinitely, but not rejected outright the instant the limit is hit either. |
@@ -320,7 +361,7 @@ The sweep runs **four** steps, in this order:
    live lease is never reaped mid-assembly). It wins the session's own `→ aborted` CAS first (racing a concurrent
    `complete`/user-`abort`), and only on winning that race does it tell the backend to discard the in-progress
    upload and delete the associated pending version row. The backend-side abort is best-effort and is **not**
-   retried by a later pass — see the `AbortIncompleteMultipartUpload` lifecycle rule recommended under
+   retried by a later pass — see the `AbortIncompleteMultipartUpload` lifecycle rule required under
    [`s3_backends`](#s3_backends) above.
 3. **Retention-expiry sweep** (`cpt-cf-file-storage-fr-retention-policies`) — keyset-paginated (500 files per page,
    `RETENTION_SWEEP_BATCH`) scan of every file across every tenant, evaluated against all stored retention rules

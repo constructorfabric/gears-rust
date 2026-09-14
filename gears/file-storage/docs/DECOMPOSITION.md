@@ -70,6 +70,24 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   Postgres flow before it can be added. The prerequisite unique index (`file_versions_version_id_unique_idx`, needed
   for a single-column FK target) already exists, added by the ADR-0006 migration. Revisit once a Postgres-backed
   test harness exists.
+- **Active recovery of uncorrelated backend multipart handles** — deliberately not implemented. In M1
+  (`concurrency-and-failure-model.md` §2.2), `StorageBackend::initiate_multipart` executes between the pending-version
+  insert and the session-row insert; a control-plane crash in that window — and likewise a failed best-effort abort
+  after the session has already moved to `aborted` — leaves a backend-side multipart handle with no persisted
+  correlation, which no sweep can find (§5 of the model). Pre-registering the handle does not solve this: the handle
+  is only known once `initiate_multipart` returns. Active recovery would require the sweep to list in-progress
+  uploads by key prefix (`ListMultipartUploads`), which widens the S3-client surface that ADR-0005 closed off
+  (status `proposed`, pending security review). What protects this today is the mandatory `AbortIncompleteMultipartUpload`
+  lifecycle rule (`operations.md` → `s3_backends`). Acceptance criterion: a simulated crash between `initiate_multipart`
+  and the session-row insert leaves a handle that the sweep finds and aborts within one sweep interval, verified
+  against a real S3-compatible backend. Revisit once ADR-0005 is accepted.
+- **`kid`-selected signing keyset and a literal PASETO `v4.public` codec** — deliberately not implemented. Signing-key
+  rotation is solved operationally instead: the sidecar verifies a token's signature against an ordered set of keys
+  (`FS_SIDECAR_PUBLIC_KEY` plus `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, procedure in `operations.md` → `signing_key_seed` →
+  Rotation); the token itself carries no `kid`, so keys are tried in order (one extra Ed25519 verification per
+  non-primary key). Acceptance criterion: the token carries a key identifier, the sidecar selects the verifier in
+  O(1), the keyset size is bounded by configuration, and a PASETO wrapper sits on the same `SignatureProvider` seam
+  without changing the Token Opacity Contract (ADR-0004). Phase: P3.
 
 ## 2. Entries
 

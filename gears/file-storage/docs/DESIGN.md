@@ -91,9 +91,10 @@ Versioning itself is **P1** (FileStorage-level, backend-agnostic: each version i
 SHA-256 hashing — see §4.2 and ADR-0006 for the content-hash combiner), audit + events + quota + usage outbound flows, backend migration
 (relocating bytes between backends without rotating URLs), the policy engine, and the **cleanup engine** (version
 retention + orphan reconciliation). P3 adds runtime BYOS backend configuration, server-side encryption, read audit,
-signed-URL key rotation, and the sharing capability described above. These phases are declared in the component model
-below with forward references to future FEATURE artifacts; their detailed designs are deliberately out of scope for
-this document.
+and the sharing capability described above (signing-key rotation is not a P3 item: the sidecar's ordered public-key
+set — §4.5, `docs/operations.md` → `signing_key_seed` → Rotation — already makes a `signing_key_seed` rotation a
+zero-outage operation). These phases are declared in the component model below with forward references to future
+FEATURE artifacts; their detailed designs are deliberately out of scope for this document.
 
 ### 1.2 Architecture Drivers
 
@@ -1375,8 +1376,11 @@ and the sidecar (a separate data-plane deployable on its own domain). The releva
   plane needs the backend **registry/capabilities** (to resolve `backend_id` and build signed URLs) but not the
   content credentials. Credentials live in environment variables / mounted secret files referenced from the platform
   gear YAML config (control plane) or from the sidecar's own `FS_SIDECAR_*` env vars
-- **Signing keys**: the control plane holds the Ed25519 **private** key; the sidecar holds the **public** key. P1 uses
-  one static keypair distributed by configuration (no rotation; key rotation + keyset is P2)
+- **Signing keys**: the control plane holds the Ed25519 **private** key; the sidecar holds the **public** key. The
+  control plane signs with one active keypair (`signing_key_seed`) distributed by configuration; the sidecar accepts
+  a small ordered **set** of public keys (active + previously-active, `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), which is
+  how a seed rotation happens without an outage — see `docs/operations.md`'s `signing_key_seed` → Rotation section.
+  No `kid` claim is used to select among them
 - **Metadata DB**: shared Postgres cluster with the platform; `file_storage` schema; migrations applied at startup by
   one elected replica (`db-runner` handles election). Connection pooling per replica via SeaORM defaults
 - **CDN offload**: download egress, the dominant cost, is offloaded to the API-Gateway/CDN layer keyed on the
@@ -1585,8 +1589,11 @@ compact token**: `base64url(JSON payload).base64url(signature)` (`infra::signed_
 `Verifier::verify`) — not literal PASETO. Ed25519, asymmetric, not JWT (no `alg` field → no algorithm-confusion).
 The control plane signs with the private key and is the **sole minter**; the sidecar verifies with the public key and
 can never forge a token. The whole claim-set is covered by **one signature**. There is **no footer and no `kid`** —
-key rotation (P2) is not yet implemented; P1/P2 both use one static keypair (private in control config, public in
-sidecar config, `FS_SIDECAR_PUBLIC_KEY`). There is no per-token revocation — emergency revocation is the platform
+the control plane signs with one active keypair at a time (private in control config, public in sidecar config,
+`FS_SIDECAR_PUBLIC_KEY`), and the sidecar instead verifies against a small ordered **set** of public keys (the
+active one plus, optionally, previously-active ones retained during a rotation window,
+`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — see `docs/operations.md`'s `signing_key_seed` → Rotation section for the
+zero-outage rotation procedure this enables. There is no per-token revocation — emergency revocation is the platform
 auth module's token revocation, not this layer. Because the token is opaque to every other participant, swapping to
 a literal PASETO library later remains a non-breaking change.
 
@@ -1632,7 +1639,9 @@ enforced anywhere in code** — a documented extension point, not a shipped capa
   The TTL therefore bounds the stale-permission exposure, so the **default is kept short** (minutes) for private
   content; the 7-day ceiling is an **explicitly accepted** trade-off reserved for low-sensitivity / deliberately
   long-lived cases, not the norm. Emergency revocation relies on the platform token-revocation path (once
-  predicate-bound tokens exist) and on key rotation (unimplemented) for the signing keypair.
+  predicate-bound tokens exist) and on key rotation for the signing keypair — implemented (see `docs/operations.md`'s
+  `signing_key_seed` → Rotation section: the sidecar's ordered multi-key `Verifier` lets the compromised key be
+  dropped from the accepted set immediately, at the cost of invalidating in-flight URLs signed under it).
 - **A size claim is optional.** If `max_size` (or `exact_size`) is present, the sidecar **MUST** enforce it (mid-stream
   `413`); if **neither** is present, the sidecar imposes **no FS-level size cap** — only the backend's own default size
   limits apply. `max_size` and `exact_size` are mutually exclusive by construction (the control plane never bakes
@@ -1700,9 +1709,11 @@ crypto; everyone else forwards it as opaque bytes and never parses it, so the fo
 intermediaries (ADR-0004 "Token Opacity Contract"). Observability is sanitized server-side logging by control/sidecar,
 never by decoding the token at the edge.
 
-**Keys = the control↔sidecar sync.** Distributing the **Ed25519 verification public key** (and, in P2, a `kid` set for
-rotation) is the only state the control plane "synchronizes" to the sidecar; the backend registry/config is configured
-independently on each plane (platform YAML on the control plane, `FS_SIDECAR_*` env vars on the sidecar — see §3.8).
+**Keys = the control↔sidecar sync.** Distributing the **Ed25519 verification public key(s)** — the active
+`FS_SIDECAR_PUBLIC_KEY` and, during a rotation window, previously-active keys via `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`
+(no `kid` set; the sidecar tries each configured key in turn instead) — is the only state the control plane
+"synchronizes" to the sidecar; the backend registry/config is configured independently on each plane (platform YAML
+on the control plane, `FS_SIDECAR_*` env vars on the sidecar — see §3.8).
 Metadata is not replicated to the sidecar at all — it has no DB connection of any kind and resolves everything it
 needs from the verified token's claims.
 
@@ -1854,9 +1865,11 @@ The control plane and the data-plane sidecar are implemented under `gears/file-s
   so a FIPS-validated backing module (e.g. `rustls-corecrypto-provider`) — or a FIPS-approved alternative algorithm
   such as ECDSA P-256 — is reachable without any codec or claim-set change. Binding rule: no dependency may hard-wire
   a non-swappable, non-FIPS algorithm. The concrete FIPS-validated provider/crate has not yet been selected.
-- **Signing keys.** P1/P2 use one static Ed25519 keypair distributed by configuration (private key via the control
-  plane's `signing_key_seed`, public key via the sidecar's `FS_SIDECAR_PUBLIC_KEY`); key rotation and a `kid` set
-  are P2/P3 work.
+- **Signing keys.** The control plane signs with one active Ed25519 keypair distributed by configuration (private key
+  via `signing_key_seed`, public key via the sidecar's `FS_SIDECAR_PUBLIC_KEY`); the sidecar additionally accepts a
+  small ordered set of previously-active keys (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), which is what makes a
+  `signing_key_seed` rotation a zero-outage operation (`docs/operations.md`'s `signing_key_seed` → Rotation section)
+  without needing a `kid` set — key *selection* by `kid` (an optimization, not a correctness gap) remains deferred.
 - **Direct-DB co-location** for the sidecar — an alternative to today's token-carried `backend_id`/`backend_path`
   model (§3.8) that would let a co-located sidecar read the metadata DB directly instead — remains a deferred,
   unscheduled optimization, not on the P1/P2 critical path.
