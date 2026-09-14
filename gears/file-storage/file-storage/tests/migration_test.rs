@@ -971,6 +971,86 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
     );
 }
 
+/// The presence CHECK's `part_count >= 2` clause rejects a
+/// `multipart-composite-sha256` row with `part_count = 1`. ADR-0006's
+/// single-part amendment degenerates a one-part multipart plan to
+/// `whole-sha256` instead (`multipart_service.rs::assemble_and_finish_inner`,
+/// `single_part`/`WholeSha256` branch), so a composite row must never carry
+/// fewer than 2 parts.
+#[tokio::test]
+async fn content_hash_modes_rejects_multipart_with_single_part_count() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    let res = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO file_versions \
+                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+                  status, is_current, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+                 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+            ),
+        ))
+        .await;
+    assert!(
+        res.is_err(),
+        "multipart-composite-sha256 with part_count = 1 must violate the >= 2 CHECK: {res:?}"
+    );
+}
+
+/// A `multipart-composite-sha256` row with `part_count = 2` (the minimum a
+/// composite row may carry) satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_multipart_with_two_parts() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'multipart-composite-sha256', 2, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("multipart-composite-sha256 with part_count = 2 must satisfy the CHECK");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions \
+                 WHERE version_id = '{VERSION}' AND part_count = 2"
+            )
+        )
+        .await,
+        1
+    );
+}
+
+/// A `whole-sha256` row with `part_count = NULL` — the ordinary,
+/// non-multipart case — satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_whole_with_null_part_count() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'whole-sha256', NULL, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("whole-sha256 with a NULL part_count must satisfy the CHECK");
+}
+
 /// The `hash_mode` CHECK rejects any value outside the two shipped modes.
 #[tokio::test]
 async fn content_hash_modes_rejects_unknown_hash_mode() {
