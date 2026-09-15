@@ -109,17 +109,18 @@ type-revision history.
   `(tenant, producer, idempotency_key)`, and a scope records its owning
   producer and refuses a replacement submitted by anyone else. Source-namespace
   ownership (`fr-source-ownership`) *is* enforced.
-- *Neighborhood projection truncates by arrival order, not by degree*, and
-  traversal takes explicit seed keys only (not search hits) and does not echo
-  the admitted seeds.
+- *Traversal takes explicit seed keys only*, not search hits. Retention under
+  a neighborhood budget *is* degree-ordered, and a traversal *does* echo the
+  seeds it admitted.
 - *Hybrid search fails, rather than degrading to its lexical arm,* when the
   embedding provider is unavailable; lexical hits carry no snippets.
 - *Compound reads on the built-in store are not one snapshot* (the platform
   offers no caller-held transaction), and the service opens a snapshot for
   traversal only. Search and projection responses still report the revision
   they observed.
-- *The traversal edge-scan budget is per hop, and a hop that reaches it is
-  trimmed without a truncation reason.*
+- *The traversal edge-scan budget is per hop*, not per walk: a walk can scan
+  the per-hop ceiling at every depth. A hop that reaches it does say so
+  (`EdgeScanCap`).
 - *Reason codes for `not_found`, `unimplemented`, `deadline_exceeded`,
   `cancelled`, `unavailable`, `data_loss` and `unknown` are not on the wire*:
   the platform's builders for those categories carry no reason slot.
@@ -132,8 +133,10 @@ type-revision history.
   contract holds for idempotency receipts only.
 - *Endpoint-constraint validation runs inside the ingest transaction but not
   under row locks* — the platform's secure ORM exposes no locking surface.
-- *Deleting an already-tombstoned row answers `404`* rather than succeeding as
-  a no-op, and re-ingesting a tombstoned edge revives it.
+- *Re-ingesting a tombstoned edge revives it* rather than refusing, so a
+  delete is undone by the next batch that names the same edge. Deleting an
+  already-tombstoned row settles as a no-op; only a row that never existed is
+  `404`.
 - *Base-ontology schemas are published once per tenant and have no update
   path*: an edit to a base schema does not reach a database that already
   published it.
