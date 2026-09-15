@@ -35,7 +35,7 @@ RUN if [ -n "$CARGO_FEATURES" ]; then \
     fi
 
 # Stage 2: Runtime - must match builder's base OS
-FROM debian:13.3-slim
+FROM debian:13.6-slim
 
 WORKDIR /app
 
