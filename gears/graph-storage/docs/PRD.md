@@ -292,13 +292,17 @@ Convergence **MUST** hold under retries with unknown commit outcomes: every inge
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
-> **Found while building the prototype.** Two clauses are not yet met: the
-> idempotency key is scoped to the tenant, not to the tenant *and producer*
-> (the producer principal is not carried into the store), and writes are one
-> statement per node and per edge rather than batched statements. The
-> measured § 6.1 ingest budget is met regardless (10k nodes + 20k edges in
-> ~20 s on developer hardware), so batching is a cost question rather than a
-> correctness one; the producer scope is an open gap.
+> **Found while building the prototype.** One clause is not met as written:
+> writes are one statement per node and per edge rather than batched
+> statements. The measured § 6.1 ingest budget is met regardless (10k nodes +
+> 20k edges in ~20 s on developer hardware), so batching is a cost question
+> rather than a correctness one. The producer scope *is* met: the writing
+> principal is carried into the store, the idempotency receipt's key is
+> `(tenant, producer, idempotency_key)`, and a scope records its owning
+> producer and refuses a replacement from any other. Both columns existed from
+> the first migration and both were written empty, so every check around them
+> passed vacuously until this was found; rows written before the fix carry an
+> empty owner and are adopted by the producer that next replaces the scope.
 
 #### Stable Identity and Parallel Edges
 

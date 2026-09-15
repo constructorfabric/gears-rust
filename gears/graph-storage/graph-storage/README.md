@@ -102,12 +102,13 @@ type-revision history.
 
 **Narrower than documented** (built, with a stated gap):
 
-- *Producer identity is not carried into the store.* The idempotency key is
-  tenant-scoped rather than tenant-and-producer-scoped, and a scope's
-  "owning producer" is not recorded, so any writer in the tenant may replace
-  any scope; ordinary ingests do not take the shared scope lock the ingest
-  protocol describes. Source-namespace ownership (`fr-source-ownership`) *is*
-  enforced.
+- *Ordinary ingests do not take the shared scope lock the ingest protocol
+  describes* — a scope replacement fences on a monotonic generation instead,
+  which is the only serialization the secure ORM's surface allows. Producer
+  identity *is* carried into the store: an idempotency receipt is keyed by
+  `(tenant, producer, idempotency_key)`, and a scope records its owning
+  producer and refuses a replacement submitted by anyone else. Source-namespace
+  ownership (`fr-source-ownership`) *is* enforced.
 - *Neighborhood projection truncates by arrival order, not by degree*, and
   traversal takes explicit seed keys only (not search hits) and does not echo
   the admitted seeds.
