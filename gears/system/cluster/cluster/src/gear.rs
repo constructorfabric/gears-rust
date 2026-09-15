@@ -117,13 +117,29 @@ impl ClusterGear {
     /// is the honest declaration doing its job, not a missing registration.
     ///
     /// [`DEFAULT_PROVIDER`]: crate::DEFAULT_PROVIDER
+    ///
+    /// The Kubernetes providers are gated behind the `k8s` cargo feature (kube is a
+    /// heavy dependency tree), so a non-k8s build links neither them nor kube. This
+    /// is where the tree first registers a **native** `with_leader_election_provider`
+    /// — every earlier provider left leader election to the SDK default over a cache.
+    #[cfg_attr(not(feature = "k8s"), allow(unused_mut))]
     fn provider_registry() -> ProviderRegistry {
-        ProviderRegistry::new()
+        let mut registry = ProviderRegistry::new()
             .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider))
             .with_cache_provider(Arc::new(postgres_cluster_plugin::PostgresCacheProvider))
             .with_lock_provider(Arc::new(postgres_cluster_plugin::PostgresLockProvider))
             .with_cache_provider(Arc::new(redis_cluster_plugin::RedisCacheProvider))
-            .with_lock_provider(Arc::new(redis_cluster_plugin::RedisLockProvider))
+            .with_lock_provider(Arc::new(redis_cluster_plugin::RedisLockProvider));
+        #[cfg(feature = "k8s")]
+        {
+            registry = registry
+                .with_cache_provider(Arc::new(k8s_cluster_plugin::K8sCacheProvider))
+                .with_leader_election_provider(Arc::new(
+                    k8s_cluster_plugin::K8sLeaderElectionProvider,
+                ))
+                .with_lock_provider(Arc::new(k8s_cluster_plugin::K8sLockProvider));
+        }
+        registry
     }
 
     /// The profile index, or an error naming the lifecycle violation.
