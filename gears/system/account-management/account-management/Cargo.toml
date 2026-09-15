@@ -54,7 +54,7 @@ types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
 gts = { workspace = true }
 
-uuid = { workspace = true, features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
 time = { workspace = true }
 
 thiserror = { workspace = true }

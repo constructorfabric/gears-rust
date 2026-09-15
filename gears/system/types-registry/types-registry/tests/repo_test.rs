@@ -240,6 +240,61 @@ async fn cas_with_a_stale_version_affects_no_row_and_reports_it() {
 }
 
 #[tokio::test]
+async fn ownership_cas_requires_both_owner_and_version_and_advances_version() {
+    let db = test_db().await;
+    seed(&db, &[CUSTOMER_V1]).await;
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+
+    assert!(
+        !EntityRepo::compare_and_swap_owning_gear(
+            &conn,
+            &scope,
+            CUSTOMER_V1,
+            1,
+            Some("foreign-gear"),
+            "account-management",
+            NOW,
+        )
+        .await
+        .expect("owner mismatch is an ordinary lost CAS")
+    );
+    assert!(
+        EntityRepo::compare_and_swap_owning_gear(
+            &conn,
+            &scope,
+            CUSTOMER_V1,
+            1,
+            Some("types-registry"),
+            "account-management",
+            NOW,
+        )
+        .await
+        .expect("matching CAS")
+    );
+    assert!(
+        !EntityRepo::compare_and_swap_owning_gear(
+            &conn,
+            &scope,
+            CUSTOMER_V1,
+            1,
+            Some("types-registry"),
+            "another-gear",
+            NOW,
+        )
+        .await
+        .expect("stale version is an ordinary lost CAS")
+    );
+
+    let reread = EntityRepo::find_by_gts_id(&conn, &scope, CUSTOMER_V1)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(reread.owning_gear.as_deref(), Some("account-management"));
+    assert_eq!(reread.resource_version, 2);
+}
+
+#[tokio::test]
 async fn cas_refuses_to_advance_past_the_integer_ceiling() {
     let db = test_db().await;
     seed(&db, &[CUSTOMER_V1]).await;

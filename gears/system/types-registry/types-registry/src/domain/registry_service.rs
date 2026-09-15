@@ -34,7 +34,7 @@ use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::config::TypesRegistryConfig;
-use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
+use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept_owned};
 use crate::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use crate::domain::admission::{Accepted, OperationDispatch, SubmitRequest};
 use crate::domain::enums::{
@@ -231,8 +231,28 @@ impl RegistryService {
         request: &SubmitRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
+        self.submit_with_owner(request, None, now).await
+    }
+
+    /// Submit trusted in-process work attributed to `owning_gear`.
+    pub(crate) async fn submit_for_gear(
+        &self,
+        request: &SubmitRequest,
+        owning_gear: &str,
+        now: OffsetDateTime,
+    ) -> Result<Accepted, ServiceError> {
+        self.submit_with_owner(request, Some(owning_gear), now)
+            .await
+    }
+
+    async fn submit_with_owner(
+        &self,
+        request: &SubmitRequest,
+        owning_gear: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<Accepted, ServiceError> {
         let provider: DBProvider<AcceptanceError> = DBProvider::new(self.db.clone());
-        let accepted = accept(
+        let accepted = accept_owned(
             &self.stores,
             &provider,
             &Self::scope(),
@@ -243,6 +263,7 @@ impl RegistryService {
             },
             &self.dispatch,
             request,
+            owning_gear,
             now,
         )
         .await?;
@@ -280,6 +301,41 @@ impl RegistryService {
             accepted.status = OperationStatus::Completed;
         }
         Ok(accepted)
+    }
+
+    /// Compare-and-swap externally visible ownership attribution.
+    pub(crate) async fn compare_and_swap_owning_gear(
+        &self,
+        gts_id: &str,
+        expected_resource_version: i64,
+        expected_owning_gear: Option<&str>,
+        owning_gear: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, ServiceError> {
+        let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+        let stores = Arc::clone(&self.stores);
+        let scope = Self::scope();
+        let gts_id = gts_id.to_owned();
+        let expected_owning_gear = expected_owning_gear.map(str::to_owned);
+        let owning_gear = owning_gear.to_owned();
+        provider
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    stores
+                        .compare_and_swap_owning_gear(
+                            tx,
+                            &scope,
+                            &gts_id,
+                            expected_resource_version,
+                            expected_owning_gear.as_deref(),
+                            &owning_gear,
+                            now,
+                        )
+                        .await
+                        .map_err(ServiceError::from)
+                })
+            })
+            .await
     }
 
     /// Read one operation and its per-candidate outcomes.

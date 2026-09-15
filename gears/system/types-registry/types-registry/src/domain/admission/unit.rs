@@ -54,7 +54,8 @@ use crate::observability::{self, CompatFacts};
 ///
 /// ponytail: ceiling C3 — caller-declared attribution that MUST NOT authorize
 /// (`database.sql`). Honest while P0 has one writer, the registry seeding itself.
-/// Upgrade: the inventory record's own `owning_gear`.
+/// Owner used by legacy and REST P0 submissions that carry no trusted
+/// in-process gear attribution.
 pub const P0_OWNING_GEAR: &str = "types-registry";
 
 /// The kind-specific half of an evaluation. The kind *is* the variant, so
@@ -840,6 +841,7 @@ pub async fn commit_creation(
     scope: &AccessScope,
     unit: &EvaluatedUnit,
     limits: &Limits,
+    owning_gear: &str,
     now: OffsetDateTime,
 ) -> Result<Result<CommittedUnit, ItemFailure>, WorkerError> {
     claim_entity_write_order(stores, tx, scope, now).await?;
@@ -929,7 +931,7 @@ pub async fn commit_creation(
                 // write-once, so this is the only writer of either column.
                 ownership_scope: family.ownership_scope,
                 owner_tenant_id: family.owner_tenant_id,
-                owning_gear: Some(P0_OWNING_GEAR.to_owned()),
+                owning_gear: Some(owning_gear.to_owned()),
                 now,
             },
         )

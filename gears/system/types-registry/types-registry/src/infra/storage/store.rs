@@ -137,6 +137,28 @@ impl EntityStore for Repos {
         EntityRepo::compare_and_swap_version(tx, scope, entity_id, expected_resource_version, now)
             .await
     }
+
+    async fn compare_and_swap_owning_gear(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_id: &str,
+        expected_resource_version: i64,
+        expected_owning_gear: Option<&str>,
+        owning_gear: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        EntityRepo::compare_and_swap_owning_gear(
+            tx,
+            scope,
+            gts_id,
+            expected_resource_version,
+            expected_owning_gear,
+            owning_gear,
+            now,
+        )
+        .await
+    }
 }
 
 #[async_trait]

@@ -53,7 +53,10 @@ use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::{
     AmDbProvider, ConversionRepoImpl, MetadataRepoImpl, TenantHierarchyReadAdapter, TenantRepoImpl,
 };
-use crate::infra::types_registry::{GtsMetadataSchemaRegistry, GtsTenantTypeChecker};
+use crate::infra::types_registry::{
+    GtsMetadataSchemaRegistry, GtsTenantTypeChecker, RootTypeAwareRegistryClient,
+    reconcile_root_type,
+};
 use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::client_hub::ClientScope;
@@ -68,6 +71,7 @@ type ConcreteService = TenantService<TenantRepoImpl>;
 /// the orchestrator mark the pod as live before the `IdP` wait begins.
 struct BootstrapParams {
     config: crate::domain::bootstrap::BootstrapConfig,
+    root_type: crate::domain::root_type::RootTypeConfig,
     idp_required: bool,
     repo: Arc<TenantRepoImpl>,
     idp: Arc<dyn IdpPluginClient>,
@@ -534,6 +538,37 @@ fn check_task_join(
     }
 }
 
+fn validate_existing_root_binding(
+    existing_root_id: uuid::Uuid,
+    existing_type_uuid: uuid::Uuid,
+    bootstrap: Option<&crate::domain::bootstrap::BootstrapConfig>,
+    root_type: &crate::domain::root_type::RootTypeConfig,
+) -> anyhow::Result<()> {
+    if let Some(boot_cfg) = bootstrap
+        && existing_root_id != boot_cfg.root_id
+    {
+        anyhow::bail!(
+            "existing platform root has id={existing_root_id}, but bootstrap.root_id={}; an explicit root migration is required",
+            boot_cfg.root_id
+        );
+    }
+    let configured_type_uuid = gts::GtsId::try_new(root_type.gts_id.as_ref())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid root_tenant_type.gts_id {}: {error}",
+                root_type.gts_id
+            )
+        })?
+        .to_uuid();
+    if existing_type_uuid != configured_type_uuid {
+        anyhow::bail!(
+            "existing platform root {existing_root_id} has tenant_type_uuid={existing_type_uuid}, but configured root_tenant_type.gts_id {} resolves to {configured_type_uuid}; an explicit root/schema migration is required",
+            root_type.gts_id
+        );
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Gear for AccountManagementGear {
     #[tracing::instrument(skip_all, fields(gear = "account-management"))]
@@ -547,6 +582,9 @@ impl Gear for AccountManagementGear {
         // background-task abort the host runtime sees as a panic.
         cfg.validate()
             .map_err(|err| anyhow::anyhow!("account-management config invalid: {err}"))?;
+        let root_type = cfg
+            .resolved_root_type()
+            .map_err(|err| anyhow::anyhow!("account-management root-type config invalid: {err}"))?;
         info!(
             max_list_children_top = cfg.listing.max_top,
             depth_strict_mode = cfg.hierarchy.depth_strict_mode,
@@ -660,10 +698,68 @@ impl Gear for AccountManagementGear {
         //     service-layer CRUD return value.
         //   * the `IdpPluginSpecV1` instance enumeration used by the
         //     vendor-based plugin selection block immediately below.
-        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
+        let legacy_types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
             .client_hub()
             .get::<dyn types_registry_sdk::TypesRegistryClient>()
             .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
+
+        // The root-type contract is reconciled independently from the optional
+        // bootstrap saga and its `strict` policy. Once reconciled, every AM read
+        // of that configured root is routed back to authoritative storage; only
+        // unrelated entities continue through the temporary legacy catalogue.
+        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = if let Some(
+            root_cfg,
+        ) =
+            root_type.as_ref()
+        {
+            // `tenant_type_uuid` is the durable create-once binding between
+            // an existing root row and its configured GTS contract. Reject
+            // drift before mutating the registry and before non-strict
+            // bootstrap policy can suppress it.
+            if let Some(existing_root) = repo
+                .find_platform_root(&toolkit_db::secure::AccessScope::allow_all())
+                .await?
+            {
+                validate_existing_root_binding(
+                    existing_root.id,
+                    existing_root.tenant_type_uuid,
+                    cfg.bootstrap.as_ref(),
+                    root_cfg,
+                )?;
+            }
+
+            let persistent_registry: Arc<dyn types_registry_sdk::TypesRegistryEntities> = ctx
+                    .client_hub()
+                    .get::<dyn types_registry_sdk::TypesRegistryEntities>()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to get persistent TypesRegistryEntities for root-type reconciliation: {e}"
+                        )
+                    })?;
+            let outcome = reconcile_root_type(Arc::clone(&persistent_registry), root_cfg)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "account-management root tenant type reconciliation failed: {error}"
+                    )
+                })?;
+
+            info!(
+                target: "am.root_tenant_type",
+                root_tenant_type = %root_cfg.gts_id,
+                ?outcome,
+                "root tenant type reconciled with authoritative Types Registry storage"
+            );
+
+            Arc::new(RootTypeAwareRegistryClient::new(
+                Arc::clone(&legacy_types_registry),
+                persistent_registry,
+                root_cfg.clone(),
+            )?)
+        } else {
+            legacy_types_registry
+        };
+
         info!("types-registry client resolved from client hub; enabling GTS tenant-type checker");
         let tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync> =
             Arc::new(GtsTenantTypeChecker::new(types_registry.clone()));
@@ -848,8 +944,12 @@ impl Gear for AccountManagementGear {
                     "bootstrap configuration invalid (non-strict); skipping bootstrap"
                 );
             } else {
+                let root_type = root_type.clone().ok_or_else(|| {
+                    anyhow::anyhow!("validated bootstrap is missing its root_tenant_type contract")
+                })?;
                 *self.bootstrap_params.lock() = Some(BootstrapParams {
                     config: boot_cfg,
+                    root_type,
                     idp_required: cfg.idp.required,
                     repo: Arc::clone(&repo),
                     idp: Arc::clone(&idp),
@@ -1336,7 +1436,8 @@ async fn run_bootstrap_saga(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let strict = params.config.strict;
-    let mut bootstrap = BootstrapService::new(params.repo, params.idp, params.config);
+    let mut bootstrap =
+        BootstrapService::new(params.repo, params.idp, params.config, params.root_type);
     bootstrap = bootstrap
         .with_types_registry(params.types_registry)
         .with_idp_required(params.idp_required)

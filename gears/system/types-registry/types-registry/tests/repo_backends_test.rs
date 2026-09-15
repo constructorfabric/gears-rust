@@ -247,6 +247,54 @@ async fn cas_reports_by_affected_rows(db: &Provider, family_id: i64, backend: &s
     );
 }
 
+/// Ownership adoption uses one conditional update on each production backend;
+/// an owner mismatch or stale version must affect no row.
+async fn ownership_cas_matches_owner_and_version(db: &Provider, family_id: i64, backend: &str) {
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let gts_id = gts_id!("acme.crm.owner_cas.type.v1~");
+    let row = EntityRepo::insert(&conn, &scope, new_entity(gts_id, family_id))
+        .await
+        .expect("insert")
+        .expect("the identifier is free");
+
+    assert!(
+        EntityRepo::compare_and_swap_owning_gear(
+            &conn,
+            &scope,
+            gts_id,
+            row.resource_version,
+            Some("types-registry"),
+            "account-management",
+            NOW,
+        )
+        .await
+        .expect("matching ownership CAS")
+    );
+    assert!(
+        !EntityRepo::compare_and_swap_owning_gear(
+            &conn,
+            &scope,
+            gts_id,
+            row.resource_version,
+            Some("types-registry"),
+            "foreign-gear",
+            NOW,
+        )
+        .await
+        .expect("stale ownership CAS")
+    );
+    let reread = EntityRepo::find_by_gts_id(&conn, &scope, gts_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(
+        (reread.owning_gear.as_deref(), reread.resource_version),
+        (Some("account-management"), 2),
+        "ownership adoption must be atomic on {backend}"
+    );
+}
+
 /// The closure walk over real foreign keys: `fk_tr_dependency_*` are declared
 /// `RESTRICT` on PostgreSQL and `MySQL` but not enforced by default on `SQLite`,
 /// so an edge insert that named a non-existent endpoint would only fail here.
@@ -905,6 +953,7 @@ async fn assert_repo_primitives_behave(db: &Provider, backend: &str) {
     keyset_pages_in_byte_order(db, family.id, backend).await;
     pattern_list_agrees_with_gts(db, backend).await;
     cas_reports_by_affected_rows(db, family.id, backend).await;
+    ownership_cas_matches_owner_and_version(db, family.id, backend).await;
     closure_walks_a_chain(db, family.id, backend).await;
     reverse_impact_walks_back_up_a_chain(db, family.id, backend).await;
     current_documents_reads_the_current_revision_only(db, family.id, backend).await;

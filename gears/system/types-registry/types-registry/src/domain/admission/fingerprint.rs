@@ -159,6 +159,8 @@ pub struct FingerprintInput<'a> {
     /// included so a tenant-owned request cannot ever fingerprint-match a global
     /// one under the same key.
     pub ownership_scope: OwnershipScope,
+    /// Trusted gear attribution. `None` preserves the P0 fingerprint shape.
+    pub owning_gear: Option<&'a str>,
     pub candidates: &'a [FingerprintCandidate<'a>],
 }
 
@@ -179,6 +181,12 @@ pub fn request_fingerprint(input: &FingerprintInput<'_>) -> RequestFingerprint {
         input.tenant_id.as_ref().map_or(&[][..], |t| t.as_bytes()),
     );
     write_field(&mut hasher, input.principal_id.as_bytes());
+    // Preserve every pre-owner P0 fingerprint byte-for-byte when attribution is
+    // absent, while binding owner-aware in-process submissions to their owner.
+    if let Some(owning_gear) = input.owning_gear {
+        write_field(&mut hasher, b"owning-gear");
+        write_field(&mut hasher, owning_gear.as_bytes());
+    }
     write_field(&mut hasher, &field_len(input.candidates.len()));
     for candidate in input.candidates {
         write_field(&mut hasher, candidate.gts_id.as_bytes());

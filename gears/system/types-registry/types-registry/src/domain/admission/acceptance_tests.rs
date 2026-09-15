@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use toolkit_gts::gts_id;
 
 use super::super::{Candidate, Precondition, SubmitRequest};
-use super::{AcceptanceContext, AcceptanceError, validate};
+use super::{AcceptanceContext, AcceptanceError, validate, validate_with_owner};
 use crate::config::{PolicyEntry, TypesRegistryConfig};
 use crate::domain::enums::OperationKind;
 use crate::domain::policy::RegistrationPolicy;
@@ -85,6 +85,22 @@ fn run(
     )
 }
 
+fn run_owned(
+    pair: &(RegistrationPolicy, TypesRegistryConfig),
+    request: &SubmitRequest,
+    owning_gear: &str,
+) -> Result<super::Validated, AcceptanceError> {
+    validate_with_owner(
+        &AcceptanceContext {
+            policy: &pair.0,
+            config: &pair.1,
+            metrics: &noop_metrics(),
+        },
+        request,
+        Some(owning_gear),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The happy path, and what it records
 // ---------------------------------------------------------------------------
@@ -93,6 +109,17 @@ fn run(
 /// produces: precondition `0` for must-not-exist, and the canonical body as the
 /// request payload (`ck_tr_operation_item_state` requires a payload while the item
 /// is non-terminal).
+#[test]
+fn trusted_owning_gear_is_recorded_and_fingerprinted() {
+    let pair = closed();
+    let request = request(vec![candidate(CF_TYPE)]);
+    let unowned = run(&pair, &request).expect("accepted");
+    let owned = run_owned(&pair, &request, "account-management").expect("accepted");
+
+    assert_eq!(owned.owning_gear.as_deref(), Some("account-management"));
+    assert_ne!(owned.request_fingerprint, unowned.request_fingerprint);
+}
+
 #[test]
 fn a_platform_vendor_creation_is_accepted_and_records_its_item() {
     let pair = closed();

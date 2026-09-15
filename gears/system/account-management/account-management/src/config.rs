@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use crate::domain::bootstrap::BootstrapConfig;
 use crate::domain::integrity_check::IntegrityCheckConfig;
+use crate::domain::root_type::RootTypeConfig;
 
 /// Gear configuration for `cf-gears-account-management`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -42,6 +43,11 @@ pub struct AccountManagementConfig {
     /// `cpt-cf-account-management-adr-conversion-approval` (ADR-0003)
     /// and PRD §5.4.
     pub conversion: ConversionConfig,
+
+    /// AM-owned concrete platform-root tenant-type contract. Independent from
+    /// tenant bootstrap so a deployment that creates its root out of band still
+    /// reconciles the shared schema.
+    pub root_tenant_type: Option<RootTypeConfig>,
 
     /// Optional platform-bootstrap saga configuration. `None` means no
     /// in-process bootstrap on this platform start (deployment is
@@ -466,6 +472,73 @@ impl Default for IdpConfig {
 }
 
 impl AccountManagementConfig {
+    /// Resolve the independent root-type contract, accepting the former
+    /// bootstrap fields during migration. Two supplied sources must agree.
+    /// Bootstrap requires a root-type contract, but root-type reconciliation
+    /// does not require bootstrap.
+    ///
+    /// # Errors
+    /// Returns a diagnostic for conflicting modern/legacy values or an invalid
+    /// concrete AM tenant-type identifier.
+    pub fn resolved_root_type(&self) -> Result<Option<RootTypeConfig>, String> {
+        let legacy = self.bootstrap.as_ref().and_then(|bootstrap| {
+            bootstrap
+                .root_tenant_type
+                .as_ref()
+                .map(|gts_id| RootTypeConfig {
+                    gts_id: gts_id.clone(),
+                    idp_provisioning: bootstrap.root_tenant_type_idp_provisioning.unwrap_or(false),
+                })
+        });
+
+        if self.bootstrap.as_ref().is_some_and(|bootstrap| {
+            bootstrap.root_tenant_type.is_none()
+                && bootstrap.root_tenant_type_idp_provisioning.is_some()
+        }) {
+            return Err(
+                "bootstrap.root_tenant_type_idp_provisioning requires bootstrap.root_tenant_type"
+                    .to_owned(),
+            );
+        }
+
+        let resolved = match (&self.root_tenant_type, legacy) {
+            (Some(modern), Some(legacy)) => {
+                if modern.gts_id != legacy.gts_id {
+                    return Err(format!(
+                        "root_tenant_type.gts_id `{}` conflicts with deprecated bootstrap.root_tenant_type `{}`",
+                        modern.gts_id, legacy.gts_id
+                    ));
+                }
+                if let Some(legacy_idp) = self
+                    .bootstrap
+                    .as_ref()
+                    .and_then(|bootstrap| bootstrap.root_tenant_type_idp_provisioning)
+                    && modern.idp_provisioning != legacy_idp
+                {
+                    return Err(format!(
+                        "root_tenant_type.idp_provisioning={} conflicts with deprecated bootstrap.root_tenant_type_idp_provisioning={legacy_idp}",
+                        modern.idp_provisioning
+                    ));
+                }
+                Some(modern.clone())
+            }
+            (Some(modern), None) => Some(modern.clone()),
+            (None, Some(legacy)) => Some(legacy),
+            (None, None) if self.bootstrap.is_some() => {
+                return Err(
+                    "bootstrap requires root_tenant_type.gts_id (or deprecated bootstrap.root_tenant_type during migration)"
+                        .to_owned(),
+                );
+            }
+            (None, None) => None,
+        };
+
+        if let Some(root_type) = resolved.as_ref() {
+            root_type.validated_id()?;
+        }
+        Ok(resolved)
+    }
+
     /// Upper bound on `hierarchy.depth_threshold` so that the
     /// `algo-depth-threshold-evaluation` `parent.depth + 1` arithmetic
     /// in `create_tenant` cannot land on `u32::MAX` and either silently
@@ -576,6 +649,10 @@ impl AccountManagementConfig {
         // interval / jitter / initial_delay surfaces here rather than
         // panicking inside the spawned loop on `tokio::time::sleep`.
         let integrity_err = self.integrity_check.validate().err();
+        // Root-type resolution is lifecycle-fatal independently of bootstrap's
+        // strict mode: a malformed or conflicting schema contract must never be
+        // downgraded to best-effort bootstrap behavior.
+        let root_type_err = self.resolved_root_type().err();
         // Bootstrap sub-section is NOT validated here. The bootstrap
         // saga's `BootstrapConfig::strict` field is the
         // operator-facing knob that selects whether a malformed
@@ -588,7 +665,11 @@ impl AccountManagementConfig {
         // out of band) unreachable — a malformed block would abort
         // init before the strict-vs-non-strict branch in `init`
         // could see the error. See `gear.rs::Gear::init`.
-        if bad.is_empty() && conversion_err.is_none() && integrity_err.is_none() {
+        if bad.is_empty()
+            && conversion_err.is_none()
+            && integrity_err.is_none()
+            && root_type_err.is_none()
+        {
             Ok(())
         } else {
             let mut parts: Vec<String> = bad.into_iter().map(str::to_owned).collect();
@@ -596,6 +677,9 @@ impl AccountManagementConfig {
                 parts.push(err);
             }
             if let Some(err) = integrity_err {
+                parts.push(err);
+            }
+            if let Some(err) = root_type_err {
                 parts.push(err);
             }
             Err(format!(

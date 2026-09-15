@@ -30,6 +30,8 @@ pub mod artifacts;
 pub mod compat;
 // The three direct dependency edge kinds, extracted from authored content and the identifier.
 pub mod dependency;
+// ClientHub adapter for authoritative persistent reads and admission.
+pub mod entities_client;
 // Version-family key derivation and the three family rules.
 pub mod family;
 // The transient `gts-rust` store, one per admission unit (SPEC D2, §8.2).

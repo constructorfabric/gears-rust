@@ -31,6 +31,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod api;
+pub mod entities;
 pub mod error;
 pub mod field;
 pub mod gts;
@@ -41,6 +42,11 @@ pub mod precondition;
 pub mod testing;
 
 pub use api::TypesRegistryClient;
+pub use entities::{
+    CandidateError, CandidateStatus, EntityKind, EntitySnapshot, LifecycleStatus, OperationStatus,
+    RegisterEntities, RegisterItem, RegistrationItemResult, RegistrationOperation,
+    TypesRegistryEntities,
+};
 pub use error::{FieldIssue, TypesRegistryError};
 pub use gts::TYPE_RESOURCE_TYPE;
 pub use models::{

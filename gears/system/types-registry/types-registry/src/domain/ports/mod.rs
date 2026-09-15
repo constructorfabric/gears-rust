@@ -223,6 +223,8 @@ pub struct OperationRow {
     pub idempotency_key: String,
     pub idempotency_scope_hash: ScopeHash,
     pub request_fingerprint: RequestFingerprint,
+    /// Trusted in-process attribution, never an authorization input.
+    pub owning_gear: Option<String>,
     pub status: OperationStatus,
     pub created_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
@@ -465,6 +467,7 @@ pub struct NewOperation {
     /// than carried as three columns.
     pub idempotency_scope_hash: ScopeHash,
     pub request_fingerprint: RequestFingerprint,
+    pub owning_gear: Option<String>,
     pub now: OffsetDateTime,
 }
 
@@ -587,6 +590,20 @@ pub trait EntityStore: Send + Sync {
         expected_resource_version: i64,
         now: OffsetDateTime,
     ) -> Result<Option<i64>, ScopeError>;
+
+    /// Replace ownership attribution and advance the entity version only when
+    /// the current owner and resource version still match.
+    #[allow(clippy::too_many_arguments)]
+    async fn compare_and_swap_owning_gear(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_id: &str,
+        expected_resource_version: i64,
+        expected_owning_gear: Option<&str>,
+        owning_gear: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError>;
 }
 
 /// Authored revisions and the current-state row.

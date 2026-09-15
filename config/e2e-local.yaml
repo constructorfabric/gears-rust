@@ -121,31 +121,12 @@ gears:
       server: "sqlite_users"
       file: "types_registry.db"
     config:
-      # The AM envelope type schemas (`gts.cf.core.am.tenant_type.v1~`
-      # and `gts.cf.core.am.tenant_metadata.v1~`) are auto-seeded at
-      # link time via `inventory::submit!` declarations in the AM SDK
-      # (see `account-management-sdk/src/gts_envelopes.rs`). The only
-      # per-deployment seed left is the concrete platform-root tenant
-      # type below, because its identity is operator-controlled.
+      # The platform-root tenant type is owned and reconciled by AM in
+      # authoritative storage. This customer type remains deployment-owned E2E
+      # data used by the AM suite for children under the platform root. It allows
+      # nesting under either the platform root or another customer so the suite
+      # can build multi-level hierarchies for metadata-inheritance tests.
       entities:
-        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-          # JSON Schema dialect (NOT the parent type — derivation is encoded
-          # by the `~`-chain in `$id`). gts 0.10.0 trait validation compiles
-          # `x-gts-traits` under this dialect, so it must be a real meta-schema;
-          # the base envelope is authored in draft-07.
-          $schema: "http://json-schema.org/draft-07/schema#"
-          description: "Platform-root tenant type (no parents)."
-          type: "object"
-          allOf:
-            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
-          x-gts-traits:
-            allowed_parent_types: []
-            idp_provisioning: false
-        # Customer tenant type used by the AM E2E suite for child
-        # tenants under the platform root. Allows nesting under either
-        # the platform root or another customer so the suite can build
-        # multi-level hierarchies (parent + child + grandchild for the
-        # metadata-inheritance walk-up test).
         - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
           # JSON Schema dialect (NOT the parent type — derivation is encoded
           # by the `~`-chain in `$id`). gts 0.10.0 trait validation compiles
@@ -390,6 +371,9 @@ gears:
       server: "sqlite_users"
       file: "account_management.db"
     config:
+      root_tenant_type:
+        gts_id: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_provisioning: false
       bootstrap:
         # Matches static-tr-plugin's `e2e-root` so AM's tenants table
         # ends up holding the same root id the platform middleware
@@ -397,7 +381,6 @@ gears:
         # under it without a separate seeding step.
         root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
         root_name: "e2e-root"
-        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
         idp_wait_timeout: "5m"
         idp_retry_backoff_initial: "2s"
         idp_retry_backoff_max: "30s"

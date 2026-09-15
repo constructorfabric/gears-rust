@@ -6,7 +6,7 @@
 //! IdP-wait backoff envelope at deployment time. Defaults match
 //! FEATURE §3 `algo-platform-bootstrap-idp-wait-with-backoff`:
 //! `idp_retry_backoff_initial = 2s`, `idp_retry_backoff_max = 30s`,
-//! `idp_retry_timeout = 5min`. The envelope bounds the saga retry
+//! `bootstrap.idp_wait_timeout = 5min`. The envelope bounds the saga retry
 //! loop on `IdpUnavailable` raised during `provision_tenant`. The
 //! bootstrap saga itself is gated by
 //! [`BootstrapConfig::strict`] — `true` makes a bootstrap failure
@@ -55,17 +55,15 @@ pub struct BootstrapConfig {
     /// the `tenants.name` column verbatim.
     pub root_name: String,
 
-    /// Chained GTS tenant-type identifier (e.g.
-    /// `gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~`) forwarded
-    /// to the `IdP` plugin in
-    /// [`account_management_sdk::IdpProvisionTenantRequest::tenant_type`].
-    /// `serde::Deserialize` lifts the configured string into the typed
-    /// wrapper at config-load time so downstream consumers do not
-    /// re-parse on every saga step. The `tenants.tenant_type_uuid`
-    /// foreign-key value is derived from this GTS id at saga time
-    /// via the same V5-UUID algorithm `create_tenant` uses, so
-    /// operators only configure the canonical type identifier.
-    pub root_tenant_type: gts::GtsTypeId,
+    /// Deprecated compatibility alias for `root_tenant_type.gts_id`.
+    ///
+    /// New deployments must use the independent top-level `root_tenant_type` block.
+    /// When both are supplied they must agree; resolution is performed by
+    /// [`crate::config::AccountManagementConfig::resolved_root_type`].
+    pub root_tenant_type: Option<gts::GtsTypeId>,
+
+    /// Deprecated compatibility alias for `root_tenant_type.idp_provisioning`.
+    pub root_tenant_type_idp_provisioning: Option<bool>,
 
     /// Opaque deployment-supplied metadata forwarded to the `IdP` plugin
     /// without interpretation. AM does **not** validate the shape of
@@ -73,7 +71,7 @@ pub struct BootstrapConfig {
     pub root_tenant_metadata: Option<Value>,
 
     /// Total time the bootstrap saga is allowed to spend waiting for
-    /// `IdP` availability (FEATURE §3 `idp_retry_timeout`, default 300s).
+    /// `IdP` availability (FEATURE §3 `bootstrap.idp_wait_timeout`, default 300s).
     /// Used as the deadline for the saga retry loop on
     /// `IdpUnavailable` raised during step 2 (`provision_tenant`).
     ///
@@ -117,7 +115,8 @@ impl Default for BootstrapConfig {
             // [bootstrap] TOML table.
             root_id: Uuid::nil(),
             root_name: "platform-root".to_owned(),
-            root_tenant_type: gts::GtsTypeId::new(""),
+            root_tenant_type: None,
+            root_tenant_type_idp_provisioning: None,
             root_tenant_metadata: None,
             idp_wait_timeout: Duration::from_mins(5),
             idp_retry_backoff_initial: Duration::from_secs(2),
@@ -132,8 +131,8 @@ impl BootstrapConfig {
     ///
     /// `serde(default)` lets the operator omit any field, so an empty
     /// `[bootstrap]` TOML table deserialises to a config with
-    /// `root_id = Uuid::nil()` and `root_tenant_type = ""`. With
-    /// `strict = true` the saga would then insert a nil-id root,
+    /// `root_id = Uuid::nil()`. With `strict = true` the saga would
+    /// then insert a nil-id root,
     /// breaking the `fr-bootstrap-idempotency` contract on the next
     /// platform start (see `feature-platform-bootstrap.md` lines
     /// 23-25 — UUIDs are "deployment-stable; changing it between
@@ -152,9 +151,6 @@ impl BootstrapConfig {
         let mut missing: Vec<&'static str> = Vec::new();
         if self.root_id.is_nil() {
             missing.push("root_id");
-        }
-        if self.root_tenant_type.as_ref().trim().is_empty() {
-            missing.push("root_tenant_type");
         }
         if self.root_name.trim().is_empty() {
             missing.push("root_name");

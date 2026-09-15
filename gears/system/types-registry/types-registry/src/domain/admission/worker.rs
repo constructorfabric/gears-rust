@@ -41,7 +41,9 @@ use uuid::Uuid;
 pub use super::errors::{ItemFailure, WorkerError};
 use super::revision::{CommittedUnit, RevisionCommit};
 use super::unchanged;
-use super::unit::{EvaluationTarget, PreparedUnit, commit_creation, commit_revision, evaluate};
+use super::unit::{
+    EvaluationTarget, P0_OWNING_GEAR, PreparedUnit, commit_creation, commit_revision, evaluate,
+};
 use super::vector::VectorDrift;
 use crate::config::{Limits, WorkerSettings};
 use crate::domain::admission::AdmissionFailureReason;
@@ -148,15 +150,25 @@ async fn run_operation_inner(
         );
     }
 
+    let owning_gear = operation.owning_gear.as_deref().unwrap_or(P0_OWNING_GEAR);
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
         // Instrument each item without splitting `process_item` to own the span.
         let span =
             observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id);
         outcomes.push(
-            process_item(stores, db, scope, tuning, operation_id, &item, now)
-                .instrument(span)
-                .await?,
+            process_item(
+                stores,
+                db,
+                scope,
+                tuning,
+                operation_id,
+                &item,
+                owning_gear,
+                now,
+            )
+            .instrument(span)
+            .await?,
         );
     }
 
@@ -229,6 +241,7 @@ struct CommitRequest<'a> {
     now: OffsetDateTime,
     limits: Limits,
     metrics: &'a Arc<dyn AdmissionMetrics>,
+    owning_gear: &'a str,
 }
 
 /// Run the serialized commit transaction (SPEC step 4b).
@@ -246,6 +259,7 @@ async fn commit_prepared(
         now,
         limits,
         metrics,
+        owning_gear,
     } = request;
     let precondition = item.precondition;
     // A short READ COMMITTED transaction containing only rechecks and
@@ -265,14 +279,16 @@ async fn commit_prepared(
     let tx_stores = Arc::clone(stores);
     // The `'static` retry closure owns each attempt's handles.
     let tx_metrics = Arc::clone(metrics);
-    // Copy limits into the `'static` retry closure.
+    // Copy limits and ownership into the `'static` retry closure.
     let tx_limits = limits;
+    let owning_gear = owning_gear.to_owned();
     db.db()
         .transaction_with_retry(commit_write(&db.db()), retryable_db_err, |tx| {
             let prepared = prepared.clone();
             let tx_scope = tx_scope.clone();
             let tx_stores = Arc::clone(&tx_stores);
             let tx_metrics = Arc::clone(&tx_metrics);
+            let owning_gear = owning_gear.clone();
             Box::pin(async move {
                 let unit = match &prepared {
                     PreparedUnit::Unchanged(candidate) => {
@@ -288,11 +304,17 @@ async fn commit_prepared(
                     PreparedUnit::Evaluated(unit) => unit,
                 };
                 match precondition {
-                    Precondition::MustNotExist => {
-                        commit_creation(tx_stores.as_ref(), tx, &tx_scope, unit, &tx_limits, now)
-                            .await
-                            .map(|r| r.map(RevisionCommit::Admitted))
-                    }
+                    Precondition::MustNotExist => commit_creation(
+                        tx_stores.as_ref(),
+                        tx,
+                        &tx_scope,
+                        unit,
+                        &tx_limits,
+                        &owning_gear,
+                        now,
+                    )
+                    .await
+                    .map(|r| r.map(RevisionCommit::Admitted)),
                     Precondition::Version(expected) => {
                         commit_revision(
                             tx_stores.as_ref(),
@@ -314,6 +336,7 @@ async fn commit_prepared(
 
 /// Evaluate and commit one non-terminal item.
 /// Revision-vector drift triggers a fresh evaluation up to the configured attempt limit.
+#[allow(clippy::too_many_arguments)]
 async fn process_item(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
@@ -321,6 +344,7 @@ async fn process_item(
     tuning: Tuning<'_>,
     operation_id: Uuid,
     item: &OperationItemRow,
+    owning_gear: &str,
     now: OffsetDateTime,
 ) -> Result<ItemOutcome, WorkerError> {
     if item.status != OperationItemStatus::Pending && item.status != OperationItemStatus::Running {
@@ -392,6 +416,7 @@ async fn process_item(
                 now,
                 limits: *tuning.limits,
                 metrics: tuning.metrics,
+                owning_gear,
             },
         )
         .await
