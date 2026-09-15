@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!-- Created: 2026-09-07 by Constructor Tech -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>settings-service sandbox</title>
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 0; display: grid; grid-template-rows: auto 1fr 220px; height: 100vh; }
+  header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #ccc; flex-wrap: wrap; }
+  header label { display: flex; gap: 4px; align-items: center; }
+  main { display: grid; grid-template-columns: 220px 1fr; min-height: 0; }
+  nav { border-right: 1px solid #ccc; overflow: auto; }
+  nav button { display: block; width: 100%; text-align: left; padding: 6px 10px; border: 0; background: none; cursor: pointer; }
+  nav button.active { background: #dde; }
+  section { overflow: auto; padding: 8px 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border-bottom: 1px solid #ddd; padding: 4px 6px; text-align: left; vertical-align: top; }
+  td.value { font-family: ui-monospace, monospace; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 8px; background: #eee; font-size: 11px; }
+  .badge.own_override { background: #cfe8cf; } .badge.inherited { background: #d8e4f5; } .badge.schema_default { background: #f0e6c8; }
+  .actions button { margin-right: 4px; }
+  #log { border-top: 1px solid #ccc; overflow: auto; background: #111; color: #ddd; font: 12px ui-monospace, monospace; padding: 6px 12px; white-space: pre-wrap; }
+  #log .req { color: #9cf; } #log .ok { color: #9f9; } #log .err { color: #f99; }
+  .editor { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+  .editor textarea, .editor input[type=text] { width: 320px; font-family: ui-monospace, monospace; }
+  details summary { cursor: pointer; color: #369; }
+  .muted { color: #777; }
+  #panel { margin-top: 12px; padding: 8px; border: 1px solid #ccc; background: #fafafa; white-space: pre-wrap; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <strong>settings-service sandbox</strong>
+  <label>Identity <select id="token"></select></label>
+  <label>Tenant <select id="tenant"></select></label>
+  <label><input type="checkbox" id="showRaw"> show raw JSON</label>
+  <button id="reload">Reload</button>
+  <span id="status" class="muted"></span>
+</header>
+<main>
+  <nav id="categories"></nav>
+  <section>
+    <h3 id="title">Pick a category</h3>
+    <table id="settings"><thead><tr><th>Setting</th><th>Type</th><th>Value</th><th>Source</th><th>Actions</th></tr></thead><tbody></tbody></table>
+    <div id="panel" hidden></div>
+  </section>
+</main>
+<div id="log"></div>
+<script src="/app.js"></script>
+</body>
+</html>

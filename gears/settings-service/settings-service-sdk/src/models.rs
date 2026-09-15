@@ -1,0 +1,275 @@
+// Created: 2026-08-11 by Constructor Tech
+// @cpt-dod:cpt-cf-settings-service-dod-gear-foundation-sdk-models:p1
+//! Public models exchanged with settings consumers.
+//!
+//! The opaque secret handle and the effective-source vocabulary, the reader
+//! request and response shapes, and the declaration-contribution shapes.
+//!
+//! The change-notification payloads belong to Settings Activation and are not
+//! modelled here; see the [`crate::api`] module docs for why.
+
+use serde::{Deserialize, Serialize};
+
+use crate::SettingKey;
+
+/// Where an effective value resolved from.
+///
+/// A successful read always carries a value, because every declaration has a
+/// Schema Default and all three scope-class algorithms terminate in one. A
+/// consumer distinguishing *an administrator set this* from *nobody has touched
+/// it* therefore reads the source, never the value: a setting whose type admits
+/// `null` may legitimately be set to `null`, which is indistinguishable by
+/// inspection from a `null` default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveSource {
+    /// An override exists at the requested scope.
+    OwnOverride,
+    /// Resolved from a nearest-ancestor override.
+    Inherited,
+    /// No override anywhere in the chain; the declaration's own default.
+    SchemaDefault,
+}
+
+impl EffectiveSource {
+    /// Whether this source means no override exists anywhere in the chain.
+    ///
+    /// For a `secret`-trait setting this is also how a machine consumer detects
+    /// an unconfigured credential: the declaration's default is a non-secret
+    /// placeholder, so a schema-default source means no credential is set at any
+    /// scope and the placeholder must be treated as absent.
+    #[must_use]
+    pub const fn is_unconfigured(self) -> bool {
+        matches!(self, Self::SchemaDefault)
+    }
+}
+
+/// An opaque reference to a `secret`-trait value.
+///
+/// Returned in place of plaintext on every read of a secret-backed setting.
+/// The handle deliberately carries **no** Credential Store coordinates, so a
+/// consumer cannot bypass the audited resolution path by reading it apart; the
+/// only way to obtain plaintext is to present the handle back to the reader,
+/// which authorizes the caller against that specific setting and emits a
+/// secret-use audit event.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretHandle(String);
+
+impl SecretHandle {
+    /// Wrap an opaque token as a secret handle.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The opaque token, for transport only.
+    #[must_use]
+    pub fn as_token(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Redacted on purpose: a secret handle must never widen a log line into a
+/// disclosure path, so neither the token nor any derived material is printed.
+impl std::fmt::Debug for SecretHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretHandle(<redacted>)")
+    }
+}
+
+/// A request for one setting's effective value at a scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetEffectiveRequest {
+    /// The setting to resolve.
+    pub key: SettingKey,
+    /// The scope to resolve it for.
+    pub scope: String,
+}
+
+/// One scope the resolver inspected, as a consumer sees it.
+///
+/// The trail is the caller's own ancestor chain from the platform root down to
+/// the requested scope — never a sibling or a descendant. It carries no setter
+/// identity and no timestamp: an ancestor's administrator is not exposed to a
+/// subordinate tenant through the consumer path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrailEntry {
+    /// The scope inspected: `/` or `/tenants/{id}`.
+    pub scope: String,
+    /// Whether an override row exists at this scope.
+    pub has_override: bool,
+    /// Whether this scope supplied the effective value.
+    pub provided_value: bool,
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// A resolved effective value with the trace of where it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveValueResponse {
+    /// The setting that was resolved.
+    pub key: SettingKey,
+    /// The scope it was resolved for.
+    pub scope: String,
+    /// The resolved value. A secret-backed setting carries its masked handle.
+    pub value: serde_json::Value,
+    /// Where the value came from. Read this, not the value, to tell a
+    /// configured setting from an untouched one.
+    pub source: EffectiveSource,
+    /// The scope that supplied the value; absent for a Schema Default.
+    pub source_scope: Option<String>,
+    /// The value type's resolved trait set, for rendering and pre-validation.
+    #[serde(default = "empty_object")]
+    pub traits: serde_json::Value,
+    /// The scopes inspected, root to self.
+    #[serde(default)]
+    pub inheritance_trail: Vec<TrailEntry>,
+}
+
+/// Where a setting's values may exist, and how they are inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeClass {
+    /// One platform-wide value; tenants read it and never override it.
+    Global,
+    /// Overridable per tenant, inherited down the tenant chain.
+    Cascading,
+    /// Per tenant, never inherited.
+    Local,
+}
+
+/// Whether a setting shows in standard mode or only in advanced mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingMode {
+    /// Shown to every administrator.
+    Standard,
+    /// Shown in advanced mode only.
+    Advanced,
+}
+
+/// The classification a module may declare for its setting's values.
+///
+/// `secret` is not here on purpose: it is derived from the value type's trait
+/// and never accepted from the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContributedClassification {
+    /// Passes through every read.
+    Public,
+    /// Masked on administrative reads for callers without the PII entitlement.
+    Pii,
+}
+
+/// One declaration a module contributes at install or upgrade.
+///
+/// The module supplies the whole key — composed with [`SettingKey::contributed`]
+/// — and the value type its values validate against; the category is read off
+/// the key's third segment by the reconciler and created if absent.
+// @cpt-dod:cpt-cf-settings-service-dod-module-contributions-sdk:p1
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributedDeclaration {
+    /// The setting key the module supplies.
+    pub key: SettingKey,
+    /// The curated value type the setting's values validate against, from
+    /// `gts.cf.toolkit.settings.type_*~`.
+    pub value_type_id: String,
+    /// The Schema Default, validated against `value_type_id`. Mandatory: a
+    /// setting with no meaningful default sends JSON `null` on a type that
+    /// admits it; omitting the field is not the same thing.
+    pub default_value: serde_json::Value,
+    /// Where values may exist and how they are inherited.
+    pub scope_class: ScopeClass,
+    /// Standard or advanced mode; standard when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SettingMode>,
+    /// Human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administrative domain the setting belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_affinity: Option<String>,
+    /// The licence feature that gates the setting once the License Resolver exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence_feature: Option<String>,
+    /// `public` or `pii`; public when absent. `secret` is derived from the
+    /// value type's trait and never accepted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_classification: Option<ContributedClassification>,
+    /// Whether changing the value needs a fresh re-authentication; `true` when
+    /// absent — a declaration that says nothing is protected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_step_up: Option<bool>,
+    /// Whether the effective value may be served on the unauthenticated read
+    /// surface; `false` when absent, and refused on `pii`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous_exposable: Option<bool>,
+}
+
+impl ContributedDeclaration {
+    /// A declaration with the mandatory fields set and every optional one absent.
+    #[must_use]
+    pub fn new(
+        key: SettingKey,
+        value_type_id: impl Into<String>,
+        default_value: serde_json::Value,
+        scope_class: ScopeClass,
+    ) -> Self {
+        Self {
+            key,
+            value_type_id: value_type_id.into(),
+            default_value,
+            scope_class,
+            mode: None,
+            description: None,
+            domain_affinity: None,
+            licence_feature: None,
+            data_classification: None,
+            requires_step_up: None,
+            anonymous_exposable: None,
+        }
+    }
+}
+
+/// One declaration a reconcile refused, with the reason.
+///
+/// A refused item never fails the set: the others are still reconciled, and
+/// the caller reads the errors per key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionError {
+    /// The key of the refused declaration, as the module supplied it.
+    pub key: String,
+    /// A stable machine-readable reason.
+    pub code: String,
+    /// Human-readable detail.
+    pub message: String,
+}
+
+/// Outcome of one reconcile pass over a module's declarations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileResult {
+    /// Declarations newly inserted, including successors of an upgrade.
+    pub registered: usize,
+    /// Declarations updated in place.
+    pub updated: usize,
+    /// Declarations moved to retired.
+    pub retired: usize,
+    /// Declarations revived from retired.
+    pub reactivated: usize,
+    /// Declarations refused, each with its reason; the others were reconciled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ContributionError>,
+}
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod models_tests;

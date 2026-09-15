@@ -25,6 +25,10 @@ use license_resolver as _;
 use nodes_registry as _;
 #[cfg(feature = "resource-group")]
 use resource_group as _;
+#[cfg(feature = "settings-demo")]
+use settings_demo as _;
+#[cfg(feature = "settings-service")]
+use settings_service as _;
 #[cfg(all(feature = "simple-user-settings", not(feature = "oop-example")))]
 use simple_user_settings as _;
 use tenant_resolver as _;

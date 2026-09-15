@@ -383,6 +383,21 @@ gears:
       # must match static-credstore-plugin (default "constructorfabric").
       vendor: "constructorfabric"
 
+  settings-service:
+    database:
+      server: "sqlite_users"
+      file: "settings-service.db"
+    # The empty section is deliberate and required. The gear reads its
+    # configuration fail-closed, so an absent `config:` key aborts startup
+    # rather than defaulting: bootstrap values are deployment-owned and are
+    # never themselves managed settings, so there is nothing to fall back to.
+    #
+    # Nothing is required today -- the only field, `cache_ttl_seconds`, has a
+    # value fixed by the design (30s) rather than by the operator. The section
+    # exists so that the first genuinely required value fails loudly here
+    # instead of being silently invented.
+    config: {}
+
   static-credstore-plugin:
     config:
       secrets:
