@@ -1,0 +1,26 @@
+# Gearbox product metadata for Resource-Group Tenant Resolver Plugin.
+#
+# One of three alternatives filling tenant-resolver's extension point. Which
+# point that is, and this plugin's vendor and priority, are all read from
+# source; only the sdk locator is declared.
+
+gear(
+    name = "Resource-Group Tenant Resolver Plugin",
+    description = "Derives tenant identity from the resource-group hierarchy.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-rg-tr-plugin",
+        lib = "rg_tr_plugin",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-tenant-resolver-sdk",
+        lib = "tenant_resolver_sdk",
+        path = "../../tenant-resolver-sdk",
+    ),
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

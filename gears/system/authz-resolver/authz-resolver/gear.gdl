@@ -1,0 +1,46 @@
+# Gearbox product metadata for the authz-resolver gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system, rest),
+# colocated_deps (types-registry). Projected from #[toolkit::contract] in the
+# SDK: the contract's version, kind, and which transports it can be bound over.
+# So `provide` names the trait as a join key and declares only the generator
+# inputs -- the base path and the local factory.
+
+AUTHZ_SDK = cargo(
+    crate_name = "cf-gears-authz-resolver-sdk",
+    lib = "authz_resolver_sdk",
+    path = "../authz-resolver-sdk",
+)
+
+gear(
+    name = "AuthZ Resolver",
+    description = "Authorization policy evaluation with pluggable decision-point backends.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-authz-resolver",
+        lib = "authz_resolver",
+        path = ".",
+    ),
+
+    # Both roles point at the same crate, and they are different facts. As a
+    # plugin host this gear expects an implementation of the decision-point
+    # trait the SDK declares; as a provider it serves AuthZResolverApi, whose
+    # trait is declared there too.
+    sdk = AUTHZ_SDK,
+
+    provides = [
+        provide(
+            contract = "AuthZResolverApi",
+            rust = "authz_resolver_sdk::AuthZResolverApi",
+            sdk = AUTHZ_SDK,
+            local = "Self::build_local",
+            rest = rest(base_path = "/authz-resolver/v1"),
+        ),
+    ],
+
+    # The join key against a plugin's own vendor. Overriding one side and not
+    # the other is what fails silently at runtime.
+    config_schema = config(exposes = ["vendor"]),
+)

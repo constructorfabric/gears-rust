@@ -1,0 +1,30 @@
+# Gearbox product metadata for the authn-resolver gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
+# (types-registry).
+
+gear(
+    name = "Authentication Resolver",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-authn-resolver",
+        lib = "authn_resolver",
+        path = ".",
+    ),
+
+    # A locator, not a restatement. The SDK declares the plugin-API trait this
+    # gear expects an implementation of; nothing in the gear's own crate says
+    # where that SDK is. Which trait it is, and which gears implement it, are
+    # both read from source.
+    sdk = cargo(
+        crate_name = "cf-gears-authn-resolver-sdk",
+        lib = "authn_resolver_sdk",
+        path = "../authn-resolver-sdk",
+    ),
+
+    # The join key against a plugin's own vendor. Overriding one side and not the
+    # other is what fails silently at runtime, which is why it is worth surfacing.
+    config_schema = config(exposes = ["vendor"]),
+)

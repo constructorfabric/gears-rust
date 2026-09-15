@@ -1,0 +1,21 @@
+# Gearbox product metadata for the types-registry gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system, rest).
+
+gear(
+    name = "Types Registry",
+    description = "Shared entity-type registry. Pulled in by roughly 22 gears via deps, so it is linked into most applications.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-types-registry",
+        lib = "types_registry",
+        path = ".",
+    ),
+
+    # Deliberately empty rather than absent: the crate's only feature is
+    # `integration`, which wants a Docker daemon. "Nothing here for you" is the
+    # true answer, and it is not the same as saying nothing.
+    cargo_features = [],
+)

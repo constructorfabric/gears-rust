@@ -1,0 +1,38 @@
+# Gearbox product metadata for the OIDC AuthN plugin.
+#
+# Fills the same extension point as static-authn-plugin, so the two are
+# alternatives: a product picks one per deployment profile.
+#
+# Note this crate states its vendor default with `#[serde(default =
+# "default_vendor")]` and a free function rather than an `impl Default` block.
+# Both spellings exist in the tree and the projector reads both -- reading only
+# the first would report "no default" here, and a missing default is what the
+# vendor-match check keys on.
+
+gear(
+    name = "OIDC AuthN Plugin",
+    description = "Validates bearer tokens against an OIDC issuer.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-oidc-authn-plugin",
+        lib = "oidc_authn_plugin",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-authn-resolver-sdk",
+        lib = "authn_resolver_sdk",
+        path = "../../authn-resolver-sdk",
+    ),
+
+    # Only the selection keys. This plugin's real surface (jwt, s2s_oauth and six
+    # more nested blocks) is the largest in the tree and belongs in YAML; see
+    # docs/config-example.yaml beside this gear.
+    config_schema = config(exposes = ["vendor", "priority"]),
+
+    # Empty rather than absent: `e2e-diagnostics` is a test switch, so there is
+    # nothing a product should be offered here.
+    cargo_features = [],
+)

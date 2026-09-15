@@ -1,0 +1,28 @@
+# Gearbox product metadata for Static Tenant Resolver Plugin.
+#
+# One of three alternatives filling tenant-resolver's extension point. Which
+# point that is, and this plugin's vendor and priority, are all read from
+# source; only the sdk locator is declared.
+
+gear(
+    name = "Static Tenant Resolver Plugin",
+    description = "Serves tenants declared in configuration.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-static-tr-plugin",
+        lib = "static_tr_plugin",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-tenant-resolver-sdk",
+        lib = "tenant_resolver_sdk",
+        path = "../../tenant-resolver-sdk",
+    ),
+
+    # `tenants` is a list with a single-root invariant no control can express,
+    # so it stays in the configuration file.
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

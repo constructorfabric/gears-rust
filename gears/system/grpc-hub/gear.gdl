@@ -1,0 +1,28 @@
+# Gearbox product metadata for the grpc-hub gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (stateful, system,
+# grpc_hub), lifecycle (entry = "serve", await_ready -- note no stop_timeout).
+
+gear(
+    name = "gRPC Hub",
+    description = "Application-wide gRPC surface; publishes the endpoint the directory is reached on.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-grpc-hub",
+        lib = "grpc_hub",
+        path = ".",
+    ),
+
+    serves = [endpoint(name = "grpc", config_key = "listen_addr", default_port = 50051)],
+
+    # GrpcHubConfig lives in src/gear.rs, not src/config.rs -- the struct is found
+    # from the ctx.config*() call, so its placement costs nothing here.
+    config_schema = config(exposes = ["listen_addr", "advertise_addr", "internal_auth_cache_ttl_secs"]),
+
+    # `default` is Cargo's, not a choice an integrator makes. `k8s-auth` reads a
+    # service-account token from a path that exists only inside a pod, so it is
+    # what a Kubernetes deployment needs and what a local one must not have.
+    cargo_features = [feature("k8s-auth", kinds = ["kubernetes"])],
+)

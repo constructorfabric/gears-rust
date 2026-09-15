@@ -1,0 +1,74 @@
+# Gearbox product metadata for the event-broker gear.
+#
+# Under ADR cpt-gearbox-adr-macro-projected-catalogue the Rust attributes keep
+# every fact they already express. Projected from #[toolkit::gear] in
+# event-broker/src/module.rs, and therefore NOT written here:
+#
+#   id             <- name = "event-broker"
+#   runtime_caps   <- capabilities = [rest, stateful]
+#   colocated_deps <- deps = [cluster]   (link-time; uncuttable)
+#   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s")
+#
+# Declaring any of them here is GBX0210, which names the owning attribute.
+
+gear(
+    name = "Events Broker",
+    description = "Durable event streaming with typed topics, pluggable storage, and consumer groups.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    # `attr` is omitted: this crate declares exactly one gear, so scanning src/
+    # is unambiguous.
+    package = cargo(
+        crate_name = "cf-gears-event-broker",
+        lib = "event_broker",
+        path = "./event-broker",
+    ),
+
+    # The two required fields of `EventBrokerConfig`; the other six sections all
+    # default and are edited in the file rather than put in front of an
+    # integrator. Their names, types and doc comments are read from the struct.
+    config_schema = config(exposes = ["mode", "default_storage_backend"]),
+
+    # The role split ADR cpt-cf-adr-instance-addressable-discovery decides, and
+    # this gear is its worked example. Each role registers under its own
+    # directory name; `cluster_dispatcher` takes the bare name and is therefore
+    # the front door, which is what makes the internal roles unreachable by a
+    # bare-name lookup -- not a filter, but the absence of a registration.
+    #
+    # `name` is the value this gear's own `DeploymentMode` accepts, which is the
+    # only spelling checkable against the projected enum.
+    #
+    # `standalone` is deliberately absent. It is the fourth `DeploymentMode`
+    # variant and not a role: it activates ingest *and* delivery and is not the
+    # front door, so it describes the un-split deployment rather than one of the
+    # split's parts. Declaring it would need either the bare name -- and then
+    # there are two front doors -- or a directory name the platform's ADR does
+    # not define.
+    roles = [
+        role(name = "cluster_dispatcher", directory_name = "event-broker"),
+        role(name = "cluster_ingest"),
+        role(name = "cluster_delivery"),
+    ],
+
+    # No `labels` on the ingest role, and the reason is the gear rather than the
+    # tool. ADR-0009 illustrates ingest instances carrying `shard=0/1/2`, but
+    # this gear has no shard field in `EventBrokerConfig` and hetero ingest --
+    # every instance serving every topic -- is its default; DESIGN §3.8 makes
+    # sharded ingest opt-in and defines it as topic patterns pinned via
+    # `serves_topic_patterns`, not as an ordinal. So a label key here would
+    # declare something no instance registers under today, and the two
+    # documents do not yet agree on what its value would mean.
+    #
+    # When the gear grows that field, the key goes here and GBX0602 will say
+    # what remains missing on the tool's side.
+
+    # Not declared, each for a reason:
+    #
+    #   serves          -- no bind-address key exists. The gear is `rest`, not
+    #                      `rest_host`: its router is composed into api-gateway's.
+    #   provides/consumes -- no #[toolkit::contract], #[toolkit::provides] or
+    #                      #[toolkit::consumes] anywhere in the tree.
+    #   cargo_features  -- `cf-gears-event-broker` has no [features] section, and
+    #                      absent is not the same answer as an empty list.
+)

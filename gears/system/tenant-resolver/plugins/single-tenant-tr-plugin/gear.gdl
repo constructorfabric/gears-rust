@@ -1,0 +1,27 @@
+# Gearbox product metadata for Single-Tenant Resolver Plugin.
+#
+# One of three alternatives filling tenant-resolver's extension point. Which
+# point that is, and this plugin's vendor and priority, are all read from
+# source; only the sdk locator is declared.
+
+gear(
+    name = "Single-Tenant Resolver Plugin",
+    description = "Resolves every request to one fixed tenant.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-single-tenant-tr-plugin",
+        lib = "single_tenant_tr_plugin",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-tenant-resolver-sdk",
+        lib = "tenant_resolver_sdk",
+        path = "../../tenant-resolver-sdk",
+    ),
+
+    # priority defaults to 1000 so static-tr-plugin wins when both are enabled.
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

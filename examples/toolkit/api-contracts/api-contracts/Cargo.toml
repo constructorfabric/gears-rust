@@ -9,6 +9,9 @@ description = "api-contracts example module — PaymentApi with local and HTTP t
 rust-version.workspace = true
 publish = false
 
+[lib]
+name = "cf_api_contracts"
+
 [features]
 default = []
 # OpenTelemetry in generated clients: W3C traceparent propagation + RED metrics.
