@@ -65,6 +65,12 @@
       "type": "string",
       "format": "date-time",
       "readOnly": true
+    },
+    "created_at": {
+      "description": "Wall-clock instant this subscription was created (at JOIN). The stable sort key for listing subscriptions (newest first).",
+      "type": "string",
+      "format": "date-time",
+      "readOnly": true
     }
   },
   "definitions": {

@@ -41,11 +41,16 @@ paths:
       description: |
         Enqueue one event into the per-topic ingest outbox. The broker resolves the
         owning topic from the `topic` trait on the event `type`'s resolved GTS type
-        schema. Default response is
-        `202 Accepted` once the event is durably enqueued; opt into synchronous
-        backend persistence via the `Sync-Wait: true` header or `?wait=persisted`
-        query parameter. Offset is assigned asynchronously by the storage backend
-        and is never returned inline.
+        schema. Publish is asynchronous: `202 Accepted` once the event is durably
+        enqueued in ingest's own store, after which the event is delivered to the
+        storage backend out of band. Offset is assigned asynchronously by the
+        storage backend and is never returned inline.
+
+        Synchronous persistence - holding the response until the backend confirms
+        the event is persisted - is requested with the standard `Prefer: wait`
+        header (RFC 7240). It is not implemented yet and is answered
+        `501 Not Implemented`. `Prefer: respond-async` names the default (async)
+        behaviour and is accepted as a no-op (still `202`).
       requestBody:
         required: true
         content:
@@ -55,10 +60,13 @@ paths:
       responses:
         "202":
           description: Accepted, durably enqueued in the outbox
-        "201":
-          description: Persisted to backend (sync mode)
+        "200":
+          description: >-
+            Idempotent duplicate - a lost-ack retry of the producer chain's current
+            head. The event is already durable; nothing is written and the response
+            carries no body.
         "400":
-          description: Validation error (InvalidPartition, InvalidTraceParent, etc.)
+          description: Validation error (read-only/unknown field, unknown producer, etc.)
           content:
             application/problem+json:
               schema:
@@ -69,8 +77,35 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "404":
+          description: Topic or event type not registered.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "412":
-          description: SequenceViolation — producer's `previous`/`sequence` does not match the broker's stored `last_sequence`. Response body includes the broker's current `last_sequence` so the producer can resync.
+          description: >-
+            SequenceViolation - the producer chain does not advance by exactly one
+            from the broker's stored `last_sequence`. `context.resource_name` names
+            the resolved topic; the violation carries `expected_previous=<n>` so the
+            producer can resync (re-read `GET /v1/producers/{id}/cursors`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            SchemaViolation - the event `data` does not satisfy the event type's
+            `data_schema`. `context.resource_name` names the resolved topic and the
+            `(payload)`/`schema_validation` field violation says what is wrong
+            without echoing submitted content.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: >-
+            Synchronous publish (`Prefer: wait`) is not implemented yet.
           content:
             application/problem+json:
               schema:
@@ -100,7 +135,7 @@ paths:
                   maxItems: 100
       responses:
         "202":
-          description: Accepted
+          description: Accepted (async; the whole batch durably enqueued)
         "400":
           description: Validation error
           content:
@@ -113,14 +148,33 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "404":
+          description: Topic or event type not registered.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "412":
-          description: SequenceViolation — atomic batch rejection when any event in the batch fails dedup validation
+          description: SequenceViolation - atomic batch rejection when any event in the batch fails the chain check
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "413":
           description: BatchTooLarge
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: SchemaViolation - an event's `data` does not satisfy its event type's `data_schema` (atomic batch rejection)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: >-
+            Synchronous publish (`Prefer: wait`) is not implemented yet.
           content:
             application/problem+json:
               schema:
@@ -173,7 +227,10 @@ paths:
                   and a JSON body with top-level `kind` of `event | heartbeat | topology | control`.
                 type: string
         "400":
-          description: Bad Request (missing or invalid `subscription_id`).
+          description: >-
+            Invalid Argument - a missing or invalid `subscription_id`, or an
+            unrecognised query parameter. Only `subscription_id` is recognised; a
+            legacy `timeout`/`collect` parameter is rejected, not ignored.
           content:
             application/problem+json:
               schema:
@@ -239,6 +296,15 @@ paths:
           description: Long-lived text/event-stream
           content:
             text/event-stream: {}
+        "400":
+          description: >-
+            Invalid Argument - a missing or invalid `subscription_id`, or an
+            unrecognised query parameter. Only `subscription_id` is recognised; a
+            legacy `timeout`/`collect` parameter is rejected, not ignored.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "404":
           description: SubscriptionNotFound (or transport disabled in deployment)
           content:
@@ -698,6 +764,9 @@ paths:
     get:
       tags: [subscriptions]
       summary: List active subscriptions visible to the caller
+      description: >-
+        Ordered newest-first by `created_at` descending, with `id` as a stable
+        tiebreaker, so a freshly created subscription is on the first page.
       parameters:
         - name: $filter
           in: query
@@ -883,8 +952,18 @@ paths:
           application/json:
             schema:
               type: object
-              required: [partition_positions]
+              required: [topology_version, partition_positions]
               properties:
+                topology_version:
+                  type: integer
+                  format: int64
+                  description: |
+                    The topology_version the caller last observed for the subscription
+                    (from the JOIN response or a subscription read). The broker fences
+                    the whole seek against a concurrent rebalance: if this differs from
+                    the subscription's current topology_version, the seek is rejected
+                    412 topology_version_mismatch (no cursor seeded) and the caller
+                    re-reads the subscription and re-seeks.
                 partition_positions:
                   type: array
                   description: |
@@ -951,10 +1030,24 @@ paths:
         "409":
           description: |
             `PartitionNotAssigned` — request references a partition not currently
-            assigned to this subscription.
+            assigned to this subscription (the versions match, so it is a genuine
+            client error, not a stale view).
             `StreamingInProgress` — a SEEK was issued while a `:stream` is open on
             this subscription; SEEK is pre-stream-only (the cursor auto-advances
             with delivery).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: |
+            `TopologyVersionMismatch` — the `topology_version` differs from
+            the subscription's current topology_version: a concurrent rebalance moved
+            the assignment under the caller. Retriable — the caller re-reads the
+            subscription (`GET /v1/subscriptions/{id}`) for the current
+            topology_version and assignment, then re-seeks. The body is minimal (no
+            topology_version, no assignment); the re-read is the single source of the
+            fresh state.
           content:
             application/problem+json:
               schema:
@@ -997,7 +1090,7 @@ components:
         chain, and `data_schema` is the payload contract composed out of the schema's `data`
         narrowings. Traits are schema-only, so none of them appear in a published event and a
         producer cannot supply them.
-      required: [id, topic, allowed_subject_types, data_schema]
+      required: [id, topic, allowed_subject_types, partition_key, data_schema]
       additionalProperties: false
       properties:
         id:
@@ -1012,6 +1105,12 @@ components:
             in `~`.
         description:
           type: ["string", "null"]
+        partition_key:
+          type: string
+          description: >-
+            JSON Pointer naming the event member whose value the partition is derived
+            from — a resolved trait of the event type. The base defaults it (to
+            `/tenant_id`), so every event type reports one.
         allowed_subject_types:
           type: array
           items: { type: string }
@@ -1080,9 +1179,13 @@ components:
           additionalProperties: true
           description: |
             Per-category structured context. Common fields include
-            `retry_after_seconds` (ServiceUnavailable) and ingest error details
-            (e.g. SequenceViolation carries `last_sequence`; partition-validation
-            errors carry the offending partitions).
+            `retry_after_seconds` (ServiceUnavailable) and, for a `NotFound` or any
+            resource-scoped error, `resource_type` / `resource_name` naming the
+            addressed resource. Every publish-path error names the targeted stream
+            (`resource_type: "gts.cf.core.events.topic.v1~"`, `resource_name`: the
+            resolved topic id); the specific fault lives in the `field_violations`
+            or `violations` entry (e.g. SequenceViolation's violation carries
+            `expected_previous=<n>`). Error bodies never echo submitted values.
 
   responses:
     Problem:

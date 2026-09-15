@@ -1,15 +1,17 @@
 //! Mirrors scenarios/consumer/positions/. Tests migrated per mock-reference-alignment.
 
-#[cfg(test)]
 use super::super::helpers::*;
+#[cfg(test)]
+use crate::sequence::Sequence;
 
 use super::super::helpers::{
     broker_with_topic, ctx, join_group, make_group, register_topic_with_event_type, wire_event,
 };
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::EventBrokerApi;
 use crate::api::SeekPosition;
 use crate::models::Event;
+use serde_json::json;
 use uuid::Uuid;
 
 /// Build a wire event with an explicit `occurred_at` so timestamp-seek scenarios
@@ -45,10 +47,11 @@ async fn s1_01_positive_seek_earliest() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -62,12 +65,13 @@ async fn s1_01_positive_seek_earliest() {
     assert_eq!(results[0].topic, TOPIC);
     assert_eq!(results[0].partition, 0);
     assert_eq!(
-        results[0].offset, 0,
+        results[0].offset,
+        Sequence::assigned(0),
         "Earliest resolves to the floor cursor (0)"
     );
     assert_eq!(
         h.cursor(&gid, TOPIC, 0).await,
-        Some(0),
+        Some(Sequence::assigned(0)),
         "group cursor is seeded to the resolved earliest offset"
     );
 }
@@ -94,22 +98,24 @@ async fn s1_02_positive_seek_latest() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Latest,
+                value: Position::Latest,
             }],
         )
         .await
         .unwrap();
 
     assert_eq!(
-        results[0].offset, 5,
+        results[0].offset,
+        Sequence::assigned(5),
         "Latest resolves to the current HWM (1-based: 5 events → offset 5)"
     );
     assert_eq!(
         h.cursor(&gid, TOPIC, 0).await,
-        Some(5),
+        Some(Sequence::assigned(5)),
         "group cursor is seeded to the HWM"
     );
 }
@@ -134,20 +140,22 @@ async fn s1_03_positive_seek_exact_offset() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(42),
+                value: Position::Exact(Sequence::assigned(42)),
             }],
         )
         .await
         .unwrap();
 
     assert_eq!(
-        results[0].offset, 42,
+        results[0].offset,
+        Sequence::assigned(42),
         "exact offset is stored verbatim (no +1 on the wire)"
     );
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(42));
+    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(Sequence::assigned(42)));
 }
 
 /// Scenario: consumer/positions/1.04-positive-mixed-sentinels.md
@@ -196,21 +204,22 @@ async fn s1_04_positive_mixed_sentinels() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[
                 SeekPosition {
                     topic: TOPIC.to_owned(),
                     partition: 0,
-                    value: ResolvedPosition::Exact(42),
+                    value: Position::Exact(Sequence::assigned(42)),
                 },
                 SeekPosition {
                     topic: TOPIC2.to_owned(),
                     partition: 0,
-                    value: ResolvedPosition::Earliest,
+                    value: Position::Earliest,
                 },
                 SeekPosition {
                     topic: TOPIC3.to_owned(),
                     partition: 0,
-                    value: ResolvedPosition::Latest,
+                    value: Position::Latest,
                 },
             ],
         )
@@ -218,26 +227,23 @@ async fn s1_04_positive_mixed_sentinels() {
         .unwrap();
 
     let by_topic = |t: &str| results.iter().find(|r| r.topic == t).unwrap().offset;
-    assert_eq!(by_topic(TOPIC), 42, "exact verbatim");
-    assert_eq!(by_topic(TOPIC2), 0, "Earliest → floor cursor (RF−1 = 0)");
+    assert_eq!(by_topic(TOPIC), Sequence::assigned(42), "exact verbatim");
+    assert_eq!(
+        by_topic(TOPIC2),
+        Sequence::NONE,
+        "Earliest → floor cursor (RF−1 = 0)"
+    );
     assert_eq!(
         by_topic(TOPIC3),
-        5,
+        Sequence::assigned(5),
         "Latest → HWM (1-based: 5 events → offset 5)"
     );
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(42));
-    assert_eq!(h.cursor(&gid, TOPIC2, 0).await, Some(0));
-    assert_eq!(h.cursor(&gid, TOPIC3, 0).await, Some(5));
+    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(Sequence::assigned(42)));
+    assert_eq!(h.cursor(&gid, TOPIC2, 0).await, Some(Sequence::assigned(0)));
+    assert_eq!(h.cursor(&gid, TOPIC3, 0).await, Some(Sequence::assigned(5)));
 }
 
 /// Scenario: consumer/positions/1.05-negative-out-of-range-offset.md
-///
-/// DIVERGENCE (range validation is unrepresentable in the mock): the scenario
-/// expects `400 InvalidInitialPosition` for an offset below `RF - 1`, with nothing
-/// committed (per-request atomic). The mock's `seek` performs no range validation -
-/// it stores any integer verbatim. The closest real assertion is that the mock
-/// accepts the value (no broker-side range guard), documenting the divergence: the
-/// 400 path is an HTTP-layer concern not implemented in the in-process mock.
 #[tokio::test]
 async fn s1_05_negative_out_of_range_offset() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
@@ -245,25 +251,39 @@ async fn s1_05_negative_out_of_range_offset() {
     let gid = make_group(&c, &broker).await;
     let sub = join_group(&c, &broker, &gid, TOPIC).await;
 
-    // Empty partition → HWM = 1, valid range [0, 1]. Offset 5 is above range.
+    // Nothing published, so the partition has assigned nothing: the only
+    // position it admits is `0`, and 5 is above its ceiling.
     let err = broker
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(5),
+                value: Position::Exact(Sequence::assigned(5)),
             }],
         )
         .await
         .expect_err("an out-of-range seek must be rejected");
-    assert!(
-        matches!(
-            err,
-            crate::error::EventBrokerError::InvalidInitialPosition { .. }
-        ),
-        "expected InvalidInitialPosition, got {err:?}"
+    assert_eq!(
+        problem_json(err),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/v1/subscriptions/test:seek",
+            "trace_id": "trace-123",
+            "context": {
+                "field_violations": [{
+                    "field": "partition_positions[0].value",
+                    "description": "the position is above the valid range [0, 0]",
+                    "reason": "above_high_water_mark"
+                }],
+                "resource_type": crate::error::resources::REQUEST
+            }
+        })
     );
     assert_eq!(
         h.cursor(&gid, TOPIC, 0).await,
@@ -273,11 +293,6 @@ async fn s1_05_negative_out_of_range_offset() {
 }
 
 /// Scenario: consumer/positions/1.06-negative-offset-above-hwm.md
-///
-/// DIVERGENCE (range validation is unrepresentable in the mock): the scenario
-/// expects `400 InvalidInitialPosition` for an offset above HWM. The mock applies
-/// no upper-bound check; it stores the value verbatim. Closest real assertion: the
-/// seek succeeds and the cursor advances (the 400 is an HTTP-only guardrail).
 #[tokio::test]
 async fn s1_06_negative_offset_above_hwm() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
@@ -291,25 +306,39 @@ async fn s1_06_negative_offset_above_hwm() {
     let gid = make_group(&c, &broker).await;
     let sub = join_group(&c, &broker, &gid, TOPIC).await;
 
-    // 3 events → HWM = 4, valid range [0, 4]. Offset 100_000 is above HWM.
+    // Three events assigned, so the ceiling is 3 and nothing has been erased,
+    // putting the floor at 0. 100_000 is far above the ceiling.
     let err = broker
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(100_000),
+                value: Position::Exact(Sequence::assigned(100_000)),
             }],
         )
         .await
         .expect_err("a seek above the HWM must be rejected");
-    assert!(
-        matches!(
-            err,
-            crate::error::EventBrokerError::InvalidInitialPosition { .. }
-        ),
-        "expected InvalidInitialPosition, got {err:?}"
+    assert_eq!(
+        problem_json(err),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/v1/subscriptions/test:seek",
+            "trace_id": "trace-123",
+            "context": {
+                "field_violations": [{
+                    "field": "partition_positions[0].value",
+                    "description": "the position is above the valid range [0, 3]",
+                    "reason": "above_high_water_mark"
+                }],
+                "resource_type": crate::error::resources::REQUEST
+            }
+        })
     );
     assert_eq!(h.cursor(&gid, TOPIC, 0).await, None);
 }
@@ -331,15 +360,16 @@ async fn s1_07_negative_seek_while_streaming() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
         .unwrap();
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(0));
+    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(Sequence::assigned(0)));
 
     // Open a stream (drain the open-time topology baseline).
     let mut stream = broker.stream(&c, sub.subscription_id).await.unwrap();
@@ -350,10 +380,11 @@ async fn s1_07_negative_seek_while_streaming() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(400),
+                value: Position::Exact(Sequence::assigned(400)),
             }],
         )
         .await
@@ -366,7 +397,7 @@ async fn s1_07_negative_seek_while_streaming() {
         "expected StreamingInProgress, got {err:?}"
     );
     // Cursor is unchanged by the rejected seek.
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(0));
+    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(Sequence::assigned(0)));
 }
 
 /// Scenario: consumer/positions/1.09-negative-seek-unassigned-partition.md
@@ -398,10 +429,13 @@ async fn s1_09_negative_seek_unassigned_partition() {
         .seek(
             &c,
             sub_a.subscription_id,
+            // Current version (sub_a's captured one is stale after B joined) so
+            // the fence passes and the genuine partition_not_assigned surfaces.
+            h.topology_version(&gid).await,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: unassigned,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -412,6 +446,66 @@ async fn s1_09_negative_seek_unassigned_partition() {
     );
     // No cursor is committed for the unassigned partition.
     assert_eq!(h.cursor(&gid, TOPIC, unassigned).await, None);
+}
+
+/// Scenario: consumer/positions/1.15-negative-seek-stale-topology-version.md
+///
+/// A concurrent JOIN rebalances the group and bumps `topology_version`. A member
+/// that seeks with the version it observed before the rebalance is rejected with
+/// `TopologyVersionMismatch` - told apart from a genuine unassigned-partition
+/// error - even for a partition it still owns, because the fence is wholesale.
+/// The member re-reads its subscription for the current version and re-seeks.
+#[tokio::test]
+async fn s1_15_negative_seek_stale_topology_version() {
+    let (broker, h) = broker_with_topic(TOPIC, 4).await;
+    let c = ctx();
+    let c2 = ctx2();
+    let gid = make_group(&c, &broker).await;
+    // A joins alone (topology_version becomes 1), then B joins and rebalances
+    // the group (topology_version becomes 2); A's captured version is now stale.
+    let sub_a = join_group(&c, &broker, &gid, TOPIC).await;
+    let _sub_b = join_group(&c2, &broker, &gid, TOPIC).await;
+
+    // A partition A still owns after the rebalance - so this proves the fence,
+    // not a partition-assignment error.
+    let owned = h.assignment(sub_a.subscription_id).await;
+    let still_owned = owned[0].partition;
+
+    let err = broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            sub_a.topology_version,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_owned,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect_err("a stale topology_version must be rejected");
+    assert!(
+        matches!(err, crate::error::EventBrokerError::TopologyVersionMismatch { .. }),
+        "expected TopologyVersionMismatch, got {err:?}"
+    );
+    // No cursor is seeded by the rejected seek.
+    assert_eq!(h.cursor(&gid, TOPIC, still_owned).await, None);
+
+    // Recovery: re-read the current version, then the same seek succeeds.
+    let current = h.topology_version(&gid).await;
+    broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            current,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_owned,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect("re-seek with the current topology_version succeeds");
 }
 
 /// Scenario: consumer/positions/1.10-positive-seek-any-value-in-range.md
@@ -439,19 +533,24 @@ async fn s1_10_positive_seek_any_value_in_range() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(100),
+                value: Position::Exact(Sequence::assigned(100)),
             }],
         )
         .await
         .unwrap();
     assert_eq!(
-        results[0].offset, 100,
+        results[0].offset,
+        Sequence::assigned(100),
         "pre-stream SEEK accepts any in-range value"
     );
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(100));
+    assert_eq!(
+        h.cursor(&gid, TOPIC, 0).await,
+        Some(Sequence::assigned(100))
+    );
 }
 
 /// Scenario: consumer/positions/1.11-positive-seek-at-timestamp.md
@@ -484,17 +583,23 @@ async fn s1_11_positive_seek_at_timestamp() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::AtTimestamp("2026-06-14T10:00:00Z".to_owned()),
+                value: Position::At(
+                    "2026-06-14T10:00:00Z"
+                        .parse()
+                        .expect("a fixed RFC 3339 instant"),
+                ),
             }],
         )
         .await
         .unwrap();
 
     assert_eq!(
-        results[0].offset, 1,
+        results[0].offset,
+        Sequence::assigned(1),
         "resolves to the first event at/after the timestamp (offset 1)"
     );
 }
@@ -525,17 +630,23 @@ async fn s1_12_positive_seek_at_timestamp_before_retention() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::AtTimestamp("2025-06-01T00:00:00Z".to_owned()),
+                value: Position::At(
+                    "2025-06-01T00:00:00Z"
+                        .parse()
+                        .expect("a fixed RFC 3339 instant"),
+                ),
             }],
         )
         .await
         .unwrap();
 
     assert_eq!(
-        results[0].offset, 0,
+        results[0].offset,
+        Sequence::assigned(0),
         "ts before the floor clamps to the oldest stored offset (the floor)"
     );
 }
@@ -566,17 +677,23 @@ async fn s1_13_positive_seek_at_timestamp_beyond_hwm() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::AtTimestamp("2030-01-01T00:00:00Z".to_owned()),
+                value: Position::At(
+                    "2030-01-01T00:00:00Z"
+                        .parse()
+                        .expect("a fixed RFC 3339 instant"),
+                ),
             }],
         )
         .await
         .unwrap();
 
     assert_eq!(
-        results[0].offset, 2,
+        results[0].offset,
+        Sequence::assigned(2),
         "ts beyond the newest event resolves to the HWM (2 events → HWM offset 2)"
     );
 }
@@ -591,4 +708,172 @@ fn interest(topic: &str) -> crate::api::SubscriptionInterest {
         types: vec!["*".to_owned()],
         filter: None,
     }
+}
+
+/// Scenario: consumer/positions/1.16-positive-seek-after-join-rebalance.md
+///
+/// A concurrent JOIN shrinks the first member's assignment and bumps
+/// `topology_version`. The member's seek at its pre-join version is fenced off
+/// (412), and after re-reading the current version it re-seeks a partition it
+/// still owns and succeeds. This is the join-caused half of the recovery flow,
+/// asserted through to the successful re-seek.
+#[tokio::test]
+async fn s1_16_positive_seek_after_join_rebalance() {
+    let (broker, h) = broker_with_topic(TOPIC, 4).await;
+    let c = ctx();
+    let c2 = ctx2();
+    let gid = make_group(&c, &broker).await;
+
+    // A joins alone: it owns all 4 partitions at topology_version 1.
+    let sub_a = join_group(&c, &broker, &gid, TOPIC).await;
+    let held = sub_a.topology_version;
+    assert_eq!(
+        h.assignment(sub_a.subscription_id).await.len(),
+        4,
+        "A alone owns all 4 partitions"
+    );
+
+    // B joins the same group: rebalance shrinks A to a subset and bumps the version.
+    let _sub_b = join_group(&c2, &broker, &gid, TOPIC).await;
+    let shrunk = h.assignment(sub_a.subscription_id).await;
+    assert_eq!(shrunk.len(), 2, "A shrinks to 2 of 4 after B joins");
+    let still_owned = shrunk[0].partition;
+
+    // Seek at the pre-rebalance version is fenced, atomically (nothing seeded).
+    let err = broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            held,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_owned,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect_err("a seek at the stale pre-join version is fenced");
+    assert!(
+        matches!(err, crate::error::EventBrokerError::TopologyVersionMismatch { .. }),
+        "expected TopologyVersionMismatch, got {err:?}"
+    );
+    assert_eq!(h.cursor(&gid, TOPIC, still_owned).await, None);
+
+    // Recovery: re-read the current version, then the re-seek of a still-owned
+    // partition succeeds and seeds the group cursor.
+    let current = h.topology_version(&gid).await;
+    assert!(current > held, "the join bumped topology_version");
+    let resolved = broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            current,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_owned,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect("re-seek at the current version succeeds");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].topic, TOPIC);
+    assert_eq!(resolved[0].partition, still_owned);
+    assert_eq!(resolved[0].offset, Sequence::assigned(0));
+    assert_eq!(
+        h.cursor(&gid, TOPIC, still_owned).await,
+        Some(Sequence::assigned(0))
+    );
+}
+
+/// Scenario: consumer/positions/1.17-positive-seek-after-leave-rebalance.md
+///
+/// A second member LEAVING grows the first member's assignment and bumps
+/// `topology_version`. The member's seek at its pre-leave version is fenced
+/// (412); after re-reading the current version it re-seeks a partition it
+/// already held and succeeds. (Newly-gained partitions are reached via re-JOIN,
+/// not a re-seek on this subscription - a gain is terminal, features/0004 - so
+/// they are out of scope for the fence this exercises.)
+#[tokio::test]
+async fn s1_17_positive_seek_after_leave_rebalance() {
+    let (broker, h) = broker_with_topic(TOPIC, 4).await;
+    let c = ctx();
+    let c2 = ctx2();
+    let gid = make_group(&c, &broker).await;
+
+    // A and B both join: 4 partitions split 2/2.
+    let sub_a = join_group(&c, &broker, &gid, TOPIC).await;
+    let sub_b = join_group(&c2, &broker, &gid, TOPIC).await;
+    let before: std::collections::HashSet<u32> = h
+        .assignment(sub_a.subscription_id)
+        .await
+        .iter()
+        .map(|s| s.partition)
+        .collect();
+    assert_eq!(before.len(), 2, "A owns 2 of 4 while B is present");
+    let held = h.topology_version(&gid).await;
+
+    // B leaves: rebalance grows A to all 4 and bumps the version.
+    broker
+        .leave(&c2, sub_b.subscription_id)
+        .await
+        .expect("B leaves");
+    let after: std::collections::HashSet<u32> = h
+        .assignment(sub_a.subscription_id)
+        .await
+        .iter()
+        .map(|s| s.partition)
+        .collect();
+    assert_eq!(after.len(), 4, "A grows to all 4 after B leaves");
+    assert!(before.is_subset(&after), "a leave never takes A's partitions");
+    // Recovery re-seeks a partition A ALREADY held (a leave never removes it).
+    // The partitions A newly gained are reached via re-JOIN, not a re-seek on
+    // this subscription (a gain is terminal per features/0004) - out of scope
+    // for the fence, which is what this scenario exercises.
+    let still_held = *before.iter().next().expect("A held a partition before the leave");
+
+    // Seek at the pre-leave version is fenced (wholesale on the version).
+    let err = broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            held,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_held,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect_err("a seek at the stale pre-leave version is fenced");
+    assert!(
+        matches!(err, crate::error::EventBrokerError::TopologyVersionMismatch { .. }),
+        "expected TopologyVersionMismatch, got {err:?}"
+    );
+    assert_eq!(h.cursor(&gid, TOPIC, still_held).await, None);
+
+    // Recovery: re-read the current version, then re-seek a still-held partition.
+    let current = h.topology_version(&gid).await;
+    assert!(current > held, "the leave bumped topology_version");
+    let resolved = broker
+        .seek(
+            &c,
+            sub_a.subscription_id,
+            current,
+            &[SeekPosition {
+                topic: TOPIC.to_owned(),
+                partition: still_held,
+                value: Position::Earliest,
+            }],
+        )
+        .await
+        .expect("re-seek of a still-held partition at the current version succeeds");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].topic, TOPIC);
+    assert_eq!(resolved[0].partition, still_held);
+    assert_eq!(resolved[0].offset, Sequence::assigned(0));
+    assert_eq!(
+        h.cursor(&gid, TOPIC, still_held).await,
+        Some(Sequence::assigned(0))
+    );
 }

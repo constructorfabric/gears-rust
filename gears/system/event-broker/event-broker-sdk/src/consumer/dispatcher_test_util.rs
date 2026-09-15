@@ -1,11 +1,14 @@
 //! Test helpers used exclusively by `#[cfg(feature = "test-util")]` dispatcher integration tests.
 
+use crate::sequence::Sequence;
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
     BatchHandlerOutcome, CommitOffset, ConsumerHandler, ConsumerRuntimeEvent,
-    ConsumerRuntimeListener, EventBatch, OffsetManagerError, OffsetStore, ResolvedPosition,
+    ConsumerRuntimeListener, EventBatch, OffsetManagerError, OffsetStore, Position,
 };
 use crate::error::ConsumerError;
 use crate::ids::{ConsumerGroupId, TopicId};
@@ -47,7 +50,7 @@ impl ConsumerHandler for SleepingBatchHandler {
         self.calls.lock().unwrap().extend(
             chunk
                 .iter()
-                .map(|event| (event.topic.clone(), event.partition, event.offset)),
+                .map(|event| (event.topic.clone(), event.partition, event.offset.as_i64())),
         );
         Ok(chunk
             .last()
@@ -96,9 +99,9 @@ impl OffsetStore for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
-        Ok(ResolvedPosition::Earliest)
+        Ok(Position::Earliest)
     }
 }
 
@@ -109,7 +112,7 @@ impl CommitOffset for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-        _offset: i64,
+        _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         Ok(())
     }
@@ -127,8 +130,8 @@ impl OffsetStore for RecordingCommitOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
-        Ok(ResolvedPosition::Earliest)
+    ) -> Result<Position, OffsetManagerError> {
+        Ok(Position::Earliest)
     }
 }
 
@@ -139,12 +142,12 @@ impl CommitOffset for RecordingCommitOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset));
+            .push((*group, *topic, partition, offset.as_i64()));
         Ok(())
     }
 }
@@ -283,5 +286,207 @@ pub(super) fn runtime_event_kind(event: &ConsumerRuntimeEvent) -> RuntimeEventKi
         ConsumerRuntimeEvent::OffsetLoaded { .. } => RuntimeEventKind::OffsetLoaded,
         ConsumerRuntimeEvent::OffsetCommitted { .. } => RuntimeEventKind::OffsetCommitted,
         ConsumerRuntimeEvent::RetryScheduled { .. } => RuntimeEventKind::RetryScheduled,
+    }
+}
+
+/// A broker decorator over an inner broker (typically the reference
+/// `MockBroker`) that injects seek/stream faults, for exercising the consumer's
+/// topology-version-mismatch recovery and its fail-fast on `PositionsNotSet`.
+/// Every operation delegates unchanged except the injected ones, and the call
+/// counters let a test observe the recovery path without racing timing.
+pub(super) struct SeekFaultBroker {
+    inner: Arc<dyn crate::api::EventBrokerApi>,
+    /// Reject the first `seek_mismatches` seeks with `TopologyVersionMismatch`
+    /// before delegating (`usize::MAX` = always).
+    seek_mismatches: usize,
+    /// Reject the first stream open with `PositionsNotSet`.
+    stream_positions_not_set_once: bool,
+    pub(super) seek_calls: Arc<AtomicUsize>,
+    pub(super) get_subscription_calls: Arc<AtomicUsize>,
+    pub(super) stream_calls: Arc<AtomicUsize>,
+}
+
+impl SeekFaultBroker {
+    pub(super) fn new(
+        inner: Arc<dyn crate::api::EventBrokerApi>,
+        seek_mismatches: usize,
+        stream_positions_not_set_once: bool,
+    ) -> Self {
+        Self {
+            inner,
+            seek_mismatches,
+            stream_positions_not_set_once,
+            seek_calls: Arc::new(AtomicUsize::new(0)),
+            get_subscription_calls: Arc::new(AtomicUsize::new(0)),
+            stream_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::api::EventBrokerApi for SeekFaultBroker {
+    async fn register_producer(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        mode: crate::api::ProducerMode,
+        client_agent: &str,
+    ) -> Result<crate::ids::ProducerId, ConsumerError> {
+        self.inner.register_producer(ctx, mode, client_agent).await
+    }
+    async fn publish(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        event: &crate::models::Event,
+    ) -> Result<crate::api::IngestOutcome, ConsumerError> {
+        self.inner.publish(ctx, event).await
+    }
+    async fn publish_sync(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        event: &crate::models::Event,
+    ) -> Result<crate::api::IngestOutcome, ConsumerError> {
+        self.inner.publish_sync(ctx, event).await
+    }
+    async fn publish_batch(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        events: &[crate::models::Event],
+    ) -> Result<crate::api::IngestOutcome, ConsumerError> {
+        self.inner.publish_batch(ctx, events).await
+    }
+    async fn get_producer_cursors(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        producer_id: crate::ids::ProducerId,
+    ) -> Result<crate::api::ProducerCursors, ConsumerError> {
+        self.inner.get_producer_cursors(ctx, producer_id).await
+    }
+    async fn reset_producer_chain(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        producer_id: crate::ids::ProducerId,
+        scope: crate::models::ResetScope<'_>,
+    ) -> Result<(), ConsumerError> {
+        self.inner
+            .reset_producer_chain(ctx, producer_id, scope)
+            .await
+    }
+    async fn create_consumer_group(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        req: crate::models::CreateConsumerGroupRequest,
+    ) -> Result<crate::models::ConsumerGroup, ConsumerError> {
+        self.inner.create_consumer_group(ctx, req).await
+    }
+    async fn get_consumer_group(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: &ConsumerGroupId,
+    ) -> Result<crate::models::ConsumerGroup, ConsumerError> {
+        self.inner.get_consumer_group(ctx, id).await
+    }
+    async fn list_consumer_groups(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        query: crate::models::ConsumerGroupQuery,
+    ) -> Result<crate::models::Page<crate::models::ConsumerGroup>, ConsumerError> {
+        self.inner.list_consumer_groups(ctx, query).await
+    }
+    async fn delete_consumer_group(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: &ConsumerGroupId,
+    ) -> Result<(), ConsumerError> {
+        self.inner.delete_consumer_group(ctx, id).await
+    }
+    async fn join(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        req: crate::api::JoinRequest,
+    ) -> Result<crate::api::SubscriptionAssignment, ConsumerError> {
+        self.inner.join(ctx, req).await
+    }
+    async fn get_subscription(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: crate::ids::SubscriptionId,
+    ) -> Result<crate::models::Subscription, ConsumerError> {
+        self.get_subscription_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_subscription(ctx, id).await
+    }
+    async fn list_subscriptions(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+    ) -> Result<Vec<crate::models::Subscription>, ConsumerError> {
+        self.inner.list_subscriptions(ctx).await
+    }
+    async fn leave(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: crate::ids::SubscriptionId,
+    ) -> Result<(), ConsumerError> {
+        self.inner.leave(ctx, id).await
+    }
+    async fn stream(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: crate::ids::SubscriptionId,
+    ) -> Result<crate::api::FrameStream, ConsumerError> {
+        if self.stream_positions_not_set_once
+            && self.stream_calls.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(ConsumerError::PositionsNotSet {
+                unseeded: Vec::new(),
+                detail: "injected".to_owned(),
+                instance: String::new(),
+            });
+        }
+        self.inner.stream(ctx, id).await
+    }
+    async fn seek(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: crate::ids::SubscriptionId,
+        topology_version: i64,
+        positions: &[crate::api::SeekPosition],
+    ) -> Result<Vec<crate::api::SeekResult>, ConsumerError> {
+        let n = self.seek_calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.seek_mismatches {
+            return Err(ConsumerError::TopologyVersionMismatch {
+                detail: "injected".to_owned(),
+                instance: String::new(),
+            });
+        }
+        self.inner.seek(ctx, id, topology_version, positions).await
+    }
+    async fn list_topics(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+    ) -> Result<Vec<crate::models::Topic>, ConsumerError> {
+        self.inner.list_topics(ctx).await
+    }
+    async fn list_topic_segments(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        topic: &str,
+        partition: u32,
+        range: crate::models::PartitionRange,
+    ) -> Result<crate::models::TopicSegment, ConsumerError> {
+        self.inner
+            .list_topic_segments(ctx, topic, partition, range)
+            .await
+    }
+    async fn list_event_types(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+    ) -> Result<Vec<crate::models::EventType>, ConsumerError> {
+        self.inner.list_event_types(ctx).await
+    }
+    async fn get_event_type(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: &str,
+    ) -> Result<crate::models::EventType, ConsumerError> {
+        self.inner.get_event_type(ctx, id).await
     }
 }
