@@ -35,6 +35,7 @@ Updated:  2026-09-10 by Constructor Tech
   - [Data](#data)
   - [Maintainability and evolution](#maintainability-and-evolution)
   - [Compliance](#compliance)
+  - [Data migration](#data-migration)
   - [Not applicable](#not-applicable)
 - [Revisit Triggers](#revisit-triggers)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
@@ -281,11 +282,20 @@ Compatibility is recorded here, not optimized for.
 - Supports `nfr-confidentiality` exactly as ADR-0004 already established; this ADR changes nothing about what leaves the gear or how a disclosure is audited.
 - Strengthens provenance: every version ever written has exactly one intent row explaining why, and, once superseded or removed, exactly one record of when and why it stopped being current — a stronger trail of "which bytes were live when" than in-place overwrite ever offered, since overwrite destroyed the previous bytes' backend residency the instant it landed.
 
+### Data migration
+
+A deployment that already holds credentials is not covered by the greenfield assumption this ADR was drafted under, and the gap is not cosmetic. The backend key shape changes from `tenant/reference/class` to `tenant/value_id`, so no value written before this decision is reachable by the new contract: the plugin has no method left that can name the old address. Such a deployment needs a one-off migration, and `m0002` alone cannot be it — a migration is handed a database connection and nothing else, so it can never read the backend (`DatabaseCapability::migrations` takes no context, and the `db` phase runs before a plugin registers itself in `init`).
+
+That constraint dictates the split. `m0002` records every row's old address, fingerprint and status into a journal table *before* it demotes anything, so that what it destroys stays recoverable: without the journalled fingerprint a later copy could only recompute one from whatever the backend returned, which would launder a poisoned entry into a valid-looking version — the very hazard ADR-0003's fence exists to catch. A one-off `copy` command then runs after `init`, and therefore has the plugin: it moves the fence key, reads each value at its old address, checks it against the journalled fingerprint, writes it under a fresh `value_id`, reads it back, and promotes the row.
+
+Deleting the superseded backend entries afterwards stays outside the gear. The old key space is the plugin's own, with its own prefix and API, and the check that matters — that what the store holds reconciles with what the journal expects — is better run against the store directly than through a contract built to hide it.
+
+The procedure, its guards and its point of no return are in [`docs/migration/value-migration.md`](../migration/value-migration.md) and [`docs/migration/storage-cleanup.md`](../migration/storage-cleanup.md); both carry the conditions for their own deletion.
+
 ### Not applicable
 
 - **Usability:** no end-user interface; unchanged from ADR-0004.
 - **Session management:** the gear holds no sessions.
-- **Data migration:** greenfield — no production rows exist, so `m0002` ships as a plain additive migration. If rows existed, a one-off job would mint a `value_id` per `active` row, copy its backend entry to the versioned key, and set the pointer, before `ck_credstore_fp_with_value` is enforced.
 - **Penetration testing as a gate:** unchanged — the security confirmation is the contract and E2E invariants above; scheduled testing is a platform activity outside this decision.
 
 ## Revisit Triggers
