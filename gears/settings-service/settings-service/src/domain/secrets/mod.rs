@@ -9,6 +9,7 @@
 //! store reference around the reader, and the value is resolved again when the
 //! handle is used.
 
+pub mod pending;
 pub mod service;
 
 use base64::Engine as _;
@@ -19,6 +20,7 @@ use settings_service_sdk::SecretHandle;
 use crate::domain::error::DomainError;
 use crate::field;
 
+pub use pending::{PendingSecret, PendingSecretDraft, PendingSecretRepository};
 pub use service::SecretResolver;
 
 /// The handle format version, so a later encoding can coexist with this one.

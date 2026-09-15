@@ -19,7 +19,8 @@ use crate::api::rest::setting_dto::render;
 use crate::api::rest::setting_handlers::TenantParam;
 use crate::api::rest::value_dto::{
     BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactRequest, SetValueRequest,
-    ValidateRequest, render_batch_item, render_committed, render_impact, render_validation,
+    StageSecretRequest, ValidateRequest, render_batch_item, render_committed, render_impact,
+    render_pending, render_validation,
 };
 use crate::domain::error::DomainError;
 use crate::domain::writes::{Change, WriteActor};
@@ -362,6 +363,42 @@ pub async fn batch_set(
         })
     }))
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-9
+}
+
+/// `POST /settings-service/v1/settings/{key}/secret-stage?tenant={tenant_id}`
+///
+/// Never a 401 challenge: nothing live changes, so no step-up is asked — the
+/// point of the operation is to run *before* the caller leaves for it.
+///
+/// # Errors
+/// 400 for a malformed key or `tenant`, an invalid value, or a declaration
+/// that is not a secret (`not_a_secret`); 403 when not authorized, the target
+/// is outside the subtree, the caller's own access is not overridable, or a
+/// service principal targets a step-up declaration; 404 when the declaration
+/// is absent or hidden; 410 when retired; 503 when the store or the database
+/// cannot answer.
+pub async fn stage_secret(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(writes): Extension<Arc<WriteCoordinator>>,
+    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Path(key): Path<String>,
+    Query(params): Query<TenantParam>,
+    headers: HeaderMap,
+    Json(body): Json<StageSecretRequest>,
+) -> ApiResult<Response> {
+    let key = parse_key(&key)?;
+    let tenant = parse_tenant(params.tenant.as_deref())?;
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
+    // The same `write` a set needs, decided first and alone.
+    authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let actor = actor(&ctx, &headers);
+    let pending = writes
+        .stage_secret(&actor, &key, tenant, body.value)
+        .await?;
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-6
+    Ok(Json(render_pending(&pending)).into_response())
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-6
 }
 
 /// `POST /settings-service/v1/settings/{key}/validate?tenant={tenant_id}`

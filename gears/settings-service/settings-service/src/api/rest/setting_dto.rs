@@ -338,7 +338,7 @@ mod setting_dto_tests;
 pub struct AuditRecordDto {
     /// Record identity.
     pub id: Uuid,
-    /// `create`, `change`, `revert`, `remove`, `clone` or `secret_use`.
+    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
     pub operation: String,
     /// Who did it, masked when the identity is PII the caller may not see.
     pub actor: String,

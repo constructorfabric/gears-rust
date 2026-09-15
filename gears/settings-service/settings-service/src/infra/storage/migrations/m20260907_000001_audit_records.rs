@@ -33,7 +33,7 @@ impl MigrationTrait for Migration {
                     tenant_id             uuid         NULL,
                     operation             text         NOT NULL
                                           CHECK (operation IN ('create', 'change', 'revert',
-                                                               'remove', 'clone', 'secret_use')),
+                                                               'remove', 'clone', 'secret_use', 'stage')),
                     actor                 text         NOT NULL,
                     actor_classification  text         NOT NULL
                                           CHECK (actor_classification IN ('public', 'pii')),
@@ -61,7 +61,7 @@ impl MigrationTrait for Migration {
                     tenant_id             text     NULL,
                     operation             text     NOT NULL
                                           CHECK (operation IN ('create', 'change', 'revert',
-                                                               'remove', 'clone', 'secret_use')),
+                                                               'remove', 'clone', 'secret_use', 'stage')),
                     actor                 text     NOT NULL,
                     actor_classification  text     NOT NULL
                                           CHECK (actor_classification IN ('public', 'pii')),

@@ -53,6 +53,9 @@ axum = { workspace = true }
 http = { workspace = true }
 toolkit = { workspace = true }
 toolkit-db = { workspace = true }
+# The pending-secret sweep runs on the gear's managed lifecycle tick.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+tokio-util = { workspace = true }
 # Step-up: the default OIDC/JWKS `StepUpVerifier` binding verifies the presented
 # token locally against the provider's published keys.
 toolkit-auth = { workspace = true }

@@ -1325,6 +1325,7 @@ Both are **immediate** — declaration operations do not go through the value wr
 | `POST` | `/settings-service/v1/settings/{key}/validate?tenant={tenant_id}` | **Check a value without storing it** — validity, current effective value + source, and (for `cascading`) the affected descendants, paginated. Read-only, needs no step-up, and not required before a write (`cpt-cf-settings-service-fr-validate-before-set`) | Yes |
 | `PUT` | `/settings-service/v1/settings/{key}/value?tenant={tenant_id}` | **Set the value** at the target scope (`If-Match` + step-up required) | Yes (same value + same `If-Match` ⇒ same outcome) |
 | `POST` | `/settings-service/v1/settings/batch` | **Set several settings in one call** — per-item results, no atomicity across items (below) | No |
+| `POST` | `/settings-service/v1/settings/{key}/secret-stage?tenant={tenant_id}` | **Stage a secret ahead of the batch** — validate the plaintext as a set would, store it under this gear's principal, and answer with an opaque single-use `pending_id` and its expiry, never the reference and never the plaintext; the following batch names `{ "pending_id": … }` in place of the value. The value write gate without step-up: nothing live changes until the batch (§5 *A secret staged across the step-up redirect*). A non-secret declaration is refused `400 not_a_secret` | No |
 | `POST` | `/settings-service/v1/settings/{key}/value/revert?tenant={tenant_id}` | **Revert** — clear the override at the target scope; the response carries the resulting fallback | Yes |
 | `POST` | `/settings-service/v1/settings/{key}/value/clone?tenant={tenant_id}` | **Clone** — copy an effective value from another scope (`from` in body) as an override here | No |
 | `DELETE` | `/settings-service/v1/settings/{key}/value?tenant={tenant_id}` | **Remove the value** at the target scope | Yes |
@@ -1754,6 +1755,24 @@ Both subject columns are **load-bearing** in the subject index: `subject_id` is 
 
 **No row for the root tenant.** Nobody is above the root to record one. A `global` setting's platform value is unaffected: it has no tenant-scoped value to write (§4.1).
 
+#### Table: `pending_secrets`
+
+A secret staged ahead of the batch that commits it (§5 *A secret staged across the step-up redirect*). The plaintext is already in the Credential Store, under the same `private` entry of this gear's principal an ordinary write creates; the row ties the caller's token to that entry for the minutes between the stage and the batch.
+
+| Column | Type | Nullable | Default | Constraints |
+|--------|------|----------|---------|-------------|
+| `id` | UUID | No | auto-generated | **PK** — the `pending_id` the caller holds, minted by this gear |
+| `declaration_id` | UUID | No | — | **FK** → `setting_declarations(id)` ON DELETE CASCADE |
+| `tenant_id` | UUID | No | — | The scope the value is for, as a tenant id (§4.1) |
+| `subject_id` | text | No | — | The subject that staged it; the only one whose batch may claim it |
+| `secret_ref` | text | No | — | The Credential Store reference the batch adopts as the row's `secret_ref` |
+| `created_at` | `timestamptz` | No | current timestamp | |
+| `expires_at` | `timestamptz` | No | — | Ten minutes past the stage, fixed by the design: the batch must have run by then, and after it the token is refused |
+
+**Indexes:** `idx_pending_secrets_expires` (`expires_at`) — the sweep's lookup.
+
+**Single-use, then gone.** A batch change naming the token deletes the row **before** its own commit, whatever that commit does: a commit that lands adopts the entry, a commit that fails releases it through the write's ordinary discard, and in neither case is a token left pointing at anything. A token that is unknown, expired, or names another declaration, tenant or subject rejects that change `invalid`, the row untouched. What nobody claimed is swept — the row and the entry together — by the managed lifecycle once a minute and opportunistically by the next stage. The stage itself writes an audit record with `operation = stage` and a masked post-image, so an abandoned stage is not traceless.
+
 #### Table: `audit_records`
 
 The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no `DELETE` outside retention pruning.
@@ -1764,7 +1783,7 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 | `resource` | text | No | — | The canonical audit resource id, `cf.settings:{key}@{tenant_id}` (§4.2 *Audit Emitter*) — one formatter, shared with the history read |
 | `declaration_key` | text | No | — | Denormalized from `resource` so the scoped query is an index lookup rather than a string match |
 | `tenant_id` | UUID | Yes | — | Scope as an id, matching `setting_values` (§4.1), and **`NULL` for a record about a definition** — a declaration or a category, which is platform-wide and sits at no scope. The rationale that makes platform scope the root tenant's id on `setting_values` (*Why the root tenant rather than `NULL`*, below) does not carry here: it turns on a scoped read having to **find** the row, and a definition's record is one no per-`(setting, scope)` read is looking for. Borrowing a tenant for it would have meant a Tenant Resolver lookup from inside the writing transaction, which is what stopped contributing gears from booting (§5.1) |
-| `operation` | text | No | — | Check: `create`, `change`, `revert`, `remove`, `clone`, `secret_use` |
+| `operation` | text | No | — | Check: `create`, `change`, `revert`, `remove`, `clone`, `secret_use`, `stage` — the last for a secret staged ahead of the batch that commits it (§4.7 *Table `pending_secrets`*) |
 | `actor` | text | No | — | Acting subject |
 | `actor_classification` | `DataClassification` | No | — | The actor identity is itself classified (§4.2 *Audit Emitter*) |
 | `pre_value` / `post_value` | JSONB | Yes | — | Masked before the record is built; a `secret`-classified value is never written in plaintext |
@@ -1975,7 +1994,7 @@ The Settings Service is **supplied as a Constructor Fabric Gear** — a composab
 **Everything else via `#[toolkit::consumes]`** — `authz-resolver` (`AuthZResolverClient`, with the SDK's `PolicyEnforcer` built over it), `tenant-resolver` (`TenantResolverClient`), `credstore` (`CredStoreClientV1`), `event-broker` (`EventBrokerApi`) in R1, and `simple-user-settings` (`SimpleUserSettingsClientV1`, the per-user mode preference — §4.3) plus `license-resolver` from R2. All are used on the **request** path, never during our init, so the client is resolved when first needed rather than eagerly. `consumes` wires it without an ordering edge, and — unlike simply omitting the name — keeps the dependency's `inventory::submit!` registration linked and registers a directory-resolving proxy in the out-of-process profiles. In R1, which is Embedded-only (§2.3), the wiring short-circuits to the co-located implementation and readiness flips immediately.
 
 **Must be built first:** `license-resolver` — the gear is documentation only, there is no crate to depend on, and the platform implements licence validation at base-licence level with per-feature entitlement still pending. A platform **audit** gear exists under no name at all. R1 waits on neither (§2.3): licence gating ships in R2, and audit is a gear-local store written inside the mutation's own transaction (§4.2 *Audit Emitter*). **No IdP gear dependency** — the step-up re-authentication happens **browser ↔ IdP** (the apply request arrives already bearing a fresh token); the gear only **validates that token's claims locally against the IdP's cached JWKS** (§4.2 *Value Writer*), so the IdP is not a per-write runtime dependency — only its JWKS endpoint is configured (fetched/refreshed in the background). Step-up verification is a **ClientHub-resolved `StepUpVerifier`** trait — default binding = the OIDC/JWKS verifier (§4.2 *Value Writer*); a deployment may bind a non-OIDC or added-factor verifier **without gear code** — but never an always-satisfied one: the mechanism is pluggable, the requirement is not (§4.2 *Value Writer*). |
-| Capabilities | `db`, `rest` |
+| Capabilities | `db`, `rest`, `stateful` — the last for the one long-running task this gear owns, the managed-lifecycle tick that sweeps staged secrets nobody claimed (§4.7 *Table `pending_secrets`*) |
 
 > **Why not `system`.** The ToolKit runtime re-partitions gears at init into *all system gears first, then all non-system gears* (`registry::gears_by_system_priority`), preserving the dependency topo-order only *within* each group. A `system` `settings-service` would therefore init **before** `types-registry`, and registering the settings GTS schemas (§4.8 *Bootstrap*) would fail. `system` is intentionally **not** declared (the reference `authz-resolver` gear omits it for the same reason). The reader's early availability is instead provided by dependency ordering — a gear that must read effective values during its own init declares `settings-service` in its `deps`.
 

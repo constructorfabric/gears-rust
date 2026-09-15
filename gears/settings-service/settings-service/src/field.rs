@@ -74,6 +74,10 @@ pub const SECRET_HANDLE_MALFORMED: &str = "secret_handle_malformed";
 /// A secret handle naming a setting that is not secret-classified.
 pub const NOT_A_SECRET: &str = "not_a_secret";
 
+/// A `pending_id` named in place of a secret value that is unknown, expired,
+/// or was staged for another setting, tenant or subject.
+pub const PENDING_SECRET_INVALID: &str = "pending_secret_invalid";
+
 /// A composed setting key segment outside the GTS grammar.
 pub const SETTING_KEY_SEGMENT: &str = "setting_key_segment";
 

@@ -11,18 +11,28 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use settings_service_sdk::SettingKey;
+use time::OffsetDateTime;
+use toolkit_db::secure::DBRunner;
 use toolkit_db::{DBProvider, DbError};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::domain::declaration::Declaration;
+use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::domain::category::DomainVisibility;
+use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
+use crate::domain::secrets::pending::{
+    self as pending, Claim, PENDING_SECRET_TTL, PendingSecret, PendingSecretDraft,
+    PendingSecretRepository,
+};
 use crate::domain::writes::service::{ImpactReport, StepUpPolicy, ValidationReport};
-use crate::domain::writes::{Change, Committed, Gated, ValueWriter, WriteActor};
+use crate::domain::writes::{Change, Committed, Gated, Staged, ValueWriter, WriteActor};
 use crate::field;
 use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::audit_store::AuditStore;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
+use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 
 /// The writer over the concrete repositories and the audit store.
@@ -30,6 +40,9 @@ pub type ConcreteWriter = ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, Au
 
 /// The most changes one batch may carry.
 pub const BATCH_LIMIT: usize = 500;
+
+/// How many expired stages one sweep pass releases at most.
+pub const SWEEP_LIMIT: u64 = 200;
 
 /// One change of a batch.
 #[derive(Debug, Clone)]
@@ -57,6 +70,8 @@ pub struct BatchOutcome {
 pub struct WriteCoordinator {
     db: Arc<DBProvider<DbError>>,
     writer: Arc<ConcreteWriter>,
+    pending: PendingSecretRepo,
+    declarations: DeclarationRepo,
 }
 
 fn conn_error(err: &DbError) -> DomainError {
@@ -69,7 +84,12 @@ impl WriteCoordinator {
     /// Over this database and writer.
     #[must_use]
     pub fn new(db: Arc<DBProvider<DbError>>, writer: Arc<ConcreteWriter>) -> Self {
-        Self { db, writer }
+        Self {
+            db,
+            writer,
+            pending: PendingSecretRepo,
+            declarations: DeclarationRepo,
+        }
     }
 
     /// The writer, for the challenge parameters and the resolver.
@@ -234,28 +254,36 @@ impl WriteCoordinator {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-5
         for change in changes {
             // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
+            let BatchChange {
+                key,
+                tenant,
+                value,
+                if_match,
+            } = change;
             let gated = self
                 .writer
                 .gate(
                     &conn,
                     actor,
-                    &change.key,
-                    change.tenant,
+                    &key,
+                    tenant,
                     StepUpPolicy::AlreadyVerified,
                     "batch",
                 )
                 .await;
             let outcome = match gated {
-                Ok(gated) => {
-                    self.commit(
-                        actor,
-                        gated,
-                        Change::Set(change.value),
-                        change.if_match.as_deref(),
-                        change_set_id,
-                    )
-                    .await
-                }
+                Ok(gated) => match self.batch_change_for(&conn, &gated, actor, value).await {
+                    Ok(change) => {
+                        self.commit(actor, gated, change, if_match.as_deref(), change_set_id)
+                            .await
+                    }
+                    Err(err) => {
+                        self.writer
+                            .after_rejection(&gated.declaration.key, gated.tenant_id, actor, &err)
+                            .await;
+                        Err(err)
+                    }
+                },
                 Err(err) => Err(err),
             };
             // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
@@ -273,6 +301,235 @@ impl WriteCoordinator {
             change_set_id,
             results,
         })
+    }
+
+    /// The change a batch entry carries: a value, or — for a secret setting —
+    /// a `pending_id` standing in for one, resolved to the entry staged
+    /// earlier. Any other shape is a value and validates as one.
+    async fn batch_change_for<C: DBRunner>(
+        &self,
+        conn: &C,
+        gated: &Gated,
+        actor: &WriteActor,
+        value: Value,
+    ) -> Result<Change, DomainError> {
+        if gated.declaration.has_secret_trait
+            && let Some(pending_id) = pending::pending_id_of(&value)
+        {
+            return self
+                .claim_pending(conn, gated, actor, pending_id)
+                .await
+                .map(Change::AdoptSecret);
+        }
+        Ok(Change::Set(value))
+    }
+
+    /// Claim a staged secret for a batch change: the row must exist, be
+    /// unexpired, and name this change's declaration, tenant and subject.
+    /// Single-use, consumed here before the commit: a commit that then fails
+    /// releases the entry through the ordinary discard path, so no token is
+    /// ever left pointing at nothing.
+    async fn claim_pending<C: DBRunner>(
+        &self,
+        conn: &C,
+        gated: &Gated,
+        actor: &WriteActor,
+        pending_id: Uuid,
+    ) -> Result<String, DomainError> {
+        let scope = AccessScope::allow_all();
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-7
+        let Some(row) = self.pending.find(conn, &scope, pending_id).await? else {
+            return Err(pending::invalid_pending());
+        };
+        let subject = actor.subject();
+        pending::check_claim(
+            &row,
+            &Claim {
+                declaration_id: gated.declaration.id,
+                tenant_id: gated.tenant_id,
+                subject_id: &subject,
+                now: OffsetDateTime::now_utc(),
+            },
+        )?;
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-7
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
+        // The row goes before the commit, whatever the commit does: a token is
+        // claimed once. A delete that finds nothing lost the race to another
+        // claim of the same token.
+        if !self.pending.delete(conn, &scope, pending_id).await? {
+            return Err(pending::invalid_pending());
+        }
+        Ok(row.secret_ref)
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
+    }
+
+    /// Stage a `secret`-trait value ahead of step-up: validate it, put the
+    /// plaintext in the store under this gear's principal exactly as a set
+    /// would, and hand back a token the batch names in place of the value.
+    /// No step-up is asked, since nothing live changes here.
+    ///
+    /// # Errors
+    /// The gate's refusals short of step-up; [`DomainError::Validation`] with
+    /// `not_a_secret` for a declaration whose values travel inline, or for an
+    /// invalid value; [`DomainError::Unavailable`] when the store or the
+    /// database cannot answer, in which case nothing is kept anywhere.
+    pub async fn stage_secret(
+        &self,
+        actor: &WriteActor,
+        key: &SettingKey,
+        requested: Option<Uuid>,
+        value: Value,
+    ) -> Result<PendingSecret, DomainError> {
+        let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        // A stage is also the moment to let go of what nobody claimed; a sweep
+        // that fails is logged and tried again by the next one.
+        if let Err(err) = self.sweep_expired_in(&conn, SWEEP_LIMIT).await {
+            tracing::warn!(%err, "pending-secret sweep failed; expired stages wait for the next pass");
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
+        // The value write gate with step-up skipped: authorization was decided
+        // by the caller, and a service principal is still refused a setting
+        // that requires a person.
+        let gated = self
+            .writer
+            .gate(
+                &conn,
+                actor,
+                key,
+                requested,
+                StepUpPolicy::AlreadyVerified,
+                "stage",
+            )
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-2
+        if !gated.declaration.has_secret_trait {
+            return Err(DomainError::Validation {
+                field: "key".to_owned(),
+                code: field::NOT_A_SECRET,
+                message: format!(
+                    "`{key}` is not a secret setting: its values travel inline and need no staging"
+                ),
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-2
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-3
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-4
+        // Exactly the set's own staging: validated against the type, then into
+        // the store under a reference unique to this stage; a store that
+        // cannot answer refuses here and nothing is kept.
+        let staged = self.writer.stage(&gated, Change::Set(value)).await?;
+        let Staged::Set {
+            secret_ref: Some(secret_ref),
+            ..
+        } = &staged
+        else {
+            return Err(DomainError::Internal {
+                diagnostic: "staging a secret produced no store reference".to_owned(),
+            });
+        };
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-4
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-3
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
+        // The row and its record in one transaction; a transaction that does
+        // not commit releases the entry, as a refused set does.
+        let draft = PendingSecretDraft {
+            declaration_id: gated.declaration.id,
+            tenant_id: gated.tenant_id,
+            subject_id: actor.subject(),
+            secret_ref: secret_ref.clone(),
+            expires_at: OffsetDateTime::now_utc() + PENDING_SECRET_TTL,
+        };
+        let pending = self.pending;
+        let key_owned = gated.declaration.key.clone();
+        let tenant_id = gated.tenant_id;
+        let actor_owned = actor.clone();
+        let outcome = self
+            .db
+            .db()
+            .transaction_ref_mapped::<_, PendingSecret, DomainError>(move |tx| {
+                Box::pin(async move {
+                    let scope = AccessScope::allow_all();
+                    let row = pending.insert(tx, &scope, draft).await?;
+                    let record = AuditRecord::new(
+                        key_owned.as_str(),
+                        Some(tenant_id),
+                        actor_owned.subject(),
+                        AuditOperation::Stage,
+                        actor_owned.request_id.clone(),
+                    )
+                    .with_post_image(AuditValue::Masked);
+                    AuditStore.append(tx, &scope, record).await?;
+                    Ok(row)
+                })
+            })
+            .await;
+        match outcome {
+            Ok(row) => Ok(row),
+            Err(err) => {
+                self.writer.discard(&gated, &staged).await;
+                Err(err)
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
+    }
+
+    /// Release the stages nobody claimed: each expired row is deleted and its
+    /// entry released, together. Returns how many rows went.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the database cannot list or delete; a store that
+    /// cannot release is logged per entry, the row already gone.
+    pub async fn sweep_expired(&self, limit: u64) -> Result<usize, DomainError> {
+        let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        self.sweep_expired_in(&conn, limit).await
+    }
+
+    async fn sweep_expired_in<C: DBRunner>(
+        &self,
+        conn: &C,
+        limit: u64,
+    ) -> Result<usize, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
+        let scope = AccessScope::allow_all();
+        let expired = self
+            .pending
+            .list_expired(conn, &scope, OffsetDateTime::now_utc(), limit)
+            .await?;
+        let mut released = 0;
+        for row in expired {
+            // Gone already: a claim got there first, and the entry is its.
+            if !self.pending.delete(conn, &scope, row.id).await? {
+                continue;
+            }
+            released += 1;
+            let key = self
+                .declarations
+                .find(
+                    conn,
+                    &scope,
+                    &DomainVisibility::Unrestricted,
+                    row.declaration_id,
+                )
+                .await?
+                .map(|d| d.key)
+                .unwrap_or_default();
+            if let Err(err) = self
+                .writer
+                .secrets()
+                .delete_secret(&key, row.tenant_id, &row.secret_ref)
+                .await
+            {
+                tracing::warn!(
+                    pending_id = %row.id,
+                    tenant = %row.tenant_id,
+                    %err,
+                    "expired staged secret not released from the store; the reference is orphaned"
+                );
+            }
+        }
+        Ok(released)
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
     }
 
     /// Copy the effective value at `from` as an override at `to`.

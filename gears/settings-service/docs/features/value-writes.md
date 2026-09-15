@@ -158,7 +158,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 3. [x] - `p1` - Verify step-up **once** for the request when any target declaration requires it; **IF** it fails → **RETURN** the refusal with nothing evaluated - `inst-vw-batch-3`
 4. [x] - `p1` - Mint one change set id for the request - `inst-vw-batch-4`
 5. [x] - `p1` - **FOR EACH** change, in order - `inst-vw-batch-5`
-   1. [x] - `p1` - Invoke the remaining write gates for its key and target, then commit one change - `inst-vw-batch-6`
+   1. [x] - `p1` - Invoke the remaining write gates for its key and target, then commit one change; for a `secret`-trait target whose value is `{ "pending_id": … }`, the change adopts the entry staged earlier instead of carrying a value (the stage flow of entry 2.9) - `inst-vw-batch-6`
    2. [x] - `p1` - Record its outcome: the old and new value and scope on success, or the error that rejected it; a failing change stores nothing and does not stop the others - `inst-vw-batch-7`
 6. [x] - `p1` - Evict the local cache for every committed change, then publish the committed keys under the change set id - `inst-vw-batch-8`
 7. [x] - `p1` - **RETURN** `200` with one entry per change; the status reflects that every item was answered, and the caller reads the outcomes - `inst-vw-batch-9`

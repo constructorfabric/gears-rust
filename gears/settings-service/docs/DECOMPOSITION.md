@@ -558,6 +558,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Classification-aware masking in every administrative read, list, search, and audit output: `secret` always masked, `pii` masked unless the caller is authorized for unmasked PII, `public` passed through
   - `SettingsReaderClient::resolve_secret` over an opaque `SecretHandle`: per-setting authorization of the calling service, plaintext fetched from the store, one `event_secret_used` record with the value masked, plaintext never cached and never returned to an administrative caller
   - `delete_secret` when an override is removed or superseded
+  - Staging a secret ahead of the step-up redirect: `POST /settings/{key}/secret-stage` validates and stores the plaintext as a set would and answers with a single-use `pending_id`; the batch names it in place of the value and adopts the entry without a second store leg; expired stages are swept with their entries (DESIGN §5 *A secret staged across the step-up redirect*, §4.7 `pending_secrets`)
   - The placeholder-default rule, already enforced by 2.3 on the declaration side: a secret setting resolves to its empty placeholder, never to a credential
 
 - **Out of scope**:
@@ -578,6 +579,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Domain Model Entities**:
   - SecretHandle
+  - PendingSecret
   - `secret_ref` on SettingValue
 
 - **Design Components**:

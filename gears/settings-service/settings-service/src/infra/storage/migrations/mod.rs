@@ -19,6 +19,7 @@ mod m20260825_000001_setting_declarations;
 mod m20260906_000001_setting_values;
 mod m20260907_000001_audit_records;
 mod m20260907_000002_tenant_permissions;
+mod m20260915_000001_pending_secrets;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000001_setting_values::Migration),
             Box::new(m20260907_000001_audit_records::Migration),
             Box::new(m20260907_000002_tenant_permissions::Migration),
+            Box::new(m20260915_000001_pending_secrets::Migration),
         ]
     }
 }

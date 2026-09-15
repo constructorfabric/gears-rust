@@ -2,10 +2,12 @@
 //! Wire shapes of the write surface.
 
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::api::rest::setting_dto::{EffectiveValueDto, mask};
 use crate::domain::error::DomainError;
+use crate::domain::secrets::PendingSecret;
 use crate::domain::writes::Committed;
 use crate::domain::writes::service::{ImpactReport, ValidationReport};
 
@@ -41,6 +43,44 @@ pub struct ImpactRequest {
     pub limit: Option<usize>,
 }
 
+/// `POST /settings/{key}/secret-stage`: the plaintext to stage ahead of the
+/// step-up redirect.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct StageSecretRequest {
+    /// The secret value, validated against the declaration's type exactly as
+    /// a set validates it.
+    pub value: Value,
+}
+
+/// The answer to staging a secret: a token that stands in for the value, and
+/// when it stops standing in for it. Neither the plaintext nor the store
+/// reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub struct PendingSecretDto {
+    /// The opaque, single-use token to send as the batch change's `value`,
+    /// shaped `{ "pending_id": "…" }`.
+    pub pending_id: String,
+    /// When the staged secret is swept, RFC 3339. After this the token is
+    /// refused and the credential-store entry is released.
+    pub expires_at: String,
+}
+
+/// Render a stage: the token and its expiry, nothing else.
+#[must_use]
+pub fn render_pending(pending: &PendingSecret) -> PendingSecretDto {
+    // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-6
+    PendingSecretDto {
+        pending_id: pending.id.to_string(),
+        expires_at: pending
+            .expires_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| pending.expires_at.to_string()),
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-6
+}
+
 /// `POST /settings/{key}/value/clone`: where to copy from.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -59,7 +99,10 @@ pub struct BatchChangeRequest {
     /// The target tenant; absent, the caller's own.
     #[serde(default)]
     pub tenant: Option<Uuid>,
-    /// The new value.
+    /// The new value. For a `secret`-trait setting this may instead be
+    /// `{ "pending_id": "…" }`, naming a secret staged earlier through
+    /// `/secret-stage`: the staged entry is adopted and nothing is stored a
+    /// second time. Any other shape is a value and validates as one.
     pub value: Value,
     /// The value state tag the caller last read for this scope, or the literal
     /// `absent` for a first write. Required in effect: a change that omits it
