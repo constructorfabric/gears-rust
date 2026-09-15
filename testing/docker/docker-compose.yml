@@ -23,11 +23,12 @@ services:
       # Allow container to access host machine via host.docker.internal
       - "host.docker.internal:host-gateway"
     environment:
-      # No external dependencies needed for file-parser gear
+      # No external dependencies needed for file-parser gear.
+      # bind_addr / enable_docs / cors_enabled come from config/e2e-local.yaml.
+      # They used to be overridden here as APP__MODULES__api_gateway__CONFIG__*,
+      # which no longer binds: the config root was renamed `modules` -> `gears`,
+      # and a dash-named gear cannot be addressed by env var at all (#4115, #4175).
       - RUST_LOG=info
-      - APP__MODULES__api_gateway__CONFIG__BIND_ADDR=0.0.0.0:8086
-      - APP__MODULES__api_gateway__CONFIG__ENABLE_DOCS=true
-      - APP__MODULES__api_gateway__CONFIG__CORS_ENABLED=true
     depends_on:
       mock:
         condition: service_healthy

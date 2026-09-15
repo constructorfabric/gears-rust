@@ -11,6 +11,7 @@ See `testing/e2e/README.md` ("How E2E Is Executed") for the full picture.
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -177,10 +178,78 @@ def cmd_cfs_validate(_args):
         sys.exit(result.returncode)
 
 
+def cmd_docker_pins(_args):
+    """Guard the base-image pins against silent drift.
+
+    Two failure modes, both observed in #4798:
+      * the Rust version is duplicated in rust-toolchain.toml and in every
+        builder stage, and nothing checked that they agree - the Dockerfiles
+        sat on 1.95 long after the toolchain moved to 1.97, so every build
+        quietly rustup-installed a second toolchain;
+      * some FROM lines were digest-pinned and others were not, so the
+        supply-chain hardening was only partial.
+
+    Pure text parsing - no Docker daemon, no network, runs in well under a
+    second, so it can sit on every PR.
+    """
+    step("Checking Docker base-image pins")
+
+    toolchain_path = os.path.join(PROJECT_ROOT, "rust-toolchain.toml")
+    with open(toolchain_path, encoding="utf-8-sig") as fh:
+        m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', fh.read(), re.M)
+    if not m:
+        print(f"ERROR: no [toolchain] channel in {toolchain_path}")
+        sys.exit(1)
+    channel = m.group(1)
+    print(f"rust-toolchain.toml channel: {channel}")
+
+    # Prune rather than filter after the fact: `target/` alone is ~17 GB here, and
+    # os.walk would happily recurse all of it looking for Dockerfiles it cannot
+    # contain.
+    pruned = {".git", ".venv", "node_modules", "target"}
+    dockerfiles = []
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        dirs[:] = [d for d in dirs if d not in pruned]
+        dockerfiles.extend(
+            os.path.join(root, name) for name in files if name.endswith("Dockerfile")
+        )
+    dockerfiles.sort()
+
+    problems = []
+    checked = 0
+    for path in dockerfiles:
+        rel = os.path.relpath(path, PROJECT_ROOT)
+        # .clusterfuzzlite is owned by the OSS-Fuzz base image contract, which
+        # tracks its own upstream tag; it is deliberately out of scope here.
+        if rel.startswith(".clusterfuzzlite"):
+            continue
+        checked += 1
+        with open(path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, 1):
+                if not line.startswith("FROM "):
+                    continue
+                ref = line.split()[1]
+                if "@sha256:" not in ref:
+                    problems.append(f"{rel}:{lineno}: base image is not digest-pinned: {ref}")
+                rust = re.match(r"^rust:([0-9.]+)-", ref)
+                if rust and rust.group(1) != channel:
+                    problems.append(
+                        f"{rel}:{lineno}: rust {rust.group(1)} != rust-toolchain.toml {channel}"
+                    )
+
+    if problems:
+        print("ERROR: Docker base-image pin check FAILED")
+        for problem in problems:
+            print(f"  {problem}")
+        sys.exit(1)
+    print(f"OK. {checked} Dockerfile(s) checked")
+
+
 def cmd_check(args):
     step("Running full check suite")
     cmd_fmt(args)
     cmd_cfs_validate(args)
+    cmd_docker_pins(args)
     cmd_clippy(args)
     cmd_test(args)
     cmd_gts_docs(args)
@@ -340,6 +409,13 @@ def cmd_e2e(args):
         # Add build args for cargo features if specified
         if args.features:
             build_cmd.extend(["--build-arg", f"CARGO_FEATURES={args.features}"])
+
+        # "release" (default) or "dev". A dev build trades runtime speed for a
+        # much shorter compile, which is what the CI smoke lane wants — the
+        # image is a functional test subject, not a performance subject.
+        build_profile = os.environ.get("E2E_DOCKER_BUILD_PROFILE")
+        if build_profile:
+            build_cmd.extend(["--build-arg", f"BUILD_PROFILE={build_profile}"])
 
         build_cmd.append(".")
         run_cmd(build_cmd)
@@ -518,6 +594,22 @@ def cmd_e2e(args):
     exit_code = result.returncode
 
     if args.docker and docker_env_started:
+        # Before `down`, not after: the teardown removes the containers, so a
+        # caller (CI step, human) has nothing left to read once we return.
+        if exit_code != 0:
+            step("Capturing docker-compose logs")
+            run_cmd_allow_fail(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "testing/docker/docker-compose.yml",
+                    "logs",
+                    "--no-color",
+                    "--tail=400",
+                ]
+            )
+
         step("Stopping E2E docker-compose environment")
         run_cmd_allow_fail(
             [
@@ -830,6 +922,12 @@ def build_parser():
     p_fuzz_clean.set_defaults(func=cmd_fuzz_clean)
 
     # cfs-validate
+    p_docker_pins = subparsers.add_parser(
+        "docker-pins",
+        help="Check Dockerfile base images are digest-pinned and match rust-toolchain.toml",
+    )
+    p_docker_pins.set_defaults(func=cmd_docker_pins)
+
     p_cfs = subparsers.add_parser("cfs-validate", help="Validate CFS artifacts (specs, code, templates)")
     p_cfs.set_defaults(func=cmd_cfs_validate)
 
