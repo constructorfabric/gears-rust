@@ -17,9 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use usage_collector_sdk::UsageCollectorPluginError;
+use toolkit_odata::{CursorV1, ODataQuery, SortDir};
+use usage_collector_sdk::{UsageCollectorPluginError, UsageKind, UsageType, UsageTypeGtsId};
 
 use super::{ChCatalogStore, RefreshOutcome};
+use crate::domain::ports::CatalogStore;
 use crate::infra::metrics::Metrics;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -304,6 +306,374 @@ fn create_version_is_monotonic_not_hardcoded() {
     assert!(
         first < second,
         "current_merge_version() must be monotonically increasing ({first} < {second})"
+    );
+}
+
+// ── Offline helpers ──────────────────────────────────────────────────────────
+
+/// A usage type id under the test suffix namespace the live tests also use.
+fn offline_gts_id(suffix: &str) -> UsageTypeGtsId {
+    UsageTypeGtsId::new(format!(
+        "gts.cf.core.uc.usage_record.v1~cf.compute._.{suffix}.v1"
+    ))
+    .expect("valid gts_id")
+}
+
+/// A minimal counter-kind usage type for the offline write paths.
+fn offline_usage_type(suffix: &str) -> UsageType {
+    UsageType {
+        gts_id: offline_gts_id(suffix),
+        kind: UsageKind::Counter,
+        metadata_fields: std::collections::BTreeSet::new(),
+    }
+}
+
+/// Assert an error is the backend-unreachable classification rather than a
+/// domain answer the store could not actually have established.
+fn assert_backend_failure(err: &UsageCollectorPluginError, what: &str) {
+    match err {
+        UsageCollectorPluginError::Transient { .. } | UsageCollectorPluginError::Internal(_) => {}
+        other => panic!("{what} must surface as a backend error, got {other:?}"),
+    }
+}
+
+// ── Refresh worker: shutdown and deadline ────────────────────────────────────
+
+/// The worker parks on `notified()` when there is nothing to refresh, and the
+/// cancellation token is the only shutdown signal the `Gear` trait gives it —
+/// there is no shutdown hook. An idle worker that ignored the token would keep
+/// the task alive for the life of the process.
+///
+/// Asserted through the run counter rather than by observing the task: after a
+/// cancel, a subsequent signal must not be picked up.
+#[tokio::test]
+async fn the_idle_worker_exits_on_cancellation_and_stops_serving_signals() {
+    use std::sync::atomic::Ordering;
+
+    let cancel = CancellationToken::new();
+    let store = offline_store(cancel.clone());
+
+    // Let the worker reach its park on `notified()`.
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after_cancel = store.refresh_runs.load(Ordering::SeqCst);
+    store.request_catalog_size_refresh();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        store.refresh_runs.load(Ordering::SeqCst),
+        after_cancel,
+        "a cancelled worker must not pick up further refresh signals"
+    );
+}
+
+/// The gauge refresh is bounded by the same client-side deadline the request
+/// path uses, so a stalled `count()` cannot pin a connection open for the life
+/// of the process.
+///
+/// It is bounded with a bare `timeout` rather than `with_deadline`: a stalled
+/// gauge refresh is not a request-path backend error, so it must stay out of
+/// the backend-error counter and only be logged. The observable contract is
+/// therefore that the refresh *returns* (as `Ran`, since a failed count is
+/// still a completed run) at roughly the deadline rather than hanging.
+#[tokio::test]
+async fn a_stalled_catalog_size_refresh_is_cut_off_by_the_client_side_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a local socket");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.push(stream);
+        }
+    });
+
+    let deadline = Duration::from_millis(300);
+    let store = ChCatalogStore::new(
+        clickhouse::Client::default().with_url(format!("http://{addr}")),
+        CancellationToken::new(),
+        Arc::new(Metrics::new()),
+        deadline,
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = store.refresh_catalog_size_cancellable().await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Ran,
+        "a refresh cut off by its deadline is still a completed run, not a cancellation"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the refresh must return at roughly the deadline rather than hang, took {elapsed:?}"
+    );
+}
+
+// ── Debug ────────────────────────────────────────────────────────────────────
+
+/// `clickhouse::Client` holds the DSN, credentials included, and does not
+/// implement `Debug`. The manual impl must stay non-exhaustive and must not
+/// grow a field that would print them into a log line.
+/// `#[tokio::test]` because `ChCatalogStore::new` spawns the refresh worker
+/// eagerly and so requires a runtime.
+#[tokio::test]
+async fn store_debug_does_not_print_the_clickhouse_client() {
+    let store = offline_store(CancellationToken::new());
+    let rendered = format!("{store:?}");
+
+    assert!(
+        rendered.starts_with("ChCatalogStore"),
+        "the struct must still name itself, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("127.0.0.1"),
+        "the endpoint (and with it any embedded credentials) must never render: {rendered}"
+    );
+}
+
+// ── Write paths reach the backend ────────────────────────────────────────────
+//
+// Each of these is a step that must not report a domain outcome it never
+// established. Against an unreachable backend the only honest answer is a
+// backend error.
+
+/// `create` issues its version-resolved pre-existence read first, so an
+/// unreachable backend cannot be mistaken for "absent, go ahead and insert" —
+/// which would silently overwrite a live type on the next reachable call.
+#[tokio::test]
+async fn create_surfaces_a_backend_failure_on_its_pre_existence_read() {
+    let store = offline_store(CancellationToken::new());
+
+    let err = store
+        .create(offline_usage_type("create_offline_test"))
+        .await
+        .expect_err("create cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed pre-existence read");
+}
+
+/// `get` must not answer `UsageTypeNotFound` for a read it never completed:
+/// the gateway treats that as an authoritative "no such type".
+#[tokio::test]
+async fn get_does_not_report_not_found_when_the_read_never_completed() {
+    let store = offline_store(CancellationToken::new());
+
+    let err = store
+        .get(offline_gts_id("get_offline_test"))
+        .await
+        .expect_err("get cannot succeed against an unreachable backend");
+
+    assert!(
+        !matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "an unreachable backend must never be reported as an absent type, got {err:?}"
+    );
+    assert_backend_failure(&err, "a failed get read");
+}
+
+/// The catalog `INSERT` itself, reached directly so its failure classification
+/// is pinned independently of the `create` read that normally precedes it.
+#[tokio::test]
+async fn insert_type_row_surfaces_a_backend_failure() {
+    use crate::infra::storage::entity::{UsageTypeKindCode, UsageTypeRow};
+
+    let store = offline_store(CancellationToken::new());
+    let row = UsageTypeRow {
+        gts_id: offline_gts_id("insert_offline_test").as_ref().to_owned(),
+        kind: UsageTypeKindCode::Counter,
+        metadata_fields: Vec::new(),
+        version: 1,
+    };
+
+    let err = store
+        .insert_type_row(&row)
+        .await
+        .expect_err("the catalog INSERT cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed catalog INSERT");
+}
+
+/// The reference probe gates `delete`, so a probe that could not run must
+/// propagate rather than read as "zero references, safe to delete".
+#[tokio::test]
+async fn count_references_surfaces_a_backend_failure() {
+    let store = offline_store(CancellationToken::new());
+
+    let err = store
+        .count_references(&offline_gts_id("refprobe_offline_test"))
+        .await
+        .expect_err("the reference probe cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed reference probe");
+}
+
+/// The `ALTER TABLE … DELETE` mutation, reached directly.
+#[tokio::test]
+async fn delete_where_gts_id_surfaces_a_backend_failure() {
+    let store = offline_store(CancellationToken::new());
+
+    let err = store
+        .delete_where_gts_id(
+            "usage_type_catalog",
+            &offline_gts_id("mutation_offline_test"),
+        )
+        .await
+        .expect_err("the delete mutation cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed delete mutation");
+}
+
+// ── Post-delete orphan sweep ─────────────────────────────────────────────────
+
+/// The sweep is infallible by contract: the type is already gone by the time it
+/// runs, so neither a failed probe nor a failed mutation may be reported as a
+/// failed `delete`.
+///
+/// With the probe unable to run, `count_orphans_after_delete` reports `0` — the
+/// same answer as "no orphans" — and the sweep issues no mutation at all. That
+/// is deliberate: the distinction an operator needs (that the plugin does not
+/// *know* whether orphans survive) is in the log line, not the return type.
+/// This pins that it returns rather than panicking or hanging.
+#[tokio::test]
+async fn the_orphan_sweep_is_silent_when_its_probe_cannot_run() {
+    let store = offline_store(CancellationToken::new());
+
+    store
+        .sweep_orphaned_records(&offline_gts_id("sweep_offline_test"))
+        .await;
+}
+
+// ── list: cursor validation happens before any I/O ───────────────────────────
+//
+// Every rejection below is a fail-closed guard against walking a token minted
+// under a different query shape, which would silently skip or repeat rows. All
+// three return before a statement is issued, so they are assertable offline —
+// and the assertion that they are `Internal` rather than `Transient` is what
+// proves no round trip was attempted.
+
+fn catalog_cursor(keys: &[&str], signed_order: &str, filter_hash: Option<&str>) -> CursorV1 {
+    CursorV1 {
+        k: keys.iter().map(|k| (*k).to_owned()).collect(),
+        o: SortDir::Asc,
+        s: signed_order.to_owned(),
+        f: filter_hash.map(str::to_owned),
+        d: "fwd".to_owned(),
+    }
+}
+
+/// Only forward paging is minted in v1; a `"bwd"` token would otherwise be
+/// walked *forward*, since the keyset operator comes from the sort direction
+/// rather than from `cursor.d`.
+#[tokio::test]
+async fn list_rejects_a_backward_cursor() {
+    let store = offline_store(CancellationToken::new());
+    let mut cursor = catalog_cursor(&["gts.a"], "+gts_id", None);
+    cursor.d = "bwd".to_owned();
+
+    let err = store
+        .list(&ODataQuery::new().with_cursor(cursor))
+        .await
+        .expect_err("a backward cursor must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("only forward paging is supported"),
+        "expected a direction rejection, got: {msg}"
+    );
+}
+
+/// A token minted under a different `$filter` describes a different row set;
+/// continuing it would skip or repeat rows silently.
+#[tokio::test]
+async fn list_rejects_a_cursor_whose_filter_hash_does_not_match() {
+    let store = offline_store(CancellationToken::new());
+    let cursor = catalog_cursor(&["gts.a"], "+gts_id", Some("hash-from-another-query"));
+
+    let err = store
+        .list(&ODataQuery::new().with_cursor(cursor))
+        .await
+        .expect_err("a cursor from a differently-filtered query must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cursor filter hash mismatch"),
+        "expected a filter-hash rejection, got: {msg}"
+    );
+}
+
+/// The catalog list has one fixed order (`gts_id` ascending) and ignores
+/// `query.order`, so the cursor is checked against *that* order — a token
+/// minted under any other one cannot be walked forward here.
+#[tokio::test]
+async fn list_rejects_a_cursor_minted_under_a_different_sort_order() {
+    let store = offline_store(CancellationToken::new());
+    let cursor = catalog_cursor(&["counter"], "+kind", None);
+
+    let err = store
+        .list(&ODataQuery::new().with_cursor(cursor))
+        .await
+        .expect_err("a cursor minted under a different order must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cursor sort order mismatch"),
+        "expected a sort-order rejection, got: {msg}"
+    );
+}
+
+/// A cursor that passes all three guards builds its keyset predicate and the
+/// call goes on to issue a statement — which is what reaching the backend error
+/// proves. The complement of the three rejections above: they must not be
+/// refusing every cursor.
+#[tokio::test]
+async fn list_accepts_a_matching_cursor_and_reaches_the_backend() {
+    let store = offline_store(CancellationToken::new());
+    let cursor = catalog_cursor(
+        &["gts.cf.core.uc.usage_record.v1~cf.compute._.page_offline_test.v1"],
+        "+gts_id",
+        None,
+    );
+
+    let err = store
+        .list(&ODataQuery::new().with_cursor(cursor))
+        .await
+        .expect_err("the statement cannot succeed against an unreachable backend");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "a cursor that validates must fail at the backend, not as a cursor rejection: {err:?}"
+    );
+}
+
+/// `$filter` is translated through the `UsageTypeFilterField` allowlist; a name
+/// that is not on it is refused before any SQL is built, so no unvetted
+/// identifier can reach the statement text.
+#[tokio::test]
+async fn list_rejects_a_filter_naming_a_field_outside_the_allowlist() {
+    use toolkit_odata::ast::{CompareOperator, Expr, Value};
+
+    let store = offline_store(CancellationToken::new());
+    let query = ODataQuery::new().with_filter(Expr::Compare(
+        Box::new(Expr::Identifier(
+            "definitely_not_a_catalog_column".to_owned(),
+        )),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::String("x".to_owned()))),
+    ));
+
+    let err = store
+        .list(&query)
+        .await
+        .expect_err("an unknown filter field must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid filter"),
+        "expected a filter-translation rejection, got: {msg}"
     );
 }
 

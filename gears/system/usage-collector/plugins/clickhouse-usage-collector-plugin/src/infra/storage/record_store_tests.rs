@@ -7,6 +7,7 @@ use std::sync::Arc;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{UsageCollectorPluginError, UsageRecord, UsageTypeGtsId};
 
 use super::{
@@ -1235,5 +1236,600 @@ fn list_sql_places_trailing_predicates_after_the_survivors_and_before_order_by()
     assert!(
         keyset_start > subquery_start,
         "the keyset predicate must follow the survivor predicate: {sql}"
+    );
+}
+
+// ── finalize_outcomes ────────────────────────────────────────────────────────
+
+/// The SPI result vector is positional: result `i` belongs to input `i`. This
+/// must hold whatever mix of successes and failures the slots carry.
+#[test]
+fn finalize_outcomes_preserves_positional_order() {
+    let tenant = Uuid::from_u128(11);
+    let base = 1_700_000_000_000_000_i64;
+    let records = vec![
+        make_record(Uuid::from_u128(1), tenant, base),
+        make_record(Uuid::from_u128(2), tenant, base + 1),
+    ];
+    let outcomes = vec![
+        Some(Ok(records[0].clone())),
+        Some(Err(UsageCollectorPluginError::internal("slot 1 failed"))),
+    ];
+
+    let finalized = super::finalize_outcomes(outcomes, &records);
+
+    assert_eq!(finalized.len(), 2);
+    match &finalized[0] {
+        Ok(r) => assert_eq!(r.id, records[0].id, "slot 0 keeps its own record"),
+        other => panic!("slot 0 must stay Ok, got {other:?}"),
+    }
+    assert!(finalized[1].is_err(), "slot 1 keeps its own failure");
+}
+
+/// An unfilled slot means a record was neither written, absorbed, nor rejected
+/// — the batch loop lost it. Dropping it would shorten the result vector and
+/// silently re-index every later record's outcome onto the wrong input; that is
+/// far worse than reporting a failure, so it is reported as an invariant break.
+#[test]
+fn finalize_outcomes_reports_an_unresolved_slot_as_an_invariant_break() {
+    let tenant = Uuid::from_u128(12);
+    let base = 1_700_000_000_000_000_i64;
+    let records = vec![
+        make_record(Uuid::from_u128(1), tenant, base),
+        make_record(Uuid::from_u128(2), tenant, base + 1),
+    ];
+    // Slot 0 never resolved.
+    let outcomes = vec![None, Some(Ok(records[1].clone()))];
+
+    let finalized = super::finalize_outcomes(outcomes, &records);
+
+    assert_eq!(
+        finalized.len(),
+        2,
+        "the result vector must stay the same length as the input, so positions still line up"
+    );
+    match &finalized[0] {
+        Err(UsageCollectorPluginError::Internal(msg)) => assert!(
+            msg.contains("invariant break"),
+            "the unresolved slot must say so, got: {msg}"
+        ),
+        other => panic!("an unresolved slot must be an Internal error, got {other:?}"),
+    }
+    assert!(
+        finalized[1].is_ok(),
+        "a resolved neighbour must be untouched"
+    );
+}
+
+// ── compose_batch: compensation rows ─────────────────────────────────────────
+
+/// A composed row carrying `corrects_id` is a compensation and is counted as
+/// one. The count is per *composed* row, so an in-batch twin of a compensation
+/// must not double-count it.
+#[test]
+fn compose_batch_composes_compensation_rows_once_per_row() {
+    let tenant = Uuid::from_u128(13);
+    let base = 1_700_000_000_000_000_i64;
+    let corrected = Uuid::from_u128(99);
+
+    let mut compensation = make_record(Uuid::from_u128(1), tenant, base);
+    compensation.corrects_id = Some(corrected);
+    let records = vec![compensation.clone(), compensation];
+
+    let existing = HashMap::new();
+    let passed = vec![0, 1];
+    let mut outcomes = vec![None, None];
+
+    let (to_insert, row_slots) =
+        offline_store().compose_batch(&records, &passed, &existing, 500, &mut outcomes);
+
+    assert_eq!(
+        to_insert.len(),
+        1,
+        "the identical twin shares the composed row"
+    );
+    assert_eq!(
+        to_insert[0].corrects_id,
+        Some(corrected),
+        "the composed row must carry the corrected id through to storage"
+    );
+    assert_eq!(
+        row_slots,
+        vec![vec![0, 1]],
+        "both input slots depend on the one composed row landing"
+    );
+    for idx in [0, 1] {
+        assert!(
+            matches!(outcomes[idx], Some(Ok(_))),
+            "slot {idx} must be Ok, got {:?}",
+            outcomes[idx]
+        );
+    }
+}
+
+// ── Aggregate NDJSON decoding: rejection paths ───────────────────────────────
+
+/// An `agg` value that is a well-typed JSON string but not a decimal is a
+/// protocol disagreement, not a value — reporting it as `None` would silently
+/// turn a broken response into an empty bucket.
+#[test]
+fn aggregate_response_rejects_an_unparseable_decimal() {
+    let err = parse_aggregate_response(b"{\"agg\":\"not-a-decimal\"}\n", &[])
+        .expect_err("a non-decimal agg string must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("aggregate value parse error"),
+        "expected a decimal parse failure, got: {msg}"
+    );
+}
+
+/// The response is decoded as UTF-8 per line; invalid bytes in a *complete*
+/// line are refused rather than lossily replaced, which would corrupt a
+/// dimension key.
+#[test]
+fn aggregate_response_rejects_invalid_utf8_in_a_complete_line() {
+    let mut body = b"{\"agg\":\"1\",\"d0\":\"".to_vec();
+    body.push(0xFF);
+    body.extend_from_slice(b"\"}\n");
+
+    let err = parse_aggregate_response(&body, &["d0".to_owned()])
+        .expect_err("invalid UTF-8 in a complete line must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("utf-8"),
+        "expected a UTF-8 decode failure, got: {msg}"
+    );
+}
+
+/// Same guard on the unterminated final line, which `finish` decodes on its own
+/// path rather than through the newline scan.
+#[test]
+fn aggregate_response_rejects_invalid_utf8_in_an_unterminated_final_line() {
+    let mut body = b"{\"agg\":\"1\",\"d0\":\"".to_vec();
+    body.push(0xFF);
+    body.extend_from_slice(b"\"}"); // no trailing newline
+
+    let err = parse_aggregate_response(&body, &["d0".to_owned()])
+        .expect_err("invalid UTF-8 in the trailing line must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("utf-8"),
+        "expected a UTF-8 decode failure, got: {msg}"
+    );
+}
+
+/// `finish` must also parse a well-formed final line that never got a newline —
+/// `ClickHouse` does terminate `JSONEachRow` rows, but a body truncated at the
+/// transport would otherwise lose its last bucket silently.
+#[test]
+fn aggregate_response_parses_an_unterminated_final_line() {
+    let buckets = parse_aggregate_response(
+        b"{\"d0\":\"a\",\"agg\":\"1\"}\n{\"d0\":\"b\",\"agg\":\"2\"}",
+        &["d0".to_owned()],
+    )
+    .expect("both lines decode");
+
+    assert_eq!(
+        buckets.len(),
+        2,
+        "the unterminated final line must still yield its bucket"
+    );
+    assert_eq!(buckets[1].key, vec!["b".to_owned()]);
+}
+
+// ── Offline store variants ───────────────────────────────────────────────────
+
+/// A store whose client skips `Client::insert`'s table-metadata round trip.
+///
+/// Insert validation is on by default and makes acquiring the handle itself a
+/// request, which against an unreachable endpoint fails before `write` / `end`
+/// are ever reached. Disabling it is what lets the offline tier exercise the
+/// rest of the insert path.
+fn offline_store_without_insert_validation() -> ChRecordStore {
+    ChRecordStore::new(
+        clickhouse::Client::default()
+            .with_url("http://127.0.0.1:1")
+            .with_validation(false),
+        Arc::new(Metrics::new()),
+        std::time::Duration::from_secs(30),
+        true,
+    )
+}
+
+fn assert_backend_failure(err: &UsageCollectorPluginError, what: &str) {
+    match err {
+        UsageCollectorPluginError::Transient { .. } | UsageCollectorPluginError::Internal(_) => {}
+        other => panic!("{what} must surface as a backend error, got {other:?}"),
+    }
+}
+
+// ── Write paths reach the backend ────────────────────────────────────────────
+
+/// The single-row insert must report the write it could not make. Reaching the
+/// failure through `write`/`end` rather than through handle acquisition is what
+/// the validation-free client buys.
+#[tokio::test]
+async fn insert_record_surfaces_a_backend_failure() {
+    let store = offline_store_without_insert_validation();
+    let row = make_row(
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+        1,
+    );
+
+    let err = store
+        .insert_record(&row, std::time::Instant::now())
+        .await
+        .expect_err("a single-row insert cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed single-row insert");
+}
+
+/// The batch insert path, including the per-row `write` loop that an empty
+/// batch short-circuits past.
+#[tokio::test]
+async fn insert_records_surfaces_a_backend_failure_for_a_non_empty_batch() {
+    let store = offline_store_without_insert_validation();
+    let tenant = Uuid::from_u128(2);
+    let base = 1_700_000_000_000_000_i64;
+    let rows = vec![
+        make_row(Uuid::from_u128(1), tenant, base, 1),
+        make_row(Uuid::from_u128(2), tenant, base + 1, 2),
+    ];
+
+    let err = store
+        .insert_records(&rows, std::time::Instant::now(), InsertKind::Record)
+        .await
+        .expect_err("a batch insert cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed batch insert");
+}
+
+/// `create`'s first statement is the catalog existence check, so an unreachable
+/// backend must not read as "the type is missing" — the caller would treat that
+/// as an authoritative rejection of a perfectly valid record.
+#[tokio::test]
+async fn create_does_not_report_usage_type_not_found_when_the_catalog_read_never_completed() {
+    let store = offline_store();
+    let record = make_record(
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+    );
+
+    let err = store
+        .create(record)
+        .await
+        .expect_err("create cannot succeed against an unreachable backend");
+
+    assert!(
+        !matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "an unreachable backend must never be reported as a missing usage type, got {err:?}"
+    );
+    assert_backend_failure(&err, "a failed catalog existence check");
+}
+
+/// The dedup pre-read, reached directly. A failure here must propagate rather
+/// than read as `None` ("no earlier row"), which would turn a retry into a
+/// duplicate write.
+#[tokio::test]
+async fn dedup_point_lookup_surfaces_a_backend_failure() {
+    let store = offline_store();
+    let record = make_record(
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+    );
+
+    let err = store
+        .dedup_point_lookup(&record)
+        .await
+        .expect_err("the dedup pre-read cannot succeed against an unreachable backend");
+
+    assert_backend_failure(&err, "a failed dedup pre-read");
+}
+
+/// `deactivate` reads the target before composing any marker, so an unreachable
+/// backend must not read as `UsageRecordNotFound` — the gateway distinguishes
+/// that from a retryable failure.
+#[tokio::test]
+async fn deactivate_does_not_report_not_found_when_the_target_read_never_completed() {
+    let store = offline_store();
+
+    let err = store
+        .deactivate(Uuid::from_u128(1))
+        .await
+        .expect_err("deactivate cannot succeed against an unreachable backend");
+
+    assert!(
+        !matches!(err, UsageCollectorPluginError::UsageRecordNotFound { .. }),
+        "an unreachable backend must never be reported as an absent record, got {err:?}"
+    );
+    assert_backend_failure(&err, "a failed deactivation target read");
+}
+
+// ── list / aggregate: guards that run before any I/O ─────────────────────────
+//
+// Each rejection below returns before a statement is issued, so it is
+// assertable offline — and asserting the message rather than just "some error"
+// is what distinguishes a guard that fired from a connection that failed.
+
+fn record_cursor(keys: &[&str], signed_order: &str, filter_hash: Option<&str>) -> CursorV1 {
+    CursorV1 {
+        k: keys.iter().map(|k| (*k).to_owned()).collect(),
+        o: SortDir::Asc,
+        s: signed_order.to_owned(),
+        f: filter_hash.map(str::to_owned),
+        d: "fwd".to_owned(),
+    }
+}
+
+fn created_at_id_asc() -> ODataOrderBy {
+    ODataOrderBy(vec![
+        OrderKey {
+            field: "created_at".to_owned(),
+            dir: SortDir::Asc,
+        },
+        OrderKey {
+            field: "id".to_owned(),
+            dir: SortDir::Asc,
+        },
+    ])
+}
+
+fn vcpu_gts() -> UsageTypeGtsId {
+    UsageTypeGtsId::new(VCPU_GTS).expect("valid gts_id")
+}
+
+/// Only forward paging is minted in v1; a `"bwd"` token would be walked forward
+/// because the keyset operator comes from the sort direction, not `cursor.d`.
+#[tokio::test]
+async fn list_rejects_a_backward_cursor() {
+    let store = offline_store();
+    let mut cursor = record_cursor(
+        &[
+            "2026-08-10T11:00:00Z",
+            "00000000-0000-4000-8000-000000000001",
+        ],
+        "+created_at,+id",
+        None,
+    );
+    cursor.d = "bwd".to_owned();
+    let query = ODataQuery::new()
+        .with_order(created_at_id_asc())
+        .with_cursor(cursor);
+
+    let err = store
+        .list(vcpu_gts(), &query, &[])
+        .await
+        .expect_err("a backward cursor must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("only forward paging is supported"),
+        "expected a direction rejection, got: {msg}"
+    );
+}
+
+/// A token minted under a different `$filter` describes a different row set.
+#[tokio::test]
+async fn list_rejects_a_cursor_whose_filter_hash_does_not_match() {
+    let store = offline_store();
+    let query = ODataQuery::new()
+        .with_order(created_at_id_asc())
+        .with_cursor(record_cursor(
+            &[
+                "2026-08-10T11:00:00Z",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            "+created_at,+id",
+            Some("hash-from-another-query"),
+        ));
+
+    let err = store
+        .list(vcpu_gts(), &query, &[])
+        .await
+        .expect_err("a cursor from a differently-filtered query must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cursor filter hash mismatch"),
+        "expected a filter-hash rejection, got: {msg}"
+    );
+}
+
+/// Unlike the catalog list, `list` honours `query.order` — so the cursor is
+/// checked against the caller's order, and a token minted under another one
+/// cannot be walked forward.
+#[tokio::test]
+async fn list_rejects_a_cursor_minted_under_a_different_sort_order() {
+    let store = offline_store();
+    let query = ODataQuery::new()
+        .with_order(created_at_id_asc())
+        .with_cursor(record_cursor(
+            &[
+                "2026-08-10T11:00:00Z",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            "-created_at,-id",
+            None,
+        ));
+
+    let err = store
+        .list(vcpu_gts(), &query, &[])
+        .await
+        .expect_err("a cursor minted under a different order must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cursor sort order mismatch"),
+        "expected a sort-order rejection, got: {msg}"
+    );
+}
+
+/// The complement of the three rejections above: a cursor that validates builds
+/// its keyset predicate and the call goes on to issue a statement, which is
+/// what reaching a backend error proves.
+#[tokio::test]
+async fn list_accepts_a_matching_cursor_and_reaches_the_backend() {
+    let store = offline_store();
+    let query = ODataQuery::new()
+        .with_order(created_at_id_asc())
+        .with_cursor(record_cursor(
+            &[
+                "2026-08-10T11:00:00Z",
+                "00000000-0000-4000-8000-000000000001",
+            ],
+            "+created_at,+id",
+            None,
+        ));
+
+    let err = store
+        .list(vcpu_gts(), &query, &[])
+        .await
+        .expect_err("the statement cannot succeed against an unreachable backend");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "a cursor that validates must fail at the backend, not as a cursor rejection: {err:?}"
+    );
+}
+
+/// `$filter` is translated through the `UsageRecordFilterField` allowlist, so a
+/// name that is not on it is refused before any SQL is built and no unvetted
+/// identifier can reach the statement text.
+#[tokio::test]
+async fn list_rejects_a_filter_naming_a_field_outside_the_allowlist() {
+    use toolkit_odata::ast::{CompareOperator, Expr, Value};
+
+    let store = offline_store();
+    let query = ODataQuery::new()
+        .with_order(created_at_id_asc())
+        .with_filter(Expr::Compare(
+            Box::new(Expr::Identifier(
+                "definitely_not_a_record_column".to_owned(),
+            )),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::String("x".to_owned()))),
+        ));
+
+    let err = store
+        .list(vcpu_gts(), &query, &[])
+        .await
+        .expect_err("an unknown filter field must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid filter"),
+        "expected a filter-translation rejection, got: {msg}"
+    );
+}
+
+/// The same allowlist guard on the aggregate path.
+#[tokio::test]
+async fn aggregate_rejects_a_filter_naming_a_field_outside_the_allowlist() {
+    use toolkit_odata::ast::{CompareOperator, Expr, Value};
+    use usage_collector_sdk::{AggregationOp, AggregationSpec};
+
+    let store = offline_store();
+    let query = ODataQuery::new().with_filter(Expr::Compare(
+        Box::new(Expr::Identifier(
+            "definitely_not_a_record_column".to_owned(),
+        )),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::String("x".to_owned()))),
+    ));
+
+    let err = store
+        .aggregate(
+            vcpu_gts(),
+            &query,
+            &[],
+            AggregationSpec {
+                op: AggregationOp::Sum,
+                group_by: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("an unknown filter field must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid filter"),
+        "expected a filter-translation rejection, got: {msg}"
+    );
+}
+
+/// A grouped aggregate builds its dimension SELECT list, the subject-not-null
+/// guards, the `GROUP BY` ordinals and the bucket-cap `LIMIT`, then issues the
+/// statement — so reaching a backend error proves the whole assembly ran.
+///
+/// The dimensions are chosen to hit every shape: a plain column, both
+/// subject guards, and a metadata key (which contributes a SELECT-list bind
+/// that must be applied before any `WHERE` placeholder).
+#[tokio::test]
+async fn a_grouped_aggregate_assembles_its_query_and_reaches_the_backend() {
+    use usage_collector_sdk::{
+        AggregationDimension, AggregationOp, AggregationSpec, MetadataFilter, MetadataKey,
+    };
+
+    let store = offline_store();
+    let metadata_filter =
+        MetadataFilter::new("region", ["eu-west"]).expect("a valid metadata filter");
+
+    let err = store
+        .aggregate(
+            vcpu_gts(),
+            &ODataQuery::new(),
+            std::slice::from_ref(&metadata_filter),
+            AggregationSpec {
+                op: AggregationOp::Sum,
+                group_by: vec![
+                    AggregationDimension::TenantId,
+                    AggregationDimension::SubjectId,
+                    AggregationDimension::SubjectType,
+                    AggregationDimension::Metadata(
+                        MetadataKey::new("region").expect("a valid metadata key"),
+                    ),
+                ],
+            },
+        )
+        .await
+        .expect_err("the statement cannot succeed against an unreachable backend");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "a fully-assembled aggregate must fail at the backend, not while building: {err:?}"
+    );
+}
+
+/// The ungrouped aggregate emits no `GROUP BY` and no dimension aliases — the
+/// other side of the `dim_count == 0` branch.
+#[tokio::test]
+async fn an_ungrouped_aggregate_assembles_its_query_and_reaches_the_backend() {
+    use usage_collector_sdk::{AggregationOp, AggregationSpec};
+
+    let store = offline_store();
+
+    let err = store
+        .aggregate(
+            vcpu_gts(),
+            &ODataQuery::new(),
+            &[],
+            AggregationSpec {
+                op: AggregationOp::Count,
+                group_by: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("the statement cannot succeed against an unreachable backend");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "an ungrouped aggregate must fail at the backend, not while building: {err:?}"
     );
 }

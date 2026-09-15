@@ -71,3 +71,44 @@ async fn init_rejects_plaintext_http_database_url_without_override() {
         "expected an allow_insecure_http validation error, got: {err}"
     );
 }
+
+/// A config that validates but names a backend nothing answers on must fail
+/// `init` at the migration step rather than reporting the gear ready.
+///
+/// `init` publishes the readiness gauge as 0 *before* any startup I/O and
+/// flips it to 1 only after the whole sequence, so a plugin that could not
+/// migrate must never reach that flip. This pins the failure to step B: the
+/// error is the migration's own, not a config rejection, which is what proves
+/// validation passed and the startup sequence actually ran.
+///
+/// `https://` keeps `allow_insecure_http` out of it; port 1 is reserved and
+/// never bound, so the connection is refused immediately rather than hanging
+/// out the 35s client deadline.
+#[tokio::test]
+async fn init_fails_at_the_migration_step_when_the_backend_is_unreachable() {
+    let provider = Arc::new(StaticConfig(json!({
+        "config": {
+            "database_url": "https://user:pass@127.0.0.1:1/usage"
+        }
+    })));
+
+    let ctx = GearCtx::new(
+        "clickhouse-usage-collector-plugin",
+        Uuid::from_u128(7),
+        provider,
+        Arc::new(ClientHub::default()),
+        CancellationToken::new(),
+    );
+
+    let err = ClickHouseUsageCollectorPlugin
+        .init(&ctx)
+        .await
+        .expect_err("init must not report success when the schema migration cannot run");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("migration DDL statement"),
+        "the failure must come from the migration step, not from config validation \
+         or the registry handshake, got: {msg}"
+    );
+}

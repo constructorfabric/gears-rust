@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::{
     DEFAULT_RETENTION_SECS, MIGRATION_SQL, parse_endpoint, parse_ttl_seconds, split_sql_statements,
     strip_line_comments,
@@ -608,6 +610,277 @@ fn parse_dedup_window_returns_none_when_missing() {
     let live = "CREATE TABLE default.usage_records (...) ENGINE = ReplacingMergeTree(version) \
                 SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192";
     assert_eq!(super::parse_dedup_window(live), None);
+}
+// ── strip_line_comments: escaped quote pairs ─────────────────────────────────
+
+/// A doubled `''` inside a string literal is SQL's escape for a literal quote,
+/// not a string terminator. Treating it as one would flip the scanner's quote
+/// state and make the *rest* of the statement look like comment-eligible text:
+/// a following `--` inside the same literal would then be stripped, and the
+/// `;` that terminates the statement would be swallowed with it.
+#[test]
+fn strip_line_comments_keeps_an_escaped_quote_pair_inside_a_string_literal() {
+    let sql = "CREATE TABLE t (x Int32 COMMENT 'it''s -- not a comment');";
+    assert_eq!(
+        strip_line_comments(sql),
+        sql,
+        "`''` must stay inside the literal so the trailing `--` is not treated as a comment"
+    );
+}
+
+/// The escape must not leave the scanner inside a string either: text after the
+/// closing quote is ordinary source again, so a `--` there is a real comment.
+#[test]
+fn strip_line_comments_resumes_comment_stripping_after_an_escaped_quote_literal() {
+    let sql = "SELECT 'it''s' -- a real comment\nFROM t;";
+    assert_eq!(strip_line_comments(sql), "SELECT 'it''s' \nFROM t;");
+}
+
+// ── parse_ttl_seconds / parse_dedup_window: rejection paths ──────────────────
+//
+// `ensure_retention_ttl` compares the parsed value against the configured
+// retention and issues `MODIFY TTL` when they differ. `None` is the fail-safe
+// answer for anything unrecognised — it re-applies the configured TTL rather
+// than skipping reconciliation on a value that was misread.
+
+/// `INTERVAL` with no digit run after it is not a TTL this parser understands.
+#[test]
+fn parse_ttl_seconds_returns_none_when_interval_has_no_digits() {
+    assert_eq!(
+        parse_ttl_seconds("TTL created_at + INTERVAL SECOND DELETE"),
+        None
+    );
+}
+
+/// A TTL in any unit other than seconds cannot be compared against
+/// `retention_period_secs` without a conversion this parser deliberately does
+/// not do — so it reads as absent and the reconciliation rewrites it in
+/// seconds.
+#[test]
+fn parse_ttl_seconds_returns_none_for_a_non_second_unit() {
+    assert_eq!(
+        parse_ttl_seconds("TTL created_at + INTERVAL 30 DAY DELETE"),
+        None,
+        "only INTERVAL <n> SECOND is recognised"
+    );
+}
+
+/// A digit run too large for `u64` must read as absent rather than panic or
+/// silently truncate.
+#[test]
+fn parse_ttl_seconds_returns_none_when_the_interval_overflows_u64() {
+    assert_eq!(
+        parse_ttl_seconds("TTL created_at + INTERVAL 99999999999999999999999 SECOND DELETE"),
+        None
+    );
+}
+
+/// A non-numeric `toIntervalSecond(...)` argument reads as absent, not as a
+/// parse that silently picks up a different number.
+///
+/// Pins a quirk worth knowing about: the literal-form fallback searches for the
+/// substring `INTERVAL`, and `toIntervalSecond` uppercased *contains* it, so the
+/// fallback re-matches inside the very token that just failed and finds `Second(`
+/// where it wants digits. The result is `None` either way, which is the fail-safe
+/// answer — `ensure_retention_ttl` treats it as "differs" and re-applies the
+/// configured TTL — so this costs a redundant `MODIFY TTL`, never a wrong one.
+/// `ClickHouse` always emits a numeric argument in practice, so the path is not
+/// reachable from a live `create_table_query`.
+#[test]
+fn parse_ttl_seconds_returns_none_when_tointervalsecond_has_no_digits() {
+    assert_eq!(
+        parse_ttl_seconds("TTL created_at + toIntervalSecond(x)"),
+        None
+    );
+}
+
+/// The dedup-window parser shares `extract_u64_after`, so it has the same
+/// no-digits guard: a malformed setting reads as absent and
+/// `ensure_insert_dedup_window` re-applies the value.
+#[test]
+fn parse_dedup_window_returns_none_when_the_setting_has_no_digits() {
+    assert_eq!(
+        super::parse_dedup_window(
+            "CREATE TABLE t (...) SETTINGS non_replicated_deduplication_window = abc"
+        ),
+        None
+    );
+}
+
+// ── ttl_uses_todatetime_cast ─────────────────────────────────────────────────
+//
+// Matching interval seconds alone is not enough to skip `MODIFY TTL`: a table
+// provisioned with the old `toDateTime(created_at)` wrapping clause saturates
+// at 2106 and must be rewritten even when its interval already matches.
+
+/// The legacy clause is detected, so `ensure_retention_ttl` rewrites it even on
+/// a matching interval.
+#[test]
+fn ttl_using_the_legacy_todatetime_cast_is_detected() {
+    assert!(super::ttl_uses_todatetime_cast(
+        "TTL toDateTime(created_at) + toIntervalSecond(31536000)"
+    ));
+}
+
+/// The current clause reads `created_at` directly; a table already on it must
+/// not be rewritten on every init.
+#[test]
+fn ttl_on_the_bare_created_at_column_is_not_flagged_as_legacy() {
+    assert!(!super::ttl_uses_todatetime_cast(
+        "TTL created_at + toIntervalSecond(31536000)"
+    ));
+}
+
+// ── warn_on_short_retention ──────────────────────────────────────────────────
+
+/// Advisory only — it logs or it does not, and neither outcome changes the DDL.
+/// The assertion is that both branches run without panicking, which pins the
+/// `tracing::warn!` field list against a future edit that names a field the
+/// macro cannot format.
+#[test]
+fn warn_on_short_retention_runs_on_both_sides_of_the_threshold() {
+    super::warn_on_short_retention(7 * 86_400);
+    super::warn_on_short_retention(DEFAULT_RETENTION_SECS);
+}
+
+// ── Startup DDL against an unreachable backend ───────────────────────────────
+//
+// `Gear::init` runs all three of these before the plugin reports ready, so each
+// must fail loudly rather than return `Ok` when the backend cannot be reached.
+// A silent success here would publish a plugin whose tables do not exist.
+
+/// Port 1 is reserved and never bound, so a request fails fast with connection
+/// refused rather than blocking.
+const OFFLINE_URL: &str = "http://127.0.0.1:1";
+
+fn offline_client() -> clickhouse::Client {
+    clickhouse::Client::default().with_url(OFFLINE_URL)
+}
+
+/// A socket that accepts connections and then answers nothing, plus a client
+/// pointed at it.
+///
+/// The failure `send_timeout` / `receive_timeout` cannot catch: they are
+/// *server* settings, and a black-holed socket never reaches a server that
+/// could apply them. Only the client-side deadline ends these calls.
+async fn black_holed_client() -> clickhouse::Client {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a local socket");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.push(stream);
+        }
+    });
+    clickhouse::Client::default().with_url(format!("http://{addr}"))
+}
+
+/// Generous relative to a connection-refused round trip, short enough that a
+/// black-holed socket test finishes quickly.
+const OFFLINE_DEADLINE: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+async fn apply_migrations_fails_and_names_the_statement_when_the_backend_is_unreachable() {
+    let err = super::apply_migrations(&offline_client(), Duration::from_secs(5))
+        .await
+        .expect_err("migrations cannot succeed against an unreachable backend");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("migration DDL statement failed"),
+        "the failure must be attributed to the migration step, got: {msg}"
+    );
+    assert!(
+        msg.contains("CREATE TABLE IF NOT EXISTS"),
+        "the failing statement text must be in the context so an operator can see which DDL \
+         did not apply, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn apply_migrations_reports_the_client_side_deadline_on_a_stalled_statement() {
+    let started = std::time::Instant::now();
+    let err = super::apply_migrations(&black_holed_client().await, OFFLINE_DEADLINE)
+        .await
+        .expect_err("a statement that never answers must not report success");
+    let elapsed = started.elapsed();
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("client-side deadline"),
+        "a stalled statement must be reported as a deadline breach, not a backend error, \
+         got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "init must fail at roughly the deadline rather than hang, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_retention_ttl_fails_when_the_create_table_query_cannot_be_read() {
+    let err = super::ensure_retention_ttl(&offline_client(), 3600, Duration::from_secs(5))
+        .await
+        .expect_err("retention reconciliation cannot succeed without reading the live table");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("create_table_query"),
+        "the failure must name the metadata read it could not complete, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_retention_ttl_reports_the_client_side_deadline_on_a_stalled_metadata_read() {
+    let started = std::time::Instant::now();
+    let err = super::ensure_retention_ttl(&black_holed_client().await, 3600, OFFLINE_DEADLINE)
+        .await
+        .expect_err("a metadata read that never answers must not report success");
+    let elapsed = started.elapsed();
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("client-side deadline"),
+        "expected a deadline breach, got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must fail at roughly the deadline rather than hang, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_insert_dedup_window_fails_when_the_create_table_query_cannot_be_read() {
+    let err = super::ensure_insert_dedup_window(&offline_client(), Duration::from_secs(5))
+        .await
+        .expect_err("dedup-window reconciliation cannot succeed without reading the live table");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("create_table_query"),
+        "the failure must name the metadata read it could not complete, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_insert_dedup_window_reports_the_client_side_deadline_on_a_stalled_metadata_read() {
+    let started = std::time::Instant::now();
+    let err = super::ensure_insert_dedup_window(&black_holed_client().await, OFFLINE_DEADLINE)
+        .await
+        .expect_err("a metadata read that never answers must not report success");
+    let elapsed = started.elapsed();
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("client-side deadline"),
+        "expected a deadline breach, got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must fail at roughly the deadline rather than hang, took {elapsed:?}"
+    );
 }
 
 // Run with: cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse

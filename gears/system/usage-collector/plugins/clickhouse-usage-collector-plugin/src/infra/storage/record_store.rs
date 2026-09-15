@@ -269,9 +269,8 @@ impl ChRecordStore {
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
-        let found: Vec<String> = {
-            with_deadline(&self.metrics, self.request_timeout, q.fetch_all::<String>()).await?
-        };
+        let found: Vec<String> =
+            { with_deadline(&self.metrics, self.request_timeout, q.fetch_all::<String>()).await? };
         Ok(found.into_iter().collect())
     }
 
@@ -566,9 +565,8 @@ impl ChRecordStore {
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
-        let rows: Vec<UsageRecordRow> = {
-            with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await?
-        };
+        let rows: Vec<UsageRecordRow> =
+            { with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await? };
         let mut out: HashMap<DedupKey, UsageRecordRow> = HashMap::with_capacity(rows.len());
         for row in rows {
             let key = row_dedup_key(&row);
@@ -1275,7 +1273,6 @@ impl RecordStore for ChRecordStore {
 
         let mut rows: Vec<UsageRecordRow> =
             with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await?;
-
 
         // Look-ahead row present → a next page exists.
         let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
