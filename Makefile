@@ -734,6 +734,35 @@ test-pgq: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
 		-E 'kind(lib) | binary(mod) | binary(ui)'
 
+## Run the graph-storage gear's database-free suites: unit tests, the
+## in-memory conformance lane, the domain-service and REST lanes. The
+## PostgreSQL lanes skip here; `test-graph-storage-pg` runs them.
+test-graph-storage: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
+
+## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
+## suite against the built-in store, plus the SQL/PGQ cases that only a real
+## server can answer. It needs an image carrying PostgreSQL 19 **and**
+## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
+## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
+## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## turns "no such image, skipping" into a failure, so CI cannot go green by
+## running nothing; that is the default here, because a target whose whole
+## purpose is the database has no business passing without one.
+## Every case in this lane gets its own PostgreSQL instance (two of them are
+## operator surgery on server-wide state), and more than a handful at once is
+## more than Docker and PostgreSQL will take: the pools time out and a
+## different case fails on each run. nextest runs each case in its own
+## process, so the bound has to be its own — GRAPH_PG_TEST_THREADS raises it
+## on a host with the memory for it. Two is what held on an 8-core, 23 GiB
+## developer machine; four failed about half its runs there.
+GRAPH_PG_TEST_THREADS ?= 2
+test-graph-storage-pg: install-tools
+	$(call print_target_banner)
+	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
+		--test pg_conformance --test-threads=$(GRAPH_PG_TEST_THREADS)
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)

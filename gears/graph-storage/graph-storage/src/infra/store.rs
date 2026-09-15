@@ -1,0 +1,459 @@
+//! The built-in `PostgreSQL` store: one implementation of `GraphStoreV1`,
+//! registered exactly as an external plugin would be.
+//!
+//! Every statement goes through the secure ORM — `.secure().scope_with(..)`
+//! or `secure_insert`/`scope_unchecked` on inserts, which cannot subtree-clamp
+//! a row that does not exist yet. There is no unscoped query API in this
+//! module.
+
+pub mod evolution;
+pub mod ingest;
+pub mod namespaces;
+pub mod projection;
+pub mod reads;
+pub mod scope;
+pub mod search;
+pub mod spaces;
+pub mod types;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use graph_storage_sdk::models::{
+    ComponentReadiness, DeleteOutcome, DeleteRequest, EdgeKey, EdgeView, GraphRevision, GtsTypeId,
+    IngestOutcome, IngestRequest, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow,
+    NodeView, Page, ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType,
+    RevisionOutcome, SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities,
+    TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
+};
+use graph_storage_sdk::plugin_api::{
+    EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+};
+use toolkit_db::secure::{Db, ScopeError};
+
+use crate::config::GraphStorageConfig;
+
+/// The built-in store.
+pub struct PgGraphStore {
+    db: Arc<Db>,
+    config: GraphStorageConfig,
+    /// Whether this server parses SQL/PGQ, probed once at init. Reads use it
+    /// to decide the hop backend; nothing else depends on it.
+    pgq_available: bool,
+}
+
+impl PgGraphStore {
+    #[must_use]
+    pub fn new(db: Arc<Db>, config: GraphStorageConfig, pgq_available: bool) -> Self {
+        Self {
+            db,
+            config,
+            pgq_available,
+        }
+    }
+
+    #[must_use]
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &GraphStorageConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn pgq_available(&self) -> bool {
+        self.pgq_available
+    }
+}
+
+/// Scope failures are a denial, not an internal error: a scope the store
+/// cannot render is a routing signal the gateway resolves.
+#[must_use]
+pub fn map_scope_err(error: ScopeError) -> GraphStoreError {
+    match error {
+        // Every statement goes through the secure ORM, so a database failure
+        // arrives wrapped. Classifying it here rather than at each call site
+        // is what keeps a unique violation, a live-edge refusal and a
+        // serialization failure from all reading as an internal error.
+        ScopeError::Db(inner) => map_db_err(&inner),
+        ScopeError::Denied(_) => GraphStoreError::NotFound,
+        ScopeError::UnresolvedScopeProperty { element, property } => {
+            GraphStoreError::ScopeUnservable {
+                reason: format!(
+                    "no constraint of the scope resolves on graph element `{element}` property `{property}`"
+                ),
+            }
+        }
+        // Not `ScopeUnservable`: a syntax refusal is a malformed declaration
+        // of ours rather than a scope this store cannot carry, and routing it
+        // to the fallback backend would hide it indefinitely.
+        ScopeError::GraphSyntax(inner) => {
+            GraphStoreError::Internal(format!("graph pattern is malformed: {inner}"))
+        }
+        other => GraphStoreError::Internal(other.to_string()),
+    }
+}
+
+/// Classify a database failure. **`PostgreSQL` 18+ reports an `ON DELETE
+/// RESTRICT` refusal as SQLSTATE `23001` (`restrict_violation`); 17 and
+/// earlier report `23503`.** Both must classify as a foreign-key violation,
+/// or a live-edge refusal reads as an internal error on PG19.
+#[must_use]
+pub fn map_db_err(error: &sea_orm::DbErr) -> GraphStoreError {
+    let text = error.to_string();
+    if text.contains("23505") {
+        return GraphStoreError::Conflict {
+            reason: "unique violation".into(),
+        };
+    }
+    if text.contains("23503") || text.contains("23001") {
+        return GraphStoreError::Conflict {
+            reason: "a live edge still references this node".into(),
+        };
+    }
+    if text.contains("40001") {
+        return GraphStoreError::Serialization;
+    }
+    GraphStoreError::Internal(text)
+}
+
+#[must_use]
+pub fn map_db_error(error: &toolkit_db::DbError) -> GraphStoreError {
+    GraphStoreError::Unavailable {
+        reason: error.to_string(),
+    }
+}
+
+/// Transaction-closure error type.
+///
+/// `Db::transaction_ref_mapped` needs `E: From<DbError>` so a begin/commit
+/// failure can be reported in the closure's own error type. `GraphStoreError`
+/// is defined in the SDK and `DbError` in the toolkit, so the impl cannot
+/// live on either; this newtype is the bridge.
+pub struct TxStoreError(pub GraphStoreError);
+
+impl From<toolkit_db::DbError> for TxStoreError {
+    fn from(error: toolkit_db::DbError) -> Self {
+        Self(map_db_error(&error))
+    }
+}
+
+impl From<GraphStoreError> for TxStoreError {
+    fn from(error: GraphStoreError) -> Self {
+        Self(error)
+    }
+}
+
+#[async_trait]
+impl GraphStoreV1 for PgGraphStore {
+    fn capabilities(&self) -> StoreCapabilities {
+        StoreCapabilities {
+            scope_replace: true,
+            // A true repeatable-read snapshot needs a transaction held across
+            // calls, which the sealed runner cannot express; `begin_read`
+            // returns a revision-stamped handle instead (DESIGN § 3.3, obligation 5, which the built-in store declines).
+            snapshots: false,
+            vector_search: true,
+            labels: false,
+            chunks: false,
+            topology: false,
+        }
+    }
+
+    async fn register_types_with(
+        &self,
+        ctx: &StoreCtx<'_>,
+        batch: Vec<TypeRegistration>,
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, GraphStoreError> {
+        types::register_types(self, ctx, batch, options).await
+    }
+
+    async fn get_type(
+        &self,
+        ctx: &StoreCtx<'_>,
+        id: &GtsTypeId,
+    ) -> Result<TypeRecord, GraphStoreError> {
+        types::get_type(self, ctx, id).await
+    }
+
+    async fn list_types(
+        &self,
+        ctx: &StoreCtx<'_>,
+        query: TypeQuery,
+    ) -> Result<Page<TypeRecord>, GraphStoreError> {
+        types::list_types(self, ctx, query).await
+    }
+
+    async fn resolve_type_set(
+        &self,
+        ctx: &StoreCtx<'_>,
+        patterns: &[String],
+    ) -> Result<TypeIdSet, GraphStoreError> {
+        types::resolve_type_set(self, ctx, patterns).await
+    }
+
+    async fn probe_readiness(&self) -> Vec<ComponentReadiness> {
+        let mut out = Vec::new();
+
+        // The database row first, because every other row is meaningless
+        // without it. Two questions, not one: a reachable server whose
+        // migrations have not run serves a schema the gear does not know.
+        if let Err(error) = self.db().conn() {
+            out.push(ComponentReadiness::new(
+                graph_storage_sdk::models::DATABASE,
+                ReadinessState::Unhealthy,
+                &format!("the database is unreachable: {error}"),
+                "everything; no traffic is admitted",
+                "connectivity restored; the probe re-runs on the next request and flips \
+                 without a restart",
+            ));
+        } else {
+            let migrations =
+                <crate::infra::storage::migrations::Migrator as sea_orm_migration::MigratorTrait>::migrations();
+            match toolkit_db::migration_runner::get_pending_migrations(
+                self.db(),
+                "graph-storage",
+                &migrations,
+            )
+            .await
+            {
+                Ok(pending) if pending.is_empty() => {
+                    out.push(ComponentReadiness::healthy(
+                        graph_storage_sdk::models::DATABASE,
+                    ));
+                }
+                Ok(pending) => out.push(ComponentReadiness::new(
+                    graph_storage_sdk::models::DATABASE,
+                    ReadinessState::Unhealthy,
+                    &format!(
+                        "{} migration(s) have not been applied: {}",
+                        pending.len(),
+                        pending.join(", ")
+                    ),
+                    "everything; no traffic is admitted",
+                    "apply the migrations; the probe re-runs without a restart",
+                )),
+                Err(error) => out.push(ComponentReadiness::new(
+                    graph_storage_sdk::models::DATABASE,
+                    ReadinessState::Unhealthy,
+                    &format!("the migration history cannot be read: {error}"),
+                    "everything; no traffic is admitted",
+                    "restore access to the migration table",
+                )),
+            }
+        }
+
+        // The traversal backend, as probed at init. Degraded and never
+        // unhealthy: the matrix reserves the second for a backend an operator
+        // explicitly demanded, and this configuration cannot express the
+        // difference between a demand and a preference (DESIGN § Readiness Matrix).
+        if self.pgq_available() {
+            out.push(ComponentReadiness::healthy(
+                graph_storage_sdk::models::SQLPGQ,
+            ));
+        } else {
+            out.push(ComponentReadiness::new(
+                graph_storage_sdk::models::SQLPGQ,
+                ReadinessState::Degraded,
+                "the declared property graph did not answer a pattern at startup; the server \
+                 major is not reported, because the attempt says the pattern did not run and \
+                 not why",
+                "nothing: every traversal is served by the two-query hop",
+                "restart after the property-graph migration runs on a server that supports \
+                 SQL/PGQ",
+            ));
+        }
+
+        out
+    }
+
+    async fn list_source_namespaces(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Vec<SourceNamespaceOwner>, GraphStoreError> {
+        namespaces::list(self, ctx).await
+    }
+
+    async fn transfer_source_namespace(
+        &self,
+        ctx: &StoreCtx<'_>,
+        namespace: &str,
+        owner_principal: &str,
+    ) -> Result<SourceNamespaceOwner, GraphStoreError> {
+        namespaces::transfer(self, ctx, namespace, owner_principal).await
+    }
+
+    async fn ingest(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: IngestRequest,
+        embedding: EmbeddingPlan,
+    ) -> Result<IngestOutcome, GraphStoreError> {
+        ingest::ingest(self, ctx, req, embedding).await
+    }
+
+    async fn soft_delete(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: DeleteRequest,
+    ) -> Result<DeleteOutcome, GraphStoreError> {
+        ingest::soft_delete(self, ctx, req).await
+    }
+
+    async fn upsert_label(
+        &self,
+        _ctx: &StoreCtx<'_>,
+        _label: LabelSpec,
+    ) -> Result<LabelRecord, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
+
+    async fn delete_label(
+        &self,
+        _ctx: &StoreCtx<'_>,
+        _id: LabelId,
+    ) -> Result<RevisionOutcome, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
+
+    async fn list_labels(&self, _ctx: &StoreCtx<'_>) -> Result<Vec<LabelRecord>, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
+
+    async fn assign_labels(
+        &self,
+        _ctx: &StoreCtx<'_>,
+        _req: graph_storage_sdk::models::LabelAssignment,
+    ) -> Result<RevisionOutcome, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
+
+    async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {
+        reads::begin_read(self, ctx).await
+    }
+
+    async fn end_read(&self, _snapshot: ReadSnapshot) -> Result<(), GraphStoreError> {
+        Ok(())
+    }
+
+    async fn revision(&self, ctx: &StoreCtx<'_>) -> Result<GraphRevision, GraphStoreError> {
+        reads::revision(self, ctx).await
+    }
+
+    async fn get_node(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: &NodeKey,
+        adjacency_limit: u32,
+    ) -> Result<NodeView, GraphStoreError> {
+        reads::get_node(self, ctx, key, adjacency_limit).await
+    }
+
+    async fn get_edge(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: &EdgeKey,
+    ) -> Result<EdgeView, GraphStoreError> {
+        reads::get_edge(self, ctx, key).await
+    }
+
+    async fn hydrate_nodes(
+        &self,
+        ctx: &StoreCtx<'_>,
+        ids: &[NodeId],
+    ) -> Result<Vec<NodeView>, GraphStoreError> {
+        reads::hydrate_nodes(self, ctx, ids).await
+    }
+
+    async fn search(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: SearchRequest,
+        vector: Option<VectorArm>,
+    ) -> Result<SearchResponse, GraphStoreError> {
+        search::search(self, ctx, req, vector).await
+    }
+
+    async fn project_table(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: ProjectionRequest,
+    ) -> Result<toolkit_odata::Page<NodeRow>, GraphStoreError> {
+        reads::project_table(self, ctx, req).await
+    }
+
+    async fn load_topology(
+        &self,
+        _ctx: &StoreCtx<'_>,
+        _req: TopologyRequest,
+    ) -> Result<TopologyPage, GraphStoreError> {
+        // The analytics gear reads topology through its own read-only role
+        // (ADR-0007); this deployment does not expose it over the port.
+        Err(GraphStoreError::Unsupported { what: "topology" })
+    }
+
+    async fn resolve_node_ids(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[NodeKey],
+    ) -> Result<Vec<(NodeKey, NodeId)>, GraphStoreError> {
+        reads::resolve_node_ids(self, ctx, keys).await
+    }
+
+    async fn embedding_state(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[NodeKey],
+    ) -> Result<Vec<Option<EmbeddingState>>, GraphStoreError> {
+        reads::embedding_state(self, ctx, keys).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PostgreSQL` 18 changed the SQLSTATE of an `ON DELETE RESTRICT` refusal
+    /// from `23503` to `23001`. Both must read as a live-edge conflict, or a
+    /// refusal to delete a referenced node surfaces as an internal error on
+    /// PG19 — which is exactly what happened in another gear before this was
+    /// understood.
+    #[test]
+    fn both_restrict_sqlstates_classify_as_a_conflict() {
+        for sqlstate in ["23503", "23001"] {
+            let error = sea_orm::DbErr::Custom(format!(
+                "error returned from database: {sqlstate} update or delete violates foreign key"
+            ));
+            assert!(
+                matches!(map_db_err(&error), GraphStoreError::Conflict { .. }),
+                "SQLSTATE {sqlstate} must classify as a conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_wrapped_database_error_is_still_classified() {
+        let inner = sea_orm::DbErr::Custom(
+            "error returned from database: 23505 duplicate key value".to_owned(),
+        );
+        assert!(
+            matches!(
+                map_scope_err(ScopeError::Db(inner)),
+                GraphStoreError::Conflict { .. }
+            ),
+            "a database error wrapped by the secure ORM must not read as internal"
+        );
+    }
+
+    #[test]
+    fn a_denial_is_not_found_rather_than_forbidden() {
+        assert!(matches!(
+            map_scope_err(ScopeError::Denied("nope")),
+            GraphStoreError::NotFound
+        ));
+    }
+}

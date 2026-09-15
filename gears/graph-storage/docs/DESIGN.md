@@ -54,7 +54,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 
 | Priority | Requirement | Design Response |
 |----------|-------------|-----------------|
-| `p1` | `cpt-cf-graph-storage-fr-type-registration` | Ontology Registry component validates draft-07 schemas, derives UUIDv5 identifiers via platform GTS, applies batches atomically, rejects conflicting re-registration |
+| `p1` | `cpt-cf-graph-storage-fr-type-registration` | Ontology Registry component validates draft-07 schemas, derives UUIDv5 identifiers via platform GTS, applies batches atomically, rejects conflicting re-registration by default and admits a proved-backward-compatible change under the same identifier when the caller asks for it (ADR-0006) |
 | `p1` | `cpt-cf-graph-storage-fr-type-constraints` | Registry enforces abstractness and edge endpoint patterns; Ingest Pipeline validates payloads across the full GTS derivation chain with JSON-pointer error reporting |
 | `p2` | `cpt-cf-graph-storage-fr-type-catalog` | Registry read endpoints list and fetch registered types with schemas, constraints, and derived UUIDs |
 | `p1` | `cpt-cf-graph-storage-fr-index-admission` | Type registration reserves estimated index footprint and passes per-tenant/global path caps before intent commits; accepted intents run through a bounded tenant-fair DDL queue at background priority (§ Capacity and Admission Contract, ADR-0003) |
@@ -116,6 +116,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | [`cpt-cf-graph-storage-adr-metadata-partitioning`](./ADR/0003-cpt-cf-graph-storage-adr-metadata-partitioning.md) | Common columns + schema-declared indexed/vectorized attributes + payload ceiling with file-storage offload | `cpt-cf-graph-storage-principle-metadata-only-graph`, `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-component-projection-service` |
 | [`cpt-cf-graph-storage-adr-embedding-provider`](./ADR/0004-cpt-cf-graph-storage-adr-embedding-provider.md) | Pluggable embedding provider; in-process ONNX default, remote plugin, deterministic fake for CI | `cpt-cf-graph-storage-component-embedding-coordinator`, `cpt-cf-graph-storage-constraint-single-embedding-space` |
 | [`cpt-cf-graph-storage-adr-sqlpgq-access`](./ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md) | SQL/PGQ is emitted from typed input through a function-call table reference (no `sea_query` fork, no hand-written SQL); every identifier comes from a closed vocabulary and every value is bound; a pattern carries the tenant bound and proposes candidates while an ordinary scoped query authorizes them; a scope whose tenants cannot be enumerated falls back to the two-query hop | `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
+| [`cpt-cf-graph-storage-adr-type-evolution`](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md) | A backward-compatible schema change is admitted under the same GTS identifier (types-registry ADR-0003 direction, the gear's own data-backed second ground, a bounded synchronous migration as the third); a byte-identical re-registration converges, an incompatible change is refused naming its location; asking what an edit costs is its own read-only operation | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-fr-type-registration` |
 
 Two decisions this gear depends on are owned by the `graph-analytics` gear and
 recorded in its ADR set: [how metrics are computed and what determinism they
@@ -455,7 +456,7 @@ key, which is the behaviour reference nodes exist for.
 | `family` | required, no default | `owned` / `reference` / `phantom`. Drives which node model applies (ADR-0002). |
 | `scope_managed` | `true` | Whether rows of this type are deleted by producer-scoped replacement when absent from the submitted batch. |
 | `emit_events` | `false` | Whether CREATE/UPDATE/DELETE events are published for this type. |
-| `index` | `[]` | Payload paths backed by a B-tree over the path's extraction expression, and therefore admissible in `$filter` and `$orderby`. Each pointer must resolve to a scalar in the type's own schema; one that does not is rejected at registration (ADR-0003). |
+| `index` | `[]` | Payload paths admissible in `$filter` and `$orderby`. Each pointer must resolve to a scalar in the type's own schema; one that does not is rejected at registration, and the resolved kind is stored with the type (ADR-0003). Equality is served by the payload GIN in containment form; range and order read the extraction expression — a B-tree per path needs DDL the platform does not yet let a gear run (ADR-0003, § What payload filtering needs from the platform). |
 | `full_text_search` | `[]` | Paths composed into the node tsvector. |
 | `vector_search` | `[]` | Paths composed into the embedding input. |
 
@@ -569,13 +570,17 @@ cause; the provenance is *who says so*. Only the first two are objects a
 consumer searches, traverses or addresses by key — which is exactly why the
 third is a fragment and not a third element kind.
 
-Provenance is also load-bearing rather than descriptive. Scope replacement reads
-`payload.provenance.origin` to decide whether a producer's re-sync may delete a
-row, which is how analyzer conclusions survive re-importing the source they were
-computed from (§ 5.2, `cpt-cf-graph-storage-fr-edge-provenance`). An analysis
-edge without provenance would be indistinguishable from static content and would
-be deleted on the next re-sync — which is why `analysis_edge` requires it in the
-schema rather than by convention.
+Provenance is also load-bearing rather than descriptive. What scope replacement
+reads to decide whether a producer's re-sync may delete an edge is the edge
+type's *family* — `static_edge` is replaceable content, `analysis_edge` is a
+conclusion that survives — and a node an analysis edge still points at survives
+with it (§ 5.2, `cpt-cf-graph-storage-fr-edge-provenance`). Provenance is what
+makes that survival defensible: an analysis edge that nobody claims to have
+produced is a conclusion without an author, which is why `analysis_edge`
+requires the fragment in the schema rather than by convention. (An earlier draft
+had replacement read a `payload.provenance.origin` member; no such member exists
+in the attribute, and the family is the more reliable signal since it cannot be
+omitted.)
 
 **What the fragment carries, and what it does not.** No envelope: a fragment is
 created, updated and deleted with the element embedding it and is only ever read
@@ -801,9 +806,14 @@ none of them fails until registration is attempted:
   searchable (`full_text_search`) and the gear composes the text from them, so
   the producer moves that logic into the type and drops the field.
 
-Two derivations is the ceiling (`guidelines/GTS.md` §9), and the family already
-spends one — so a producer type is always the third segment and can never
-introduce a hierarchy of its own beneath it.
+The chain ceiling is a deployment policy, `ontology_max_chain_depth`: the
+default 3 keeps the GTS guideline's posture (`guidelines/GTS.md` §9 recommends
+two derivations, and the family spends one), and a deployment mirroring a
+deeper domain hierarchy raises it. Nothing in the gear depends on the depth —
+chain walking, trait resolution, chain validation and pattern matching work on
+any length. Two rules follow for intermediate types: they may not close
+`payload` (rule 3 above), and trait values replace along the chain rather than
+accumulate, so a leaf restating `index` restates all of it.
 
 ##### What the gear enforces beyond JSON Schema
 
@@ -819,13 +829,13 @@ introduce a hierarchy of its own beneath it.
 
 The schemas above are kept as registrable files under
 [`schemas/`](./schemas/), with the worked producer types in
-[`schemas/examples/`](./schemas/examples/) under the fictional `acme` vendor.
+[`graph-storage/schemas/examples/`](../graph-storage/schemas/examples/) under the fictional `acme` vendor.
 This section is the normative narrative; those files are the same content in the
 form the types-registry accepts, so the chain can be validated mechanically
 rather than read for correctness:
 
 ```bash
-gts --path gears/graph-storage/docs/schemas \
+gts --path gears/graph-storage/graph-storage/schemas \
     validate-type-schema --type-id 'gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~'
 ```
 
@@ -852,7 +862,7 @@ Independent producers can only share one graph if a single component owns type r
 
 ##### Responsibility scope
 
-GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across the full derivation chain; resolution and persistence of the chain-effective trait object per registered type (family, scope management, endpoint constraints, index/full-text/vector paths, event emission — ADR-0003); rejection of a type that resolves no `family` or an out-of-enum trait value; idempotent, conflict-rejecting, batch-atomic registration; type catalog reads exposing effective traits; an in-memory validator cache per registered type chain.
+GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across the full derivation chain; resolution and persistence of the chain-effective trait object per registered type (family, scope management, endpoint constraints, index/full-text/vector paths, event emission — ADR-0003); rejection of a type that resolves no `family` or an out-of-enum trait value; idempotent, conflict-rejecting, batch-atomic registration, plus the in-place update of ADR-0006 (the backward verdict from GTS OP#8, and the re-validation of the type's rows when the caller offers them); type catalog reads exposing effective traits; an in-memory validator cache per registered type chain.
 
 ##### Responsibility boundaries
 
@@ -981,7 +991,7 @@ Consumers need bounded, renderable views — neighborhood subgraphs for UIs and 
 
 ##### Responsibility scope
 
-Neighborhood projection (depth-bounded expansion, degree-ordered retention within node budgets, phantom toggle, optional metric annotations); tabular projection (type-family selection, identifier lists, OData filters restricted to the payload paths the type declares in its `index` trait, ordering, pagination, label filtering); rejection of filters on undeclared attributes with the documented error.
+Neighborhood projection (depth-bounded expansion, degree-ordered retention within node budgets — the degree comes from the engine, which is the only layer that can count it, § 3.3 — phantom toggle, optional metric annotations); tabular projection (type-family selection, identifier lists, OData filters restricted to the payload paths the type declares in its `index` trait, ordering, pagination, label filtering); rejection of filters on undeclared attributes with the documented error.
 
 ##### Responsibility boundaries
 
@@ -1091,17 +1101,22 @@ No behavior differences from REST beyond transport; identical permission checks 
 
 The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-rest-api` and `cpt-cf-graph-storage-interface-sdk-client`, with external contracts `cpt-cf-graph-storage-contract-gts-ontology`, `cpt-cf-graph-storage-contract-embedding-provider`, `cpt-cf-graph-storage-contract-graph-engine-plugin`, and `cpt-cf-graph-storage-contract-graph-store-plugin` (the three plugin contracts follow the platform pattern: plugin trait + GTS-registered plugin instances discovered via types-registry and resolved through ClientHub scoped clients). Because the store is pluggable, no PostgreSQL concept appears anywhere in the REST or SDK surface below.
 
-**REST surface** (`/api/graph-storage/v1`, all operations authenticated and permission-checked):
+**REST surface** (`/api/graph-storage/v1`, all operations authenticated and permission-checked; the gear registers its routes under `/graph-storage/v1` and the platform runtime serves them under its `/api` prefix):
 
 | Method | Path | Description | Priority |
 |---|---|---|---|
-| `POST` | `/api/graph-storage/v1/types` | Register a type batch, atomically | p1 |
-| `GET` | `/api/graph-storage/v1/types` | List types; `$filter` on kind and GTS pattern | p1 |
+| `POST` | `/api/graph-storage/v1/types` | Register a type batch, atomically; `options.on_existing` decides what a changed schema under a registered identifier means (ADR-0006) | p1 |
+| `POST` | `/api/graph-storage/v1/types/compatibility` | What registering this batch would do, without writing: per type the verdicts, the diagnostics with their schema locations, the moved traits, the row count (ADR-0006) | p1 |
+| `GET` | `/api/graph-storage/v1/types` | List types; plain query parameters `kind`, `pattern` (GTS identifier pattern), `limit`, `cursor` — not an OData collection (below), and the cursor is a keyset over the identifier rather than `CursorV1` | p1 |
 | `GET` | `/api/graph-storage/v1/types/{gts_type_id}` | One type with its schema and effective traits | p1 |
-| `POST` | `/api/graph-storage/v1/ingest` | Nodes and edges in one transaction; options: skip-embedding, phantom control, replace scope | p1 |
+| `GET` | `/api/graph-storage/v1/source-namespaces` | Claimed source namespaces and the producer principal bound to each (`fr-source-ownership`) | p1 |
+| `POST` | `/api/graph-storage/v1/source-namespaces/{namespace}/owner` | Transfer a namespace to another principal — the only way one changes hands; ontology administration | p1 |
+| `POST` | `/api/graph-storage/v1/ingest` | Nodes and edges in one transaction; options: skip-embedding, phantom control, per-item outcomes, replace scope | p1 |
+| `GET` | `/api/graph-storage/v1/revision` | The tenant's current `(source_epoch, graph_revision)` — the cache-invalidation signal (`fr-revision-signal`) | p1 |
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
+| `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
 | `POST` | `/api/graph-storage/v1/search` | Lexical, vector or hybrid search | p1 |
 | `POST` | `/api/graph-storage/v1/graph/traverse` | Seeded, depth-bounded traversal | p1 |
@@ -1138,6 +1153,13 @@ because each was answerable more than one way:
 - **Adjacency on node read is bounded by a named parameter**, `adjacency_limit`,
   defaulting to `limits.node_read_max_adjacency`, with a truncation flag in the
   response.
+- **Asking what an edit costs is its own operation.** `POST /types/compatibility`
+  could have been a `dry_run` flag on `POST /types`, and was not, for two
+  reasons: a dry run is a *read* and should not need the permission a write
+  needs to be refused for, and a refusal is its normal answer rather than an
+  error — it returns `200` with per-type verdicts where the write path returns
+  `409`. It runs the identical admission path, so the two cannot disagree
+  (ADR-0006).
 
 **OData binding.** Tabular projection binds all five system query options the
 platform accepts (`$filter`, `$orderby`, `$select`, `$top`, `$skiptoken`, with
@@ -1161,15 +1183,27 @@ resolved to a set of registered types, not evaluated as an expression, so the
 type catalog takes `pattern` and `limit` as ordinary query parameters. Only the
 node projection is an OData collection.
 
+Its `cursor` is an ordinary parameter for the same reason: the platform's
+`CursorV1` belongs to the OData binding, so the catalogue pages by keyset over
+the identifier it already orders by. The GTS pattern is matched in the gear
+rather than in the query — an identifier must never reach a `LIKE` — so a page
+is *filled* rather than cut: the scan continues past rows the pattern excludes
+until the page is full or the catalogue ends. Answering with an empty page and
+a continuation token would be a page nobody reads, since the convention every
+client follows is to stop when the items are empty. A cursor means only that
+more rows may follow, so a continuation may still come back short.
+
 **Found while building the prototype: `CursorV1` cannot be extended with the
 revision.** An earlier draft said continuation tokens were "the platform
 `CursorV1` extended with the observed graph revision". A gear cannot do that —
 `CursorV1` has no revision member and `toolkit_odata::Page` carries only
 `items` and `page_info { next_cursor, prev_cursor, limit }`. Using the platform
 binding is itself mandatory here, so a gear-local page envelope is not an
-alternative. The consequence is recorded under § Read Consistency Contract:
-tabular projection is the one read surface that does not report the revision,
-until the platform offers a slot for it.
+alternative. The cursor therefore does not carry the revision — but the
+projection still reports it: the revision rides on every row's element
+envelope (§ API element envelope), which the platform wrapper does not
+constrain. What remains open is the *binding*: a continuation cannot be checked
+against the revision it was minted at (§ Read Consistency Contract).
 
 **Versioning policy.** `/v1/` is additive-only: new optional fields, new
 endpoints and new enum variants ship without a major bump. Renames, removals,
@@ -1215,6 +1249,34 @@ and the wrapper constrains the page rather than the items. Putting
 `graph_revision` in the envelope is therefore what lets that path report the
 snapshot it observed at all (PRD § `fr-tabular-projection`).
 
+**Both halves of this are reachable.** The envelope is required on every
+returned node *and* edge, which needs a surface that returns an edge as an
+element: `GET /edges/{edge_key}`, above. Without it the edge columns were
+written by every ingest path and read by nothing, so a path that forgot one
+would have broken no test — a requirement nothing can observe is a requirement
+nothing checks. Topology references stay what they are: `EdgeRef` in a
+traversal and `AdjacencyEntry` in a node read carry a key, a type and two
+endpoints, and the key is the one the edge read accepts.
+
+**A search hit is a reference too, by the same rule.** `SearchHit` carries a
+key, a type, a name, the fused score and each arm's rank — what a ranking is
+*about* — and no envelope. A hit is a pointer into a result list rather than
+the element itself; the caller reads the node when it wants the element, and
+that read carries the envelope. Stating it because the alternative reading of
+"every node returned by any read surface" is that a hit list must repeat the
+audit envelope of every row it ranks, which would make the common
+search-then-open flow pay for it twice.
+
+**A re-asserted edge comes back; a re-ingested node key does not.** Rule 4 of
+the Soft Delete Contract makes a tombstoned `node_key` unusable before purge,
+because a consumer holds that key and letting it return with different content
+would break stable identity silently. An edge key is not held that way: it is
+*derived* from the type, the endpoints and the discriminator, so re-ingesting
+one is the same producer making the same statement about the same two nodes
+again. That revives the tombstoned row rather than conflicting, and the
+envelope records who revived it. The rule does not extend to edges, and this
+paragraph says so rather than leaving the difference to be discovered.
+
 **An attribute has no envelope of its own.** It is a fragment inside an element's
 payload, so its tenant, its timestamps and the subject that wrote it are the
 embedding element's, reported once on that element. What is *not* inherited is
@@ -1251,6 +1313,9 @@ the load-bearing part of these contracts:
 pub struct StoreCtx<'a> {
     pub tenant: TenantId,
     pub scope: &'a AccessScope,
+    /// The acting subject, stamped onto the audit envelope of every element a
+    /// write in this call creates, updates or tombstones (`fr-audit-envelope`).
+    pub subject: Subject,
     /// Present when the call participates in a compound read that must observe
     /// one graph state (Read Consistency Contract).
     pub snapshot: Option<&'a ReadSnapshot>,
@@ -1280,25 +1345,49 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     fn capabilities(&self) -> StoreCapabilities;
 
     // --- ontology -------------------------------------------------------
+    /// Register a batch atomically. `options.on_existing` decides what a
+    /// changed schema under a registered identifier means (ADR-0006);
+    /// `options.dry_run` computes every verdict and writes nothing. This is
+    /// the required method; `register_types` below is a provided wrapper
+    /// under the default options, so one code path decides admission.
+    async fn register_types_with(&self, ctx: &StoreCtx<'_>, batch: Vec<TypeRegistration>,
+        options: TypeRegistrationOptions) -> Result<Vec<RegisteredType>, GraphStoreError>;
     async fn register_types(&self, ctx: &StoreCtx<'_>, batch: Vec<TypeRegistration>)
-        -> Result<Vec<TypeRecord>, GraphStoreError>;
+        -> Result<Vec<TypeRecord>, GraphStoreError> { /* provided */ }
     async fn get_type(&self, ctx: &StoreCtx<'_>, id: &GtsTypeId)
         -> Result<TypeRecord, GraphStoreError>;
     async fn list_types(&self, ctx: &StoreCtx<'_>, query: TypeQuery)
         -> Result<Page<TypeRecord>, GraphStoreError>;
-    /// Resolve GTS patterns to the set of registered types they cover, so a
-    /// caller's type filter and an authorizing permission's pattern can be
-    /// intersected on one representation.
-    async fn resolve_type_set(&self, ctx: &StoreCtx<'_>, patterns: &[GtsIdPattern])
+    /// Resolve GTS patterns (as strings, parsed by the platform matcher) to
+    /// the set of registered types they cover, so a caller's type filter and
+    /// an authorizing permission's pattern can be intersected on one
+    /// representation.
+    async fn resolve_type_set(&self, ctx: &StoreCtx<'_>, patterns: &[String])
         -> Result<TypeIdSet, GraphStoreError>;
+    /// The rows of the readiness matrix only the store can answer (database,
+    /// migrations, traversal backend). Takes no `StoreCtx`: readiness is
+    /// reached before authentication.
+    async fn probe_readiness(&self) -> Vec<ComponentReadiness>;
+
+    // --- source namespaces (fr-source-ownership) ------------------------
+    async fn list_source_namespaces(&self, ctx: &StoreCtx<'_>)
+        -> Result<Vec<SourceNamespaceOwner>, GraphStoreError>;
+    /// The only way a namespace changes hands; authorized as ontology
+    /// administration, not as a write.
+    async fn transfer_source_namespace(&self, ctx: &StoreCtx<'_>, namespace: &str,
+        owner_principal: &str) -> Result<SourceNamespaceOwner, GraphStoreError>;
 
     // --- write ----------------------------------------------------------
-    /// Nodes, edges, chunks and the idempotency record commit together or not
-    /// at all. A replay of a recorded key returns `IngestOutcome::replayed`
-    /// without touching state.
-    async fn ingest(&self, ctx: &StoreCtx<'_>, req: IngestRequest)
+    /// Nodes, edges and the idempotency record commit together or not at
+    /// all. A replay of a recorded key returns `IngestOutcome { replayed: true }`
+    /// without touching state. `embedding` carries one entry per node, in
+    /// order: the vector to store if this request embedded, and the canonical
+    /// hash of its input either way — a store composes and embeds nothing,
+    /// so ingest and query cannot diverge (Embedding Coordinator).
+    async fn ingest(&self, ctx: &StoreCtx<'_>, req: IngestRequest, embedding: EmbeddingPlan)
         -> Result<IngestOutcome, GraphStoreError>;
-    /// Tombstone a node with its incident edges, or a single edge.
+    /// Tombstone a node with its incident edges, or a single edge (an edge
+    /// only when both endpoints are visible under the scope).
     async fn soft_delete(&self, ctx: &StoreCtx<'_>, req: DeleteRequest)
         -> Result<DeleteOutcome, GraphStoreError>;
 
@@ -1325,28 +1414,60 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         -> Result<GraphRevision, GraphStoreError>;
     async fn get_node(&self, ctx: &StoreCtx<'_>, key: &NodeKey, adjacency_limit: u32)
         -> Result<NodeView, GraphStoreError>;
+    /// One edge as an element. An edge either of whose endpoints the scope
+    /// does not admit reads as absent: the authorized graph is the induced
+    /// subgraph, and an edge is a statement about two nodes.
+    async fn get_edge(&self, ctx: &StoreCtx<'_>, key: &EdgeKey)
+        -> Result<EdgeView, GraphStoreError>;
     async fn hydrate_nodes(&self, ctx: &StoreCtx<'_>, ids: &[NodeId])
         -> Result<Vec<NodeView>, GraphStoreError>;
     /// One call, not one per arm: the scope must apply inside each arm before
     /// UNION, ranking and LIMIT, and RRF needs each arm's ranks. Exposing the
     /// arms separately would let a caller assemble them in an order that
-    /// authorizes correctly and ranks wrongly, or the reverse.
-    async fn search(&self, ctx: &StoreCtx<'_>, req: SearchRequest)
+    /// authorizes correctly and ranks wrongly, or the reverse. `vector` is
+    /// the query's embedding, computed by the coordinator with the same
+    /// provider ingest used; `None` for a lexical-only search.
+    async fn search(&self, ctx: &StoreCtx<'_>, req: SearchRequest, vector: Option<VectorArm>)
         -> Result<SearchResponse, GraphStoreError>;
+    /// The platform page (`toolkit_odata::Page`): items and cursors, no
+    /// revision — the revision rides on each row's envelope.
     async fn project_table(&self, ctx: &StoreCtx<'_>, req: ProjectionRequest)
-        -> Result<Page<NodeRow>, GraphStoreError>;
+        -> Result<toolkit_odata::Page<NodeRow>, GraphStoreError>;
     /// Node keys with their type and typed edge pairs, tombstoned rows
     /// excluded, paged. This is the *capability*; how it is exposed depends on
-    /// the store. The built-in PostgreSQL store materializes it as the
-    /// read-only role the analytics gear queries directly, because serializing
-    /// a million-node topology across an API on every recomputation is the cost
-    /// graph-analytics ADR-0001 rejected. A store that cannot expose it declares the capability
-    /// absent, and analytics is then unavailable in that deployment (graph-analytics ADR-0002)
-    /// rather than served over this method at that cost.
+    /// the store. The intended shape for the built-in PostgreSQL store is the
+    /// read-only role the analytics gear queries directly, because
+    /// serializing a million-node topology across an API on every
+    /// recomputation is the cost graph-analytics ADR-0001 rejected. A store
+    /// that cannot expose it declares the capability absent, and analytics is
+    /// then unavailable in that deployment (graph-analytics ADR-0002). **The
+    /// shipped built-in store declares it absent** — the role and grant are
+    /// not built yet (`fr-analytics-topology` is deferred), and the method
+    /// answers `Unsupported`.
     async fn load_topology(&self, ctx: &StoreCtx<'_>, req: TopologyRequest)
         -> Result<TopologyPage, GraphStoreError>;
+
+    // --- keys and vectors (added while building) -------------------------
+    /// Producer keys to internal ids under the scope; unknown and
+    /// unauthorized keys are absent alike (anti-enumeration). What traversal
+    /// seeds resolve through.
+    async fn resolve_node_ids(&self, ctx: &StoreCtx<'_>, keys: &[NodeKey])
+        -> Result<Vec<(NodeKey, NodeId)>, GraphStoreError>;
+    /// The stored input hash and current epoch of each key's vector,
+    /// index-aligned with `keys`, so the coordinator embeds only what changed.
+    async fn embedding_state(&self, ctx: &StoreCtx<'_>, keys: &[NodeKey])
+        -> Result<Vec<Option<EmbeddingState>>, GraphStoreError>;
 }
 ```
+
+**Found while building the prototype: the listing above is the shipped trait,
+not the first draft.** Building the coordinator moved embedding out of the
+store (`ingest` takes an `EmbeddingPlan`, `search` a `VectorArm`), type
+evolution made `register_types_with` the required method, and readiness,
+source namespaces, key resolution and vector state each needed a method the
+first draft did not have. An external `GraphStoreV1` implementation is written
+against `graph-storage-sdk::plugin_api`, which is the authority; this listing
+is kept in step with it.
 
 The five obligations of `cpt-cf-graph-storage-contract-graph-store-plugin` are
 carried by specific methods, and each is asserted by the conformance suite
@@ -1413,16 +1534,32 @@ pub struct ExpandRequest {
     pub direction: Direction,          // explicit; there is no "undirected" shorthand
     pub edge_types: Option<TypeIdSet>, // per-hop restriction
     pub labels: Option<LabelFilter>,   // per-hop restriction
-    pub budget: HopBudget,             // frontier cap and cumulative edges scanned
+    pub budget: HopBudget,             // frontier cap and edges scanned
+    pub with_degrees: bool,            // fill `degrees` below; costs a second scoped read
 }
 
 pub struct ExpandResponse {
     pub reached: Vec<NodeId>,
+    pub degrees: Vec<u32>,                   // index-aligned with `reached`; empty unless asked
     pub edges: Vec<EdgeRef>,
     pub truncated: Option<TruncationReason>, // never silent
     pub served_by: HopBackend,               // Pattern | TwoQuery — which path answered
 }
 ```
+
+**Found while building the prototype: the degree a projection ranks by is the
+engine's to report.** Degree-ordered retention is what keeps a hub's
+neighborhood useful when the node budget cuts it
+(`cpt-cf-graph-storage-fr-neighborhood-projection`), and nothing above this
+port can compute it: a reached node is an internal id while an `EdgeRef` names
+its endpoints by producer key, so joining them costs another read. It also has
+to be the neighbour's *own* connectivity rather than the number of edges tying
+it to this frontier — at depth one those are all exactly one, so the cheap
+count ranks a hub's neighbours arbitrarily, which is the failure the
+requirement exists to prevent. Every edge counted has passed the caller's
+scope, so this is the degree inside the authorized subgraph (§ Authorization
+Model). It is opt-in because it is a second scoped read that a traversal, whose
+caller post-processes the whole region, has no use for.
 
 Two shapes here are consequences of the PG19 spike rather than preference: the
 direction is explicit because the undirected shorthand plans as an all-vertex
@@ -1569,7 +1706,7 @@ Content-Type: application/json
 {
   "options": {
     "embed": true,               // false skips embedding; existing vectors are kept, not cleared
-    "materialize_phantoms": true,
+    "create_phantoms": true,     // false makes an edge to an unknown key a per-item error
     "report_per_item": false     // aggregate counts on success; errors are always per item
   },
   "replace_scope": {             // omit entirely for an additive ingest
@@ -1580,7 +1717,7 @@ Content-Type: application/json
   "nodes": [
     {
       "node_key": "finding:acme:SEC-014:a1b2c3",
-      "type": "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.sec._.finding.v1~",
+      "type_id": "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.sec._.finding.v1~",
       "name": "Hardcoded credential in deploy script",
       "expected_version": 3,     // optional compare-and-set; a mismatch rejects the batch
       "payload": {
@@ -1594,7 +1731,7 @@ Content-Type: application/json
   ],
   "edges": [
     {
-      "type": "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~acme.sec._.introduced_by.v1~",
+      "type_id": "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~acme.sec._.introduced_by.v1~",
       "src_node_key": "finding:acme:SEC-014:a1b2c3",
       "dst_node_key": "commit:github:acme/infra:a1b2c3",
       "payload": {
@@ -1615,7 +1752,7 @@ discriminator. The commit node is not in this batch — if it has not been
 ingested yet it materializes as a phantom, which is why endpoint constraints are
 checked against the *materialized* type and not against the request.
 
-**2. Security.** The permission is `ingest` on ResourceType *graph node*, and
+**2. Security.** The permission is `write` on ResourceType *graph node*, and
 edges authorize through both endpoints (Authorization Model). The decision is
 resolved once, from the PDP, for this request — never reused from a previous one
 and never skipped because the `(tenant, type)` pair already exists locally.
@@ -1662,49 +1799,59 @@ tenants, which `allow_all` and tenant-subtree scopes are not. All three paths
 return identical results for the same seeds and scope, which is what makes the
 choice a configuration detail rather than a semantic one.
 
-**6. The response.** Success, with `report_per_item` unset:
+**6. The response.** Success, with `report_per_item` unset (this is the wire
+shape; an earlier draft of this example sketched nested `nodes`/`edges` count
+objects and a `phantoms_materialized` key list, which is not what shipped):
 
 ```jsonc
 {
-  "graph_revision": 90412,        // unchanged if the batch converged without writing
-  "nodes":  { "created": 0, "updated": 1, "unchanged": 0 },
-  "edges":  { "created": 1, "updated": 0, "unchanged": 0 },
-  "chunks": { "created": 0, "deleted": 0 },
-  "phantoms_materialized": ["commit:github:acme/infra:a1b2c3"],
-  "scope_replacement": { "deleted_nodes": 2, "deleted_edges": 5, "generation": 4711 },
-  "idempotency": "committed"      // "replayed" when a recorded outcome was returned
+  "revision": { "source_epoch": 1, "revision": 90412 }, // unchanged if the batch converged without writing
+  "replayed": false,               // true when a recorded idempotency receipt answered the call
+  "counts": {
+    "nodes_inserted": 0, "nodes_updated": 1, "nodes_unchanged": 0,
+    "edges_inserted": 1, "edges_updated": 0, "edges_unchanged": 0,
+    "phantoms_created": 1,         // the commit node, materialized as a phantom by this edge
+    "phantoms_materialized": 0,
+    "scope_removed_nodes": 2,      // static content the replacement removed; 0 without replace_scope
+    "scope_removed_edges": 5
+  },
+  "per_item_nodes": null,          // with report_per_item: ["inserted" | "updated" | "unchanged" | "materialized"] per node, in batch order
+  "per_item_edges": null           // likewise per edge; both absent on a replayed call (the receipt keeps counts, not lists)
 }
 ```
 
-And a validation failure, RFC 9457 with the per-item list:
+And a validation failure: the platform's RFC 9457 problem document
+(`invalid_argument`, HTTP `400` — the platform maps that category to 400, not
+422), with one field violation per failed item. The field names the
+collection, the index and the JSON pointer; the reason is the stable
+`SCHEMA_VIOLATION`:
 
 ```jsonc
 {
-  "type": "gts.cf.core.graph.err.v1~cf.core.graph.validation_failed.v1~",
-  "title": "Ingest batch rejected",
-  "status": 422,
-  "detail": "2 of 1 nodes and 1 edges failed validation; no part of the batch was applied",
+  "type": "…invalid_argument…",
+  "title": "Invalid argument",
+  "status": 400,
+  "detail": "…",
   "instance": "/api/graph-storage/v1/ingest",
   "trace_id": "0af7651916cd43dd8448eb211c80319c",
-  "errors": [
+  "field_violations": [
     {
-      "kind": "node",
-      "index": 0,
-      "key": "finding:acme:SEC-014:a1b2c3",
-      "gts_type": "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.sec._.finding.v1~",
-      "pointer": "/payload/severity",
-      "message": "\"critical-ish\" is not one of \"low\", \"medium\", \"high\", \"critical\""
+      "field": "nodes[0]/payload/severity",
+      "description": "\"critical-ish\" is not one of \"low\", \"medium\", \"high\", \"critical\"",
+      "reason": "SCHEMA_VIOLATION"
     },
     {
-      "kind": "edge",
-      "index": 0,
-      "gts_type": "gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~acme.sec._.introduced_by.v1~",
-      "pointer": "/payload/provenance/produced_at",
-      "message": "required property missing"
+      "field": "edges[0]/payload/provenance/produced_at",
+      "description": "required property missing",
+      "reason": "SCHEMA_VIOLATION"
     }
   ]
 }
 ```
+
+The item's GTS type is not a separate member of the violation — it is
+recoverable from the request at the named index — which is narrower than the
+"(item index, GTS type, JSON pointer, message)" § 3.3 promised.
 
 The batch is atomic, so a per-item error list describes what was rejected, never
 what was partially applied. Conflicts are a different problem type from
@@ -1775,7 +1922,7 @@ back off) instead of parsing prose.
 
 Single PostgreSQL schema; all tables tenant-scoped; vector dimension fixed by migration and verified at readiness. Index plan: composite edge indexes (tenant, src) / (tenant, dst) / (tenant, gts_edge_type_id); GIN over generated tsvectors; expression/GIN indexes over the payload paths a type declares in its `index` trait; HNSW cosine indexes over embeddings. Every read-path index is partial on `deleted_at IS NULL` (Soft Delete).
 
-The SQL/PGQ property graph is created by a gear migration alongside the tables, so every fresh database can serve `GRAPH_TABLE` queries without manual setup; the platform migration runner executes that DDL without special handling.
+The SQL/PGQ property graph is created by a gear migration alongside the tables, so a fresh database on a server that supports it can serve `GRAPH_TABLE` queries without manual setup; the platform migration runner executes that DDL without special handling. *Found while building the prototype:* the migration is conditional — below server major 19 it records that the graph was not created and the runtime probe (§ 2.2) routes every hop to the two-query backend. The graph itself (`kb`) has one vertex label (`node`) and one edge label (`edge`), each carrying the key and scope columns; typing is done by the interned type id as a property, not by one label per GTS type.
 
 `tenant_id` is the designated partition key and participates in every primary, unique, and foreign-key contract from day one (e.g., nodes are unique on `(tenant_id, node_key)` and edges reference `(tenant_id, node_id)`), so adopting PostgreSQL partitioning at scale is a physical reorganization, not an identity migration (ADR-0001 § scale envelope). `metrics_cache` is written by the analytics gear and its growth is bounded by that gear's retention limits (graph-analytics ADR-0002); this gear reads it for annotation only.
 
@@ -1820,6 +1967,8 @@ is a cache with a foreign identity, never a second source of truth.
 | type_schema | JSONB | The type's draft-07 JSON Schema |
 | effective_traits | JSONB | Trait values resolved across the derivation chain (Base Ontology GTS Schemas) |
 | created_at | TIMESTAMPTZ | Registration time |
+| revision | INTEGER | Which definition of this identifier is in force: `1` until the type is first updated in place, one more per admitted update (ADR-0006, types-registry ADR-0005) |
+| updated_at | TIMESTAMPTZ | When the definition last moved; equals `created_at` for a type that was never updated |
 
 **Naming rule.** The interned surrogate is referenced as `gts_<entity>_type_id`
 (`node.gts_node_type_id`, `edge.gts_edge_type_id`); the GTS identifier and its
@@ -1829,6 +1978,13 @@ node-type reference, `gts_type_id = 'gts.cf.…'` is an identifier. `INTEGER`
 rather than `SMALLINT` because each registered minor version is its own row, and
 32,767 types per tenant is not a ceiling worth discovering in production; at
 PostgreSQL row alignment the two are the same size in these tables anyway.
+
+**A row per identifier, revisions within it (ADR-0006).** "Each registered minor
+version is its own row" holds per *identifier*: a minor-bearing identifier is
+immutable and keeps its own row, while a major-only identifier names a mutable
+logical entity (types-registry ADR-0004) whose row carries successive
+definitions, counted by `revision`. The retained revisions themselves are not
+stored: this is the counter, not the history table ADR-0005 describes.
 
 #### Table: node
 
@@ -1840,6 +1996,7 @@ PostgreSQL row alignment the two are the same size in these tables anyway.
 | id | BIGINT | Internal id; **PK (tenant_id, id)** |
 | node_key | TEXT | Producer-supplied stable key; **UNIQUE (tenant_id, node_key)** |
 | gts_node_type_id | INTEGER | **FK (tenant_id, gts_node_type_id) -> gts_type (tenant_id, id)** |
+| version | BIGINT | Moves on every write that changes the row; the target of a producer's `expected_version` compare-and-set |
 | name | TEXT | Display name |
 | payload | JSONB | GTS-validated attributes (ceiling-bounded) |
 | search_text | TEXT | Composed vectorizable text |
@@ -1855,9 +2012,37 @@ PostgreSQL row alignment the two are the same size in these tables anyway.
 | deleted_by_subject_id / deleted_by_subject_type | UUID / TEXT | Subject that tombstoned the row; `NULL` while live |
 
 `source_namespace` and `owner_principal` are written once, on insert, and never
-by an upsert; the ingest path compares them instead. A companion
+by an upsert; the ingest path compares against the registry instead. A companion
 `source_namespace_owner` registry table binds namespaces to producer principals
 per tenant and is the authority the comparison consults.
+
+#### Table: source_namespace_owner
+
+**ID**: `cpt-cf-graph-storage-dbtable-source-namespace-owner`
+
+Named by the paragraph above and left unspecified in the first draft; the
+columns are below. One row per `(tenant, namespace)`, where the namespace is the
+`source.system` value of a reference node's identity triple.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| tenant_id | UUID | Tenant scope; **PK (tenant_id, namespace)** |
+| namespace | TEXT | The `source.system` value the boundary is drawn around |
+| owner_principal | TEXT | The producer principal entitled to write it **now** |
+| claimed_at | TIMESTAMPTZ | When it was first claimed |
+| previous_owner | TEXT | Whom it was taken from, set only by a transfer; `NULL` otherwise |
+| transferred_at | TIMESTAMPTZ | When it last changed hands; `NULL` if never |
+| transferred_by_subject_id / transferred_by_subject_type | UUID / TEXT | The subject that performed the transfer — the audit of the one act that can move the boundary |
+
+**Why the registry and not `node.owner_principal` is the authority.** The column
+records who *created* a row and is immutable, so consulting it would make a
+transfer unusable: the new owner could not touch a row the previous one wrote.
+The registry answers "who may write this namespace now", the column answers
+"who wrote this row", and a transfer changes the first without rewriting the
+second. A claim is `INSERT … ON CONFLICT DO UPDATE SET owner_principal =
+source_namespace_owner.owner_principal` — a no-op write that takes the row lock,
+so two producers claiming one namespace in the same instant serialize and the
+loser is told it is forbidden rather than both believing they own it.
 
 #### Table: edge
 
@@ -1869,6 +2054,7 @@ per tenant and is the authority the comparison consults.
 | id | BIGINT | Internal id; **PK (tenant_id, id)** |
 | edge_key | TEXT | Deterministic hash of type, src, dst, discriminator; **UNIQUE (tenant_id, edge_key)** |
 | gts_edge_type_id | INTEGER | **FK (tenant_id, gts_edge_type_id) -> gts_type (tenant_id, id)** |
+| discriminator | TEXT | Producer-supplied disambiguator for parallel edges of one type between one pair; part of the `edge_key` derivation; `NULL` when absent |
 | src_node_id / dst_node_id | BIGINT | Endpoints; **FK (tenant_id, src/dst_node_id) -> node (tenant_id, id) ON DELETE RESTRICT** — deletion never cascades into edges, so an analysis edge can never be destroyed as a side effect of removing a static node |
 | payload | JSONB | GTS-validated attributes incl. provenance |
 | created_at / updated_at | TIMESTAMPTZ | Timestamps |
@@ -1976,7 +2162,7 @@ reconciliation, never automatic re-execution.
 |--------|------|-------------|
 | tenant_id | UUID | Tenant scope |
 | scope_attribute / scope_value | TEXT / TEXT | Canonical scope identity; **PK (tenant_id, scope_attribute, scope_value)** |
-| owner_producer | TEXT | Producer owning this scope |
+| owner_producer | TEXT | Producer owning this scope: the writing principal, taken from the security context. Empty means unclaimed — the next replacement adopts it, under this row's lock, as a source namespace is claimed by its first writer |
 | generation | BIGINT | Highest accepted source generation (fencing) |
 | request_hash | TEXT | Hash of the last accepted replacement snapshot |
 | updated_at | TIMESTAMPTZ | Last accepted replacement |
@@ -2015,6 +2201,12 @@ Payload-free by construction (Telemetry and Audit Contract); written in the inge
 | dimension | INTEGER | Vector width, cross-checked against the column type |
 | state | TEXT | active / migrating / retired |
 | created_at / activated_at | TIMESTAMPTZ | Lifecycle timestamps |
+
+A partial unique index on `(tenant_id) WHERE state = 'active'` makes the
+one-active-space invariant a database constraint rather than a convention. The
+table is deployment-wide in meaning and carries a `tenant_id` column holding the
+nil UUID only because every runtime read goes through the scope-enforcing ORM
+(the same device `graph_meta` uses).
 
 This is the canonical durable location of the embedding-space identity. `node` and `chunk` carry an `embedding_epoch` column alongside `embedding` and the embedding-input hash: readiness compares the active provider's identity against the epoch its stored vectors reference, similarity search reads only vectors of the active epoch (never absent, stale, or previous-epoch ones), and the re-embedding lifecycle (ADR-0004) writes new-epoch vectors during backfill before an atomic cutover of `state`.
 
@@ -2147,12 +2339,13 @@ Tenant scoping is the outer wall; the PDP-derived `AccessScope` is the inner, re
 
 | Operation group | ResourceType | Action | Composition |
 |---|---|---|---|
-| Types (admin) | graph ontology | administer | none (tenant-level) |
+| Types (admin) | graph type (`cf.core.graph.type.v1~`) | admin | none (tenant-level) |
+| Source namespaces: list / transfer | graph type | read / admin | none (tenant-level); a transfer is ontology administration, not a write |
 | Ingest | graph node | write | edges authorize via both endpoints; chunks via parent node; scope replacement via owned scope; reference nodes additionally authorize against the source-namespace owner |
 | Node read | graph node | read | chunks, labels and adjacency via the node's scope; unauthorized key follows the anti-enumeration contract |
 | Delete | graph node (+ edge via endpoints) | delete | incident edges follow the node; a caller authorized for the node is authorized for the cascade |
-| Labels (registry) | graph ontology | administer | none (tenant-level) |
-| Labels (attach / detach) | graph node, graph edge | label | authorized on the target object, not on the label; distinct from ingest write |
+| Labels (registry) | graph type | admin | none (tenant-level) — labels are deferred; the row is the intended binding |
+| Labels (attach / detach) | graph node, graph edge | label | authorized on the target object, not on the label; distinct from ingest write — deferred with labels; the `label` action and the edge resource are declared and unused |
 | Search | graph node | read | resource predicate inside all four arms before UNION/ranking/LIMIT; chunk rows authorize through their parent node; folding, counts, snippets, fusion inputs, pagination, and hydration re-apply the same scope |
 | Traversal / projections | graph node (+ edge via endpoints) | read | the caller-authorized induced subgraph, below |
 
@@ -2189,8 +2382,13 @@ The contract:
   owner**, not merely against the tenant — a mismatch is `permission_denied`,
   reported the same way whatever the caller's other grants;
 - **ownership transfer and reconciliation are an explicit administrative flow**
-  under the ontology-administration permission, audited in `ingest_audit` like
-  any other mutation; there is no implicit transfer by writing.
+  under the ontology-administration permission; there is no implicit transfer
+  by writing.
+
+*Found while building the prototype:* the transfer is audited on the registry
+row itself — previous owner, timestamp, acting subject — rather than in
+`ingest_audit`, which this iteration does not build. That answers "who moved
+this, and from whom" and not "how many times".
 
 An unclaimed namespace is claimed by the first producer that writes it, which
 keeps single-producer deployments free of setup while still making the second
@@ -2243,14 +2441,15 @@ otherwise — never a silent mix of revisions.
 
 **Found while building the prototype: two of these are not yet reachable.**
 
-- **Tabular projection does not report the revision.** Its response envelope is
-  the platform's `Page`, and its continuation token the platform's `CursorV1`;
-  neither has a member a gear can put the revision in, and using the platform
-  binding is mandatory for this surface (`fr-tabular-projection`). Node read,
-  search, traversal and ingest all report the pair. Until the platform offers a
-  slot, a caller that needs a projection page bound to a revision reads the
-  revision surface alongside it and compares — which is weaker, because the two
-  calls are not one snapshot.
+- **A continuation token is not bound to a revision.** The projection's token
+  is the platform's `CursorV1`, which has no member a gear can put the revision
+  in, and using the platform binding is mandatory for this surface
+  (`fr-tabular-projection`). The revision itself *is* reported — on every
+  projected row's element envelope, as on every other read surface — so a
+  caller can see that two pages observed different revisions; what it cannot
+  get is the "recorded revision's data or a typed stale-token error" promised
+  above. Until the platform offers a slot in the cursor, a page boundary is a
+  possible seam between revisions.
 - **The snapshot is per-statement, not per-read, on the built-in store.** See
   § 3.3, where the store declines the snapshot obligation: holding one
   transaction across the calls that make up a compound read is not expressible
@@ -2324,7 +2523,7 @@ One authoritative chain classifies every failure: `DomainError -> CanonicalError
 
 | Failure | Canonical category | Stable reason | Client disposition |
 |---|---|---|---|
-| Malformed payload, schema violation, inconsistent limits | `invalid_argument` | `SCHEMA_VIOLATION`, `LIMIT_COMBINATION` | Fix the request |
+| Malformed payload, schema violation, a request the gear cannot interpret, inconsistent limits | `invalid_argument` | `SCHEMA_VIOLATION` (per-item and query-shape violations), `INVALID_ARGUMENT` (an unknown enumeration value, an unaccepted query option, a malformed migration step), `LIMIT_COMBINATION` (two bounds that cannot hold at once) | Fix the request |
 | Value outside a documented hard range (depth, batch size, seed count) | `out_of_range` | `LIMIT_EXCEEDED` | Reduce the value; never retry unchanged |
 | Same-key different-type ingest, expected-version mismatch | `aborted` | `CAS_CONFLICT` | Re-read and retry |
 | Serialization failure under concurrent ingest | `aborted` | `SERIALIZATION` | Retry unchanged |
@@ -2346,6 +2545,24 @@ One authoritative chain classifies every failure: `DomainError -> CanonicalError
 | Unexpected internal failure | `unknown` | `INTERNAL` | Retry once, then escalate |
 
 Reasons are a stable, published vocabulary; clients never parse human-readable `detail` strings. Transient categories carry a retry-after hint; non-retryable ones explicitly carry none.
+
+**Found while building the prototype: which reasons are actually on the wire.**
+The platform's error builders attach a reason only to the categories that carry
+a violation or a precondition — `invalid_argument`, `out_of_range`, `aborted`,
+`failed_precondition`, `permission_denied`. For `not_found`, `unimplemented`,
+`deadline_exceeded`, `cancelled`, `unavailable`, `data_loss` and `unknown` the
+builders have no reason slot, so the *category* is the whole of what a client
+receives; the reasons listed for them above (`NOT_FOUND`,
+`CAPABILITY_UNSUPPORTED`, `DEADLINE`, `CANCELLED`, `DEPENDENCY_UNAVAILABLE`,
+`STORE_CORRUPT`, `INTERNAL`) name the meaning and are not a field to match on
+until the platform grows one. Separately, `QUEUE_FULL`, `MEMORY_POOL_BUSY`,
+`TENANT_CONCURRENCY`, `INDEX_NOT_ACTIVE`, `TENANT_FENCED`, `PROJECTION_CORRUPT`
+and `PROJECTION_STALE` belong to features this iteration defers (the admission
+layer, the index-activation lifecycle, tenant offboarding, analytics
+projections) and are produced by nothing yet. One reason reaches callers from
+the platform rather than this vocabulary: a malformed continuation token on the
+projection answers `invalid_argument` / `INVALID_CURSOR` from the OData
+extractor.
 
 The category names above are exactly those the platform's `#[resource_error]` macro generates — `aborted`, `already_exists`, `cancelled`, `data_loss`, `deadline_exceeded`, `failed_precondition`, `invalid_argument`, `not_found`, `out_of_range`, `permission_denied`, `resource_exhausted`, `unimplemented`, `unknown`. There is no `internal` category; unexpected failures map to `unknown`.
 
@@ -2392,7 +2609,7 @@ job categories (`graph-analytics` DESIGN § Error Model).
 
 **Asynchronous jobs** (owned by the `graph-analytics` gear, its ADR-0002; the contract is recorded here because the two gears share the error model) have three error surfaces: (1) submission errors before `202` — validation, authorization, admission, dependency — returned immediately as a Problem, no job created; (2) execution errors after `202` — the terminal category, stable reason, safe structured context, and trace identifier are persisted with the job and replayed by the result endpoint, while status returns a failed-job envelope; (3) job-request errors — unknown or unauthorized job (`not_found`, indistinguishable), result requested before completion (`failed_precondition`, `JOB_NOT_COMPLETE`), invalid cancellation (`failed_precondition`), expired result (`not_found`, `JOB_RESULT_EXPIRED`). The SDK exposes the same terminal category and context.
 
-**Route registration.** Each route registers every Problem status its runtime can produce through OperationBuilder — `standard_errors` plus explicit additional responses for the canonical outcomes it can reach (for example `499` cancelled, `501` unsupported capability, `503` dependency unavailable, `504` deadline exceeded). Every route registers its own set, so OpenAPI describes every failure a generated client or gateway can observe.
+**Route registration.** Each route registers every Problem status its runtime can produce through OperationBuilder — `standard_errors` plus explicit additional responses for the canonical outcomes it can reach (for example `499` cancelled, `501` unsupported capability, `503` dependency unavailable, `504` deadline exceeded). Every route registers its own set, so OpenAPI describes every failure a generated client or gateway can observe. *Found while building the prototype:* the shipped routes register `400`, `401`, `403`, `404`, `409`, `500` and `503`; `501` (traversal on an engine without the capability), `504` and `499` are produced but not described, and `404` is reachable on the `POST` routes too (a denied caller reads as absent) though only the `GET`/`DELETE` routes declare it. A gap between the description and the behaviour, to be closed route by route.
 
 ### Deadlines and Cancellation
 
@@ -2404,6 +2621,21 @@ job categories (`graph-analytics` DESIGN § Error Model).
 - once `COMMIT` has been issued and its outcome is unknown — the operation is resolved through the idempotency receipt, and a definite cancellation is never reported while the outcome is unknown;
 - after a durable commit or a published job result — success wins even if response delivery was cancelled; the recorded outcome remains retrievable by idempotency key or job identifier;
 - for `202` jobs — cancellation and result publication compete through a single persisted terminal-state transition, so exactly one of them wins.
+
+**Found while building the prototype: the deadline is in force, the token is a
+seam.** Every request opens with an absolute budget (`deadline_interactive` by
+default) and that budget is what actually stops long work — traversal hops,
+provider calls and evolution scans all check it. The `CancellationToken` beside
+it in `StoreCtx` is threaded through the same call sites and polled by them, but
+in this build nothing signals it: no caller-supplied cancellation and no
+connection-lifecycle source is wired to it, and the only thing that fires it is
+the SDK's own contract test. A REST caller who disconnects still stops the work
+— axum drops the handler future, which drops everything it was awaiting — so
+the observable behaviour is right for HTTP and the gap is the *cooperative*
+path: an in-process `ClientHub` caller cannot ask a running operation to stop
+early, and a shutdown cannot interrupt one before its deadline. The seam is
+present so that wiring it later is a change at the edges rather than through
+every signature.
 
 The same rules apply during shutdown.
 
@@ -2436,10 +2668,27 @@ returns to `Healthy`. A degraded component never silently widens behavior.
 
 The readiness endpoint reports per-component state with named problems and, for
 degraded components, the recovery condition being waited on. The aggregate is
-ready only when no component is `Unhealthy`. Every blocked operation above is
-rejected with the canonical category and stable reason from § Error Model — a
-degraded capability never returns a partial or best-effort result in place of
-the rejection.
+ready only when no component *whose failure blocks every operation* is
+`Unhealthy` — the embedding-space row above is `Unhealthy` and the gear stays
+ready, because a mismatch blocks the vector arms and nothing else, and taking
+the graph out of service for it would be worse than the fault. (An earlier draft
+said "no component is `Unhealthy`", which that row contradicted; the row is the
+specific statement and wins.) Every blocked operation above is rejected with the
+canonical category and stable reason from § Error Model — a degraded capability
+never returns a partial or best-effort result in place of the rejection.
+
+**Found while building the prototype: what the shipped matrix reports.** Five
+rows have no component behind them in this build and are reported as
+`not_implemented` rather than as `Healthy` — the authorization-resolver probe
+(the platform PEP publishes no health surface), the types registry as a runtime
+dependency, dynamic indexes, tenant reconciliation and the metric-annotation
+source — so an operator sees what the gear cannot yet say instead of a green
+light that means nothing. SQL/PGQ is reported `Degraded`, never `Unhealthy`:
+`traversal_hop` has no "no preference" value, so the gear cannot tell an
+explicit demand from the default and does not pretend to. And the embedding
+provider's outage does not yet degrade hybrid search to its lexical arm as the
+row prescribes — a hybrid search whose query cannot be embedded fails
+(`unavailable`), which is honest but not the documented behaviour.
 
 ### Telemetry and Audit Contract
 
@@ -2575,6 +2824,8 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Ingest batch: edges | `ingest_max_edges` | 20,000 | 1 – 100,000 | Admission |
 | REST request body | `rest_max_body_bytes` | 32 MiB | 1 – 128 MiB | REST edge |
 | Node payload size | `payload_max_bytes` | 64 KiB | 1 KiB – 1 MiB | Admission (ADR-0003 ceiling) |
+| Producer key or node name | `identifier_max_bytes` | 2 KiB | 64 B – 64 KiB | Admission, per node key, name, edge endpoint and discriminator |
+| Search query text | `search_query_max_bytes` | 8 KiB | 64 B – 1 MiB | Admission |
 | Node content size | `content_max_bytes` | 2 MiB | 64 KiB – 16 MiB | Admission |
 | Total size of one node or edge (envelope + name + payload + content) | `item_max_bytes` | 256 KiB | 4 KiB – 4 MiB | Admission, per item |
 | Adjacency returned on node read | `node_read_max_adjacency` | 100 | 1 – 1,000 | Admission |
@@ -2583,7 +2834,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal depth | `traversal_max_depth` | 5 | 1 – 8 | Admission |
 | Traversal node budget | `traversal_max_nodes` | 1,000 per request, 10,000 hard | 1 – 10,000 | Admission + per hop |
 | Traversal frontier per hop | `traversal_max_frontier` | 10,000 | 100 – 100,000 | Engine, per hop |
-| Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1,000 – 1,000,000 | Engine, cumulative |
+| Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
@@ -2618,6 +2869,29 @@ Enforcement is layered, and the authoritative layer is shared:
 Rejections are classified by cause, not by the fact that a limit was involved: a value outside a documented hard range is `out_of_range` (backoff can never make it valid), a malformed or internally inconsistent combination of limits is `invalid_argument`, and only transient quota, concurrency, queue, or memory pressure is `resource_exhausted` (retryable, with a retry-after hint); termination by time or cancellation is `deadline_exceeded` or `cancelled`. The Error Model section defines the client disposition for each class.
 
 Every rejection carries the limit name, the configured bound, and the requested value in structured context. Every limit exposes a saturation counter (rejections) and a high-watermark gauge, so capacity pressure is visible in telemetry before it becomes an incident (`cpt-cf-graph-storage-fr-observability`), including idempotency-record retention and cleanup-lag gauges.
+
+**Found while building the prototype: which rows the shipped gear enforces.**
+`ingest_max_nodes`, `ingest_max_edges`, `payload_max_bytes`, `item_max_bytes`,
+`node_read_max_adjacency`, `traversal_max_depth`, `traversal_max_nodes`,
+`traversal_max_frontier`, `traversal_max_edges_scanned`, `search_max_arm_limit`,
+`projection_max_page` and the interactive deadline are configuration keys with
+the defaults above; four hard ranges differ from the table, deliberately —
+`traversal_max_frontier` admits 1 (a test needs a frontier of one),
+`traversal_max_edges_scanned` runs to 10,000,000, `deadline_interactive_secs`
+to 300 (the gateway's own 30 s ceiling is the binding one, ADR-0006) and
+`idempotency_retention_days` to 365. `embedding_input_max_bytes` (8 KiB,
+64 B – 256 KiB) bounds the composed embedding input and is not in the table
+above. `traversal_max_edges_scanned` is applied per hop rather than
+cumulatively: each hop's scan is bounded, the walk's total is not. A hop that
+reaches the bound reports `EdgeScanCap` — it reads one row past the budget to
+know, then discards it — so a partial subgraph is no longer indistinguishable
+from a whole one. A cumulative budget across the walk is what the table's
+"cumulative" describes and is not built. The `content_*`, `labels_*`, `tenant_max_*`,
+`global_max_*`, `interactive_reserved_connections`, `response_max_*`,
+`types_max_per_tenant`, `indexed_paths_*` and `ddl_*` rows belong to deferred
+features (content, labels, the admission layer, aggregate response bounds, the
+index lifecycle) and have no key yet; `idempotency_retention_days` exists as a
+key and is read by no cleanup, so receipts expire only with the source epoch.
 
 **Seed admission.** Because every seed survives truncation, the seed set is bounded before expansion begins: after authorization and deduplication, a request whose distinct authorized seeds exceed the effective node budget is rejected with `out_of_range` (naming the seed count and the budget) rather than silently exceeding the budget. Seeds are ordered deterministically by node key, and the response reports the admitted seed count alongside truncation metadata.
 
@@ -2659,7 +2933,17 @@ its own pools in the `graph-analytics` gear (its ADR-0002) under the same three
 rules; this section governs ingest, queries, provider calls, index builds and
 re-embedding inside this gear.
 
-**Index and DDL admission.** Authorization to register a type is not a resource
+**Index and DDL admission — specified, not built.** Nothing below this
+paragraph exists in the gear: there is no DDL queue, no capacity reservation,
+no index-activation lifecycle and no `ddl_*` configuration key, and a declared
+`index` path is filterable the moment it is declared (PRD
+`cpt-cf-graph-storage-fr-index-admission`, still unchecked; ADR-0003's two
+platform asks, still unraised). It is written out because the shape of the
+admission is the decision, and because the first thing anyone building it will
+need is the reason each bound exists. Read it as the design it is, not as a
+description of this build.
+
+Authorization to register a type is not a resource
 bound: an ontology administrator acting entirely within permission can publish
 type versions whose accepted `index`, `full_text_search` and `vector_search`
 traits each commit durable index intent, launch `CREATE INDEX CONCURRENTLY` and
