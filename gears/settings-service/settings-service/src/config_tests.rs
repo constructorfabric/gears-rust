@@ -73,18 +73,24 @@ fn the_audit_retention_defaults_to_twelve_months() {
 
 #[test]
 fn the_step_up_section_is_optional_and_defaults_its_window_to_five_minutes() {
+    // Absent means the default policy, not an unbound verifier: the token is
+    // validated by the platform's AuthN resolver either way.
     let cfg = parse(serde_json::json!({})).expect("parses");
-    assert!(cfg.step_up.is_none(), "absent means no verifier is bound");
-    let cfg = parse(serde_json::json!({
-        "step_up": { "jwks_uri": "https://idp.example/keys" }
-    }))
-    .expect("parses");
-    let step_up = cfg.step_up.expect("present");
-    assert_eq!(step_up.max_age_seconds, 300);
-    assert!(step_up.acr_values.is_empty());
+    assert_eq!(cfg.step_up.max_age_seconds, 300);
+    assert!(cfg.step_up.issuer.is_none() && cfg.step_up.audience.is_none());
+    assert!(cfg.step_up.acr_values.is_empty() && cfg.step_up.amr_values.is_empty());
+
+    let cfg = parse(serde_json::json!({ "step_up": { "max_age_seconds": 30 } })).expect("parses");
+    assert_eq!(cfg.step_up.max_age_seconds, 30);
+
+    // The retired key-set address is the one deployment value that no longer
+    // exists; a file still naming it fails to load rather than being ignored.
     assert!(
-        parse(serde_json::json!({ "step_up": { "max_age_seconds": 60 } })).is_err(),
-        "the JWKS endpoint is required"
+        parse(serde_json::json!({
+            "step_up": { "jwks_uri": "https://idp.example/keys" }
+        }))
+        .is_err(),
+        "`jwks_uri` is not a field any more"
     );
 }
 

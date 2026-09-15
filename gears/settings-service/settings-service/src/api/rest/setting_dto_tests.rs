@@ -23,6 +23,9 @@ fn effective(classification: &str) -> EffectiveValue {
         value: json!("hello"),
         source: EffectiveSource::Inherited,
         source_scope: Some("/".to_owned()),
+        fallback: json!("hello"),
+        fallback_source: EffectiveSource::Inherited,
+        fallback_scope: Some("/".to_owned()),
         traits: json!({}),
         trail: vec![TrailEntry {
             tenant_id: Uuid::nil(),
@@ -48,6 +51,48 @@ fn secret_is_always_masked_pii_only_without_the_entitlement_public_never() {
     assert_eq!(mask(&json!("x"), "pii", false), (json!(MASK_TOKEN), true));
     assert_eq!(mask(&json!("x"), "pii", true), (json!("x"), false));
     assert_eq!(mask(&json!("x"), "public", false), (json!("x"), false));
+}
+
+#[test]
+fn the_fallback_is_masked_by_the_one_decision_made_for_the_value() {
+    // A row with its own override: the value is its own, the fallback the
+    // parent's. Whatever the rule says for the value, it says for both.
+    let with_own = |classification: &str| {
+        let mut e = effective(classification);
+        e.value = json!("own");
+        e.source = EffectiveSource::OwnOverride;
+        e.fallback = json!("parent");
+        e
+    };
+    let secret = render(&with_own("secret"), true);
+    assert_eq!(
+        (secret.value, secret.fallback),
+        (json!(MASK_TOKEN), json!(MASK_TOKEN))
+    );
+    assert!(secret.masked);
+
+    let pii_hidden = render(&with_own("pii"), false);
+    assert_eq!(
+        (pii_hidden.value, pii_hidden.fallback),
+        (json!(MASK_TOKEN), json!(MASK_TOKEN))
+    );
+    assert!(pii_hidden.masked);
+
+    let pii_shown = render(&with_own("pii"), true);
+    assert_eq!(
+        (pii_shown.value, pii_shown.fallback),
+        (json!("own"), json!("parent"))
+    );
+    assert!(!pii_shown.masked);
+
+    let public = render(&with_own("public"), false);
+    assert_eq!(
+        (public.value, public.fallback),
+        (json!("own"), json!("parent"))
+    );
+    assert_eq!(public.fallback_source, "inherited");
+    assert_eq!(public.fallback_scope.as_deref(), Some("/"));
+    assert!(!public.masked);
 }
 
 #[test]

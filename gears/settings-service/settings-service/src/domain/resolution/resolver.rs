@@ -75,6 +75,9 @@ struct Walk {
     value: Value,
     source: EffectiveSource,
     source_tenant: Option<Uuid>,
+    fallback: Value,
+    fallback_source: EffectiveSource,
+    fallback_tenant: Option<Uuid>,
     secret_backed: bool,
     trail: Vec<TrailEntry>,
     resolved_row_last_change_at: Option<time::OffsetDateTime>,
@@ -164,6 +167,32 @@ fn select(
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-5
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-4
 
+    // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-16
+    // The fallback is the same walk with the requested scope's own row left
+    // out: the deepest valid override above it, else the Schema Default. It is
+    // what a revert would leave in effect, computed without deleting anything,
+    // and it never reaches outside the chain the value itself came from — the
+    // scopes it may name are exactly the ones `inspected` already holds.
+    let fallback_row = inspected
+        .iter()
+        .rev()
+        .filter(|t| **t != tenant)
+        .filter_map(|t| rows.get(t))
+        .find(|row| !row.needs_review);
+    let (fallback, fallback_source, fallback_tenant) = match fallback_row {
+        Some(row) => (
+            value_of(row).0,
+            EffectiveSource::Inherited,
+            Some(row.tenant_id),
+        ),
+        None => (
+            declaration.default_value.clone(),
+            EffectiveSource::SchemaDefault,
+            None,
+        ),
+    };
+    // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-16
+
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-5
     // The flagged row stays where it is: excluded from the walk above, but
     // reported on the requested scope's own state so an administrator sees it.
@@ -198,6 +227,9 @@ fn select(
                 value,
                 source,
                 source_tenant: Some(row.tenant_id),
+                fallback,
+                fallback_source,
+                fallback_tenant,
                 secret_backed,
                 trail,
                 resolved_row_last_change_at,
@@ -217,6 +249,9 @@ fn select(
             value: declaration.default_value.clone(),
             source: EffectiveSource::SchemaDefault,
             source_tenant: None,
+            fallback,
+            fallback_source,
+            fallback_tenant,
             secret_backed: false,
             trail,
             resolved_row_last_change_at: None,
@@ -597,6 +632,9 @@ where
             value: walk.value,
             source: walk.source,
             source_scope: walk.source_tenant.map(|t| scope_path(t, root)),
+            fallback: walk.fallback,
+            fallback_source: walk.fallback_source,
+            fallback_scope: walk.fallback_tenant.map(|t| scope_path(t, root)),
             traits,
             trail: walk.trail,
             data_classification: declaration.data_classification.clone(),

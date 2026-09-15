@@ -70,6 +70,9 @@ pub enum AuditOperation {
     Clone,
     /// A machine caller resolved a secret's plaintext.
     SecretUse,
+    /// A secret was staged ahead of the batch that commits it: the entry is in
+    /// the store, nothing live has changed yet.
+    Stage,
 }
 
 impl AuditOperation {
@@ -83,6 +86,7 @@ impl AuditOperation {
             Self::Remove => "remove",
             Self::Clone => "clone",
             Self::SecretUse => "secret_use",
+            Self::Stage => "stage",
         }
     }
 
@@ -96,6 +100,7 @@ impl AuditOperation {
             "remove" => Some(Self::Remove),
             "clone" => Some(Self::Clone),
             "secret_use" => Some(Self::SecretUse),
+            "stage" => Some(Self::Stage),
             _ => None,
         }
     }

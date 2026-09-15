@@ -27,6 +27,44 @@ use crate::domain::ports::{SecretManager, SecretResolveGate};
 /// The name the gear's store namespace and principal derive from.
 const NAMESPACE_NAME: &[u8] = b"urn:constructorfabric:gears:settings-service";
 
+/// First-party wildcard token scope (`"*"`) presented on the Credential Store
+/// path.
+///
+/// This is an in-process call made on the gear's own behalf, so no bearer
+/// token exists to carry scopes — and the authorization resolver's OAuth
+/// token-scope enforcer fail-closes on an empty `token_scopes` with
+/// `scope_mismatch`, *before* RBAC is consulted at all. Without this the store
+/// call is refused before any policy runs, and the refusal arrives as
+/// `access denied` from a store that is neither down nor mis-provisioned.
+///
+/// It widens nothing. The scope check only decides whether evaluation
+/// continues; what this gear may actually do in the store remains RBAC's to
+/// say, through the narrow Credstore Secret Operator grant held by the derived
+/// principal above — which is also why presenting the wildcard cannot grant
+/// anything the grant does not already allow. `keycloak-idp-plugin` presents
+/// the same scope on the same path, for the same reason.
+const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
+
+/// The subject type presented on the Credential Store path, classifying this
+/// gear's principal as a machine.
+///
+/// The tag is what decides which principal type RBAC is asked about, and the
+/// grant this gear holds is held by a service principal. An **absent** tag does
+/// not read as "not a person": the authorization plugin maps `None` to `User`
+/// outright, mirroring RBAC's own resolver, so leaving it off asks for a grant
+/// held by a user with this id — which no one holds — and the store call is
+/// denied after passing every other check. The gear's own grant is lost to the
+/// omission.
+///
+/// Like the scope above this widens nothing: naming the type only selects which
+/// grant is looked up, and the narrow Credstore Secret Operator role remains
+/// the authoritative limit. It is the same spelling `keycloak-idp-plugin`
+/// presents on the same path, and the pair — service tag, service-principal
+/// grant — is what makes the lookup meet. The interactive vocabulary this gear
+/// reads on the way *in* is a separate matter; see
+/// [`crate::domain::stepup::INTERACTIVE_SUBJECT_TYPES`].
+const STORE_SUBJECT_TYPE: &str = "gts.cf.core.security.subject_service.v1~";
+
 /// The Secret Manager bound to `credstore`.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-manager:p1
 pub struct CredStoreSecretManager {
@@ -85,10 +123,16 @@ impl CredStoreSecretManager {
         // @cpt-begin:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-4
         // The target tenant is the subject tenant, so the entry lives where the
         // value belongs; the subject is this gear's principal, so only this
-        // gear reads it back; no subject type, since it is no user.
+        // gear reads it back; the subject type says that principal is a
+        // machine, because an omitted one is read as a person and asks for a
+        // grant nobody holds — see [`STORE_SUBJECT_TYPE`]; and the first-party
+        // wildcard scope, without which the enforcer refuses the call before
+        // RBAC is asked at all — see [`FIRST_PARTY_TOKEN_SCOPE`].
         SecurityContext::builder()
             .subject_id(self.principal)
+            .subject_type(STORE_SUBJECT_TYPE)
             .subject_tenant_id(tenant)
+            .token_scopes(vec![FIRST_PARTY_TOKEN_SCOPE.to_owned()])
             .build()
             .map_err(|err| DomainError::Internal {
                 diagnostic: format!("store context: {err}"),

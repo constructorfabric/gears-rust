@@ -197,6 +197,19 @@ pub struct EffectiveValue {
     pub source: EffectiveSource,
     /// The scope that supplied it; absent for a Schema Default.
     pub source_scope: Option<String>,
+    /// What the requested scope would resolve to **without a row of its own**:
+    /// the nearest valid ancestor override for a `cascading` setting, the
+    /// platform row for a `global` one read from a tenant, otherwise the
+    /// Schema Default. Equal to `value` when the scope holds no override. It
+    /// is exactly what a revert would leave in effect, computed without
+    /// deleting anything, over the same chain `value` came from — so it
+    /// discloses nothing the caller could not read by reverting.
+    pub fallback: Value,
+    /// Where the fallback comes from: `inherited` or `schema_default`, never
+    /// `own_override`.
+    pub fallback_source: EffectiveSource,
+    /// The scope that supplies the fallback; absent for a Schema Default.
+    pub fallback_scope: Option<String>,
     /// The value type's resolved trait set.
     pub traits: Value,
     /// The scopes inspected, root to self — the caller's own chain only.

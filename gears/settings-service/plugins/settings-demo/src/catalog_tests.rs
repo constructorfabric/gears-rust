@@ -69,7 +69,35 @@ fn the_catalogue_size_is_pinned() {
     // added without updating the prose is the drift this pins.
     assert_eq!(
         declarations().len(),
-        16,
+        17,
         "the catalogue changed size; update README.md with it"
     );
+}
+
+#[test]
+fn step_up_is_also_gated_on_a_setting_that_is_not_a_secret() {
+    // The secret's refusal could come from the step-up gate or from the
+    // credential store; only an ordinary setting isolates the gate, so a
+    // client can prove its re-authentication flow by reaching `committed`.
+    let all = declarations();
+    let gated: Vec<_> = all
+        .iter()
+        .filter(|d| d.requires_step_up == Some(true))
+        .collect();
+    assert!(
+        gated
+            .iter()
+            .any(|d| d.value_type_id != settings_service_sdk::catalogue::SECRET_STRING),
+        "every step-up-gated declaration is a secret: {:?}",
+        gated.iter().map(|d| d.key.to_string()).collect::<Vec<_>>()
+    );
+    let turbo = all
+        .iter()
+        .find(|d| d.key.leaf_slug() == "turbo_mode")
+        .expect("turbo_mode is declared");
+    assert_eq!(
+        turbo.value_type_id,
+        settings_service_sdk::catalogue::BOOL_FLAG
+    );
+    assert_eq!(turbo.requires_step_up, Some(true));
 }

@@ -1,7 +1,7 @@
 # Settings Service sandbox
 
 A local environment for building a frontend against the Settings Service:
-the example server with sixteen demo declarations in four categories, a set of
+the example server with seventeen demo declarations in four categories, a set of
 test identities, and a throwaway page that drives every endpoint so the
 request flows can be watched raw.
 
@@ -37,8 +37,8 @@ Static bearer tokens from `config/e2e-local.yaml`, sent as
 | `e2e-token-tenant-b` | a tenant outside the tree | `bbbbbbbb-…` (expect 403 or 404) |
 
 The hierarchy tokens carry no `subject_type`, so the write path treats them as
-service principals: they may write every demo setting except `api_token`,
-which requires step-up and refuses a service principal with 403.
+service principals: they may write every demo setting except `api_token` and
+`turbo_mode`, which require step-up and refuse a service principal with 403.
 
 Authorization is a static policy that allows everything for these tokens; the
 subtree rules below are enforced by the service itself.
@@ -192,9 +192,12 @@ and revive always need step-up, and a gear's contributed declarations answer
   plugin, which keeps entries in memory only. After a server restart a secret
   setting still shows its masked row, but the credential behind it is gone
   and the machine path answers `SecretNotConfigured` until it is set again.
-- Step-up needs an identity provider configured under `step_up` in the gear's
-  config; the sandbox has none, so any declaration with `requires_step_up`
-  answers 401 on write. The demo declarations opt out, except `api_token`.
+- Step-up hands the presented token to the platform's AuthN resolver and then
+  reads `auth_time` from it; the sandbox's static tokens are not JWTs and carry
+  no such claim, so any declaration with `requires_step_up` answers 401
+  (`auth_time_missing`) on write. The demo declarations opt out, except `api_token` and
+  `turbo_mode` — the latter an ordinary boolean, so the gate can be exercised
+  without the credential store in the way.
 - CORS is off on the example server. Serve the frontend from the same origin
   or proxy `/settings-service/*` in the dev server, as this sandbox does.
 - No "who am I" endpoint: the client knows its tenant from how it logged in.

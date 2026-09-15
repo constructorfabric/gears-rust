@@ -23,15 +23,16 @@
 //! Step-up is gated per declaration (`requires_step_up`, default required —
 //! `cpt-cf-settings-service-fr-service-writes`) and enforced on interactive writes
 //! (`cpt-cf-settings-service-fr-authn-role-gating`). DESIGN.md §4.2 *Value
-//! Writer* fixes the R1 check: the presented token's signature against the
-//! identity provider's JWKS, `sub` matching the session, `auth_time` within the
-//! freshness window, and the required `acr`/`amr` — the default binding behind
-//! the gear's `StepUpVerifier` port. The [`StepUpConfig`] section carries the
-//! provider's JWKS endpoint and the window, which
+//! Writer* fixes the R1 check: the presented token is validated by the
+//! platform's `AuthN` resolver as every session token is, its `sub` must match
+//! the session, its `auth_time` must fall within the freshness window, and its
+//! `acr`/`amr` must meet the required assurance. The [`StepUpConfig`] section
+//! therefore carries **policy only** — the window, which
 //! `cpt-cf-settings-service-fr-validate-before-set` makes deployment-configured
-//! and DESIGN caps at five minutes. With the section absent nothing is bound:
-//! every write to a declaration that requires step-up refuses, reads keep
-//! serving, and there is no bypass to configure.
+//! and DESIGN caps at five minutes, and the optional pins — and names no
+//! identity provider: the platform already owns the trusted path to it. Every
+//! field has a default, so the section may be omitted; the verifier is bound
+//! either way, and there is no bypass to configure.
 
 use serde::Deserialize;
 
@@ -63,9 +64,10 @@ pub struct SettingsServiceConfig {
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u32,
 
-    /// The step-up verifier binding. Absent, no verifier is bound.
+    /// The step-up policy. Absent, the defaults: a five-minute window, no
+    /// pins, no assurance requirement — the verifier is bound either way.
     #[serde(default)]
-    pub step_up: Option<StepUpConfig>,
+    pub step_up: StepUpConfig,
     /// Per-contract client wiring, as `ToolKit` reads it.
     ///
     /// Accepted here so a deployment that names one gets the reason rather
@@ -123,40 +125,46 @@ impl SettingsServiceConfig {
     }
 }
 
-/// The OIDC/JWKS step-up binding's deployment values.
+/// The step-up policy: what a fresh re-authentication must satisfy.
+///
+/// The token itself is validated by the platform's `AuthN` resolver, so nothing
+/// here names an identity provider or a key set. `deny_unknown_fields` is what
+/// makes a deployment file still carrying the retired `jwks_uri` fail to load
+/// rather than be silently ignored: it names the one value that no longer
+/// exists.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct StepUpConfig {
-    /// The identity provider's JWKS endpoint, fetched and cached in the
-    /// background; never called on the write path.
-    pub jwks_uri: String,
-
     /// The freshness window for `auth_time`, in seconds. Five minutes by
     /// default and never above it: init refuses a longer window.
-    #[serde(default = "default_step_up_max_age_seconds")]
     pub max_age_seconds: u64,
 
-    /// The issuer the token must carry, when the deployment pins one.
-    #[serde(default)]
+    /// The issuer the token must carry, when the deployment pins one; the
+    /// resolver has its own opinion of the issuer, this one is additional.
     pub issuer: Option<String>,
 
     /// The audience the token must carry, when the deployment pins one.
-    #[serde(default)]
     pub audience: Option<String>,
 
     /// Authentication context class references that satisfy the requirement.
-    #[serde(default)]
     pub acr_values: Vec<String>,
 
     /// Authentication methods that satisfy the requirement.
-    #[serde(default)]
     pub amr_values: Vec<String>,
 }
 
 const DEFAULT_STEP_UP_MAX_AGE_SECONDS: u64 = 300;
 
-const fn default_step_up_max_age_seconds() -> u64 {
-    DEFAULT_STEP_UP_MAX_AGE_SECONDS
+impl Default for StepUpConfig {
+    fn default() -> Self {
+        Self {
+            max_age_seconds: DEFAULT_STEP_UP_MAX_AGE_SECONDS,
+            issuer: None,
+            audience: None,
+            acr_values: Vec::new(),
+            amr_values: Vec::new(),
+        }
+    }
 }
 
 const fn default_cache_ttl_seconds() -> u64 {

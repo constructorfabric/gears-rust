@@ -12,7 +12,8 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 use crate::api::rest::value_dto::{
     BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactReportDto, ImpactRequest,
-    SetResultDto, SetValueRequest, ValidateRequest, ValidationReportDto,
+    PendingSecretDto, SetResultDto, SetValueRequest, StageSecretRequest, ValidateRequest,
+    ValidationReportDto,
 };
 use crate::api::rest::value_handlers as handlers;
 use crate::infra::value_writes::WriteCoordinator;
@@ -60,7 +61,7 @@ fn etag_header() -> ResponseHeaderSpec {
     )
 }
 
-/// Register the seven write operations.
+/// Register the eight write operations.
 #[allow(clippy::too_many_lines)]
 pub fn register_routes(
     router: Router,
@@ -243,17 +244,26 @@ pub fn register_routes(
         .operation_id("settings_service.batch_set")
         .summary("Set several settings in one call")
         .description(
-            "At most five hundred changes, each with its own key, target tenant, value and \
-             `if_match`. Step-up is verified once for the request when any target declaration \
-             requires it; each change then commits on its own, with no atomicity across \
-             changes, and the answer carries one entry per change - committed with its new \
-             tag, or rejected with one of a fixed vocabulary of codes: `invalid`, \
-             `if_match_required`, `stale`, `conflict`, `forbidden`, `step_up_required`, \
-             `retired`, `not_found`, `unavailable`, `error`. `if_match` is required in \
+            "At most five hundred changes, each with its own key, target tenant, operation, \
+             value and `if_match`. `op` is `set` (the default, so a client that never sends it \
+             is unaffected) or `revert`, which clears the scope's own override and carries no \
+             value; a `set` without a value, a `revert` with one, or an unknown word rejects \
+             that change alone with `invalid`, and a `revert` of a scope holding no override \
+             is rejected `not_found` alone. Step-up is verified once for the request when any \
+             target declaration requires it; each change then commits on its own, with no \
+             atomicity across changes, and the answer carries one entry per change - \
+             committed with its new tag and its `operation`, or rejected with one of a fixed \
+             vocabulary of codes: `invalid`, \
+             `if_match_required`, `stale`, `conflict`, `forbidden`, `retired`, \
+             `not_found`, `unavailable`, `error`. `if_match` is required in \
              effect - a change without one is rejected `if_match_required` on its own while \
              the rest proceed; a first write sends the literal `absent`. `retired` covers a \
              declaration retired after the change was assembled, since the check runs again \
-             as each change commits.",
+             as each change commits. For a secret-trait setting the value may be \
+             `{ \"pending_id\": \"...\" }`, naming a secret staged through `/secret-stage` \
+             before the step-up redirect: the staged entry is adopted, and a token that is \
+             unknown, expired, or was staged by another subject or for another setting or \
+             tenant rejects that change `invalid`.",
         )
         .tag(TAG)
         .authenticated()
@@ -269,6 +279,46 @@ pub fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::post("/settings-service/v1/settings/{key}/secret-stage")
+        .operation_id("settings_service.stage_secret")
+        .summary("Stage a secret ahead of the batch")
+        .description(
+            "Store a secret-trait value in the credential store before the caller leaves for \
+             step-up, and answer with an opaque single-use token to send in place of the value \
+             in the following batch. It exists because a browser cannot carry a secret's \
+             plaintext across the identity provider's redirect: the token can cross it safely, \
+             since only this service can resolve it and it expires within minutes. The entry is \
+             created under this service's own principal, exactly as an ordinary secret write \
+             creates it, so the no-reveal-path guarantee is unchanged and the credential-store \
+             reference is never returned. Requires the same authorization a set requires and \
+             no step-up, since nothing live changes until the batch commits. A non-secret \
+             declaration is refused 400 with `not_a_secret`.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("key", "The setting key, a URL-encoded GTS type id")
+        .param(tenant_param())
+        .json_request::<StageSecretRequest>(openapi, "The secret value to stage")
+        .handler(handlers::stage_secret)
+        .json_response_with_schema::<PendingSecretDto>(
+            openapi,
+            StatusCode::OK,
+            "The token and its expiry",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);

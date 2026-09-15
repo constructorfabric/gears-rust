@@ -14,7 +14,7 @@ use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
 use crate::domain::resolution::{ScopeTarget, scope_class};
-use crate::domain::stepup::{NoStepUpVerifier, StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
+use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
@@ -36,7 +36,10 @@ struct WriteHarness {
 
 impl WriteHarness {
     async fn new() -> Self {
-        Self::with_step_up(Arc::new(NoStepUpVerifier::default())).await
+        Self::with_step_up(Arc::new(FixedStepUp::refusing(
+            StepUpRefusal::NotConfigured,
+        )))
+        .await
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
@@ -48,7 +51,7 @@ impl WriteHarness {
     async fn with_secrets() -> (Self, Arc<RecordingSecrets>) {
         let secrets = Arc::new(RecordingSecrets::default());
         let harness = Self::build(
-            Arc::new(NoStepUpVerifier::default()),
+            Arc::new(FixedStepUp::refusing(StepUpRefusal::NotConfigured)),
             Arc::clone(&secrets) as Arc<dyn SecretManager>,
         )
         .await;
@@ -483,6 +486,83 @@ async fn step_up_is_asked_only_where_the_declaration_requires_it() {
             ..
         })
     ));
+}
+
+/// A caller labelled as the test says — or not labelled at all.
+fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
+    let mut ctx = SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant);
+    if let Some(label) = subject_type {
+        ctx = ctx.subject_type(label);
+    }
+    WriteActor {
+        ctx: ctx.build().expect("context"),
+        request_id: "req".to_owned(),
+        step_up_token: Some("token".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn a_person_is_recognised_in_both_vocabularies_and_nothing_else_is() {
+    // The authorization design says the GTS type; a deployed realm maps
+    // Keycloak's bare `user`. Both are a person: the request reaches the
+    // verifier and gets its challenge, never the service-principal denial.
+    let h =
+        WriteHarness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Missing))).await;
+    h.base
+        .declare("guarded", scope_class::CASCADING, json!(false))
+        .await;
+    let root = h.base.tree.root;
+    for label in [USER_SUBJECT_TYPE, "user"] {
+        let refused = h
+            .gate(&actor_labelled(root, Some(label)), "guarded", None)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(DomainError::StepUpRequired {
+                    reason: "missing",
+                    ..
+                })
+            ),
+            "{label}: {refused:?}"
+        );
+    }
+
+    // No label, or any other type — a machine's, an unrelated resource's, or a
+    // near miss — is a service principal for step-up: refused before the
+    // verifier is consulted. Absence of a label is no evidence of a person.
+    for label in [
+        None,
+        Some("gts.cf.core.security.subject_service.v1~"),
+        Some("gts.cf.core.hosts.host.v1~"),
+        Some("User"),
+    ] {
+        let refused = h.gate(&actor_labelled(root, label), "guarded", None).await;
+        assert!(
+            matches!(refused, Err(DomainError::Unauthorized { .. })),
+            "{label:?}: {refused:?}"
+        );
+    }
+
+    // With a verifier that accepts, the `user`-labelled caller commits.
+    let verified = WriteHarness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    verified
+        .base
+        .declare("guarded", scope_class::CASCADING, json!(false))
+        .await;
+    let committed = verified
+        .write(
+            &actor_labelled(verified.base.tree.root, Some("user")),
+            "guarded",
+            None,
+            Change::Set(json!(true)),
+            Some("absent"),
+        )
+        .await
+        .expect("a person labelled `user` completes a step-up-gated write");
+    assert_eq!(committed.new_value, Some(json!(true)));
 }
 
 #[tokio::test]

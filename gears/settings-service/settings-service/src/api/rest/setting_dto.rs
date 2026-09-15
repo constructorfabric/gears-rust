@@ -85,6 +85,16 @@ pub struct EffectiveValueDto {
     /// The scope that supplied the value; absent for a Schema Default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_scope: Option<String>,
+    /// What this scope resolves to without a row of its own — the nearest
+    /// valid ancestor override, else the Schema Default — masked by the same
+    /// rule as `value`. Equal to `value` when the scope holds no override: the
+    /// settings table's *Default* column, and what a revert would leave.
+    pub fallback: Value,
+    /// `inherited` or `schema_default`; never `own_override`.
+    pub fallback_source: String,
+    /// The scope that supplies the fallback; absent for a Schema Default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_scope: Option<String>,
     /// The value type's resolved trait set.
     pub traits: Value,
     /// The scopes inspected, root to self, with setter identity.
@@ -94,7 +104,9 @@ pub struct EffectiveValueDto {
     pub last_change_at: String,
     /// `public`, `pii` or `secret`.
     pub data_classification: String,
-    /// Whether `value` carries the mask token rather than the value.
+    /// Whether `value` and `fallback` carry the mask token rather than the
+    /// value: one decision, made on the declaration's classification, for
+    /// both.
     pub masked: bool,
     /// Present when the requested scope's own override is flagged for review;
     /// the value above is then the fallthrough the resolver served.
@@ -117,6 +129,14 @@ pub fn render(effective: &EffectiveValue, may_read_pii: bool) -> EffectiveValueD
         &effective.data_classification,
         may_read_pii,
     );
+    // The same rule over the same classification: the fallback can be no
+    // clearer than the value, and a secret's fallback is the mask token too.
+    let (fallback, fallback_masked) = mask(
+        &effective.fallback,
+        &effective.data_classification,
+        may_read_pii,
+    );
+    debug_assert_eq!(masked, fallback_masked, "one masking decision for both");
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-8
     // The later of the two arms, each leak-safe on its own: the declaration's
     // definition change, and the resolved row's — a row within the caller's
@@ -164,6 +184,9 @@ pub fn render(effective: &EffectiveValue, may_read_pii: bool) -> EffectiveValueD
         value,
         source: source_name(effective.source),
         source_scope: effective.source_scope.clone(),
+        fallback,
+        fallback_source: source_name(effective.fallback_source),
+        fallback_scope: effective.fallback_scope.clone(),
         traits: effective.traits.clone(),
         inheritance_trail,
         last_change_at: rfc3339(last_change_at),
@@ -338,7 +361,7 @@ mod setting_dto_tests;
 pub struct AuditRecordDto {
     /// Record identity.
     pub id: Uuid,
-    /// `create`, `change`, `revert`, `remove`, `clone` or `secret_use`.
+    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
     pub operation: String,
     /// Who did it, masked when the identity is PII the caller may not see.
     pub actor: String,

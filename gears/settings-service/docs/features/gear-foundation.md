@@ -60,7 +60,7 @@ Two contracts in this feature are consumed from outside the service and are ther
 |-------|-----------------|
 | `cpt-cf-settings-service-actor-internal-caller` | Consumes the `SettingsReaderClient` trait in process and must handle its degradation contract |
 | `cpt-cf-settings-service-actor-contributing-module` | Consumes the `SettingsContributionClient` trait to register and retire its own declarations |
-| `cpt-cf-settings-service-actor-authn-resolver` | Authenticates the caller. The step-up token a re-authenticated caller presents is verified **locally** in this gear against the identity provider's JWKS; the resolver is not called on the write path (DESIGN §4.2 *Value Writer*) |
+| `cpt-cf-settings-service-actor-authn-resolver` | Authenticates the caller. The step-up token a re-authenticated caller presents is authenticated by the resolver on the write path, exactly as a session token is; the identity provider is never called by this gear (DESIGN §4.2 *Value Writer*) |
 | `cpt-cf-settings-service-actor-authz-resolver` | Supplies the authorization decision and the `AccessScope` constraints the PEP enforces |
 | `cpt-cf-settings-service-actor-platform-admin` | The operator whose session is re-authenticated when a behavior-affecting action demands step-up |
 
@@ -164,7 +164,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 3. [x] - `p1` - Ask the Policy Decision client for a decision on the action against the target GTS resource type - `inst-gf-authz-3`
 4. [x] - `p1` - **IF** the decision cannot be obtained → **RETURN** denial, failing closed rather than proceeding on an unknown verdict - `inst-gf-authz-4`
 5. [x] - `p1` - **IF** the decision is deny → **RETURN** denial - `inst-gf-authz-5`
-6. [x] - `p1` - **IF** the action demands step-up → require a fresh step-up token established at the identity provider, verified locally through the gear's `StepUpVerifier` port: signature against the provider's JWKS, `sub` bound to this principal, `auth_time` within the freshness window of at most five minutes, and the required `acr`/`amr` - `inst-gf-authz-6`
+6. [x] - `p1` - **IF** the action demands step-up → require a fresh step-up token established at the identity provider, verified through the gear's `StepUpVerifier` port: authenticated by the platform's AuthN resolver, `sub` bound to this principal, `auth_time` within the freshness window of at most five minutes, and the required `acr`/`amr` - `inst-gf-authz-6`
 7. [x] - `p1` - **IF** the token is absent, outside the window, or not bound to this principal → **RETURN** denial carrying the RFC 9470 challenge, `401` with `insufficient_user_authentication`, so the client learns what to ask the provider for; a service principal writing to such a declaration is refused outright, since no ceremony a machine performs proves a person is present - `inst-gf-authz-7`
 8. [x] - `p1` - Build the `AccessScope` from the decision's constraints - `inst-gf-authz-8`
 9. [x] - `p1` - **RETURN** the `AccessScope` for the handler to apply as a query and visibility predicate - `inst-gf-authz-9`
@@ -187,7 +187,7 @@ Not applicable. This feature introduces no domain entity and therefore no lifecy
 
 `SettingsReaderClient` is the reason two of these wait until 2.5 rather than 2.2: it is the effective-**value** read path, so nothing implements it until value resolution exists, and there is nothing to register before then.
 
-The step-up half of *Policy Enforcement Point and Step-Up Gate* is this gear's own to build, not a contract to wait on: DESIGN.md §4.2 *Value Writer* specifies the default OIDC/JWKS `StepUpVerifier` binding — a port declared in the domain and adapted in infra, verifying the presented token's claims locally. It lands with the first path that needs it, the value write path (entry 2.8), which is also where the behavior-affecting declaration actions of 2.3 pick it up; `MockStepUpVerifier` in the test harness is the only sanctioned non-verifying binding.
+The step-up half of *Policy Enforcement Point and Step-Up Gate* is this gear's own to build, not a contract to wait on: DESIGN.md §4.2 *Value Writer* specifies the default `StepUpVerifier` binding over the platform's AuthN resolver — a port declared in the domain and adapted in infra, having the resolver authenticate the presented token and checking its claims. It lands with the first path that needs it, the value write path (entry 2.8), which is also where the behavior-affecting declaration actions of 2.3 pick it up; `MockStepUpVerifier` in the test harness is the only sanctioned non-verifying binding.
 
 ### SDK Crate, Models and Value Objects
 
@@ -289,7 +289,7 @@ An earlier wording required *"SeaORM entity scaffolding"* here. That could not b
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-gear-scaffold`
 
-The system **MUST** provide a `#[toolkit::gear]` annotated gear that declares only the client it calls during its own init — `deps = [types_registry]` — and reaches every consumed client through `#[toolkit::consumes]` at first use; **MUST** register its client traits into `ClientHub` and bind them per the active deployment profile, failing startup on a remote binding while the release is Embedded-only; **MUST** register its GTS control-plane schemas and the abstract `setting_type` base, and seed the minimal category set idempotently, at init; and **MUST** take bootstrap configuration — database and broker endpoints, service identity, TLS, ports, and the step-up JWKS endpoint and freshness window once the verifier binds — from ToolKit config at gear init, never from a managed setting.
+The system **MUST** provide a `#[toolkit::gear]` annotated gear that declares only the client it calls during its own init — `deps = [types_registry]` — and reaches every consumed client through `#[toolkit::consumes]` at first use; **MUST** register its client traits into `ClientHub` and bind them per the active deployment profile, failing startup on a remote binding while the release is Embedded-only; **MUST** register its GTS control-plane schemas and the abstract `setting_type` base, and seed the minimal category set idempotently, at init; and **MUST** take bootstrap configuration — database and broker endpoints, service identity, TLS, ports, and the step-up freshness window and pins — from ToolKit config at gear init, never from a managed setting.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-gear-init`
@@ -315,7 +315,7 @@ The system **MUST** provide shared `OperationBuilder` wiring, OData `$filter`, `
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-authz-stepup`
 
-The system **MUST** enforce authorization through the `PolicyEnforcer` PEP against the target GTS resource type, **MUST** derive an `AccessScope` from the decision's constraints for handlers to apply as a query and visibility predicate, and **MUST** verify a fresh step-up token established at the identity provider before any behavior-affecting declaration action and before an interactive value write to a declaration that requires elevated confirmation. Verification **MUST** go through the gear's own `StepUpVerifier` port, whose default binding is the local OIDC/JWKS claims check of DESIGN.md §4.2 *Value Writer*; a binding that cannot fail is not a binding. Authorization **MUST** be decided before step-up is consulted, and an authorization or entitlement decision that cannot be obtained **MUST** deny.
+The system **MUST** enforce authorization through the `PolicyEnforcer` PEP against the target GTS resource type, **MUST** derive an `AccessScope` from the decision's constraints for handlers to apply as a query and visibility predicate, and **MUST** verify a fresh step-up token established at the identity provider before any behavior-affecting declaration action and before an interactive value write to a declaration that requires elevated confirmation. Verification **MUST** go through the gear's own `StepUpVerifier` port, whose default binding has the platform's AuthN resolver authenticate the token and checks its claims, as DESIGN.md §4.2 *Value Writer* specifies; a binding that cannot fail is not a binding. Authorization **MUST** be decided before step-up is consulted, and an authorization or entitlement decision that cannot be obtained **MUST** deny.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-authz-stepup`

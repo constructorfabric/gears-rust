@@ -13,8 +13,10 @@ use serde_json::{Value, json};
 use settings_service_sdk::EffectiveSource;
 use uuid::Uuid;
 
+use toolkit_security::AccessScope;
+
 use crate::domain::error::DomainError;
-use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
+use crate::domain::resolution::{EffectiveValue, ScopeTarget, TenantHierarchy, scope_class};
 use settings_service_sdk::SettingKey;
 
 use crate::test_support::{ResolutionHarness as Harness, SECRET};
@@ -644,4 +646,250 @@ async fn a_key_stale_after_a_category_rename_is_absent_exactly_as_one_never_decl
         format!("{:?}", never_outcome.err()),
         "the two absences are indistinguishable"
     );
+}
+
+// --- The fallback: what a scope resolves to without its own row -------------
+
+/// What `resolve` answers for `name` at `at` once the scope's own row is
+/// gone — the ground truth the fallback must equal.
+async fn without_own_row(h: &Harness, d: Uuid, name: &str, at: Uuid) -> Arc<EffectiveValue> {
+    use crate::domain::value::ValueRepository;
+    let conn = h.db.conn().expect("connection");
+    crate::infra::storage::value_repo::ValueRepo
+        .delete(&conn, &AccessScope::allow_all(), d, at)
+        .await
+        .expect("delete own row");
+    h.cache.invalidate_key(h.key(name).as_str());
+    h.resolve(name, tenant(at)).await.expect("resolves")
+}
+
+#[tokio::test]
+async fn the_fallback_is_what_the_scope_resolves_to_without_its_own_row() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+
+    // No override of its own: the fallback is the value, with the same source.
+    h.set(d, t.a, json!(true)).await;
+    let inherited = h.resolve("strict", tenant(t.b)).await.expect("resolves");
+    assert_eq!(inherited.source, EffectiveSource::Inherited);
+    assert_eq!(inherited.fallback.clone(), inherited.value);
+    assert_eq!(inherited.fallback_source, inherited.source);
+    assert_eq!(inherited.fallback_scope, inherited.source_scope);
+
+    // Its own override: the value is its own, the fallback the nearest valid
+    // ancestor's — the Default column beside the Custom one.
+    h.set(d, t.b, json!(false)).await;
+    h.cache.invalidate_key(h.key("strict").as_str());
+    let own = h.resolve("strict", tenant(t.b)).await.expect("resolves");
+    assert_eq!(
+        (own.value.clone(), own.source),
+        (json!(false), EffectiveSource::OwnOverride)
+    );
+    assert_eq!(own.fallback.clone(), json!(true));
+    assert_eq!(own.fallback_source, EffectiveSource::Inherited);
+    assert_eq!(own.fallback_scope, Some(format!("/tenants/{}", t.a)));
+
+    // And it is exactly what the scope resolves to once the row is reverted.
+    let reverted = without_own_row(&h, d, "strict", t.b).await;
+    assert_eq!(reverted.value, own.fallback);
+    assert_eq!(reverted.source, own.fallback_source);
+    assert_eq!(reverted.source_scope, own.fallback_scope.clone());
+}
+
+#[tokio::test]
+async fn an_own_override_with_no_ancestor_override_falls_back_to_the_schema_default() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+    h.set(d, t.b, json!(true)).await;
+    let at_b = h.resolve("strict", tenant(t.b)).await.expect("resolves");
+    assert_eq!(at_b.source, EffectiveSource::OwnOverride);
+    assert_eq!(at_b.fallback.clone(), json!(false));
+    assert_eq!(at_b.fallback_source, EffectiveSource::SchemaDefault);
+    assert_eq!(at_b.fallback_scope, None);
+
+    // At the platform there is nothing above: the fallback is the default.
+    h.set(d, t.root, json!(true)).await;
+    h.cache.invalidate_key(h.key("strict").as_str());
+    let at_root = h
+        .resolve("strict", ScopeTarget::Platform)
+        .await
+        .expect("resolves");
+    assert_eq!(at_root.source, EffectiveSource::OwnOverride);
+    assert_eq!(
+        (
+            at_root.fallback.clone(),
+            at_root.fallback_source,
+            at_root.fallback_scope.clone()
+        ),
+        (json!(false), EffectiveSource::SchemaDefault, None)
+    );
+}
+
+#[tokio::test]
+async fn a_local_setting_falls_back_to_the_schema_default_whatever_an_ancestor_holds() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("per_tenant", scope_class::LOCAL, json!(false))
+        .await;
+    let t = &h.tree;
+    h.set(d, t.a, json!(true)).await;
+    h.set(d, t.b, json!(true)).await;
+    let at_b = h
+        .resolve("per_tenant", tenant(t.b))
+        .await
+        .expect("resolves");
+    assert_eq!(at_b.source, EffectiveSource::OwnOverride);
+    assert_eq!(
+        (
+            at_b.fallback.clone(),
+            at_b.fallback_source,
+            at_b.fallback_scope.clone()
+        ),
+        (json!(false), EffectiveSource::SchemaDefault, None),
+        "a local setting never inherits, so it never falls back to an ancestor"
+    );
+}
+
+#[tokio::test]
+async fn a_global_setting_falls_back_to_its_default_at_the_platform_and_to_the_platform_row_below()
+{
+    let h = Harness::new().await;
+    let d = h
+        .declare("proxy_enabled", scope_class::GLOBAL, json!(false))
+        .await;
+    h.set(d, h.tree.root, json!(true)).await;
+    let at_platform = h
+        .resolve("proxy_enabled", ScopeTarget::Platform)
+        .await
+        .expect("resolves");
+    assert_eq!(
+        (
+            at_platform.fallback.clone(),
+            at_platform.fallback_source,
+            at_platform.fallback_scope.clone()
+        ),
+        (json!(false), EffectiveSource::SchemaDefault, None)
+    );
+    // A tenant has no row of its own for a global setting: its fallback is the
+    // platform value it is served, as its value is.
+    let at_b = h
+        .resolve("proxy_enabled", tenant(h.tree.b))
+        .await
+        .expect("resolves");
+    assert_eq!(at_b.fallback.clone(), at_b.value);
+    assert_eq!(at_b.fallback_source, EffectiveSource::Inherited);
+    assert_eq!(at_b.fallback_scope.as_deref(), Some("/"));
+}
+
+#[tokio::test]
+async fn a_flagged_ancestor_is_skipped_by_the_fallback_walk_as_by_resolution() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+    h.set(d, t.root, json!(true)).await;
+    h.set_flagged(d, t.a, json!(false)).await;
+    h.set(d, t.b, json!(false)).await;
+    let at_b = h.resolve("strict", tenant(t.b)).await.expect("resolves");
+    assert_eq!(at_b.source, EffectiveSource::OwnOverride);
+    assert_eq!(
+        at_b.fallback.clone(),
+        json!(true),
+        "the flagged row at `a` is skipped"
+    );
+    assert_eq!(at_b.fallback_scope.as_deref(), Some("/"));
+    let reverted = without_own_row(&h, d, "strict", t.b).await;
+    assert_eq!(reverted.value, at_b.fallback);
+    assert_eq!(reverted.source_scope, at_b.fallback_scope.clone());
+}
+
+#[tokio::test]
+async fn a_secret_setting_falls_back_to_a_handle_never_plaintext() {
+    let h = Harness::new().await;
+    let d = h
+        .declare_typed(
+            "api_token",
+            scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    h.set_secret(d, h.tree.root, "credstore:root").await;
+    h.set_secret(d, h.tree.b, "credstore:b").await;
+    let at_b = h
+        .resolve("api_token", tenant(h.tree.b))
+        .await
+        .expect("resolves");
+    assert_eq!(at_b.value, json!("credstore:b"));
+    // The reference, as the value is: the administrative rendering masks
+    // both by the declaration's classification, and no plaintext exists here.
+    assert_eq!(at_b.fallback.clone(), json!("credstore:root"));
+    assert_eq!(at_b.fallback_source, EffectiveSource::Inherited);
+    assert_eq!(at_b.data_classification, "secret");
+}
+
+#[tokio::test]
+async fn a_standalone_tenant_falls_back_along_its_own_chain_only() {
+    // `s` is a standalone child of `a`; `c` a sibling subtree. Inheritance
+    // flows into `s` unchanged, so its fallback is `a`'s value — what it would
+    // resolve to without its own row — and never a scope outside its chain.
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.tree;
+    h.set(d, t.root, json!(true)).await;
+    h.set(d, t.a, json!(false)).await;
+    h.set(d, t.c, json!(true)).await;
+    h.set(d, t.s, json!(true)).await;
+    let at_s = h.resolve("strict", tenant(t.s)).await.expect("resolves");
+    assert_eq!(at_s.source, EffectiveSource::OwnOverride);
+    assert_eq!(at_s.fallback.clone(), json!(false));
+    assert_eq!(at_s.fallback_scope, Some(format!("/tenants/{}", t.a)));
+    assert!(at_s.trail.iter().all(|e| e.tenant_id != t.c));
+    let reverted = without_own_row(&h, d, "strict", t.s).await;
+    assert_eq!(reverted.value, at_s.fallback);
+    assert_eq!(reverted.source_scope, at_s.fallback_scope.clone());
+}
+
+#[tokio::test]
+async fn the_bulk_read_carries_the_same_fallback_as_the_single_read() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let other = h
+        .declare("other", scope_class::CASCADING, json!(true))
+        .await;
+    let t = &h.tree;
+    h.set(d, t.a, json!(true)).await;
+    h.set(d, t.b, json!(false)).await;
+    h.set(other, t.b, json!(false)).await;
+    let single_strict = h.resolve("strict", tenant(t.b)).await.expect("resolves");
+    let single_other = h.resolve("other", tenant(t.b)).await.expect("resolves");
+    let conn = h.db.conn().expect("connection");
+    let bulk = h
+        .resolver
+        .resolve_bulk(&conn, &[h.key("strict"), h.key("other")], tenant(t.b))
+        .await;
+    let by_key: std::collections::HashMap<String, Arc<EffectiveValue>> = bulk
+        .into_iter()
+        .map(|(k, r)| (k.to_string(), r.expect("resolves")))
+        .collect();
+    for (single, key) in [(single_strict, "strict"), (single_other, "other")] {
+        let from_bulk = &by_key[&h.key(key).to_string()];
+        assert_eq!(from_bulk.fallback.clone(), single.fallback.clone(), "{key}");
+        assert_eq!(from_bulk.fallback_source, single.fallback_source, "{key}");
+        assert_eq!(from_bulk.fallback_scope, single.fallback_scope, "{key}");
+    }
+    assert_eq!(by_key[&h.key("strict").to_string()].fallback, json!(true));
+    assert_eq!(by_key[&h.key("other").to_string()].fallback, json!(true));
 }

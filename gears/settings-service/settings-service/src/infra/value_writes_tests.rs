@@ -11,25 +11,33 @@
 //! two overlapped in time or merely in intent.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use serde_json::json;
+use time::{Duration, OffsetDateTime};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{BATCH_LIMIT, BatchChange, WriteCoordinator};
-use crate::audit::AuditOperation;
+use crate::api::rest::value_dto::rejection_code;
+use crate::audit::{AuditOperation, AuditValue, StoredAuditRecord};
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::ports::NoMetrics;
 use crate::domain::resolution::{ScopeTarget, scope_class};
-use crate::domain::stepup::{NoStepUpVerifier, StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
+use crate::domain::secrets::pending::{
+    PENDING_SECRET_TTL, PendingSecret, PendingSecretDraft, PendingSecretRepository,
+};
+use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::domain::writes::{Change, ValueWriter, WriteActor};
+use crate::field;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
+use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingPublisher, RecordingSecrets, ResolutionHarness,
+    BOOL, FixedStepUp, RecordingPublisher, RecordingSecrets, ResolutionHarness, SECRET,
     resolution_catalogue,
 };
 
@@ -37,23 +45,28 @@ struct Harness {
     base: ResolutionHarness,
     coordinator: WriteCoordinator,
     published: Arc<RecordingPublisher>,
+    secrets: Arc<RecordingSecrets>,
 }
 
 impl Harness {
     async fn new() -> Self {
-        Self::with_step_up(Arc::new(NoStepUpVerifier::default())).await
+        Self::with_step_up(Arc::new(FixedStepUp::refusing(
+            StepUpRefusal::NotConfigured,
+        )))
+        .await
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
         let base = ResolutionHarness::new().await;
         let published = Arc::new(RecordingPublisher::default());
+        let secrets = Arc::new(RecordingSecrets::default());
         let writer = Arc::new(ValueWriter::new(
             ValueRepo,
             Arc::clone(&base.resolver),
             Arc::new(GtsTypeValidator::new(resolution_catalogue())),
             crate::infra::storage::audit_store::AuditStore,
             step_up,
-            Arc::new(RecordingSecrets::default()),
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
         ));
@@ -62,7 +75,84 @@ impl Harness {
             base,
             coordinator,
             published,
+            secrets,
         }
+    }
+
+    /// A secret-trait declaration that keeps requiring step-up, as declared.
+    async fn declare_secret(&self, name: &str) -> Uuid {
+        self.base
+            .declare_typed(name, scope_class::CASCADING, json!(""), SECRET, "secret")
+            .await
+    }
+
+    async fn stage(
+        &self,
+        actor: &WriteActor,
+        name: &str,
+        tenant: Option<Uuid>,
+        value: serde_json::Value,
+    ) -> Result<PendingSecret, DomainError> {
+        self.coordinator
+            .stage_secret(actor, &self.base.key(name), tenant, value)
+            .await
+    }
+
+    async fn pending(&self, id: Uuid) -> Option<PendingSecret> {
+        let conn = self.base.db.conn().expect("connection");
+        PendingSecretRepo
+            .find(&conn, &AccessScope::allow_all(), id)
+            .await
+            .expect("lookup")
+    }
+
+    /// Every pending row, whatever its expiry.
+    async fn all_pending(&self) -> Vec<PendingSecret> {
+        let conn = self.base.db.conn().expect("connection");
+        PendingSecretRepo
+            .list_expired(
+                &conn,
+                &AccessScope::allow_all(),
+                OffsetDateTime::now_utc() + Duration::days(1),
+                1_000,
+            )
+            .await
+            .expect("listing")
+    }
+
+    /// A row as a stage would have left it, with the expiry the test chooses.
+    async fn insert_pending(
+        &self,
+        declaration_id: Uuid,
+        tenant_id: Uuid,
+        subject: &str,
+        secret_ref: &str,
+        expires_at: OffsetDateTime,
+    ) -> PendingSecret {
+        let conn = self.base.db.conn().expect("connection");
+        self.secrets.seed(secret_ref, "staged-plaintext");
+        PendingSecretRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                PendingSecretDraft {
+                    declaration_id,
+                    tenant_id,
+                    subject_id: subject.to_owned(),
+                    secret_ref: secret_ref.to_owned(),
+                    expires_at,
+                },
+            )
+            .await
+            .expect("pending row")
+    }
+
+    fn stores(&self) -> usize {
+        self.secrets.stores.load(Ordering::SeqCst)
+    }
+
+    fn deleted(&self) -> Vec<String> {
+        self.secrets.deleted.lock().expect("lock").clone()
     }
 
     /// A declaration a caller may write without step-up.
@@ -131,8 +221,8 @@ impl Harness {
             .expect("lookup")
     }
 
-    /// The audit records stored for one key, in order.
-    async fn history(&self, name: &str) -> Vec<String> {
+    /// The audit records stored for one key at the root, newest first.
+    async fn history_records(&self, name: &str) -> Vec<StoredAuditRecord> {
         let conn = self.base.db.conn().expect("connection");
         let key = self.base.key(name);
         crate::infra::storage::audit_store::AuditStore
@@ -146,10 +236,39 @@ impl Harness {
             .await
             .expect("history")
             .items
+    }
+
+    /// The operations recorded for one key, newest first.
+    async fn history(&self, name: &str) -> Vec<String> {
+        self.history_records(name)
+            .await
             .into_iter()
             .map(|r| r.operation.as_str().to_owned())
             .collect()
     }
+}
+
+fn pending_value(pending: &PendingSecret) -> serde_json::Value {
+    json!({ "pending_id": pending.id.to_string() })
+}
+
+fn one_change(
+    key: settings_service_sdk::SettingKey,
+    tenant: Option<Uuid>,
+    value: serde_json::Value,
+) -> Vec<BatchChange> {
+    vec![BatchChange {
+        key,
+        tenant,
+        op: None,
+        value: Some(value),
+        if_match: Some("absent".to_owned()),
+    }]
+}
+
+fn is_invalid_pending(err: &DomainError) -> bool {
+    rejection_code(err) == "invalid"
+        && matches!(err, DomainError::Validation { code, .. } if *code == field::PENDING_SECRET_INVALID)
 }
 
 fn actor(tenant: Uuid) -> WriteActor {
@@ -261,13 +380,15 @@ async fn a_batch_verifies_step_up_once_and_a_refusal_stores_nothing() {
         BatchChange {
             key: h.base.key("one"),
             tenant: None,
-            value: json!(true),
+            op: None,
+            value: Some(json!(true)),
             if_match: Some("absent".to_owned()),
         },
         BatchChange {
             key: h.base.key("two"),
             tenant: None,
-            value: json!(true),
+            op: None,
+            value: Some(json!(true)),
             if_match: Some("absent".to_owned()),
         },
     ];
@@ -297,13 +418,15 @@ async fn a_batch_verifies_step_up_once_and_a_refusal_stores_nothing() {
         BatchChange {
             key: refusing.base.key("one"),
             tenant: None,
-            value: json!(true),
+            op: None,
+            value: Some(json!(true)),
             if_match: Some("absent".to_owned()),
         },
         BatchChange {
             key: refusing.base.key("two"),
             tenant: None,
-            value: json!(true),
+            op: None,
+            value: Some(json!(true)),
             if_match: Some("absent".to_owned()),
         },
     ];
@@ -319,6 +442,85 @@ async fn a_batch_verifies_step_up_once_and_a_refusal_stores_nothing() {
     assert!(refusing.rows(two).await.is_empty());
 }
 
+/// A caller labelled as the test says — or not labelled at all.
+fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
+    let mut ctx = SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant);
+    if let Some(label) = subject_type {
+        ctx = ctx.subject_type(label);
+    }
+    WriteActor {
+        ctx: ctx.build().expect("context"),
+        request_id: "req".to_owned(),
+        step_up_token: Some("token".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn a_batch_recognises_a_person_labelled_user_and_refuses_the_unlabelled() {
+    // The batch decides interactivity once for the request, at its own call
+    // site: Keycloak's bare `user` is a person and reaches the verifier; no
+    // label is a service principal and is denied before it.
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Missing))).await;
+    h.base
+        .declare_typed(
+            "guarded",
+            scope_class::CASCADING,
+            json!(false),
+            BOOL,
+            "public",
+        )
+        .await;
+    let root = h.base.tree.root;
+    let changes = one_change(h.base.key("guarded"), None, json!(true));
+    let refused = h
+        .coordinator
+        .batch(&actor_labelled(root, Some("user")), changes.clone())
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(DomainError::StepUpRequired {
+                reason: "missing",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let denied = h
+        .coordinator
+        .batch(&actor_labelled(root, None), changes)
+        .await;
+    assert!(
+        matches!(denied, Err(DomainError::Unauthorized { .. })),
+        "{denied:?}"
+    );
+
+    // With a verifier that accepts, the `user`-labelled caller's batch commits.
+    let ok = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    let d = ok
+        .base
+        .declare_typed(
+            "guarded",
+            scope_class::CASCADING,
+            json!(false),
+            BOOL,
+            "public",
+        )
+        .await;
+    let outcome = ok
+        .coordinator
+        .batch(
+            &actor_labelled(ok.base.tree.root, Some("user")),
+            one_change(ok.base.key("guarded"), None, json!(true)),
+        )
+        .await
+        .expect("the batch runs");
+    assert!(outcome.results[0].is_ok(), "{:?}", outcome.results[0]);
+    assert_eq!(ok.rows(d).await.len(), 1);
+}
+
 #[tokio::test]
 async fn a_batch_of_more_than_the_limit_is_refused_before_anything_is_written() {
     let h = Harness::new().await;
@@ -327,7 +529,8 @@ async fn a_batch_of_more_than_the_limit_is_refused_before_anything_is_written() 
         .map(|_| BatchChange {
             key: h.base.key("flag"),
             tenant: None,
-            value: json!(true),
+            op: None,
+            value: Some(json!(true)),
             if_match: Some("absent".to_owned()),
         })
         .collect();
@@ -337,6 +540,294 @@ async fn a_batch_of_more_than_the_limit_is_refused_before_anything_is_written() 
         "{refused:?}"
     );
     assert!(h.rows(d).await.is_empty());
+}
+
+/// One batch entry, with the operation and value spelled out.
+fn entry(
+    key: settings_service_sdk::SettingKey,
+    op: Option<&str>,
+    value: Option<serde_json::Value>,
+    if_match: &str,
+) -> BatchChange {
+    BatchChange {
+        key,
+        tenant: None,
+        op: op.map(ToOwned::to_owned),
+        value,
+        if_match: Some(if_match.to_owned()),
+    }
+}
+
+/// A verifier that counts how often the coordinator asked it.
+struct CountingStepUp {
+    inner: FixedStepUp,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingStepUp {
+    fn verified() -> Arc<Self> {
+        Arc::new(Self {
+            inner: FixedStepUp::verified(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl StepUpVerifier for CountingStepUp {
+    async fn verify(
+        &self,
+        token: Option<&str>,
+        subject: &crate::domain::stepup::StepUpSubject,
+    ) -> Result<(), StepUpRefusal> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.verify(token, subject).await
+    }
+
+    fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
+        self.inner.requirement()
+    }
+}
+
+#[tokio::test]
+async fn a_batch_mixing_a_set_and_a_revert_commits_both_under_one_change_set() {
+    // What the settings page presses Apply on: some rows edited, some reverted,
+    // one request. Both reach the store through the same writer, so the change
+    // set covers the whole press and the journal records one entry per row.
+    let h = Harness::new().await;
+    let edited = h.declare("edited", scope_class::CASCADING).await;
+    let reverted = h.declare("reverted", scope_class::CASCADING).await;
+    let root = h.base.tree.root;
+    let actor = actor(root);
+
+    let existing = h
+        .set(&actor, "reverted", None, json!(true), Some("absent"))
+        .await
+        .expect("the row to revert");
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor,
+            vec![
+                entry(h.base.key("edited"), None, Some(json!(true)), "absent"),
+                entry(h.base.key("reverted"), Some("revert"), None, &existing.etag),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+
+    let committed: Vec<_> = outcome
+        .results
+        .iter()
+        .map(|r| r.as_ref().expect("committed"))
+        .collect();
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0].operation, AuditOperation::Create);
+    assert_eq!(committed[1].operation, AuditOperation::Revert);
+    // One press, one change set — the whole point of carrying the revert here.
+    assert!(
+        committed
+            .iter()
+            .all(|c| c.change_set_id == outcome.change_set_id),
+        "every entry belongs to the batch's change set"
+    );
+
+    assert_eq!(h.rows(edited).await.len(), 1);
+    assert!(
+        h.rows(reverted).await.is_empty(),
+        "the revert cleared the scope's own row"
+    );
+    assert_eq!(h.history("edited").await, vec!["create"]);
+    assert_eq!(h.history("reverted").await, vec!["revert", "create"]);
+    let records = h.history_records("reverted").await;
+    assert_eq!(records[0].change_set_id, Some(outcome.change_set_id));
+}
+
+#[tokio::test]
+async fn an_absent_op_and_an_explicit_set_are_the_same_change() {
+    // The default exists so that a client written before the field keeps
+    // working; it must not be a second code path.
+    let h = Harness::new().await;
+    let implicit = h.declare("implicit", scope_class::CASCADING).await;
+    let explicit = h.declare("explicit", scope_class::CASCADING).await;
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor(h.base.tree.root),
+            vec![
+                entry(h.base.key("implicit"), None, Some(json!(true)), "absent"),
+                entry(
+                    h.base.key("explicit"),
+                    Some("set"),
+                    Some(json!(true)),
+                    "absent",
+                ),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+
+    let one = outcome.results[0].as_ref().expect("committed");
+    let two = outcome.results[1].as_ref().expect("committed");
+    assert_eq!(one.operation, two.operation);
+    assert_eq!(one.new_value, two.new_value);
+    assert_eq!(h.rows(implicit).await.len(), 1);
+    assert_eq!(h.rows(explicit).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_entry_whose_value_contradicts_its_op_is_invalid_and_the_rest_commits() {
+    // Three ways to name a change that cannot be carried out, each refusing one
+    // entry: a revert that brought a value, a set that brought none, and a word
+    // that is not an operation at all.
+    let h = Harness::new().await;
+    let good = h.declare("good", scope_class::CASCADING).await;
+    let d = h.declare("bad", scope_class::CASCADING).await;
+    let actor = actor(h.base.tree.root);
+    let existing = h
+        .set(&actor, "bad", None, json!(true), Some("absent"))
+        .await
+        .expect("a row to aim at");
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor,
+            vec![
+                entry(
+                    h.base.key("bad"),
+                    Some("revert"),
+                    Some(json!(false)),
+                    &existing.etag,
+                ),
+                entry(h.base.key("bad"), Some("set"), None, &existing.etag),
+                entry(h.base.key("bad"), Some("remove"), None, &existing.etag),
+                entry(h.base.key("good"), None, Some(json!(true)), "absent"),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+
+    for (i, result) in outcome.results.iter().take(3).enumerate() {
+        let err = result.as_ref().expect_err("refused");
+        assert_eq!(rejection_code(err), "invalid", "entry {i}: {err:?}");
+    }
+    assert!(outcome.results[3].is_ok(), "{:?}", outcome.results[3]);
+
+    // Nothing the three refusals named was touched, and the good entry stands.
+    assert_eq!(h.rows(d).await.len(), 1);
+    assert_eq!(h.rows(d).await[0].value, Some(json!(true)));
+    assert_eq!(h.rows(good).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_revert_of_a_scope_with_no_override_is_not_found_alone() {
+    // The single endpoint answers 404 here. Inside a batch that is one entry's
+    // rejection, in a code the vocabulary already carries.
+    let h = Harness::new().await;
+    let bare = h.declare("bare", scope_class::CASCADING).await;
+    let other = h.declare("other", scope_class::CASCADING).await;
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor(h.base.tree.root),
+            vec![
+                entry(h.base.key("bare"), Some("revert"), None, "absent"),
+                entry(h.base.key("other"), None, Some(json!(true)), "absent"),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+
+    let err = outcome.results[0].as_ref().expect_err("refused");
+    assert_eq!(rejection_code(err), "not_found", "{err:?}");
+    assert!(outcome.results[1].is_ok(), "{:?}", outcome.results[1]);
+    assert!(h.rows(bare).await.is_empty());
+    assert_eq!(h.rows(other).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_stale_tag_on_a_revert_entry_rejects_that_entry_and_keeps_its_row() {
+    // A revert presents the tag of the row it clears, and is guarded by it
+    // exactly as a set is.
+    let h = Harness::new().await;
+    let d = h.declare("flag", scope_class::CASCADING).await;
+    let actor = actor(h.base.tree.root);
+    h.set(&actor, "flag", None, json!(true), Some("absent"))
+        .await
+        .expect("the row");
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor,
+            vec![entry(h.base.key("flag"), Some("revert"), None, "moved")],
+        )
+        .await
+        .expect("the batch runs");
+
+    let err = outcome.results[0].as_ref().expect_err("refused");
+    assert_eq!(rejection_code(err), "stale", "{err:?}");
+    assert_eq!(
+        h.rows(d).await.len(),
+        1,
+        "the row a stale tag aimed at stays"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_of_step_up_gated_reverts_asks_for_one_assertion() {
+    // Step-up is a property of the request, not of the operation: several
+    // gated reverts cost the administrator one re-authentication, as several
+    // gated sets already do.
+    let verifier = CountingStepUp::verified();
+    let h = Harness::with_step_up(Arc::clone(&verifier) as Arc<dyn StepUpVerifier>).await;
+    let one = h
+        .base
+        .declare_typed("one", scope_class::CASCADING, json!(false), BOOL, "public")
+        .await;
+    let two = h
+        .base
+        .declare_typed("two", scope_class::CASCADING, json!(false), BOOL, "public")
+        .await;
+    let actor = actor(h.base.tree.root);
+    let first = h
+        .set(&actor, "one", None, json!(true), Some("absent"))
+        .await
+        .expect("a row");
+    let second = h
+        .set(&actor, "two", None, json!(true), Some("absent"))
+        .await
+        .expect("a row");
+    let before = verifier.calls();
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor,
+            vec![
+                entry(h.base.key("one"), Some("revert"), None, &first.etag),
+                entry(h.base.key("two"), Some("revert"), None, &second.etag),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+
+    assert!(outcome.results.iter().all(Result::is_ok), "{outcome:?}");
+    assert_eq!(
+        verifier.calls() - before,
+        1,
+        "one assertion for the whole batch, not one per revert"
+    );
+    assert!(h.rows(one).await.is_empty());
+    assert!(h.rows(two).await.is_empty());
 }
 
 #[tokio::test]
@@ -570,4 +1061,280 @@ async fn history_of_a_retired_declaration_is_still_readable() {
         "the record survives the retirement"
     );
     let _ = AuditOperation::Create;
+}
+
+// --- Staging a secret ahead of the batch ---------------------------------
+
+#[tokio::test]
+async fn staging_a_secret_needs_no_step_up_and_answers_a_token_only() {
+    // No verifier is bound, so every write that needs step-up is refused ...
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let admin = actor(root);
+    let direct = h
+        .set(&admin, "api_token", None, json!("hunter2"), Some("absent"))
+        .await;
+    assert!(
+        matches!(direct, Err(DomainError::StepUpRequired { .. })),
+        "{direct:?}"
+    );
+
+    // ... while staging goes through: the plaintext is in the store, a row
+    // waits, nothing live changed, and the caller holds a token and an expiry.
+    let before = OffsetDateTime::now_utc();
+    let pending = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect("staged");
+    assert_eq!(pending.declaration_id, d);
+    assert_eq!(pending.tenant_id, root);
+    assert_eq!(pending.subject_id, admin.subject());
+    assert!(pending.expires_at > before + PENDING_SECRET_TTL - Duration::minutes(1));
+    assert!(pending.expires_at <= OffsetDateTime::now_utc() + PENDING_SECRET_TTL);
+    assert_eq!(h.secrets.held(), vec![pending.secret_ref.clone()]);
+    assert_eq!(
+        h.secrets
+            .entries
+            .lock()
+            .expect("lock")
+            .get(&pending.secret_ref)
+            .map(String::as_str),
+        Some("hunter2")
+    );
+    assert!(h.rows(d).await.is_empty(), "nothing live changed");
+    let row = h.pending(pending.id).await.expect("the row waits");
+    assert_eq!(row.secret_ref, pending.secret_ref);
+
+    // Audited as a stage, distinct from a commit, with the image masked.
+    let records = h.history_records("api_token").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].operation, AuditOperation::Stage);
+    assert_eq!(records[0].post_image, Some(AuditValue::Masked));
+    assert_eq!(records[0].actor, admin.subject());
+}
+
+#[tokio::test]
+async fn a_batch_change_naming_the_token_adopts_the_staged_entry_without_a_second_store_leg() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let admin = actor(root);
+    let pending = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect("staged");
+    let stores_after_stage = h.stores();
+
+    let outcome = h
+        .coordinator
+        .batch(
+            &admin,
+            one_change(h.base.key("api_token"), None, pending_value(&pending)),
+        )
+        .await
+        .expect("the batch runs");
+    let committed = outcome.results[0].as_ref().expect("committed");
+    assert_eq!(committed.new_value, Some(json!(pending.secret_ref)));
+    assert_eq!(committed.operation, AuditOperation::Create);
+
+    // One store leg, at the stage; the row points at that entry; the token is spent.
+    assert_eq!(h.stores(), stores_after_stage, "no second store leg");
+    let rows = h.rows(d).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].value.is_none());
+    assert_eq!(
+        rows[0].secret_ref.as_deref(),
+        Some(pending.secret_ref.as_str())
+    );
+    assert!(h.pending(pending.id).await.is_none(), "single-use");
+    assert_eq!(h.secrets.held(), vec![pending.secret_ref.clone()]);
+    assert!(h.deleted().is_empty(), "the live entry was never released");
+    assert_eq!(h.history("api_token").await, vec!["create", "stage"]);
+
+    // The spent token buys nothing a second time.
+    let again = h
+        .coordinator
+        .batch(
+            &admin,
+            vec![BatchChange {
+                key: h.base.key("api_token"),
+                tenant: None,
+                op: None,
+                value: Some(pending_value(&pending)),
+                if_match: Some(committed.etag.clone()),
+            }],
+        )
+        .await
+        .expect("the batch runs");
+    let err = again.results[0].as_ref().expect_err("rejected");
+    assert!(is_invalid_pending(err), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_token_of_another_subject_setting_tenant_or_past_expiry_is_rejected_and_the_row_kept() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    let d = h.declare_secret("api_token").await;
+    let other = h.declare_secret("other_token").await;
+    let root = h.base.tree.root;
+    let a = h.base.tree.a;
+    let admin = actor(root);
+    let pending = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect("staged");
+
+    let attempts = vec![
+        (
+            "another subject",
+            actor(root),
+            h.base.key("api_token"),
+            None,
+        ),
+        (
+            "another setting",
+            admin.clone(),
+            h.base.key("other_token"),
+            None,
+        ),
+        (
+            "another tenant",
+            admin.clone(),
+            h.base.key("api_token"),
+            Some(a),
+        ),
+    ];
+    for (case, who, key, tenant) in attempts {
+        let outcome = h
+            .coordinator
+            .batch(&who, one_change(key, tenant, pending_value(&pending)))
+            .await
+            .expect("the batch runs");
+        let err = outcome.results[0].as_ref().expect_err(case);
+        assert!(is_invalid_pending(err), "{case}: {err:?}");
+        assert!(
+            h.pending(pending.id).await.is_some(),
+            "{case}: the row is untouched"
+        );
+    }
+    assert!(h.rows(d).await.is_empty());
+    assert!(h.rows(other).await.is_empty());
+    assert_eq!(h.secrets.held(), vec![pending.secret_ref.clone()]);
+
+    // Expired: the row is the sweep's, not the batch's.
+    let stale = h
+        .insert_pending(
+            d,
+            root,
+            &admin.subject(),
+            "stale-ref",
+            OffsetDateTime::now_utc() - Duration::seconds(1),
+        )
+        .await;
+    let outcome = h
+        .coordinator
+        .batch(
+            &admin,
+            one_change(h.base.key("api_token"), None, pending_value(&stale)),
+        )
+        .await
+        .expect("the batch runs");
+    let err = outcome.results[0].as_ref().expect_err("expired");
+    assert!(is_invalid_pending(err), "{err:?}");
+    assert!(h.pending(stale.id).await.is_some());
+    assert!(h.rows(d).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_claimed_token_whose_commit_fails_is_spent_and_its_entry_released() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let admin = actor(root);
+    let pending = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect("staged");
+
+    // A tag no row ever had: the commit is refused after the claim.
+    let outcome = h
+        .coordinator
+        .batch(
+            &admin,
+            vec![BatchChange {
+                key: h.base.key("api_token"),
+                tenant: None,
+                op: None,
+                value: Some(pending_value(&pending)),
+                if_match: Some("moved".to_owned()),
+            }],
+        )
+        .await
+        .expect("the batch runs");
+    let err = outcome.results[0].as_ref().expect_err("refused");
+    assert_eq!(rejection_code(err), "stale", "{err:?}");
+    assert!(h.pending(pending.id).await.is_none(), "consumed on use");
+    assert_eq!(h.deleted(), vec![pending.secret_ref.clone()]);
+    assert!(h.secrets.held().is_empty());
+    assert!(h.rows(d).await.is_empty());
+}
+
+#[tokio::test]
+async fn staging_a_non_secret_declaration_is_refused_and_nothing_is_stored() {
+    let h = Harness::new().await;
+    h.declare("flag", scope_class::CASCADING).await;
+    let root = h.base.tree.root;
+    let refused = h.stage(&actor(root), "flag", None, json!(true)).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(DomainError::Validation { code, .. }) if *code == field::NOT_A_SECRET
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(h.stores(), 0);
+    assert!(h.all_pending().await.is_empty());
+    assert!(h.history("flag").await.is_empty());
+}
+
+#[tokio::test]
+async fn staging_with_the_store_down_is_refused_and_no_row_is_written() {
+    let h = Harness::new().await;
+    h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    h.secrets.go_down();
+    let refused = h
+        .stage(&actor(root), "api_token", None, json!("hunter2"))
+        .await;
+    assert!(
+        matches!(refused, Err(DomainError::Unavailable { .. })),
+        "{refused:?}"
+    );
+    assert!(h.all_pending().await.is_empty());
+    assert!(h.history("api_token").await.is_empty());
+}
+
+#[tokio::test]
+async fn the_sweep_releases_expired_stages_with_their_entries_and_keeps_live_ones() {
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let now = OffsetDateTime::now_utc();
+    let stale = h
+        .insert_pending(d, root, &subject, "stale-ref", now - Duration::minutes(1))
+        .await;
+    let live = h
+        .insert_pending(d, root, &subject, "live-ref", now + Duration::minutes(9))
+        .await;
+
+    let released = h.coordinator.sweep_expired(100).await.expect("sweep");
+    assert_eq!(released, 1);
+    assert!(h.pending(stale.id).await.is_none());
+    assert!(h.pending(live.id).await.is_some());
+    assert_eq!(h.deleted(), vec!["stale-ref".to_owned()]);
+    assert_eq!(h.secrets.held(), vec!["live-ref".to_owned()]);
+
+    // Nothing left to sweep, and a second pass says so.
+    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 0);
 }

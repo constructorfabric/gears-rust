@@ -6,11 +6,14 @@
 //! waits on an implementation to register. The marker lands with the tick.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use sea_orm_migration::MigrationTrait;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
+use toolkit::lifecycle::ReadySignal;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::{DBProvider, DbError};
 use tracing::info;
@@ -45,7 +48,12 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
 >;
 
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
-#[toolkit::gear(name = "settings-service", deps = [types_registry, credstore], capabilities = [db, rest])]
+#[toolkit::gear(
+    name = "settings-service",
+    deps = [types_registry, credstore],
+    capabilities = [db, rest, stateful],
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+)]
 pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
@@ -94,7 +102,56 @@ impl Default for SettingsService {
     }
 }
 
+/// How often the managed lifecycle releases the staged secrets nobody claimed.
+const SWEEP_TICK: Duration = Duration::from_mins(1);
+
 impl SettingsService {
+    /// The managed lifecycle: the pending-secret sweep, once a minute until
+    /// cancelled. The only long-running work this gear owns; everything else
+    /// is request-driven.
+    #[allow(
+        clippy::redundant_pub_crate,
+        reason = "module-private serve entry-point invoked by the toolkit runtime"
+    )]
+    pub(crate) async fn serve(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        ready: ReadySignal,
+    ) -> anyhow::Result<()> {
+        let writes = self.writes()?;
+        let mut interval = tokio::time::interval(SWEEP_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ready.notify();
+        info!(
+            tick_secs = SWEEP_TICK.as_secs(),
+            "pending-secret sweep started"
+        );
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                _ = interval.tick() => Self::sweep_once(&writes).await,
+            }
+        }
+        info!("pending-secret sweep stopped");
+        Ok(())
+    }
+
+    /// One pass of the sweep, logged and never fatal: what it could not
+    /// release waits for the next tick.
+    async fn sweep_once(writes: &crate::infra::value_writes::WriteCoordinator) {
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
+        match writes
+            .sweep_expired(crate::infra::value_writes::SWEEP_LIMIT)
+            .await
+        {
+            Ok(0) => {}
+            Ok(released) => info!(released, "expired staged secrets released"),
+            Err(err) => tracing::warn!(%err, "pending-secret sweep failed; retried next tick"),
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
+    }
+
     /// The bootstrap configuration, once initialization has run.
     ///
     /// # Errors
@@ -343,16 +400,16 @@ impl Gear for SettingsService {
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // The write path: the step-up verifier from configuration — the OIDC/JWKS
-        // binding when a section is present, otherwise the binding that refuses
-        // every write needing step-up while reads keep serving — over the same
-        // resolver, audit store, and the ports whose real bindings come later.
-        let step_up: Arc<dyn crate::domain::stepup::StepUpVerifier> = match &config.step_up {
-            Some(section) => Arc::new(crate::infra::step_up::OidcStepUpVerifier::from_config(
-                section,
-            )?),
-            None => Arc::new(crate::domain::stepup::NoStepUpVerifier::default()),
-        };
+        // The write path: the step-up verifier over the platform's AuthN
+        // resolver, fetched from the hub at first use — never here, and the
+        // resolver is not in `deps` (DESIGN.md §4.9). Always bound: an absent
+        // `step_up` section is the default policy, not the absence of a
+        // verifier. Init refuses a window above five minutes.
+        let step_up: Arc<dyn crate::domain::stepup::StepUpVerifier> =
+            Arc::new(crate::infra::step_up::AuthnStepUpVerifier::from_config(
+                ctx.client_hub(),
+                &config.step_up,
+            )?);
         // The Secret Manager over the Credential Store: `credstore` is a system
         // gear, so its client is in the hub before this init runs.
         let credstore = ctx

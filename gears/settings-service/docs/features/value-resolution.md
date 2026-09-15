@@ -92,7 +92,7 @@ Three properties matter more than the walk itself.
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
 **Success Scenarios**:
-- An effective value returned with its source, source scope, resolved traits, and inheritance trail
+- An effective value returned with its source, source scope, resolved traits, inheritance trail, and the fallback — what the scope would resolve to without a row of its own — with its source and scope
 
 **Error Scenarios**:
 - The declaration was retired, reported as a distinct outcome
@@ -111,7 +111,7 @@ Three properties matter more than the walk itself.
 9. [x] - `p1` - Resolve the declaration's trait set for rendering metadata - `inst-vr-resolve-9`
 10. [x] - `p1` - **IF** the setting is secret-backed → return the value in its masked handle form, never plaintext - `inst-vr-resolve-10`
 11. [x] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace - `inst-vr-resolve-11`
-12. [x] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, and the inheritance trail - `inst-vr-resolve-12`
+12. [x] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, the inheritance trail, and `fallback` with `fallback_source` and `fallback_scope` - `inst-vr-resolve-12`
 
 ### Resolve Effective Values in Bulk
 
@@ -163,7 +163,7 @@ Three properties matter more than the walk itself.
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- The effective value at the requested scope with its source, source scope, resolved traits, inheritance trail with per-entry setter and time, leak-safe recency, the scope's own review flag, and the tag a write must present
+- The effective value at the requested scope with its source, source scope, resolved traits, inheritance trail with per-entry setter and time, leak-safe recency, the scope's own review flag, the tag a write must present, and the fallback — what the scope would show without its own row — masked as the value is
 
 **Error Scenarios**:
 - The caller may not read the setting, or the target is outside its subtree or a standalone descendant
@@ -180,9 +180,9 @@ Three properties matter more than the walk itself.
 7. [x] - `p1` - Resolve the effective value at the target through the resolver, cache first, recording the trail - `inst-vr-aread-7`
 8. [x] - `p1` - Compute `last_change_at` as the greater of the declaration's own `last_change_at` and the **resolved** row's — never a maximum over sibling or descendant scopes, so the timestamp reveals nothing the caller could not already read - `inst-vr-aread-8`
 9. [x] - `p1` - **IF** the target's **own** override is flagged for review → include `needs_review` and `needs_review_detail` beside the fallthrough value the resolver served, so the administrator sees both - `inst-vr-aread-9`
-10. [x] - `p1` - Mask the value by classification: `secret` as the mask token always; `pii` unless the caller is authorized for unmasked PII; `public` as is - `inst-vr-aread-10`
+10. [x] - `p1` - Mask the value — and the fallback with it, one decision on the declaration's classification for both — `secret` as the mask token always; `pii` unless the caller is authorized for unmasked PII; `public` as is - `inst-vr-aread-10`
 11. [x] - `p1` - Include the per-entry setter identity and timestamp on the trail, which is the administrative read and not the consumer path - `inst-vr-aread-11`
-12. [x] - `p1` - **RETURN** `200` with `value`, `source`, `source_scope`, `traits`, `inheritance_trail`, `last_change_at`, and the review pair when present, carrying in `ETag` the value state tag of the requested scope's own row or absent state — the tag a write at that scope must present, distinct from the recency in the body - `inst-vr-aread-12`
+12. [x] - `p1` - **RETURN** `200` with `value`, `source`, `source_scope`, `fallback`, `fallback_source`, `fallback_scope`, `traits`, `inheritance_trail`, `last_change_at`, and the review pair when present, carrying in `ETag` the value state tag of the requested scope's own row or absent state — the tag a write at that scope must present, distinct from the recency in the body - `inst-vr-aread-12`
 
 ### Browse Effective Values
 
@@ -206,7 +206,7 @@ Three properties matter more than the walk itself.
 5. [x] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it - `inst-vr-browse-5`
 6. [x] - `p1` - Exclude every setting whose effective tenant access for the caller is `hidden`, silently and from the count; an administrator above the target still sees what it restricted - `inst-vr-browse-6`
 7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, and return them with their detail; this lists rows, not resolved values - `inst-vr-browse-7`
-8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value by classification - `inst-vr-browse-8`
+8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value and its fallback by classification, so one page answers the whole table — the value a scope holds and what it would hold without it - `inst-vr-browse-8`
 9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
 10. [x] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
 
@@ -218,7 +218,7 @@ Three properties matter more than the walk itself.
 
 **Input**: A declaration and a requested scope
 
-**Output**: The resolved value with its source and source scope
+**Output**: The resolved value with its source and source scope, and the fallback with its source and scope
 
 **Steps**:
 1. [x] - `p1` - **IF** the declaration's scope class is `global` - `inst-vr-disp-1`
@@ -235,7 +235,8 @@ Three properties matter more than the walk itself.
 3. [x] - `p1` - **IF** the declaration's scope class is `local` - `inst-vr-disp-12`
    1. [x] - `p1` - DB: SELECT only the row for the requested tenant, performing no ancestor walk - `inst-vr-disp-13`
    2. [x] - `p1` - **IF** absent or flagged → **RETURN** the Schema Default, since a local setting is never inherited - `inst-vr-disp-14`
-4. [x] - `p1` - **RETURN** the resolved value, its source, and its source scope - `inst-vr-disp-15`
+4. [x] - `p1` - Compute the fallback beside the value: the same walk with the requested scope's own row left out — the deepest valid override above it for `cascading`, the platform row for a `global` setting read from a tenant, otherwise the Schema Default — with `inherited` or `schema_default` as its source and the supplying scope; equal to the value when the scope holds no override, and never a scope outside the chain the value came from - `inst-vr-disp-16`
+5. [x] - `p1` - **RETURN** the resolved value, its source, and its source scope, with the fallback beside them - `inst-vr-disp-15`
 
 ### Needs-Review Fallthrough
 
@@ -332,7 +333,7 @@ The cascading walk **MUST** obtain ancestry from the tenant resolver and **MUST 
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-shape`
 
-The resolved result **MUST** carry the key, the requested scope, the value, the source, the scope that supplied it, the resolved trait set, and the inheritance trail. The trail **MUST** be limited to the caller's own ancestor chain and **MUST NOT** include a sibling or descendant scope. Per-entry setter identity and timestamp **MUST** appear only on the administrative read and never on the consumer path. The recency indicator's value arm **MUST** derive from the resolved row alone.
+The resolved result **MUST** carry the key, the requested scope, the value, the source, the scope that supplied it, the resolved trait set, and the inheritance trail. It **MUST** also carry the fallback — what the scope would resolve to without a row of its own, computed by the same walk with that row left out — with its source (`inherited` or `schema_default`) and supplying scope; the fallback **MUST** equal the value when the scope holds no override, **MUST** follow the Scope Class rules and the needs-review fallthrough exactly as the value does, and **MUST NOT** name a scope outside the caller's own chain. The trail **MUST** be limited to the caller's own ancestor chain and **MUST NOT** include a sibling or descendant scope. Per-entry setter identity and timestamp **MUST** appear only on the administrative read and never on the consumer path. The recency indicator's value arm **MUST** derive from the resolved row alone.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-value-resolution-source-trail`
@@ -483,6 +484,11 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] A read whose own override is flagged returns the fallthrough value together with `needs_review` and its detail
 - [x] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
 - [x] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
+- [x] A scope with its own override carries as `fallback` the nearest valid ancestor's value, `fallback_source` `inherited` and `fallback_scope` naming that ancestor; with no ancestor override, the Schema Default, `schema_default`, and no scope — and the fallback equals what the scope resolves to once its own row is gone
+- [x] A scope without its own override carries a `fallback` equal to its `value`, with the same source and scope
+- [x] A `local` setting with an override falls back to the Schema Default whatever an ancestor holds; a `global` setting falls back to the Schema Default at the platform and to the platform row at a tenant; a flagged ancestor is skipped by the fallback exactly as by resolution
+- [x] A secret setting's `fallback` is masked exactly as its `value`, by one decision on the declaration's classification
+- [x] A standalone tenant's fallback comes from its own chain and never from a sibling; the browse page and the bulk read carry the same fallback fields as the single read
 - [x] `GET /settings-service/v1/settings?$filter=key in (…)` returns one entry per key, a hidden or non-existent key carrying its own outcome
 - [x] `GET /settings-service/v1/settings?$filter=needs_review eq true` lists the flagged overrides in the caller's subtree with their detail and none from a standalone descendant
 - [ ] Under a base-type grant a page costs one authorization decision; under a narrowed grant denied settings are absent from the page and the count and the page comes back full

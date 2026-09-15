@@ -36,7 +36,8 @@ fn declare(
     d.description = Some(description.to_owned());
     // Demo settings are written from the example server, which has no identity
     // provider to re-authenticate against, so they opt out of step-up; the
-    // secret below keeps it, as a real deployment's settings would by default.
+    // secret and the ordinary `turbo_mode` below keep it, as a real
+    // deployment's settings would by default.
     d.requires_step_up = Some(false);
     Ok(d)
 }
@@ -176,6 +177,27 @@ pub fn declarations() -> Result<Vec<ContributedDeclaration>, SettingKeyError> {
     )?;
     token.requires_step_up = Some(true);
     all.push(token);
+
+    // Step-up on an ORDINARY setting: not a secret, but still an edit a stolen
+    // session should not be able to make on its own.
+    //
+    // It earns its place by isolating the gate. The secret above demands a
+    // fresh re-authentication AND stores its value through the credential
+    // store, so a refusal there could come from either mechanism — and where
+    // the credential store refuses to store, the gate itself is never
+    // exercised at all. This one commits through the ordinary value path, so
+    // the only thing standing between the caller and a committed change is how
+    // recently they authenticated.
+    let mut turbo = declare(
+        "limits",
+        "turbo_mode",
+        catalogue::BOOL_FLAG,
+        json!(false),
+        ScopeClass::Cascading,
+        "Whether the demo workload runs in turbo mode.",
+    )?;
+    turbo.requires_step_up = Some(true);
+    all.push(turbo);
 
     // A secret without step-up: what the credential path looks like when the
     // declaration does not also demand a fresh authentication.

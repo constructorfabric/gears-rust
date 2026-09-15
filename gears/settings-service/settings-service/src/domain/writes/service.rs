@@ -25,7 +25,9 @@ use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver, scope_class};
-use crate::domain::stepup::{StepUpSubject, StepUpVerifier, USER_SUBJECT_TYPE};
+use crate::domain::stepup::{
+    INTERACTIVE_SUBJECT_TYPES, StepUpSubject, StepUpVerifier, unverified_payload,
+};
 use crate::domain::validation::{FieldViolation, TypeValidator};
 use crate::domain::value::{ValueDraft, ValueRepository};
 
@@ -48,9 +50,13 @@ impl WriteActor {
     }
 
     /// Whether the caller is a human session rather than a service principal.
+    /// An unlabelled subject is not: absence of a label is no evidence of a
+    /// person.
     #[must_use]
     pub fn is_interactive(&self) -> bool {
-        self.ctx.subject_type() == Some(USER_SUBJECT_TYPE)
+        self.ctx
+            .subject_type()
+            .is_some_and(|t| INTERACTIVE_SUBJECT_TYPES.contains(&t))
     }
 
     /// Who a step-up assertion must be bound to.
@@ -70,13 +76,10 @@ impl WriteActor {
 /// bind a step-up token to the session it must confirm; the session token
 /// itself was verified by authentication.
 fn session_sub(bearer: &str) -> Option<String> {
-    use base64::Engine;
-    let payload = bearer.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    claims.get("sub")?.as_str().map(str::to_owned)
+    unverified_payload(bearer)?
+        .get("sub")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// What a change does to the scope's own row.
@@ -84,6 +87,9 @@ fn session_sub(bearer: &str) -> Option<String> {
 pub enum Change {
     /// Store this value.
     Set(Value),
+    /// Adopt the entry a stage created earlier, by its reference: the plaintext
+    /// was validated and stored then, and travels nowhere now.
+    AdoptSecret(String),
     /// Clear the override so the scope falls back.
     Revert,
     /// Remove the scope's own row.
@@ -275,6 +281,12 @@ where
     #[must_use]
     pub fn step_up(&self) -> &Arc<dyn StepUpVerifier> {
         &self.step_up
+    }
+
+    /// The Secret Manager, for the entries a sweep releases.
+    #[must_use]
+    pub fn secrets(&self) -> &Arc<dyn SecretManager> {
+        &self.secrets
     }
 
     /// The declaration at a key as a write sees it: absent or hidden from the
@@ -483,6 +495,17 @@ where
         let declaration = &gated.declaration;
         let value = match change {
             Change::Set(value) => value,
+            Change::AdoptSecret(secret_ref) => {
+                // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
+                // Validated and stored when it was staged; the store leg is
+                // skipped and the reference goes on to the commit as any
+                // secret's would.
+                return Ok(Staged::Set {
+                    inline: None,
+                    secret_ref: Some(secret_ref),
+                });
+                // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
+            }
             Change::Revert => return Ok(Staged::Revert),
             Change::Remove => return Ok(Staged::Remove),
         };

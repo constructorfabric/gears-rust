@@ -53,7 +53,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 - **Validate, then set** replaces the staged-change-and-Apply model. A value operation takes effect when the caller sets it, after inline validation and an `If-Match` check; a read-only validate call reports what a value would do; there is no pending state and no separate activation step (`cpt-cf-settings-service-fr-set-value`, `cpt-cf-settings-service-fr-validate-before-set`).
 - **Platform scope is the root tenant's id**, never `NULL` and never a sentinel: every platform-scoped row and every audit resource id carries it, so a scoped read's `AccessScope` predicate can see it and the cascade collapses to one `IN` over the ancestor ids. The `@platform` audit sentinel is gone.
 - **Audit is gear-local in R1.** The `AuditSink` port takes the mutation's transaction; its R1 binding appends to the gear's own `audit_records` table, and R2 adds shipping through the transactional outbox behind the same port.
-- **Step-up is built here, not awaited.** Earlier revisions of this section deferred step-up to a contract owned by `authn-resolver`. The design now specifies the default binding as this gear's own: a `StepUpVerifier` port whose OIDC/JWKS implementation checks the presented token's signature, `sub`, `auth_time` within a freshness window of at most five minutes, and `acr`/`amr` locally (DESIGN §4.2 *Value Writer*). It gates interactive writes to declarations that require elevated confirmation and the behavior-affecting declaration actions (`cpt-cf-settings-service-fr-authn-role-gating`, `cpt-cf-settings-service-fr-validate-before-set`). The only sanctioned non-verifying binding is `MockStepUpVerifier` inside the test harness.
+- **Step-up is built here, not awaited.** Earlier revisions of this section deferred step-up to a contract owned by `authn-resolver`. The design now specifies the default binding as this gear's own: a `StepUpVerifier` port whose implementation has the platform's AuthN resolver authenticate the presented token and then checks `sub`, `auth_time` within a freshness window of at most five minutes, and `acr`/`amr` (DESIGN §4.2 *Value Writer*). It gates interactive writes to declarations that require elevated confirmation and the behavior-affecting declaration actions (`cpt-cf-settings-service-fr-authn-role-gating`, `cpt-cf-settings-service-fr-validate-before-set`). The only sanctioned non-verifying binding is `MockStepUpVerifier` inside the test harness.
 - **Tenant access is a sparse decision, not a pair of flags.** `tenant_visible` and `tenant_overridable` are gone from the declaration; a `tenant_permissions` row of `read_only` or `hidden`, recorded by an ancestor's administrator, restricts one tenant for one setting, and absence means `overridable`. The declaration keeps two flags that gate people rather than scopes: `requires_step_up` (default `true`) and `anonymous_exposable` (default `false`, refused on `secret` or `pii`).
 - **Licence gating is R2.** The `license-resolver` gear is documentation only, so the licence predicate the read surfaces will apply is left as a seam.
 
@@ -107,7 +107,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Persistence: SeaORM entity scaffolding, `SecureConn` and `DBRunner` wiring, migration harness
   - Error mapping: `DomainError` to Problem (RFC-9457) across the canonical error categories of DESIGN §4.3 — a validation rejection is invalid-argument and renders as `400`; `428`/`412` are explicit transport overrides on the `If-Match` preconditions
   - REST infrastructure: `OperationBuilder` wiring, OData `$filter`, `$select`, and `$orderby` parsing, pagination helpers, and `If-Match`/ETag plumbing
-  - AuthN and AuthZ: the `PolicyEnforcer` PEP pattern, `AccessScope` derived from PDP constraints, and the `StepUpVerifier` port — declared in the domain, adapted in infra — whose default OIDC/JWKS binding verifies a presented step-up token locally; it is bound in 2.8, the first path that refuses without it, and picked up there by the behavior-affecting declaration actions of 2.3
+  - AuthN and AuthZ: the `PolicyEnforcer` PEP pattern, `AccessScope` derived from PDP constraints, and the `StepUpVerifier` port — declared in the domain, adapted in infra — whose default binding has the platform's AuthN resolver authenticate a presented step-up token and checks its claims; it is bound in 2.8, the first path that refuses without it, and picked up there by the behavior-affecting declaration actions of 2.3
   - Audit Emitter: the `AuditSink` port taking the mutation's own transaction and `AccessScope`, and event publication; the gear-local binding is entry 2.6, and the tracing stand-in until then exercises the emitter's callers without satisfying the audit DoD
   - Deployment-owned bootstrap configuration delivered through ToolKit config at gear init (DESIGN §4.9), never as a managed setting
 
@@ -479,7 +479,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-feature-value-writes`
 
-- **Purpose**: Deliver the write path: a read-only check of what a value would do, and set, revert, remove and clone operations that validate inline, refuse a stale write, take effect when the caller sets them, and are audited in the same transaction. This is where the `StepUpVerifier` port acquires its default OIDC/JWKS binding, and where the two gates — authorization, asked of every caller, and elevated confirmation, which only a human can answer — are kept apart.
+- **Purpose**: Deliver the write path: a read-only check of what a value would do, and set, revert, remove and clone operations that validate inline, refuse a stale write, take effect when the caller sets them, and are audited in the same transaction. This is where the `StepUpVerifier` port acquires its default binding over the platform's AuthN resolver, and where the two gates — authorization, asked of every caller, and elevated confirmation, which only a human can answer — are kept apart.
 
 - **Depends On**: `cpt-cf-settings-service-feature-audit-store`, `cpt-cf-settings-service-feature-tenant-access`
 
@@ -491,7 +491,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `revert` clearing the scope's override and reporting the resulting fallback — nearest ancestor for a tenant scope, Schema Default at the root — with `validate` reporting the same fallback beforehand
   - `clone` authorizing `read` at the source and `write` at the target, both within the caller's subtree, copying the effective value with no continuing link, and refusing a `secret` setting with `SecretNotCloneable`
   - `cascading_impact` as a bounded, non-blocking preview: breadth-first over `get_descendants`, the first `limit` changed descendants (default 100, at most 500) in traversal order, `total_changed`, `scanned`, and `truncated` under a node budget of 5,000; standalone descendants omitted from the list and the count
-  - The default `StepUpVerifier` binding: signature against the identity provider's JWKS, `sub` matching the session, `auth_time` within the freshness window of at most five minutes, `acr`/`amr` as required; the `401` refusal carrying the RFC 9470 challenge `insufficient_user_authentication` with `max_age`; no development or sandbox bypass, since a binding that cannot fail is the always-satisfied binding the contract rejects
+  - The default `StepUpVerifier` binding: the token authenticated by the platform's AuthN resolver, `sub` matching the session, `auth_time` within the freshness window of at most five minutes, `acr`/`amr` as required; the `401` refusal carrying the RFC 9470 challenge `insufficient_user_authentication` with `max_age`; no development or sandbox bypass, since a binding that cannot fail is the always-satisfied binding the contract rejects
   - A `change_set_id` minted per `set` request and carried on the audit records it produces
   - Publication of `event_value_changed` and `event_value_change_failed` through the Change Publisher port; in R1 no consumer notification and no cross-replica broadcast are bound, so the local eviction is the write's only cache effect and a second host would be stale for at most `cache_ttl_seconds`
   - The `settings_step_up_total` counter by operation and result, and the set-path metrics `cpt-cf-settings-service-nfr-ops-set-monitoring` requires
@@ -521,7 +521,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Domain Model Entities**:
   - SetResult, ValidationReport, ImpactReport
-  - StepUpVerifier and its OIDC/JWKS binding
+  - StepUpVerifier and its binding over the AuthN resolver
   - Change set identifier
 
 - **Design Components**:
@@ -558,6 +558,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Classification-aware masking in every administrative read, list, search, and audit output: `secret` always masked, `pii` masked unless the caller is authorized for unmasked PII, `public` passed through
   - `SettingsReaderClient::resolve_secret` over an opaque `SecretHandle`: per-setting authorization of the calling service, plaintext fetched from the store, one `event_secret_used` record with the value masked, plaintext never cached and never returned to an administrative caller
   - `delete_secret` when an override is removed or superseded
+  - Staging a secret ahead of the step-up redirect: `POST /settings/{key}/secret-stage` validates and stores the plaintext as a set would and answers with a single-use `pending_id`; the batch names it in place of the value and adopts the entry without a second store leg; expired stages are swept with their entries (DESIGN §5 *A secret staged across the step-up redirect*, §4.7 `pending_secrets`)
   - The placeholder-default rule, already enforced by 2.3 on the declaration side: a secret setting resolves to its empty placeholder, never to a credential
 
 - **Out of scope**:
@@ -578,6 +579,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Domain Model Entities**:
   - SecretHandle
+  - PendingSecret
   - `secret_ref` on SettingValue
 
 - **Design Components**:
