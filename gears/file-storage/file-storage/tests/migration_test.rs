@@ -94,6 +94,28 @@ async fn migration_creates_all_three_tables() {
 async fn migration_up_down_up_roundtrip() {
     let db = migrated_db().await;
 
+    // Sanity anchor for the redesign columns, checked *before* anything is
+    // rolled back. `m20260722_000001_multipart_auto_bind`'s `down()` used to
+    // be a `SELECT 1` no-op on both dialects: a full `Migrator::down` rolled
+    // back every other migration's schema while silently leaving
+    // `multipart_uploads.auto_bind` (plus its three lease siblings and the
+    // widened `state` CHECK) in place, so migration history claimed the
+    // redesign was reverted when it was not. This roundtrip cannot prove the
+    // fix on its own -- `p2_initial::down()` drops `multipart_uploads`
+    // outright, so "the column is gone afterwards" would hold even for a
+    // no-op `down()`. That proof lives in
+    // `multipart_auto_bind_down_actually_drops_the_new_columns`, which rolls
+    // back only the last two migrations; all this assertion does is pin that
+    // the column exists on the fully-migrated schema the rest of the test
+    // starts from.
+    let auto_bind_before_down = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        auto_bind_before_down.is_ok(),
+        "sanity: auto_bind must exist on the fully-migrated schema: {auto_bind_before_down:?}"
+    );
+
     Migrator::down(&db, None).await.expect("roll back");
     let gone = db
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
@@ -105,6 +127,174 @@ async fn migration_up_down_up_roundtrip() {
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
         .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
+}
+
+/// Directly exercises the `multipart_auto_bind` migration's own up/down/up
+/// round trip (as opposed to the full-migrator roundtrip above, which
+/// dropped and recreated `multipart_uploads` from scratch via the other
+/// migrations' `down()`s and so could not tell a real column drop from a
+/// no-op). Asserts that `down()` actually removes `auto_bind` — i.e. is not
+/// the old `SELECT 1` no-op — and that a subsequent `up()` restores it.
+#[tokio::test]
+async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
+    let db = migrated_db().await;
+
+    let before = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        before.is_ok(),
+        "auto_bind must exist after the full up(): {before:?}"
+    );
+
+    // Roll back only the two most-recently-registered migrations
+    // (index_hardening, then multipart_auto_bind) rather than the whole
+    // history, so this test is independent of how many migrations precede
+    // multipart_auto_bind.
+    Migrator::down(&db, Some(2))
+        .await
+        .expect("roll back index_hardening and multipart_auto_bind");
+
+    let after_down = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        after_down.is_err(),
+        "auto_bind must be gone after a real (non-no-op) down(): {after_down:?}"
+    );
+
+    Migrator::up(&db, Some(2))
+        .await
+        .expect("re-apply multipart_auto_bind and index_hardening");
+    let after_up = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        after_up.is_ok(),
+        "auto_bind must exist again after re-up(): {after_up:?}"
+    );
+}
+
+// ── multipart_auto_bind rebuild: child rows and indexes survive ──────────────
+
+/// Upload id used only by the `multipart_auto_bind` rebuild-survival test
+/// below.
+const UPLOAD: &str = "00000000-0000-0000-0000-0000000000f1";
+
+async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'index' AND name = '{name}'"
+        ),
+    )
+    .await
+        == 1
+}
+
+/// Reproduces the bug fixed in `m20260722_000001_multipart_auto_bind`'s
+/// `SQLITE_UP`: that migration rebuilds `multipart_uploads` (SQLite cannot
+/// widen a `CHECK` constraint in place) by creating a new table, copying the
+/// parent rows, then `DROP TABLE multipart_uploads`. `multipart_upload_parts
+/// .upload_id` carries `REFERENCES multipart_uploads (upload_id) ON DELETE
+/// CASCADE` (`m20260701_000001_p2_initial`), and this test suite runs with
+/// `PRAGMA foreign_keys = ON` — exactly like the production sqlx pool
+/// defaults — so the naive rebuild's `DROP TABLE` cascades and silently
+/// deletes every `multipart_upload_parts` row, and the rebuild never
+/// recreates `multipart_uploads_file_idx` / `multipart_uploads_expired_idx`
+/// either.
+///
+/// This test applies every migration up to (but not including)
+/// `multipart_auto_bind` — the 8th of 9 registered migrations, so `Some(7)`
+/// pending migrations — inserts a file, a multipart session, and two parts
+/// referencing it, then applies the remaining migrations (`multipart_auto_bind`
+/// and `index_hardening`) and asserts the parts and the session are both
+/// still there, and both indexes exist.
+#[tokio::test]
+async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) multipart_auto_bind");
+
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', 'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session before the rebuild migration");
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_upload_parts \
+             (upload_id, part_number, backend_etag, part_hash, size) VALUES \
+             ('{UPLOAD}', 1, 'etag-1', X'{HASH32}', 100), \
+             ('{UPLOAD}', 2, 'etag-2', X'{HASH32}', 200)"
+        ),
+    ))
+    .await
+    .expect("insert two parts before the rebuild migration");
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migrations (multipart_auto_bind, index_hardening)");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_upload_parts WHERE upload_id = '{UPLOAD}'"
+            )
+        )
+        .await,
+        2,
+        "both parts must survive the multipart_uploads rebuild"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}'")
+        )
+        .await,
+        1,
+        "the session row must survive the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_file_idx").await,
+        "multipart_uploads_file_idx must be recreated by the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_expired_idx").await,
+        "multipart_uploads_expired_idx must be recreated by the rebuild"
+    );
+}
+
+// ── index_hardening ───────────────────────────────────────────────────────────
+
+/// Both new covering indexes from `m20260902_000001_index_hardening` must
+/// exist after a full `up()`.
+#[tokio::test]
+async fn index_hardening_indexes_exist_after_up() {
+    let db = migrated_db().await;
+    assert!(
+        index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_sweep_idx").await,
+        "multipart_uploads_sweep_idx must exist after up()"
+    );
 }
 
 // ── files CHECK constraints ──────────────────────────────────────────────────
@@ -779,6 +969,86 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
         res.is_err(),
         "whole-sha256 with a non-NULL part_count must violate the presence CHECK"
     );
+}
+
+/// The presence CHECK's `part_count >= 2` clause rejects a
+/// `multipart-composite-sha256` row with `part_count = 1`. ADR-0006's
+/// single-part amendment degenerates a one-part multipart plan to
+/// `whole-sha256` instead (`multipart_service.rs::assemble_and_finish_inner`,
+/// `single_part`/`WholeSha256` branch), so a composite row must never carry
+/// fewer than 2 parts.
+#[tokio::test]
+async fn content_hash_modes_rejects_multipart_with_single_part_count() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    let res = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO file_versions \
+                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+                  status, is_current, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+                 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+            ),
+        ))
+        .await;
+    assert!(
+        res.is_err(),
+        "multipart-composite-sha256 with part_count = 1 must violate the >= 2 CHECK: {res:?}"
+    );
+}
+
+/// A `multipart-composite-sha256` row with `part_count = 2` (the minimum a
+/// composite row may carry) satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_multipart_with_two_parts() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'multipart-composite-sha256', 2, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("multipart-composite-sha256 with part_count = 2 must satisfy the CHECK");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions \
+                 WHERE version_id = '{VERSION}' AND part_count = 2"
+            )
+        )
+        .await,
+        1
+    );
+}
+
+/// A `whole-sha256` row with `part_count = NULL` — the ordinary,
+/// non-multipart case — satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_whole_with_null_part_count() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'whole-sha256', NULL, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("whole-sha256 with a NULL part_count must satisfy the CHECK");
 }
 
 /// The `hash_mode` CHECK rejects any value outside the two shipped modes.

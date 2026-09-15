@@ -7,7 +7,7 @@
 //! `reqwest` client. S3's XML response/error bodies are parsed in-house via
 //! `quick-xml`, per the ADR.
 //!
-//! ## Dependency-feature deviation (Stage 0, recorded here per plan.md)
+//! ## Dependency-feature deviation
 //! `rusty-s3` gates its `ListObjectsV2`/`CreateMultipartUpload`/
 //! `CompleteMultipartUpload` **action builders** (not just their bundled
 //! response-parsing types) behind the `full` cargo feature — disabling it
@@ -20,9 +20,9 @@
 //!
 //! ## `reqwest::Client` ownership
 //! `S3Backend` constructs its own `reqwest::Client` internally (cheap: the
-//! client is a thin `Arc` handle). Stage 4/5 callers may switch to injecting a
-//! shared client if that proves more convenient once those call sites exist;
-//! nothing about this stage's trait contract depends on which is chosen.
+//! client is a thin `Arc` handle). A future caller may switch to injecting a
+//! shared client if that proves more convenient; nothing about the trait
+//! contract depends on which is chosen.
 
 use std::fmt;
 use std::time::Duration;
@@ -41,8 +41,33 @@ use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root,
 };
+
+/// Whether the terminal object-creating write of a streamed upload may
+/// overwrite an existing object or must fail if one already exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Plain `PutObject` / `CompleteMultipartUpload` — last write wins.
+    Overwrite,
+    /// `If-None-Match: *` conditional write. A `412 Precondition Failed`
+    /// is **not** an error: it means the object already existed and is
+    /// reported as `created: false` (create-exclusive publish, closing the
+    /// PUT-token-replay overwrite race — ADR-0003 immutability). Requires an
+    /// S3 endpoint that honours conditional writes (AWS S3 since 2024-08;
+    /// see this module's `publish_exclusive` note).
+    CreateExclusive,
+}
+
+/// Result of the shared streaming-upload core ([`S3Backend::stream_upload`]).
+struct StreamUploadOutcome {
+    bytes_written: u64,
+    digest: [u8; 32],
+    /// `true` if this call created the object; `false` only in
+    /// [`WriteMode::CreateExclusive`] when the object already existed.
+    created: bool,
+}
 
 /// Expiry for the presigned URLs this backend signs. Requests execute
 /// immediately after signing (there is no user-facing redirect), so this only
@@ -128,9 +153,9 @@ impl S3Backend {
         self
     }
 
-    /// Build an `S3Backend` from a `config::S3BackendConfig` entry (P2 1.7.3
-    /// config wiring). Shared by `gear.rs`'s `build_backend_registry` and the
-    /// sidecar's `FS_SIDECAR_S3_BACKENDS` parsing so the two don't duplicate
+    /// Build an `S3Backend` from a `config::S3BackendConfig` entry. Shared by
+    /// `gear.rs`'s `build_backend_registry` and the sidecar's
+    /// `FS_SIDECAR_S3_BACKENDS` parsing so the two don't duplicate
     /// construction logic.
     ///
     /// - `endpoint: None` derives a real-AWS endpoint from `region`
@@ -203,6 +228,31 @@ impl S3Backend {
         format!("/{key}")
     }
 
+    /// Build the HTTP `Range` header value for `range`, or fail locally (no
+    /// S3 round trip needed) for the two range shapes that are already
+    /// known-unsatisfiable without asking the server (`start > end` for an
+    /// inclusive range, `length == 0` for a suffix range). Shared by
+    /// `get_range` and `get_range_stream` so the header text is built in
+    /// exactly one place — a divergence here would mean the two methods could
+    /// silently serve different bytes for what should be the same range.
+    fn range_header_value(range: ByteRange) -> Result<String, DomainError> {
+        match range {
+            ByteRange::Inclusive { start, end } => {
+                if start > end {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes={start}-{end}"))
+            }
+            ByteRange::OpenEnded { start } => Ok(format!("bytes={start}-")),
+            ByteRange::Suffix { length } => {
+                if length == 0 {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes=-{length}"))
+            }
+        }
+    }
+
     fn transport_err(&self, e: &reqwest::Error) -> DomainError {
         DomainError::backend(&self.id, e.to_string())
     }
@@ -232,6 +282,46 @@ impl S3Backend {
         }
     }
 
+    /// Like [`send_and_check`](Self::send_and_check) but for a create-exclusive
+    /// (`If-None-Match: *`) write: `Ok(true)` means this request created the
+    /// object, `Ok(false)` means a `412 Precondition Failed` — the object
+    /// already existed and was left untouched. Any other non-2xx is still an
+    /// error (with the S3 XML error body parsed as usual).
+    async fn send_and_check_created(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<bool, DomainError> {
+        let resp = req.send().await.map_err(|e| self.transport_err(&e))?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+        if status.is_success() {
+            Ok(true)
+        } else if status == StatusCode::PRECONDITION_FAILED {
+            Ok(false)
+        } else {
+            Err(self.s3_error(status, &body))
+        }
+    }
+
+    /// `PutObject` for `path` carrying `If-None-Match: *`, so S3 creates the
+    /// object only if it does not already exist. `Ok(true)` = created,
+    /// `Ok(false)` = already existed (`412`). The header is added to the
+    /// action's *signed* header set before signing, so it is covered by the
+    /// `SigV4` signature the presigned URL carries.
+    async fn put_create_exclusive(&self, path: &str, bytes: Bytes) -> Result<bool, DomainError> {
+        let key = Self::path_to_key(path);
+        let mut action = self.bucket.put_object(Some(&self.credentials), key);
+        // Add `If-None-Match` to the action's *signed* header set, then send
+        // the same header on the wire: a SigV4 presigned request lists its
+        // signed headers in `X-Amz-SignedHeaders`, and every one of them MUST
+        // be present on the actual request with the value that was signed, or
+        // S3 rejects it with a signature mismatch.
+        action.headers_mut().insert("if-none-match", "*");
+        let url = action.sign(SIGN_DURATION);
+        self.send_and_check_created(self.http.put(url).header("if-none-match", "*").body(bytes))
+            .await
+    }
+
     fn head_error(&self, path: &str, status: StatusCode) -> DomainError {
         DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
     }
@@ -244,101 +334,79 @@ impl S3Backend {
     /// `complete_multipart` builds the ADR-0006 offset-manifest root from the
     /// per-part digests it was handed. Either way a large multipart upload
     /// stays a single pass over the bytes instead of upload-then-re-download.
+    ///
+    /// In [`WriteMode::CreateExclusive`] the `CompleteMultipartUpload` carries
+    /// `If-None-Match: *`, so `Ok(false)` signals the assembled object already
+    /// existed (`412`); in [`WriteMode::Overwrite`] it always returns
+    /// `Ok(true)` on success.
     async fn finalize_multipart(
         &self,
         path: &str,
         upload_handle: &str,
         parts: &[(u32, String)],
-    ) -> Result<(), DomainError> {
+        mode: WriteMode,
+    ) -> Result<bool, DomainError> {
         let mut sorted_parts = parts.to_vec();
         sorted_parts.sort_by_key(|(part_number, _)| *part_number);
         let etags: Vec<&str> = sorted_parts.iter().map(|(_, etag)| etag.as_str()).collect();
 
         let key = Self::path_to_key(path);
-        let action = self.bucket.complete_multipart_upload(
+        let mut action = self.bucket.complete_multipart_upload(
             Some(&self.credentials),
             key,
             upload_handle,
             etags.iter().copied(),
         );
+        let exclusive = mode == WriteMode::CreateExclusive;
+        if exclusive {
+            // Signed + sent on the wire — see `put_create_exclusive`.
+            action.headers_mut().insert("if-none-match", "*");
+        }
         let url = action.sign(SIGN_DURATION);
         let body = action.body();
-        self.send_and_check(self.http.post(url).body(body)).await?;
-        Ok(())
-    }
-}
-
-impl fmt::Debug for S3Backend {
-    /// Manual `Debug`, redacting `credentials` (mirrors
-    /// `FileStorageConfig`'s manual `Debug` impl's secret-redaction pattern).
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Backend")
-            .field("id", &self.id)
-            .field("bucket", &self.bucket.name())
-            .field("region", &self.bucket.region())
-            .field("credentials", &"<redacted>")
-            .field("list_page_size", &self.list_page_size)
-            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
-            // `reqwest::Client` has no useful `Debug` output of its own beyond
-            // internal connection-pool state; omit it explicitly.
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl StorageBackend for S3Backend {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            multipart_native: true,
-            range_native: true,
-            durable: true,
-            ..BackendCapabilities::default()
+        let mut req = self.http.post(url).body(body);
+        if exclusive {
+            req = req.header("if-none-match", "*");
         }
+        self.send_and_check_created(req).await
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let key = Self::path_to_key(path);
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), key)
-            .sign(SIGN_DURATION);
-        self.send_and_check(self.http.put(url).body(bytes)).await?;
-        Ok(())
-    }
-
-    /// Streams `stream` into `path` without ever buffering the whole object
-    /// in memory once it crosses `multipart_threshold_bytes`: below the
-    /// threshold, the (small) object is buffered whole and written with one
-    /// `PutObject`; above it, this drives a native multipart upload, holding
-    /// at most one part's worth of bytes beyond the current chunk at a time.
-    /// The SHA-256 digest is computed incrementally as bytes arrive
+    /// Shared streaming-upload core for [`put_stream`](StorageBackend::put_stream)
+    /// (overwrite) and [`publish_exclusive`](StorageBackend::publish_exclusive)
+    /// (create-exclusive). Streams `stream` into `path` without ever buffering
+    /// the whole object once it crosses `multipart_threshold_bytes`: below the
+    /// threshold the (small) object is buffered whole and written with one
+    /// `PutObject`; above it, this drives a native multipart upload, holding at
+    /// most one part's worth of bytes beyond the current chunk at a time. The
+    /// SHA-256 digest is computed incrementally as bytes arrive
     /// (`hash::Hasher`), and `max_size` is enforced the moment the running
     /// total exceeds it — mid-stream, before any extra part is flushed. If a
     /// multipart upload was already initiated when the stream fails (a
-    /// transport error or a `max_size` violation) or when finishing the
-    /// upload fails (uploading the final part / `CompleteMultipartUpload`),
-    /// the multipart session is aborted so no orphaned session or partial
-    /// object is left behind.
-    async fn put_stream(
+    /// transport error or a `max_size` violation) or when finishing the upload
+    /// fails (uploading the final part / `CompleteMultipartUpload`), the
+    /// multipart session is aborted so no orphaned session or partial object is
+    /// left behind. `mode` selects whether the terminal write may overwrite an
+    /// existing object; in [`WriteMode::CreateExclusive`] a `412` on the
+    /// terminal write yields `created: false` (and any multipart session opened
+    /// along the way is aborted, since its `CompleteMultipartUpload` did not
+    /// take effect).
+    async fn stream_upload(
         &self,
         path: &str,
         mut stream: BoxStream<'_, std::io::Result<Bytes>>,
         max_size: Option<u64>,
-    ) -> Result<(u64, [u8; 32]), DomainError> {
+        mode: WriteMode,
+    ) -> Result<StreamUploadOutcome, DomainError> {
         let mut hasher = hash::Hasher::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut upload_handle: Option<String> = None;
         let mut parts: Vec<(u32, String)> = Vec::new();
         let mut next_part_number: u32 = 1;
-        // Byte offset of the next part within the object. `put_stream`
-        // produces a `whole-sha256` version (the digest is computed
-        // incrementally over the whole stream, not from an offset-manifest),
-        // so this is threaded purely to satisfy `upload_part`'s ADR-0006
-        // signature; it is never used to build a manifest on this path.
+        // Byte offset of the next part within the object. This path produces a
+        // `whole-sha256` version (the digest is computed incrementally over the
+        // whole stream, not from an offset-manifest), so this is threaded purely
+        // to satisfy `upload_part`'s ADR-0006 signature; it is never used to
+        // build a manifest here.
         let mut next_part_offset: u64 = 0;
 
         let collect_result: Result<(), DomainError> = async {
@@ -405,8 +473,20 @@ impl StorageBackend for S3Backend {
             None => {
                 // Never crossed the threshold: the whole (small) object is
                 // already buffered — issue one PutObject.
-                self.put(path, Bytes::from(buf)).await?;
-                Ok((bytes_written, digest))
+                let created = match mode {
+                    WriteMode::Overwrite => {
+                        self.put(path, Bytes::from(buf)).await?;
+                        true
+                    }
+                    WriteMode::CreateExclusive => {
+                        self.put_create_exclusive(path, Bytes::from(buf)).await?
+                    }
+                };
+                Ok(StreamUploadOutcome {
+                    bytes_written,
+                    digest,
+                    created,
+                })
             }
             Some(handle) => {
                 if !buf.is_empty() {
@@ -430,8 +510,21 @@ impl StorageBackend for S3Backend {
                 // hashing the stored object would yield (a test asserts the two
                 // actually agree). This keeps a large streaming upload to a
                 // single pass over the bytes instead of upload-then-re-download.
-                match self.finalize_multipart(path, &handle, &parts).await {
-                    Ok(()) => Ok((bytes_written, digest)),
+                match self.finalize_multipart(path, &handle, &parts, mode).await {
+                    Ok(created) => {
+                        // CreateExclusive + `412`: the assembled object already
+                        // existed, so our `CompleteMultipartUpload` did not take
+                        // effect and the multipart session is still open — abort
+                        // it so no orphan session/parts leak.
+                        if !created {
+                            drop(self.abort_multipart(path, &handle).await);
+                        }
+                        Ok(StreamUploadOutcome {
+                            bytes_written,
+                            digest,
+                            created,
+                        })
+                    }
                     Err(e) => {
                         drop(self.abort_multipart(path, &handle).await);
                         Err(e)
@@ -439,6 +532,98 @@ impl StorageBackend for S3Backend {
                 }
             }
         }
+    }
+}
+
+impl fmt::Debug for S3Backend {
+    /// Manual `Debug`, redacting `credentials` (mirrors
+    /// `FileStorageConfig`'s manual `Debug` impl's secret-redaction pattern).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Backend")
+            .field("id", &self.id)
+            .field("bucket", &self.bucket.name())
+            .field("region", &self.bucket.region())
+            .field("credentials", &"<redacted>")
+            .field("list_page_size", &self.list_page_size)
+            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
+            // `reqwest::Client` has no useful `Debug` output of its own beyond
+            // internal connection-pool state; omit it explicitly.
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl StorageBackend for S3Backend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            multipart_native: true,
+            range_native: true,
+            durable: true,
+            ..BackendCapabilities::default()
+        }
+    }
+
+    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .put_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        self.send_and_check(self.http.put(url).body(bytes)).await?;
+        Ok(())
+    }
+
+    /// Streams `stream` into `path` (overwrite-allowed), returning the total
+    /// bytes written and the incrementally-computed SHA-256 digest. See
+    /// [`stream_upload`](Self::stream_upload) for the streaming/multipart
+    /// mechanics; this is the plain last-write-wins entry point.
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::Overwrite)
+            .await?;
+        Ok((o.bytes_written, o.digest))
+    }
+
+    /// Create-exclusive publish: streams `stream` into `path` but fails to
+    /// overwrite an existing object, closing the PUT-token-replay race the
+    /// trait's default (non-atomic `exists`-then-`put`) leaves open for S3.
+    ///
+    /// Atomicity is delegated to S3 conditional writes (`If-None-Match: *` on
+    /// the terminal `PutObject`/`CompleteMultipartUpload`): a `412 Precondition
+    /// Failed` is mapped to `created: false`, matching the outcome
+    /// `LocalFsBackend`/`InMemoryBackend` produce. `bytes_written`/`digest`
+    /// always describe *this* attempt's bytes (the control plane re-derives
+    /// integrity from the stored object at finalize regardless).
+    ///
+    /// **Provider requirement:** the target endpoint MUST honour conditional
+    /// writes — native AWS S3 (since 2024-08-20) and any S3-compatible store
+    /// implementing `If-None-Match: *` on `PutObject`/`CompleteMultipartUpload`
+    /// (e.g. recent `MinIO`). Against an endpoint that silently ignores the
+    /// header this degrades to last-write-wins; validating a specific
+    /// deployment's support is part of the ADR-0005 release gate.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::CreateExclusive)
+            .await?;
+        Ok(PublishOutcome {
+            bytes_written: o.bytes_written,
+            digest: o.digest,
+            created: o.created,
+        })
     }
 
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
@@ -460,7 +645,7 @@ impl StorageBackend for S3Backend {
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
             .bucket
@@ -491,21 +676,7 @@ impl StorageBackend for S3Backend {
     /// Builds the header directly from `range` without a prior `HEAD`, so a
     /// range read never costs more than one round trip.
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let header_value = match range {
-            ByteRange::Inclusive { start, end } => {
-                if start > end {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes={start}-{end}")
-            }
-            ByteRange::OpenEnded { start } => format!("bytes={start}-"),
-            ByteRange::Suffix { length } => {
-                if length == 0 {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes=-{length}")
-            }
-        };
+        let header_value = Self::range_header_value(range)?;
 
         let key = Self::path_to_key(path);
         let url = self
@@ -530,6 +701,66 @@ impl StorageBackend for S3Backend {
         } else {
             Err(self.s3_error(status, &body))
         }
+    }
+
+    /// Native streaming range read: identical request shape to `get_range`
+    /// (same unsigned `Range` header, same one-round-trip contract), but
+    /// returns the response body as a `BoxStream` via `bytes_stream()`
+    /// instead of buffering it whole — mirrors `get_stream`'s relationship to
+    /// `get`, applied to a range. `Range: bytes=0-` (`ByteRange::OpenEnded`
+    /// with `start: 0`) resolves to the entire object, so without this a
+    /// player's very first range request would still pull the whole object
+    /// into memory via `resp.bytes()` before the client had read a byte of
+    /// it — this streams it instead. Status handling (416 / non-2xx) is
+    /// checked eagerly before returning, exactly like `get_stream`, so a bad
+    /// range or an S3-side error surfaces from this call directly rather than
+    /// from polling the returned stream.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let header_value = Self::range_header_value(range)?;
+
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        let resp = self
+            .http
+            .get(url)
+            .header(RANGE, header_value)
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+
+        let status = resp.status();
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            return Err(DomainError::validation("range", "unsatisfiable byte range"));
+        }
+        if !status.is_success() {
+            let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+            return Err(self.s3_error(status, &body));
+        }
+        // The caller turns this stream into a `206 Partial Content` body whose
+        // `Content-Range`/`Content-Length` describe the *requested* range, so a
+        // backend that silently ignored `Range` and answered `200 OK` with the
+        // whole object would make the sidecar emit a response whose body does
+        // not match its own headers -- while streaming an arbitrary amount of
+        // data to do it. Every S3 implementation that honours the header
+        // answers `206`; anything else is refused here rather than trusted.
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(DomainError::backend(
+                &self.id,
+                format!("backend ignored the Range header (answered {status}, expected 206)"),
+            ));
+        }
+
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        Ok(Box::pin(stream))
     }
 
     /// Cheap stat via `HeadObject`: reads only the `Content-Length` response
@@ -602,6 +833,41 @@ impl StorageBackend for S3Backend {
         match resp.status() {
             StatusCode::OK => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
+            other => Err(self.head_error(path, other)),
+        }
+    }
+
+    /// Native combined stat: a single `HeadObject` distinguishes
+    /// "not found" (`Ok(None)`, `404`) from "present, this many bytes"
+    /// (`Ok(Some(len))`, `200` + `Content-Length`) from a genuine backend
+    /// fault (`Err`, any other status or a transport failure) -- exactly
+    /// what `exists` followed by `size` used to need two separate
+    /// `HeadObject` requests for.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        let resp = self
+            .http
+            .head(url)
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+        match resp.status() {
+            StatusCode::OK => {
+                let len = resp
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        DomainError::backend(&self.id, "HEAD response missing Content-Length")
+                    })?;
+                Ok(Some(len))
+            }
+            StatusCode::NOT_FOUND => Ok(None),
             other => Err(self.head_error(path, other)),
         }
     }
@@ -708,10 +974,9 @@ impl StorageBackend for S3Backend {
             .iter()
             .map(|(part_number, _, _, etag)| (*part_number, etag.clone()))
             .collect();
-        self.finalize_multipart(path, upload_handle, &etag_parts)
+        self.finalize_multipart(path, upload_handle, &etag_parts, WriteMode::Overwrite)
             .await?;
 
-        // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest
         build_manifest_and_root(parts)
     }
 
@@ -769,11 +1034,12 @@ impl StorageBackend for S3Backend {
     /// from "bucket does not exist (or is misconfigured)": both come back as
     /// a bare `404` with no body — HEAD responses never carry one, so there
     /// is nothing in the response to tell `NoSuchBucket` apart from
-    /// `NoSuchKey`. `exists`'s 404-means-absent mapping (correct for its own
-    /// contract) previously leaked into readiness via this method, so a
-    /// missing/misconfigured bucket reported `Ok(false)` — "reachable,
-    /// object absent" — same as the expected steady-state, and `/readyz`
-    /// passed while every real read/write against that backend would fail.
+    /// `NoSuchKey`. Basing readiness on a probe-key `HeadObject` would
+    /// therefore reuse `exists`'s 404-means-absent mapping (correct for its
+    /// own contract) for the wrong question: a missing/misconfigured bucket
+    /// would report `Ok(false)` — "reachable, object absent" — same as the
+    /// expected steady-state, and `/readyz` would pass while every real
+    /// read/write against that backend fails.
     ///
     /// `ListObjectsV2` is bucket-scoped: it returns `200` (with an empty
     /// `<Contents>` list) for *any* existing, accessible bucket regardless of

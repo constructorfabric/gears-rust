@@ -43,8 +43,6 @@ pub enum Op {
     /// Carries additional multipart-specific claims (`upload_id`, `part_number`,
     /// `offset`, exact `size`) that the sidecar enforces before writing any bytes.
     /// The control plane is the sole minter; the sidecar only verifies (ADR-0004).
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload (FEATURE §4)
     MultipartPart,
 }
 
@@ -138,6 +136,17 @@ pub struct Claims {
     /// before this field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
+    /// Upload-flow redesign: instructs the control plane's **finalize**
+    /// callback handler to also bind the finalized version as the file's
+    /// current content, under a `content_id IS NULL` CAS (`op = put` tokens
+    /// only). Minted **exclusively** by `POST /files` for a brand-new file
+    /// with `bind: "auto"` — never for `POST /files/{id}/versions` (replacing
+    /// existing content must go through the JWT-authorized `bind`/`complete`
+    /// paths; see DESIGN §3.6's delegated-authorization amendment). The
+    /// sidecar itself never reads this claim. `#[serde(default)]` keeps
+    /// verification tolerant of tokens minted before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bind_on_finalize: bool,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {
@@ -199,9 +208,7 @@ impl Issuer {
     /// The verifier the sidecar uses (public key only).
     #[must_use]
     pub fn verifier(&self) -> Verifier {
-        Verifier {
-            verifier: self.provider.verifier(),
-        }
+        Verifier::with_verifier(self.provider.verifier())
     }
 
     /// Mint a token for `claims`, clamping its lifetime to `max_ttl`.
@@ -221,39 +228,103 @@ impl Issuer {
     }
 }
 
-/// The sidecar's verifier: public key only, stateless verification.
+/// The sidecar's verifier: a small **ordered** set of public keys, stateless
+/// verification.
+///
+/// This exists so a `signing_key_seed` rotation on the control plane never
+/// needs an outage or invalidates already-issued signed URLs: the sidecar is
+/// rolled out first with the new key added to its set (see
+/// `docs/operations.md`'s `signing_key_seed` → **Rotation** section), so
+/// tokens signed by either the old or the new key verify throughout the
+/// rollout window. There is deliberately no `kid` claim — the set is small
+/// (primary + at most a couple of retained previous keys), so trying each
+/// verifier in turn is cheap, and it avoids a claim that would otherwise let
+/// a token name which key to check.
 #[derive(Clone)]
 pub struct Verifier {
-    verifier: Arc<dyn SignatureVerifier>,
+    /// Verifiers to try, in order. `verifiers[0]` is the current primary key
+    /// (the one the control plane signs new tokens with); anything after it
+    /// exists only to keep accepting tokens minted by an older key during a
+    /// rotation window. Never empty — [`Self::from_public_keys`] returns an
+    /// error and [`Self::with_verifiers`] panics on an empty set, since a `Verifier`
+    /// that can accept no key at all is a misconfiguration, not a valid
+    /// "accept nothing" state.
+    verifiers: Vec<Arc<dyn SignatureVerifier>>,
 }
 
 impl Verifier {
-    /// Construct from raw Ed25519 public-key bytes (e.g. shared config). Uses the
-    /// default P1 provider's verifier; FIPS deployments construct the matching
-    /// provider's verifier instead. Validates the key length up front so a
-    /// malformed `FS_SIDECAR_PUBLIC_KEY` fails at startup rather than as a
-    /// request-time token error.
+    /// Construct from a single raw Ed25519 public-key (e.g. shared config).
+    /// Thin single-key wrapper over [`Self::from_public_keys`], kept so
+    /// existing single-key call sites don't need to change.
     pub fn from_public_key(public_key: Vec<u8>) -> Result<Self, DomainError> {
-        const ED25519_PUBLIC_KEY_LEN: usize = 32;
-        if public_key.len() != ED25519_PUBLIC_KEY_LEN {
-            return Err(DomainError::token_invalid(format!(
-                "invalid Ed25519 public key length: expected {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
-                public_key.len()
-            )));
-        }
-        Ok(Self {
-            verifier: Arc::new(provider::Ed25519Verifier::new(public_key)),
-        })
+        Self::from_public_keys(vec![public_key])
     }
 
-    /// Construct over an explicit verifier (matches a non-default provider).
+    /// Construct from an ordered list of raw Ed25519 public-key bytes (e.g.
+    /// `FS_SIDECAR_PUBLIC_KEY` followed by `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`).
+    /// Uses the default P1 provider's verifier for each key; FIPS deployments
+    /// construct the matching provider's verifiers instead via
+    /// [`Self::with_verifiers`]. Validates every key's length up front so a
+    /// malformed key fails at startup rather than as a request-time token
+    /// error, and rejects an empty list for the same reason (see
+    /// [`Self::verifiers`](Self)'s doc comment).
+    pub fn from_public_keys(public_keys: Vec<Vec<u8>>) -> Result<Self, DomainError> {
+        const ED25519_PUBLIC_KEY_LEN: usize = 32;
+        if public_keys.is_empty() {
+            return Err(DomainError::token_invalid(
+                "at least one public key is required to construct a Verifier",
+            ));
+        }
+        let verifiers = public_keys
+            .into_iter()
+            .map(|key| {
+                if key.len() != ED25519_PUBLIC_KEY_LEN {
+                    return Err(DomainError::token_invalid(format!(
+                        "invalid Ed25519 public key length: expected {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
+                        key.len()
+                    )));
+                }
+                Ok(Arc::new(provider::Ed25519Verifier::new(key)) as Arc<dyn SignatureVerifier>)
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        Ok(Self { verifiers })
+    }
+
+    /// Construct over a single explicit verifier (matches a non-default
+    /// provider). Thin single-verifier wrapper over [`Self::with_verifiers`].
     #[must_use]
     pub fn with_verifier(verifier: Arc<dyn SignatureVerifier>) -> Self {
-        Self { verifier }
+        Self::with_verifiers(vec![verifier])
+    }
+
+    /// Construct over an ordered list of explicit verifiers — primary first,
+    /// then any retained for a rotation window. See [`Self::from_public_keys`]
+    /// for the try-in-order verification contract [`Self::verify`] applies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `verifiers` is empty — a `Verifier` that can accept no key
+    /// at all is a programming error, not a valid "accept nothing" state.
+    #[must_use]
+    pub fn with_verifiers(verifiers: Vec<Arc<dyn SignatureVerifier>>) -> Self {
+        assert!(
+            !verifiers.is_empty(),
+            "Verifier::with_verifiers requires at least one SignatureVerifier"
+        );
+        Self { verifiers }
     }
 
     /// Verify a token's signature and expiry, returning its claims. The caller
     /// still checks `op` against the HTTP method and enforces upload constraints.
+    ///
+    /// Token parsing (splitting and base64-decoding the payload/signature) is
+    /// done exactly once, regardless of how many keys are configured. The
+    /// signature is then checked against each configured verifier in order
+    /// (primary first, see [`Self::verifiers`](Self)'s doc comment),
+    /// returning as soon as one accepts. When none accept, the error is
+    /// exactly the same "signature verification failed" a single-key
+    /// `Verifier` would return — a caller can never tell from the response
+    /// how many keys were tried or which (if any) came close.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<Claims, DomainError> {
         let (payload_b64, sig_b64) = token
             .split_once('.')
@@ -265,7 +336,13 @@ impl Verifier {
             .decode(sig_b64)
             .map_err(|_| DomainError::token_invalid("bad signature encoding"))?;
 
-        self.verifier.verify(&payload, &sig)?;
+        let signature_ok = self
+            .verifiers
+            .iter()
+            .any(|verifier| verifier.verify(&payload, &sig).is_ok());
+        if !signature_ok {
+            return Err(DomainError::token_invalid("signature verification failed"));
+        }
 
         let claims: Claims = serde_json::from_slice(&payload)
             .map_err(|_| DomainError::token_invalid("bad claims"))?;

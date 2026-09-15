@@ -9,10 +9,6 @@
 //!    is deleted and a `retention_delete` audit row is written.
 //! 4. Backend migration (`migrate_backend`) — happy path and rejection of
 //!    versioned files.
-//!
-//! @cpt-cf-file-storage-fr-orphan-reconciliation
-//! @cpt-cf-file-storage-fr-retention-policies
-//! @cpt-cf-file-storage-fr-backend-migration
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -145,6 +141,7 @@ async fn build_all_with_db(
     Store,
     CleanupEngine,
     Arc<DBProvider<DbError>>,
+    Arc<dyn StorageBackend>,
 ) {
     let db = build_db().await;
 
@@ -192,7 +189,7 @@ async fn build_all_with_db(
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, msvc, store, engine, db)
+    (svc, msvc, store, engine, db, backend)
 }
 
 /// Build a service + cleanup engine with TWO in-memory backends ("mem" and "alt").
@@ -261,6 +258,24 @@ fn new_file() -> NewFile {
     }
 }
 
+/// [`new_file`] with the owner set explicitly, for tests whose authorizer
+/// denies `ADMIN_POLICY`.
+///
+/// `new_file`'s `owner_id` is a fresh UUID that never equals the caller's
+/// own `subject_id`, so every file it builds is owned by *another* subject.
+/// `FileService::create_file` now requires `ADMIN_POLICY` for exactly that
+/// (creating a file under a foreign `owner_id` picks that owner's effective
+/// policy and debits that owner's quota), which an admin-denying authorizer
+/// refuses -- unrelated to whatever such a test is actually asserting.
+/// Passing the caller's own subject id keeps the creation self-owned, the
+/// realistic shape for a non-admin caller.
+fn new_file_owned_by(owner_id: Uuid) -> NewFile {
+    NewFile {
+        owner_id,
+        ..new_file()
+    }
+}
+
 /// A [`CleanupStore`] wrapper that makes `list_versions` fail for one
 /// specific `file_id` while delegating every other method to a real
 /// [`Store`]. `CleanupStore` is a narrow trait, so this is a small
@@ -284,6 +299,16 @@ impl CleanupStore for FaultyListVersionsStore {
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
             .list_abandoned_pending_versions(older_than, now)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
             .await
     }
 
@@ -346,6 +371,13 @@ impl CleanupStore for FaultyListVersionsStore {
         self.inner.list_metadata(file_id).await
     }
 
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
     /// The one faulted method: errors for `fault_file_id`, delegates otherwise.
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         if file_id == self.fault_file_id {
@@ -403,8 +435,6 @@ impl CleanupStore for FaultyListVersionsStore {
 /// With `orphan_grace_secs = 0` every pending version created before `now()` is
 /// immediately eligible; `run_sweep()` must delete it and return
 /// `abandoned_pending_deleted = 1`.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
     // grace = 0 → any pre-existing pending version is eligible immediately.
@@ -413,7 +443,10 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
     let ctx = ctx(tenant);
 
     // create_file leaves exactly one pending version row.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // Verify the version exists before sweep.
     let before = store.list_versions(ticket.file_id).await.unwrap();
@@ -452,8 +485,6 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
 }
 
 /// With `orphan_grace_secs = 86400` a newly-created pending version is NOT swept.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn recent_pending_version_is_not_swept_within_grace_window() {
     // grace = 24 hours → a freshly created version must not be deleted.
@@ -461,7 +492,10 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -485,8 +519,6 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
 /// Once the sweep reclaims that last (only) pending version, it must also
 /// delete the now-permanently-orphaned parent `files` row -- otherwise it
 /// lingers forever in `GET /files`, unable to ever serve content.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_deletes_abandoned_zero_version_file() {
     // grace = 0 → the file's only pending version is immediately eligible.
@@ -495,7 +527,10 @@ async fn sweep_deletes_abandoned_zero_version_file() {
     let ctx = ctx(tenant);
 
     // create_file leaves exactly one pending version and content_id = NULL.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -540,8 +575,6 @@ async fn sweep_deletes_abandoned_zero_version_file() {
 /// one bound `Available` version must keep its parent `files` row -- the
 /// sweep may only reclaim the abandoned version, never the file itself, once
 /// real content still exists.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_keeps_file_with_other_versions() {
     let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(0).await;
@@ -549,7 +582,10 @@ async fn sweep_keeps_file_with_other_versions() {
     let ctx = ctx(tenant);
 
     // v1: created, then immediately abandoned (never uploaded/finalized).
-    let v1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let v1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // v2: a second version on the same file, uploaded and bound as current.
     let v2 = svc.presign_version(&ctx, v1.file_id).await.unwrap();
@@ -598,6 +634,256 @@ async fn sweep_keeps_file_with_other_versions() {
     assert_eq!(v2_after.status, VersionStatus::Available);
 }
 
+// ── test 1b: versionless orphan files (never received any version) ───────────
+
+/// Second phase of sweep step 1 (`CleanupEngine::sweep_versionless_files`):
+/// a `files` row created via [`FileService::create_file_bare`] that never
+/// got a version at all (simulating a crash between that commit and the
+/// multipart plan's `insert_pending_version`, or a failed
+/// `compensate_failed_multipart_initiate`) is reclaimed once its own
+/// `created_at` ages past the grace cutoff -- even though it was never
+/// picked up by `sweep_abandoned_pending`, which only ever sees a row that
+/// once had a `file_versions` entry.
+#[tokio::test]
+async fn sweep_deletes_versionless_file_past_grace() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h so we can deterministically distinguish "old" (backdated
+    // 2h) from "fresh" (just created) without racing the clock.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    // `create_file_bare` is the merged `POST /files` create+plan path's first
+    // step: it commits a `files` row with NO version at all -- exactly the
+    // shape this phase targets.
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // Sanity: zero versions from the start.
+    let versions = store.list_versions(file_id).await.unwrap();
+    assert!(
+        versions.is_empty(),
+        "create_file_bare must leave no version"
+    );
+
+    // Backdate the file's own `created_at` past the grace cutoff -- there is
+    // no public API to backdate it on an already-created row (mirrors the
+    // sibling tests' direct-entity backdating of `file_versions.created_at`
+    // / `multipart_uploads.expires_at`).
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "no pending version ever existed for this file"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "sweep_versionless_files should have deleted the permanently versionless file"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_none(),
+        "the versionless orphan file row must be deleted by the sweep"
+    );
+
+    let audit = store.list_audit(file_id).await.unwrap();
+    let reconcile_count = audit
+        .iter()
+        .filter(|r| r.operation == "orphan_reconcile")
+        .count();
+    assert!(
+        reconcile_count >= 1,
+        "expected at least 1 orphan_reconcile audit row"
+    );
+
+    let events = store.list_file_events(file_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "file.deleted"),
+        "expected a file.deleted event for the reclaimed versionless file"
+    );
+}
+
+/// Negative control: a versionless file younger than the grace cutoff must
+/// not be swept.
+#[tokio::test]
+async fn sweep_keeps_recent_versionless_file_within_grace() {
+    let (svc, _msvc, store, engine, _db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a recently-created versionless file must not be swept within the grace window"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the recent versionless file must survive the sweep"
+    );
+}
+
+/// A versionless file past the grace cutoff, but with a live `in_progress`
+/// multipart session still pointing at it, must NOT be deleted --
+/// `maybe_delete_orphaned_file`'s `has_blocking_multipart_session` guard is
+/// shared across every sweep phase, so this phase respects it exactly like
+/// `sweep_abandoned_pending`'s own reclaim does. In production such a session
+/// always implies a pending `file_versions` row exists (it is inserted
+/// first, in `MultipartService::initiate_multipart_upload`), which would
+/// already exclude the file from this phase's own listing query -- this test
+/// exercises the guard directly (via a hand-inserted session row) to prove
+/// the second phase never bypasses it, rather than relying on that
+/// production invariant alone.
+#[tokio::test]
+async fn sweep_versionless_file_blocked_by_in_progress_multipart_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    // Hand-insert an `in_progress` session for this file -- bypassing
+    // `insert_pending_version` -- purely to exercise the shared blocking
+    // guard in isolation (see the doc comment above for why this shape
+    // cannot arise through the real `POST /files/{id}/multipart` path).
+    let now = time::OffsetDateTime::now_utc();
+    store
+        .create_multipart_upload(
+            Uuid::now_v7(),
+            file_id,
+            Uuid::now_v7(),
+            "backend-handle",
+            "text/plain",
+            1024,
+            1024,
+            false,
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("insert in_progress multipart session");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a versionless file with a live in_progress multipart session must not be reclaimed"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the file must survive while its multipart session is still in_progress"
+    );
+}
+
+/// A file that has a version (even an untouched `pending` one, itself still
+/// fresh) must never be picked up by `sweep_versionless_files`, no matter how
+/// old the *file* row itself is -- the phase's `NOT EXISTS (file_versions)`
+/// predicate is what actually distinguishes it from
+/// `sweep_abandoned_pending`'s version-age-keyed query, not `files.created_at`
+/// alone.
+#[tokio::test]
+async fn sweep_versionless_files_skips_file_with_a_version() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h: the version created below stays fresh (not itself
+    // eligible for `sweep_abandoned_pending`), while the file row is
+    // deliberately backdated past the cutoff.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    // Leaves one (fresh, still-pending) version -- unlike `create_file_bare`.
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(ticket.file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "the version itself is fresh, not past the grace cutoff"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a file with an existing version row must never be treated as versionless, \
+         regardless of the file row's own age"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap();
+    assert!(file_after.is_some(), "the file must survive the sweep");
+    let version_after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version_after.is_some(),
+        "the pending version must survive the sweep"
+    );
+}
+
 // ── test 2: expired multipart session sweep ────────────────────────────────────
 
 /// An in-progress multipart upload session whose `expires_at` is in the past is
@@ -607,8 +893,6 @@ async fn sweep_keeps_file_with_other_versions() {
 /// with a far-future `now` to confirm it returns the session (simulating passage
 /// of time), then call the sweep directly with a past-pointing clock by inserting
 /// a session with a manually-backdated `expires_at`.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn expired_multipart_session_is_aborted_by_sweep() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
@@ -616,9 +900,12 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     let ctx = ctx(tenant);
 
     // Create a file and initiate a multipart session.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
         .await
         .unwrap();
 
@@ -663,6 +950,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
             "text/plain",
             0u64,      // declared_size (not relevant for sweep test)
             0u64,      // part_size (not relevant for sweep test)
+            false,     // auto_bind (not relevant for sweep test)
             past_time, // expires in the past
             now_t,
         )
@@ -719,8 +1007,6 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 /// `orphan_grace_secs` would have its backing version deleted out from under
 /// it -- and the eventual `complete_multipart_upload` would fail at
 /// `finalize_version`, losing the whole upload's work.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_skips_pending_version_of_active_multipart_session() {
     use sea_orm::sea_query::Expr;
@@ -734,13 +1020,16 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
     // grace = 1 hour so the file's own creation-time pending version (which
     // stays fresh) is never itself a sweep candidate -- only the
     // deliberately backdated multipart-session version is.
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
         .await
         .unwrap();
 
@@ -790,8 +1079,6 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
 /// once the same session's `expires_at` has also passed, it is no longer
 /// "live" from the sweep's perspective -- `sweep_expired_multipart` aborts
 /// it, and its now-unprotected backing version becomes reclaimable.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_reclaims_version_after_session_expires() {
     use sea_orm::sea_query::Expr;
@@ -805,13 +1092,16 @@ async fn sweep_reclaims_version_after_session_expires() {
         Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
     };
 
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
         .await
         .unwrap();
 
@@ -874,6 +1164,184 @@ async fn sweep_reclaims_version_after_session_expires() {
     );
 }
 
+/// P2 remediation: `sweep_reclaims_version_after_session_expires` already
+/// proves the *version* is reclaimed and the session ends up `aborted` when
+/// step 1 (`sweep_abandoned_pending`) races ahead of step 2
+/// (`sweep_expired_multipart`) within the same `run_sweep()` call. This test
+/// extends that exact ordering with the two follow-on gaps it left open:
+/// before the fix, `cleanup_expired_session_version` early-returned as soon
+/// as its own `get_version` lookup came back empty (because step 1 had
+/// already deleted the row), which skipped BOTH the backend
+/// `abort_multipart` call (leaking the backend-side multipart upload, e.g.
+/// incomplete S3 MPU parts) AND the `multipart_upload_parts` row deletion
+/// for this session (unbounded growth). Both must still happen in this
+/// reordering.
+#[tokio::test]
+async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_deletes_parts() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
+    };
+
+    let (svc, msvc, store, engine, db, backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .await
+        .unwrap();
+
+    let session = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
+
+    // Simulate the sidecar having already uploaded (and reported) one part
+    // before the session expires -- both the backend-side part state and the
+    // `multipart_upload_parts` row it left behind are exactly what must be
+    // reclaimed by the abort flow, even in this step1-before-step2 ordering.
+    let part = plan.parts.first().expect("declared_size fits in one part");
+    let part_bytes = Bytes::from_static(b"partial-part-data-before-expiry");
+    let part_size = i64::try_from(part_bytes.len()).unwrap();
+    let (etag, part_hash) = backend
+        .upload_part(
+            &backend_path,
+            &session.backend_upload_handle,
+            part.part_number,
+            part.offset,
+            part_bytes,
+        )
+        .await
+        .expect("simulated sidecar part upload");
+    store
+        .upsert_multipart_part(
+            plan.upload_id,
+            i32::try_from(part.part_number).unwrap(),
+            &etag,
+            part_hash,
+            part_size,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_multipart_parts(plan.upload_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "sanity: the part row must exist before the sweep"
+    );
+
+    let conn = db.conn().expect("conn");
+    let now = time::OffsetDateTime::now_utc();
+
+    // Same setup as `sweep_reclaims_version_after_session_expires`: both the
+    // version's `created_at` and the session's `expires_at` are backdated, so
+    // step 1 reclaims the version in the SAME `run_sweep()` call, before step
+    // 2 ever fetches this session.
+    FileVersionEntity::update_many()
+        .col_expr(
+            FileVersionColumn::CreatedAt,
+            Expr::value(now - time::Duration::hours(2)),
+        )
+        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate version created_at");
+    MultipartUploadEntity::update_many()
+        .col_expr(
+            MultipartUploadColumn::ExpiresAt,
+            Expr::value(now - time::Duration::seconds(10)),
+        )
+        .filter(MultipartUploadColumn::UploadId.eq(plan.upload_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate session expires_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 1,
+        "step 1 must reclaim the version before step 2 ever sees the session"
+    );
+    assert_eq!(
+        result.expired_multipart_aborted, 1,
+        "step 2 must still abort the session even though its version is already gone"
+    );
+
+    // The version row is gone (reclaimed by step 1, as in the sibling test).
+    assert!(
+        store
+            .get_version(ticket.file_id, plan.version_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "version must be gone"
+    );
+
+    // The part rows must be gone too -- before the fix,
+    // `cleanup_expired_session_version` early-returned as soon as
+    // `get_version` came back empty, so this delete was never reached.
+    assert!(
+        store
+            .list_multipart_parts(plan.upload_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "multipart_upload_parts rows must be deleted even when the version was \
+         already reclaimed by step 1"
+    );
+
+    // The backend multipart handle must have been aborted too -- before the
+    // fix it leaked, because the same early return also skipped the backend
+    // `abort_multipart` call. Prove it indirectly: a still-live (non-aborted)
+    // handle would accept another `upload_part` call; an aborted one reports
+    // "handle not found".
+    let upload_after_abort = backend
+        .upload_part(
+            &backend_path,
+            &session.backend_upload_handle,
+            2,
+            0,
+            Bytes::from_static(b"x"),
+        )
+        .await;
+    assert!(
+        upload_after_abort.is_err(),
+        "the backend multipart handle must have been aborted (a post-sweep upload_part \
+         against it must fail), but it succeeded: {upload_after_abort:?}"
+    );
+
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("the session row itself is aborted, not deleted");
+    assert_eq!(
+        session_after.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "the session must be aborted"
+    );
+}
+
 // ── test 3: retention-policy expiry sweep ─────────────────────────────────────
 
 /// A file that matches a tenant-level age retention rule (max_age_days = 0)
@@ -885,8 +1353,6 @@ async fn sweep_reclaims_version_after_session_expires() {
 /// by inserting the rule directly through the store — bypassing the service's
 /// validation guard, the same way `expired_multipart_session_is_aborted_by_sweep`
 /// bypasses normal session creation to simulate a backdated row.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn retention_expired_file_is_deleted_by_sweep() {
     let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
@@ -894,7 +1360,10 @@ async fn retention_expired_file_is_deleted_by_sweep() {
     let ctx = ctx(tenant);
 
     // Create + upload + bind a file.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -969,8 +1438,6 @@ async fn retention_expired_file_is_deleted_by_sweep() {
 /// the sweep in the first place — `PolicyService::create_retention_rule`
 /// rejects it at write time (P2 remediation 0.11), so zero rows are ever
 /// written, and a file that would otherwise match survives the sweep.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn sweep_does_not_run_zero_age_rule() {
     let (svc, psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
@@ -1009,7 +1476,10 @@ async fn sweep_does_not_run_zero_age_rule() {
     );
 
     // Create + upload + bind a file that WOULD have matched a zero-age rule.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1045,8 +1515,6 @@ async fn sweep_does_not_run_zero_age_rule() {
 /// silently orphan the file's real, un-enumerated version blobs. A second,
 /// unrelated matching file (real `list_versions`) must still be deleted in
 /// the same sweep, proving one file's fault does not abort the whole sweep.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn expire_file_list_versions_error_does_not_delete_file() {
     let (svc, _psvc, _msvc, dp, store, _engine, backend) = build_all(86400).await;
@@ -1054,7 +1522,10 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
     let ctx = ctx(tenant);
 
     // The file whose `list_versions` call will be made to fail.
-    let faulted = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let faulted = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         faulted.file_id,
@@ -1069,7 +1540,10 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
         .unwrap();
 
     // A second, unrelated file with a real (non-faulted) `list_versions`.
-    let healthy = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let healthy = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         healthy.file_id,
@@ -1150,15 +1624,16 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
 }
 
 /// A file that does NOT match any retention rule is NOT deleted.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
 #[tokio::test]
 async fn file_without_matching_retention_rule_is_not_deleted() {
     let (svc, _psvc, _msvc, dp, _store, engine, _backend) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1192,8 +1667,6 @@ async fn file_without_matching_retention_rule_is_not_deleted() {
 /// - The file is readable via the service (content unchanged).
 /// - The version row points to the "alt" backend.
 /// - A `backend_migrate` audit row is written.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_moves_content_and_updates_version_row() {
     let (svc, dp, store, _engine) = build_all_dual_backend(86400).await;
@@ -1201,7 +1674,10 @@ async fn migrate_backend_moves_content_and_updates_version_row() {
     let ctx = ctx(tenant);
 
     // Create + upload + bind a file on the default "mem" backend.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1253,15 +1729,16 @@ async fn migrate_backend_moves_content_and_updates_version_row() {
 }
 
 /// Migrating to the same backend is a no-op.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_to_same_backend_is_noop() {
     let (svc, dp, store, _engine) = build_all_dual_backend(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1294,8 +1771,6 @@ async fn migrate_backend_to_same_backend_is_noop() {
 
 /// Versioned files (more than 1 version) cannot be migrated — the service
 /// returns `VersionedFileMigrationNotSupported`.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_rejects_versioned_file() {
     use file_storage::domain::error::DomainError;
@@ -1305,7 +1780,10 @@ async fn migrate_backend_rejects_versioned_file() {
     let ctx = ctx(tenant);
 
     // Create + upload v1, bind it.
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1434,8 +1912,6 @@ async fn build_all_dual_backend_scoped(
 /// A non-admin caller may not migrate content onto a non-durable ("alt",
 /// `InMemoryBackend`) target: `migrate_backend` must reject with `Forbidden`
 /// and the version row must stay unchanged.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
     let (svc, dp, store, authorizer) = build_all_dual_backend_scoped(86400).await;
@@ -1443,7 +1919,10 @@ async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file_owned_by(ctx.subject_id()), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1479,8 +1958,6 @@ async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
 
 /// An admin-scoped caller may migrate content onto a non-durable ("alt")
 /// target; the version row is updated as usual.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 #[tokio::test]
 async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
     let (svc, dp, store, authorizer) = build_all_dual_backend_scoped(86400).await;
@@ -1488,7 +1965,10 @@ async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1534,7 +2014,7 @@ async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
 ///
 /// Returns `(upload_id, version_id)`.
 async fn complete_one_part_multipart_upload(
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     svc: &FileService,
     store: &Store,
     backend: &Arc<dyn StorageBackend>,
@@ -1551,6 +2031,7 @@ async fn complete_one_part_multipart_upload(
             declared_size,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1584,9 +2065,11 @@ async fn complete_one_part_multipart_upload(
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap_completed();
     svc.bind(ctx, file_id, plan.version_id, None).await.unwrap();
 
     (plan.upload_id, plan.version_id)
@@ -1603,15 +2086,16 @@ async fn complete_one_part_multipart_upload(
 /// expired session outright, which would defeat the point of this test (it
 /// must exercise the sweep's session CAS losing against an
 /// already-`completed` row, not `complete` being rejected up front).
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     let (svc, _psvc, msvc, _dp, store, engine, backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let (upload_id, version_id) = complete_one_part_multipart_upload(
         &msvc,
         &svc,
@@ -1664,18 +2148,25 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
 }
 
 /// The reverse ordering: the sweep wins the session CAS *before* any
-/// `complete_multipart_upload` call for the same session. The version is
-/// deleted, the session is `aborted`, and a subsequent `complete` attempt is
-/// rejected.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
+/// `complete_multipart_upload` call for the same session. Both pending
+/// versions on this file (`create_file`'s own initial one, and the
+/// standalone multipart session's) are reclaimed by the same `grace = 0`
+/// sweep pass, so the file ends up a genuine zero-version, `NULL`-content_id
+/// orphan -- and, since FS-05/F10's fix, is now correctly reclaimed too
+/// (within this same sweep pass, once step 2 aborts the session that had
+/// been blocking step 1's own orphan-file check). A subsequent `complete`
+/// attempt therefore hits `FileNotFound` (the file itself is gone), not
+/// `MultipartUploadNotInProgress`.
 #[tokio::test]
 async fn sweep_before_complete_wins_cleans_up_expired_session() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1684,6 +2175,7 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
             13,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1703,6 +2195,11 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         result.expired_multipart_aborted, 1,
         "sweep must win the session CAS and abort the expired session"
     );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "FS-05/F10 fix: the now-zero-version parent file must also be reclaimed in this same \
+         sweep pass, via step 2's own orphan-file check (cleanup_expired_session_version)"
+    );
 
     // The pending version row must be gone.
     let version = store
@@ -1714,7 +2211,25 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         "pending version must be deleted once the sweep wins the session CAS"
     );
 
-    // A subsequent complete attempt for the same upload_id must be rejected.
+    // FS-05/F10 fix: the file itself must be gone too -- both of its
+    // versions (create_file's own initial one, and this multipart session's)
+    // were reclaimed by the same grace=0 sweep pass, leaving zero versions
+    // and a NULL content_id, and step 2's own orphan check (unblocked now
+    // that the session is aborted) correctly reclaims it.
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        matches!(
+            file_after,
+            Err(file_storage::domain::error::DomainError::FileNotFound { .. })
+        ),
+        "FS-05/F10 fix: expected the now-orphaned parent file to be reclaimed by the same sweep \
+         pass, got: {file_after:?}"
+    );
+
+    // A subsequent complete attempt for the same upload_id must be rejected
+    // -- FileNotFound now (the file itself is gone), not
+    // MultipartUploadNotInProgress (which would require the file to still
+    // exist for require_file to get past before reaching the session check).
     let err = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
@@ -1722,9 +2237,10 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
     assert!(
         matches!(
             err,
-            file_storage::domain::error::DomainError::MultipartUploadNotInProgress { .. }
+            file_storage::domain::error::DomainError::FileNotFound { .. }
         ),
-        "expected MultipartUploadNotInProgress after the sweep aborted the session, got {err:?}"
+        "expected FileNotFound after the sweep reclaimed both the session and its now-orphaned \
+         parent file, got {err:?}"
     );
 }
 
@@ -1732,15 +2248,16 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
 /// whose `expires_at` is already in the past but whose state is still
 /// `in_progress` (no sweep tick has run at all) must be rejected by
 /// `complete_multipart_upload` itself.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
 async fn complete_after_session_expired_is_rejected() {
     let (svc, _psvc, msvc, _dp, store, _engine, _backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1749,6 +2266,7 @@ async fn complete_after_session_expired_is_rejected() {
             13,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1785,8 +2303,6 @@ async fn complete_after_session_expired_is_rejected() {
 /// directly (as `abort_expired_multipart_session` does immediately after
 /// winning its own session CAS) and confirm the now-`Available` version is
 /// left untouched -- the status-guarded delete must match zero rows.
-///
-/// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
 async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_available_version()
 {
@@ -1794,7 +2310,10 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1803,6 +2322,7 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             5,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1841,9 +2361,11 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             None,
             None,
             finalize_audit,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .updated;
     assert!(
         finalized,
         "finalize_version must flip the pending version to available"
@@ -1864,6 +2386,120 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
     assert_eq!(after.status, VersionStatus::Available);
 }
 
+/// Step 1's sibling to
+/// [`sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_available_version`]:
+/// before the fix, `sweep_abandoned_pending` deleted its candidates with the
+/// unconditional `delete_version` instead of the status-guarded
+/// `delete_pending_version` step 2 already uses. A version finalized by a
+/// racing `finalize_upload` between `list_abandoned_pending_versions`
+/// returning the row and step 1's per-row delete running would therefore be
+/// deleted anyway -- destroying a just-finalized version row and its now-real
+/// backend blob.
+///
+/// Exercised directly against the now-`pub`
+/// `CleanupEngine::delete_abandoned_pending_version` (called by
+/// `sweep_abandoned_pending` per-row with the exact snapshot values
+/// `list_abandoned_pending_versions` returned) rather than via a real
+/// concurrent task, for the same determinism reason the step-2 sibling test
+/// above calls `cleanup_expired_session_version` directly.
+#[tokio::test]
+async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete() {
+    let (svc, _psvc, _msvc, _dp, store, engine, backend) = build_all(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    // Snapshot exactly what `list_abandoned_pending_versions` would have
+    // returned for this row (still `pending` at this point).
+    let candidate = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("pending version must exist");
+    assert_eq!(candidate.status, VersionStatus::Pending);
+
+    // Put real content at the version's backend path so a wrongful blob
+    // delete would be observable.
+    backend
+        .put(
+            &candidate.backend_path,
+            Bytes::from_static(b"finalized content"),
+        )
+        .await
+        .unwrap();
+
+    // Simulate the race: a client's `finalize_upload` wins between the list
+    // query and step 1's per-row delete, flipping the version
+    // `pending -> available`.
+    let finalize_audit = AuditEntry {
+        tenant_id: tenant,
+        actor_kind: "system".to_owned(),
+        actor_id: Uuid::nil(),
+        file_id: Some(ticket.file_id),
+        operation: AuditOperation::FinalizeVersion,
+        outcome: file_storage::domain::audit::AuditOutcome::Success,
+        detail: serde_json::json!({ "test": "step1 mid-flight simulation" }),
+        occurred_at: time::OffsetDateTime::now_utc(),
+    };
+    let finalized = store
+        .finalize_version(
+            ticket.file_id,
+            ticket.version_id,
+            17,
+            vec![0u8; 32],
+            file_storage::infra::content::hash_mode::HashMode::WholeSha256,
+            None,
+            None,
+            None,
+            finalize_audit,
+            None,
+        )
+        .await
+        .unwrap()
+        .updated;
+    assert!(finalized, "finalize_version must flip pending -> available");
+
+    // Invoke step 1's per-row delete directly with the stale (pre-finalize)
+    // snapshot -- exactly what `sweep_abandoned_pending` would do had this
+    // race landed inside a real `run_sweep()` call.
+    let (pending_deleted, files_deleted) = engine
+        .delete_abandoned_pending_version(
+            ticket.file_id,
+            ticket.version_id,
+            candidate.size,
+            &candidate.backend_id,
+            &candidate.backend_path,
+        )
+        .await;
+    assert_eq!(
+        (pending_deleted, files_deleted),
+        (0, 0),
+        "the status-guarded delete must match zero rows once the version is no \
+         longer pending"
+    );
+
+    // The version row must be untouched.
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must not be deleted by the mid-flight race");
+    assert_eq!(after.status, VersionStatus::Available);
+
+    // The backend blob must survive too -- proving `best_effort_delete` was
+    // never reached (it lives inside the `Ok(true)` branch of the guarded
+    // delete, which this race never takes).
+    let blob = backend.get(&candidate.backend_path).await;
+    assert!(
+        blob.is_ok(),
+        "the just-finalized backend blob must not be deleted, got {blob:?}"
+    );
+}
+
 // ── test: idempotency-key GC / outbox lock-in (P2 remediation 1.9) ─────────────
 
 /// `run_sweep()` deletes `idempotency_keys` rows whose `expires_at` is at or
@@ -1875,8 +2511,6 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
 /// `idempotency_key::Entity::find()` -- mirroring the pattern already used by
 /// `multipart_test.rs` for asserting DB state independent of the store's own
 /// read methods.
-///
-/// @cpt-cf-file-storage-fr-upload-idempotency
 #[tokio::test]
 async fn run_sweep_deletes_expired_idempotency_rows() {
     use sea_orm::EntityTrait;
@@ -1930,8 +2564,14 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     );
     let tenant_id = Uuid::now_v7();
     let ctx = ctx(tenant_id);
-    let expired_ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let live_ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let expired_ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let live_ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let conn = db.conn().expect("conn");
     let repo = IdempotencyRepo::new();
@@ -2012,9 +2652,6 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
 /// purge would silently drop events that were never delivered. This test seeds
 /// an ancient, unpublished row in each outbox table directly (there is no
 /// public API to backdate `occurred_at`) and confirms both survive a sweep.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
     use sea_orm::{EntityTrait, Set};
@@ -2112,7 +2749,6 @@ async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
 // `UPDATE` affect zero rows, so `migrate_backend` can detect and correctly
 // react to the race -- see the three-way branch below.
 //
-// @cpt-cf-file-storage-fr-backend-migration
 
 /// Two racers that both captured the SAME pre-migration `(backend_id,
 /// backend_path)` call `VersionRepo::rebind_backend` directly with that
@@ -2148,7 +2784,10 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
     let svc = FileService::new(store.clone(), backends, issuer, authorizer, cfg, None, None);
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let before = store
         .get_version(ticket.file_id, ticket.version_id)
@@ -2371,7 +3010,10 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
     let ctx = ctx(tenant);
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -2534,7 +3176,10 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
     let ctx = ctx(tenant);
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,

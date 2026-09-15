@@ -13,8 +13,6 @@
 //! `enforce_test.rs`'s `CappedQuota`/`ErroringQuota`), wired into
 //! `FileService`, `MultipartService`, and `CleanupEngine` so every
 //! `report_usage` call site in this remediation is exercised.
-//!
-//! @cpt-cf-file-storage-fr-usage-reporting
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -200,7 +198,7 @@ fn new_file(owner: Uuid) -> NewFile {
 /// part's declared byte length (`declared_size`, as an `i64`) — `file_id` is
 /// an input, not part of the return value.
 async fn drive_multipart_upload(
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     multipart_store: &Arc<dyn MultipartStore>,
     backend: &Arc<dyn StorageBackend>,
     ctx: &SecurityContext,
@@ -216,6 +214,7 @@ async fn drive_multipart_upload(
             declared_size,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -245,9 +244,11 @@ async fn drive_multipart_upload(
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap_completed();
 
     (
         plan.upload_id,
@@ -266,7 +267,10 @@ async fn finalize_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
 
     // `create_file` reports `+1 file / 0 bytes` -- confirms the pre-state
     // (0.12's premise) so the finalize credit below is proven to be the
@@ -319,7 +323,10 @@ async fn finalize_by_token_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let payload = Bytes::from_static(b"token-path payload bytes");
@@ -343,6 +350,7 @@ async fn finalize_by_token_reports_positive_byte_delta() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     svc.finalize_upload_by_token(&claims, size, digest)
         .await
@@ -367,7 +375,10 @@ async fn multipart_complete_reports_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let data = Bytes::from_static(b"multipart assembled payload bytes for usage credit");
@@ -407,7 +418,10 @@ async fn delete_version_reports_negative_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let v1_payload = Bytes::from_static(b"version one payload");
     dp.put_content(
         &ctx,
@@ -470,7 +484,10 @@ async fn sweep_reports_deltas_for_deleted_files() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let payload = Bytes::from_static(b"retention-swept payload");
     dp.put_content(
         &ctx,
@@ -534,7 +551,7 @@ async fn usage_deltas_sum_to_zero_over_create_upload_delete() {
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc
-        .create_file(&ctx, new_file(Uuid::now_v7()), None)
+        .create_file(&ctx, new_file(Uuid::now_v7()), None, false)
         .await
         .unwrap();
     dp.put_content(

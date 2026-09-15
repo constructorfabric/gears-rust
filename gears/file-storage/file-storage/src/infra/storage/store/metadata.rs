@@ -1,5 +1,7 @@
 //! Custom-metadata queries and the atomic patch operation.
 
+use std::collections::HashMap;
+
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -7,9 +9,9 @@ use uuid::Uuid;
 use file_storage_sdk::CustomMetadataEntry;
 use file_storage_sdk::CustomMetadataPatch;
 
-use crate::domain::audit::AuditEntry;
+use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::Store;
 
 impl Store {
@@ -27,18 +29,35 @@ impl Store {
             .await
     }
 
+    /// Batched counterpart of `list_metadata`: fetch custom-metadata entries
+    /// for a page of files in one query, grouped by `file_id`. `GET /files`
+    /// listing uses this instead of calling `list_metadata` once per file
+    /// (an N+1 query pattern that would scale with the page size).
+    pub async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .metadata
+            .list_for_files(&conn, &AccessScope::allow_all(), file_ids)
+            .await
+    }
+
     // ── atomic multi-step operations ─────────────────────────────────────────
 
     /// Bump `meta_version` and apply a JSON-merge patch, in a single
     /// transaction (DESIGN §3.7 metadata CAS). An audit row is written in the
-    /// same transaction on a successful patch.
+    /// same transaction on a successful patch, and an optional `FileEvent`
+    /// (`file.metadata_updated`) is enqueued alongside it — the events-aware
+    /// counterpart of the audit row, mirroring `bind_atomic_with_event` /
+    /// `transfer_ownership_atomic`.
     ///
     /// Returns `false` when `expected_meta_version` does not match the current
     /// row (caller maps to PreconditionFailed with "metadata revision changed
-    /// concurrently"; REST maps that canonical error to HTTP 400).
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
+    /// concurrently"; REST maps that canonical error to HTTP 400). No audit
+    /// row and no event are written in that case.
+    #[allow(clippy::too_many_arguments)]
     pub async fn patch_metadata_atomic(
         &self,
         scope: &AccessScope,
@@ -47,40 +66,100 @@ impl Store {
         patch: CustomMetadataPatch,
         now: OffsetDateTime,
         audit: AuditEntry,
+        event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
         let files = self.repos.files.clone();
         let metadata = self.repos.metadata.clone();
         let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         let patch_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let bumped = files
-                        .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
-                        .await?;
-                    if !bumped {
-                        return Ok(false);
+        let db = self.db.db();
+        // Retryable: this transaction touches `files` (the `meta_version`
+        // CAS) and `files_custom_metadata`, and shares the `files` row with
+        // both `finalize_version`'s auto-bind branch and
+        // `delete_file`/`delete_file_with_event` -- either of which can
+        // invert the lock order relative to this one under concurrent
+        // writers on the same file. See `db::transaction_with_bounded_retry`
+        // for the retry contract and per-attempt cloning (`patch` is
+        // `CustomMetadataPatch`, `#[derive(Clone)]` in `file-storage-sdk`).
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let metadata = metadata.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let patch_scope = patch_scope.clone();
+            let patch = patch.clone();
+            let audit = audit.clone();
+            let event = event.clone();
+            Box::pin(async move {
+                let Some(new_meta_version) = files
+                    .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                // Batch the patch instead of one delete-then-insert (or
+                // delete) per entry. Every touched key (both the ones being
+                // replaced and the ones being removed) is deleted in a
+                // single statement first -- upsert semantics, so the
+                // pre-existing row for a key being *set* must go too -- then
+                // every entry with a `Some` value is inserted in a single
+                // multi-row statement. Two statements for any patch that
+                // fits the backend's bind-parameter budget, which is every
+                // realistic one. A patch large enough to exceed that budget
+                // is split into a few more by
+                // `MetadataRepo::delete_keys`/`secure_insert_many`, both of
+                // which chunk against `max_bind_params_for` -- still a
+                // constant handful rather than a per-entry count, and all
+                // inside this one transaction.
+                //
+                // `patch.entries` is a plain `Vec<(String, Option<String>)>`
+                // (`file_storage_sdk::CustomMetadataPatch`) -- nothing
+                // upstream guarantees a client can't send the same key
+                // twice in one request. The old sequential per-entry
+                // loop naturally gave "last occurrence in the patch
+                // wins" for such a duplicate; a single multi-row INSERT
+                // with the same (file_id, key) twice would instead
+                // violate the primary key and fail the whole patch. The
+                // dedup below (last write in iteration order survives)
+                // preserves the exact old semantics before batching.
+                let all_keys: Vec<String> = patch.entries.iter().map(|(k, _)| k.clone()).collect();
+                metadata
+                    .delete_keys(tx, &AccessScope::allow_all(), file_id, &all_keys)
+                    .await?;
+                let mut deduped: HashMap<&str, &str> = HashMap::new();
+                for (k, v) in &patch.entries {
+                    if let Some(v) = v {
+                        deduped.insert(k.as_str(), v.as_str());
+                    } else {
+                        deduped.remove(k.as_str());
                     }
-                    for (key, value) in &patch.entries {
-                        match value {
-                            Some(v) => {
-                                metadata
-                                    .upsert(tx, &AccessScope::allow_all(), file_id, key, v, now)
-                                    .await?;
-                            }
-                            None => {
-                                metadata
-                                    .delete_key(tx, &AccessScope::allow_all(), file_id, key)
-                                    .await?;
-                            }
-                        }
+                }
+                let inserts: Vec<(String, String)> = deduped
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect();
+                metadata
+                    .insert_many(tx, &AccessScope::allow_all(), file_id, &inserts, now)
+                    .await?;
+                audit_repo.insert(tx, &audit).await?;
+                if let Some(mut ev) = event {
+                    // Stamp the authoritative post-bump revision the CAS
+                    // actually committed. The domain builds the event
+                    // before the transaction and cannot know the committed
+                    // value for an unconditional patch that raced another,
+                    // so the `meta_version` payload field is filled here.
+                    if let Some(obj) = ev.payload.as_object_mut() {
+                        obj.insert(
+                            "meta_version".to_owned(),
+                            serde_json::Value::from(new_meta_version),
+                        );
                     }
-                    // @cpt-cf-file-storage-nfr-audit-completeness
-                    audit_repo.insert(tx, &audit).await?;
-                    Ok::<bool, DomainError>(true)
-                })
+                    events_repo.enqueue(tx, &ev).await?;
+                }
+                Ok::<bool, DomainError>(true)
             })
-            .await
+        })
+        .await
     }
 }

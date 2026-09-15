@@ -18,6 +18,7 @@ fn sample_claims(op: Op, exp: i64) -> Claims {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 
@@ -123,6 +124,70 @@ fn token_from_other_key_is_rejected() {
 fn malformed_token_is_rejected() {
     let verifier = Issuer::generate(3600).unwrap().verifier();
     assert!(verifier.verify("not-a-token", now()).is_err());
+}
+
+// ── Multi-key `Verifier` (rotation without outage / without `kid`) ──────────
+
+#[test]
+fn from_public_key_still_works_as_a_single_key_verifier() {
+    // `from_public_key` must behave exactly as before the multi-key
+    // refactor: a thin single-element wrapper over `from_public_keys`.
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = Verifier::from_public_key(issuer.public_key()).unwrap();
+    let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
+    let token = issuer.issue(claims.clone(), now()).unwrap();
+    assert_eq!(verifier.verify(&token, now()).unwrap(), claims);
+}
+
+#[test]
+fn from_public_keys_accepts_a_token_signed_by_any_configured_key() {
+    let provider_a = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_b = Arc::new(Ed25519Provider::generate().unwrap());
+    let issuer_a =
+        Issuer::with_provider(Arc::clone(&provider_a) as Arc<dyn SignatureProvider>, 3600);
+    let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
+    let token = issuer_a.issue(claims.clone(), now()).unwrap();
+
+    // Primary (index 0) is B's key, previous (index 1) is A's -- the token
+    // was signed by A, so it must still verify via the second entry. This
+    // is the rotation-without-outage property: a sidecar configured with
+    // [new, old] keeps accepting tokens signed by the old (still-primary
+    // on the control plane) key.
+    let verifier =
+        Verifier::from_public_keys(vec![provider_b.public_key(), provider_a.public_key()]).unwrap();
+    assert_eq!(verifier.verify(&token, now()).unwrap(), claims);
+}
+
+#[test]
+fn from_public_keys_rejects_a_token_from_an_unlisted_key_with_the_same_error_as_a_single_wrong_key()
+{
+    let provider_a = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_b = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_c = Arc::new(Ed25519Provider::generate().unwrap());
+    let issuer_c =
+        Issuer::with_provider(Arc::clone(&provider_c) as Arc<dyn SignatureProvider>, 3600);
+    let token = issuer_c
+        .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
+        .unwrap();
+
+    let multi_key_err =
+        Verifier::from_public_keys(vec![provider_b.public_key(), provider_a.public_key()])
+            .unwrap()
+            .verify(&token, now())
+            .unwrap_err();
+    let single_key_err = Verifier::from_public_key(provider_b.public_key())
+        .unwrap()
+        .verify(&token, now())
+        .unwrap_err();
+
+    // A caller must not be able to tell from the error how many keys were
+    // configured or tried -- same message either way.
+    assert_eq!(multi_key_err.to_string(), single_key_err.to_string());
+}
+
+#[test]
+fn from_public_keys_rejects_an_empty_list() {
+    assert!(Verifier::from_public_keys(vec![]).is_err());
 }
 
 #[test]

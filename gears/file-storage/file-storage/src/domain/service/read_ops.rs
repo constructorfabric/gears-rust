@@ -42,6 +42,28 @@ impl FileService {
         Ok((file, meta))
     }
 
+    /// Batched custom-metadata lookup for `list_files`'s page of results:
+    /// one `IN (...)` query for every file id in `file_ids` instead of one
+    /// `list_metadata` call per file (`GET /files` was previously built with
+    /// an empty `custom_metadata` on every item -- see `handlers::list_files`).
+    ///
+    /// Takes raw file ids with **no `SecurityContext`/authorization check of
+    /// its own** -- it trusts the caller to have already authorized every id
+    /// in `file_ids` (e.g. via a preceding `list_files` call, which
+    /// tenant-scopes and owner-gates its results before returning them). It
+    /// is `pub(crate)`, not `pub`, precisely to keep its only intended caller
+    /// (`handlers::list_files`, same crate) from becoming a foot-gun for a
+    /// future caller reachable from outside this crate that might pass
+    /// unauthorized ids straight through to an unscoped batched DB read.
+    /// Do **not** call this with file ids that have not already come out of
+    /// an authorized listing for the current `SecurityContext`.
+    pub(crate) async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.store.list_metadata_for_files(file_ids).await
+    }
+
     /// List files for a mandatory owner filter, offset-paginated.
     pub async fn list_files(
         &self,
@@ -76,6 +98,24 @@ impl FileService {
         self.store
             .list_files(&Self::tenant_scope(ctx), owner, limit, offset)
             .await
+    }
+
+    /// Authorize `GET /storages` and `GET /storages/{id}` (backend
+    /// discovery). Both handlers previously extracted no `SecurityContext`
+    /// at all and called the synchronous, authz-free
+    /// `FileService::list_backends`/`get_backend` directly — any
+    /// authenticated subject of any tenant could enumerate backend ids and
+    /// capabilities. Those two methods stay synchronous and unauthorized
+    /// (their `AccessScope`-free signature is used elsewhere too, see
+    /// `domain/service/backend.rs`); this is a small async wrapper the
+    /// handlers call first, purely to gate the read behind the same
+    /// resource-less `READ` check the rest of this gear's coarse read paths
+    /// use (e.g. `list_files`, `list_retention_rules`).
+    pub async fn authorize_backends_read(&self, ctx: &SecurityContext) -> Result<(), DomainError> {
+        self.authorizer
+            .authorize(ctx, actions::READ, "", None)
+            .await
+            .map(|_| ())
     }
 
     // ── pub(crate) accessors for DataPlaneService ─────────────────────────────
@@ -168,6 +208,25 @@ impl FileService {
         self.store.list_versions_page(file_id, limit, offset).await
     }
 
+    /// Batched manifest lookup for `list_versions`'s page of results: one
+    /// `IN (...)` query for every version id in `version_ids` instead of one
+    /// `get_version_manifest` call per version. Only
+    /// `multipart-composite-sha256` versions have a manifest row, so
+    /// `whole-sha256` version ids are simply absent from the map.
+    ///
+    /// Takes raw version ids with **no `SecurityContext`/authorization check
+    /// of its own** — it trusts the caller to have already authorized every
+    /// id in `version_ids` (e.g. via a preceding `list_versions` call, which
+    /// tenant-scopes and `read`-authorizes the file before returning its
+    /// versions). It is `pub(crate)`, not `pub`, for exactly the same
+    /// foot-gun-avoidance reason as [`Self::list_metadata_for_files`] above.
+    pub(crate) async fn manifests_for_versions(
+        &self,
+        version_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+        self.store.get_version_manifests(version_ids).await
+    }
+
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
     pub async fn restore_version(
         &self,
@@ -187,8 +246,6 @@ impl FileService {
     /// an `If-Match` content-ETag precondition, then best-effort delete the
     /// backend blobs. `If-Match` is **required** (see api.md §DELETE); pass `"*"`
     /// to delete unconditionally when the ETag is unknown.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn delete_file(
         &self,
@@ -229,8 +286,6 @@ impl FileService {
     /// Inner (unconditional) file deletion: authorization and If-Match must have
     /// already been checked by the caller. Collects versions, removes the DB row
     /// (and FK children via cascade), then best-effort-deletes all backend blobs.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub(super) async fn delete_file_inner(
         &self,
         ctx: &SecurityContext,
@@ -243,7 +298,6 @@ impl FileService {
         // Collect backend blobs before the metadata row (and FK children) vanish.
         let versions = self.store.list_versions(file_id).await?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -251,7 +305,6 @@ impl FileService {
             serde_json::json!({ "version_count": versions.len() }),
         );
 
-        // @cpt-cf-file-storage-fr-file-events
         // We need the file's tenant/owner for the event payload; fetch before deletion.
         let file_meta = self.store.get_file(&scope, file_id).await?;
         let (event_tenant, event_owner) = file_meta.as_ref().map_or_else(
@@ -274,7 +327,6 @@ impl FileService {
             return Err(DomainError::file_not_found(file_id));
         }
 
-        // @cpt-cf-file-storage-fr-usage-reporting
         let total_bytes: i64 = versions.iter().map(|v| v.size).sum();
         self.report_usage(UsageDelta {
             tenant_id: event_tenant,
@@ -293,8 +345,6 @@ impl FileService {
 
     /// Delete a single version (and its backend blob). Deleting the only version
     /// is equivalent to deleting the file.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn delete_version(
         &self,
@@ -330,7 +380,6 @@ impl FileService {
             ));
         }
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -358,7 +407,6 @@ impl FileService {
                 None => DomainError::version_not_found(file_id, version_id),
             });
         }
-        // @cpt-cf-file-storage-fr-usage-reporting
         // Debit this non-current version's bytes. The `all.len() <= 1` branch
         // above already delegated to `delete_file_inner` (which reports its
         // own whole-file debit), so this arm only runs when at least one
@@ -376,3 +424,7 @@ impl FileService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "read_ops_tests.rs"]
+mod read_ops_tests;

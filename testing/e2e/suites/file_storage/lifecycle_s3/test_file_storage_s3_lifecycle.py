@@ -114,15 +114,16 @@ def test_s3_single_part_full_lifecycle(
         f"PUT {upload_url!r} failed: {upload_resp.status_code}\n{upload_resp.text}"
     )
 
-    # ── 3. Bind the version (first bind — no If-Match required) ──────────
-    bind_resp = client.post(
-        f"{API_BASE}/files/{file_id}/bind",
-        json={"version_id": version_id},
+    # ── 3. The upload already bound the content (auto-bind) ──────────────
+    # `bind: "auto"` is the default, so the sidecar's finalize callback swaps
+    # the content pointer in the same transaction that marks the version
+    # available. A separate `POST /bind` is no longer part of this flow and
+    # would be rejected without `If-Match`, content being already bound.
+    bound_resp = client.get(f"{API_BASE}/files/{file_id}")
+    assert bound_resp.status_code == 200, (
+        f"GET /files/{file_id} failed: {bound_resp.status_code}\n{bound_resp.text}"
     )
-    assert bind_resp.status_code == 200, (
-        f"POST /files/{file_id}/bind failed: {bind_resp.status_code}\n{bind_resp.text}"
-    )
-    bound_file = bind_resp.json()
+    bound_file = bound_resp.json()
     assert bound_file.get("content_id") == version_id
 
     # ── 4. Get a signed download URL from the control plane ───────────────

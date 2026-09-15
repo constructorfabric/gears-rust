@@ -11,8 +11,27 @@ use file_storage_sdk::{File, NewFile, OwnerFilter};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::{IdempotencyInsert, Store, pending_version};
+
+/// De-duplicate a new file's initial `custom_metadata` entries (last
+/// occurrence in the request wins) before batching them into one
+/// `MetadataRepo::insert_many` call. Nothing upstream (`NewFile::
+/// custom_metadata: Vec<CustomMetadataEntry>`) guarantees a client can't
+/// list the same key twice in one create request, and a single multi-row
+/// INSERT with the same `(file_id, key)` twice would violate the primary key
+/// and fail the whole create -- so duplicates must be resolved to "last one
+/// wins" before batching.
+fn dedup_initial_metadata(entries: &[(String, String)]) -> Vec<(String, String)> {
+    let mut deduped: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (k, v) in entries {
+        deduped.insert(k.as_str(), v.as_str());
+    }
+    deduped
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
 
 impl Store {
     // ── file queries ─────────────────────────────────────────────────────────
@@ -57,9 +76,6 @@ impl Store {
     /// write an audit row — both in a single transaction.
     ///
     /// Returns `true` if a row was removed.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_file(
         &self,
         scope: &AccessScope,
@@ -69,19 +85,26 @@ impl Store {
         let files = self.repos.files.clone();
         let audit_repo = self.repos.audit.clone();
         let del_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let removed = files.delete(tx, &del_scope, file_id).await?;
-                    if removed {
-                        // @cpt-cf-file-storage-nfr-audit-completeness
-                        audit_repo.insert(tx, &audit).await?;
-                    }
-                    Ok::<bool, DomainError>(removed)
-                })
+        let db = self.db.db();
+        // Retryable: `files.delete` cascades (FK `ON DELETE CASCADE`) into
+        // `file_versions`, i.e. this transaction locks `files` then
+        // `file_versions` -- the opposite order from `finalize_version`'s
+        // auto-bind branch (`file_versions` then `files`). See
+        // `db::transaction_with_bounded_retry` for the retry contract.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let audit_repo = audit_repo.clone();
+            let del_scope = del_scope.clone();
+            let audit = audit.clone();
+            Box::pin(async move {
+                let removed = files.delete(tx, &del_scope, file_id).await?;
+                if removed {
+                    audit_repo.insert(tx, &audit).await?;
+                }
+                Ok::<bool, DomainError>(removed)
             })
-            .await
+        })
+        .await
     }
 
     // ── create ───────────────────────────────────────────────────────────────
@@ -91,9 +114,6 @@ impl Store {
     /// leave a visible file with no version (or partial metadata) behind.
     ///
     /// An audit row is written in the same transaction.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn create_file_with_pending_version(
         &self,
@@ -145,12 +165,16 @@ impl Store {
                     versions
                         .insert(tx, &AccessScope::allow_all(), &pending)
                         .await?;
-                    for (key, value) in &metadata_entries {
-                        metadata
-                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
-                            .await?;
-                    }
-                    // @cpt-cf-file-storage-nfr-audit-completeness
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     Ok::<(), DomainError>(())
                 })
@@ -158,7 +182,7 @@ impl Store {
             .await
     }
 
-    // ── file-events variants (P2-M5) ─────────────────────────────────────────
+    // ── file-events variants ─────────────────────────────────────────────────
 
     /// Delete a file row (FK cascade removes versions + custom metadata),
     /// optionally enqueue a file-event, and write an audit row — all in a
@@ -168,10 +192,6 @@ impl Store {
     ///
     /// This is the events-aware variant of [`delete_file`]; the original method
     /// is preserved for callers that do not need event enqueuing.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     pub async fn delete_file_with_event(
         &self,
         scope: &AccessScope,
@@ -183,43 +203,60 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let del_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let removed = files.delete(tx, &del_scope, file_id).await?;
-                    if removed {
-                        audit_repo.insert(tx, &audit).await?;
-                        if let Some(ev) = event {
-                            events_repo.enqueue(tx, &ev).await?;
-                        }
+        let db = self.db.db();
+        // Retryable for the same reason as `delete_file` (see its comment):
+        // `files` then cascaded `file_versions`, opposite `finalize_version`'s
+        // auto-bind order.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let del_scope = del_scope.clone();
+            let audit = audit.clone();
+            let event = event.clone();
+            Box::pin(async move {
+                let removed = files.delete(tx, &del_scope, file_id).await?;
+                if removed {
+                    audit_repo.insert(tx, &audit).await?;
+                    if let Some(ev) = event {
+                        events_repo.enqueue(tx, &ev).await?;
                     }
-                    Ok::<bool, DomainError>(removed)
-                })
+                }
+                Ok::<bool, DomainError>(removed)
             })
-            .await
+        })
+        .await
     }
 
     /// Delete the parent `files` row left behind by an abandoned
-    /// pending-version orphan (P2 2.8), re-verifying **inside this
-    /// transaction** that the file still has zero remaining versions and a
-    /// `NULL` `content_id` before deleting it.
+    /// pending-version orphan.
     ///
     /// Unlike [`Self::delete_file_with_event`] (unconditional -- used by the
     /// retention-expiry sweep, which has already decided the file must go
-    /// regardless of its version count), this method re-reads `files`/
-    /// `versions` fresh inside the same transaction that performs the
-    /// delete, so a version inserted or bound between the caller's
-    /// pre-check (`list_versions` + `get_file`) and this call is guaranteed
-    /// to be seen and aborts the deletion -- the DELETE simply matches zero
-    /// intent and the file (with its new version) is left untouched.
+    /// regardless of its version count), this method re-verifies the orphan
+    /// condition (`content_id IS NULL` and zero version rows) as part of
+    /// **the same conditional `DELETE` statement** that removes the row --
+    /// see [`crate::infra::storage::repo::FileRepo::delete_if_orphan`]'s doc
+    /// comment for the full reasoning.
     ///
-    /// Returns `true` if the file row was removed; `false` if the guard
-    /// failed (a version now exists or content is bound) or the row was
+    /// This used to re-read `files`/`versions` with two plain `SELECT`s
+    /// inside the transaction before an unconditional delete, on the theory
+    /// that a version inserted between the caller's pre-check and this call
+    /// was "guaranteed to be seen" -- that was **incorrect** under `READ
+    /// COMMITTED` (ordinary `SELECT`s take no locks and each is its own
+    /// snapshot, so a concurrently-inserted, autocommitted pending version
+    /// could be missed and then cascade-deleted along with the file; SQLite
+    /// does not reproduce this, which is why it went unnoticed). Delegating
+    /// the whole guard to `delete_if_orphan`'s single statement narrows that
+    /// window to the span of one statement and removes the `content_id` half
+    /// of it entirely -- but it does not eliminate the version half on
+    /// PostgreSQL, for the MVCC reason spelled out in that method's own doc
+    /// comment. Do not read this call as race-free; read it as "no longer
+    /// racy between two application-level reads".
+    ///
+    /// Returns `true` if the file row was removed; `false` if the guard did
+    /// not match (a version now exists or content is bound) or the row was
     /// already gone (e.g. a concurrent sweep).
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn delete_orphan_file_with_event(
         &self,
         file_id: Uuid,
@@ -227,38 +264,32 @@ impl Store {
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
         let files = self.repos.files.clone();
-        let versions = self.repos.versions.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let scope = AccessScope::allow_all();
-                    // Re-check both halves of the orphan guard fresh, inside
-                    // this transaction, rather than trusting the caller's
-                    // pre-transaction snapshot.
-                    let Some(file) = files.get(tx, &scope, file_id).await? else {
-                        return Ok::<bool, DomainError>(false);
-                    };
-                    if file.content_id.is_some() {
-                        return Ok(false);
+        let db = self.db.db();
+        // Retryable: `delete_if_orphan` still touches `files` first (its
+        // guard re-reads `content_id`/version count before deleting), the
+        // same exposure as `delete_file`/`delete_file_with_event` against
+        // `finalize_version`'s reversed lock order.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let audit = audit.clone();
+            let event = event.clone();
+            Box::pin(async move {
+                let scope = AccessScope::allow_all();
+                let removed = files.delete_if_orphan(tx, &scope, file_id).await? > 0;
+                if removed {
+                    audit_repo.insert(tx, &audit).await?;
+                    if let Some(ev) = event {
+                        events_repo.enqueue(tx, &ev).await?;
                     }
-                    let remaining = versions.list_by_file(tx, &scope, file_id, 1, 0).await?;
-                    if !remaining.is_empty() {
-                        return Ok(false);
-                    }
-                    let removed = files.delete(tx, &scope, file_id).await?;
-                    if removed {
-                        audit_repo.insert(tx, &audit).await?;
-                        if let Some(ev) = event {
-                            events_repo.enqueue(tx, &ev).await?;
-                        }
-                    }
-                    Ok(removed)
-                })
+                }
+                Ok::<bool, DomainError>(removed)
             })
-            .await
+        })
+        .await
     }
 
     /// Create a new file + pending version + initial metadata + optional event,
@@ -266,10 +297,6 @@ impl Store {
     ///
     /// This is the events-aware variant of [`create_file_with_pending_version`];
     /// the original is preserved for callers that do not need event enqueuing.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-cf-file-storage-fr-file-events
-    /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
     pub async fn create_file_with_pending_version_and_event(
         &self,
@@ -324,21 +351,96 @@ impl Store {
                     versions
                         .insert(tx, &AccessScope::allow_all(), &pending)
                         .await?;
-                    for (key, value) in &metadata_entries {
-                        metadata
-                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
-                            .await?;
-                    }
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;
                     }
                     // Persist the idempotency record in the same transaction, so
-                    // a committed create always has a replay record. A PK
-                    // conflict (concurrent duplicate) is tolerated inside the
-                    // repo; any real DB error rolls the whole creation back.
+                    // a committed create always has a replay record. Only a
+                    // *lapsed* row for the same key is deleted first inside the
+                    // repo (an expired row's PK would otherwise collide with a
+                    // legitimate new insert); a live-key PK conflict from a
+                    // concurrent duplicate create is NOT tolerated — every
+                    // failure, including that conflict, is propagated by
+                    // `IdempotencyRepo::insert` and rolls this whole creation
+                    // back, so the racing caller retries and replays the
+                    // winner's record via `get` instead of ending up with two
+                    // files (see `IdempotencyRepo::insert`'s doc comment).
                     if let Some(idem) = idempotency {
                         idempotency_repo.insert(tx, &idem, file_id, now).await?;
+                    }
+                    Ok::<(), DomainError>(())
+                })
+            })
+            .await
+    }
+
+    /// Create the file row (+ initial custom metadata, audit, optional event)
+    /// WITHOUT pre-registering any version. Used by the merged `POST /files`
+    /// create+plan path, where the multipart
+    /// initiate that follows registers its own pending version — the
+    /// pre-registered single-part version of
+    /// [`Self::create_file_with_pending_version_and_event`] would only become
+    /// an orphan here.
+    pub async fn create_file_with_event(
+        &self,
+        new: &NewFile,
+        file_id: Uuid,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<(), DomainError> {
+        let file = File {
+            file_id,
+            tenant_id,
+            owner_kind: new.owner_kind,
+            owner_id: new.owner_id,
+            name: new.name.clone(),
+            gts_file_type: new.gts_file_type.clone(),
+            content_id: None,
+            meta_version: 0,
+            created_at: now,
+            last_modified_at: now,
+        };
+        let metadata_entries: Vec<(String, String)> = new
+            .custom_metadata
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+
+        let files = self.repos.files.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    files.create(tx, &AccessScope::allow_all(), &file).await?;
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
+                    audit_repo.insert(tx, &audit).await?;
+                    if let Some(ev) = event {
+                        events_repo.enqueue(tx, &ev).await?;
                     }
                     Ok::<(), DomainError>(())
                 })
@@ -349,8 +451,6 @@ impl Store {
     /// List file-event rows for a specific file ordered by occurrence time.
     ///
     /// Intended for testing; not exposed on the REST API.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub async fn list_file_events(
         &self,
         file_id: Uuid,

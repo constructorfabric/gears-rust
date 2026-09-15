@@ -1,9 +1,7 @@
 //! P1 initial migration — control-plane metadata tables.
 //!
-//! Mirrors the P1 section of `gears/file-storage/docs/migration.sql`:
-//!   - @cpt-cf-file-storage-dbtable-files
-//!   - @cpt-cf-file-storage-dbtable-file-versions
-//!   - @cpt-cf-file-storage-dbtable-files-custom-metadata
+//! Mirrors the P1 section of `gears/file-storage/docs/migration.sql`, creating
+//! the `files`, `file_versions` and `files_custom_metadata` tables.
 //!
 //! No bytes live here — content moves over signed URLs against the sidecar
 //! (ADR-0003). Postgres uses the dedicated `file_storage` schema; `SQLite` (tests)
