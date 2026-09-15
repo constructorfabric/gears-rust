@@ -111,6 +111,8 @@ fn if_match_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 

@@ -4640,6 +4640,50 @@
         ],
         "type": "object"
       },
+      "DeleteEntitiesRequest": {
+        "description": "A deletion batch.",
+        "properties": {
+          "dry_run": {
+            "description": "Predict without changing entities. Defaults to `false`; part of the idempotency fingerprint.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "items": {
+            "description": "No `max_items`: the ceiling is `limits.batch_candidates`, which a deployment\nconfigures. A literal here would be a second, fixed number that disagrees\nwith the server the moment anyone changes that setting. `RegistryService::delete`\nenforces the real one before reading anything.",
+            "items": {
+              "$ref": "#/components/schemas/DeleteEntityDto"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DeleteEntityDto": {
+        "description": "A batch deletion target, resolved like `GET /entities/{entity_key}`.",
+        "properties": {
+          "expected_resource_version": {
+            "description": "Required positive version. Optional in Rust so acceptance returns the same\n`400 deletion_requires_version` on both deletion routes rather than letting\nthe extractor answer first.\n\n`value_type = i64` alongside `required` is what keeps the generated schema a\nplain `integer`: `required` on its own leaves the property nullable, so the\ndocument would promise that an explicit `null` is accepted while acceptance\nanswers `400` — and it would disagree with the DELETE route, which declares\nthe same precondition as a non-nullable `integer` query parameter.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "expected_resource_version"
+        ],
+        "type": "object"
+      },
       "DeltaData": {
         "description": "Delta text chunk.",
         "properties": {
@@ -53182,6 +53226,195 @@
       }
     },
     "/types-registry/v2/entities/{entity_key}": {
+      "delete": {
+        "description": "Delete a single entity named by canonical GTS identifier or Registry Reference UUID, resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. One item's worth of :batchDelete. Returns 202 with the operation's Location; a stale version is reported as a terminal `precondition_failed` item rather than a 412, and If-Match is refused rather than ignored.",
+        "operationId": "types_registry.delete_entity",
+        "parameters": [
+          {
+            "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry Reference UUID",
+            "in": "path",
+            "name": "entity_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required and positive: the resource_version the caller observed. Absent, non-numeric or zero is a 400; a mismatch is reported on the operation item",
+            "in": "query",
+            "name": "expected_resource_version",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run the whole check sequence and commit nothing. Defaults to false",
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Replay of an operation that is already terminal",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Accepted; poll the operation at the returned Location",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Suggested delay in seconds before polling the operation",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete one GTS entity",
+        "tags": [
+          "Types Registry"
+        ]
+      },
       "get": {
         "description": "Return one entity with its authored document and the effective artifacts materialized at admission. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it. A deleted entity is still readable and reports its lifecycle status.",
         "operationId": "types_registry.get_entity",
@@ -53294,6 +53527,209 @@
           }
         ],
         "summary": "Get a GTS entity by identifier or Registry Reference",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/entities:batchDelete": {
+      "post": {
+        "description": "Submit one or more entities for deletion. Each item names its target in `key` (a canonical GTS identifier or the Registry Reference UUID derived from it) and carries a required positive `expected_resource_version`. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-item outcome. Outcomes are keyed by GTS identifier and reported in request order, so a caller that deleted by Registry Reference matches results to requests by position. A stale version is not a 412: it is reported as a terminal `precondition_failed` item on the operation.",
+        "operationId": "types_registry.batch_delete_entities",
+        "parameters": [
+          {
+            "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteEntitiesRequest"
+              }
+            }
+          },
+          "description": "Entities to delete",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Replay of an operation that is already terminal",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Accepted; poll the operation at the returned Location",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Suggested delay in seconds before polling the operation",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Submit GTS entities for deletion",
         "tags": [
           "Types Registry"
         ]

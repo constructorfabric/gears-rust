@@ -425,6 +425,9 @@ jobs:
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
 
+      - name: Test types-registry (db integration)
+        run: make test-types-registry-db
+
   test-fips:
     name: FIPS verification (${{ matrix.os }})
     needs: changes

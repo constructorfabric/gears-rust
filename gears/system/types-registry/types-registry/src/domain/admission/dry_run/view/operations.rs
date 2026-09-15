@@ -11,6 +11,7 @@ use super::{AdmissionView, ItemOutcomeWrite, unsupported};
 use crate::domain::admission::fingerprint::ScopeHash;
 use crate::domain::ports::{
     ItemSuccess, NewOperation, NewOperationItem, OperationItemRow, OperationRow, OperationStore,
+    RecoveryCursor,
 };
 
 #[async_trait]
@@ -34,6 +35,18 @@ impl OperationStore for AdmissionView {
         id: Uuid,
     ) -> Result<Option<OperationRow>, ScopeError> {
         self.base.find_by_id(tx, scope, id).await
+    }
+
+    async fn find_nonterminal_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ScopeError> {
+        self.base
+            .find_nonterminal_ids(tx, scope, after, limit)
+            .await
     }
 
     async fn insert_operation(
@@ -81,6 +94,18 @@ impl OperationStore for AdmissionView {
     }
 
     async fn mark_completed(
+        &self,
+        _tx: &DbTx<'_>,
+        _scope: &AccessScope,
+        _id: Uuid,
+        _now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        Err(unsupported(
+            "an admission view does not move the operation row; the pass owns that",
+        ))
+    }
+
+    async fn mark_abandoned(
         &self,
         _tx: &DbTx<'_>,
         _scope: &AccessScope,

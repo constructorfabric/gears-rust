@@ -15,6 +15,7 @@ use super::AdmissionFailureReason as Reason;
 fn known() -> Vec<Reason> {
     vec![
         Reason::ActivationWriteSetExceeded,
+        Reason::AdmissionAbandoned,
         Reason::AlreadyExists,
         Reason::BaselineUnresolvable,
         Reason::BlockedByDependency,
@@ -48,7 +49,7 @@ fn known() -> Vec<Reason> {
 
 /// The count [`known`] must have. Bumped deliberately, which is the point: a
 /// variant added without a thought about the dashboards reading it fails here.
-const KNOWN_VARIANTS: usize = 29;
+const KNOWN_VARIANTS: usize = 30;
 
 /// Read variant names from the enum source, failing on unexpected syntax
 /// rather than returning an incomplete vocabulary.
@@ -113,6 +114,7 @@ fn variant_name(reason: &Reason) -> &'static str {
     {
         match reason {
             Reason::ActivationWriteSetExceeded => "ActivationWriteSetExceeded",
+            Reason::AdmissionAbandoned => "AdmissionAbandoned",
             Reason::AlreadyExists => "AlreadyExists",
             Reason::BaselineUnresolvable => "BaselineUnresolvable",
             Reason::BlockedByDependency => "BlockedByDependency",

@@ -197,6 +197,28 @@ pub enum StoreBuildError {
     Register { gts_id: String, source: StoreError },
 }
 
+impl StoreBuildError {
+    /// Whether a redelivery can reach a different answer.
+    ///
+    /// Only [`Self::Storage`] can: it wraps the closure read's `ScopeError`, which
+    /// is the same contention `WorkerError::Storage` retries. Every other variant
+    /// is a statement about stored data or about this unit's own shape, and a
+    /// reread produces it again.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        match self {
+            Self::Storage(_) => true,
+            Self::MissingDocument { .. }
+            | Self::Content { .. }
+            | Self::MissingDialect { .. }
+            | Self::Duplicate { .. }
+            | Self::InstanceWithoutType { .. }
+            | Self::MissingValue { .. }
+            | Self::Register { .. } => false,
+        }
+    }
+}
+
 /// Register one Instance into the store, with the conforming type it declares by
 /// its identifier.
 ///

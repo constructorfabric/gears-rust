@@ -20,8 +20,8 @@ use types_registry::domain::ports::{
     DependencyStore, EdgeSide, EntityEdge, EntityRow, EntityStore, EntityWriteOrderStore,
     InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
     NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, ReverseImpact, Stores, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    OperationRow, OperationStore, RecoveryCursor, ReverseImpact, Stores, TypeSchemaStore,
+    VersionFamilyRow, VersionFamilyStore,
 };
 use uuid::Uuid;
 
@@ -64,6 +64,19 @@ pub trait StoreHooks: Send + Sync {
         false
     }
 
+    /// Return `true` to fail the item-success write, which is used to verify
+    /// that a deletion and its operation outcome share one transaction.
+    fn fail_mark_item_succeeded(&self) -> bool {
+        false
+    }
+
+    /// Return `true` to fail `mark_running`, which is the first write a pass makes.
+    /// The operation is still `pending` when the failure surfaces, which is the
+    /// state abandonment has to terminalize from.
+    fn fail_mark_running(&self) -> bool {
+        false
+    }
+
     /// Return `true` to simulate a deletion losing its race: the entity read
     /// inside the commit saw `ACTIVE` at the expected version, and the write
     /// then matched nothing. Both preconditions live in the statement's
@@ -71,6 +84,42 @@ pub trait StoreHooks: Send + Sync {
     /// writer that ignores the `entity_write_order` claim — and there is none.
     fn refuse_deletion(&self, _entity_id: i64) -> bool {
         false
+    }
+
+    /// Called on every `find_items` invocation. When `Some` is returned it is
+    /// used as the result instead of the real database read; subsequent calls
+    /// fall through to the real store. Used to inject a stale snapshot so that
+    /// the real item CAS misses deterministically — without timing or mocking.
+    fn take_stale_find_items_snapshot(&self) -> Option<Vec<OperationItemRow>> {
+        None
+    }
+
+    /// Return `true` to fail the operation read by id, which is how a status
+    /// that cannot be read is put under test. It is the only read on the path
+    /// the outbox takes once a delivery budget is spent.
+    fn fail_find_by_id(&self) -> bool {
+        false
+    }
+
+    /// Return `Some` to make the operation read by id sleep that long before it
+    /// answers, which is how a read that outlives its caller's budget is put
+    /// under test. A failure returns; a stall is what a caller has to bound.
+    fn stall_find_by_id(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Return `Some` to make the abandonment write sleep that long. Stalling it
+    /// alongside [`Self::stall_find_by_id`] is what distinguishes a caller that
+    /// budgets the whole path from one that budgets each call separately.
+    fn stall_mark_abandoned(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Return `Some` to make `mark_running` sleep that long. Together with
+    /// [`Self::fail_mark_running`] it spends part of a pass before admission
+    /// fails, which is what reveals a deadline recomputed after admission.
+    fn stall_mark_running(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 
@@ -211,6 +260,28 @@ impl StoreHooks for CompletionFailureHooks {
     }
 }
 
+/// Fails the item-success write and nothing else.
+pub struct ItemSuccessFailureHooks;
+
+impl StoreHooks for ItemSuccessFailureHooks {
+    fn fail_mark_item_succeeded(&self) -> bool {
+        true
+    }
+}
+
+/// Returns a saved Pending snapshot on the first `find_items` call and
+/// delegates to the real store on all subsequent calls, so the real item-CAS
+/// miss happens deterministically without any timing dependency.
+pub struct StaleFirstFindItemsHooks {
+    snapshot: parking_lot::Mutex<Option<Vec<OperationItemRow>>>,
+}
+
+impl StoreHooks for StaleFirstFindItemsHooks {
+    fn take_stale_find_items_snapshot(&self) -> Option<Vec<OperationItemRow>> {
+        self.snapshot.lock().take()
+    }
+}
+
 impl TestStores<CompletionFailureHooks> {
     /// Ports whose `mark_completed` always fails, so a publication that includes
     /// it must leave every item write behind with it.
@@ -219,6 +290,140 @@ impl TestStores<CompletionFailureHooks> {
         Arc::new(Self {
             inner: stores(),
             hooks: CompletionFailureHooks,
+        })
+    }
+}
+
+pub struct RunningFailureHooks;
+
+impl StoreHooks for RunningFailureHooks {
+    fn fail_mark_running(&self) -> bool {
+        true
+    }
+}
+
+impl TestStores<RunningFailureHooks> {
+    /// Ports whose `mark_running` always fails, so the pass aborts while the
+    /// operation is still `pending`.
+    #[must_use]
+    pub fn failing_running() -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: RunningFailureHooks,
+        })
+    }
+}
+
+impl TestStores<ItemSuccessFailureHooks> {
+    /// Ports whose deletion item-success write always fails, so the entity
+    /// mutation must roll back with it.
+    #[must_use]
+    pub fn failing_item_success() -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: ItemSuccessFailureHooks,
+        })
+    }
+}
+
+pub struct OperationReadFailureHooks;
+
+impl StoreHooks for OperationReadFailureHooks {
+    fn fail_find_by_id(&self) -> bool {
+        true
+    }
+}
+
+impl TestStores<OperationReadFailureHooks> {
+    /// Ports whose operation read always fails, so a caller that has to decide
+    /// from the stored status cannot learn it.
+    #[must_use]
+    pub fn failing_operation_read() -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: OperationReadFailureHooks,
+        })
+    }
+}
+
+pub struct StallHooks {
+    delay: std::time::Duration,
+}
+
+impl StoreHooks for StallHooks {
+    fn stall_find_by_id(&self) -> Option<std::time::Duration> {
+        Some(self.delay)
+    }
+
+    fn stall_mark_abandoned(&self) -> Option<std::time::Duration> {
+        Some(self.delay)
+    }
+}
+
+impl TestStores<StallHooks> {
+    /// Ports whose operation read *and* abandonment write each sleep for `delay`.
+    /// Pass a delay far longer than the caller's own budget: the caller must be
+    /// what ends the call, not the store. Stalling both is what separates a caller
+    /// that budgets the whole path from one that budgets each call.
+    #[must_use]
+    pub fn stalling_status_path(delay: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: StallHooks { delay },
+        })
+    }
+}
+
+/// Spends `admit` on a pass that then fails, and stalls the abandonment that
+/// follows it.
+pub struct SlowAdmissionThenStalledAbandonHooks {
+    admit: std::time::Duration,
+    abandon: std::time::Duration,
+}
+
+impl StoreHooks for SlowAdmissionThenStalledAbandonHooks {
+    fn stall_mark_running(&self) -> Option<std::time::Duration> {
+        Some(self.admit)
+    }
+
+    fn fail_mark_running(&self) -> bool {
+        true
+    }
+
+    fn stall_mark_abandoned(&self) -> Option<std::time::Duration> {
+        Some(self.abandon)
+    }
+}
+
+impl TestStores<SlowAdmissionThenStalledAbandonHooks> {
+    /// Ports whose `mark_running` sleeps for `admit` and then fails, and whose
+    /// abandonment write then sleeps for `abandon`. A handler that derives the
+    /// abandonment's deadline after admission has returned gives it a budget that
+    /// ignores the `admit` already spent; one deadline for the delivery does not.
+    #[must_use]
+    pub fn slow_admission_then_stalled_abandon(
+        admit: std::time::Duration,
+        abandon: std::time::Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: SlowAdmissionThenStalledAbandonHooks { admit, abandon },
+        })
+    }
+}
+
+impl TestStores<StaleFirstFindItemsHooks> {
+    /// Returns the `snapshot` on the first `find_items` call, then delegates to
+    /// the real store. The real `mark_item_succeeded` CAS then misses when the
+    /// item has already been terminalized in the database, producing a
+    /// deterministic `Ok(false)` without mocking or timing.
+    #[must_use]
+    pub fn with_stale_snapshot(snapshot: Vec<OperationItemRow>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: StaleFirstFindItemsHooks {
+                snapshot: parking_lot::Mutex::new(Some(snapshot)),
+            },
         })
     }
 }
@@ -403,6 +608,15 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
         gts_uuid: Uuid,
     ) -> Result<Option<EntityRow>, ScopeError> {
         self.inner.find_by_gts_uuid(tx, scope, gts_uuid).await
+    }
+
+    async fn find_by_gts_uuids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
     async fn kind_in_family(
@@ -599,7 +813,27 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         scope: &AccessScope,
         id: Uuid,
     ) -> Result<Option<OperationRow>, ScopeError> {
+        if self.hooks.fail_find_by_id() {
+            return Err(ScopeError::Invalid(
+                "this operation's status read is under failure injection",
+            ));
+        }
+        if let Some(delay) = self.hooks.stall_find_by_id() {
+            tokio::time::sleep(delay).await;
+        }
         self.inner.find_by_id(tx, scope, id).await
+    }
+
+    async fn find_nonterminal_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ScopeError> {
+        self.inner
+            .find_nonterminal_ids(tx, scope, after, limit)
+            .await
     }
 
     async fn insert_operation(
@@ -627,6 +861,9 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         scope: &AccessScope,
         operation_id: Uuid,
     ) -> Result<Vec<OperationItemRow>, ScopeError> {
+        if let Some(snapshot) = self.hooks.take_stale_find_items_snapshot() {
+            return Ok(snapshot);
+        }
         self.inner.find_items(tx, scope, operation_id).await
     }
 
@@ -637,6 +874,14 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         id: Uuid,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
+        if let Some(delay) = self.hooks.stall_mark_running() {
+            tokio::time::sleep(delay).await;
+        }
+        if self.hooks.fail_mark_running() {
+            return Err(ScopeError::Invalid(
+                "this operation's running move is under failure injection",
+            ));
+        }
         self.inner.mark_running(tx, scope, id, now).await
     }
 
@@ -655,6 +900,19 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         self.inner.mark_completed(tx, scope, id, now).await
     }
 
+    async fn mark_abandoned(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        if let Some(delay) = self.hooks.stall_mark_abandoned() {
+            tokio::time::sleep(delay).await;
+        }
+        self.inner.mark_abandoned(tx, scope, id, now).await
+    }
+
     async fn mark_item_succeeded(
         &self,
         tx: &DbTx<'_>,
@@ -663,6 +921,11 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         outcome: ItemSuccess,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
+        if self.hooks.fail_mark_item_succeeded() {
+            return Err(ScopeError::Invalid(
+                "this item's success write is under failure injection",
+            ));
+        }
         self.inner
             .mark_item_succeeded(tx, scope, item_id, outcome, now)
             .await

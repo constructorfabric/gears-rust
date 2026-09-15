@@ -143,6 +143,33 @@ impl EntityStore for AdmissionView {
         self.base.find_by_gts_uuid(tx, scope, gts_uuid).await
     }
 
+    /// Overlay first, then one batched read for whatever the overlay does not
+    /// hold, so an overlaid candidate is never shadowed by its stored row.
+    async fn find_by_gts_uuids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        let overlay = self.overlay().await;
+        let mut rows = Vec::new();
+        let mut unresolved = Vec::new();
+        for gts_uuid in gts_uuids {
+            if let Some(row) = overlay.entity_by_uuid(*gts_uuid) {
+                rows.push(row.as_ref().clone());
+            } else {
+                unresolved.push(*gts_uuid);
+            }
+        }
+        drop(overlay);
+        if !unresolved.is_empty() {
+            rows.extend(self.base.find_by_gts_uuids(tx, scope, &unresolved).await?);
+        }
+        rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
+        rows.dedup_by(|a, b| a.id == b.id);
+        Ok(rows)
+    }
+
     /// Stored members determine family kind; otherwise consult the overlay.
     async fn kind_in_family(
         &self,

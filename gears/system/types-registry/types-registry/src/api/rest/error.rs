@@ -134,6 +134,12 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::CorruptDocument(detail) => {
                 opaque_internal(&detail, "stored document parse")
             }
+            // Match GET's unresolved-key response (DESIGN §3.3).
+            ServiceError::UnresolvedReference { gts_uuid } => TypeRegistryError::not_found(
+                format!("No entity with Registry Reference: {gts_uuid}"),
+            )
+            .with_resource(gts_uuid.to_string())
+            .create(),
         }
     }
 }
@@ -245,6 +251,7 @@ impl From<WorkerError> for CanonicalError {
 /// `field::` constants the SDK already publishes.
 mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
+    pub const IF_MATCH: &str = "If-Match";
     pub const ITEMS: &str = "items";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
@@ -269,6 +276,19 @@ pub fn idempotency_key_not_utf8() -> CanonicalError {
     invalid_field(
         violation_field::IDEMPOTENCY_KEY,
         "the Idempotency-Key header is not valid UTF-8".to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject `If-Match`: deletion uses `expected_resource_version`, checked
+/// asynchronously at admission, so it cannot provide HTTP `412` semantics (DESIGN §3.3).
+#[must_use]
+pub fn if_match_not_supported() -> CanonicalError {
+    invalid_field(
+        violation_field::IF_MATCH,
+        "If-Match is not supported on this route; name the precondition in \
+         expected_resource_version, whose failure is reported on the operation item"
+            .to_owned(),
         field::VALIDATION_FAILED,
     )
 }

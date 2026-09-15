@@ -10,15 +10,15 @@ use toolkit::api::rest::extract;
 use uuid::Uuid;
 
 use super::dto::{
-    EntityDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse, OperationAcceptedDto,
-    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, RegisterResultDto,
-    RegisterSummaryDto, SubmitEntitiesRequest,
+    DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, GtsEntityDto, ListEntitiesQuery,
+    ListEntitiesResponse, OperationAcceptedDto, OperationDto, RegisterEntitiesRequest,
+    RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto, SubmitEntitiesRequest,
 };
 use super::paths::V2;
-use crate::domain::admission::{Candidate, SubmitRequest};
+use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::{EntityKey, RegistryService};
+use crate::domain::registry_service::{DeleteRequest, DeleteTarget, EntityKey, RegistryService};
 use crate::domain::service::TypesRegistryService;
 
 /// POST /api/v1/types-registry/entities
@@ -141,21 +141,8 @@ pub async fn submit_entities(
     extract::Json(req): extract::Json<SubmitEntitiesRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<OperationAcceptedDto>)> {
     let service = require_registry(service)?;
-    // Absent and unusable are kept apart. An absent header is the domain's refusal
-    // to make — `validate` takes the empty string and answers "an Idempotency-Key
-    // header is required" — but a header that *was* sent and cannot be decoded is
-    // this layer's own answer, because a `String` cannot carry the distinction any
-    // further and "required" would be a lie about what the caller did.
-    let idempotency_key = match headers.get("idempotency-key") {
-        None => String::new(),
-        Some(value) => value
-            .to_str()
-            .map_err(|_| super::error::idempotency_key_not_utf8())?
-            .to_owned(),
-    };
-
     let request = SubmitRequest {
-        idempotency_key,
+        idempotency_key: idempotency_key(&headers)?,
         kind: OperationKind::Registration,
         dry_run: req.dry_run.unwrap_or(false),
         candidates: req
@@ -175,6 +162,85 @@ pub async fn submit_entities(
         .await
         .map_err(CanonicalError::from)?;
 
+    receipt(uri.path(), accepted)
+}
+
+/// Submit a deletion batch with per-item preconditions (DESIGN §3.3).
+pub async fn batch_delete_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    extract::Json(req): extract::Json<DeleteEntitiesRequest>,
+) -> ApiResult<(StatusCode, HeaderMap, Json<OperationAcceptedDto>)> {
+    let service = require_registry(service)?;
+    let request = DeleteRequest {
+        idempotency_key: idempotency_key(&headers)?,
+        dry_run: req.dry_run.unwrap_or(false),
+        targets: req
+            .items
+            .into_iter()
+            .map(|item| DeleteTarget {
+                key: EntityKey::parse(&item.key),
+                expected_resource_version: item.expected_resource_version,
+            })
+            .collect(),
+    };
+
+    let accepted = service
+        .delete(&request, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(CanonicalError::from)?;
+
+    receipt(uri.path(), accepted)
+}
+
+/// Submit a single deletion through the same [`DeleteRequest`] as batch deletion.
+pub async fn delete_entity(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    extract::Path(key): extract::Path<String>,
+    extract::Query(query): extract::Query<DeleteEntityQuery>,
+) -> ApiResult<(StatusCode, HeaderMap, Json<OperationAcceptedDto>)> {
+    let service = require_registry(service)?;
+    // Reject HTTP conditionals here; acceptance validates the version precondition.
+    if headers.contains_key(header::IF_MATCH) {
+        return Err(super::error::if_match_not_supported());
+    }
+
+    let request = DeleteRequest {
+        idempotency_key: idempotency_key(&headers)?,
+        dry_run: query.dry_run.unwrap_or(false),
+        targets: vec![DeleteTarget {
+            key: EntityKey::parse(&key),
+            expected_resource_version: query.expected_resource_version,
+        }],
+    };
+
+    let accepted = service
+        .delete(&request, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(CanonicalError::from)?;
+
+    receipt(uri.path(), accepted)
+}
+
+/// Decode `Idempotency-Key`; acceptance handles absence, this layer rejects invalid bytes.
+fn idempotency_key(headers: &HeaderMap) -> Result<String, CanonicalError> {
+    match headers.get("idempotency-key") {
+        None => Ok(String::new()),
+        Some(value) => Ok(value
+            .to_str()
+            .map_err(|_| super::error::idempotency_key_not_utf8())?
+            .to_owned()),
+    }
+}
+
+/// Build the shared mutation response from the receipt's admission status.
+fn receipt(
+    request_path: &str,
+    accepted: Accepted,
+) -> Result<(StatusCode, HeaderMap, Json<OperationAcceptedDto>), CanonicalError> {
     let status = if accepted.replayed && accepted.terminal() {
         StatusCode::OK
     } else {
@@ -182,7 +248,7 @@ pub async fn submit_entities(
     };
 
     let mut out = HeaderMap::new();
-    let location = operation_location(uri.path(), accepted.operation_id);
+    let location = operation_location(request_path, accepted.operation_id);
     let location_value = HeaderValue::from_str(&location).map_err(|e| {
         tracing::error!(
             error = %e,
@@ -205,10 +271,6 @@ pub async fn submit_entities(
         );
     }
 
-    // The status comes from the receipt, not from a second read: `submit` already
-    // knows it — `pending` when the operation is queued, `completed` once inline
-    // admission has run — so a constant `pending` here would be wrong and a re-read
-    // would cost a snapshot transaction over two statements.
     Ok((
         status,
         out,
@@ -231,14 +293,13 @@ pub async fn submit_entities(
 /// Checkpoint 1 report §8.1). [`OriginalUri`] rather than `Uri` for the same
 /// reason: `nest` strips exactly the prefix that has to survive here.
 ///
-/// The receipt is a **sibling** of the submit path — `…/v1/entities` answers with
-/// `…/v1/operations/{id}` — so the last segment is replaced, not appended to. If the
-/// route is ever mounted somewhere not ending in `/entities`, the gear-relative path
-/// is the fallback: a wrong prefix beats a path with two resources in it.
+/// Replace the last `/entities` segment and its suffix with `/operations/{id}`.
+/// This handles all mutation paths and preserves mount prefixes containing `entities`.
+/// Fall back to a gear-relative path when the segment is absent.
 fn operation_location(request_path: &str, operation_id: Uuid) -> String {
     let trimmed = request_path.trim_end_matches('/');
-    match trimmed.strip_suffix("/entities") {
-        Some(base) => format!("{base}/operations/{operation_id}"),
+    match trimmed.rfind("/entities") {
+        Some(cut) => format!("{}/operations/{operation_id}", &trimmed[..cut]),
         None => format!("{V2}/operations/{operation_id}"),
     }
 }

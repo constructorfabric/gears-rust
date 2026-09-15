@@ -8,6 +8,11 @@ use toolkit_macros::domain_model;
 #[non_exhaustive]
 pub enum AdmissionFailureReason {
     ActivationWriteSetExceeded,
+    /// Outbox delivery gave up on the operation after its attempt budget, so the
+    /// candidate was never decided. Distinct from every other reason here, which
+    /// states something about the candidate: this one states that admission
+    /// stopped trying.
+    AdmissionAbandoned,
     AlreadyExists,
     /// The baseline's own references no longer resolve, so no comparison could be
     /// performed. Distinct from an undecidable one: the check never ran.
@@ -65,6 +70,7 @@ impl AdmissionFailureReason {
     pub fn from_wire(code: &str) -> Self {
         match code {
             "activation_write_set_exceeded" => Self::ActivationWriteSetExceeded,
+            "admission_abandoned" => Self::AdmissionAbandoned,
             "already_exists" => Self::AlreadyExists,
             "baseline_unresolvable" => Self::BaselineUnresolvable,
             "blocked_by_dependency" => Self::BlockedByDependency,
@@ -111,6 +117,7 @@ impl AdmissionFailureReason {
     pub const fn metric_label(&self) -> &'static str {
         match self {
             Self::ActivationWriteSetExceeded => "activation_write_set_exceeded",
+            Self::AdmissionAbandoned => "admission_abandoned",
             Self::AlreadyExists => "already_exists",
             Self::BaselineUnresolvable => "baseline_unresolvable",
             Self::BlockedByDependency => "blocked_by_dependency",

@@ -1,4 +1,5 @@
-//! Predict a batch against one snapshot and an [`AdmissionView`] overlay.
+//! Run a dry-run batch: predict against one snapshot and an [`AdmissionView`]
+//! overlay, then publish the outcomes after releasing the snapshot.
 //!
 //! Reuse committing-path ordering, refusal helpers, evaluation and commit checks.
 //! Successful virtual writes feed later candidates; publish outcomes only after
@@ -7,6 +8,10 @@
 //! No drift retries: the snapshot is fixed and the overlay has one writer.
 //! A revision-vector mismatch indicates inconsistent view reads and propagates.
 
+mod publish;
+pub mod view;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -16,12 +21,13 @@ use toolkit_macros::domain_model;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use self::view::{AdmissionView, ItemOutcomeWrite};
 use super::batch;
 use super::deletion;
 use super::errors::{ItemFailure, WorkerError};
 use super::tuning::Tuning;
 use super::unit::{CommitRequest, EvaluationTarget, PreparedUnit, commit_prepared_in, evaluate_in};
-use super::view::{AdmissionView, ItemOutcomeWrite};
+use super::worker::{ItemOutcome, OperationOutcome, read_operation, stored_outcome};
 use crate::domain::admission::{AdmissionFailureReason, Precondition};
 use crate::domain::enums::{OperationItemStatus, OperationKind};
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, snapshot_read};
@@ -71,12 +77,67 @@ struct PredictedCommit {
     write: Option<ItemOutcomeWrite>,
 }
 
+/// Simulate a batch in one snapshot, then atomically publish outcomes and completion.
+pub(super) async fn run_batch(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    tuning: Tuning<'_>,
+    operation: &OperationRow,
+    items: &Arc<[OperationItemRow]>,
+    now: OffsetDateTime,
+) -> Result<OperationOutcome, WorkerError> {
+    let operation_id = operation.id;
+    let predictions =
+        predict_batch(stores, db, scope, tuning, operation, Arc::clone(items), now).await?;
+    let published =
+        publish::publish(stores, db, scope, operation_id, items, &predictions, now).await?;
+    // A concurrent pass won the CAS; keep its stored outcomes, loading all items once.
+    let terminalized: HashMap<i64, OperationItemRow> = if published.recorded.contains(&false) {
+        read_operation(stores, db, scope, operation_id)
+            .await?
+            .1
+            .into_iter()
+            .map(|row| (row.id, row))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let mut outcomes = Vec::with_capacity(items.len());
+    for ((item, prediction), won) in items.iter().zip(&predictions).zip(published.recorded) {
+        if !won {
+            let row = terminalized
+                .get(&item.id)
+                .ok_or(WorkerError::OperationNotFound { operation_id })?;
+            outcomes.push(stored_outcome(row)?);
+            continue;
+        }
+        let reported = publish::published_outcome(operation_id, item, prediction, tuning.metrics);
+        outcomes.push(ItemOutcome {
+            gts_id: item.gts_id.clone(),
+            status: reported.status,
+            gts_uuid: reported.gts_uuid,
+            resource_version: reported.resource_version,
+            revision_no: reported.revision_no,
+            failure: match prediction {
+                Predicted::Refused(failure) => Some(failure.clone()),
+                Predicted::Terminal { .. } => None,
+            },
+        });
+    }
+    Ok(OperationOutcome {
+        operation_id,
+        already_terminal: false,
+        items: outcomes,
+    })
+}
+
 /// Predict a batch without entity writes; return outcomes in submission order.
 /// Release the shared read-only snapshot before the caller publishes results.
 ///
 /// # Errors
 /// [`WorkerError`] for infrastructure failure; [`Predicted::Refused`] for refusal.
-pub(super) async fn simulate_batch(
+async fn predict_batch(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
@@ -123,7 +184,7 @@ pub(super) async fn simulate_batch(
                         match refusal {
                             Some(failure) => Ok(Predicted::Refused(failure)),
                             None => {
-                                simulate_item(
+                                predict_item(
                                     view,
                                     tx,
                                     scope,
@@ -169,7 +230,7 @@ pub(super) async fn simulate_batch(
     clippy::too_many_arguments,
     reason = "mirrors `predict_commit`'s parameter list one for one; a shared context struct would have to be threaded through both and saves nothing"
 )]
-async fn simulate_item(
+async fn predict_item(
     view: &AdmissionView,
     tx: &toolkit_db::DbTx<'_>,
     scope: &AccessScope,

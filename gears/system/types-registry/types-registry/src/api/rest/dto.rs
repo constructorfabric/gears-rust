@@ -505,6 +505,54 @@ pub struct SubmitEntitiesRequest {
     pub dry_run: Option<bool>,
 }
 
+/// A batch deletion target, resolved like `GET /entities/{entity_key}`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeleteEntityDto {
+    /// A canonical GTS identifier or a Registry Reference UUID.
+    pub key: String,
+    /// Required positive version. Optional in Rust so acceptance returns the same
+    /// `400 deletion_requires_version` on both deletion routes rather than letting
+    /// the extractor answer first.
+    ///
+    /// `value_type = i64` alongside `required` is what keeps the generated schema a
+    /// plain `integer`: `required` on its own leaves the property nullable, so the
+    /// document would promise that an explicit `null` is accepted while acceptance
+    /// answers `400` — and it would disagree with the DELETE route, which declares
+    /// the same precondition as a non-nullable `integer` query parameter.
+    #[serde(default)]
+    #[schema(required, value_type = i64, minimum = 1)]
+    pub expected_resource_version: Option<i64>,
+}
+
+/// A deletion batch.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeleteEntitiesRequest {
+    /// No `max_items`: the ceiling is `limits.batch_candidates`, which a deployment
+    /// configures. A literal here would be a second, fixed number that disagrees
+    /// with the server the moment anyone changes that setting. `RegistryService::delete`
+    /// enforces the real one before reading anything.
+    #[schema(min_items = 1)]
+    pub items: Vec<DeleteEntityDto>,
+    /// Predict without changing entities. Defaults to `false`; part of the idempotency fingerprint.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// Single-deletion parameters; the entity key is in the path.
+#[derive(Debug, Clone, Default)]
+#[toolkit_macros::api_dto(request)]
+pub struct DeleteEntityQuery {
+    /// Required positive version, validated by acceptance as on the batch route.
+    /// Missing or non-numeric values return `400`.
+    #[serde(default)]
+    pub expected_resource_version: Option<i64>,
+    /// Predict without changing entities. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
 /// The receipt returned by a submission: `202` for accepted work, `200` only when
 /// a replayed operation is already terminal.
 #[derive(Debug, Clone)]

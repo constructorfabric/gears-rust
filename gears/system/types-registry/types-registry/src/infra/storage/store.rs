@@ -1,18 +1,9 @@
-//! The adapter behind the domain's persistence ports.
+//! [`Repos`] implements [`crate::domain::ports`] via [`super::repo`], forwarding
+//! transactions without state or row mapping, as in `credstore`'s `repo_impl.rs`
+//! and `account-management`'s `repo_impl/mod.rs`.
 //!
-//! [`Repos`] implements every trait in [`crate::domain::ports`] over the
-//! repositories in [`super::repo`]. It holds no state and — since the repositories
-//! speak the domain's row types themselves — no mapping either: every method
-//! forwards the transaction verbatim, the same shape as `credstore`'s
-//! `repo_impl.rs` and `account-management`'s `repo_impl/mod.rs`.
-//!
-//! # Why this file exists at all, given it only forwards
-//!
-//! The domain holds one `Arc<dyn Stores>`, and
-//! [`Stores`](crate::domain::ports::Stores) is the conjunction of six traits, so
-//! something has to be a single type implementing all six — the repositories are
-//! five separate unit structs. The alternative, six `Arc<dyn XStore>` in the
-//! service, is more wiring at every call site for no gain.
+//! One `Arc<dyn Stores>` combines six port traits over five repository unit structs,
+//! avoiding six separately wired `Arc<dyn XStore>` handles in the service.
 //!
 //! Only repository operations used by the domain are exposed as ports.
 
@@ -31,7 +22,7 @@ use crate::domain::ports::{
     DependencyStore, EdgeSide, EntityEdge, EntityRow, EntityStore, EntityWriteOrderStore,
     InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
     NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
+    OperationRow, OperationStore, RecoveryCursor, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
     VersionFamilyStore,
 };
 
@@ -125,6 +116,15 @@ impl EntityStore for Repos {
         gts_uuid: Uuid,
     ) -> Result<Option<EntityRow>, ScopeError> {
         EntityRepo::find_by_gts_uuid(tx, scope, gts_uuid).await
+    }
+
+    async fn find_by_gts_uuids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        EntityRepo::find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
     async fn kind_in_family(
@@ -302,6 +302,16 @@ impl OperationStore for Repos {
         OperationRepo::find_by_id(tx, scope, id).await
     }
 
+    async fn find_nonterminal_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ScopeError> {
+        OperationRepo::find_nonterminal_ids(tx, scope, after, limit).await
+    }
+
     async fn insert_operation(
         &self,
         tx: &DbTx<'_>,
@@ -348,6 +358,16 @@ impl OperationStore for Repos {
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
         OperationRepo::mark_completed(tx, scope, id, now).await
+    }
+
+    async fn mark_abandoned(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        OperationRepo::mark_abandoned(tx, scope, id, now).await
     }
 
     async fn mark_item_succeeded(

@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use toolkit_canonical_errors::problem;
 use toolkit_gts::gts_id;
+use utoipa::openapi::schema::SchemaFormat;
 
 /// Convert OpenAPI-style path placeholders to Axum 0.8+ style path parameters.
 ///
@@ -148,6 +149,10 @@ pub struct ParamSpec {
     /// `style: form, explode: true` — i.e. `?tag=a&tag=b`, which is how the
     /// generated REST client encodes a `Vec<T>` query field.
     pub array: bool,
+    /// Optional JSON Schema `format`, either a known format or a custom extension.
+    pub format: Option<SchemaFormat>,
+    /// Optional JSON Schema `minimum`.
+    pub minimum: Option<f64>,
 }
 
 impl ParamSpec {
@@ -166,6 +171,8 @@ impl ParamSpec {
             description,
             param_type,
             array: false,
+            format: None,
+            minimum: None,
         }
     }
 }
@@ -786,6 +793,8 @@ where
                 description: None,
                 param_type: p.openapi_type.to_owned(),
                 array: p.array,
+                format: None,
+                minimum: None,
             });
         }
         self
@@ -811,6 +820,8 @@ where
             description: Some(description.into()),
             param_type: item_type.into(),
             array: true,
+            format: None,
+            minimum: None,
         });
         self
     }

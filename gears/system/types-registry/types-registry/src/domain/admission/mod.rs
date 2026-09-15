@@ -17,20 +17,18 @@ mod batch;
 mod bounds;
 mod deletion;
 mod drift;
+pub mod dry_run;
 mod errors;
 mod reasons;
 mod unchanged;
 
 pub mod fingerprint;
 mod graph;
-mod publish;
 pub mod refresh;
 pub mod revision;
-pub mod simulate;
 mod tuning;
 pub mod unit;
 pub mod vector;
-pub mod view;
 pub mod worker;
 
 pub use reasons::AdmissionFailureReason;
