@@ -169,9 +169,12 @@ async fn build_internal_authenticator(
         return Ok(None);
     };
 
-    // Shared-secret (and any future dependency-light provider) builds here.
-    if let Some(auth) = cfg.build_authenticator() {
-        return Ok(Some(auth));
+    // Shared-secret (and any future dependency-light provider) builds here. An
+    // unusable secret fails the build rather than falling through to the kube
+    // branch, which would report the wrong problem.
+    match cfg.build_authenticator()? {
+        toolkit_security::BuiltAuthenticator::Built(auth) => return Ok(Some(auth)),
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
     }
 
     #[cfg(feature = "k8s-auth")]
@@ -943,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn build_internal_authenticator_builds_shared_secret() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "test-secret".to_owned(),
+            secret: secrecy::SecretString::from("test-secret"),
             peer_name: "test-peer".to_owned(),
         };
         let auth = build_internal_authenticator(Some(&cfg), 30).await.unwrap();

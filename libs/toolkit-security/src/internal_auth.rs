@@ -103,11 +103,25 @@ pub enum PlatformIdentity {
         /// Configured caller label (returned by [`PlatformIdentity::peer_name`]).
         name: String,
     },
+    /// A credential-free outbound plane marker, not an authenticated caller.
+    ///
+    /// Produced only by [`PlatformSecurityContext::outbound_marker`], so gear
+    /// code can satisfy a platform-plane signature without possessing a real
+    /// identity. It is never the result of validating anything, and must never
+    /// authorize anything.
+    ///
+    /// It has its own variant because it used to share [`Self::Unknown`],
+    /// leaving one value meaning two unrelated things — a locally minted marker
+    /// and a peer identity this build does not recognise — with `peer_name()`
+    /// answering `"<unknown>"` for both.
+    OutboundMarker,
     /// Catch-all for variants introduced in a newer library version.
     ///
     /// Produced only by `serde::Deserialize` when the `"type"` field holds an
-    /// unrecognised value. Never constructed directly; `peer_name` returns
-    /// `"<unknown>"` for this variant.
+    /// unrecognised value; `peer_name` returns `"<unknown>"` for it.
+    ///
+    /// It no longer doubles as the outbound marker — see
+    /// [`Self::OutboundMarker`].
     #[serde(other)]
     Unknown,
 }
@@ -126,6 +140,10 @@ impl PlatformIdentity {
             } => service_account,
             Self::Spiffe { name, .. } | Self::Shared { name } => name,
             Self::Unknown => "<unknown>",
+            // Deliberately distinct from `<unknown>`: this one is not a peer at
+            // all, and a log line saying so is worth more than one that looks
+            // like an unrecognised caller.
+            Self::OutboundMarker => "<outbound-marker>",
         }
     }
 }
@@ -165,13 +183,23 @@ impl PlatformSecurityContext {
     /// (`cpt-cf-adr-two-plane-auth`).
     ///
     /// It MUST never be consulted for an authorization decision — its
-    /// [`PlatformIdentity`] is [`PlatformIdentity::Unknown`] precisely so a
-    /// consumer that mistakenly reads it cannot derive a meaningful caller name.
+    /// [`PlatformIdentity`] is [`PlatformIdentity::OutboundMarker`], a variant
+    /// no validation ever produces, so a consumer that mistakenly reads it
+    /// derives neither a caller name nor a peer that could be mistaken for one.
     #[must_use]
     pub fn outbound_marker() -> Self {
         Self {
-            identity: PlatformIdentity::Unknown,
+            identity: PlatformIdentity::OutboundMarker,
         }
+    }
+
+    /// Whether this is the credential-free [outbound marker], rather than a
+    /// validated caller.
+    ///
+    /// [outbound marker]: PlatformSecurityContext::outbound_marker
+    #[must_use]
+    pub fn is_outbound_marker(&self) -> bool {
+        matches!(self.identity, PlatformIdentity::OutboundMarker)
     }
 
     /// The validated platform identity backing this context.
@@ -236,6 +264,13 @@ pub trait InternalAuthenticator: Send + Sync {
     /// Authenticate the raw `X-ToolKit-Internal-Token` value and resolve the
     /// caller's [`PlatformIdentity`].
     ///
+    /// cancel-safe: this future is dropped mid-flight when a client
+    /// disconnects — it runs from middleware on an abortable task — and also
+    /// when a caller bounds it with `tokio::time::timeout`, as the caching
+    /// wrapper in this crate does. An implementation must hold no state across
+    /// the await that would be corrupted by never resuming: an abandoned call
+    /// must leave the authenticator exactly as it found it.
+    ///
     /// # Errors
     ///
     /// Returns [`InternalAuthNError`] if the credential is invalid, the backend
@@ -269,25 +304,46 @@ mod tests {
     }
 
     #[test]
-    fn platform_security_context_wraps_identity() {
-        let identity = PlatformIdentity::KubernetesServiceAccount {
-            namespace: "toolkit".to_owned(),
-            service_account: "directory-service".to_owned(),
-            pod: None,
-        };
-        let ctx = PlatformSecurityContext::new(identity.clone());
-        assert_eq!(ctx.identity(), &identity);
-        assert_eq!(ctx.into_identity(), identity);
+    fn an_unrecognised_identity_tag_decodes_to_unknown() {
+        // `#[serde(other)]` is what keeps a peer running a newer build from
+        // failing to decode here, and nothing exercised it: a payload whose
+        // `type` this build does not know must land on `Unknown` and report
+        // `<unknown>` rather than deserializing into some known variant.
+        let identity: PlatformIdentity =
+            serde_json::from_str(r#"{"type":"future_method"}"#).unwrap();
+
+        assert_eq!(identity, PlatformIdentity::Unknown);
+        assert_eq!(
+            identity.peer_name(),
+            "<unknown>",
+            "an unrecognised identity must not resolve to a usable caller name"
+        );
     }
 
     #[test]
     fn outbound_marker_carries_no_identity() {
-        // The marker is a credential-free plane selector; its identity is
-        // deliberately `Unknown` so a consumer that mistakenly reads it cannot
-        // derive a meaningful caller name.
+        // The marker is a credential-free plane selector, so a consumer that
+        // mistakenly reads it derives no caller name.
         let marker = PlatformSecurityContext::outbound_marker();
-        assert_eq!(marker.identity(), &PlatformIdentity::Unknown);
-        assert_eq!(marker.identity().peer_name(), "<unknown>");
+        assert_eq!(marker.identity(), &PlatformIdentity::OutboundMarker);
+        assert_eq!(marker.identity().peer_name(), "<outbound-marker>");
+        assert!(marker.is_outbound_marker());
+    }
+
+    #[test]
+    fn the_outbound_marker_is_distinguishable_from_an_unrecognised_peer() {
+        // The two used to be the same value, so nothing could reject the marker
+        // specifically -- a locally minted plane selector and a peer identity
+        // from a newer build both read as `Unknown` / `<unknown>`.
+        let marker = PlatformSecurityContext::outbound_marker();
+        let unrecognised = PlatformSecurityContext::new(PlatformIdentity::Unknown);
+
+        assert_ne!(marker.identity(), unrecognised.identity());
+        assert!(marker.is_outbound_marker());
+        assert!(
+            !unrecognised.is_outbound_marker(),
+            "a peer this build does not recognise is still a peer, not our own marker"
+        );
     }
 
     #[test]

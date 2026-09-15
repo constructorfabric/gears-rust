@@ -27,7 +27,7 @@ pub(crate) fn require_authenticated(
     let Some(Extension(ctx)) = extension_ctx else {
         return Err(unauthenticated());
     };
-    if ctx.subject_id().is_nil() || ctx.subject_tenant_id().is_nil() {
+    if ctx.is_anonymous() {
         return Err(unauthenticated());
     }
     if ctx.subject_type().is_none() {

@@ -37,7 +37,7 @@
 //!   distinct, individually-valid credentials — does it evict the entry
 //!   expiring soonest, rather than growing unbounded.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +64,34 @@ pub const MAX_TOKEN_REVIEW_CACHE_TTL: Duration = Duration::from_mins(5);
 /// non-configurable: it exists only to blunt a hot loop of fresh invalid
 /// tokens, not to widen any acceptance window.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Longest credential this cache will hold as a key.
+///
+/// [`MAX_CACHE_ENTRIES`] bounds how *many* entries exist, but not how large any
+/// one of them is, and a rejected credential is attacker-supplied in full. A
+/// stream of distinct oversized junk tokens could therefore pin
+/// `MAX_CACHE_ENTRIES` header-sized strings at once, with the only real bound
+/// being whatever limit the transport happened to enforce.
+///
+/// Comfortably above any real JWT — those run to a few kilobytes even with
+/// generous claims — so this bounds abuse without turning a legitimate
+/// credential away. A token over the limit is not rejected, it simply bypasses
+/// the cache: the memory stays bounded and the verdict still comes from the
+/// backend.
+const MAX_CACHEABLE_TOKEN_LEN: usize = 16 * 1024;
+
+/// How long a single backend validation may take before it is abandoned.
+///
+/// The backend call happens while the per-token single-flight lock is held, so
+/// a backend that never answers would otherwise park every caller presenting
+/// that token for as long as it stays unresponsive — with no deadline, since
+/// the waiters are blocked on the lock rather than on the call. Bounding the
+/// call converts an indefinite hang into an `Unavailable` a caller can act on.
+///
+/// This is a request deadline, deliberately unrelated to the cache TTL: it is
+/// sized for how long a `TokenReview` round-trip may reasonably take, not for
+/// how long its answer stays usable.
+pub const TOKEN_REVIEW_BACKEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Amortizes the expired-entry sweep: a full scan of the cache runs only
 /// every `SWEEP_INTERVAL`-th insert rather than on every single one.
@@ -112,38 +140,158 @@ enum CacheLookup {
     Miss,
 }
 
+/// The cache map, paired with an index of its entries ordered by expiry.
+///
+/// The index exists so that neither reclaiming expired entries nor choosing an
+/// eviction victim has to scan the map. That matters because every one of those
+/// operations runs under the cache mutex, on the authentication hot path: the
+/// previous whole-map `min_by_key` scan ran on *every* insert for as long as the
+/// cache stayed full of still-valid entries, which is exactly the sustained-load
+/// case, and it blocked every concurrent lookup while it ran.
+///
+/// The two collections are only consistent if they are updated together, so the
+/// map is private and every mutation goes through a method here.
+struct ExpiringCache {
+    entries: HashMap<String, CacheEntry>,
+    /// `(expires_at, token)` for every entry in `entries`. Ordered, so the
+    /// soonest-to-expire is the first element and expired entries are a prefix.
+    by_expiry: BTreeSet<(Instant, String)>,
+}
+
+impl ExpiringCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_expiry: BTreeSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn contains_key(&self, token: &str) -> bool {
+        self.entries.contains_key(token)
+    }
+
+    fn get(&self, token: &str) -> Option<&CacheEntry> {
+        self.entries.get(token)
+    }
+
+    fn insert(&mut self, token: String, entry: CacheEntry) {
+        let expires_at = entry.expires_at();
+        if let Some(previous) = self.entries.insert(token.clone(), entry) {
+            self.by_expiry.remove(&(previous.expires_at(), token.clone()));
+        }
+        self.by_expiry.insert((expires_at, token));
+    }
+
+    fn remove(&mut self, token: &str) {
+        if let Some(entry) = self.entries.remove(token) {
+            self.by_expiry.remove(&(entry.expires_at(), token.to_owned()));
+        }
+    }
+
+    /// Drop every entry that has expired by `now`. Touches only the entries it
+    /// removes: they are a prefix of the index.
+    fn sweep_expired(&mut self, now: Instant) {
+        // `Instant` has no "minimum", so split at `now` instead: everything
+        // ordered before `(now, "")` expired at or before it.
+        let live = self.by_expiry.split_off(&(now, String::new()));
+        let expired = std::mem::replace(&mut self.by_expiry, live);
+        for (_, token) in expired {
+            self.entries.remove(&token);
+        }
+    }
+
+    /// Drop the entry that expires soonest, which is the one needing
+    /// re-validation soonest anyway. `O(log n)`, no scan.
+    fn evict_soonest(&mut self) {
+        if let Some((expires_at, token)) = self.by_expiry.pop_first() {
+            self.entries.remove(&token);
+            debug_assert!(
+                !self.entries.contains_key(&token),
+                "index and map disagreed about {token} at {expires_at:?}"
+            );
+        }
+    }
+}
+
+/// What a credential's `exp` claim says, if anything.
+///
+/// An `Option<u64>` collapsed two different answers onto `None`: a credential
+/// carrying no `exp` because it is not a JWT, and a JWT whose `exp` could not
+/// be read. The first is cacheable for the full TTL; the second is not, because
+/// the one thing known about it is that it declares an expiry we cannot honour.
+enum ExpClaim {
+    /// Not a JWT (e.g. a shared secret). Nothing to clamp against.
+    NotJwt,
+    /// A JWT declaring this expiry, in seconds since the Unix epoch.
+    Expires(u64),
+    /// Shaped like a JWT, but `exp` is absent, not a number, or the payload did
+    /// not decode.
+    Unreadable,
+}
+
 /// Best-effort extraction of the `exp` (seconds since the Unix epoch) claim
 /// from a JWT, without verifying the signature.
 ///
 /// The caller has already had the token's signature verified by the
 /// authentication backend (e.g. Kubernetes `TokenReview`); this is a plain
 /// base64 decode of the already-trusted payload, used only to avoid caching a
-/// validation past the credential's own expiry. Returns `None` for a
-/// non-JWT credential (e.g. a shared secret), which simply skips the clamp.
-fn jwt_exp_claim(token: &str) -> Option<u64> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    value.get("exp")?.as_u64()
+/// validation past the credential's own expiry.
+fn jwt_exp_claim(token: &str) -> ExpClaim {
+    // Three dot-separated parts is what makes this a JWT rather than an opaque
+    // credential, and an opaque credential has no expiry to honour.
+    let mut parts = token.split('.');
+    let (Some(_header), Some(payload_b64), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return ExpClaim::NotJwt;
+    };
+
+    let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) else {
+        return ExpClaim::Unreadable;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+        return ExpClaim::Unreadable;
+    };
+    match value.get("exp").and_then(serde_json::Value::as_u64) {
+        Some(exp) => ExpClaim::Expires(exp),
+        None => ExpClaim::Unreadable,
+    }
 }
 
 /// The instant a freshly validated `token` should stop being trusted from
 /// cache: whichever is sooner of `now + ttl` and the token's own `exp` claim
 /// (when present).
+///
+/// Every arithmetic step is checked. `exp` comes out of a base64 payload with
+/// no bound on its value, and both `SystemTime + Duration` and
+/// `Instant + Duration` panic on overflow — which would take down the platform
+/// authentication path rather than skip a clamp.
 fn clamped_expiry(token: &str, now: Instant, ttl: Duration) -> Instant {
-    let ttl_expiry = now + ttl;
-    let Some(exp_secs) = jwt_exp_claim(token) else {
+    let ttl_expiry = now.checked_add(ttl).unwrap_or(now);
+    let exp_secs = match jwt_exp_claim(token) {
+        ExpClaim::NotJwt => return ttl_expiry,
+        // A declared-but-unreadable expiry is not a licence to cache for the
+        // full TTL: expire immediately and re-validate on the next call.
+        ExpClaim::Unreadable => return now,
+        ExpClaim::Expires(exp) => exp,
+    };
+
+    let Some(exp_at) = UNIX_EPOCH.checked_add(Duration::from_secs(exp_secs)) else {
+        // An `exp` too far in the future to fit a `SystemTime` says nothing
+        // useful about when to stop trusting the token; fall back to the TTL.
         return ttl_expiry;
     };
-    let exp_at = UNIX_EPOCH + Duration::from_secs(exp_secs);
     let Ok(remaining) = exp_at.duration_since(SystemTime::now()) else {
         // The token's own claim says it is already expired; do not extend
         // trust in it at all.
         return now;
     };
-    ttl_expiry.min(now + remaining)
+    let exp_expiry = now.checked_add(remaining).unwrap_or(ttl_expiry);
+    ttl_expiry.min(exp_expiry)
 }
 
 /// Wraps an [`InternalAuthenticator`] with a short-lived cache of both
@@ -172,7 +320,7 @@ fn clamped_expiry(token: &str, now: Instant, ttl: Duration) -> Instant {
 pub struct CachingInternalAuthenticator<A> {
     inner: A,
     ttl: Duration,
-    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache: Mutex<ExpiringCache>,
     /// Per-token single-flight locks: concurrent misses for the same token
     /// serialize here instead of each issuing a backend call.
     inflight: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -202,7 +350,7 @@ impl<A> CachingInternalAuthenticator<A> {
         Ok(Self {
             inner,
             ttl,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(ExpiringCache::new()),
             inflight: Mutex::new(HashMap::new()),
             sweep_counter: AtomicU32::new(0),
         })
@@ -214,7 +362,7 @@ impl<A> CachingInternalAuthenticator<A> {
         Self {
             inner,
             ttl: DEFAULT_TOKEN_REVIEW_CACHE_TTL,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(ExpiringCache::new()),
             inflight: Mutex::new(HashMap::new()),
             sweep_counter: AtomicU32::new(0),
         }
@@ -241,42 +389,36 @@ impl<A> CachingInternalAuthenticator<A> {
     }
 
     /// Insert `entry` under `token`, amortizing the expired-entry sweep over
-    /// [`SWEEP_INTERVAL`] inserts instead of scanning the whole map every
-    /// time, and enforcing [`MAX_CACHE_ENTRIES`] when a new token would
-    /// exceed it.
+    /// [`SWEEP_INTERVAL`] inserts and enforcing [`MAX_CACHE_ENTRIES`] when a
+    /// new token would exceed it.
     ///
-    /// When full, expired entries are reclaimed with a single `retain` sweep
-    /// first — one scan typically frees room for many subsequent inserts, so
-    /// the following misses take the cheap path. Only if that sweep frees
-    /// nothing (a fleet of simultaneously-valid tokens) does it fall back to
-    /// the O(n) soonest-to-expire scan, so the whole-map scan is no longer
-    /// paid on every miss while the cache stays full.
+    /// Both the sweep and the eviction go through [`ExpiringCache`]'s expiry
+    /// index, so each touches only the entries it actually removes. Under
+    /// sustained load with a cache full of still-valid entries — the case that
+    /// matters, since TTL expiry alone never reclaims anything there — this is
+    /// the difference between a whole-map scan per insert and an `O(log n)`
+    /// lookup, all of it under the mutex every concurrent lookup needs.
     fn insert(&self, token: String, entry: CacheEntry, now: Instant) {
         let mut cache = self.cache.lock();
         let count = self.sweep_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let swept = count.is_multiple_of(SWEEP_INTERVAL);
-        if swept {
-            cache.retain(|_, e| e.expires_at() > now);
+        if count.is_multiple_of(SWEEP_INTERVAL) {
+            cache.sweep_expired(now);
         }
         if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&token) {
-            // Reclaim expired entries before scanning for a victim: a single
-            // sweep amortizes across the many inserts it makes room for,
-            // whereas the min_by_key scan below would otherwise run on every
-            // miss for as long as the cache stayed full.
-            if !swept {
-                cache.retain(|_, e| e.expires_at() > now);
-            }
+            // Reclaim what has expired before evicting anything still valid.
+            cache.sweep_expired(now);
             if cache.len() >= MAX_CACHE_ENTRIES {
-                // Sweep freed nothing (every entry still valid): fall back to
-                // evicting the soonest-to-expire, which needs re-validation
-                // soonest regardless. No extra bookkeeping for real LRU order.
-                if let Some(victim) = cache
-                    .iter()
-                    .min_by_key(|(_, e)| e.expires_at())
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&victim);
-                }
+                // Every entry is still valid, so caching is now costing us a
+                // live entry per insert and the backend sees a call for each
+                // one evicted. Nothing else reports that, and the symptom
+                // downstream is a surge of TokenReview traffic that looks like
+                // a backend problem rather than cache saturation.
+                tracing::warn!(
+                    entries = cache.len(),
+                    max_entries = MAX_CACHE_ENTRIES,
+                    "internal-auth cache is full of unexpired entries; evicting a live entry"
+                );
+                cache.evict_soonest();
             }
         }
         cache.insert(token, entry);
@@ -342,6 +484,13 @@ impl<A: InternalAuthenticator> CachingInternalAuthenticator<A> {
         token: &str,
         now: Instant,
     ) -> Result<PlatformIdentity, InternalAuthNError> {
+        // Oversized credentials never enter the map, in either direction: the
+        // key is attacker-supplied and only the entry *count* is bounded. They
+        // still get a verdict, just not a cached one.
+        if token.len() > MAX_CACHEABLE_TOKEN_LEN {
+            return self.inner.authenticate(token).await;
+        }
+
         match self.lookup(token, now) {
             CacheLookup::Valid(identity) => return Ok(identity),
             CacheLookup::Rejected => return Err(InternalAuthNError::InvalidToken),
@@ -370,7 +519,22 @@ impl<A: InternalAuthenticator> CachingInternalAuthenticator<A> {
             CacheLookup::Miss => {}
         }
 
-        let result = self.inner.authenticate(token).await;
+        // Bounded: `_guard` is held across this await, so an unresponsive
+        // backend would otherwise block every caller presenting this token
+        // indefinitely — they are parked on the lock, not on a call that could
+        // time out on its own.
+        let result = match tokio::time::timeout(
+            TOKEN_REVIEW_BACKEND_TIMEOUT,
+            self.inner.authenticate(token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            // Not cached either way: a timeout says nothing about whether the
+            // credential is valid, and caching it would turn one slow call into
+            // a fixed window of denials.
+            Err(_elapsed) => return Err(InternalAuthNError::Unavailable),
+        };
         // Re-sampled *after* the backend round-trip: sampling before it would
         // shrink the effective TTL by however long the call took.
         let stored_at = Instant::now();
@@ -413,7 +577,6 @@ impl<A: InternalAuthenticator> InternalAuthenticator for CachingInternalAuthenti
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
@@ -472,6 +635,119 @@ mod tests {
                 Mode::Invalid => Err(InternalAuthNError::InvalidToken),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_token_never_enters_the_cache() {
+        let cached =
+            CachingInternalAuthenticator::new(CountingAuth::new(), Duration::from_mins(1)).unwrap();
+        let huge = "x".repeat(MAX_CACHEABLE_TOKEN_LEN + 1);
+
+        // Still authenticated, twice, because nothing was cached.
+        cached.authenticate(&huge).await.unwrap();
+        cached.authenticate(&huge).await.unwrap();
+
+        assert_eq!(
+            cached.cache.lock().len(),
+            0,
+            "an oversized token must not become a cache key: the key is \
+             attacker-supplied and only the entry count is bounded"
+        );
+        assert_eq!(
+            cached.inner.calls(),
+            2,
+            "bypassing the cache means every call reaches the backend"
+        );
+    }
+
+    #[test]
+    fn the_expiry_index_tracks_the_map_through_overwrites_and_removals() {
+        // The map and its index are only useful if they agree; an entry left in
+        // the index after its map entry is gone would evict the wrong token.
+        let mut cache = ExpiringCache::new();
+        let now = Instant::now();
+
+        cache.insert("a".to_owned(), valid_entry("a", now + Duration::from_secs(30)));
+        cache.insert("b".to_owned(), valid_entry("b", now + Duration::from_secs(10)));
+        // Overwrite `a` with a *sooner* expiry: the stale index entry must go,
+        // or `a` would look like it expires at the original, later instant.
+        cache.insert("a".to_owned(), valid_entry("a", now + Duration::from_secs(5)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.by_expiry.len(), 2, "index must not keep a stale entry");
+
+        cache.evict_soonest();
+        assert!(!cache.contains_key("a"), "`a` now expires soonest");
+        assert!(cache.contains_key("b"));
+        assert_eq!(cache.by_expiry.len(), 1);
+
+        cache.remove("b");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.by_expiry.len(), 0);
+    }
+
+    #[test]
+    fn sweeping_removes_exactly_the_expired() {
+        let mut cache = ExpiringCache::new();
+        let now = Instant::now();
+
+        cache.insert(
+            "expired".to_owned(),
+            valid_entry("expired", now.checked_sub(Duration::from_secs(1)).unwrap()),
+        );
+        cache.insert("live".to_owned(), valid_entry("live", now + Duration::from_mins(1)));
+
+        cache.sweep_expired(now);
+
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.contains_key("live"));
+        assert_eq!(
+            cache.by_expiry.len(),
+            1,
+            "the index must shrink with the map"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_backend_times_out_rather_than_parking_every_caller() {
+        let cached =
+            CachingInternalAuthenticator::new(CountingAuth::new(), Duration::from_mins(1)).unwrap();
+        // Longer than the deadline, i.e. a backend that never answers.
+        cached
+            .inner
+            .set_delay(TOKEN_REVIEW_BACKEND_TIMEOUT * 2);
+
+        let err = cached
+            .authenticate("tok")
+            .await
+            .expect_err("a backend that outlasts the deadline must not resolve");
+        assert!(
+            matches!(err, InternalAuthNError::Unavailable),
+            "a timeout is a backend availability problem, not a verdict on the credential"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_validation_is_not_cached() {
+        let cached =
+            CachingInternalAuthenticator::new(CountingAuth::new(), Duration::from_mins(1)).unwrap();
+        cached
+            .inner
+            .set_delay(TOKEN_REVIEW_BACKEND_TIMEOUT * 2);
+        drop(cached.authenticate("tok").await);
+
+        // The backend recovers; the next call must reach it rather than serve a
+        // cached failure, or one slow call would deny the token for a full TTL.
+        cached.inner.set_delay(Duration::ZERO);
+        let identity = cached
+            .authenticate("tok")
+            .await
+            .expect("a recovered backend must be consulted again");
+        assert_eq!(identity.peer_name(), "tok");
+        assert_eq!(
+            cached.inner.calls(),
+            2,
+            "the timed-out attempt must not have been cached"
+        );
     }
 
     #[tokio::test]
@@ -571,6 +847,7 @@ mod tests {
         let cached =
             CachingInternalAuthenticator::new(CountingAuth::new(), Duration::from_mins(1)).unwrap();
         cached.inner.set_mode(Mode::Invalid);
+        let t0 = Instant::now();
 
         let err = cached.authenticate("bad").await.unwrap_err();
         assert!(matches!(err, InternalAuthNError::InvalidToken));
@@ -584,9 +861,15 @@ mod tests {
             "a cached rejection must not re-hit the backend"
         );
 
-        tokio::time::sleep(NEGATIVE_CACHE_TTL + Duration::from_millis(50)).await;
+        // Step past the negative-cache window with the injected instant rather
+        // than a real sleep: this cache keys off `std::time::Instant`, which
+        // `tokio::time::pause` cannot virtualize, so a sleep here would burn a
+        // real second and still drift on a loaded runner.
         cached.inner.set_mode(Mode::Succeed);
-        let identity = cached.authenticate("bad").await.unwrap();
+        let identity = cached
+            .authenticate_at("bad", t0 + NEGATIVE_CACHE_TTL + Duration::from_millis(1))
+            .await
+            .unwrap();
         assert_eq!(
             identity.peer_name(),
             "bad",
@@ -780,8 +1063,16 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         let token = format!("h.{payload}.s");
         let expiry = clamped_expiry(&token, now, Duration::from_mins(5));
+
+        // Bounded from both sides. An upper bound alone holds for any value
+        // below the ttl, `now` included, so a clamp that collapsed to zero --
+        // disabling positive caching entirely -- would still pass.
         assert!(
-            expiry < now + Duration::from_mins(5),
+            expiry > now + Duration::from_secs(1),
+            "the token has ~2s of life left; clamping to less would disable caching"
+        );
+        assert!(
+            expiry <= now + Duration::from_secs(2),
             "a JWT with less remaining life than the configured ttl must clamp to the JWT's expiry"
         );
     }
@@ -872,14 +1163,91 @@ mod tests {
         );
     }
 
+    /// Build `header.payload.signature` around a base64url payload.
+    fn jwt_with_payload(payload: &[u8]) -> String {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("h.{encoded}.s")
+    }
+
     #[test]
     fn jwt_exp_claim_extracts_and_ignores_non_jwt() {
-        // header.payload.signature, payload = {"exp":123} base64url (no padding).
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":123}"#);
-        let token = format!("h.{payload}.s");
-        assert_eq!(jwt_exp_claim(&token), Some(123));
+        let token = jwt_with_payload(br#"{"exp":123}"#);
+        assert!(matches!(jwt_exp_claim(&token), ExpClaim::Expires(123)));
 
-        assert_eq!(jwt_exp_claim("not-a-jwt"), None);
-        assert_eq!(jwt_exp_claim("shared-secret-token"), None);
+        assert!(matches!(jwt_exp_claim("not-a-jwt"), ExpClaim::NotJwt));
+        assert!(matches!(
+            jwt_exp_claim("shared-secret-token"),
+            ExpClaim::NotJwt
+        ));
+    }
+
+    #[test]
+    fn jwt_exp_claim_separates_unreadable_from_absent() {
+        // The distinction that matters: a credential with no expiry to honour
+        // is cacheable for the full TTL, one that declares an unreadable expiry
+        // is not.
+        assert!(matches!(
+            jwt_exp_claim(&jwt_with_payload(br"{}")),
+            ExpClaim::Unreadable
+        ));
+        assert!(matches!(
+            jwt_exp_claim(&jwt_with_payload(br#"{"exp":"soon"}"#)),
+            ExpClaim::Unreadable
+        ));
+        assert!(matches!(
+            jwt_exp_claim(&jwt_with_payload(br#"{"exp":1.5}"#)),
+            ExpClaim::Unreadable
+        ));
+        assert!(matches!(
+            jwt_exp_claim(&jwt_with_payload(br"not json")),
+            ExpClaim::Unreadable
+        ));
+        assert!(matches!(
+            jwt_exp_claim("h.!!!not-base64!!!.s"),
+            ExpClaim::Unreadable
+        ));
+    }
+
+    #[test]
+    fn unreadable_exp_is_not_cached_for_the_full_ttl() {
+        let now = Instant::now();
+        let ttl = Duration::from_mins(5);
+
+        // No expiry declared at all: the TTL applies.
+        assert_eq!(
+            clamped_expiry("shared-secret-token", now, ttl),
+            now + ttl,
+            "an opaque credential has no expiry to clamp against"
+        );
+
+        // An expiry we cannot read: expire immediately rather than trust it for
+        // five minutes.
+        let unreadable = jwt_with_payload(br#"{"exp":"soon"}"#);
+        assert_eq!(
+            clamped_expiry(&unreadable, now, ttl),
+            now,
+            "a declared-but-unreadable expiry must not be cached for the full TTL"
+        );
+    }
+
+    #[test]
+    fn absurd_exp_claims_do_not_panic() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(30);
+
+        // `SystemTime + Duration` and `Instant + Duration` both panic on
+        // overflow, and `exp` is attacker-influenced.
+        for payload in [
+            format!(r#"{{"exp":{}}}"#, u64::MAX),
+            format!(r#"{{"exp":{}}}"#, i64::MAX),
+            r#"{"exp":0}"#.to_owned(),
+        ] {
+            let token = jwt_with_payload(payload.as_bytes());
+            let expiry = clamped_expiry(&token, now, ttl);
+            assert!(
+                expiry <= now + ttl,
+                "the clamp must never extend trust beyond the configured TTL"
+            );
+        }
     }
 }

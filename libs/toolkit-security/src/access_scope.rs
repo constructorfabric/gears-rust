@@ -102,58 +102,6 @@ pub mod pep_properties {
     pub const OWNER_ID: &str = "owner_id";
 }
 
-/// Well-known resource-group table and column names for subquery construction.
-///
-/// Used by the `SecureORM` condition builder to translate `InGroup`/`InGroupSubtree`
-/// scope filters into SQL subqueries without depending on entity types.
-///
-/// **Note:** These tables are canonical to the RG gear's database.
-/// `resource_group_membership` is not projected to domain services.
-/// `InGroup`/`InGroupSubtree` predicates are only executable within the RG gear.
-pub mod rg_tables {
-    /// Membership table (RG-internal, not projected to domain services).
-    pub const MEMBERSHIP_TABLE: &str = "resource_group_membership";
-    /// Column in membership table: the resource's external ID.
-    pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
-    /// Column in membership table: the group the resource belongs to.
-    pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
-
-    /// Closure table for group hierarchy.
-    pub const CLOSURE_TABLE: &str = "resource_group_closure";
-    /// Column in closure table: the ancestor group.
-    pub const CLOSURE_ANCESTOR_ID: &str = "ancestor_id";
-    /// Column in closure table: the descendant group.
-    pub const CLOSURE_DESCENDANT_ID: &str = "descendant_id";
-}
-
-/// Well-known tenant-closure table and column names for subquery construction.
-///
-/// Used by the `SecureORM` condition builder to translate `InTenantSubtree`
-/// scope filters into SQL subqueries without depending on entity types.
-///
-/// **Note:** This table is canonical to the Account Management gear's
-/// database. `InTenantSubtree` predicates are only executable in gears
-/// that share the AM database (or replicate `tenant_closure` from it).
-pub mod tenant_tables {
-    /// Closure table for tenant hierarchy.
-    pub const CLOSURE_TABLE: &str = "tenant_closure";
-    /// Column in closure table: the ancestor tenant.
-    pub const CLOSURE_ANCESTOR_ID: &str = "ancestor_id";
-    /// Column in closure table: the descendant tenant.
-    pub const CLOSURE_DESCENDANT_ID: &str = "descendant_id";
-    /// Column in closure table: barrier flag.
-    ///
-    /// AM materializes `barrier = 1` on every closure row whose strict path
-    /// `(ancestor, descendant]` crosses a self-managed tenant. Subtree
-    /// queries that should stop at delegation boundaries clamp the
-    /// subquery with `AND barrier = 0`.
-    pub const CLOSURE_BARRIER: &str = "barrier";
-    /// Column in closure table: status of the descendant tenant (SMALLINT,
-    /// canonically `{1 = active, 2 = suspended, 3 = deleted}` — see
-    /// `tenant_resolver_sdk::TenantStatus::as_smallint`).
-    pub const CLOSURE_DESCENDANT_STATUS: &str = "descendant_status";
-}
-
 /// A single scope filter — a typed predicate on a named resource property.
 ///
 /// The property name (e.g., `"owner_tenant_id"`, `"id"`) is an authorization
@@ -165,7 +113,15 @@ pub mod tenant_tables {
 /// - [`ScopeFilter::InGroup`] — group membership subquery
 /// - [`ScopeFilter::InGroupSubtree`] — group subtree subquery
 /// - [`ScopeFilter::InTenantSubtree`] — tenant subtree subquery on `tenant_closure`
+///
+/// `#[non_exhaustive]`: this mirrors the PDP's predicate set, which has already
+/// grown to five variants and will grow again. Without it, every new predicate
+/// is a breaking change for every downstream `match`. With it, a consumer must
+/// write a wildcard arm — and **that arm must fail closed**: a filter this build
+/// does not understand is a restriction it cannot apply, so treating it as
+/// "nothing to do" silently drops a narrowing term and widens the grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScopeFilter {
     /// Equality: `property = value`.
     Eq(EqScopeFilter),
@@ -519,6 +475,24 @@ impl ScopeFilter {
         }
     }
 
+    /// Whether this filter can be decided from its values alone.
+    ///
+    /// `false` for the three subquery variants, whose matching happens in SQL.
+    /// [`ScopeFilter::values`] returns an empty view for those, which is
+    /// indistinguishable from an `In` filter that genuinely has no values — so
+    /// a caller deciding membership in memory reads "no match" for a filter
+    /// that does grant access.
+    ///
+    /// Check this first: a filter that is not representable in memory has to be
+    /// resolved against the database, not treated as a negative.
+    #[must_use]
+    pub fn is_representable_in_memory(&self) -> bool {
+        match self {
+            Self::Eq(_) | Self::In(_) => true,
+            Self::InGroup(_) | Self::InGroupSubtree(_) | Self::InTenantSubtree(_) => false,
+        }
+    }
+
     /// Extract filter values as UUIDs, skipping non-UUID entries.
     ///
     /// Useful when the caller knows the property holds UUID values
@@ -549,8 +523,12 @@ impl<'a> ScopeFilterValues<'a> {
     #[must_use]
     pub fn iter(&self) -> ScopeFilterValuesIter<'a> {
         match self {
-            Self::Single(v) => ScopeFilterValuesIter::Single(Some(v)),
-            Self::Multiple(vs) => ScopeFilterValuesIter::Multiple(vs.iter()),
+            Self::Single(v) => {
+                ScopeFilterValuesIter(ScopeFilterValuesIterInner::Single(Some(v)))
+            }
+            Self::Multiple(vs) => {
+                ScopeFilterValuesIter(ScopeFilterValuesIterInner::Multiple(vs.iter()))
+            }
         }
     }
 
@@ -580,7 +558,16 @@ impl<'a> IntoIterator for &ScopeFilterValues<'a> {
 }
 
 /// Iterator over [`ScopeFilterValues`].
-pub enum ScopeFilterValuesIter<'a> {
+#[derive(Debug, Clone)]
+pub struct ScopeFilterValuesIter<'a>(ScopeFilterValuesIterInner<'a>);
+
+/// How [`ScopeFilterValuesIter`] is actually yielding values.
+///
+/// Private on purpose: as public variants this put `std::slice::Iter` into the
+/// crate's API, pinning an implementation detail into the contract that a
+/// change of backing collection would then break.
+#[derive(Debug, Clone)]
+enum ScopeFilterValuesIterInner<'a> {
     /// Yields a single value.
     Single(Option<&'a ScopeValue>),
     /// Yields from a slice.
@@ -591,12 +578,24 @@ impl<'a> Iterator for ScopeFilterValuesIter<'a> {
     type Item = &'a ScopeValue;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Single(v) => v.take(),
-            Self::Multiple(iter) => iter.next(),
+        match &mut self.0 {
+            ScopeFilterValuesIterInner::Single(v) => v.take(),
+            ScopeFilterValuesIterInner::Multiple(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.0 {
+            ScopeFilterValuesIterInner::Single(v) => {
+                let n = usize::from(v.is_some());
+                (n, Some(n))
+            }
+            ScopeFilterValuesIterInner::Multiple(iter) => iter.size_hint(),
         }
     }
 }
+
+impl ExactSizeIterator for ScopeFilterValuesIter<'_> {}
 
 /// A conjunction (AND) of scope filters — one access path.
 ///
@@ -607,10 +606,49 @@ pub struct ScopeConstraint {
     filters: Vec<ScopeFilter>,
 }
 
+/// A [`ScopeConstraint`] was built with no filters.
+///
+/// A constraint is a conjunction, so an empty one is an AND over nothing: it
+/// matches every row. As one disjunct of an [`AccessScope`] that makes the whole
+/// scope allow-all, while `is_unconstrained()` and `is_deny_all()` both still
+/// answer `false` — so the scope looks constrained to every caller that asks.
+/// `toolkit-db` compiled exactly this shape to an unconditional `WHERE true`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("a scope constraint must carry at least one filter; an empty one matches every row")]
+pub struct EmptyScopeConstraint;
+
 impl ScopeConstraint {
-    /// Create a new scope constraint from a list of filters.
+    /// Create a new scope constraint from a non-empty list of filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyScopeConstraint`] if `filters` is empty. Rejecting here is
+    /// what keeps a predicate-free constraint from reaching a consumer at all:
+    /// the policy compiler builds one of these from whatever predicates a PDP
+    /// returned, and a decision that produced none would otherwise widen into
+    /// an allow-all grant instead of failing closed.
+    pub fn try_new(filters: Vec<ScopeFilter>) -> Result<Self, EmptyScopeConstraint> {
+        if filters.is_empty() {
+            return Err(EmptyScopeConstraint);
+        }
+        Ok(Self { filters })
+    }
+
+    /// Create a new scope constraint from a list of filters known to be
+    /// non-empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `filters` is empty. Prefer [`ScopeConstraint::try_new`]
+    /// wherever the list is derived from input rather than written out in
+    /// place; this exists for literals and test fixtures, where an empty list
+    /// is a bug in the caller rather than a condition to handle.
     #[must_use]
     pub fn new(filters: Vec<ScopeFilter>) -> Self {
+        assert!(
+            !filters.is_empty(),
+            "a scope constraint must carry at least one filter; an empty one matches every row"
+        );
         Self { filters }
     }
 
@@ -758,7 +796,40 @@ impl AccessScope {
         !self.unconstrained && self.constraints.is_empty()
     }
 
+    /// Whether this scope permits `id` for `property`.
+    ///
+    /// Prefer this over [`AccessScope::contains_uuid`] for an authorization
+    /// decision. The `contains_*` and `has_property` family reports on the
+    /// *constraint list* only, so on an allow-all scope — which has no
+    /// constraints — every one of them answers "no", which reads exactly like
+    /// deny-all at the call site. Each caller then has to remember to check
+    /// [`AccessScope::is_unconstrained`] first, and a caller that forgets denies
+    /// a request the scope actually permits.
+    ///
+    /// This folds that check in, so the unconstrained case cannot be skipped.
+    #[must_use]
+    pub fn allows_uuid(&self, property: &str, id: Uuid) -> bool {
+        self.unconstrained || self.contains_uuid(property, id)
+    }
+
+    /// Whether this scope permits `value` for `property`.
+    ///
+    /// The [`AccessScope::allows_uuid`] rationale applies here too: this is the
+    /// predicate to use for an authorization decision, because it accounts for
+    /// an allow-all scope.
+    #[must_use]
+    pub fn allows_value(&self, property: &str, value: &ScopeValue) -> bool {
+        self.unconstrained || self.contains_value(property, value)
+    }
+
     /// Collect all values for a given property across all constraints.
+    ///
+    /// **Reports on the constraint list only.** An allow-all scope has no
+    /// constraints, so this returns an empty `Vec` for it — which means "no
+    /// constraint names this property", never "this scope permits nothing".
+    /// An allow-all scope permits every value, and no finite list can say so.
+    /// Check [`AccessScope::is_unconstrained`] before reading anything into an
+    /// empty result.
     #[must_use]
     pub fn all_values_for(&self, property: &str) -> Vec<&ScopeValue> {
         let mut result = Vec::new();
@@ -775,6 +846,10 @@ impl AccessScope {
     /// Collect all UUID values for a given property across all constraints.
     ///
     /// Convenience wrapper — skips non-UUID values.
+    ///
+    /// **Reports on the constraint list only**, with the same caveat as
+    /// [`AccessScope::all_values_for`]: empty on an allow-all scope, which
+    /// permits everything rather than nothing.
     #[must_use]
     pub fn all_uuid_values_for(&self, property: &str) -> Vec<Uuid> {
         let mut result = Vec::new();
@@ -789,12 +864,28 @@ impl AccessScope {
     }
 
     /// Check if any constraint has a filter matching the given property and value.
+    ///
+    /// **Reports on the constraint list only**, so an allow-all scope answers
+    /// `false` despite permitting the value. Use [`AccessScope::allows_value`]
+    /// for an authorization decision.
+    ///
+    /// A UUID matches whichever representation the scope carries. `ScopeValue`
+    /// admits the same id as either [`ScopeValue::Uuid`] or a
+    /// [`ScopeValue::String`] holding its text, and those two are not equal
+    /// under `PartialEq` — so a plain equality check answered `false` here for
+    /// an id that [`AccessScope::contains_uuid`], which parses through
+    /// [`ScopeValue::as_uuid`], answered `true` for. One identity, one answer.
     #[must_use]
     pub fn contains_value(&self, property: &str, value: &ScopeValue) -> bool {
+        // Resolve once, outside the scan.
+        let as_uuid = value.as_uuid();
         self.constraints.iter().any(|c| {
-            c.filters()
-                .iter()
-                .any(|f| f.property() == property && f.values().contains(value))
+            c.filters().iter().any(|f| {
+                f.property() == property
+                    && f.values().iter().any(|v| {
+                        v == value || (as_uuid.is_some() && v.as_uuid() == as_uuid)
+                    })
+            })
         })
     }
 
@@ -804,6 +895,10 @@ impl AccessScope {
     /// that UUID-as-string values are treated consistently with
     /// [`AccessScope::all_uuid_values_for`], which also parses strings via
     /// [`ScopeValue::as_uuid`].
+    ///
+    /// **Reports on the constraint list only**, so an allow-all scope answers
+    /// `false` despite permitting the id. Use [`AccessScope::allows_uuid`] for
+    /// an authorization decision.
     #[must_use]
     pub fn contains_uuid(&self, property: &str, id: Uuid) -> bool {
         self.constraints.iter().any(|c| {
@@ -814,6 +909,10 @@ impl AccessScope {
     }
 
     /// Check if any constraint references the given property.
+    ///
+    /// **Reports on the constraint list only**: an allow-all scope has no
+    /// constraints and so answers `false`, which is not a statement about what
+    /// it permits. Check [`AccessScope::is_unconstrained`] first.
     #[must_use]
     pub fn has_property(&self, property: &str) -> bool {
         self.constraints
@@ -830,6 +929,21 @@ impl AccessScope {
     /// - Unconstrained scopes become deny-all (fail-closed).
     /// - Constraints that contain no `owner_tenant_id` filter are dropped entirely.
     /// - If all constraints are dropped, the result is deny-all.
+    ///
+    /// # This widens the grant, by design — check that you want it
+    ///
+    /// Filters on other properties are **removed from surviving constraints**,
+    /// and a constraint is a conjunction, so dropping one of its terms admits
+    /// everything that term excluded. `[owner_tenant_id = T, id IN (r1)]`
+    /// becomes `owner_tenant_id = T`: one resource turned into the whole tenant.
+    ///
+    /// That is correct for the case this exists for — re-targeting a scope at a
+    /// *different* entity, one with no `owner_id`/`id` column of its own, where
+    /// the removed terms never applied to the rows being filtered. It is wrong
+    /// if you are narrowing a scope for the same entity, and the resulting
+    /// scope must not be the only thing authorizing the access: mini-chat, for
+    /// example, checks the parent chat against the full scope first and only
+    /// then uses `tenant_only()` for its messages.
     #[must_use]
     pub fn tenant_only(&self) -> Self {
         self.retain_properties(&[pep_properties::OWNER_TENANT_ID])
@@ -841,7 +955,9 @@ impl AccessScope {
     /// resource-level constraints (e.g., reactions scoped to the acting user).
     ///
     /// - Unconstrained scopes become deny-all (fail-closed).
-    /// - Constraints that contain none of the retained properties are dropped.
+    /// - A constraint is kept only if **every** filter in it is on one of the
+    ///   two retained properties; one carrying anything else is dropped whole,
+    ///   for the reason given on [`AccessScope::tenant_only`].
     /// - If all constraints are dropped, the result is deny-all.
     #[must_use]
     pub fn tenant_and_owner(&self) -> Self {
@@ -970,11 +1086,16 @@ mod tests {
     // --- ScopeFilter::Eq ---
 
     #[test]
-    fn scope_filter_eq_constructor() {
+    fn scope_filter_eq_exposes_exactly_one_value() {
         let f = ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1));
         assert_eq!(f.property(), pep_properties::OWNER_TENANT_ID);
         assert!(matches!(f, ScopeFilter::Eq(_)));
-        assert!(f.values().contains(&ScopeValue::Uuid(uid(T1))));
+
+        // The behaviour worth pinning is what an `Eq` filter yields, not that
+        // the constructor stored what it was handed: exactly one value, and one
+        // that parses back to the UUID it was built from.
+        assert_eq!(f.values().iter().count(), 1);
+        assert_eq!(f.uuid_values(), vec![uid(T1)]);
     }
 
     #[test]
@@ -1006,13 +1127,189 @@ mod tests {
     }
 
     #[test]
-    fn contains_value_works_with_eq() {
+    fn contains_uuid_works_with_eq() {
         let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
             pep_properties::OWNER_TENANT_ID,
             uid(T1),
         )]));
         assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
         assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T2)));
+    }
+
+    #[test]
+    fn contains_value_matches_the_value_it_was_given() {
+        // This is `contains_value` itself, not `contains_uuid`: the two tests
+        // named for it exercised the latter, leaving this one untested.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            uid(T1),
+        )]));
+
+        assert!(scope.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::Uuid(uid(T1))
+        ));
+        assert!(!scope.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::Uuid(uid(T2))
+        ));
+        assert!(
+            !scope.contains_value("some_other_property", &ScopeValue::Uuid(uid(T1))),
+            "a match on the value alone is not a match: the property must agree too"
+        );
+    }
+
+    #[test]
+    fn a_subquery_filter_reports_that_it_cannot_be_decided_in_memory() {
+        // An empty value view means two different things, and only this
+        // predicate separates them: an `In` filter with no values genuinely
+        // matches nothing, while a subquery filter matches whatever the
+        // database says and simply cannot answer here.
+        let empty_in = ScopeFilter::r#in(pep_properties::OWNER_TENANT_ID, vec![]);
+        assert_eq!(empty_in.values().iter().count(), 0);
+        assert!(
+            empty_in.is_representable_in_memory(),
+            "an In filter with no values is a real, decidable negative"
+        );
+
+        for subquery in [
+            ScopeFilter::in_group(pep_properties::RESOURCE_ID, vec![ScopeValue::Uuid(uid(T1))]),
+            ScopeFilter::in_group_subtree(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(uid(T1))],
+            ),
+        ] {
+            assert_eq!(subquery.values().iter().count(), 0);
+            assert!(
+                !subquery.is_representable_in_memory(),
+                "a subquery filter's empty value view is not a negative"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_value_and_contains_uuid_agree_on_a_uuid_held_as_a_string() {
+        // The same id can sit in a scope as either variant, and they are not
+        // equal under `PartialEq` -- so the two predicates used to disagree
+        // about whether the scope contains it.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            ScopeValue::String(uid(T1).to_string()),
+        )]));
+
+        assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(
+            scope.contains_value(
+                pep_properties::OWNER_TENANT_ID,
+                &ScopeValue::Uuid(uid(T1))
+            ),
+            "a UUID must match the scope's string rendering of the same id"
+        );
+
+        // And the reverse: a scope holding the typed variant, queried by text.
+        let typed = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            uid(T1),
+        )]));
+        assert!(typed.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::String(uid(T1).to_string())
+        ));
+
+        // A different id still does not match, in either direction.
+        assert!(!typed.contains_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::String(uid(T2).to_string())
+        ));
+    }
+
+    #[test]
+    fn contains_value_still_distinguishes_non_uuid_values() {
+        // The UUID equivalence must not blur values that are not UUIDs.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            "status",
+            ScopeValue::String("active".to_owned()),
+        )]));
+
+        assert!(scope.contains_value("status", &ScopeValue::String("active".to_owned())));
+        assert!(!scope.contains_value("status", &ScopeValue::String("suspended".to_owned())));
+        assert!(!scope.contains_value("status", &ScopeValue::Int(1)));
+    }
+
+    #[test]
+    fn contains_value_is_false_for_a_subquery_filter() {
+        // `InGroup` resolves in SQL, so it exposes no values in memory. The
+        // answer here is "cannot tell from memory", and `false` is the
+        // fail-closed rendering of that.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(uid(T1))],
+        )]));
+        assert!(!scope.contains_value(pep_properties::RESOURCE_ID, &ScopeValue::Uuid(uid(T1))));
+    }
+
+    #[test]
+    fn an_allow_all_scope_permits_everything_it_reports_no_constraint_for() {
+        // The distinction the `contains_*` family cannot express on its own: an
+        // allow-all scope holds no constraints, so every one of them answers
+        // "no" for a value the scope in fact permits.
+        let scope = AccessScope::allow_all();
+
+        assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(!scope.has_property(pep_properties::OWNER_TENANT_ID));
+        assert!(scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID).is_empty());
+
+        assert!(
+            scope.allows_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            "an allow-all scope permits any id"
+        );
+        assert!(
+            scope.allows_value(
+                pep_properties::OWNER_TENANT_ID,
+                &ScopeValue::Uuid(uid(T1))
+            ),
+            "an allow-all scope permits any value"
+        );
+    }
+
+    #[test]
+    fn an_empty_constraint_is_refused() {
+        // An AND over no filters is TRUE, so this shape is an allow-all
+        // disjunct -- while the scope carrying it still reports itself as
+        // neither unconstrained nor deny-all, so nothing downstream sees that
+        // it grants everything.
+        assert_eq!(
+            ScopeConstraint::try_new(vec![]).unwrap_err(),
+            EmptyScopeConstraint
+        );
+
+        assert!(
+            ScopeConstraint::try_new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                uid(T1)
+            )])
+            .is_ok(),
+            "one filter is enough to narrow"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must carry at least one filter")]
+    fn the_infallible_constructor_refuses_an_empty_list_too() {
+        // `new` is for literals, where an empty list is a bug in the caller
+        // rather than a condition to handle -- but it must not quietly produce
+        // the allow-all shape either.
+        drop(ScopeConstraint::new(vec![]));
+    }
+
+    #[test]
+    fn a_deny_all_scope_permits_nothing() {
+        let scope = AccessScope::deny_all();
+        assert!(!scope.allows_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+        assert!(!scope.allows_value(
+            pep_properties::OWNER_TENANT_ID,
+            &ScopeValue::Uuid(uid(T1))
+        ));
     }
 
     // --- tenant_only ---
@@ -1027,6 +1324,26 @@ mod tests {
         let tenant_scope = scope.tenant_only();
         assert!(tenant_scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
         assert!(!tenant_scope.has_property(pep_properties::OWNER_ID));
+    }
+
+    #[test]
+    fn tenant_only_widens_a_resource_scoped_grant_to_the_whole_tenant() {
+        // Pinning the sharp edge rather than the happy path: removing a term
+        // from a conjunction admits everything that term excluded. This is what
+        // makes `tenant_only()` safe only when re-targeting the scope at an
+        // entity the removed terms never applied to -- and unsafe as the sole
+        // authorization for the same entity.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(T1)),
+            ScopeFilter::eq(pep_properties::RESOURCE_ID, uid(T2)),
+        ]));
+
+        let tenant_scope = scope.tenant_only();
+        assert!(
+            !tenant_scope.has_property(pep_properties::RESOURCE_ID),
+            "the resource narrowing is gone, so this grant now covers the tenant"
+        );
+        assert!(tenant_scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
     }
 
     #[test]
@@ -1305,15 +1622,30 @@ mod tests {
 
     #[test]
     fn in_tenant_subtree_scope_filter_carries_descendant_status() {
-        let f = InTenantSubtreeScopeFilter::with_descendant_status(
-            pep_properties::OWNER_TENANT_ID,
-            ScopeValue::Uuid(uid(T1)),
-            true,
-            vec![ScopeValue::Int(1), ScopeValue::Int(2)],
+        let filter = ScopeFilter::InTenantSubtree(
+            InTenantSubtreeScopeFilter::with_descendant_status(
+                pep_properties::OWNER_TENANT_ID,
+                ScopeValue::Uuid(uid(T1)),
+                true,
+                vec![ScopeValue::Int(1), ScopeValue::Int(2)],
+            ),
         );
-        assert_eq!(f.descendant_status().len(), 2);
-        assert_eq!(f.descendant_status()[0], ScopeValue::Int(1));
-        assert_eq!(f.descendant_status()[1], ScopeValue::Int(2));
+
+        // The status list must survive into the filter...
+        let ScopeFilter::InTenantSubtree(inner) = &filter else {
+            panic!("constructed as InTenantSubtree");
+        };
+        assert_eq!(
+            inner.descendant_status(),
+            &[ScopeValue::Int(1), ScopeValue::Int(2)]
+        );
+
+        // ...while `values()` stays empty, because this variant resolves as a
+        // subquery in SQL and exposes nothing to match against in memory. That
+        // pairing is what the filter promises; reading the field back alone
+        // would pass even if the variant started leaking values.
+        assert_eq!(filter.values().iter().count(), 0);
+        assert!(!filter.is_representable_in_memory());
     }
 
     #[test]
@@ -1335,13 +1667,11 @@ mod tests {
         assert!(!f.respect_barriers());
     }
 
-    #[test]
-    fn tenant_tables_constants_are_stable() {
-        assert_eq!(tenant_tables::CLOSURE_TABLE, "tenant_closure");
-        assert_eq!(tenant_tables::CLOSURE_ANCESTOR_ID, "ancestor_id");
-        assert_eq!(tenant_tables::CLOSURE_DESCENDANT_ID, "descendant_id");
-        assert_eq!(tenant_tables::CLOSURE_BARRIER, "barrier");
-    }
+    // `tenant_tables_constants_are_stable` used to live here, comparing each
+    // constant to the literal it was defined as a few hundred lines above --
+    // which can only fail if someone edits one and forgets the other. The
+    // constants themselves have since moved to `toolkit-db`, next to the code
+    // that emits SQL against those tables.
 
     // --- contains_uuid string matching ---
 
