@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp /build/target/$OUTPUT_DIR/cf-gears-example-server /tmp/cf-gears-example-server
 
 # Stage 2: Runtime
-FROM debian:13.3-slim
+FROM debian:13.6-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
