@@ -229,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn build_from_shared_secret_attaches_static_token() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "shared-tok".to_owned(),
+            secret: "shared-tok".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
         let mut interceptor = build_internal_auth_interceptor(&cfg)

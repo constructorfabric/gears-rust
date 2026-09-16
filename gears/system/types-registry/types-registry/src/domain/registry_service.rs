@@ -267,6 +267,7 @@ impl RegistryService {
                     limits: &self.config.limits,
                     worker: &self.config.worker,
                     metrics: &self.metrics,
+                    allow_compatibility_force: self.config.allow_compatibility_force,
                 },
                 accepted.operation_id,
                 now,

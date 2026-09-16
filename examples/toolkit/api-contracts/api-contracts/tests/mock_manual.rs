@@ -79,6 +79,18 @@ impl PaymentApi for ManualPaymentApi {
             Result<PaymentSummary, CanonicalError>,
         >())
     }
+
+    // The fallible-open counterpart: the open is awaited and could fail, so a
+    // hand-written mock returns `Ok(stream)` to say "the open succeeded".
+    async fn stream_payments(
+        &self,
+        _ctx: SecurityContext,
+        _filter: ListPaymentsFilter,
+    ) -> Result<PaymentStream<PaymentSummary>, CanonicalError> {
+        Ok(Box::pin(futures_util::stream::empty::<
+            Result<PaymentSummary, CanonicalError>,
+        >()))
+    }
 }
 
 fn ctx() -> SecurityContext {

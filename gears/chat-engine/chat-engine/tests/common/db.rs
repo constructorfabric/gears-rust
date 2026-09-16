@@ -314,6 +314,8 @@ fn part_type_str(t: &message_part::MessagePartType) -> &'static str {
         message_part::MessagePartType::Videos => "videos",
         message_part::MessagePartType::Links => "links",
         message_part::MessagePartType::Statuses => "statuses",
+        message_part::MessagePartType::ToolCall => "tool_call",
+        message_part::MessagePartType::ToolResult => "tool_result",
     }
 }
 

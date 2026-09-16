@@ -16,26 +16,20 @@ We welcome contributions in:
 
 ### 1.1 Prerequisites
 
-- **Rust stable** with Cargo (Edition 2024, Rust MSRV 1.95.0)
-- **Protocol Buffers compiler** (`protoc`) (see `README.md`)
-- **Git** for version control
+Follow the cross-platform [development setup guide](SETUP.md) before contributing. It covers macOS, Linux, and Windows setup, including Rust and Cargo through rustup, native build tools, `make setup`, and optional Constructor Studio installation.
+
 - **Your favorite editor** (VS Code with rust-analyzer recommended)
 
 ### 1.2 Development Setup
 
 ```bash
-# Clone the repository
+# Clone the repository after completing SETUP.md.
 git clone --recurse-submodules <repository-url>
 cd gears-rust
 
-# If you didn't clone with --recurse-submodules (includes Constructor Studio for PR reviews)
+# If you did not clone with --recurse-submodules
+# (includes Constructor Studio for PR reviews)
 git submodule update --init --recursive
-
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install required components
-rustup component add clippy rustfmt
 
 # Build the whole-project example server release binary
 make build

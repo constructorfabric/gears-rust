@@ -32,9 +32,9 @@ and dependent refresh. Both must be positive. Closure accounting is per document
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-32 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a added
-out of the Checkpoint 1 review (P12/P13). Twenty-nine are S or M; three are **L** and say
-why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
+33 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a added
+out of the Checkpoint 1 review (P12/P13), and T27 split into T20a and T22a (P17). Thirty are
+S or M; three are **L** and say why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
 (e2e migration across seven files), each split by gear or by file rather than landing as one
 commit. Two tasks exceed the ~5 file guideline, flagged with the reason where they occur.
 
@@ -49,10 +49,10 @@ into Phase 1, and `make dylint` per phase instead of per task. P14 defines `x-gt
 independently of the dependency graph. P15 replaces the revision-vector lock with the optimistic
 guard and keeps the one thing that survives the argument: a serialized write path — one row,
 claimed first by every commit — that orders commits, joined by every writer of entity state:
-admission here, deletion at T20, purge under ADR-0013. P16 and P17 came out
-of reviewing Phase 3 on its way out: P16 makes observability a per-task obligation from T17
-onward, and P17 moves T27 — the REST surface — from Phase 7 into Phase 5. (P11 was a
-housekeeping close-out and is retired; the number is not reused.)
+admission here, deletion at T20, purge under ADR-0013. P16 came out of reviewing Phase 3:
+observability is a per-task obligation from T17 onward. P17, revised after T20, splits REST
+completion into T20a (mutations, Phase 5) and T22a (reads, Phase 6), and moves T21 outbox
+dispatch into Phase 5. (P11 was a housekeeping close-out and is retired; the number is not reused.)
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -277,7 +277,7 @@ uncached. Checkpoint 7 gates on T30 being done, so P0 does not finish without it
 
 ### P8. P0 ships the platform-plane API on the business listener; the plane is contract-deep, not transport-deep
 
-SPEC §8.4 is rewritten and ceiling **C8** is added. No task moves; T9 and T27 gain criteria.
+SPEC §8.4 is rewritten and ceiling **C8** is added. No task moves; T9, T20a and T22a carry the criteria.
 
 Registering a global entity is a platform-level operation, and P0 already treats it as one in
 the data — §8.1 writes `plane = 1`, `tenant_id = NULL` on every operation record. The earlier
@@ -362,14 +362,14 @@ Consequences:
   produces a false `unchanged` (RFC 9110 §8.8.3). The versioned wire form is the escape hatch,
   but paying one field now is cheaper than relying on it.
 
-**Ordering.** T27 (the routes, in Phase 5 per P17) → T23 (the field in the models) → **T29**
+**Ordering.** T22a (read routes, Phase 6 per P17) → T23 (the field in the models) → **T29**
 (computation, `ETag`, `304`, per-key batch validators) → T30 (cache revalidates against them).
-T30 was renumbered from T29 to keep task numbers in dependency order; T27's number is the one
-documented exception (P17).
+T30 was renumbered from T29 to keep task numbers in dependency order. P17 retires T27's
+out-of-order identifier by splitting it into T20a and T22a; T28–T30 keep their existing IDs.
 
 ### P10. Discovery is paged and content-free in P0; `$select` and expansion stay out
 
-SPEC gains decision **D12** and a rewritten §10.2; §2's row is split. T4, T23, T27 and T28
+SPEC gains decision **D12** and a rewritten §10.2; §2's row is split. T4, T22a, T23 and T28
 gain criteria; no task is added.
 
 `Discovery cursors, $select projections, OData pagination, expand_type_filter` were listed out
@@ -383,8 +383,8 @@ over *"content-free discovery"*. And the cursor's inputs degenerate exactly as t
 did: of the seven DESIGN binds into it — query, subject visibility context, Context Tenant,
 authorization scope, routing generation, per-source position, running item count — P0 keeps
 **two**, query and position, because the rest are tenant-plane, PDP, or federation. Position is
-free: T27 already required ordering by canonical identifier, so the cursor is a keyset over a
-unique immutable column, and `toolkit-odata` (`page.rs`, `pagination.rs`) already encodes
+free: the read route already required ordering by canonical identifier, so the cursor is a
+keyset over a unique immutable column, and `toolkit-odata` (`page.rs`, `pagination.rs`) already encodes
 cursors as versioned base64url that refuse an unknown version.
 
 **The current shape is also a live problem, not only a spec gap.** `GET /entities` returns
@@ -435,11 +435,10 @@ intended: with a fallback, an admission that never happened would read as succes
 
 **v2 is interim, and its retirement is planned rather than assumed.** T24 deletes the in-memory
 repository, so the v1 routes reading it are deleted in that same task, and **T24a** promotes v2
-onto the v1 paths. Recommended Phase 7 order was **T24 → T27 → T24a → T28**: T27 authors the
-remaining routes once, on v2, and the rename happens after them; T25/T26 float, since they depend
-on T24 alone. **P17 supersedes that half:** T27 moved into Phase 5, so the routes exist before the
-cutover and Phase 7 is **T24 → T24a → T28**, with T24a promoting all seven at once. Nothing else
-in this decision changes — v1 and v2 stay separate stores until T24, and the promotion is still
+onto the v1 paths. **P17 fixes the order at T24 → T24a → T28:** T20a authors deletion in
+Phase 5 and T22a completes reads in Phase 6, so every route exists before cutover and T24a
+promotes all seven at once. T25 follows T24 and T26 follows T25; both can proceed alongside
+route promotion and e2e migration. Nothing else in this decision changes — v1 and v2 stay separate stores until T24, and the promotion is still
 where the break reaches a v1 caller.
 
 **What the T24–T26 window owes `TypesRegistryClient`.** T25 and T26
@@ -666,7 +665,7 @@ and T20:
    for the compatibility verdict, because `compatible` is not a refusal and has nowhere else to
    go.
 2. **A series that blends writes with non-writes is wrong.** `dry_run` becomes a label wherever
-   a series would otherwise mix a rollback-only pass with a commit, and `kind` wherever it would
+   a series would otherwise mix a dry run with a commit, and `kind` wherever it would
    mix a deletion with a registration. T20 does that sweep in one commit, across every instrument
    that exists by then, because it is the task that makes both distinctions real.
 3. **The admission reason vocabulary has one home, and it is compile-enforced.**
@@ -690,51 +689,34 @@ infrastructure type that hides at the crate root — and it is the shape to exte
 is corrected rather than the code. Only `observability.rs`'s two span constructors are free
 functions, and its module header states why.
 
-### P17. T27 moves into Phase 5, behind T20 — the REST surface is not cutover-dependent
+### P17. Complete mutations and dispatch in Phase 5; reads and the SDK contract in Phase 6
 
-T27's declared dependencies were T21 and T23. Neither survives inspection.
+T27 is split into T20a (mutations) and T22a (reads); T21 moves into Phase 5.
+T28–T30 keep their IDs.
 
-* **T21 is not a dependency.** Admission already runs inline — `AdmissionMode::Inline` with
-  `NullDispatch` (`gear.rs`), written that way at T7 precisely so the outbox could arrive later —
-  so a `POST` to `/v2/` admits end to end today and every route T27 adds is exercisable without
-  an outbox. T21 changes *who calls the worker*, not what a route can do.
-* **T23 is a contract dependency, and the contract is already fixed** by SPEC §10.1 and §10.2:
-  `items` as the array name on all three batch bodies, `key` as the per-item entity name,
-  `EntityPage` as the page shape. T27 authors DTOs against that section and T23 authors the trait
-  against the same one. Where the two could still disagree they disagree while both sit behind
-  `/v2/` with no consumer, which is the cheapest place in the plan for that to happen.
+- **Phase 5: T19 → T20 → T20a → T21 → Checkpoint 5.** T20a exposes single/batch
+  deletion with dry run on all mutations (body for registration/batch deletion, query for
+  single deletion). T21 adds outbox submission; seeding remains inline (P3).
+- **Phase 6: T22 → T22a → T23 → Checkpoint 6.** T22a adds `:batchGet` and bounded,
+  content-free discovery with cursors and `$select` refusal. REST and SDK follow SPEC
+  §10.1/§10.2 (`items`, `key`, `EntityPage`).
 
-What T27 *does* depend on is **T20**: `:batchDelete` and `DELETE /entities/{entity_key}` are one
-route pair over the deletion path, and by T27's own criteria they add no logic the domain does not
-already expose. So the task moves whole to the end of Phase 5, and the phase becomes batching,
-deletion, dry run **and the REST surface that exposes them**. `GET /entities` — the paged,
-content-free discovery route of D12 — therefore lands two phases earlier than planned, which is
-the point: it is the route with the live problem (every match in one array, each with up to 1 MB
-of content), and it is the one every consumer and every e2e suite reads through.
+T20a works with inline admission. T21 depends on T20; scheduling it after T20a enables
+REST-to-outbox tests before Checkpoint 5. T22a needs database reads, v2 routes and T20a's
+mutation docs for the seven-route completeness check. T22's `owning_gear` is independent
+of reads; T23 depends on T22 and follows T22a by execution order. T29 needs T22a and T23.
 
-Three consequences, each tighter than what it replaces:
+Checkpoint 5 proves submit → poll → terminal outcome through the router and outbox for
+all mutations in both modes, without direct worker calls. Dry runs persist outcomes but
+change no entity state, revisions or versions. Checkpoint 6 verifies reads and completes
+all seven routes.
 
-* **P12's ordering constraint disappears.** The recommended Phase 7 order was
-  T24 → T27 → T24a → T28, with the promotion wedged between the last new route and the e2e
-  migration. With the routes authored in Phase 5, Phase 7 is **T24 → T24a → T28**, with
-  T25 → T26 running alongside it — T25 on T24, T26 on T25, since T26 deletes the trait T25's
-  gears are still on. T24a promotes all seven routes at once, because all seven already exist.
-* **The changelog entries stay in Phase 7, with T24a.** T27 carried them, but the break they
-  describe happens at the promotion — a changelog entry announcing a v1 break in a release where
-  v1 still works is simply wrong. T24a already required both entries as *"one release, two
-  entries"*; it now owns them outright.
-* **T27's `make e2e-local` verification is replaced, not moved.** P12's invariant is that no e2e
-  file is edited before T24, and T27 now lands five tasks ahead of it. The new routes are
-  verified through the real router in `tests/api_rest_test.rs` and by manual `curl` against
-  `/v2/`, while `make e2e-local` stays green **and untouched** — it becomes a criterion of T27
-  rather than its verification. T28 remains the single task that migrates the Python suites, and
-  it still runs against the promoted v1 paths.
+T20a documents mutations; T22a completes OpenAPI and quickstart reads. Both use
+`routes::V2` and internal-only mutations (C8), with router tests and manual `curl`.
+P12 keeps e2e files unchanged and `make e2e-local` green until T24.
 
-**The number stays T27**, out of dependency order, which this plan otherwise avoids — T30 was
-renumbered from T29 for exactly that reason. Renaming costs two dozen cross-references across two
-documents to satisfy a convention whose only reader is the plan itself, so the exception is
-documented here instead. **T29's dependency on T27 is satisfied two phases early**; its remaining
-one is T23, and it stays in Phase 7 beside T30, which needs T24 and T26 regardless.
+Cutover remains **T24 → T24a → T28**, alongside T25 → T26. T24a promotes all seven
+routes and owns both v1-breaking changelog entries; T28 migrates the Python suites.
 
 ## Dependency graph
 
@@ -769,31 +751,37 @@ T6 config ───────────────────────�
                                  │
                      T19 partial admission ──► T20 delete + dry run
                                                         │
-                     T27 REST completion + OpenAPI + QUICKSTART (P17)
+                                        T20a REST deletion + dry run
                                                         │
-        ┌────────────────────────┬──────────────────────┴─┐
-        ▼                        ▼                        ▼
-   T21 outbox        T22 toolkit-gts owning_gear    (T19 enables T24)
-        │                        │
-        └──────────┬─────────────┘
+                                                 T21 outbox
+                                                        │
+                                             ─── Checkpoint 5 ───
+                                                        │
+                   ┌────────────────────────────────────┘
+                   │
+        ┌──────────┴──────────────────────┐
+        ▼                                 ▼
+        T22 toolkit-gts owning_gear       T22a REST batchGet + discovery
+        (needs T1)                        (needs T4, T9a, T20a)
+        └──────────┬──────────────────────┘
                    ▼
         T23 new SDK trait + reconciliation helper
+        (needs T22; scheduled after T22a)
                    │
-        T24 CUTOVER: registry seeds only its own; ready mode + in-memory repo out
+        ─── Checkpoint 6: SDK + all seven v2 routes ───
                    │
-        T24a retire v1; promote v2 → v1 — all seven routes at once (P12, P17)
+        T24 CUTOVER (needs T19, T21, T23)
                    │
-        ┌──────────┴──────────┐
-        ▼                     ▼
-   T25 migrate system    T26 migrate domain gears,
-   gears + plugins       delete the old trait
-        └──────────┬──────────┘
-                   ▼
-        T28 e2e suites move to submit-then-poll
+        ┌──────────┴──────────────────────┐
+        ▼                                 ▼
+        T24a retire v1; promote v2 → v1    T25 migrate system gears + plugins
+        │                                 │
+        ▼                                 ▼
+        T28 e2e migration                 T26 migrate domain gears; delete old trait
 
-        T29 validators + conditional reads (needs T23; T27 landed in Phase 5)
+        T29 validators + conditional reads (needs T22a, T23)
                    │
-        T30 SDK client cache on EntitySnapshot — revalidates against T29 (P7)
+        T30 SDK client cache (needs T24, T26, T29; parallel with T28)
 ```
 
 Foundation order (T2→T5) is unavoidably layered: nothing can be registered before a table
@@ -840,16 +828,17 @@ exists. From T7 onward the graph is vertical.
 
 **Checkpoint 4**
 
-### Phase 5 — Batching, deletion, dry run, and the REST surface
+### Phase 5 — Batching, deletion, dry run, and dispatch
 - T19: Dependency-aware partial admission
 - T20: Deletion and Dry Run — plus the `dry_run` / `kind` label sweep (P16)
-- T27: REST completion, OpenAPI, QUICKSTART — **moved here from Phase 7** (P17)
+- T20a: REST deletion and dry run — mutation OpenAPI and quickstart (P17)
+- T21: Outbox dispatch wiring — **moved here from Phase 6** (P17)
 
 **Checkpoint 5**
 
-### Phase 6 — Dispatch and the new contract
-- T21: Outbox dispatch wiring
+### Phase 6 — Read API and the new contract
 - T22: `toolkit-gts` — `owning_gear` on inventory records
+- T22a: REST batchGet and discovery — complete OpenAPI and quickstart (P17)
 - T23: New SDK trait and the reconciliation helper
 
 **Checkpoint 6**
@@ -902,23 +891,27 @@ compile-enforced vocabulary** (P16) — quarantine and dialect refusals included
 collapsed into `invalid_schema`.
 
 **Checkpoint 5** — a batch with a failing dependency commits independent branches and
-blocks everything downstream of it; a circular `$ref` is refused; Dry Run writes nothing.
+blocks everything downstream of it; a circular `$ref` is refused; deletion safety holds.
 **No series blends a dry run with a commit or a deletion with a registration, and blocked
-candidates are counted per reason** (P16). **The REST surface is complete on `/v2/`** (T27, P17):
-all seven routes are in OpenAPI, `GET /entities` returns one bounded content-free page whose
-cursor traverses the set exactly once and refuses `$select`, and `make e2e-local` is still green
-with no e2e file edited.
+candidates are counted per reason** (P16). Registration and both deletion routes support
+dry run on `/v2/`, with mutation OpenAPI and quickstart examples (T20a). All three routes,
+in committed and dry-run mode, reach terminal outcomes through the outbox without a direct
+worker call (T21): operation/outcome records persist, while a dry run changes no entity state,
+revision or resource version. `make e2e-local` stays green with no e2e file edited.
 
-**Checkpoint 6** — an operation submitted through the outbox reaches `completed` without a
-direct worker call; inventory records carry `owning_gear`; the new trait and its
-reconciliation helper work against a mock consumer. Nothing has been cut over yet.
+**Checkpoint 6** — inventory records carry `owning_gear`; the new trait and its reconciliation
+helper work against a mock consumer. **All seven v2 routes are complete** (T20a, T22a, P17):
+`batchGet` returns explicit per-key results; discovery is bounded and content-free, its cursor
+traverses a stable set exactly once, and `$select` is refused. OpenAPI covers every route and
+`QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged
+`make e2e-local` pass; nothing has been cut over yet.
 
 **Checkpoint 7** — every gear reconciles its own declarations and gates its own readiness;
 the platform boots; the old trait is gone and no consumer references it. The SDK client cache
 is in place on the new models, with its window, byte bound and `fresh` bypass (P7) — P0 does
 not finish with an uncached read path. **One REST version: no `/v2/` path survives, and the
 in-memory repository and its routes are gone (T24a, P12).** Discovery and the batch routes still
-behave as Checkpoint 5 proved them, now on the promoted v1 paths. All 16 success criteria of SPEC §16;
+behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 success criteria of SPEC §16;
 `make ci`, `make test-types-registry-db`, `make e2e-local`, `make dylint` green.
 
 ## Risks and mitigations
@@ -929,7 +922,7 @@ behave as Checkpoint 5 proved them, now on the promoted v1 paths. All 16 success
 | Pull→push cutover regresses platform boot | **High** — every gear now gates on its own registration | T24 lands after the helper is proven against a mock (Checkpoint 6); migration split across T25/T26 by gear group; each verified by booting the example server |
 | Removing the old trait breaks ~50 call sites in 20+ gears | **High** | Split by gear group; new trait exists and is tested (T23) before the first consumer moves; `cargo test --workspace` gates each migration task |
 | A gear's registration fails at startup and it gates readiness on it | Medium | This is DESIGN-intended (*"Each gear gates only its own readiness"*), but it is a real behavioural change; the SDK helper retries, and failures name the gear and identifier |
-| Dual path (in-memory + DB) live through phases 1–5 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository. **This was breached by T9 and repaired by T9a (P12):** repointing the v1 routes made the DB path consumer-visible ~19 tasks early, and `oagw` / `account-management` were then registering into the database while resolving from memory. The mitigation is now structural — v1 and v2 are separate routes over separate stores, and the criterion "no route straddles the two stores" is grep-checkable |
+| Dual path (in-memory + DB) live through phases 1–6 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository. **This was breached by T9 and repaired by T9a (P12):** repointing the v1 routes made the DB path consumer-visible ~19 tasks early, and `oagw` / `account-management` were then registering into the database while resolving from memory. The mitigation is now structural — v1 and v2 are separate routes over separate stores, and the criterion "no route straddles the two stores" is grep-checkable |
 | DB revisions land before reverse-impact refresh and compatibility | Medium | T11 documents the staging window; minor-bearing Type Schema revisions and effective `force` are refused, and the DB path has no consumer until T24. Checkpoints 3 and 4 must close T14/T17 before cutover |
 | Read latency regresses at T24, when reads move from memory to the database | Medium | Correctness first, then the cache: D3 already materializes what a read returns, so a read is one keyed `SELECT`, and T30 restores caching with DESIGN's contract (P7). The exposure is the T24–T28 window, which is why Checkpoint 7 gates on T30 |
 | A cached entry can be stale inside its freshness window | Low | DESIGN §3.3's sanctioned trade, and now bounded further: T29's validators let T30 revalidate rather than guess, `fresh` gives an authoritative read, `0s` disables the window, and invalidation is immediate on an observed terminal outcome |
@@ -939,18 +932,21 @@ behave as Checkpoint 5 proved them, now on the promoted v1 paths. All 16 success
 | `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable`. Under P12 both arrive at the same moment by construction: T24 deletes old v1, T24a promotes the whole async surface at once |
 | Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | Plain gear tests on SQLite plus `make test-types-registry-db` on PostgreSQL/MySQL at every checkpoint |
 | The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py` and — **missed until P12** — `oagw/helpers.py`, which registers a batch of schemas *and* instances and reads them back through the list route. T28 owns the migration behind one shared polling helper, not open-coded loops. The break itself no longer arrives at T9: T9a keeps v1 intact, so the suite goes red at T24 and green at T28 rather than being red for ~19 tasks |
-| T27's v2 DTOs are authored before T23 fixes the SDK trait shape | Low | The contract is SPEC §10.1/§10.2, not either task: `items`, `key`, `EntityPage`. Both are written against that section, and a disagreement surfaces at T23 while the routes are still behind `/v2/` with no consumer (P17) |
-| The new routes sit on `/v2/` for two extra phases without e2e coverage | Low | They were never e2e-covered before T28 either — P12 forbids editing an e2e file before T24. Coverage is `tests/api_rest_test.rs` through the real router plus manual `curl`; T28's scope is unchanged, and T27 now carries "`make e2e-local` still green, no e2e file edited" as a criterion (P17) |
+| T20a/T22a's v2 DTOs are authored before T23 fixes the SDK trait shape | Low | The contract is SPEC §10.1/§10.2, not either task: `items`, `key`, `EntityPage`. Both are written against that section, and a disagreement surfaces at T23 while the routes are still behind `/v2/` with no consumer (P17) |
+| New routes sit on `/v2/` until cutover without Python e2e coverage | Low | They were never e2e-covered before T28 either — P12 forbids editing an e2e file before T24. Coverage is `tests/api_rest_test.rs` through the real router plus manual `curl`; T28's scope is unchanged, and T20a/T22a carry "`make e2e-local` still green, no e2e file edited" as a criterion (P17) |
 | A later refusal or outcome ships without a metric, silently emptying a panel | Medium | P16 makes it a compile error rather than a review item: `ItemFailure::new` takes a `Reason` newtype whose only constructors are the vocabulary's consts, `dry_run` and `kind` become required port parameters at T20, and each of T17–T20 carries T16's evidence bar — contract test, emission test, mutation check |
 | Activation write set exceeds the measured 27 in a future deployment | Low | Configured bound 512, refuses rather than partially commits (T14) |
 
 ## Parallelization
 
-- **Parallel:** T16 with T14/T15. T22 with T21. T25 and T26 split per gear, but T26 deletes the
+- **Parallel:** T16 with T14/T15. T22 and T22a are independent after Checkpoint 5; the
+  default execution order is T22 then T22a. T25 and T26 split per gear, but T26 deletes the
   shared trait and so lands after T25 — the split is within each, not between them. T30 with T28 — it needs the new models (T26) and the database read path (T24), and
   nothing in the e2e task touches the client cache.
-- **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T19→T20→T27 in Phase 5 (P17 — the
-  deletion routes are one pair over T20's path), T22→T23→T24, and in Phase 7 T24→T24a→T28: the
+- **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T19→T20→T20a→T21 in Phase 5
+  (P17). Phase 6 executes T22→T22a→T23; T22→T23 is the SDK dependency, while T22a uses the
+  existing read primitives. In Phase 7 T24→T24a→T28: the
   promotion now sits directly after the cutover, because every route it promotes already exists.
-- **Contract first, then parallel:** T23's trait shape is fixed by SPEC §10.1, so it can
-  start as soon as Checkpoint 4 passes.
+- **Contract first:** T23's trait shape is fixed by SPEC §10.1 rather than by the REST DTOs.
+  Keep SDK integration after T22a in the chosen execution order; T29 then uses both the
+  batch read route and the SDK validator models.

@@ -27,6 +27,7 @@ use utoipa::openapi::{
 
 use crate::api::operation_builder;
 use toolkit_canonical_errors::problem;
+use toolkit_contract::StreamFraming;
 
 /// Type alias for schema collections used in API operations.
 type SchemaCollection = Vec<(String, RefOr<Schema>)>;
@@ -106,6 +107,58 @@ pub fn ensure_schema<T: utoipa::ToSchema + utoipa::PartialSchema + 'static>(
     registry.ensure_schema_raw(&root_name, collected)
 }
 
+/// Build the `x-*` vendor extensions for one operation.
+fn operation_vendor_extensions(
+    spec: &operation_builder::OperationSpec,
+) -> utoipa::openapi::extensions::Extensions {
+    let mut ext = utoipa::openapi::extensions::Extensions::default();
+
+    // Pagination
+    if let Some(pagination) = spec.vendor_extensions.x_odata_filter.as_ref()
+        && let Ok(value) = serde_json::to_value(pagination)
+    {
+        ext.insert("x-odata-filter".to_owned(), value);
+    }
+    if let Some(pagination) = spec.vendor_extensions.x_odata_orderby.as_ref()
+        && let Ok(value) = serde_json::to_value(pagination)
+    {
+        ext.insert("x-odata-orderby".to_owned(), value);
+    }
+
+    // Visibility axis (`OperationSpec.exposed`): mark routes that are
+    // registered in the gateway for external access. The `GatewayProvider`
+    // reads this vendor extension to select which routes to reverse-proxy.
+    // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
+    if spec.exposed {
+        ext.insert(
+            "x-toolkit-visibility".to_owned(),
+            serde_json::Value::String("exposed".to_owned()),
+        );
+    }
+
+    // Throttling zone bindings. The contract layer only knows zone
+    // *names*; the API gateway enriches these operations with the
+    // zones' numeric limits (`x-rate-limit-rps` / `x-rate-limit-burst`)
+    // when it builds the final document, using the zone name emitted
+    // here as the join key.
+    if let Some(throttling) = spec.throttling.as_ref() {
+        if let Some(zone) = throttling.rate_limit_zone.as_ref() {
+            ext.insert(
+                "x-throttling-rate-limit-zone".to_owned(),
+                serde_json::Value::String(zone.clone()),
+            );
+        }
+        if let Some(zone) = throttling.in_flight_limit_zone.as_ref() {
+            ext.insert(
+                "x-throttling-in-flight-limit-zone".to_owned(),
+                serde_json::Value::String(zone.clone()),
+            );
+        }
+    }
+
+    ext
+}
+
 /// Implementation of `OpenAPI` registry with lock-free data structures
 pub struct OpenApiRegistryImpl {
     /// Store operation specs keyed by "METHOD:path"
@@ -153,42 +206,7 @@ impl OpenApiRegistryImpl {
                 op = op.tag(tag.clone());
             }
 
-            // Vendor extensions
-            let mut ext = utoipa::openapi::extensions::Extensions::default();
-
-            // Rate limit
-            if let Some(rl) = spec.rate_limit.as_ref() {
-                ext.insert("x-rate-limit-rps".to_owned(), serde_json::json!(rl.rps));
-                ext.insert("x-rate-limit-burst".to_owned(), serde_json::json!(rl.burst));
-                ext.insert(
-                    "x-in-flight-limit".to_owned(),
-                    serde_json::json!(rl.in_flight),
-                );
-            }
-
-            // Pagination
-            if let Some(pagination) = spec.vendor_extensions.x_odata_filter.as_ref()
-                && let Ok(value) = serde_json::to_value(pagination)
-            {
-                ext.insert("x-odata-filter".to_owned(), value);
-            }
-            if let Some(pagination) = spec.vendor_extensions.x_odata_orderby.as_ref()
-                && let Ok(value) = serde_json::to_value(pagination)
-            {
-                ext.insert("x-odata-orderby".to_owned(), value);
-            }
-
-            // Visibility axis (`OperationSpec.exposed`): mark routes that are
-            // registered in the gateway for external access. The `GatewayProvider`
-            // reads this vendor extension to select which routes to reverse-proxy.
-            // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
-            if spec.exposed {
-                ext.insert(
-                    "x-toolkit-visibility".to_owned(),
-                    serde_json::Value::String("exposed".to_owned()),
-                );
-            }
-
+            let ext = operation_vendor_extensions(&spec);
             if !ext.is_empty() {
                 op = op.extensions(Some(ext));
             }
@@ -270,9 +288,15 @@ impl OpenApiRegistryImpl {
                 // empty `content_type`. Emit just `description` — attaching a
                 // `content` block would make code-generators expect a body.
                 if !r.content_type.is_empty() {
+                    // Streaming media types are json-like here too: their
+                    // declared schema is the *item* type, so it must render as
+                    // a `$ref` rather than as an opaque string blob. Derived
+                    // from `StreamFraming` rather than hard-coded, so a new
+                    // framing variant is covered automatically instead of
+                    // silently falling through to the opaque-string branch.
                     let is_json_like = r.content_type == "application/json"
                         || r.content_type == problem::APPLICATION_PROBLEM_JSON
-                        || r.content_type == "text/event-stream";
+                        || StreamFraming::is_stream_media_type(r.content_type);
                     let content = if is_json_like {
                         // Manually build content to preserve the correct content type.
                         ContentBuilder::new()
@@ -664,7 +688,7 @@ mod tests {
             handler_id: handler.to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -684,6 +708,40 @@ mod tests {
             description: None,
             servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn throttling_zone_names_are_emitted_as_vendor_extensions() {
+        use crate::api::operation_builder::ThrottlingSpec;
+
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response("/throttled", "throttled_op", None);
+        spec.throttling = Some(ThrottlingSpec {
+            rate_limit_zone: Some("rl_zone".to_owned()),
+            in_flight_limit_zone: Some("ifl_zone".to_owned()),
+            require_security_context: false,
+            dry_run: false,
+        });
+        registry.register_operation(&spec);
+        // An operation without throttling must not carry the extensions.
+        registry.register_operation(&spec_with_response("/plain", "plain_op", None));
+
+        let doc = registry.build_openapi(&test_info()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        let throttled = &json["paths"]["/throttled"]["get"];
+        assert_eq!(
+            throttled["x-throttling-rate-limit-zone"],
+            serde_json::json!("rl_zone")
+        );
+        assert_eq!(
+            throttled["x-throttling-in-flight-limit-zone"],
+            serde_json::json!("ifl_zone")
+        );
+
+        let plain = &json["paths"]["/plain"]["get"];
+        assert!(plain.get("x-throttling-rate-limit-zone").is_none());
+        assert!(plain.get("x-throttling-in-flight-limit-zone").is_none());
     }
 
     #[test]
@@ -715,7 +773,7 @@ mod tests {
             handler_id: "get_test".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -888,7 +946,7 @@ mod tests {
             handler_id: "get_users_id".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -949,7 +1007,7 @@ mod tests {
             handler_id: "post_upload".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -1029,7 +1087,7 @@ mod tests {
             handler_id: "get_test".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -1084,7 +1142,7 @@ mod tests {
             handler_id: "get_ping".to_owned(),
             authenticated: false,
             exposed: true,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -1247,6 +1305,42 @@ mod tests {
 
         assert_eq!(schema["$ref"], "#/components/schemas/GearDto");
         assert!(schema.get("type").is_none());
+    }
+
+    /// `OperationBuilder::multipart_json` declares the *item* schema under the
+    /// bare `multipart/mixed` media-type key: no `boundary=` parameter (that is
+    /// generated per response at runtime, so it is not a property of the
+    /// operation), and a `$ref` rather than the opaque string blob a
+    /// non-json-like media type would render as.
+    #[test]
+    fn multipart_mixed_response_emits_the_item_ref_under_a_bare_media_type() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response(
+            "/events",
+            "stream_events",
+            Some(ResponseSchema::Ref {
+                schema_name: "FrameDto".to_owned(),
+            }),
+        );
+        spec.responses[0].content_type = "multipart/mixed";
+        registry.register_operation(&spec);
+
+        let doc = serde_json::to_value(registry.build_openapi(&test_info()).unwrap()).unwrap();
+        let content = &doc["paths"]["/events"]["get"]["responses"]["200"]["content"];
+
+        assert_eq!(
+            content["multipart/mixed"]["schema"]["$ref"],
+            "#/components/schemas/FrameDto"
+        );
+        // The runtime boundary must not leak into the spec's media-type key.
+        assert_eq!(
+            content.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+            Some(vec![&"multipart/mixed".to_owned()])
+        );
+        // Not rendered as a string with a custom format — that is what a
+        // non-json-like media type would produce, and it would lose the item
+        // schema entirely.
+        assert!(content["multipart/mixed"]["schema"].get("format").is_none());
     }
 
     #[test]

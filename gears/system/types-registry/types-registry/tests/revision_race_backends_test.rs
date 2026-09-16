@@ -21,7 +21,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{EntityTrait, QueryOrder};
+use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Statement};
 use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -30,16 +30,17 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 
 use common::{
-    ClaimSignallingStores, PausePoint, PausingStores, allow_all, provider_for,
-    seed_current_type_schema, seed_operation_item, seed_pending_revision_item,
+    PausePoint, TestStores, allow_all, provider_for, seed_current_type_schema, seed_operation_item,
+    seed_pending_revision_item,
 };
 use types_registry::domain::admission::revision::RevisionCommit;
 use types_registry::domain::admission::unit::{EvaluatedOutcome, EvaluatedUnit, commit_revision};
 use types_registry::domain::admission::vector::RevisionVector;
 use types_registry::domain::admission::worker::{ItemFailure, WorkerError};
 use types_registry::domain::artifacts::{MaterializedArtifacts, content_hash};
-use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
+use types_registry::domain::enums::{DependencyKind, EntityKind, OperationKind, OwnershipScope};
 use types_registry::domain::family::family_key;
+use types_registry::domain::ports::metrics::PassLabels;
 use types_registry::domain::ports::{NewEntity, NewRevision, ReverseImpact, commit_write};
 use types_registry::infra::storage::entity::{operation_item, type_schema, type_schema_revision};
 use types_registry::infra::storage::repo::{
@@ -90,6 +91,7 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
         canonical_body: body.to_owned(),
         content_hash: content_hash(body),
         outcome: EvaluatedOutcome::TypeSchema {
+            is_abstract: false,
             artifacts: MaterializedArtifacts {
                 resolved_schema: body.to_owned(),
                 effective_traits: "{}".to_owned(),
@@ -98,6 +100,11 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
             },
         },
         operation_item_id,
+        // No waiver: this fixture races two commits, and the compatibility verdict
+        // is not what it is about.
+        compat_forced: false,
+        // A committing registration: this file is about commit order, not modes.
+        labels: PassLabels::new(OperationKind::Registration, false),
         edges: Vec::new(),
         // The vector a real evaluation of this fixture would record, spelled out: the closure over
         // the candidate's own identifier resolves to the candidate and nothing else, and nothing
@@ -209,19 +216,65 @@ async fn resource_version(db: &Provider, gts_id: &str) -> i64 {
         .resource_version
 }
 
+/// Deadline for the backend to register the second session's lock wait.
+const LOCK_WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Verify a lock wait on `types_registry__coordination_state` using the backend's
+/// wait graph. A separate connection avoids contention for the commits' pool.
+async fn assert_backend_reports_a_blocked_claim(dsn: &str, backend: &str) {
+    let observer = sea_orm::Database::connect(dsn)
+        .await
+        .expect("open an observer connection");
+    let sql = match backend {
+        "postgres" => {
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE cardinality(pg_blocking_pids(pid)) > 0 \
+               AND query ILIKE '%types_registry__coordination_state%'"
+        }
+        "mysql" => {
+            "SELECT COUNT(*) FROM performance_schema.data_lock_waits w \
+             JOIN performance_schema.data_locks l \
+               ON l.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID \
+             WHERE l.OBJECT_NAME = 'types_registry__coordination_state'"
+        }
+        other => panic!("no lock-wait view wired for {other}"),
+    };
+    let started = tokio::time::Instant::now();
+    loop {
+        let row = observer
+            .query_one_raw(Statement::from_string(
+                observer.get_database_backend(),
+                sql.to_owned(),
+            ))
+            .await
+            .expect("read the backend's lock-wait view")
+            .expect("count queries return a row");
+        let waiting: i64 = row.try_get_by_index(0).expect("the count column");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < LOCK_WAIT_DEADLINE,
+            "{backend} never reported a session waiting on the claim row; the second \
+             commit is not blocked by the first",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The two branches
 // ---------------------------------------------------------------------------
 
 /// The second commit waits at the claim, then reads the first commit's result.
-async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
+async fn a_second_commit_waits_for_the_first(db: &Provider, dsn: &str, backend: &str) {
     seed_entity_at_revision_one(db, EXCLUSION_CASE_ID).await;
 
     let item = {
         let conn = db.conn().expect("conn");
         seed_pending_revision_item(&conn, EXCLUSION_CASE_ID, 1, NOW).await
     };
-    let (decorated, reached, resume) = PausingStores::new(PausePoint::CurrentDocuments);
+    let (decorated, reached, resume) = TestStores::pausing(PausePoint::CurrentDocuments);
     let provider: DBProvider<WorkerError> = DBProvider::new(db.db());
     let unit = Arc::new(unit(EXCLUSION_CASE_ID, BODY_B, item));
 
@@ -250,8 +303,8 @@ async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
     reached.await.expect("the pass reaches the content read");
 
     // `expected = 2` succeeds only if this reads after the held commit.
-    let (signalling, entered) = ClaimSignallingStores::new();
-    let mut second = {
+    let (signalling, entered, mut returned) = TestStores::claim_signalling();
+    let second = {
         let db = Arc::clone(db);
         tokio::spawn(async move {
             try_commit_through(&db, signalling, EXCLUSION_CASE_ID, BODY_C, 2).await
@@ -260,11 +313,16 @@ async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
     entered
         .await
         .expect("the second commit must reach the claim");
+    // Verify the lock wait while the first commit holds the row.
+    assert_backend_reports_a_blocked_claim(dsn, backend).await;
+    // One container per test and no other writer attribute the wait to this claim.
+    // Check it remains pending; the timeout alone cannot prove a lock wait.
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), &mut second)
+        tokio::time::timeout(Duration::from_millis(500), &mut returned)
             .await
             .is_err(),
-        "and having reached it, must still be queued behind the held one on {backend}",
+        "and having issued it, must still be inside that statement, behind the held \
+         row on {backend}",
     );
     assert_eq!(
         resource_version(db, EXCLUSION_CASE_ID).await,
@@ -273,6 +331,11 @@ async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
     );
 
     resume.send(()).expect("the paused pass is still waiting");
+    // Require progress after release to rule out a permanently stuck claim.
+    tokio::time::timeout(Duration::from_secs(30), returned)
+        .await
+        .unwrap_or_else(|_| panic!("the claim must return once the row is released on {backend}"))
+        .expect("the signalling hook outlives the claim it brackets");
     let first = paused
         .await
         .expect("task")
@@ -294,8 +357,8 @@ async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
 }
 
 /// Both cases in one body, so neither backend can drift into covering less.
-async fn assert_revision_races_behave(db: &Provider, backend: &str) {
-    a_second_commit_waits_for_the_first(db, backend).await;
+async fn assert_revision_races_behave(db: &Provider, dsn: &str, backend: &str) {
+    a_second_commit_waits_for_the_first(db, dsn, backend).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -319,8 +382,9 @@ async fn revision_races_behave_on_postgres() {
         .to_string();
     wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(1)).await;
 
-    let db = provider_for(&format!("postgres://user:pass@{host}:{port}/app"), 8).await;
-    assert_revision_races_behave(&db, "postgres").await;
+    let dsn = format!("postgres://user:pass@{host}:{port}/app");
+    let db = provider_for(&dsn, 8).await;
+    assert_revision_races_behave(&db, &dsn, "postgres").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -342,8 +406,9 @@ async fn revision_races_behave_on_mysql() {
         .to_string();
     wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(2)).await;
 
-    let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
-    assert_revision_races_behave(&db, "mysql").await;
+    let dsn = format!("mysql://root@{host}:{port}/test");
+    let db = provider_for(&dsn, 8).await;
+    assert_revision_races_behave(&db, &dsn, "mysql").await;
 }
 
 /// A database capacity failure must unwind a real admission transaction. Setting

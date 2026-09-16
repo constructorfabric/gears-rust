@@ -182,7 +182,9 @@ Owners that want in-place evolution **SHOULD** use the closed envelope with desi
 
 ### Reporting is confined to refusal
 
-**A refused candidate carries structured diagnostics naming the cause and the offending schema location. A candidate that was admitted carries nothing about the check.** The forward-direction result **MAY** ride along as advisory diagnostics, since the implementation computes both directions in one call.
+**A refused candidate carries a stable refusal `reason` and a bounded human-readable `message` explaining the cause and naming the offending schema location where available. A candidate that was admitted carries nothing about the check.** The message marks omitted findings and truncated paths. Its wording is not a machine-readable contract; clients branch on `reason` and display `message` without parsing it. The forward-direction result **MAY** ride along as advisory diagnostics, since the implementation computes both directions in one call.
+
+There is no separate structured diagnostics field in the current contract. Authors and operators need an actionable explanation, and CI can distinguish refusal categories through the stable reason code. A per-finding API would additionally commit the registry to a finding vocabulary, location format, and truncation metadata without an established consumer requiring them. That API is deferred until a concrete consumer needs to process individual findings. The engine's structured findings remain an internal input to the verdict and message, not a public schema.
 
 The asymmetry is not an economy. Everything a successful result could have said is already available to the caller, or unreachable, or a fold this decision set declined elsewhere:
 

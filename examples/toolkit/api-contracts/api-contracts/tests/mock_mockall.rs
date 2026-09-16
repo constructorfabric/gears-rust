@@ -44,6 +44,15 @@ mock! {
             ctx: SecurityContext,
             filter: ListPaymentsFilter,
         ) -> PaymentStream<PaymentSummary>;
+
+        // `async fn` here mirrors the fallible open on the trait: mockall
+        // generates `expect_stream_payments().returning(|..| Ok(stream))`, so a
+        // test can drive an open *failure* as well as a per-item one.
+        async fn stream_payments(
+            &self,
+            ctx: SecurityContext,
+            filter: ListPaymentsFilter,
+        ) -> Result<PaymentStream<PaymentSummary>, CanonicalError>;
     }
 }
 

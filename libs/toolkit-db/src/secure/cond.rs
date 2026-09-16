@@ -1,10 +1,9 @@
 use sea_orm::sea_query::{Alias, Query, SelectStatement};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, IdenStatic, sea_query::Expr};
 
+use crate::secure::schema::{rg_tables, tenant_tables};
 use crate::secure::{AccessScope, ScopableEntity, ScopeError};
-use toolkit_security::access_scope::{
-    ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
-};
+use toolkit_security::access_scope::{ScopeConstraint, ScopeFilter, ScopeValue};
 
 /// How a resolved column is written into SQL.
 ///
@@ -389,7 +388,15 @@ where
     E::Column: ColumnTrait + Copy,
 {
     if constraint.is_empty() {
-        return Ok(Some(Condition::all()));
+        // An AND over no filters is `TRUE`, so honouring it here would emit an
+        // unconditional `WHERE true` and hand back every row in the table --
+        // while the scope still reports itself as constrained, so nothing
+        // upstream would notice. `ScopeConstraint` refuses to build this shape
+        // now; this is the second line, for a value that reached us some other
+        // way (an older serialized scope, a future constructor).
+        return Err(ScopeError::Denied(
+            "scope constraint has no filters, which would match every row",
+        ));
     }
     let mut and_cond = Condition::all();
     for (filter_index, filter) in constraint.filters().iter().enumerate() {
@@ -534,6 +541,16 @@ where
                     },
                     siblings,
                 )?;
+            }
+            // A predicate this build does not know how to render. It is a
+            // restriction the PDP asked for, so emitting the query without it
+            // would drop a narrowing term and hand back rows the grant excluded.
+            // Refuse the query instead.
+            _ => {
+                return Err(ScopeError::Denied(
+                    "scope filter variant is not supported by this build; refusing to emit a \
+                     query that would ignore it",
+                ));
             }
         }
     }

@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-23 by Constructor Tech
+Updated:  2026-09-15 by Constructor Tech
 # PRD — Chat Engine
 
 
@@ -91,7 +91,7 @@ The core value proposition is enabling flexible, stateful conversation managemen
 | **Backend Plugin** | A Gear plugin gear implementing `ChatEngineBackendPlugin` trait; co-located in the same Gears process and called directly via `ClientHub`. External HTTP backends are supported via the `chat-engine-webhook-adapter` plugin. See ADR-0022. |
 | **Message Tree** | A tree structure where each message references a parent message; sibling nodes with the same parent are variants |
 | **Message Variant** | An alternative response at the same position in the conversation tree — created by regeneration or branching |
-| **Message Part** | An ordered, typed fragment of a message body (`text`, `code`, `images`, `videos`, `links`, `statuses`). A message is composed of one or more parts; the parts in order form the message body. See FR-022. |
+| **Message Part** | An ordered, typed fragment of a message body (`text`, `code`, `images`, `videos`, `links`, `statuses`, `tool_call`, `tool_result`). A message is composed of one or more parts; the parts in order form the message body. See FR-022. |
 | **Citation** | A plugin-supplied attribution attached to a `text` message part, anchoring a `[N]` marker in the text to a source: a retrieved document (file citation) or a web page (link citation). Carries quote, source location, and the text offsets of the marker. See FR-023. |
 | **Reference** | A lightweight URL badge attached to a `text` message part (URL + position, no quote/anchor). See FR-023. |
 | **Capability** | A typed feature declared by the backend plugin (`bool`, `enum`, `str`, `int`). `SessionType.available_capabilities` is the maximum set the plugin supports; `Session.enabled_capabilities` is the confirmed set for a specific session. Per-message settings are passed as `CapabilityValue` (id + value). |
@@ -195,7 +195,7 @@ No gear-specific environment constraints beyond platform defaults.
 - Session lifecycle management (create, delete, retrieve)
 - Message routing to backend plugins with real-time streaming
 - Message variant preservation (regeneration, branching)
-- Structured message bodies as ordered typed parts (text, code, images, videos, links, statuses) (see FR-022)
+- Structured message bodies as ordered typed parts (text, code, images, videos, links, statuses, tool calls and their results) (see FR-022)
 - Per-part citations and references (file/link citations, URL badges) anchoring text to sources (see FR-023)
 - Real-time delta streaming over Server-Sent Events with resumable connections (see FR-024)
 - File attachment references in messages
@@ -664,7 +664,7 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 
 | Category | Base Schemas | Extension Point |
 |---|---|---|
-| **Message part types** | `text`, `code`, `images`, `videos`, `links`, `statuses` (`MessagePart`, see FR-022) | Plugins declare custom `MessagePartType` values and part `content` schemas |
+| **Message part types** | `text`, `code`, `images`, `videos`, `links`, `statuses`, `tool_call`, `tool_result` (`MessagePart`, see FR-022) | Plugins declare part `content` schemas within a base type. Custom `MessagePartType` values are **not** supported yet — the discriminant set is closed and unknown values are rejected (consistent with the Non-Goal below: base enums are not extensible) |
 | **Event types** | `MessageNewEvent`, `SessionCreatedEvent`, `StreamingChunkEvent`, etc. | Plugins emit custom typed events via webhook response extensions |
 | **Error types** | `ErrorResponse`, `ErrorCode` | Plugins define domain-specific error codes in the `ErrorCode` enum space |
 | **Session / Message metadata** | `Session.metadata`, `Message.metadata` | Plugins store and validate typed custom metadata blobs |
@@ -694,7 +694,7 @@ The system **SHOULD** provide extensible, versioned base schemas for all core do
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-fr-message-parts`
 
 <!-- fdd-id-content -->
-The system **MUST** represent a message body as an **ordered list of typed parts** rather than a single content blob. Each part has a `type` and a typed `content` payload; the parts in order constitute the message. This lets a single assistant or user message mix prose, code, media, links, and progress statuses while preserving rendering order.
+The system **MUST** represent a message body as an **ordered list of typed parts** rather than a single content blob. Each part has a `type` and a typed `content` payload; the parts in order constitute the message. This lets a single assistant or user message mix prose, code, media, links, progress statuses, and tool calls with their results while preserving rendering order.
 
 **Supported part types (initial set)**:
 - **text** — plain text (`content`, optional `title`)
@@ -703,19 +703,24 @@ The system **MUST** represent a message body as an **ordered list of typed parts
 - **videos** — one or more video references (file UUIDs + optional thumbnail/format)
 - **links** — link preview cards (`url`, optional `title`/`description`/`icon`/`source`)
 - **statuses** — progress/status indicators (`code`, optional `detail`)
+- **tool_call** — one tool invocation the backend decided to make (`tool_call_id`, `name`, `arguments`, optional `title`)
+- **tool_result** — the outcome of one invocation (`tool_call_id`, optional `name`, `result`, optional `is_error`)
 
 **Behavioral rules**:
 - Parts are **ordered** within a message and the order is stable across reads (persisted ordinal).
 - Media parts (`images`, `videos`) reference files by UUID via the File Storage Service (`cpt-cf-chat-engine-fr-attach-files`); Chat Engine never stores or fetches the bytes.
 - Streaming assistant responses are delivered as incremental deltas per part (text token-by-token, richer parts as they open); the engine persists the assembled parts on completion (see FR-024).
-- The part type set is **extensible** by plugin vendors via GTS without forking Chat Engine core (`cpt-cf-chat-engine-fr-schema-extensibility`).
+- The part type set is **closed**: a part whose `type` is outside the supported set is rejected (see the acceptance criteria). Vendor-defined discriminants via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) are a **future** extension — there is no registration or forwarding path for them yet, so until one exists a vendor extends a part through its `content`, which the engine validates structurally and otherwise treats as opaque.
+- A `tool_result` part pairs with its `tool_call` part by `tool_call_id`, not by position; the pair may span two messages (the call on an assistant message, the result on the following one). The engine forwards both verbatim and does not execute tools itself.
 - Deleting a message deletes its parts (cascade); parts are not independently addressable for deletion.
 
 **Acceptance criteria**:
 - A message sent with multiple ordered parts is persisted and returned with the same parts in the same order.
 - A `text` part's content is full-text searchable (`cpt-cf-chat-engine-fr-search-session`, `cpt-cf-chat-engine-fr-search-sessions`); non-text parts are excluded from text search.
 - An `images`/`videos` part referencing a file UUID is forwarded to backend plugins without the engine fetching the file.
+- A `tool_call` part and the `tool_result` part quoting its `tool_call_id` round-trip through persistence and appear in a session export.
 - A message with no parts is rejected as an invalid request.
+- A part whose `type` is outside the known set is rejected as an invalid request; it is never coerced into another type.
 
 **Actors**: `cpt-cf-chat-engine-actor-client`, `cpt-cf-chat-engine-actor-backend-plugin`
 <!-- fdd-id-content -->

@@ -25,9 +25,20 @@ pub struct ClientTuning {
     #[serde(default)]
     pub retry: Option<RetrySettings>,
 
-    /// Override for the SSE-stream reconnect policy.
-    #[serde(default)]
-    pub sse_reconnect: Option<ReconnectSettings>,
+    /// Override for the stream reconnect policy, of any framing.
+    ///
+    /// `alias = "sse_reconnect"` keeps already-deployed config files working:
+    /// this struct has no `rename_all`, so the Rust field name *is* the JSON
+    /// key, and the field was called `sse_reconnect` before the policy covered
+    /// framings other than SSE.
+    ///
+    /// Supplying **both** `stream_reconnect` and `sse_reconnect` is rejected as
+    /// a duplicate field — the two name the same field — so a config that adds
+    /// the new key without removing the legacy one fails loudly at parse time
+    /// rather than silently honouring one and dropping the other. This holds
+    /// even though the field is `#[serde(flatten)]`-ed into [`ClientWiring`].
+    #[serde(default, alias = "sse_reconnect")]
+    pub stream_reconnect: Option<ReconnectSettings>,
 
     /// Reject plaintext `http://` endpoints.
     ///
@@ -116,12 +127,15 @@ impl ClientTuning {
                 multiplier: r.multiplier.unwrap_or(base.multiplier),
             });
         }
-        if let Some(ref s) = self.sse_reconnect {
-            let base = cfg.sse_reconnect.clone();
-            cfg = cfg.with_sse_reconnect(ReconnectConfig {
+        if let Some(ref s) = self.stream_reconnect {
+            let base = cfg.stream_reconnect.clone();
+            cfg = cfg.with_stream_reconnect(ReconnectConfig {
                 max_attempts: s.max_attempts.unwrap_or(base.max_attempts),
                 base_delay: s.base_delay.unwrap_or(base.base_delay),
                 max_delay: s.max_delay.unwrap_or(base.max_delay),
+                // Not exposed as wiring keys yet; inherit the base policy.
+                min_healthy_uptime: base.min_healthy_uptime,
+                max_total_reopens: base.max_total_reopens,
             });
         }
         if let Some(require_tls) = self.require_tls {

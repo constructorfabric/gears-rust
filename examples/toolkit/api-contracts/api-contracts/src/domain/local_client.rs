@@ -100,6 +100,31 @@ impl PaymentApi for PaymentLocalClient {
         // wrap the stream construction; left to a future iteration.
         self.service.list_payments(&ctx, &filter)
     }
+
+    async fn stream_payments(
+        &self,
+        ctx: SecurityContext,
+        filter: ListPaymentsFilter,
+    ) -> Result<PaymentStream<PaymentSummary>, CanonicalError> {
+        // Unlike `list_payments`, the fallible open gives the policy stack
+        // something meaningful to wrap on a streaming method: the open is a
+        // real awaited operation that can fail, and it is the part worth
+        // tracing. Items are still not policied individually.
+        let pc = PolicyContext {
+            service: "PaymentApi",
+            method: "stream_payments",
+            idempotency: Idempotency::SafeRead,
+            kind: MethodKind::ServerStreaming,
+        };
+        let svc = Arc::clone(&self.service);
+        self.policies
+            .execute(
+                &pc,
+                || async move { svc.open_feed(&ctx, &filter) },
+                policy_err,
+            )
+            .await
+    }
 }
 
 /// Local (in-process) client for the **v2** contract.

@@ -85,24 +85,82 @@ fn rest_with_retry_overrides() {
     assert_eq!(multiplier, Some(1.5));
 }
 
-#[test]
-fn grpc_with_sse_reconnect() {
-    // SSE reconnect tuning is meaningless for grpc transport at runtime but
-    // the schema is shared — accepting it here is a no-op rather than a
-    // parse failure. Documents current shape.
-    let json = r#"{
+/// Parse a grpc wiring document whose reconnect tuning is spelled `key`, and
+/// return that tuning.
+///
+/// Stream reconnect tuning is meaningless for grpc transport at runtime but the
+/// schema is shared — accepting it here is a no-op rather than a parse failure.
+/// Documents current shape.
+#[allow(
+    clippy::expect_used,
+    reason = "Test-only helper: a document that fails to parse, or a tuning field that lands nowhere, IS the failure each caller is asserting against, and the expect message names which. `allow-expect-in-tests` covers `#[test]` fns but not a shared helper like this one."
+)]
+fn grpc_reconnect_under_key(key: &str) -> toolkit_contract::wiring::ReconnectSettings {
+    let json = format!(
+        r#"{{
         "transport": "grpc",
         "endpoint": "http://payments:50051",
-        "sse_reconnect": { "max_attempts": 3, "base_delay": "1s" }
-    }"#;
-    let w = parse(json).expect("grpc parses with sse tuning");
+        "{key}": {{ "max_attempts": 3, "base_delay": "1s" }}
+    }}"#
+    );
+    let w = parse(&json).expect("grpc parses with stream tuning");
     let ClientWiring::Grpc { endpoint, tuning } = w else {
         panic!("expected Grpc variant");
     };
     assert_eq!(endpoint, "http://payments:50051");
-    let sse = tuning.sse_reconnect.expect("sse_reconnect present");
-    assert_eq!(sse.max_attempts, Some(3));
-    assert_eq!(sse.base_delay, Some(Duration::from_secs(1)));
+    tuning.stream_reconnect.expect("stream_reconnect present")
+}
+
+#[test]
+fn grpc_with_stream_reconnect() {
+    let settings = grpc_reconnect_under_key("stream_reconnect");
+    assert_eq!(settings.max_attempts, Some(3));
+    assert_eq!(settings.base_delay, Some(Duration::from_secs(1)));
+}
+
+/// #4734 Q10: `stream_reconnect` was called `sse_reconnect` before the policy
+/// covered framings other than SSE, and `ClientTuning` has no `rename_all`, so
+/// the Rust field name *is* the JSON key. The `#[serde(alias)]` is what keeps
+/// an already-deployed config file working across the rename, and this is the
+/// test that makes it mean something: both spellings must land on the same
+/// field with the same value.
+#[test]
+fn legacy_sse_reconnect_key_still_deserializes() {
+    let legacy = grpc_reconnect_under_key("sse_reconnect");
+    let current = grpc_reconnect_under_key("stream_reconnect");
+    assert_eq!(legacy.max_attempts, current.max_attempts);
+    assert_eq!(legacy.base_delay, current.base_delay);
+    assert_eq!(legacy.max_delay, current.max_delay);
+    assert_eq!(legacy.max_attempts, Some(3));
+    assert_eq!(legacy.base_delay, Some(Duration::from_secs(1)));
+}
+
+/// #4740 #9: `stream_reconnect` and its legacy alias `sse_reconnect` name the
+/// *same* field, so a config that supplies **both** is rejected as a duplicate
+/// field rather than silently honouring one and dropping the other. This holds
+/// even though `ClientTuning` is `#[serde(flatten)]`-ed into `ClientWiring`:
+/// serde's flatten still detects a field populated twice via name + alias. The
+/// outcome is order-independent and the error names the canonical field.
+///
+/// (Empirically verified — an earlier note guessed flatten would bypass
+/// duplicate detection and resolve silently; it does not.)
+#[test]
+fn both_stream_reconnect_and_its_alias_is_a_duplicate_field_error() {
+    for json in [
+        r#"{ "transport": "grpc", "endpoint": "http://x:50051",
+             "stream_reconnect": { "max_attempts": 11 },
+             "sse_reconnect": { "max_attempts": 22 } }"#,
+        r#"{ "transport": "grpc", "endpoint": "http://x:50051",
+             "sse_reconnect": { "max_attempts": 22 },
+             "stream_reconnect": { "max_attempts": 11 } }"#,
+    ] {
+        let err = parse(json).expect_err("both keys present must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate field") && msg.contains("stream_reconnect"),
+            "expected a duplicate-field error naming stream_reconnect, got: {msg}"
+        );
+    }
 }
 
 #[test]

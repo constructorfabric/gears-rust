@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use quota_enforcement_sdk::{NotificationEvent, NotificationScope, TenantId};
 use toolkit_db::Db;
-use toolkit_db::outbox::{EnqueueMessage, Outbox, OutboxError, OutboxHandle, OutboxMessageId};
+use toolkit_db::outbox::{Outbox, OutboxError, OutboxHandle, OutboxMessageId, Records};
 use toolkit_db::secure::DBRunner;
 
 pub use crate::infra::storage::migrations::OUTBOX_TABLE_PREFIX;
@@ -102,31 +102,24 @@ impl NotificationEnqueuer for QeOutbox {
         events: &[NotificationEvent],
     ) -> Result<Vec<OutboxMessageId>, EnqueueError> {
         let outbox = self.outbox.get().ok_or(EnqueueError::NotBound)?;
-        if events.is_empty() {
+        let Some(first) = events.first() else {
             return Ok(Vec::new());
+        };
+        // Every event names its own kind, so the batch default is only the
+        // fallback each entity overrides. Nothing traces the batch: a
+        // notification is already identified by its own event id.
+        let mut batch = Records::to(NOTIFICATION_QUEUE).payload_type(first.kind.as_str());
+        for event in events {
+            let payload =
+                serde_json::to_vec(event).map_err(|e| EnqueueError::Serialize(e.to_string()))?;
+            let partition = match event.scope {
+                NotificationScope::Tenant { tenant_id } => Self::partition_for(tenant_id),
+                // All policy transitions share one ordered platform stream.
+                NotificationScope::Platform => 0,
+            };
+            batch = batch.push_with_type(partition, payload, event.kind.as_str());
         }
-        let payloads = events
-            .iter()
-            .map(|event| {
-                serde_json::to_vec(event).map_err(|e| EnqueueError::Serialize(e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let items: Vec<EnqueueMessage<'_>> = events
-            .iter()
-            .zip(payloads)
-            .map(|(event, payload)| EnqueueMessage {
-                partition: match event.scope {
-                    NotificationScope::Tenant { tenant_id } => Self::partition_for(tenant_id),
-                    // All policy transitions share one ordered platform stream.
-                    NotificationScope::Platform => 0,
-                },
-                payload,
-                payload_type: event.kind.as_str(),
-            })
-            .collect();
-        Ok(outbox
-            .enqueue_batch(runner, NOTIFICATION_QUEUE, &items)
-            .await?)
+        Ok(outbox.enqueue_batch(runner, batch.build()?).await?)
     }
 }
 

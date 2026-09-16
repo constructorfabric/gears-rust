@@ -44,22 +44,15 @@ See also [REPO_PLAYBOOK](docs/REPO_PLAYBOOK.md) with the registry of repository-
 
 ## Quick Start
 
-### Prerequisites
+### Prerequisites and installation
 
-- Rust stable with Cargo ([Install via rustup](https://rustup.rs/))
-- Protocol Buffers compiler (`protoc`):
-  - macOS: `brew install protobuf`
-  - Linux: `apt-get install protobuf-compiler`
-  - Windows: Download from https://github.com/protocolbuffers/protobuf/releases
-- MariaDB/PostgreSQL/SQLite or in-memory database
+See [SETUP.md](SETUP.md) for clean-install and run instructions for macOS, Linux, and Windows. It covers Rust and Cargo through rustup, native build prerequisites, `make setup`, and optional Constructor Studio installation.
+
+A MariaDB, PostgreSQL, SQLite, or in-memory database is required for the corresponding runtime configuration.
 
 ### CI/Development Commands
 
 ```bash
-# Clone the repository
-git clone --recurse-submodules <repository-url>
-cd gears-rust
-
 make build      # Build the whole-project example server release binary
 make test       # Run workspace tests
 make check      # Run formatting, validation, linting, security, docs, and tests
@@ -223,12 +216,14 @@ gears:
 
 ### Environment Variable Overrides
 
-Configuration supports environment variable overrides with `CF_` prefix:
+Configuration supports environment variable overrides with the `APP__` prefix,
+using `__` to separate nesting levels:
 
 ```bash
-export CF_GEARS_DATABASE_URL="postgres://user:pass@localhost/db"
-export CF_GEARS_API_GATEWAY_BIND_ADDR="0.0.0.0:8080"
-export CF_GEARS_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
+export APP__SERVER__PORT=8087
+export APP__MODULES__api_gateway__CONFIG__BIND_ADDR="0.0.0.0:8080"
+export APP__LOGGING__DEFAULT__CONSOLE_LEVEL="debug"
+export APP__OPENTELEMETRY__TRACING__ENABLED=true
 ```
 
 ## Testing

@@ -19,7 +19,7 @@ use super::types::{
     OutboxConfig, OutboxError, OutboxProfile, Partitions, SequencerConfig, WorkerTuning,
 };
 use super::workers::sequencer::{Sequencer, SequencerReport};
-use super::workers::vacuum::{VacuumReport, VacuumTask};
+use super::workers::vacuum::{CollectableTraces, VacuumReport, VacuumTask};
 use crate::Db;
 
 /// Deferred queue declaration — factory, resolved at `start()`.
@@ -39,6 +39,8 @@ struct ResolvedTuning {
     sequencer: WorkerTuning,
     vacuum: WorkerTuning,
     reconciler: WorkerTuning,
+    notifier: WorkerTuning,
+    trace_sweeper: WorkerTuning,
 }
 
 /// Short-lived context bag passed to spawn helpers during `start()`.
@@ -55,6 +57,12 @@ struct StartContext<'a> {
 /// Eliminates the duplicated stats-wiring pattern used by sequencer, vacuum, and
 /// processor worker factories.
 type StatsExtractor = Box<dyn Fn(&dyn std::any::Any) -> u64 + Send + Sync>;
+
+/// A stats extractor for workers whose `Directive` payload is a plain `u64`
+/// count (notifier, retry reporter, trace sweeper).
+fn count_payload() -> StatsExtractor {
+    Box::new(|any| any.downcast_ref::<u64>().copied().unwrap_or(0))
+}
 
 pub(super) fn register_stats<P: Send + Sync + 'static>(
     builder: WorkerBuilder<P>,
@@ -299,11 +307,15 @@ impl OutboxBuilder {
                 .reconciler_tuning
                 .clone()
                 .unwrap_or_else(|| profile.reconciler.clone()),
+            notifier: profile.notifier.clone(),
+            trace_sweeper: profile.trace_sweeper.clone(),
         };
         resolved.processor.validate();
         resolved.sequencer.validate();
         resolved.vacuum.validate();
         resolved.reconciler.validate();
+        resolved.notifier.validate();
+        resolved.trace_sweeper.validate();
         resolved
     }
 
@@ -368,6 +380,7 @@ impl OutboxBuilder {
     fn spawn_vacuum_workers(
         ctx: &mut StartContext<'_>,
         outbox: &Arc<Outbox>,
+        collectable_traces: &CollectableTraces,
         tuning: &WorkerTuning,
         shared_sem: &Arc<Semaphore>,
         count: usize,
@@ -378,6 +391,7 @@ impl OutboxBuilder {
                 ctx.db.clone(),
                 outbox.statements_arc(),
                 tuning.batch_size as usize,
+                collectable_traces.clone(),
             );
             let name = format!("vacuum-{i}");
             let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
@@ -412,6 +426,87 @@ impl OutboxBuilder {
             let worker = builder.build(vacuum);
             ctx.task_set.spawn(&name, worker.run());
         }
+    }
+
+    /// Spawn the trace sweeper, on its own clock and nudged by the vacuum.
+    fn spawn_trace_sweeper(
+        ctx: &mut StartContext<'_>,
+        outbox: &Arc<Outbox>,
+        collectable_traces: &CollectableTraces,
+        tuning: &WorkerTuning,
+    ) {
+        let sweeper = super::workers::trace_sweeper::TraceSweeper {
+            db: ctx.db.clone(),
+            statements: outbox.statements_arc(),
+            batch_size: tuning.batch_size as usize,
+            periods: super::workers::trace_sweeper::TraceSweep::default(),
+        };
+        let name = "trace-sweeper";
+        let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
+        let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .pacing(tuning)
+            .notifier(collectable_traces.wakeup())
+            .notifier(poker_notify)
+            .notifier(Arc::clone(ctx.start_notify))
+            .listener(TracingListener)
+            .on_panic(PanicPolicy::CatchAndRetry);
+        let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
+        ctx.task_set.spawn(name, builder.build(sweeper).run());
+    }
+
+    /// Spawn the notifier: collects completions this instance owns but did not
+    /// finish itself.
+    ///
+    /// Always spawned, and self-gating: it issues no query while nothing is
+    /// outstanding, so a deployment that never subscribes pays a lock check
+    /// per tick and nothing else.
+    fn spawn_notifier(ctx: &mut StartContext<'_>, outbox: &Arc<Outbox>, tuning: &WorkerTuning) {
+        let notifier = super::workers::notifier::Notifier {
+            outbox: Arc::clone(outbox),
+            db: ctx.db.clone(),
+            batch_size: tuning.batch_size,
+            next_look: Duration::from_millis(100),
+        };
+        let name = "notifier";
+        let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .pacing(tuning)
+            // No timer. It schedules itself while somebody is waiting, and
+            // sleeps on this wakeup when nobody is - a subscription being
+            // taken is the only event that gives it a reason to look.
+            .notifier(outbox.mailbox().subscriptions().arrivals())
+            .notifier(Arc::clone(ctx.start_notify))
+            .listener(TracingListener)
+            .on_panic(PanicPolicy::CatchAndRetry);
+        let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
+        ctx.task_set.spawn(name, builder.build(notifier).run());
+    }
+
+    /// Spawn the retry reporter: tells subscribers which of their batches are
+    /// stuck.
+    ///
+    /// Always spawned and self-gating, like the notifier, but on a stricter
+    /// gate: it runs only while some caller is watching retries, so a
+    /// deployment that never watches retries issues no query here ever.
+    fn spawn_retry_reporter(
+        ctx: &mut StartContext<'_>,
+        outbox: &Arc<Outbox>,
+        tuning: &WorkerTuning,
+    ) {
+        let reporter = super::workers::retry_reporter::RetryReporter {
+            outbox: Arc::clone(outbox),
+            db: ctx.db.clone(),
+            batch_size: tuning.batch_size,
+        };
+        let name = "retry-reporter";
+        let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
+        let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .pacing(tuning)
+            .notifier(poker_notify)
+            .notifier(Arc::clone(ctx.start_notify))
+            .listener(TracingListener)
+            .on_panic(PanicPolicy::CatchAndRetry);
+        let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
+        ctx.task_set.spawn(name, builder.build(reporter).run());
     }
 
     /// Spawn cold reconciler as a `WorkerAction` (ungated, poker-driven).
@@ -484,6 +579,7 @@ impl OutboxBuilder {
 
         let config = OutboxConfig {
             tables: self.tables.clone(),
+            instance_id: super::types::InstanceId::default(),
             sequencer: SequencerConfig {
                 batch_size: tuning.sequencer.batch_size,
                 poll_interval: tuning.sequencer.idle_interval,
@@ -587,8 +683,31 @@ impl OutboxBuilder {
         // 8. Spawn cold reconciler
         Self::spawn_cold_reconciler(&mut ctx, &outbox, &shared_prioritizer, &tuning.reconciler);
 
-        // 9. Spawn vacuum workers
-        Self::spawn_vacuum_workers(&mut ctx, &outbox, &tuning.vacuum, &shared_sem, shared);
+        // 8b. Collect completion mail this instance owns
+        Self::spawn_notifier(&mut ctx, &outbox, &tuning.notifier);
+
+        // 8c. Report retries to callers watching their batches. Paced with the
+        // notifier on purpose: both are subscription-gated polls of the trace
+        // table, and a caller learning its batch is stuck is worth the same
+        // latency as learning it finished.
+        Self::spawn_retry_reporter(&mut ctx, &outbox, &tuning.notifier);
+
+        // 9. Spawn vacuum workers, and the sweeper they tell about their work
+        let collectable_traces = CollectableTraces::new();
+        Self::spawn_vacuum_workers(
+            &mut ctx,
+            &outbox,
+            &collectable_traces,
+            &tuning.vacuum,
+            &shared_sem,
+            shared,
+        );
+        Self::spawn_trace_sweeper(
+            &mut ctx,
+            &outbox,
+            &collectable_traces,
+            &tuning.trace_sweeper,
+        );
 
         // 10. Spawn stats reporter (if enabled)
         if let Some(interval) = self.stats_interval {
@@ -600,7 +719,7 @@ impl OutboxBuilder {
 
         Ok(OutboxHandle {
             outbox,
-            tasks: task_set,
+            tasks: Some(task_set),
         })
     }
 }
@@ -611,10 +730,15 @@ impl OutboxBuilder {
 /// [`stop()`](Self::stop) method for graceful shutdown.
 ///
 /// Drop safety: if `stop()` is never called, `TaskSet::Drop` cancels the
-/// cancellation token, signaling all workers to exit.
+/// cancellation token, signaling all workers to exit, and this handle's own
+/// `Drop` closes the subscription registry.
+///
+/// `tasks` is an `Option` only so `stop()` can take the `TaskSet` out and
+/// consume it (`TaskSet::shutdown` takes `self`) while this handle also
+/// implements `Drop`; it is always `Some` until `stop()` runs.
 pub struct OutboxHandle {
     outbox: Arc<Outbox>,
-    tasks: TaskSet,
+    tasks: Option<TaskSet>,
 }
 
 impl OutboxHandle {
@@ -625,7 +749,26 @@ impl OutboxHandle {
     }
 
     /// Cancel background tasks and join all handles. Consumes self.
-    pub async fn stop(self) {
-        self.tasks.shutdown().await;
+    ///
+    /// The subscription registry is closed when `self` is dropped at the end of
+    /// this scope (see the `Drop` impl below), after the workers have stopped.
+    pub async fn stop(mut self) {
+        if let Some(tasks) = self.tasks.take() {
+            tasks.shutdown().await;
+        }
+    }
+}
+
+impl Drop for OutboxHandle {
+    fn drop(&mut self) {
+        // Dropping the handle is a supported shutdown path - `TaskSet`'s own
+        // drop cancels every worker token - so it must give the same guarantee
+        // `stop` does. Closing the registry drops its senders, which makes an
+        // awaiting subscription yield `None`: the documented signal that this
+        // process can no longer answer. Without it the caller waits for ever,
+        // since it necessarily holds the `Arc` that owns the registry and
+        // nothing else would drop the senders. `close` is idempotent, so the
+        // `stop` path closing here a second time is harmless.
+        self.outbox.mailbox().subscriptions().close();
     }
 }

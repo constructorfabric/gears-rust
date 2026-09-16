@@ -3,7 +3,15 @@
 //! Recognized attributes on trait methods:
 //! - `#[get("/path/{param}")]`, `#[post(...)]`, `#[put(...)]`, `#[delete(...)]`
 //! - `#[retryable]` — marks the method as safe to retry on transport failure.
-//! - `#[streaming]` — marks the method as server-streaming (SSE).
+//! - `#[streaming]`, `#[streaming(sse)]`, `#[streaming(multipart_mixed)]` —
+//!   marks the method as server-streaming and selects the wire framing. A bare
+//!   `#[streaming]` is SSE. The method's `asyncness` selects the *open shape*
+//!   (mirroring the base macro in `parse.rs`): a `#[streaming] async fn` emits
+//!   the fallible open `-> Result<Stream, E>`, a non-`async` `#[streaming] fn`
+//!   emits the immediate open `-> Stream`. This parser previously ignored
+//!   `asyncness` and normalised `async` away, so a stray `async` on a REST
+//!   streaming projection now silently changes the emitted signature — audit
+//!   existing projections (see DESIGN.md, #4740).
 //! - `#[server_manual]` — skip server-route generation for this method.
 //! - `#[exposed]` / `#[internal]` — edge visibility, overriding the trait-level
 //!   `visibility` default. Internal unless said otherwise.
@@ -15,6 +23,8 @@
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
+
+use crate::model::{MethodShape, StreamFraming, StreamOpen};
 
 pub struct RestContractAttr {
     pub base_path: String,
@@ -48,7 +58,16 @@ pub struct RestMethodModel {
     pub http_method: HttpVerb,
     pub path_template: String,
     pub retryable: bool,
-    pub streaming: bool,
+    /// Unary, or server-streaming with how its stream is opened
+    /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
+    /// `Stream(Awaited)`). Folds what was a `streaming: bool` + `open:
+    /// StreamOpen` pair, so an `open` exists exactly when the method streams
+    /// (#4740).
+    pub shape: MethodShape,
+    /// Wire framing selected by `#[streaming(sse | multipart_mixed)]`. A bare
+    /// `#[streaming]` means SSE, which is what it has always meant. Meaningless
+    /// for a `MethodShape::Unary` method, where it stays at its default.
+    pub stream_framing: StreamFraming,
     pub params: Vec<RestParam>,
     /// `Some((ok_ty, err_ty))` extracted from the method's `Result<T, E>`
     /// return type. Populated for **both** unary and streaming methods (a
@@ -252,6 +271,8 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     let mut http: Option<(HttpVerb, String, Span)> = None;
     let mut retryable = false;
     let mut streaming = false;
+    let mut stream_framing = StreamFraming::default();
+    let mut stream_open_arg: Option<StreamOpen> = None;
     let mut server_manual = false;
     let mut exposed: Option<bool> = None;
     let mut anonymous = false;
@@ -288,7 +309,22 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         } else if path.is_ident("retryable") {
             retryable = true;
         } else if path.is_ident("streaming") {
+            // Reject a SECOND `#[streaming]` before it overwrites the framing /
+            // open selectors — last-one-wins would silently change the emitted
+            // signature with no signal, exactly the hazard the verb dedup above
+            // guards against.
+            if streaming {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate `#[streaming]` attribute: a streaming method declares it exactly \
+                     once (all framing and open selectors go in that one attribute)",
+                ));
+            }
             streaming = true;
+            let args = crate::stream_attr::parse_streaming_args(attr)?;
+            // A bare `#[streaming]` is SSE — what the marker has always meant.
+            stream_framing = args.framing.unwrap_or_default();
+            stream_open_arg = args.open;
         } else if path.is_ident("server_manual") {
             server_manual = true;
         } else if path.is_ident("exposed") || path.is_ident("internal") {
@@ -356,12 +392,27 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     )?);
     let optional = method.default.is_some();
 
+    // The open shape is selected by `#[streaming(open = fallible)]` and
+    // cross-checked against `async` — the same rule as the base and gRPC
+    // parsers, shared in `stream_attr`.
+    let shape = if streaming {
+        let open = crate::stream_attr::resolve_stream_open(
+            stream_open_arg,
+            method.sig.asyncness.is_some(),
+            method.sig.ident.span(),
+        )?;
+        MethodShape::Stream(open)
+    } else {
+        MethodShape::Unary
+    };
+
     Ok(RestMethodModel {
         ident,
         http_method,
         path_template,
         retryable,
-        streaming,
+        shape,
+        stream_framing,
         params,
         result_types,
         optional,

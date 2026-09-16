@@ -220,6 +220,22 @@ mod tests {
     use gts::GtsIdSegment;
     use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
+    #[test]
+    fn operation_item_error_preserves_reason_and_message() -> Result<(), serde_json::Error> {
+        let payload = serde_json::json!({
+            "reason": "incompatible_with_baseline",
+            "message": "PropertyAdded at $.payload",
+        });
+        let dto = OperationItemDto::from(OperationItemRecord {
+            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+            status: OperationItemStatus::Failed,
+            resource_version: None,
+            error: Some(payload.to_string()),
+        });
+        assert_eq!(serde_json::to_value(dto)?["error"], payload);
+        Ok(())
+    }
+
     fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
         gts::GtsId::try_new(full_id)
             .unwrap_or_else(|e| panic!("invalid GTS id `{full_id}`: {e}"))
@@ -462,9 +478,9 @@ pub struct SubmitEntityDto {
     /// mismatch fails the candidate terminally rather than rebasing it.
     #[serde(default)]
     pub expected_resource_version: Option<i64>,
-    /// ADR-0004 `force`: waive one cross-minor compatibility check. Refused where
-    /// the deployment disallows it, where the candidate has no such check, and
-    /// until T17 can evaluate the check and persist the waiver provenance.
+    /// ADR-0004: waive one cross-minor check when the deployment permits it.
+    /// Intra-entity revisions are never waivable. The revision records the
+    /// effective waiver as `compat_forced`.
     #[serde(default)]
     pub force: Option<bool>,
 }
@@ -481,10 +497,10 @@ pub struct SubmitEntityDto {
 pub struct SubmitEntitiesRequest {
     #[schema(min_items = 1)]
     pub items: Vec<SubmitEntityDto>,
-    /// Reserved for T20 rollback-only evaluation. `true` is synchronously refused
-    /// until dry runs are implemented. The field is already part of the request
-    /// fingerprint, so a future dry run and commit cannot share one idempotency
-    /// identity.
+    /// Predict the batch using one snapshot and an overlay of prior candidates' effects.
+    /// Record outcomes without entity-state writes or reservations.
+    ///
+    /// Defaults to `false`; participates in the idempotency fingerprint.
     #[serde(default)]
     pub dry_run: Option<bool>,
 }
@@ -508,7 +524,10 @@ pub struct OperationItemDto {
     pub gts_id: String,
     pub status: OperationItemStatusDto,
     pub resource_version: Option<i64>,
-    /// The structured refusal reason, when this candidate failed.
+    /// The refusal as `{reason, message}`, when this candidate failed.
+    /// `reason` is a stable machine-readable code; `message` is an explanation for humans.
+    /// Compatibility messages include causes and schema locations where available.
+    /// Clients must not parse `message` or depend on its wording.
     pub error: Option<serde_json::Value>,
 }
 

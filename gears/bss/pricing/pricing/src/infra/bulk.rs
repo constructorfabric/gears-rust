@@ -75,7 +75,6 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -91,6 +90,7 @@ use crate::infra::storage::repo::{
     BulkOperationRecord, NewPriceDraft, PriceRepo, bulk_repo, price_repo,
 };
 use crate::infra::storage::{RepoError, repo_failure};
+use time::OffsetDateTime;
 
 /// §5's per-row conflict code, reported in the operation report.
 ///
@@ -162,6 +162,25 @@ const INTERRUPTED_NOTE: &str = "the commit was interrupted before it reached its
 /// **retryable** — the run is still `committing`, so the operator simply asks
 /// again.
 ///
+/// **And a release goes last, because the one in front cannot see the whole set.**
+/// A commit cancelled inside `take_locks` still owes a lock insert that the driver
+/// will not cancel, and the window between the release above and the terminal move
+/// is the one state that insert is still admitted in — so the row lands after the
+/// DELETE that would have removed it and the run goes terminal over a lock nothing
+/// can reach (#4803). The body says why the terminal move closes the window and
+/// why the trailing release is therefore a last word rather than one more racer.
+/// Its own failure is logged rather than returned, for the reason given there, so
+/// it adds nothing to the errors below.
+///
+/// **`runner` must therefore be an autocommit connection, not a transaction** —
+/// [`bulk_repo::take_locks`]' requirement, now for a second reason. Inside a
+/// transaction neither the release nor the terminal move is visible to the
+/// connection carrying the owed insert until the commit, so the lock is admitted
+/// for the whole body and the trailing release reads as a guarantee it is not
+/// making. `infra::repricing`'s sibling sweep is the transactional shape and does
+/// not need this: it releases and advances inside one `in_transaction`, which
+/// leaves no window between the two statements to admit a lock in.
+///
 /// **The report is added to, never replaced**, so what the run committed survives
 /// the note wherever a receipt did reach the column — including on the one shape
 /// that has no member to add to, where the prior value moves under
@@ -178,7 +197,7 @@ pub async fn abandon_committing_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     note: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<BulkOperationRecord, RepoError> {
     let run = bulk_repo::read(runner, scope, tenant_id, operation_id)
         .await?
@@ -201,7 +220,7 @@ pub async fn abandon_committing_run(
     }
 
     bulk_repo::release_locks(runner, scope, tenant_id, operation_id).await?;
-    bulk_repo::advance(
+    let landed = bulk_repo::advance(
         runner,
         scope,
         tenant_id,
@@ -211,7 +230,57 @@ pub async fn abandon_committing_run(
         report,
         at,
     )
-    .await
+    .await?;
+
+    // **And a release goes last as well, because the one in front cannot see the
+    // whole set.** `take_locks` takes its locks as individual autocommit inserts,
+    // and an insert already handed to the driver is not cancellable: the SQLite
+    // backend passes the statement to that connection's worker thread and only
+    // then awaits the reply, so a dropped future cancels the *wait* and never the
+    // statement. A `commit_batch` cancelled inside `take_locks` therefore still
+    // owes a lock row, which lands whenever that worker is next scheduled — on a
+    // different pooled connection from the one this sweep runs on.
+    //
+    // Between the two statements above the run still reads `committing`, which is
+    // exactly the state `pricing_bulk_row_lock`'s custody rule admits a lock in. So
+    // an owed row landing there is accepted *after* the DELETE that would have
+    // removed it, and the run then goes terminal over a lock nothing can reach —
+    // the freeze the whole module is written against, reported from CI as #4803.
+    //
+    // **What the terminal move buys, and it is not the same on both engines.** The
+    // custody rule refuses a lock to a run that is not `committing` on SQLite and on
+    // Postgres alike, but *when* it reads the state is the whole difference.
+    //
+    // On SQLite the owed insert is one serialized autocommit write: it cannot
+    // interleave with the move at all, so it either lands before this release and is
+    // swept by it, or lands after the move and is refused. The window is closed, and
+    // that is the engine #4803 and this crate's suites run on.
+    //
+    // On Postgres the custody read is a snapshot read inside the owed insert's own
+    // READ COMMITTED transaction, and the insert's foreign key takes only
+    // `FOR KEY SHARE` on the run row, which does not conflict with the move's
+    // `FOR NO KEY UPDATE`. An insert whose statement began before the move committed
+    // therefore still reads `committing` and is admitted. So the release below
+    // narrows the window there rather than closing it — from the whole
+    // release-to-move gap down to an insert already executing across the move.
+    // Closing it needs the custody read to conflict with the move (a `FOR SHARE` on
+    // `pricing_bulk_operation`), which is a schema change this does not make and
+    // which owes its own measurement on a live Postgres.
+    if let Err(e) = bulk_repo::release_locks(runner, scope, tenant_id, operation_id).await {
+        // **The one statement here whose failure is not the caller's.** The run has
+        // landed, which is the answer that was asked for; reporting an error over it
+        // would fail a call that did what it was asked while leaving the residue no
+        // more cleared than logging does, and the retry it invites is refused by the
+        // run's own state. So it is announced at the level a frozen row deserves.
+        tracing::error!(
+            error = %e,
+            operation_id = %operation_id,
+            "bss-pricing: a bulk run landed terminal but the sweep that clears any lock taken \
+             inside its own window did not run; if a cancelled commit owed one, that row is \
+             frozen against interactive editing and against every later bulk run"
+        );
+    }
+    Ok(landed)
 }
 
 /// The `validating` half of the abort door: land a run that never reached a
@@ -239,7 +308,7 @@ pub async fn abandon_validating_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     note: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<BulkOperationRecord, RepoError> {
     let run = bulk_repo::read(runner, scope, tenant_id, operation_id)
         .await?
@@ -387,7 +456,7 @@ impl Drop for CommitLockGuard {
                 tenant_id,
                 operation_id,
                 INTERRUPTED_NOTE,
-                Utc::now(),
+                OffsetDateTime::now_utc(),
             )
             .await
             {
@@ -402,10 +471,18 @@ impl Drop for CommitLockGuard {
                 // The other half of the pair announced at the spawn. Its absence is
                 // the signal: a shutdown that swallowed the task logs the warning
                 // and never reaches here.
+                //
+                // **It claims the landing and no more.** The sweep's trailing release
+                // -- the one that clears a lock owed by this very cancellation -- does
+                // not fail the sweep, so `Ok` here is not by itself proof that nothing
+                // was left behind. That half is announced on its own `error!` line
+                // inside `abandon_committing_run`; this line saying the recovery ran is
+                // exactly as much as reaching here establishes.
                 tracing::info!(
                     operation_id = %operation_id,
-                    "bss-pricing: the dropped bulk commit's row locks were released and the \
-                     run landed terminal"
+                    "bss-pricing: the dropped bulk commit's recovery ran: the run landed \
+                     terminal and its locks were released, except for any residue this \
+                     sweep reported on an error line of its own"
                 );
             }
         });
@@ -540,7 +617,7 @@ impl Drop for ValidationGuard {
                 BulkState::Validating,
                 BulkState::ValidationFailed,
                 report,
-                Utc::now(),
+                OffsetDateTime::now_utc(),
             )
             .await
             {
@@ -630,7 +707,7 @@ pub async fn commit_batch(
     operation_id: Uuid,
     rows: &[ImportRow],
     stamp: AuditStamp,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<CommitReceipt, DomainError> {
     let conn = db
         .conn()
@@ -869,7 +946,7 @@ async fn commit_rows(
     rows: &[ImportRow],
     drafts: &HashMap<ScopeKey, PriceRecord>,
     stamp: AuditStamp,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> (CommitReceipt, Option<DomainError>) {
     let mut receipt = CommitReceipt::default();
     for (index, row) in rows.iter().enumerate() {

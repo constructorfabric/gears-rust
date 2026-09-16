@@ -37,16 +37,9 @@ pub struct TypesRegistryConfig {
     #[serde(default)]
     pub local_client: LocalClientSettings,
 
-    /// Whether ADR-0004 `force` may waive a cross-minor compatibility check.
-    ///
-    /// Off by default: waiving compatibility is a deployment decision, and a
-    /// registry that accepted `force` because a caller asked would make the
-    /// guarantee advisory. The per-candidate gate is acceptance step 6 (T7);
-    /// this key is what it consults.
-    ///
-    /// **Effectively inert until T17:** without compatibility evaluation, enabling
-    /// this key changes only whether the caller sees `ForceNotPermitted` or
-    /// `ForceCompatibilityUnavailable`; it cannot make a candidate admissible.
+    /// Allow ADR-0004 `force` for cross-minor checks; disabled by default.
+    /// Acceptance and each worker pass check this setting. Intra-entity checks
+    /// remain unwaivable.
     #[serde(default)]
     pub allow_compatibility_force: bool,
 

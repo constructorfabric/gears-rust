@@ -21,7 +21,7 @@ use uuid::Uuid;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::AdmissionFailureReason;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::unit::{commit_creation, evaluate};
+use types_registry::domain::admission::unit::{EvaluationTarget, commit_creation, evaluate};
 use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::artifacts::resolution_fingerprint;
@@ -120,6 +120,7 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -250,6 +251,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         first,
         LATER,
@@ -285,6 +287,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,
@@ -332,10 +335,16 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
         &stores(),
         &provider,
         &allow_all(),
-        &item.gts_id,
-        &payload,
-        item.id,
+        EvaluationTarget {
+            gts_id: &item.gts_id,
+            canonical_body: &payload,
+            operation_item_id: item.id,
+            precondition: item.precondition,
+            force: item.compat_forced,
+            labels: item.pass_labels(),
+        },
         &common::limits(),
+        &common::metrics(),
         None,
     )
     .await
@@ -446,6 +455,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         first,
         LATER,
@@ -465,6 +475,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,
@@ -482,6 +493,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,
@@ -537,6 +549,7 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -597,6 +610,7 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         first,
         LATER,
@@ -618,6 +632,7 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,
@@ -667,6 +682,7 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -711,6 +727,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         first,
         LATER,
@@ -742,6 +759,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,
@@ -786,6 +804,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -802,6 +821,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -843,6 +863,7 @@ async fn an_unknown_operation_is_an_error() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         Uuid::new_v4(),
         LATER,
@@ -851,6 +872,42 @@ async fn an_unknown_operation_is_an_error() {
     .expect_err("an unknown operation must not look like success");
     assert!(
         matches!(err, WorkerError::OperationNotFound { .. }),
+        "got {err}"
+    );
+}
+
+/// A terminal success owes its Registry Reference, which is derived from the
+/// stored identifier. Acceptance canonicalized that identifier before the row was
+/// written, so one that no longer parses is a corrupt row: the redelivered pass
+/// says so instead of answering a success with the field left out, which is the
+/// one shape ADR-0012 rules out.
+#[tokio::test]
+async fn a_terminal_item_whose_stored_identifier_does_not_parse_is_an_error() {
+    let db = test_db().await;
+    let operation_id = {
+        let conn = db.conn().expect("conn");
+        common::seed_completed_operation_item(&conn, "not a gts identifier", 1, NOW)
+            .await
+            .0
+    };
+
+    let err = run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        operation_id,
+        LATER,
+    )
+    .await
+    .expect_err("a corrupt stored identifier must not be reported as a success");
+    assert!(
+        matches!(err, WorkerError::StoredIdentifierUnparsable { .. }),
         "got {err}"
     );
 }
@@ -877,6 +934,7 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -942,6 +1000,7 @@ async fn a_ref_outside_the_chain_is_admitted() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         first,
         LATER,
@@ -966,6 +1025,7 @@ async fn a_ref_outside_the_chain_is_admitted() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         second,
         LATER,

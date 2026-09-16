@@ -363,15 +363,16 @@ mod scope_to_odata_tests {
     }
 
     #[test]
-    fn empty_constraint_disjunct_is_denied_fail_closed() {
+    fn an_empty_constraint_disjunct_cannot_be_built() {
         // A constraint with no filters matches every row (an allow-all
-        // disjunct). Honouring it would widen the projection to all tenants,
-        // so it MUST fail closed rather than collapse to "no row narrowing".
-        let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![])]);
-        assert!(!scope.is_unconstrained(), "guard: not the allow_all path");
-        assert!(!scope.is_deny_all(), "guard: not the deny_all path");
-        let err = scope_to_odata_filter(&scope).expect_err("empty constraint -> authz denied");
-        assert!(matches!(err, DomainError::AuthorizationDenied { .. }));
+        // disjunct), and honouring it would widen the projection to all
+        // tenants. This gear used to defend against the shape here; it is now
+        // unbuildable, so the defence sits at the constructor for every
+        // consumer at once.
+        assert!(
+            ScopeConstraint::try_new(vec![]).is_err(),
+            "an empty constraint must not be constructible"
+        );
     }
 
     #[test]
