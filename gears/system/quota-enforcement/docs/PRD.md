@@ -2319,7 +2319,8 @@ The system **MUST** emit events for the following catalog of event kinds:
   lease `commit`,
 - `policy-changed` — a Quota Resolution Policy was created, updated, or deleted.
 
-Each event **MUST** carry `event_id`, `event_kind`, `tenant_id`, `quota_id` or `policy_id` (whichever applies),
+Each event **MUST** carry `event_id`, `event_kind`, its scope (`tenant_id` for a tenant-scoped Quota, lease, or
+consumption event; `policy-changed` is platform-scoped and carries none), `quota_id` or `policy_id` (whichever applies),
 `subject` (when applicable), event-specific payload, and an emission timestamp. Event delivery is best-effort in phase 1
 — sustained delivery failures **MUST** be reflected in operational telemetry but **MUST NOT** block Quota Enforcement
 write operations. Delivery MAY duplicate under retry; sinks **MUST** tolerate duplicate delivery of the same

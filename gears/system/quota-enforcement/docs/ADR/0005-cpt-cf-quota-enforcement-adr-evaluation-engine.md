@@ -109,13 +109,15 @@ P1 ships two reference engines bundled with QE-core for default-deployment ergon
 - **`most-restrictive-wins`** — hardcoded engine, no `engine_config`. Sub-millisecond
   hot path. Default global-Policy engine
   (per `cpt-cf-quota-enforcement-fr-quota-resolution-policy`); rejects any non-empty
-  `engine_config`. Hardcoded because this arbitration shape («every applicable Quota
-  debited equally») has no operator-authored degrees of freedom.
-- **`cel`** — sandboxed CEL evaluator backed by the `cel-interpreter` crate
-  (Rust-native, sandbox by construction, cost-bound via
-  `Context::with_cost_limit(steps)`, pre-compiled AST cache keyed by
+  `engine_config`. Hardcoded because this arbitration shape («the single binding
+  Quota is debited the full requested amount») has no operator-authored degrees of
+  freedom.
+- **`cel`** — sandboxed CEL evaluator over the `cel-core` parser
+  (Rust-native, sandbox by construction, cost-bound by a QE-owned metered evaluator
+  because no inspected Rust CEL runtime exposes an internal cost hook,
+  pre-compiled AST cache keyed by
   `(policy_id, policy_version)`). Operators author `cel` Policies via
-  `engine_config.expr` (CEL string). The `cel-interpreter` choice is the reference
+  `engine_config.expr` (CEL string). The `cel-core` choice is the reference
   realisation — a different Rust-native CEL evaluator (or even a non-CEL expression
   language) could ship as an alternative engine without contract change.
 
