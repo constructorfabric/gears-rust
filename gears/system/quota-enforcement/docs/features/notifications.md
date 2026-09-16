@@ -54,7 +54,7 @@ duplicates, and dispatch telemetry.
 **Out of scope**: producing events (each mutating feature enqueues its own, same-tx via the storage contract), the
 outbox tables and I11 guarantee (foundation, via the `toolkit-db` Outbox), the cluster coordination adapter (sweeper
 singletons only — the dispatcher is fenced by the Outbox lease), EventBus routing (P2 per PRD §13), and any QE-side subscription
-primitive (P2; P1 sinks filter on `event.tenant_id` themselves).
+primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
 
 **Requirements**: `cpt-cf-quota-enforcement-fr-notification-plugin`
 
@@ -212,7 +212,7 @@ system-level context) — with the documented obligation that sinks tolerate dup
 and with the closed `DispatchError` enum
 (`Timeout`, `Transient(String)`, `Permanent(String)`) and the `QuotaEvent` shape carrying the closed event-kind enum,
 event-kind payloads, discriminators (`quota-changed.change_kind`, `policy-changed.change_kind` with rollback reported
-as `updated`), `event_id`, `tenant_id`, target reference, `subject` when applicable, and the emission timestamp.
+as `updated`), `event_id`, its scope, target reference, `subject` when applicable, and the emission timestamp.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-sink-delivery`
@@ -289,7 +289,7 @@ upstream prerequisite of this feature, and QE does not query the framework's tab
 
 ## 6. Acceptance Criteria
 
-- [ ] All eight event kinds reach every registered sink; each carries `event_id`, `event_kind`, `tenant_id`, its
+- [ ] All eight event kinds reach every registered sink; each carries `event_id`, `event_kind`, its scope, its
   target reference, `subject` when applicable, and the emission timestamp
 - [ ] A `Permanent` sink outcome maps to `Reject`: the event lands in the framework dead-letter store,
   `outbox_rejections_total` grows, and no quota write is blocked or slowed (best-effort verified under sustained
