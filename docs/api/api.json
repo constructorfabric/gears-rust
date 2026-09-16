@@ -3967,78 +3967,6 @@
         ],
         "type": "object"
       },
-      "CredentialListItemDto": {
-        "description": "One item of `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the same\nfields as [`CredentialDto`], plus `secret` — populated only in value mode\n(`$select` containing `secret`) and only for an item the caller may read;\nabsent from the wire entirely in metadata mode or when the item's value\ncould not be served (refused, missing, fingerprint mismatch — omitted by\nthe domain layer already, never reported as an error for one item).\n\n`Debug` is hand-written to redact `secret`.",
-        "properties": {
-          "expires_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "fallback": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/FallbackDto"
-              }
-            ]
-          },
-          "inheritance": {
-            "$ref": "#/components/schemas/InheritanceStatusDto"
-          },
-          "owner_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "reference": {
-            "type": "string"
-          },
-          "secret": {
-            "description": "The decrypted value — the same wire form as [`SecretDto::value`] —\npresent only in value mode, for an item the caller may read.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sharing": {
-            "$ref": "#/components/schemas/SharingModeDto"
-          },
-          "status": {
-            "$ref": "#/components/schemas/CredentialStatusDto"
-          },
-          "type": {
-            "type": "string"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "version": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "reference",
-          "type",
-          "sharing",
-          "status",
-          "inheritance"
-        ],
-        "type": "object"
-      },
       "CredentialPatchDto": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0004): an\nRFC 7396 JSON Merge Patch. Every field is tri-state (`Option<Option<T>>`):\nabsent (untouched), explicit `null`, or a value. `secret_type`/`sharing`/\n`fallback` have no valid `null` state on the wire (rejected as\n`NULL_NOT_ALLOWED` by the handler, since none is a nullable column);\n`expires_at`/`value` do — `null` clears/removes them.\n\n`Debug` is hand-written to redact `value`.",
@@ -10042,24 +9970,6 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/CredentialDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_CredentialListItemDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialListItemDto"
             },
             "type": "array"
           },
@@ -16841,33 +16751,6 @@
           "phase",
           "price_eligibility",
           "charge_kind"
-        ],
-        "type": "object"
-      },
-      "SecretDto": {
-        "description": "Response body for `GET /credstore/v1/credentials/{ref}/secret`\n(ADR-0004): the value with exactly what is needed to use it.\n\n`Debug` is hand-written to redact `value`.",
-        "properties": {
-          "expires_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "reference": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string"
-          },
-          "value": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "reference",
-          "type",
-          "value"
         ],
         "type": "object"
       },
