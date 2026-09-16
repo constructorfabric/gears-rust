@@ -13,7 +13,7 @@
   - [1.4 References](#14-references)
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
   - [2.1 Cold JOIN (new consumer, fresh group)](#21-cold-join-new-consumer-fresh-group)
-  - [2.2 SEEK (set cursor; pre-stream or forward advance)](#22-seek-set-cursor-pre-stream-or-forward-advance)
+  - [2.2 SEEK (set cursor; pre-stream)](#22-seek-set-cursor-pre-stream)
   - [2.3 Re-JOIN after 410 Gone / 404 / shard failover](#23-re-join-after-410-gone--404--shard-failover)
   - [2.4 Upscaling (add consumer instance)](#24-upscaling-add-consumer-instance)
   - [2.5 Downscaling (remove consumer instance)](#25-downscaling-remove-consumer-instance)
@@ -96,7 +96,8 @@ resp = http.post("/v1/subscriptions", json={
 })
 sub_id              = resp.json["id"]
 assigned            = resp.json["assigned"]            # list of (topic, partition); topic-centric for seek
-topology_version    = resp.json["topology_version"]
+topology_version    = resp.json["topology_version"]    # echo back on SEEK (rebalance fence)
+created_at          = resp.json["created_at"]          # set at JOIN; list sort key (newest first)
 
 # Broker-side join logic
 def join(req):
@@ -120,9 +121,12 @@ for (topic, partition) in assigned:
     positions[f"{topic}:{partition}"] = pos.to_wire()           # int | "earliest" | "latest"
 
 resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
+    "topology_version": topology_version,   # fenced against a concurrent rebalance
     "partition_positions": positions,
 })
 assert resp.status == 200    # 400 InvalidInitialPosition if an integer is out of range
+# 412 topology_version_mismatch if the group rebalanced since JOIN - re-read the
+# subscription for the fresh topology_version + assigned set, then re-seek (see §2.2).
 
 # Step 3 — first stream
 for frame in http.get(f"/v1/events:stream?subscription_id={sub_id}", stream=True):
@@ -141,46 +145,53 @@ for frame in http.get(f"/v1/events:stream?subscription_id={sub_id}", stream=True
 #   cluster + persistent → cursor survives shard restart (Redis-with-disk, etcd)
 ```
 
-### 2.2 SEEK (set cursor; pre-stream or forward advance)
+### 2.2 SEEK (set cursor; pre-stream)
 
-The `POST /v1/subscriptions/{id}:seek` endpoint serves two roles for the same subscription:
+`POST /v1/subscriptions/{id}:seek` seeds the starting position for each assigned partition. It is **pre-stream-only**: a SEEK while a `:stream` is open on the subscription is rejected with `409 StreamingInProgress`. Any value in the valid range `[retention_floor - 1, high_water_mark]` is permitted; sentinels `"earliest"` / `"latest"` are server-resolved and returned as integers.
 
-1. **Pre-stream seed** (§2.1 Step 2) — call it once after JOIN to declare the starting position for each assigned partition. Any value in the valid range `[retention_floor - 1, high_water_mark]` is permitted; sentinels `"earliest"` / `"latest"` are server-resolved at admission.
-2. **Forward SEEK during streaming** — call it to advance the cursor past processed events. While `:stream` is open against the subscription, the broker enforces `MAX(stored, requested)` per partition; backward moves are rejected with `409 SeekBackwardNotAllowed`.
+The request carries the `topology_version` the caller last observed (from JOIN or a subscription read). The broker fences the seek against a concurrent rebalance: a value differing from the subscription's current `topology_version` rejects the whole seek with `412 topology_version_mismatch` (nothing seeded), and the caller recovers by re-reading the subscription for the fresh `topology_version` + `assigned` set and re-seeking. This covers the pre-stream JOIN→SEEK window, where no open stream exists to carry an in-band `topology` frame. (Contrast the open-stream rebalance recovery in [`0004-consumption-transport.md`](0004-consumption-transport.md), which reads the fresh assignment from the `topology` frame on the live stream.)
 
 ```python
-# Consumer side — pre-stream seed (per-partition; values are int OR "earliest"/"latest")
+# Consumer side - pre-stream seed (per-partition; values are int OR "earliest"/"latest")
 resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
+    "topology_version": topology_version,   # last observed; fences a concurrent rebalance
     "partition_positions": {
         "orders:0": 42,         # last-processed offset; broker emits from 43
-        "orders:1": "earliest", # broker sets cursor := retention_floor - 1
-        "orders:2": "latest",   # broker sets cursor := current high-water mark
+        "orders:1": "earliest", # broker resolves to retention_floor - 1
+        "orders:2": "latest",   # broker resolves to current high-water mark
     }
 })
-assert resp.status == 200
-
-# Consumer side — forward SEEK during streaming (integers only; forward-only enforced)
-resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
-    "partition_positions": {"orders:0": 100}  # 409 SeekBackwardNotAllowed if < 42
-})
+assert resp.status == 200       # body echoes each position resolved to an integer
 
 # Broker side
-def seek(sub_id, partition_positions, stream_is_open):
+def seek(sub_id, topology_version, partition_positions, stream_is_open):
+    if stream_is_open:
+        return 409_StreamingInProgress                       # SEEK is pre-stream-only
     sub = state.subscriptions[sub_id]
+    for (key, _) in partition_positions.items():
+        topic, part = key.split(":")
+        if not topic_registered(topic):
+            return 404_TopicNotFound                         # judged before the version fence
+
+    if topology_version != sub.topology_version:
+        return 412_TopologyVersionMismatch                   # stale view; re-read + re-seek
+
+    resolved = {}
+    violations = []
     for (key, value) in partition_positions.items():
         topic, part = key.split(":")
         if (topic, int(part)) not in sub.assigned:
             return 409_PartitionNotAssigned                  # atomic: nothing applies
-
-        resolved = resolve(value, topic, int(part))          # int verbatim or sentinel→int
-        if not (retention_floor(topic, int(part)) - 1 <= resolved <= high_water_mark(topic, int(part))):
-            return 400_InvalidInitialPosition
-
-        if stream_is_open and resolved < cursor.get(sub.group, topic, int(part)):
-            return 409_SeekBackwardNotAllowed                 # forward-only during streaming
-
-        cursor.set((sub.group, topic, int(part)), resolved)
-    return 200_OK
+        pos = backend.resolve(topic, int(part), value)       # int verbatim or sentinel→int
+        if pos.out_of_range:
+            violations.append(pos)                           # every offender reported
+        else:
+            resolved[key] = pos
+    if violations:
+        return 400_SeekOutOfRange(violations)                # nothing seeded
+    for (key, pos) in resolved.items():
+        cursor.set((sub.group, *key), pos)
+    return 200_OK(resolved)
 ```
 
 Sentinel resolution (broker-side, at admission):
@@ -345,6 +356,8 @@ async def release_ownership(G):
 The lock around `cluster.distributed_lock("evbk.group.<G>")` is the serialization point for every GroupState mutation (JOIN, LEAVE, rebalance, ownership transfer). Stream reads and pre-stream SEEK are NOT lock-protected by the GroupState mutation lock — they touch runtime cursor cache keys directly and rely on the cache's own consistency guarantees.
 
 `topology_version` is monotonically increasing per group; every mutation increments it. Consumers compare across poll responses to detect rebalance.
+
+A subscription carries a `created_at` timestamp set at JOIN. `GET /v1/subscriptions` returns subscriptions newest-first, ordered by `created_at` descending with `id` as a stable tiebreaker, so a freshly created subscription lands on the first page rather than wherever its random id would fall.
 
 ## 4. States (CDSL)
 

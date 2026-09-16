@@ -3,7 +3,7 @@ use toolkit_gts::gts_id;
 
 use uuid::Uuid;
 
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::{
     BarrierMode, EventBrokerApi, JoinRequest, SeekPosition, SubscriptionInterest,
     TenantTraversalDepth,
@@ -53,10 +53,11 @@ async fn dropping_unpolled_stream_clears_active_marker() {
         .seek(
             &ctx,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await

@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +26,7 @@ use {
         CommitOffset, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder, ConsumerCommitMode,
         ConsumerGroupRef, ConsumerListenerSettings, ConsumerRuntimeEvent, ConsumerSlowDetection,
         Fallback, InMemoryOffsetManager, OffsetManagerError, OffsetStore, PartitionBufferState,
-        ResolvedPosition, SlowConsumerTrigger,
+        Position, SlowConsumerTrigger,
     },
     crate::ids::ConsumerGroupId,
     std::collections::BTreeSet,
@@ -51,8 +52,8 @@ fn raw_event_on(topic: &str, type_id: &str, partition: u32, offset: i64) -> RawE
         subject: format!("event-{offset}"),
         subject_type: "test".to_owned(),
         partition,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -72,7 +73,7 @@ impl super::SingleEventHandler for RecordingSingleHandler {
         event: RawEvent,
         _attempts: u16,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        self.calls.lock().unwrap().push(event.offset);
+        self.calls.lock().unwrap().push(event.offset.as_i64());
         Ok(self.outcome.clone())
     }
 }
@@ -91,7 +92,10 @@ impl ConsumerHandler for RecordingBatchHandler {
         _attempts: u16,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         if let Some(event) = batch.next_event() {
-            self.calls.lock().unwrap().push((self.name, event.offset));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((self.name, event.offset.as_i64()));
         }
         Ok(self.outcome.clone())
     }
@@ -112,7 +116,7 @@ impl ConsumerHandler for AckAllBatchHandler {
         self.calls.lock().unwrap().extend(
             chunk
                 .iter()
-                .map(|event| (event.topic.clone(), event.partition, event.offset)),
+                .map(|event| (event.topic.clone(), event.partition, event.offset.as_i64())),
         );
         Ok(chunk
             .last()
@@ -127,15 +131,23 @@ impl ConsumerHandler for AckAllBatchHandler {
 fn slow_state_detects_buffer_high_watermark_once() {
     let mut state = PartitionSlowState::default();
 
-    assert!(state.observe_enqueue(3, 10, 4).is_none());
+    assert!(
+        state
+            .observe_enqueue(3, Sequence::assigned(10), 4)
+            .is_none()
+    );
     let signal = state
-        .observe_enqueue(4, 11, 4)
+        .observe_enqueue(4, Sequence::assigned(11), 4)
         .expect("high watermark triggers");
 
     assert_eq!(signal.reason, SlowConsumerReason::BufferHighWatermark);
     assert_eq!(signal.buffered_count, 4);
-    assert_eq!(signal.latest_observed_offset, Some(11));
-    assert!(state.observe_enqueue(5, 12, 4).is_none());
+    assert_eq!(signal.latest_observed_offset, Some(Sequence::assigned(11)));
+    assert!(
+        state
+            .observe_enqueue(5, Sequence::assigned(12), 4)
+            .is_none()
+    );
 }
 
 #[test]
@@ -145,27 +157,47 @@ fn slow_state_detects_handler_latency_strikes_and_resets_on_fast_completion() {
 
     assert!(
         state
-            .observe_handler_completion(Duration::from_millis(75), threshold, 2, 20)
+            .observe_handler_completion(
+                Duration::from_millis(75),
+                threshold,
+                2,
+                Sequence::assigned(20)
+            )
             .is_none()
     );
     assert!(
         state
-            .observe_handler_completion(Duration::from_millis(10), threshold, 2, 21)
+            .observe_handler_completion(
+                Duration::from_millis(10),
+                threshold,
+                2,
+                Sequence::assigned(21)
+            )
             .is_none()
     );
 
     assert!(
         state
-            .observe_handler_completion(Duration::from_millis(75), threshold, 2, 22)
+            .observe_handler_completion(
+                Duration::from_millis(75),
+                threshold,
+                2,
+                Sequence::assigned(22)
+            )
             .is_none()
     );
     let signal = state
-        .observe_handler_completion(Duration::from_millis(80), threshold, 2, 23)
+        .observe_handler_completion(
+            Duration::from_millis(80),
+            threshold,
+            2,
+            Sequence::assigned(23),
+        )
         .expect("latency strikes trigger");
 
     assert_eq!(signal.reason, SlowConsumerReason::HandlerLatencyStrikes);
     assert_eq!(signal.consecutive_slow_handlers, 2);
-    assert_eq!(signal.last_delivered_offset, Some(23));
+    assert_eq!(signal.last_delivered_offset, Some(Sequence::assigned(23)));
 }
 
 #[tokio::test]
@@ -238,9 +270,12 @@ async fn single_handler_adapter_dispatches_one_event_batch() {
     assert_eq!(*calls.lock().unwrap(), vec![20]);
     assert!(matches!(
         outcome,
-        BatchHandlerOutcome::AdvanceThrough { offset: 20 }
+        BatchHandlerOutcome::AdvanceThrough { offset } if offset == Sequence::assigned(20)
     ));
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(20));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(20))
+    );
 }
 
 #[tokio::test]
@@ -268,9 +303,12 @@ async fn native_batch_handler_dispatches_multiple_events_from_one_partition() {
     );
     assert!(matches!(
         outcome,
-        BatchHandlerOutcome::AdvanceThrough { offset: 32 }
+        BatchHandlerOutcome::AdvanceThrough { offset } if offset == Sequence::assigned(32)
     ));
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(30));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(30))
+    );
 }
 
 #[tokio::test]
@@ -372,7 +410,10 @@ async fn routed_dispatch_fails_visibly_without_matching_route_or_default() {
         err.to_string().contains("no consumer route matched"),
         "unexpected error: {err:?}"
     );
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(13));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(13))
+    );
 }
 
 #[tokio::test]
@@ -412,10 +453,13 @@ async fn routed_dispatch_preserves_adjacent_event_order_across_routes() {
         *calls.lock().unwrap(),
         vec![("created", 40), ("cancelled", 41)]
     );
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(40));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(40))
+    );
     assert_eq!(
         second_batch.next_event().map(|event| event.offset),
-        Some(41)
+        Some(Sequence::assigned(41))
     );
 }
 
@@ -454,7 +498,10 @@ async fn routed_dispatch_retry_does_not_advance_past_earlier_unprocessed_event()
 
     assert!(matches!(outcome, BatchHandlerOutcome::Retry { .. }));
     assert_eq!(*calls.lock().unwrap(), vec![("created", 50)]);
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(50));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(50))
+    );
 }
 
 #[cfg(feature = "test-util")]
@@ -550,8 +597,6 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
                     partition: None,
                     sequence: None,
                     sequence_time: None,
-                    offset: None,
-                    offset_time: None,
                     meta: None,
                 },
             )
@@ -750,8 +795,6 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -893,8 +936,6 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1020,8 +1061,6 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1153,8 +1192,6 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
                     partition: None,
                     sequence: None,
                     sequence_time: None,
-                    offset: None,
-                    offset_time: None,
                     meta: None,
                 },
             )
@@ -1179,8 +1216,15 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
         "listener failure must not drop consumer events before handler dispatch"
     );
     let commits = commits.lock().unwrap().clone();
+    // Nothing beyond "no position" may be committed. This used to read
+    // `*offset < 0`, from when the mock reported -1 for a partition it had
+    // never scanned; the floor of the cursor space is 0, so the same intent -
+    // no *delivered* event's position is committed - is that every recorded
+    // offset is still the empty one.
     assert!(
-        commits.iter().all(|(_, _, _, offset)| *offset < 0),
+        commits
+            .iter()
+            .all(|(_, _, _, offset)| *offset == Sequence::NONE.as_i64()),
         "listener failure must not durably advance delivered event offsets by itself: {commits:?}"
     );
     assert!(
@@ -1286,8 +1330,6 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1405,8 +1447,6 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1550,8 +1590,6 @@ async fn slow_drop_drains_buffer_before_rejoin_load_position() {
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1630,8 +1668,8 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-        ) -> Result<ResolvedPosition, OffsetManagerError> {
-            Ok(ResolvedPosition::Earliest)
+        ) -> Result<Position, OffsetManagerError> {
+            Ok(Position::Earliest)
         }
     }
 
@@ -1642,12 +1680,14 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
             group: &ConsumerGroupId,
             topic: &TopicId,
             partition: u32,
-            offset: i64,
+            offset: Sequence,
         ) -> Result<(), OffsetManagerError> {
-            self.commits
-                .lock()
-                .expect("recording commits")
-                .push((*group, *topic, partition, offset));
+            self.commits.lock().expect("recording commits").push((
+                *group,
+                *topic,
+                partition,
+                offset.as_i64(),
+            ));
             Ok(())
         }
     }
@@ -1710,8 +1750,6 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -1744,4 +1782,253 @@ async fn wait_for_first_non_negative_commit(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("auto-commit did not persist a recorded event offset");
+}
+
+#[cfg(feature = "test-util")]
+#[tokio::test]
+async fn seek_recovers_from_one_shot_topology_version_mismatch() {
+    use crate::EventBrokerApi;
+    use crate::mock::stubs::test_ctx_for_tenant;
+    use crate::mock::{MockBroker, MockBrokerHandle};
+    use crate::models::Event;
+    use std::sync::atomic::Ordering;
+
+    const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.reseek.v1");
+    const EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.reseek.v1~");
+
+    let mock = MockBroker::new();
+    let control = MockBrokerHandle::from_broker(&mock);
+    control.register_topic(TOPIC, 1).await;
+    control
+        .register_event_type(TOPIC, EVENT, serde_json::json!({ "type": "object" }), &[])
+        .await;
+    control
+        .set_heartbeat_interval(Duration::from_millis(10))
+        .await;
+
+    // Fault only the first seek: the consumer must re-read the subscription and
+    // re-seek to recover, then deliver the event.
+    let faulty = SeekFaultBroker::new(Arc::new(mock), 1, false);
+    let seek_calls = faulty.seek_calls.clone();
+    let get_sub_calls = faulty.get_subscription_calls.clone();
+    let broker: Arc<dyn EventBrokerApi> = Arc::new(faulty);
+
+    let ctx = test_ctx_for_tenant(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+    let recorder = BatchScopeRecorder::default();
+    let scopes = recorder.scopes.clone();
+
+    let handle = ConsumerBuilder::new(broker.clone())
+        .group(ConsumerGroupRef::auto_anonymous("reseek"))
+        .topics([TOPIC])
+        .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
+        .batch_handler(recorder)
+        .start()
+        .await
+        .expect("consumer starts");
+
+    broker
+        .publish(
+            &ctx,
+            &Event {
+                id: Uuid::new_v4(),
+                type_id: EVENT.to_owned(),
+                tenant_id: ctx.subject_tenant_id(),
+                source: "reseek.test".to_owned(),
+                subject: "s".to_owned(),
+                subject_type: "test".to_owned(),
+                occurred_at: Utc::now(),
+                trace_parent: None,
+                data: Some(serde_json::json!({})),
+                partition: None,
+                sequence: None,
+                sequence_time: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect("event published");
+
+    for _ in 0..300 {
+        if !scopes.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.stop().await.expect("consumer stops");
+
+    // The event was delivered despite the injected mismatch - recovery worked.
+    assert_eq!(scopes.lock().unwrap().len(), 1);
+    // The first seek faulted, the retry re-read the subscription and re-seeked.
+    assert!(
+        seek_calls.load(Ordering::SeqCst) >= 2,
+        "expected a re-seek after the mismatch, saw {}",
+        seek_calls.load(Ordering::SeqCst)
+    );
+    assert!(
+        get_sub_calls.load(Ordering::SeqCst) >= 1,
+        "expected a subscription re-read on the mismatch"
+    );
+}
+
+#[cfg(feature = "test-util")]
+#[tokio::test]
+async fn seek_topology_mismatch_is_bounded_and_surfaces() {
+    use crate::EventBrokerApi;
+    use crate::mock::stubs::test_ctx_for_tenant;
+    use crate::mock::{MockBroker, MockBrokerHandle};
+    use crate::models::Event;
+    use std::sync::atomic::Ordering;
+
+    const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.reseekfail.v1");
+    const EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.reseekfail.v1~");
+
+    let mock = MockBroker::new();
+    let control = MockBrokerHandle::from_broker(&mock);
+    control.register_topic(TOPIC, 1).await;
+    control
+        .register_event_type(TOPIC, EVENT, serde_json::json!({ "type": "object" }), &[])
+        .await;
+
+    // Every seek mismatches: recovery must give up after a bounded number of
+    // re-reads and surface the error instead of looping forever.
+    let faulty = SeekFaultBroker::new(Arc::new(mock), usize::MAX, false);
+    let seek_calls = faulty.seek_calls.clone();
+    let get_sub_calls = faulty.get_subscription_calls.clone();
+    let broker: Arc<dyn EventBrokerApi> = Arc::new(faulty);
+
+    let ctx = test_ctx_for_tenant(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+    let recorder = BatchScopeRecorder::default();
+    let scopes = recorder.scopes.clone();
+
+    let handle = ConsumerBuilder::new(broker.clone())
+        .group(ConsumerGroupRef::auto_anonymous("reseekfail"))
+        .topics([TOPIC])
+        .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
+        .batch_handler(recorder)
+        .start()
+        .await
+        .expect("consumer starts");
+
+    broker
+        .publish(
+            &ctx,
+            &Event {
+                id: Uuid::new_v4(),
+                type_id: EVENT.to_owned(),
+                tenant_id: ctx.subject_tenant_id(),
+                source: "reseekfail.test".to_owned(),
+                subject: "s".to_owned(),
+                subject_type: "test".to_owned(),
+                occurred_at: Utc::now(),
+                trace_parent: None,
+                data: Some(serde_json::json!({})),
+                partition: None,
+                sequence: None,
+                sequence_time: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect("event published");
+
+    // One resolve_and_seek issues `RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS + 1`
+    // seeks (each retry re-reads the subscription) then surfaces the mismatch.
+    let want_seeks = (super::dispatcher::RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS + 1) as usize;
+    for _ in 0..300 {
+        if seek_calls.load(Ordering::SeqCst) >= want_seeks {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = handle.stop().await;
+
+    assert!(
+        seek_calls.load(Ordering::SeqCst) >= want_seeks,
+        "expected the seek to be retried up to the budget, saw {}",
+        seek_calls.load(Ordering::SeqCst)
+    );
+    assert!(
+        get_sub_calls.load(Ordering::SeqCst)
+            >= super::dispatcher::RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS as usize,
+        "expected one subscription re-read per retry"
+    );
+    // A persistent mismatch never masquerades as success: nothing was delivered.
+    assert!(scopes.lock().unwrap().is_empty());
+}
+
+#[cfg(feature = "test-util")]
+#[tokio::test]
+async fn positions_not_set_at_open_is_not_masked() {
+    use crate::EventBrokerApi;
+    use crate::mock::stubs::test_ctx_for_tenant;
+    use crate::mock::{MockBroker, MockBrokerHandle};
+    use crate::models::Event;
+    use std::sync::atomic::Ordering;
+
+    const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.pns.v1");
+    const EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.broker.pns.v1~");
+
+    let mock = MockBroker::new();
+    let control = MockBrokerHandle::from_broker(&mock);
+    control.register_topic(TOPIC, 1).await;
+    control
+        .register_event_type(TOPIC, EVENT, serde_json::json!({ "type": "object" }), &[])
+        .await;
+
+    // No seek fault; the first stream open reports PositionsNotSet. A compliant
+    // consumer seeks before opening, so this is a protocol violation the runtime
+    // must surface rather than silently re-seed-and-retry.
+    let faulty = SeekFaultBroker::new(Arc::new(mock), 0, true);
+    let stream_calls = faulty.stream_calls.clone();
+    let broker: Arc<dyn EventBrokerApi> = Arc::new(faulty);
+
+    let ctx = test_ctx_for_tenant(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+    let recorder = BatchScopeRecorder::default();
+    let scopes = recorder.scopes.clone();
+
+    let handle = ConsumerBuilder::new(broker.clone())
+        .group(ConsumerGroupRef::auto_anonymous("pns"))
+        .topics([TOPIC])
+        .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
+        .batch_handler(recorder)
+        .start()
+        .await
+        .expect("consumer starts");
+
+    broker
+        .publish(
+            &ctx,
+            &Event {
+                id: Uuid::new_v4(),
+                type_id: EVENT.to_owned(),
+                tenant_id: ctx.subject_tenant_id(),
+                source: "pns.test".to_owned(),
+                subject: "s".to_owned(),
+                subject_type: "test".to_owned(),
+                occurred_at: Utc::now(),
+                trace_parent: None,
+                data: Some(serde_json::json!({})),
+                partition: None,
+                sequence: None,
+                sequence_time: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect("event published");
+
+    for _ in 0..100 {
+        if stream_calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = handle.stop().await;
+
+    // Fail-fast: the run loop returned on the first PositionsNotSet - it did not
+    // re-seed and re-open (which would have opened the stream a second time),
+    // and nothing was delivered.
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+    assert!(scopes.lock().unwrap().is_empty());
 }

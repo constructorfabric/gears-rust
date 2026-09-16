@@ -35,12 +35,69 @@ pub struct ProducerOutboxEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
     broker_partition: u32,
+    // `ProducerMode` is a transport-free SDK type (no serde derives), so the
+    // envelope - a private wire DTO - maps it through a local serde DTO
+    // (`producer_mode_dto`) rather than serializing the SDK enum directly. The
+    // field stays the domain type; only the wire mapping lives in the adapter.
+    #[serde(with = "producer_mode_dto")]
     producer_mode: ProducerMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     producer_id: Option<ProducerId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation: Option<i64>,
     diagnostic_metadata: ProducerOutboxDiagnostics,
+}
+
+/// Private wire DTO for [`ProducerMode`] inside [`ProducerOutboxEnvelope`].
+/// `ProducerMode` carries no serde derives (SDK types stay transport-free), so
+/// this local serde-derived mirror is the one place the mode's wire form is
+/// defined; `#[serde(with = "producer_mode_dto")]` maps the envelope field
+/// through it.
+mod producer_mode_dto {
+    use serde::{Deserialize, Serialize};
+
+    use crate::api::ProducerMode;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ProducerModeDto {
+        Stateless,
+        Monotonic,
+        Chained,
+    }
+
+    impl From<ProducerMode> for ProducerModeDto {
+        fn from(mode: ProducerMode) -> Self {
+            match mode {
+                ProducerMode::Stateless => Self::Stateless,
+                ProducerMode::Monotonic => Self::Monotonic,
+                ProducerMode::Chained => Self::Chained,
+            }
+        }
+    }
+
+    impl From<ProducerModeDto> for ProducerMode {
+        fn from(dto: ProducerModeDto) -> Self {
+            match dto {
+                ProducerModeDto::Stateless => Self::Stateless,
+                ProducerModeDto::Monotonic => Self::Monotonic,
+                ProducerModeDto::Chained => Self::Chained,
+            }
+        }
+    }
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        mode: &ProducerMode,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ProducerModeDto::from(*mode).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ProducerMode, D::Error> {
+        Ok(ProducerModeDto::deserialize(deserializer)?.into())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,8 +191,6 @@ impl ProducerOutboxEnvelope {
             partition: None,
             sequence: None,
             sequence_time: None,
-            offset: None,
-            offset_time: None,
             meta,
         })
     }
