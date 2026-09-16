@@ -267,3 +267,81 @@ async fn reverse_impact_refuses_rather_than_truncating_a_chain_deeper_than_the_b
         "every hop of the chain, with no hop lost to the depth cap"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `edges_within`: the edges a deletion batch orders by (T20)
+// ---------------------------------------------------------------------------
+
+const A: &str = gts_id!("acme.rev.thing.type.v1~acme.rev.edges.a.v1~");
+const B: &str = gts_id!("acme.rev.thing.type.v1~acme.rev.edges.b.v1~");
+const C: &str = gts_id!("acme.rev.thing.type.v1~acme.rev.edges.c.v1~");
+
+async fn within(db: &Provider, ids: &[i64]) -> Vec<(i64, i64)> {
+    let conn = db.conn().expect("conn");
+    DependencyRepo::edges_within(&conn, &allow_all(), ids)
+        .await
+        .expect("edges within")
+        .into_iter()
+        .map(|edge| (edge.from_entity_id, edge.to_entity_id))
+        .collect()
+}
+
+/// An edge whose far end is outside the set is dropped. That dependant survives
+/// the deletion, and refusing on it is the commit-time recheck's job — the
+/// order must not be told about it at all.
+#[tokio::test]
+async fn an_edge_leaving_the_set_is_not_returned() {
+    let db = test_db().await;
+    let ids = seed(&db, &[A, B]).await;
+    edge(&db, ids[0], ids[1]).await;
+
+    assert_eq!(within(&db, &ids).await, vec![(ids[0], ids[1])]);
+    assert!(
+        within(&db, &ids[..1]).await.is_empty(),
+        "B is outside the set, so A's edge to it orders nothing",
+    );
+}
+
+/// One dependant can hold two edge **kinds** to one target, and the order cares
+/// only that it waits — so the pair is returned once.
+#[tokio::test]
+async fn two_edge_kinds_between_one_pair_are_one_link() {
+    let db = test_db().await;
+    let ids = seed(&db, &[A, B]).await;
+    let conn = db.conn().expect("conn");
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &allow_all(),
+        ids[0],
+        &[
+            (DependencyKind::SchemaRef, ids[1]),
+            (DependencyKind::Derivation, ids[1]),
+        ],
+    )
+    .await
+    .expect("edges");
+
+    assert_eq!(
+        within(&db, &ids).await,
+        vec![(ids[0], ids[1])],
+        "the two kinds are one ordering constraint",
+    );
+}
+
+#[tokio::test]
+async fn a_chain_returns_each_of_its_links() {
+    let db = test_db().await;
+    let ids = seed(&db, &[A, B, C]).await;
+    edge(&db, ids[0], ids[1]).await;
+    edge(&db, ids[1], ids[2]).await;
+
+    let mut edges = within(&db, &ids).await;
+    edges.sort_unstable();
+    assert_eq!(edges, vec![(ids[0], ids[1]), (ids[1], ids[2])]);
+}
+
+#[tokio::test]
+async fn an_empty_set_reads_nothing() {
+    let db = test_db().await;
+    assert!(within(&db, &[]).await.is_empty());
+}

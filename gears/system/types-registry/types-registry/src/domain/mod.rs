@@ -26,6 +26,8 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
+// Compatibility against one baseline: which definition, and the verdict (ADR-0003).
+pub mod compat;
 // The three direct dependency edge kinds, extracted from authored content and the identifier.
 pub mod dependency;
 // Version-family key derivation and the three family rules.

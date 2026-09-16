@@ -1,0 +1,5 @@
+error: #[grpc_contract]: `#[streaming]` takes no framing selector here. A framing such as `multipart_mixed` names an HTTP media type, and gRPC has none. Declare the framing on the `#[rest_contract]` projection instead. `open = fallible` is allowed here.
+  --> tests/ui/fail/grpc_streaming_framing_arg.rs:20:5
+   |
+20 |     #[streaming(multipart_mixed)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

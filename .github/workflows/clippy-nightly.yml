@@ -60,7 +60,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: nightly-clippy-stable-1.95
+          shared-key: nightly-clippy-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11

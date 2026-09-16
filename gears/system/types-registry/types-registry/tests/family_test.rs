@@ -118,6 +118,7 @@ async fn admit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str) -> Operat
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         op,
         LATER,

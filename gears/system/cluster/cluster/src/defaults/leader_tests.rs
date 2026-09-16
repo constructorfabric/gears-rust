@@ -92,6 +92,27 @@ async fn single_candidate_becomes_leader() {
 }
 
 #[tokio::test]
+async fn elects_leader_over_a_watchless_cache() {
+    // A cache that serves no exact watch (features().watch == false, watch()
+    // -> Unsupported) must not fail elect(): the CAS election reconciles off the
+    // renewal timer alone rather than propagating the Unsupported error from the
+    // pre-claim subscribe. Regression for the live redis `watch_mode: disabled`
+    // bug (plan D3).
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let Ok(mut watch) = backend.elect("primary").await else {
+        panic!("election must join even without a cache watch");
+    };
+    assert!(matches!(
+        watch.changed().await,
+        LeaderWatchEvent::Status(LeaderStatus::Leader)
+    ));
+    assert!(watch.is_leader());
+}
+
+#[tokio::test]
 async fn second_candidate_is_follower() {
     let cache = MemoryCache::linearizable();
     let Ok(a) = CasBasedLeaderElectionBackend::new(Arc::clone(&cache) as _) else {
@@ -853,4 +874,50 @@ async fn revoke_still_terminates_after_a_retryable_close_profile1() {
         LeaderWatchEvent::Closed(ClusterError::Shutdown)
     ));
     assert!(!watch.is_leader());
+}
+
+/// The watchless twin of `foreign_takeover_emits_lost_then_resolves`: over a
+/// cache that serves no exact watch there is no reactive feed, so a follower must
+/// still take over once the incumbent's lease **lapses**, reconciled off its own
+/// renewal timer alone. A lapse writes nothing — not even a native watch would
+/// fire on it — so this is precisely the timer-only path the watchless
+/// degradation claims.
+#[tokio::test(start_paused = true)]
+async fn a_follower_takes_over_after_a_lapse_over_a_watchless_cache() {
+    let cache = MemoryCache::linearizable_without_watch();
+    let (incumbent, challenger) = two_handles(&cache);
+    let config = short_lived();
+
+    // Incumbent A takes the raw claim via `join` — a token with no auto-renewal
+    // task — so nothing sustains it once time passes.
+    let Ok(Some(_token)) = incumbent.join("primary", "owner-a", config).await else {
+        panic!("A takes the initial claim");
+    };
+
+    // Candidate B enrols (watchless) and starts behind A as a follower.
+    let Ok(mut watch) = challenger.elect_with_config("primary", config).await else {
+        panic!("B enrols even without a cache watch");
+    };
+    settle().await;
+    assert!(!watch.is_leader(), "B starts behind A's live claim");
+
+    // A never renews. Past the lease, B must reconcile to Leader off its timer.
+    tokio::time::advance(config.ttl() * 2).await;
+    settle().await;
+    let become_leader = async {
+        loop {
+            match watch.changed().await {
+                LeaderWatchEvent::Status(LeaderStatus::Leader) => break,
+                LeaderWatchEvent::Status(_) | LeaderWatchEvent::Reset => {}
+                other => panic!("unexpected event while taking over: {other:?}"),
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), become_leader)
+        .await
+        .is_err()
+    {
+        panic!("a watchless follower must take over off the renewal timer after a lapse");
+    }
+    assert!(watch.is_leader());
 }

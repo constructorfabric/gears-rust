@@ -169,6 +169,18 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, \
+              compat_forced, status, request_payload, created_at) \
+             VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 7, 1, '{{}}', '{TS}')"
+        ),
+    )
+    .await
+    .expect_err("compat_forced must reject values outside the boolean domain");
+
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
              (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \

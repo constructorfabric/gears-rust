@@ -9,3 +9,21 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+
+  # Container base images. Without this, every `FROM ...@sha256:` in the repo is
+  # updated by hand, i.e. not at all - which is how the builder pin sat on Rust
+  # 1.95.0 long after rust-toolchain.toml moved to 1.97.0 (#4798).
+  - package-ecosystem: "docker"
+    directories:
+      - "/testing/docker"
+      - "/gears/mini-chat/deploy/docker"
+    schedule:
+      interval: "weekly"
+
+  # Pinned action SHAs. Pinning by commit (#2093) is only half of the practice:
+  # a frozen SHA never picks up the action's own security releases unless
+  # something moves it forward.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

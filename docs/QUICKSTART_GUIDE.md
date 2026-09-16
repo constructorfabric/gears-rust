@@ -14,7 +14,7 @@ make example
 make quickstart
 ```
 
-Server runs on `http://127.0.0.1:8087`.
+Server runs on `http://127.0.0.1:8087/cf/`.
 The example configuration also sets `gears.api-gateway.config.prefix_path: "/cf"` in `config/quickstart.yaml`, so API docs and endpoints are exposed under `/cf`.
 Change `prefix_path` if you want a different base path, or set it to an empty string to serve the API at the root.
 
@@ -23,7 +23,7 @@ Change `prefix_path` if you want a different base path, or set it to an empty st
 ## Verify It's Running
 
 ```bash
-curl -s http://127.0.0.1:8087/health
+curl -s http://127.0.0.1:8087/cf/health
 # {"status": "healthy", "timestamp": "..."}
 ```
 

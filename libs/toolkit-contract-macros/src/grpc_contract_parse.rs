@@ -4,7 +4,9 @@
 //! - `#[rpc(name = "PascalCase")]` — explicit RPC name (default = `PascalCase` from method ident).
 //! - `#[idempotency_level(NoSideEffects | Idempotent | NotIdempotent)]` —
 //!   proto3 method option (default = `NotIdempotent`).
-//! - `#[streaming]` — server-streaming RPC (re-used from base contract).
+//! - `#[streaming]` — server-streaming RPC (re-used from base contract). On an
+//!   `async fn` the open is awaited and fallible, matching tonic's own client
+//!   and server shapes; on a plain `fn` it is the historical flattened form.
 //! - `#[retryable]` — wrap call in retry-with-backoff (re-used from base).
 //!
 //! Attribute on the trait itself: `#[grpc_contract(package = "...",
@@ -19,6 +21,8 @@ use heck::ToUpperCamelCase as _;
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
+
+use crate::model::{MethodShape, StreamOpen};
 
 pub struct GrpcContractAttr {
     pub package: String,
@@ -40,7 +44,12 @@ pub struct GrpcMethodModel {
     pub ident: Ident,
     pub rpc_name: String,
     pub idempotency: GrpcIdempotency,
-    pub server_streaming: bool,
+    /// Unary, or server-streaming with how its stream is opened
+    /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
+    /// `Stream(Awaited)`). Folds what was a `server_streaming: bool` + `open:
+    /// StreamOpen` pair, so an `open` exists exactly when the method streams
+    /// (#4740).
+    pub shape: MethodShape,
     pub retryable: bool,
     pub optional: bool,
     pub params: Vec<GrpcParam>,
@@ -212,6 +221,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
     let mut rpc_name = default_rpc_name;
     let mut idempotency = GrpcIdempotency::NotIdempotent;
     let mut server_streaming = false;
+    let mut stream_open_arg: Option<StreamOpen> = None;
     let mut retryable = false;
 
     for attr in &method.attrs {
@@ -224,7 +234,33 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
         } else if path.is_ident("idempotency_level") {
             idempotency = parse_idempotency_level(attr)?;
         } else if path.is_ident("streaming") {
+            // Reject a SECOND `#[streaming]` before it overwrites the open
+            // selector — last-one-wins would silently change the emitted open
+            // shape with no signal.
+            if server_streaming {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate `#[streaming]` attribute: a streaming method declares it exactly \
+                     once (the open selector goes in that one attribute)",
+                ));
+            }
+            // A framing selector (`#[streaming(multipart_mixed)]`) names an
+            // HTTP media type, and gRPC has none — its framing is length-prefixed
+            // protobuf, fixed by the transport. Reject it rather than accept and
+            // silently ignore it, so a framing argument is never written
+            // somewhere it does nothing. `open = fallible` is allowed.
+            let args = crate::stream_attr::parse_streaming_args(attr)?;
+            if args.framing.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[grpc_contract]: `#[streaming]` takes no framing selector here. A framing \
+                     such as `multipart_mixed` names an HTTP media type, and gRPC has none. \
+                     Declare the framing on the `#[rest_contract]` projection instead. \
+                     `open = fallible` is allowed here.",
+                ));
+            }
             server_streaming = true;
+            stream_open_arg = args.open;
         } else if path.is_ident("retryable") {
             retryable = true;
         }
@@ -251,11 +287,30 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
     let result_types = parse_return_type(&method.sig.output, method.sig.ident.span())?;
     let optional = method.default.is_some();
 
+    // `async fn` on a streaming method selects the fallible-open shape, exactly
+    // as it does for the base contract and the REST projection. gRPC carries it
+    // natively rather than by emulation: tonic's client call is already
+    // `async fn(..) -> Result<Response<Streaming<T>>, Status>` and its server
+    // trait method is already `async fn(..) -> Result<Response<Self::Stream>,
+    // Status>`, so the open and the items are two phases on the wire whether or
+    // not the contract says so. `Immediate` flattens them, reporting an
+    // open-time `Status` as the stream's first item; `Awaited` keeps them apart.
+    let shape = if server_streaming {
+        let open = crate::stream_attr::resolve_stream_open(
+            stream_open_arg,
+            method.sig.asyncness.is_some(),
+            method.sig.ident.span(),
+        )?;
+        MethodShape::Stream(open)
+    } else {
+        MethodShape::Unary
+    };
+
     Ok(GrpcMethodModel {
         ident,
         rpc_name,
         idempotency,
-        server_streaming,
+        shape,
         retryable,
         optional,
         params,

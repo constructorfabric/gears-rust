@@ -3,7 +3,9 @@ pub mod contract;
 pub mod grpc;
 pub mod validation;
 
-pub use binding::{HttpBindingIr, HttpFieldBinding, HttpMethod, HttpMethodBindingIr};
+pub use binding::{
+    HttpBindingIr, HttpFieldBinding, HttpMethod, HttpMethodBindingIr, StreamFraming,
+};
 pub use contract::{
     ContractIr, FieldIr, FieldRole, Idempotency, InputShape, MethodIr, MethodKind, PrimitiveType,
     ServiceIr, TypeRef,

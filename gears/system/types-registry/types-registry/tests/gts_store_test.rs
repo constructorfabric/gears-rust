@@ -102,7 +102,7 @@ async fn load_in_snapshot(
 ) -> Result<UnitStore, StoreBuildError> {
     db.transaction_with_config(snapshot_read(&db.db()), move |tx| {
         Box::pin(async move {
-            Ok(load_unit_store(stores().as_ref(), tx, &allow_all(), candidates).await)
+            Ok(load_unit_store(stores().as_ref(), tx, &allow_all(), candidates, &[]).await)
         })
     })
     .await
@@ -474,6 +474,7 @@ async fn the_builder_runs_inside_a_transaction() {
                     tx,
                     &allow_all(),
                     vec![doc(DERIVED, content)],
+                    &[],
                 )
                 .await
                 .expect("build inside a transaction");

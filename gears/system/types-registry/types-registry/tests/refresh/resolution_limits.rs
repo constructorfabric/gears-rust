@@ -272,7 +272,11 @@ async fn assert_revision_rolled_back(
 #[tokio::test]
 async fn a_dependent_closure_over_budget_rolls_back_the_candidate_revision() {
     let db = test_db().await;
-    admit(&db, "base", BASE, base_schema("name"), None).await;
+    // Use a closed level so the addition is compatible and the closure budget
+    // is what refuses this candidate.
+    let mut closed_base = base_schema("name");
+    closed_base["additionalProperties"] = json!(false);
+    admit(&db, "base", BASE, closed_base.clone(), None).await;
     admit(
         &db,
         "referrer",
@@ -286,7 +290,7 @@ async fn a_dependent_closure_over_budget_rolls_back_the_candidate_revision() {
     admit(&db, "extra", SECOND, extra, None).await;
     let before_base = current(&db, BASE).await;
     let before_referrer = current(&db, REFERRER).await;
-    let mut replacement = base_schema("name");
+    let mut replacement = closed_base;
     replacement["properties"]["extra"] = json!({"$ref": format!("gts://{SECOND}")});
     let limits = Limits {
         resolution_closure: 2,

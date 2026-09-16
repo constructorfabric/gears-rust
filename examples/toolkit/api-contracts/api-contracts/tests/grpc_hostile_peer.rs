@@ -8,8 +8,10 @@
 //! that behaviour by serving deliberately malformed values from a hostile server.
 //!
 //! One test per decode site in the codegen, since they are separate code paths:
-//! one-shot unary, retryable unary (decode happens inside the retry loop), and
-//! server-streaming (decode happens inside an `async_stream` body).
+//! one-shot unary, retryable unary (decode happens inside the retry loop),
+//! server-streaming (decode happens inside an `async_stream` body), and
+//! fallible-open server-streaming (a different body again — the open is
+//! hoisted out of the `async_stream`, leaving only the item loop inside).
 
 #![cfg(feature = "grpc-client")]
 #![allow(clippy::unwrap_used)]
@@ -74,6 +76,31 @@ impl PaymentApi for HostilePaymentServer {
     ) -> Result<Response<Self::ListPaymentsStream>, Status> {
         // First item is well-formed, second is not: the stream must yield one
         // good value and then an error, rather than panicking mid-flight.
+        let good = stubs::PaymentSummary {
+            amount_cents: 100,
+            currency: "USD".to_owned(),
+            payment_id: uuid::Uuid::new_v4().to_string(),
+            status: stubs::PaymentStatus::Pending as i32,
+        };
+        let bad = stubs::PaymentSummary {
+            payment_id: MALFORMED_UUID.to_owned(),
+            ..good.clone()
+        };
+        let stream = futures_util::stream::iter(vec![Ok(good), Ok(bad)]);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type StreamPaymentsStream =
+        Pin<Box<dyn Stream<Item = Result<stubs::PaymentSummary, Status>> + Send + 'static>>;
+
+    /// Same hostility as `list_payments`, reached through the **fallible-open**
+    /// client body — a fourth decode site, since `#[streaming] async fn` emits a
+    /// different shape (the open is hoisted out of the `try_stream!`) and its
+    /// per-item decode is therefore separate code.
+    async fn stream_payments(
+        &self,
+        _request: Request<stubs::ListPaymentsFilter>,
+    ) -> Result<Response<Self::StreamPaymentsStream>, Status> {
         let good = stubs::PaymentSummary {
             amount_cents: 100,
             currency: "USD".to_owned(),
@@ -160,6 +187,32 @@ async fn streaming_item_error_ends_stream_instead_of_panicking() {
         SecurityContext::anonymous(),
         ListPaymentsFilter::default(),
     );
+
+    let first = stream.next().await.expect("first item");
+    assert!(first.is_ok(), "the well-formed item should decode");
+
+    let second = stream.next().await.expect("second item");
+    assert!(
+        second.is_err(),
+        "the malformed item must terminate the stream with an error"
+    );
+}
+
+#[tokio::test]
+async fn awaited_open_streaming_item_error_ends_stream_instead_of_panicking() {
+    // The fourth decode site: `#[streaming] async fn` emits a different client
+    // body from `#[streaming] fn` — the open is hoisted out of the
+    // `async_stream::try_stream!` and only the item loop stays inside — so its
+    // per-item decode is separate code and needs its own hostile-peer case.
+    let (client, _shutdown) = hostile_client().await;
+
+    let mut stream = PaymentApiContract::stream_payments(
+        &client,
+        SecurityContext::anonymous(),
+        ListPaymentsFilter::default(),
+    )
+    .await
+    .expect("the open succeeds; this peer is hostile only in its message bodies");
 
     let first = stream.next().await.expect("first item");
     assert!(first.is_ok(), "the well-formed item should decode");

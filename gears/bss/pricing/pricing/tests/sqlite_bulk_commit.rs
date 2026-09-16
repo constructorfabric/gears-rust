@@ -17,6 +17,7 @@ use bss_pricing::domain::audit::AuditStamp;
 use bss_pricing::domain::bulk::{BulkKind, BulkState};
 use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::import::ImportRow;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
 use bss_pricing::domain::price_row::{ModelKind, PriceRow};
@@ -33,7 +34,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{
     IdempotencyGate, NewBulkOperation, NewPriceDraft, PriceRepo, bulk_repo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::{ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, Statement};
 use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -51,8 +53,8 @@ fn plan() -> PlanId {
 fn phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0xfa_90))
 }
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 9, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 9, hour, 0, 0)
 }
 fn scope() -> AccessScope {
     AccessScope::for_tenant(TENANT)
@@ -1707,5 +1709,331 @@ async fn a_lock_fault_that_may_have_left_rows_leaves_the_run_committing() {
         message.contains("locks may still be held"),
         "the caller is told what state the run is in, not merely that a statement \
          failed: {message}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #4803 — the lock that lands inside the sweep's own window.
+// ---------------------------------------------------------------------------
+
+/// An `AFTER DELETE` trigger that puts **one** lock row straight back and then
+/// disarms itself.
+///
+/// # What it stands in for
+///
+/// `bulk_repo::take_locks` takes its locks as individual autocommit inserts, and
+/// an insert already handed to the driver is **not cancellable**: `sqlx`'s `SQLite`
+/// backend passes the statement to that connection's worker thread over a channel
+/// and only then awaits the reply, so dropping the awaiting future cancels the
+/// *wait* and never the statement. A `commit_batch` cancelled inside `take_locks`
+/// therefore still owes one lock row, which lands whenever that worker thread is
+/// next scheduled — and the pool holds up to ten connections over one shared-cache
+/// database, so the commit's `Drop` guard sweeps on a *different* connection and
+/// can overtake it.
+///
+/// The sweep is `release_locks` then the terminal `advance`, in that order and for
+/// D-300's reason. Between those two statements the run still reads `committing`,
+/// which is precisely the state
+/// `trg_pricing_bulk_row_lock_only_while_committing` admits a lock in — so the
+/// late insert is accepted, the DELETE that would have removed it has already run,
+/// and the run then goes terminal over a lock nothing can reach: the abort route
+/// refuses a run that is not `committing`, the table has no sweeper, D-37's lease
+/// takeover is unbuilt.
+///
+/// # Why it is injected rather than raced for
+///
+/// That is the CI failure #4803 reported, and running the cancellation case harder
+/// does not reproduce it: 240 runs of
+/// [`a_commit_future_dropped_mid_flight_releases_its_locks_and_lands_the_run_terminal`]
+/// six-abreast on a warm box are green, because the sweep has to overtake a worker
+/// thread that is usually already running. So the ordering is **stated** instead,
+/// on `RefuseEveryLockRelease`'s precedent and for its reason — a trigger is the
+/// narrowest injection point there is, and no seam of any kind enters the crate.
+///
+/// It fires inside `release_locks`' own `DELETE`, one statement earlier than the
+/// real insert lands, which leaves the database in exactly the state the race
+/// leaves it in: the release has happened, a lock of this run exists, and the run
+/// has not yet moved off `committing`.
+struct RelockOnceOnRelease;
+
+impl MigrationName for RelockOnceOnRelease {
+    fn name(&self) -> &'static str {
+        "m99999999_000002_test_relock_once_on_release"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for RelockOnceOnRelease {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // A one-row arming table rather than a `WHEN` on the lock table itself:
+        // the trigger has to fire exactly once, or the sweep's *second* release —
+        // which is what this case exists to require — would meet the same
+        // injection again and the run could never be left clean by any ordering.
+        for statement in [
+            "CREATE TABLE test_relock_once (armed integer NOT NULL)",
+            "INSERT INTO test_relock_once (armed) VALUES (1)",
+            "CREATE TRIGGER trg_test_relock_once_on_release
+             AFTER DELETE ON pricing_bulk_row_lock
+             FOR EACH ROW
+             WHEN (SELECT count(*) FROM test_relock_once) > 0
+             BEGIN
+               INSERT INTO pricing_bulk_row_lock
+                 (tenant_id, price_id, bulk_operation_id, locked_at)
+                 VALUES (OLD.tenant_id, OLD.price_id, OLD.bulk_operation_id, OLD.locked_at);
+               DELETE FROM test_relock_once;
+             END",
+        ] {
+            manager
+                .get_connection()
+                .execute_raw(Statement::from_string(
+                    manager.get_database_backend(),
+                    statement.to_owned(),
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+/// Install [`RelockOnceOnRelease`] on the harness's own database.
+async fn relock_once_on_release(h: &Harness) {
+    let applied = run_migrations_for_testing(&h.provider.db(), vec![Box::new(RelockOnceOnRelease)])
+        .await
+        .expect("install the late relock");
+    assert_eq!(
+        applied.applied, 1,
+        "the injection must actually be installed"
+    );
+}
+
+/// Move a run into `committing` and give it the one row's lock, which is the state
+/// every case in this section starts from.
+async fn committing_with_a_lock(h: &Harness, run: Uuid, price_id: Uuid) {
+    let conn = h.provider.conn().expect("conn");
+    bulk_repo::advance(
+        &conn,
+        &scope(),
+        TENANT,
+        run,
+        BulkState::Validating,
+        BulkState::Committing,
+        serde_json::json!({}),
+        at(11),
+    )
+    .await
+    .expect("the run enters committing");
+    bulk_repo::take_locks(&conn, &scope(), TENANT, run, &[price_id], at(11))
+        .await
+        .expect("the run holds the row");
+}
+
+/// **The freeze #4803 is about.** A lock that lands between the sweep's
+/// `release_locks` and its terminal `advance` must not outlive the run.
+///
+/// See [`RelockOnceOnRelease`] for why such a lock exists at all and why the
+/// ordering is injected rather than raced for. What the sweep owes is an
+/// invariant, not a best effort: **a terminal run holds no locks.** The release in
+/// front of the terminal move cannot deliver it alone, because the window it
+/// leaves open is exactly the window the trigger admits a lock in.
+///
+/// The move itself is what ends the window — a run that is no longer `committing`
+/// is refused a lock outright, which [`a_terminal_run_can_no_longer_take_a_lock`]
+/// pins — so a release *after* the landing has a last word that the release in
+/// front of it does not. On this engine that closes the window outright, because
+/// the owed insert is one serialized autocommit write and cannot interleave with
+/// the move; `abandon_committing_run`'s own body says what the same pair buys on
+/// Postgres, where the custody read is a snapshot read and the window is narrowed
+/// rather than closed.
+///
+/// To redden this: drop the second `release_locks` from `abandon_committing_run`,
+/// and the run lands `completed_with_conflicts` over a lock that no door, sweeper
+/// or lease takeover can clear.
+#[tokio::test]
+async fn a_lock_that_lands_inside_the_sweeps_window_does_not_outlive_the_run() {
+    let h = harness().await;
+    let (price_id, _) = seed_draft(&h, key("eu"), 9_900).await;
+    let run = open_run(&h, "sweep-window-1").await;
+    committing_with_a_lock(&h, run, price_id).await;
+
+    // Armed only now, so the one DELETE it meets is the sweep's own.
+    relock_once_on_release(&h).await;
+
+    let conn = h.provider.conn().expect("conn");
+    let landed = abandon_committing_run(&conn, &scope(), TENANT, run, ABORT_NOTE, at(12))
+        .await
+        .expect("the sweep still lands the run");
+
+    assert!(
+        landed.state.is_terminal(),
+        "the landing is unchanged - this case is about what it leaves behind: {landed:?}"
+    );
+    assert_eq!(
+        bulk_repo::lock_holder(&conn, &scope(), TENANT, price_id)
+            .await
+            .expect("read the lock"),
+        None,
+        "a lock taken inside the sweep's own window outlived the run: the abort route \
+         refuses a run that is not committing, pricing_bulk_row_lock has no sweeper and \
+         D-37's lease takeover is unbuilt, so this row is frozen against interactive \
+         editing and against every later bulk run, permanently"
+    );
+}
+
+/// **The window has a hard end, and this is it.** Once the run is terminal the
+/// store itself refuses a lock, so the sweep's trailing release is the last word
+/// rather than one more racer.
+///
+/// [`a_lock_that_lands_inside_the_sweeps_window_does_not_outlive_the_run`]'s
+/// premise, asserted rather than assumed: without this,
+/// `abandon_committing_run`'s trailing release would only narrow the window and a
+/// late enough insert would still freeze the row.
+///
+/// The refusal is `trg_pricing_bulk_row_lock_only_while_committing` on `SQLite` and
+/// `pricing_bulk_row_lock_custody`'s `run_state <> 'committing'` arm on Postgres,
+/// so both engines answer it.
+#[tokio::test]
+async fn a_terminal_run_can_no_longer_take_a_lock() {
+    let h = harness().await;
+    let (price_id, _) = seed_draft(&h, key("eu"), 9_900).await;
+    let run = open_run(&h, "sweep-window-2").await;
+    committing_with_a_lock(&h, run, price_id).await;
+
+    let conn = h.provider.conn().expect("conn");
+    abandon_committing_run(&conn, &scope(), TENANT, run, ABORT_NOTE, at(12))
+        .await
+        .expect("the sweep lands the run");
+
+    let refused = bulk_repo::take_locks(&conn, &scope(), TENANT, run, &[price_id], at(13))
+        .await
+        .expect_err("a run that is over may not take a lock");
+    assert!(
+        format!("{refused:?}").contains("only on entry to committing"),
+        "and it is the custody rule that refuses it, named as the sibling store cases name \
+         it - a foreign key or a primary key failing on the same table would satisfy a \
+         weaker assertion while the premise this case exists to pin had gone: {refused:?}"
+    );
+    assert_eq!(
+        bulk_repo::lock_holder(&conn, &scope(), TENANT, price_id)
+            .await
+            .expect("read the lock"),
+        None,
+        "the refusal leaves nothing behind"
+    );
+}
+
+/// A `BEFORE DELETE` trigger that refuses a lock release **only once the run has
+/// landed**, which is the one release [`RefuseEveryLockRelease`] cannot reach.
+///
+/// The two faults are opposites on purpose. That one refuses every `DELETE`, so
+/// the sweep stops at its first statement and never reaches the terminal move —
+/// which is the property
+/// [`a_release_that_fails_leaves_the_run_committing_so_the_abort_door_can_retry`]
+/// exists to pin. This one lets the release in front through and fails the one
+/// behind, so the sweep lands the run and *then* cannot clear what the window
+/// admitted. Its `WHEN` clause reads the run's own state, which is precisely the
+/// difference between the two statements.
+struct RefuseTheTrailingLockRelease;
+
+impl MigrationName for RefuseTheTrailingLockRelease {
+    fn name(&self) -> &'static str {
+        "m99999999_000003_test_refuse_the_trailing_lock_release"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for RefuseTheTrailingLockRelease {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_raw(Statement::from_string(
+                manager.get_database_backend(),
+                "CREATE TRIGGER trg_test_refuse_the_trailing_lock_release
+                 BEFORE DELETE ON pricing_bulk_row_lock
+                 FOR EACH ROW
+                 WHEN NOT EXISTS (
+                   SELECT 1 FROM pricing_bulk_operation
+                    WHERE operation_id = OLD.bulk_operation_id
+                      AND state = 'committing'
+                 )
+                 BEGIN
+                   SELECT RAISE(ABORT,
+                     'injected: pricing_bulk_row_lock refuses a release after the landing');
+                 END"
+                .to_owned(),
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+/// Install [`RefuseTheTrailingLockRelease`] on the harness's own database.
+async fn refuse_the_trailing_lock_release(h: &Harness) {
+    let applied = run_migrations_for_testing(
+        &h.provider.db(),
+        vec![Box::new(RefuseTheTrailingLockRelease)],
+    )
+    .await
+    .expect("install the trailing release refusal");
+    assert_eq!(applied.applied, 1, "the fault must actually be installed");
+}
+
+/// **The trailing release is the one statement whose failure is not the caller's,
+/// and this is that contract.** The run has landed — which is the answer the
+/// caller asked for — so the sweep answers `Ok`, and the residue it could not
+/// clear is announced on an error line of its own rather than returned.
+///
+/// The alternative was measured against the caller rather than assumed: returning
+/// `Err` here would fail a call that did what it was asked, and the retry it
+/// invites is refused by the run's own state — `POST …/abort` answers
+/// `LIFECYCLE_FORBIDDEN` to a run that is no longer `committing`, so the error
+/// would be a report with no remedy attached rather than a remedy.
+///
+/// **What it costs, stated rather than hidden.** `CommitLockGuard`'s completion
+/// line used to say the row locks *were released*; over this path that sentence is
+/// false, so it was narrowed to claim the landing and no more. An operator reading
+/// the completion line alone must not conclude the rows are free — the error line
+/// is where that half lives.
+///
+/// To redden this: return the trailing release's error instead of logging it, and
+/// the `expect` below fails with the injected refusal.
+#[tokio::test]
+async fn a_trailing_release_that_fails_still_lands_the_run_and_says_so() {
+    let h = harness().await;
+    let (price_id, _) = seed_draft(&h, key("eu"), 9_900).await;
+    let run = open_run(&h, "sweep-window-3").await;
+    committing_with_a_lock(&h, run, price_id).await;
+
+    // Both faults, because the subject only exists where they meet: the relock is
+    // what leaves a row for the trailing release to find, and the refusal is what
+    // stops it removing that row.
+    relock_once_on_release(&h).await;
+    refuse_the_trailing_lock_release(&h).await;
+
+    let conn = h.provider.conn().expect("conn");
+    let landed = abandon_committing_run(&conn, &scope(), TENANT, run, ABORT_NOTE, at(12))
+        .await
+        .expect("a trailing release that failed does not fail the landing it follows");
+
+    assert!(
+        landed.state.is_terminal(),
+        "the run still lands, which is the whole reason the failure is not returned: \
+         {landed:?}"
+    );
+    assert_eq!(
+        bulk_repo::lock_holder(&conn, &scope(), TENANT, price_id)
+            .await
+            .expect("read the lock"),
+        Some(run),
+        "and the residue is real rather than hypothetical - this is the row the error \
+         line names, and the reason the guard's completion line no longer claims the \
+         locks were released"
     );
 }

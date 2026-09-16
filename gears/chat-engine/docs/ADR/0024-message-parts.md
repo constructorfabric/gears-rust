@@ -1,5 +1,5 @@
 Created:  2026-06-30 by Constructor Tech
-Updated:  2026-06-30 by Constructor Tech
+Updated:  2026-09-15 by Constructor Tech
 # ADR-0024: Parts-Based Message Model
 
 
@@ -23,17 +23,17 @@ Updated:  2026-06-30 by Constructor Tech
 
 **Status**: accepted
 
-**Review**: Revisit when adding `audio` / `document` / `table` part types, or if per-part streaming of non-text content is required.
+**Review**: Revisit when adding `audio` / `document` / `table` part types, if per-part streaming of non-text content is required, or when vendor-defined part types via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) are actually designed — the discriminant set is closed in code today.
 
 **ID**: `cpt-cf-chat-engine-adr-message-parts`
 
 ## Context and Problem Statement
 
-An assistant answer is rarely just one blob of text: it can interleave prose, code blocks, image/video references, link cards, and status notes, and each fragment may need its own type, ordering, and (for text) its own citations. The original model stored a message as a single `content` field, which cannot represent a heterogeneous, ordered body or anchor citations to a specific span. How should a message body be modeled so it supports mixed, ordered, typed content and incremental streaming?
+An assistant answer is rarely just one blob of text: it can interleave prose, code blocks, image/video references, link cards, status notes, and the tool calls a backend made along with their results, and each fragment may need its own type, ordering, and (for text) its own citations. The original model stored a message as a single `content` field, which cannot represent a heterogeneous, ordered body or anchor citations to a specific span. How should a message body be modeled so it supports mixed, ordered, typed content and incremental streaming?
 
 ## Decision Drivers
 
-* Represent a heterogeneous, ordered message body (text, code, images, videos, links, statuses)
+* Represent a heterogeneous, ordered message body (text, code, images, videos, links, statuses, tool calls and their results)
 * Per-part typing with structurally validated `content` shapes
 * Stable ordering for streaming (open part N, append to part N) and for citation anchoring per text block
 * Text-only full-text search without indexing binary/structured payloads
@@ -47,17 +47,19 @@ An assistant answer is rarely just one blob of text: it can interleave prose, co
 
 ## Decision Outcome
 
-Chosen option: "Ordered list of typed parts in a child table". A message body is an ordered list of `MessagePart` rows (`cpt-cf-chat-engine-design-entity-message-part`), each carrying a `type` (`text`, `code`, `images`, `videos`, `links`, `statuses`), a typed `content` JSON whose shape is determined by `type`, and a 0-based `number` that is unique per message (`UNIQUE(message_id, number)`). The former scalar `content` field/column is removed; on read, the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. Ordinals are assigned as `MAX(number)+1` within the insert transaction, reusing the SERIALIZABLE-retry machinery from variant indexing (`cpt-cf-chat-engine-adr-variant-indexing`). The streaming text part is filled as chunks arrive and frozen on completion; the part-type set is extensible by plugin vendors via GTS. Chat Engine validates `content` structurally but leaves semantics to plugins (`cpt-cf-chat-engine-principle-zero-business-logic`).
+Chosen option: "Ordered list of typed parts in a child table". A message body is an ordered list of `MessagePart` rows (`cpt-cf-chat-engine-design-entity-message-part`), each carrying a `type` (`text`, `code`, `images`, `videos`, `links`, `statuses`, `tool_call`, `tool_result`), a typed `content` JSON whose shape is determined by `type`, and a 0-based `number` that is unique per message (`UNIQUE(message_id, number)`). The former scalar `content` field/column is removed; on read, the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. Ordinals are assigned as `MAX(number)+1` within the insert transaction, reusing the SERIALIZABLE-retry machinery from variant indexing (`cpt-cf-chat-engine-adr-variant-indexing`). The streaming text part is filled as chunks arrive and frozen on completion. Vendor extensibility of the part-type set via GTS was a driver, but no registration or forwarding path was built: the discriminant set is closed, an unknown `type` is rejected, and vendor extension happens inside the part's `content` until that path exists. Chat Engine validates `content` structurally but leaves semantics to plugins (`cpt-cf-chat-engine-principle-zero-business-logic`).
 
 ### Consequences
 
 * Good, because a single answer can interleave typed fragments in a stable order.
+* Good, because a tool-calling backend has a persisted home for both sides of an invocation (`tool_call` / `tool_result`, paired by `tool_call_id`), so tool traffic survives into `GET /messages` and session exports instead of living only in the out-of-band `message.tool` stream event.
 * Good, because text parts can own per-block citations (`cpt-cf-chat-engine-adr-citations`).
 * Good, because text-only parts are cleanly indexable for full-text search.
 * Good, because the streaming protocol maps naturally onto "add part / append to part" deltas.
 * Bad, because reading a message requires joining/loading a child table (more rows per message).
 * Bad, because ordinal assignment needs the SERIALIZABLE-retry path under concurrent inserts.
 * Bad, because the wire/persisted shapes diverge (`MessagePartInput` vs `MessagePart`).
+* Bad, because the GTS extensibility driver went unmet — a vendor that needs a genuinely new discriminant has to change Chat Engine core, so each such need lands as a core enum addition (as `tool_call` / `tool_result` did) until the registration path is designed.
 
 ### Confirmation
 

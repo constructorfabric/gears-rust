@@ -122,6 +122,15 @@ CREATE TABLE types_registry__operation_item (
     kind                      smallint      NOT NULL, -- 1 registration, 2 deletion
     -- 0 means the candidate must not exist; otherwise the version to match
     expected_resource_version bigint        NOT NULL,
+    -- ADR-0004's accepted force: this candidate waives its one cross-minor
+    -- compatibility check. Request-static and write-once. It is a column because
+    -- admission is a separate pass that reads this row, and after T21 the outbox
+    -- payload carries the operation UUID and nothing else -- so a waiver that is
+    -- not stored is one the worker never sees, and type_schema_revision.compat_forced
+    -- would record false on a revision whose check was in fact waived. Named for
+    -- that destination column rather than for the wire field `force`, which MySQL
+    -- reserves.
+    compat_forced             boolean       NOT NULL DEFAULT false,
     -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 failed.
     -- Status describes progress and outcome; error_payload describes failure causes.
     status                    smallint      NOT NULL,

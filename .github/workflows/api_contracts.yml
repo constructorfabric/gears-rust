@@ -91,7 +91,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-stable-1.95
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
 
       # Install sccache (cross-platform)
       - name: Install sccache

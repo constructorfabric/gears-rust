@@ -54,28 +54,55 @@ impl Partitions {
     }
 }
 
+/// Identity of one running outbox instance, generated rather than configured.
+///
+/// A trace completion is delivered to the instance that enqueued the batch,
+/// whichever instance processed the entities, and this is how that instance is
+/// addressed. It is generated per process and never surfaced as a setting,
+/// because it only has to be unique among *running* processes: a restarted
+/// process holds no subscription for anything to be delivered to, so a stable
+/// name would buy nothing. Mail addressed to a process that is gone is
+/// collected by the sweep, and the durable answer for a restarted process is
+/// [`Outbox::trace_status`](super::Outbox::trace_status).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InstanceId(String);
+
+impl InstanceId {
+    /// Name an instance explicitly. Used only by the sqlite-gated integration
+    /// tests; a running outbox generates its own id. The cfg matches those
+    /// callers exactly so it is not dead code under a single non-sqlite backend.
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) fn new(instance_id: impl Into<String>) -> Self {
+        Self(instance_id.into())
+    }
+
+    /// The name as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for InstanceId {
+    /// A fresh per-process name, unique to this process and lost on restart.
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+impl std::fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Identifier for an enqueued outbox message (the `toolkit_outbox_incoming.id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutboxMessageId(pub i64);
 
-/// A single message to enqueue in the outbox.
-///
-/// Used with [`Outbox::enqueue_batch`] to enqueue multiple messages in one call.
-/// Each message specifies its target partition, the message payload (owned), and
-/// a payload type string (borrowed — typically a static string like a MIME type
-/// or schema identifier).
-#[derive(Debug)]
-pub struct EnqueueMessage<'a> {
-    /// Target partition index (0-based, within the queue's partition count).
-    pub partition: u32,
-    /// Message payload bytes. Ownership is transferred to the outbox.
-    pub payload: Vec<u8>,
-    /// Type tag for the payload (e.g. `"application/json"`, schema name).
-    pub payload_type: &'a str,
-}
-
 /// Errors from the outbox subsystem.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OutboxError {
     #[error("queue '{0}' is not registered")]
     QueueNotRegistered(String),
@@ -97,14 +124,26 @@ pub enum OutboxError {
         found: usize,
     },
 
-    #[error("invalid queue name: '{0}'")]
-    InvalidQueueName(String),
+    #[error("a traced batch must carry at least one entity")]
+    EmptyTracedBatch,
 
-    #[error("invalid payload type: '{0}'")]
-    InvalidPayloadType(String),
+    #[error("a traced batch of {entities} entities exceeds the addressable maximum")]
+    TracedBatchTooLarge { entities: usize },
 
-    #[error("invalid outbox table prefix: '{0}'")]
-    InvalidTablePrefix(String),
+    #[error("invalid queue name: {reason}")]
+    InvalidQueueName { reason: &'static str },
+
+    #[error("invalid payload type: {reason}")]
+    InvalidPayloadType { reason: &'static str },
+
+    #[error("invalid trace: {reason}")]
+    InvalidTrace { reason: &'static str },
+
+    #[error("trace size {size} exceeds maximum {max}")]
+    TraceTooLong { size: usize, max: usize },
+
+    #[error("invalid outbox table prefix: {reason}")]
+    InvalidTablePrefix { reason: &'static str },
 
     #[error(transparent)]
     Database(#[from] sea_orm::DbErr),
@@ -114,6 +153,7 @@ pub enum OutboxError {
 #[derive(Debug, Clone, Default)]
 pub struct OutboxConfig {
     pub(crate) tables: OutboxTables,
+    pub(crate) instance_id: InstanceId,
     pub sequencer: SequencerConfig,
 }
 
@@ -315,6 +355,50 @@ impl WorkerTuning {
             min_interval: Duration::from_secs(1),
             active_interval: Duration::from_secs(1),
             idle_interval: Duration::from_hours(1),
+            ramp_step: Duration::ZERO,
+            retry_base: Duration::from_secs(1),
+            retry_max: Duration::from_mins(1),
+            degradation_threshold: 1,
+            lease_duration: Duration::from_secs(30),
+        }
+    }
+
+    /// Notifier defaults.
+    ///
+    /// The intervals here are not what paces it: it returns `Sleep` with its
+    /// own widening delay while a caller is waiting, and `Idle` when none is,
+    /// so only `batch_size` and the panic policy matter. A fixed idle interval
+    /// would be wrong in both directions at once - too slow for a batch that
+    /// just finished, too eager for one that will take minutes.
+    #[must_use]
+    pub fn notifier() -> Self {
+        Self {
+            batch_size: 100,
+            min_interval: Duration::from_millis(100),
+            active_interval: Duration::from_millis(100),
+            idle_interval: Duration::from_millis(250),
+            ramp_step: Duration::ZERO,
+            retry_base: Duration::from_millis(100),
+            retry_max: Duration::from_secs(30),
+            degradation_threshold: 1,
+            // Unused by this worker; it holds no lease.
+            lease_duration: Duration::from_secs(30),
+        }
+    }
+
+    /// Trace-sweeper defaults.
+    ///
+    /// Collection is mostly time-driven - a delivered trace becomes
+    /// collectable by nothing more than the clock - so this runs on its own
+    /// slow pace rather than the body collector's, and is additionally nudged
+    /// when the vacuum has deleted bodies.
+    #[must_use]
+    pub fn trace_sweeper() -> Self {
+        Self {
+            batch_size: 500,
+            min_interval: Duration::from_secs(1),
+            active_interval: Duration::from_secs(1),
+            idle_interval: Duration::from_mins(5),
             ramp_step: Duration::ZERO,
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_mins(1),
@@ -545,11 +629,14 @@ impl WorkerTuning {
 ///     .start().await?;
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OutboxProfile {
     pub sequencer: WorkerTuning,
     pub processor: WorkerTuning,
     pub vacuum: WorkerTuning,
     pub reconciler: WorkerTuning,
+    pub notifier: WorkerTuning,
+    pub trace_sweeper: WorkerTuning,
 }
 
 impl OutboxProfile {
@@ -561,6 +648,8 @@ impl OutboxProfile {
             processor: WorkerTuning::processor_default(),
             vacuum: WorkerTuning::vacuum(),
             reconciler: WorkerTuning::reconciler(),
+            notifier: WorkerTuning::notifier(),
+            trace_sweeper: WorkerTuning::trace_sweeper(),
         }
     }
 
@@ -572,6 +661,10 @@ impl OutboxProfile {
             processor: WorkerTuning::processor_low_latency(),
             vacuum: WorkerTuning::vacuum(),
             reconciler: WorkerTuning::reconciler().idle_interval(Duration::from_secs(30)),
+            // A caller waiting on a completion in a low-latency deployment is
+            // waiting on a chat message, not a nightly job.
+            notifier: WorkerTuning::notifier().idle_interval(Duration::from_millis(50)),
+            trace_sweeper: WorkerTuning::trace_sweeper(),
         }
     }
 
@@ -583,6 +676,8 @@ impl OutboxProfile {
             processor: WorkerTuning::processor_high_throughput(),
             vacuum: WorkerTuning::vacuum(),
             reconciler: WorkerTuning::reconciler(),
+            notifier: WorkerTuning::notifier().batch_size(500),
+            trace_sweeper: WorkerTuning::trace_sweeper(),
         }
     }
 
@@ -594,6 +689,8 @@ impl OutboxProfile {
             processor: WorkerTuning::processor_relaxed(),
             vacuum: WorkerTuning::vacuum(),
             reconciler: WorkerTuning::reconciler().idle_interval(Duration::from_mins(2)),
+            notifier: WorkerTuning::notifier().idle_interval(Duration::from_secs(1)),
+            trace_sweeper: WorkerTuning::trace_sweeper(),
         }
     }
 }

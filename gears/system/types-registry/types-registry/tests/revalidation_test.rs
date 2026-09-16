@@ -16,15 +16,14 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use common::{
-    CasMissStores, PausePoint, PausingStores, TestDir, allow_all, stores, test_db, test_db_file,
-    worker_settings,
+    PausePoint, TestDir, TestStores, allow_all, stores, test_db, test_db_file, worker_settings,
 };
 use types_registry::config::{TypesRegistryConfig, WorkerSettings};
 use types_registry::domain::admission::AdmissionFailureReason;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::revision::RevisionCommit;
 use types_registry::domain::admission::unit::{
-    EvaluatedUnit, commit_creation, commit_revision, evaluate,
+    EvaluatedUnit, EvaluationTarget, commit_creation, commit_revision, evaluate,
 };
 use types_registry::domain::admission::vector::{VectorDrift, VectorRole};
 use types_registry::domain::admission::worker::{
@@ -50,6 +49,9 @@ const LATER: OffsetDateTime = datetime!(2026-08-20 10:20:40 UTC);
 const BASE: &str = gts_id!("cf.core.reval.thing.v1~");
 const DERIVED: &str = gts_id!("cf.core.reval.thing.v1~cf.core.reval.leaf.v1~");
 const REFERRER: &str = gts_id!("cf.core.reval.referrer.v1~");
+/// A minor family, for the compatibility baseline's own place in the vector.
+const M2_0: &str = gts_id!("cf.core.reval.minor.v2.0~");
+const M2_1: &str = gts_id!("cf.core.reval.minor.v2.1~");
 
 type Provider = Arc<DBProvider<DbError>>;
 
@@ -66,13 +68,40 @@ fn worker(db: &Provider) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
-fn base_schema(property: &str) -> Value {
+/// Vary an annotation to move the document and dependent artifacts compatibly.
+fn base_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{BASE}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": marker,
         "type": "object",
-        "properties": { property: { "type": "string" } },
+        "properties": { "name": { "type": "string" } },
     })
+}
+
+/// Open-level minor schema: naming another property makes the candidate
+/// incompatible, so the test detects a skipped comparison.
+fn minor_schema(gts_id: &str, properties: &Value) -> Value {
+    json!({
+        "$id": format!("gts://{gts_id}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": properties,
+    })
+}
+
+/// The predecessor of the minor family: one named property at an open level.
+fn minor_predecessor(gts_id: &str) -> Value {
+    minor_schema(gts_id, &json!({ "name": { "type": "string" } }))
+}
+
+/// The candidate: the same document with one more property named — incompatible
+/// against [`minor_predecessor`], admissible against no baseline at all.
+fn minor_candidate(gts_id: &str) -> Value {
+    minor_schema(
+        gts_id,
+        &json!({ "name": { "type": "string" }, "extra": { "type": "string" } }),
+    )
 }
 
 fn derived_schema() -> Value {
@@ -90,11 +119,9 @@ fn referencing_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{REFERRER}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": marker,
         "type": "object",
-        "properties": {
-            "subject": { "$ref": format!("gts://{BASE}") },
-            marker: { "type": "string" },
-        },
+        "properties": { "subject": { "$ref": format!("gts://{BASE}") } },
     })
 }
 
@@ -103,11 +130,9 @@ fn chained_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{REFERRER}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": marker,
         "type": "object",
-        "properties": {
-            "leaf": { "$ref": format!("gts://{DERIVED}") },
-            marker: { "type": "string" },
-        },
+        "properties": { "leaf": { "$ref": format!("gts://{DERIVED}") } },
     })
 }
 
@@ -159,6 +184,11 @@ async fn admit(
     let operation_id = submit(db, key, gts_id, content, expected_resource_version)
         .await
         .expect("acceptance");
+    run_the_operation(db, operation_id).await
+}
+
+/// One full worker pass over an already-accepted operation — the retry path.
+async fn run_the_operation(db: &Provider, operation_id: Uuid) -> OperationOutcome {
     run_operation(
         &stores(),
         &worker(db),
@@ -167,6 +197,7 @@ async fn admit(
             limits: &common::limits(),
             worker: &worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -209,10 +240,16 @@ async fn submitted(
         &stores(),
         &provider,
         &allow_all(),
-        &item.gts_id,
-        &payload,
-        item.id,
+        EvaluationTarget {
+            gts_id: &item.gts_id,
+            canonical_body: &payload,
+            operation_item_id: item.id,
+            precondition: item.precondition,
+            force: item.compat_forced,
+            labels: item.pass_labels(),
+        },
         &common::limits(),
+        &common::metrics(),
         None,
     )
     .await
@@ -475,6 +512,79 @@ async fn a_dependent_refreshed_after_the_scan_is_detected() {
     );
 }
 
+/// An absent predecessor remains a closure root in the revision vector.
+/// Its arrival must trigger `Appeared` and rollback; the retry must compare
+/// against it and refuse this deliberately incompatible candidate.
+#[tokio::test]
+async fn a_compatibility_baseline_created_after_evaluation_is_compared_on_the_retry() {
+    let db = test_db().await;
+
+    // Evaluated with the preceding minor absent: no baseline document to compare.
+    let (operation_id, unit) = submitted(&db, "k-m2-1", M2_1, minor_candidate(M2_1), None).await;
+
+    // The predecessor lands in the gap.
+    admit(&db, "k-m2-0", M2_0, minor_predecessor(M2_0), None).await;
+
+    let provider = worker(&db);
+    let ports = stores();
+    let candidate = unit.clone();
+    let outcome = provider
+        .transaction_with_config(commit_write(&provider.db()), move |tx| {
+            let candidate = candidate.clone();
+            let ports = Arc::clone(&ports);
+            Box::pin(async move {
+                commit_creation(
+                    ports.as_ref(),
+                    tx,
+                    &allow_all(),
+                    &candidate,
+                    &common::limits(),
+                    LATER,
+                )
+                .await
+            })
+        })
+        .await;
+
+    assert_eq!(
+        outcome
+            .err()
+            .map(|e| match e {
+                WorkerError::RevalidationRequired(drift) => drift,
+                other => panic!("expected revalidation, got {other:?}"),
+            })
+            .expect("a predecessor appearing in the gap must roll the commit back"),
+        VectorDrift::Appeared {
+            gts_id: M2_0.to_owned(),
+            role: VectorRole::Dependency,
+        },
+    );
+
+    // The retry the rollback exists to trigger: a full pass over the same operation,
+    // which re-evaluates from scratch and now finds the predecessor.
+    let retried = run_the_operation(&db, operation_id).await;
+    assert_eq!(
+        (
+            retried.items[0].status,
+            retried.items[0].failure.as_ref().map(|f| f.reason.clone()),
+        ),
+        (
+            OperationItemStatus::Failed,
+            Some(AdmissionFailureReason::IncompatibleWithBaseline),
+        ),
+        "the retry must compare against the predecessor that appeared, not skip it: {:?}",
+        retried.items[0].failure,
+    );
+    let conn = db.conn().expect("conn");
+    assert!(
+        EntityRepo::find_by_gts_id(&conn, &allow_all(), M2_1)
+            .await
+            .expect("read")
+            .is_none(),
+        "a refused candidate leaves no entity"
+    );
+}
+
 #[tokio::test]
 async fn a_creation_whose_dependency_moved_after_evaluation_rolls_the_commit_back() {
     let db = test_db().await;
@@ -558,7 +668,7 @@ where
     Fut: Future<Output = ()> + Send,
 {
     // Pause before the claim so the mutation can commit in the evaluation gap.
-    let (paused, reached, resume) = PausingStores::new(PausePoint::BeforeEntityWriteOrderClaim);
+    let (paused, reached, resume) = TestStores::pausing(PausePoint::BeforeEntityWriteOrderClaim);
     let ports: Arc<dyn Stores> = paused;
     let provider = worker(db);
     let pass = tokio::spawn(async move {
@@ -570,6 +680,7 @@ where
                 limits: &common::limits(),
                 worker: &settings,
                 metrics: &common::metrics(),
+                allow_compatibility_force: false,
             },
             operation_id,
             LATER,
@@ -902,7 +1013,7 @@ async fn a_dependent_refresh_losing_the_compare_and_swap_rolls_the_commit_back()
         submitted(&db, "k-base-2", BASE, base_schema("label"), Some(1)).await;
 
     let derived_id = entity(&db, DERIVED).await.id;
-    let ports = CasMissStores::new(derived_id);
+    let ports = TestStores::cas_miss(derived_id);
     let outcome = commit_the_revision_with(ports, &db, &unit, 1).await;
 
     let Err(WorkerError::RevalidationRequired(VectorDrift::CurrentProjectionMoved { ref gts_id })) =
@@ -966,7 +1077,7 @@ async fn a_candidate_current_write_losing_the_compare_and_swap_rolls_the_commit_
         submitted(&db, "k-base-2", BASE, base_schema("label"), Some(1)).await;
 
     let base_id = entity(&db, BASE).await.id;
-    let ports = CasMissStores::new(base_id);
+    let ports = TestStores::cas_miss(base_id);
     let outcome = commit_the_revision_with(ports, &db, &unit, 1).await;
 
     let Err(WorkerError::RevalidationRequired(VectorDrift::CurrentProjectionMoved { ref gts_id })) =

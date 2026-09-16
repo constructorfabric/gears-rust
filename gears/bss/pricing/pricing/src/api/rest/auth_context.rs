@@ -6,13 +6,14 @@
 //! silently treated as an anonymous identity.
 
 use axum::extract::Extension;
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::rest::error::unauthenticated;
 use crate::domain::audit::AuditStamp;
+use time::OffsetDateTime;
 
 /// Extract the [`SecurityContext`] from the request extensions, returning 401
 /// when it is missing, carries the anonymous all-zero placeholder, or lacks the
@@ -26,7 +27,7 @@ pub(crate) fn require_authenticated(
     let Some(Extension(ctx)) = extension_ctx else {
         return Err(unauthenticated());
     };
-    if ctx.subject_id().is_nil() || ctx.subject_tenant_id().is_nil() {
+    if ctx.is_anonymous() {
         return Err(unauthenticated());
     }
     if ctx.subject_type().is_none() {
@@ -61,7 +62,7 @@ mod auth_context_tests;
 /// of the type rather than of a convention — a handler cannot build a stamp
 /// without having asked the edge for the value.
 #[must_use]
-pub fn audit_stamp(ctx: &SecurityContext, now: DateTime<Utc>, correlation: Uuid) -> AuditStamp {
+pub fn audit_stamp(ctx: &SecurityContext, now: OffsetDateTime, correlation: Uuid) -> AuditStamp {
     AuditStamp {
         actor_principal_id: ctx.subject_id(),
         recorded_at: now,

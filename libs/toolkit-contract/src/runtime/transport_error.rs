@@ -67,9 +67,25 @@ pub enum TransportError {
     #[error("serialization error: {0}")]
     Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
-    /// Server-Sent Events stream error (frame parse, malformed event, etc.).
-    #[error("SSE protocol error: {0}")]
-    Sse(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Streaming framing-protocol error: the peer's bytes do not conform to
+    /// the wire framing in use — a malformed SSE frame, a bad multipart
+    /// delimiter or part header, a part length that overruns its delimiter, an
+    /// accumulation guard trip.
+    ///
+    /// Distinct from [`TransportError::Serialization`], which is a
+    /// well-framed frame or part whose *payload* would not decode.
+    ///
+    /// Replaces an earlier SSE-only variant: naming the framing is what keeps
+    /// a fault attributable once more than one framing exists, so there is
+    /// deliberately no framing-specific variant to reach for instead.
+    #[error("{} framing error: {source}", framing.media_type())]
+    Framing {
+        /// Which wire framing produced the fault.
+        framing: crate::ir::binding::StreamFraming,
+        /// Underlying cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 
     /// URL construction error (missing path parameter, invalid template).
     #[error("URL build error: {0}")]
@@ -106,13 +122,16 @@ impl TransportError {
         Self::Serialization(err.into())
     }
 
-    /// Convenience constructor for [`TransportError::Sse`] from any boxable
-    /// error. Preserves the source via `Error::source()`.
-    pub fn sse<E>(err: E) -> Self
+    /// Convenience constructor for [`TransportError::Framing`] from any
+    /// boxable error. Preserves the source via `Error::source()`.
+    pub fn framing<E>(framing: crate::ir::binding::StreamFraming, err: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
-        Self::Sse(err.into())
+        Self::Framing {
+            framing,
+            source: err.into(),
+        }
     }
 
     /// Convenience constructor for [`TransportError::Unresolved`].
@@ -152,9 +171,11 @@ impl TransportError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
+            // `Framing` is transient deliberately: that classification is
+            // what makes a mid-stream framing fault reconnect-eligible.
             TransportError::Network(_)
             | TransportError::Timeout(_)
-            | TransportError::Sse(_)
+            | TransportError::Framing { .. }
             | TransportError::Unresolved { .. } => true,
             TransportError::HttpStatus { status, .. } => is_retryable_status(*status),
             #[cfg(feature = "canonical-errors")]
@@ -203,6 +224,42 @@ mod tests {
     #[test]
     fn unresolved_is_transient() {
         assert!(TransportError::unresolved("billing").is_transient());
+    }
+
+    #[test]
+    fn framing_is_transient_for_every_framing() {
+        // Q9: a framing fault is transient on purpose — that classification is
+        // what makes it reconnect-eligible, and it must not depend on which
+        // framing faulted.
+        for framing in [
+            crate::ir::binding::StreamFraming::ServerSentEvents,
+            crate::ir::binding::StreamFraming::MultipartMixed,
+        ] {
+            assert!(
+                TransportError::framing(framing, "bad frame").is_transient(),
+                "expected {framing:?} framing errors to be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_display_names_the_media_type() {
+        assert_eq!(
+            TransportError::framing(
+                crate::ir::binding::StreamFraming::MultipartMixed,
+                "bad delimiter",
+            )
+            .to_string(),
+            "multipart/mixed framing error: bad delimiter"
+        );
+        assert_eq!(
+            TransportError::framing(
+                crate::ir::binding::StreamFraming::ServerSentEvents,
+                "bad frame",
+            )
+            .to_string(),
+            "text/event-stream framing error: bad frame"
+        );
     }
 
     #[cfg(feature = "grpc-client")]

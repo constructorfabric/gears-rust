@@ -188,3 +188,27 @@ fn message_part_to_active_model_maps_type_number_and_leaves_owner_unset() {
     assert_eq!(am.owner_tenant_id, ActiveValue::NotSet);
     assert_eq!(am.owner_id, ActiveValue::NotSet);
 }
+
+#[test]
+fn part_type_maps_round_trip_for_every_variant() {
+    // The two mappings are each other's inverse; the read direction
+    // (`part_type_from_entity`) is otherwise only exercised through a DB
+    // fetch, so pin both here for the whole closed set.
+    let all = [
+        MessagePartType::Text,
+        MessagePartType::Code,
+        MessagePartType::Images,
+        MessagePartType::Videos,
+        MessagePartType::Links,
+        MessagePartType::Statuses,
+        MessagePartType::ToolCall,
+        MessagePartType::ToolResult,
+    ];
+    for ty in all {
+        assert_eq!(
+            part_type_from_entity(&part_type_to_entity(&ty)),
+            ty,
+            "part type must survive the entity round trip"
+        );
+    }
+}

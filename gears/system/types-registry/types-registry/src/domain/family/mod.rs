@@ -12,14 +12,13 @@
 //!   lookup through `uq_tr_entity_gts_id` on an identifier `key` derived, never
 //!   a scan of the family.
 //!
-//! Only [`FamilyKey`], [`family_key`], [`FamilyRefusal`] and [`admits_new_member`]
-//! leave the directory — the key the storage layer persists, and the question the
-//! commit path asks. `sibling_id`, `version_probe` and `VersionProbe` are the rules'
-//! own arithmetic, with no caller outside; publishing them would make any change to
-//! the probe's shape a breaking release.
+//! [`FamilyKey`], [`family_key`], [`FamilyRefusal`] and [`admits_new_member`]
+//! serve storage and admission. [`version_probe`] also supplies `compat` with
+//! the contiguity rule's predecessor identifier; `sibling_id` stays private.
 
 mod key;
 mod rules;
 
 pub use key::{FamilyKey, family_key, lock_order};
 pub use rules::{FamilyRefusal, admits_new_member};
+pub(crate) use rules::{VersionProbe, version_probe};

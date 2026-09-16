@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider-ecb-plugin"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider ECB source plugin: fetches ECB daily reference rates and registers as a RateProviderV1 plugin instance"
@@ -35,8 +35,9 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-# NaiveDate / DateTime<Utc> for as_of; no `clock` feature.
+# NaiveDate for the ECB cube's civil date; midnight UTC is `time::OffsetDateTime`.
 chrono = { workspace = true }
+time = { workspace = true }
 # ECB daily reference-rate XML parsing.
 quick-xml = { workspace = true }
 

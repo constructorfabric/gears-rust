@@ -298,7 +298,7 @@ async fn rd_watch_004_prefix_watch_is_native_and_per_key() {
     let (_container, handle, cache, _raw) = fixture(json!({})).await;
 
     assert!(
-        cache.features().prefix_watch,
+        cache.features().prefix_watch(),
         "on a non-clustered server under watch_mode: publish, prefix watch is native"
     );
 
@@ -684,7 +684,7 @@ async fn rd_watch_010_disabled_mode_degrades_honestly() {
     let baseline_publishes = common::command_calls(&raw, "publish").await;
 
     assert!(
-        !cache.features().prefix_watch,
+        !cache.features().prefix_watch(),
         "watch_mode: disabled must declare no native prefix watch, so the SDK falls back to \
          PollingPrefixWatch rather than opening a stream that never fires"
     );

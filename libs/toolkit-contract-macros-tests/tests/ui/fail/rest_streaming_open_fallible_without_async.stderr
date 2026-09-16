@@ -1,0 +1,5 @@
+error: `#[streaming(open = fallible)]` requires `async fn`: the fallible open is an awaited operation. Add `async`, or drop `open = fallible` for the immediate (synchronous-handback) shape.
+  --> tests/ui/fail/rest_streaming_open_fallible_without_async.rs:21:8
+   |
+21 |     fn frames(&self, ctx: SecurityContext) -> Result<u64, std::io::Error>;
+   |        ^^^^^^
