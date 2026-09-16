@@ -17,11 +17,11 @@ use super::{
     AccessRepository, EffectiveAccess, Restriction, RestrictionDraft, TenantAccess,
     evict_access_change, may_restrict, restriction_tag, strictest,
 };
-use crate::api::precondition::{self, ETag};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::platform_scope::PlatformScope;
+use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::{EffectiveCache, TenantHierarchy};
 
 /// Who is acting.

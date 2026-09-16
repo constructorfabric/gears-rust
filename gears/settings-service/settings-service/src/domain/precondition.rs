@@ -3,7 +3,9 @@
 //! `If-Match` evaluation for conditional writes.
 //!
 //! Every mutating request against a versioned resource passes through here
-//! before its handler runs. Two settings administrators editing the same
+//! before its handler runs. The rule is the domain's, not the transport's: a
+//! service decides whether a caller's edit still stands against the state it
+//! was based on, and `If-Match` is only how that intent arrives. Two settings administrators editing the same
 //! declaration is the ordinary case, not the exceptional one, and without a
 //! precondition the second write silently discards the first.
 //!
@@ -15,7 +17,7 @@
 //! into the check at all; retrying is pointless, the client itself must change.
 //! Collapsing the two would tell a broken client to retry forever.
 
-use crate::domain::error::DomainError;
+use super::error::DomainError;
 
 /// An entity tag over a resource's persisted representation.
 ///

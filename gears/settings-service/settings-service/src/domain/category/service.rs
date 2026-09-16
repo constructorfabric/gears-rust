@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use super::visibility::{self, DomainVisibility};
 use super::{Category, CategoryDraft, CategoryPatch, CategoryRepository};
-use crate::api::precondition::{self, ETag};
 use crate::domain::error::DomainError;
+use crate::domain::precondition::{self, ETag};
 
 /// Who performed a mutation and under which request.
 ///

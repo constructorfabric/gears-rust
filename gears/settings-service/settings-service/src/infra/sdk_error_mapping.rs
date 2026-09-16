@@ -71,7 +71,7 @@ impl From<DomainError> for CanonicalError {
             // and be indistinguishable from a malformed body.
             DomainError::PreconditionRequired { detail } => SettingsResource::invalid_argument()
                 .with_field_violation(
-                    crate::api::precondition::IF_MATCH_HEADER,
+                    crate::domain::precondition::IF_MATCH_HEADER,
                     detail,
                     crate::field::IF_MATCH_REQUIRED,
                 )

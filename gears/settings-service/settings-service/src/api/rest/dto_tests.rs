@@ -5,9 +5,9 @@
 //! shapes are a contract consuming clients depend on.
 
 use super::{CategoryDto, CreateCategoryRequest, UpdateCategoryRequest};
-use crate::api::precondition::ETag;
 use crate::domain::category::{Category, CategoryKey};
 use crate::domain::error::DomainError;
+use crate::domain::precondition::ETag;
 use crate::field;
 use uuid::Uuid;
 

@@ -16,7 +16,6 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::api::precondition::{self, ETag};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::repo::CategoryRepository;
 use crate::domain::category::visibility;
@@ -25,6 +24,7 @@ use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
 use crate::domain::stepup::StepUpVerifier;
 use crate::domain::validation::{TraitSet, TypeValidator};

@@ -41,7 +41,7 @@ pub struct Category {
     /// Optional icon reference.
     pub icon: Option<String>,
     /// The entity tag derived from the row's last write, used by `If-Match`.
-    pub etag: crate::api::precondition::ETag,
+    pub etag: crate::domain::precondition::ETag,
 }
 
 /// What a caller may change on an existing category.

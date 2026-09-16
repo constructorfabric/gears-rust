@@ -6,7 +6,7 @@ pub mod service;
 
 use serde_json::Value;
 
-use crate::api::precondition::ETag;
+use crate::domain::precondition::ETag;
 use crate::domain::value::StoredValue;
 
 pub use service::{Change, Committed, Gated, Staged, ValueWriter, WriteActor};

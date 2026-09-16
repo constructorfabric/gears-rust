@@ -2,7 +2,7 @@
 //! Wire shapes for the category endpoints.
 //!
 //! Separate from the domain [`Category`](crate::domain::category::Category) on
-//! purpose. The domain type carries an [`ETag`](crate::api::precondition::ETag)
+//! purpose. The domain type carries an [`ETag`](crate::domain::precondition::ETag)
 //! that travels as a **header**, not a body field, and a client that could send
 //! `id` or `etag` in a request body would be claiming an identity or forging a
 //! precondition. What a caller may set and what the service assigns are

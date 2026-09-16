@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::api::precondition::ETag;
 use crate::domain::error::DomainError;
+use crate::domain::precondition::ETag;
 use crate::domain::resolution::{EffectiveCache, TenantHierarchy};
 
 pub use repo::AccessRepository;

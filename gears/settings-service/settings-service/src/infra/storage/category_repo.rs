@@ -11,12 +11,12 @@ use uuid::Uuid;
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_odata::{ODataQuery, Page, SortDir};
 
-use crate::api::precondition::ETag;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::category::{
     Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::precondition::ETag;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::odata_mapper::CategoryODataMapper;

@@ -9,6 +9,7 @@ pub mod error;
 pub mod odata;
 pub mod platform_scope;
 pub mod ports;
+pub mod precondition;
 pub mod resolution;
 pub mod secrets;
 pub mod stepup;

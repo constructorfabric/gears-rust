@@ -18,12 +18,12 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{image_of, value_state_tag};
-use crate::api::precondition;
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::access::{AccessRepository, TenantAccess};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
+use crate::domain::precondition;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver, scope_class};
 use crate::domain::stepup::{
     INTERACTIVE_SUBJECT_TYPES, StepUpSubject, StepUpVerifier, unverified_payload,
