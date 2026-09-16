@@ -749,10 +749,15 @@ async fn build_internal_authenticator(
         return Ok(None);
     };
 
-    // Dependency-light providers (shared-secret) build directly here.
-    if let Some(authenticator) = cfg.build_authenticator() {
-        info!("Initializing shared-secret platform-plane authenticator");
-        return Ok(Some(authenticator));
+    // Dependency-light providers (shared-secret) build directly here. An
+    // unusable secret is an error rather than a fallthrough: dropping to the
+    // kube branch below would report the wrong problem entirely.
+    match cfg.build_authenticator()? {
+        toolkit_security::BuiltAuthenticator::Built(authenticator) => {
+            info!("Initializing shared-secret platform-plane authenticator");
+            return Ok(Some(authenticator));
+        }
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
     }
 
     #[cfg(feature = "k8s-auth")]
@@ -763,6 +768,7 @@ async fn build_internal_authenticator(
             let authenticator = toolkit_k8s_auth::build_cached_k8s_authenticator(
                 audiences,
                 Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+                None,
             )
             .await
             .context("failed to initialize Kubernetes TokenReview authenticator")?;

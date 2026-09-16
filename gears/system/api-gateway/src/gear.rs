@@ -1392,10 +1392,15 @@ async fn build_internal_authenticator(
         return Ok(None);
     };
 
-    // Shared-secret (and any future dependency-light provider) builds here.
-    if let Some(auth) = cfg.build_authenticator() {
-        tracing::info!("Initializing shared-secret platform-plane authenticator");
-        return Ok(Some(auth));
+    // Shared-secret (and any future dependency-light provider) builds here. An
+    // unusable secret fails the build rather than falling through to the kube
+    // branch, which would report the wrong problem.
+    match cfg.build_authenticator()? {
+        toolkit_security::BuiltAuthenticator::Built(auth) => {
+            tracing::info!("Initializing shared-secret platform-plane authenticator");
+            return Ok(Some(auth));
+        }
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
     }
 
     #[cfg(feature = "k8s-auth")]
@@ -1406,6 +1411,7 @@ async fn build_internal_authenticator(
             let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(
                 audiences,
                 Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+                None,
             )
             .await
             .map_err(|e| {
@@ -1636,7 +1642,7 @@ mod tests {
     #[tokio::test]
     async fn build_internal_authenticator_builds_shared_secret() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
         let auth = build_internal_authenticator(Some(&cfg)).await.unwrap();
@@ -1683,7 +1689,7 @@ mod tests {
         let api = ApiGateway::new(config);
 
         let auth = build_internal_authenticator(Some(&InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         }))
         .await
@@ -1759,7 +1765,7 @@ mod tests {
             ..Default::default()
         };
         let internal = InternalAuthConfig::SharedSecret {
-            secret: "dev-internal-token".to_owned(),
+            secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
         let result = ApiGateway::connect_directory(&cfg, Some(&internal)).await;

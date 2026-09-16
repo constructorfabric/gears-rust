@@ -226,7 +226,11 @@ fn compile_constraint(
         filters.push(filter);
     }
 
-    Ok(ScopeConstraint::new(filters))
+    // Fail closed on a predicate-free decision. `filters` is whatever the PDP
+    // returned, and a constraint with none of them is an AND over nothing: it
+    // matches every row, which `toolkit-db` compiles to an unconditional
+    // `WHERE true`. A PDP answer that narrows nothing must deny, not widen.
+    ScopeConstraint::try_new(filters).map_err(|e| e.to_string())
 }
 
 /// Convert a `serde_json::Value` to a UUID `ScopeValue`.

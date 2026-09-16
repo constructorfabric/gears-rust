@@ -123,6 +123,7 @@ mod error;
 mod pgq_tests;
 pub mod provider;
 mod runner;
+pub mod schema;
 mod secure_conn;
 mod select;
 mod tests;
