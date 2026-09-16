@@ -6,8 +6,9 @@ use authz_resolver_sdk::AuthZResolverApi;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::{InMemoryStorage, quota_draft};
 use quota_enforcement_sdk::{
-    CONTRACT_MAJOR, MetricId, QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_USER,
-    StorageError, SubjectRef, SubjectScope,
+    CONTRACT_MAJOR, MetricId, PageRequest, PolicyDraft, PolicyId, PolicySchemaSnapshot,
+    PolicyScope, QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_USER, StorageError,
+    SubjectRef, SubjectScope,
 };
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
@@ -20,6 +21,7 @@ use crate::domain::plugins::PluginBinding;
 use crate::domain::ports::contracts::ContractRegistry;
 use crate::domain::ports::coordination::SingletonScope;
 use crate::domain::ports::metric_registry::MetricRegistry;
+use crate::domain::ports::metrics::EngineLabel;
 use crate::domain::ports::metrics::{ValidationReason, ValidationSurface};
 use crate::domain::readiness::{Readiness, ReadinessState};
 use crate::infra::pdp_probe::PdpReachability;
@@ -107,8 +109,11 @@ fn bootstrap(h: &Harness) -> Bootstrap {
             config: h.config.clone(),
         },
         h.metric_registry.clone() as Arc<dyn MetricRegistry>,
-        h.metrics.clone(),
-        h.readiness.clone(),
+        super::BootstrapReporting {
+            metrics: h.metrics.clone(),
+            readiness: h.readiness.clone(),
+        },
+        crate::test_support::policy_limits(),
     )
 }
 
@@ -526,4 +531,116 @@ async fn the_real_registry_bootstraps_registers_discovers_compiles_and_restarts_
     );
     assert!(first.metrics.contract_failures().is_empty());
     assert!(second.metrics.contract_failures().is_empty());
+}
+
+/// A policy an operator persisted before this deployment was built.
+fn persisted_policy(engine_id: &str, engine_config: serde_json::Value) -> PolicyDraft {
+    PolicyDraft {
+        schema_snapshot: PolicySchemaSnapshot::default(),
+        scope: PolicyScope::Metric {
+            metric: MetricId::parse(METRIC_TOKENS).expect("metric"),
+        },
+        engine_id: engine_id.to_owned(),
+        engine_config,
+        timeout_ms: None,
+        description: None,
+        comment: None,
+        created_by: "operator".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_registers_both_engines_seeds_the_global_policy_and_publishes_its_artifact() {
+    let h = harness(Arc::new(InMemoryStorage::new()), true, permitting_pdp());
+    let bound = bootstrap(&h).run().await.expect("bootstrap succeeds");
+    assert_eq!(
+        bound.engines.ids().collect::<Vec<_>>(),
+        vec!["cel", "most-restrictive-wins"]
+    );
+    let seeded = h
+        .storage
+        .read_policy(&PolicyScope::Global)
+        .await
+        .expect("read")
+        .expect("seeded after registration");
+    assert_eq!(
+        (seeded.version, seeded.engine_id.as_str()),
+        (1, "most-restrictive-wins")
+    );
+    assert_eq!(seeded.engine_config, serde_json::json!({}));
+    assert!(
+        bound.artifacts.get(&PolicyId::global(), 1).is_some(),
+        "the active policy's artifact is rebuilt from its persisted config"
+    );
+    assert!(h.metrics.engine_bootstrap_failures.lock().is_empty());
+
+    // A second bootstrap finds the scope occupied and seeds nothing new.
+    let again = harness(h.storage.clone(), true, permitting_pdp());
+    bootstrap(&again).run().await.expect("repeat");
+    let versions = h
+        .storage
+        .list_policy_versions(&PolicyId::global(), PageRequest::first(10))
+        .await
+        .expect("history");
+    assert_eq!(versions.items.len(), 1, "seeded exactly once");
+}
+
+#[tokio::test]
+async fn an_active_policy_naming_an_unregistered_engine_fails_readiness_on_engine() {
+    let storage = Arc::new(InMemoryStorage::new());
+    storage
+        .create_policy(
+            &ctx(),
+            persisted_policy("starlark", serde_json::json!({})),
+            &[],
+        )
+        .await
+        .expect("persisted");
+    let h = harness(storage, true, permitting_pdp());
+    let err = bootstrap(&h)
+        .run()
+        .await
+        .err()
+        .expect("unsupported active policy");
+    assert!(
+        matches!(
+            err,
+            DomainError::InvalidPolicy {
+                reason: "UNKNOWN_ENGINE",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    failed_on(&h, Dependency::Engine);
+    assert!(
+        !h.readiness.is_ready(),
+        "no silent fallback to most-restrictive-wins"
+    );
+}
+
+#[tokio::test]
+async fn an_active_policy_whose_config_no_longer_compiles_fails_readiness_and_is_counted() {
+    let storage = Arc::new(InMemoryStorage::new());
+    storage
+        .create_policy(
+            &ctx(),
+            persisted_policy(
+                "most-restrictive-wins",
+                serde_json::json!({ "weights": [1] }),
+            ),
+            &[],
+        )
+        .await
+        .expect("persisted");
+    let h = harness(storage, true, permitting_pdp());
+    assert!(
+        bootstrap(&h).run().await.is_err(),
+        "config the engine refuses"
+    );
+    failed_on(&h, Dependency::Engine);
+    assert_eq!(
+        h.metrics.engine_bootstrap_failures.lock().as_slice(),
+        &[EngineLabel::MostRestrictiveWins]
+    );
 }

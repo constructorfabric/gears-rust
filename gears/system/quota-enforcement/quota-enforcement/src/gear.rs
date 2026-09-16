@@ -34,8 +34,8 @@ use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
 use crate::domain::ports::{LifecycleGaugeSink, MetricRegistry, QeMetrics};
 use crate::domain::{
-    Admission, Bootstrap, Bound, CatalogBinding, GaugeTiming, LifecycleGaugeRefresher,
-    PluginBinding, Readiness, Service, SingletonScope,
+    Admission, Bootstrap, BootstrapReporting, Bound, CatalogBinding, GaugeTiming,
+    LifecycleGaugeRefresher, PluginBinding, Readiness, Service, SingletonScope,
 };
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
 use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
@@ -245,12 +245,20 @@ impl Gear for QuotaEnforcementGear {
             metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone());
         let readiness = Arc::new(Readiness::new());
         let admission = Admission::new(enforcer, metrics.clone());
+        let policy_limits = cfg
+            .policies
+            .to_limits()
+            .context("[quota-enforcement.policies] is not a valid policy bound set")?;
         let service = Arc::new(Service::new(
             admission,
             readiness.clone(),
             cfg.quotas.to_limits(),
+            policy_limits,
         ));
         // The in-process manager client enters the domain where REST does.
+        hub.register::<dyn quota_enforcement_sdk::QuotaOperatorClientV1>(Arc::new(
+            crate::api::in_process::InProcessQuotaOperator::new(service.clone()),
+        ));
         hub.register::<dyn QuotaManagerClientV1>(Arc::new(InProcessQuotaManager::new(
             service.clone(),
         )));
@@ -269,8 +277,8 @@ impl Gear for QuotaEnforcementGear {
             pdp_probe,
             catalog,
             metric_registry,
-            metrics,
-            readiness,
+            BootstrapReporting { metrics, readiness },
+            policy_limits,
         );
 
         let gauges = GaugeWiring {

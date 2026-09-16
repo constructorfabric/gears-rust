@@ -38,6 +38,7 @@ pub fn parse_metric_under_base(text: &str) -> Option<MetricId> {
 pub struct CompiledContract {
     type_id: GtsTypeId,
     validator: Validator,
+    schema: Arc<Value>,
 }
 
 impl CompiledContract {
@@ -61,7 +62,17 @@ impl CompiledContract {
             })
             .build(&root)
             .map_err(|e| e.to_string())?;
-        Ok(Self { type_id, validator })
+        Ok(Self {
+            type_id,
+            validator,
+            schema: root,
+        })
+    }
+
+    /// The resolved schema used by this immutable catalogue, without a registry read.
+    #[must_use]
+    pub fn schema(&self) -> &Value {
+        &self.schema
     }
 
     /// The contract type.
@@ -387,6 +398,11 @@ impl ProjectionContractCatalog {
     /// The configured subject projections.
     pub fn subject_projections(&self) -> impl Iterator<Item = &SubjectProjectionContract> {
         self.subjects.values()
+    }
+
+    /// The configured resource projections.
+    pub fn resource_projections(&self) -> impl Iterator<Item = &ResourceProjectionContract> {
+        self.resources.values()
     }
 
     /// The admitted metrics.

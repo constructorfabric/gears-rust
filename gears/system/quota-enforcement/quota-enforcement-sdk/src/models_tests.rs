@@ -672,3 +672,25 @@ fn notification_event_kind_names_equal_their_serialized_form() {
         );
     }
 }
+
+#[test]
+fn public_policy_inputs_reject_server_owned_fields() {
+    let create =
+        json!({"scope":{"kind":"global"},"engine_id":"most-restrictive-wins","engine_config":{}});
+    let patch = json!({"if_match_version":1,"timeout_ms":8});
+    assert!(serde_json::from_value::<super::PolicySpec>(create.clone()).is_ok());
+    assert!(serde_json::from_value::<super::PolicyPatch>(patch.clone()).is_ok());
+    for field in [
+        "created_by",
+        "schemas",
+        "schema_snapshot",
+        "compiled_artifact",
+    ] {
+        let mut spoofed = create.clone();
+        spoofed[field] = json!("caller controlled");
+        assert!(serde_json::from_value::<super::PolicySpec>(spoofed).is_err());
+        let mut spoofed = patch.clone();
+        spoofed[field] = json!("caller controlled");
+        assert!(serde_json::from_value::<super::PolicyPatch>(spoofed).is_err());
+    }
+}

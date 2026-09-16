@@ -1,16 +1,15 @@
 #![allow(clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    CapPatch, Decision, DecisionResult, EnforcementMode, IdempotencyScope, IdempotencySubjectKey,
-    IdempotencyWrite, LeaseState, MetricKind, NotificationEventKind, OperationType, PayloadHash,
-    PeriodType, PolicyId, QuotaDebitPlan, QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource,
-    QuotaStatus, QuotaType, SubjectRef, ValidityWindow,
+    CapPatch, EnforcementMode, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite,
+    LeaseState, MetricKind, NotificationEventKind, OperationType, PayloadHash, PeriodType,
+    QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef,
+    ValidityWindow,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -181,31 +180,52 @@ fn idem(op: OperationType, key: &str) -> IdempotencyWrite {
             key: key.to_owned(),
         },
         payload_hash: PayloadHash::from_bytes([1; 32]),
-        decision: Decision {
-            result: DecisionResult::Allowed,
-            debit_plan: BTreeMap::new(),
-            diagnostics: BTreeMap::new(),
-        },
-        engine_id: "most-restrictive-wins".to_owned(),
-        policy_id: PolicyId::global(),
-        policy_version: 1,
     }
 }
 
-fn applicable(
-    id: QuotaId,
-) -> (
-    quota_enforcement_sdk::ApplicableQuotas,
-    BTreeMap<QuotaId, QuotaDebitPlan>,
-) {
-    (
-        quota_enforcement_sdk::ApplicableQuotas {
-            tenant_id: tenant(),
-            subjects: vec![user_subject("u1")],
-            metric: quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
-        },
-        BTreeMap::from([(id, QuotaDebitPlan { amount: 60 })]),
-    )
+/// A counter mutation through the shared convention: the transaction selects
+/// the policy and evaluates, so these tests state an amount, not a plan.
+async fn debit(storage: &InMemoryStorage, amount: u64, write: &IdempotencyWrite) {
+    let evaluator = quota_enforcement_sdk::testing::ScriptedEvaluator::new();
+    let call = |context: &quota_enforcement_sdk::EvaluationContext<'_>| evaluator.evaluate(context);
+    storage
+        .apply_debit_plan(&ctx(), &scope(), &evaluated(amount, write, &call), &[])
+        .await
+        .expect("debit");
+}
+
+fn evaluated<'a>(
+    amount: u64,
+    write: &'a IdempotencyWrite,
+    call: &'a quota_enforcement_sdk::engine::TransactionEvaluator<'a>,
+) -> quota_enforcement_sdk::EvaluatedMutation<'a> {
+    quota_enforcement_sdk::EvaluatedMutation {
+        applicable: applicable(),
+        amount,
+        request: &serde_json::Value::Null,
+        resource: &serde_json::Value::Null,
+        user_projection: None,
+        limits: test_limits_clamp(),
+        idempotency: write,
+        evaluate: call,
+    }
+}
+
+fn test_limits_clamp() -> quota_enforcement_sdk::engine::EvaluationLimits {
+    quota_enforcement_sdk::engine::EvaluationLimits {
+        upper_timeout_ms: std::num::NonZeroU64::new(5).expect("nonzero"),
+        cost_limit: std::num::NonZeroU64::new(10_000).expect("nonzero"),
+    }
+}
+
+fn applicable() -> &'static quota_enforcement_sdk::ApplicableQuotas {
+    static APPLICABLE: std::sync::OnceLock<quota_enforcement_sdk::ApplicableQuotas> =
+        std::sync::OnceLock::new();
+    APPLICABLE.get_or_init(|| quota_enforcement_sdk::ApplicableQuotas {
+        tenant_id: tenant(),
+        subjects: vec![user_subject("u1")],
+        metric: quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
+    })
 }
 
 fn scope() -> AccessScope {
@@ -492,19 +512,12 @@ async fn ac7_rate_is_unimplemented_on_create_and_update_before_any_other_gate() 
 #[tokio::test]
 async fn ac8_the_cap_guard_is_decided_by_storage_and_raises_bypass_it() {
     let h = Harness::new().await;
-    let id = h.create(request()).await;
-    let (applicable, plan) = applicable(id);
     h.storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable,
-            &plan,
-            &idem(OperationType::Debit, "d"),
-            &[],
-        )
+        .bootstrap(&quota_enforcement_sdk::testing::bundle_with_global_policy())
         .await
-        .expect("debit 60");
+        .expect("bootstrap");
+    let id = h.create(request()).await;
+    debit(&h.storage, 60, &idem(OperationType::Debit, "d")).await;
     let err = h
         .quotas()
         .update(
@@ -757,23 +770,24 @@ async fn a_metadata_update_after_a_catalogue_change_moves_the_stored_contract_re
 async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
     let h = Harness::new().await;
     h.storage
-        .bootstrap(&quota_enforcement_sdk::BootstrapBundle::foundation())
+        .bootstrap(&quota_enforcement_sdk::testing::bundle_with_global_policy())
         .await
         .expect("bootstrap");
     let id = h.create(request()).await;
-    let (applicable, plan) = applicable(id);
-    let token = h
+    let write = idem(OperationType::Reserve, "r");
+    let evaluator = quota_enforcement_sdk::testing::ScriptedEvaluator::new();
+    let call = |context: &quota_enforcement_sdk::EvaluationContext<'_>| evaluator.evaluate(context);
+    let acquired = h
         .storage
         .acquire_lease(
             &ctx(),
             &scope(),
-            &applicable,
-            &plan,
+            &evaluated(60, &write, &call),
             std::time::Duration::from_mins(1),
-            &idem(OperationType::Reserve, "r"),
         )
         .await
         .expect("lease");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
     let outcome = h.quotas().deactivate(&ctx(), id).await.expect("deactivate");
     assert_eq!(outcome.resolved_leases, vec![token]);
     assert_eq!(

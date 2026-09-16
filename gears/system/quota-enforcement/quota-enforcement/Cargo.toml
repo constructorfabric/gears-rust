@@ -31,6 +31,9 @@ ignored = ["utoipa"]
 grpc-client = ["cluster-sdk/grpc-client"]
 
 [dependencies]
+quota-enforcement-engine-cel = { workspace = true }
+quota-enforcement-engine-most-restrictive = { workspace = true }
+parking_lot = { workspace = true }
 quota-enforcement-sdk = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }

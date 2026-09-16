@@ -12,6 +12,7 @@
     reason = "test support"
 )]
 
+use crate::domain::ports::metrics::{EngineLabel, PolicyTransition};
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -320,6 +321,16 @@ pub fn register_pdp(hub: &Arc<ClientHub>, pdp: Arc<dyn AuthZResolverApi>) {
 /// Records every emission in order.
 #[derive(Default)]
 pub struct RecordingMetrics {
+    pub engine_bootstrap_failures: parking_lot::Mutex<Vec<EngineLabel>>,
+    pub engine_evaluations: parking_lot::Mutex<Vec<(EngineLabel, std::time::Duration)>>,
+    pub plan_violations: parking_lot::Mutex<
+        Vec<(
+            EngineLabel,
+            quota_enforcement_sdk::engine::DebitPlanInvariant,
+        )>,
+    >,
+    pub policy_transitions: parking_lot::Mutex<Vec<PolicyTransition>>,
+    pub policy_conflicts: parking_lot::Mutex<u64>,
     denials: Mutex<Vec<DenialReason>>,
     contract_failures: Mutex<Vec<(ValidationSurface, ValidationReason)>>,
     admitted_violations: Mutex<Vec<ValidationSurface>>,
@@ -342,6 +353,26 @@ impl RecordingMetrics {
 }
 
 impl QeMetrics for RecordingMetrics {
+    fn record_engine_bootstrap_failure(&self, engine: EngineLabel) {
+        self.engine_bootstrap_failures.lock().push(engine);
+    }
+    fn record_engine_evaluation(&self, engine: EngineLabel, elapsed: std::time::Duration) {
+        self.engine_evaluations.lock().push((engine, elapsed));
+    }
+    fn record_plan_violation(
+        &self,
+        engine: EngineLabel,
+        invariant: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    ) {
+        self.plan_violations.lock().push((engine, invariant));
+    }
+    fn record_policy_transition(&self, transition: PolicyTransition) {
+        self.policy_transitions.lock().push(transition);
+    }
+    fn record_policy_conflict(&self) {
+        *self.policy_conflicts.lock() += 1;
+    }
+
     fn record_denial(&self, reason: DenialReason) {
         self.denials.lock().expect("lock").push(reason);
     }
@@ -1388,6 +1419,13 @@ pub fn test_limits() -> crate::domain::quotas::QuotaLimits {
     }
 }
 
+/// The configured policy bounds every test runs with: the shipped defaults.
+pub fn policy_limits() -> crate::domain::policies::PolicyRuntimeLimits {
+    crate::config::PoliciesSection::default()
+        .to_limits()
+        .expect("the default policy section is valid")
+}
+
 /// A service whose dependencies are not bound: every lifecycle call is
 /// `NotReady`.
 pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Service> {
@@ -1396,6 +1434,7 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
         crate::domain::Admission::new(authz_resolver_sdk::PolicyEnforcer::new(pdp), metrics),
         Arc::new(crate::domain::Readiness::new()),
         test_limits(),
+        policy_limits(),
     ))
 }
 
@@ -1417,6 +1456,11 @@ pub async fn bound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain:
         .expect("catalogue");
     service
         .bind(crate::domain::Bound {
+            engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+            artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
+                std::num::NonZeroUsize::new(256).expect("capacity"),
+                std::num::NonZeroUsize::new(2).expect("permits"),
+            )),
             storage: Arc::new(InMemoryStorage::new()),
             coordinator: Arc::new(NoopCoordinator),
             catalog: Arc::new(catalog),

@@ -69,3 +69,28 @@ async fn events_are_enqueued_in_order_with_their_kind_as_the_payload_type() {
     }
     handle.stop().await;
 }
+
+#[tokio::test]
+async fn platform_event_has_no_tenant_and_round_trips_through_outbox() {
+    let db = test_db().await;
+    let (handle, outbox) = bound_outbox(&db).await;
+    let mut event = quota_changed(tenant());
+    event.kind = quota_enforcement_sdk::NotificationEventKind::PolicyChanged;
+    event.scope = quota_enforcement_sdk::NotificationScope::Platform;
+    event.policy_id = Some(quota_enforcement_sdk::PolicyId::global());
+    let conn = db.conn().expect("connection");
+    outbox
+        .enqueue_all(&conn, &[event.clone()])
+        .await
+        .expect("enqueue");
+    let messages = enqueued_messages(&db).await;
+    assert_eq!(messages.len(), 1);
+    let json: serde_json::Value = serde_json::from_slice(&messages[0].payload).expect("JSON");
+    assert_eq!(json["scope"], "platform");
+    assert!(json.get("tenant_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<NotificationEvent>(json).expect("decode"),
+        event
+    );
+    handle.stop().await;
+}

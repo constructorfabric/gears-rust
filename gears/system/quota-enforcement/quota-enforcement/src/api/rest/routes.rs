@@ -31,7 +31,7 @@ pub fn register_routes(
     service: Arc<Service>,
 ) -> Router {
     let router = register_quota_routes(router, openapi);
-    router.layer(Extension(service))
+    super::policies::register(router, openapi).layer(Extension(service))
 }
 // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry
 

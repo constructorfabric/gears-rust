@@ -64,6 +64,21 @@ pub struct Admitted {
     pub access_scope: AccessScope,
 }
 
+/// Platform policy admission without a fabricated tenant identifier.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorAdmission {
+    access_scope: AccessScope,
+}
+
+impl OperatorAdmission {
+    /// Preserve the PDP-issued scope for the policy storage boundary.
+    #[must_use]
+    pub const fn access_scope(&self) -> &AccessScope {
+        &self.access_scope
+    }
+}
+
 /// The PEP boundary.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-gateway-admission:p1
 #[domain_model]
@@ -83,6 +98,32 @@ impl Admission {
     #[must_use]
     pub fn metrics(&self) -> &dyn QeMetrics {
         self.metrics.as_ref()
+    }
+
+    /// Admit a platform policy operation through the PDP without row properties.
+    ///
+    /// # Errors
+    /// Returns PDP denial (including unsupported constraints) or unavailability.
+    pub async fn admit_operator(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+    ) -> Result<OperatorAdmission, DomainError> {
+        let resource = &super::pep::resources::POLICY;
+        let site = LogSite {
+            principal: ctx.subject_id(),
+            resource: resource.name(),
+            action,
+        };
+        let request = AccessRequest::new().require_constraints(false);
+        let access_scope = self
+            .enforcer
+            .access_scope_with(ctx, resource, action, None, &request)
+            .await
+            .map_err(|err| {
+                self.deny(&site, denial_reason(&err), DomainError::from_enforcer(err))
+            })?;
+        Ok(OperatorAdmission { access_scope })
     }
 
     /// Admit `action` on `resource` for the explicit `target`.

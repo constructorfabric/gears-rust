@@ -7,11 +7,13 @@
 use std::fmt;
 
 use authz_resolver_sdk::EnforcerError;
-use quota_enforcement_sdk::{LeaseToken, PolicyId, StorageError};
+use quota_enforcement_sdk::{LeaseToken, PolicyId, PolicyScope, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
 
 use super::ports::metrics::ValidationReason;
+use quota_enforcement_sdk::engine::DebitPlanInvariant;
+
 use super::tokens;
 
 /// Which plugin family a binding error is about.
@@ -47,6 +49,8 @@ pub enum Dependency {
     TypesRegistry,
     /// The projection contract catalogue built from the configured projections.
     Catalog,
+    /// The statically registered resolution engines and their artifacts.
+    Engine,
 }
 
 impl Dependency {
@@ -59,6 +63,7 @@ impl Dependency {
             Self::Pdp => "pdp",
             Self::TypesRegistry => "types_registry",
             Self::Catalog => "catalog",
+            Self::Engine => "engine",
         }
     }
 }
@@ -116,6 +121,50 @@ pub enum DomainError {
         field: &'static str,
         /// Closed `UPPER_SNAKE` reason token.
         reason: &'static str,
+    },
+
+    // --- engine evaluation (DESIGN section 3.3) ---
+    /// The engine reported its wall-time budget spent. The partial Decision
+    /// is discarded and no counter moves (`inst-eb-timeout`).
+    #[error("engine {engine_id} exceeded its evaluation budget")]
+    EngineTimeout {
+        /// The engine that ran out of time.
+        engine_id: String,
+    },
+    /// The engine spent its cost budget before finishing.
+    #[error("engine {engine_id} exceeded its evaluation cost limit")]
+    EngineCostExceeded {
+        /// The engine that ran out of budget.
+        engine_id: String,
+    },
+    /// A Decision broke the closed Debit-Plan invariant set; nothing was
+    /// mutated (`inst-eb-violation`).
+    #[error("engine {engine_id} produced a decision violating {invariant}")]
+    InvariantViolation {
+        /// The engine whose Decision was refused.
+        engine_id: String,
+        /// Which invariant, from the closed set of four.
+        invariant: DebitPlanInvariant,
+    },
+    /// A type or internal failure inside the engine. The detail is for the
+    /// log; the response carries an opaque `Internal`.
+    #[error("engine {engine_id} failed: {detail}")]
+    EngineFailure {
+        /// The engine that failed.
+        engine_id: String,
+        /// What the engine reported.
+        detail: String,
+    },
+
+    /// A policy input failed bounded validation before persistence.
+    #[error("invalid policy {field}: {reason}: {detail}")]
+    InvalidPolicy {
+        /// Public field name.
+        field: &'static str,
+        /// Stable machine-readable reason.
+        reason: &'static str,
+        /// Safe diagnostic without the submitted configuration.
+        detail: String,
     },
 
     // --- readiness and binding ---
@@ -222,6 +271,27 @@ pub enum DomainError {
         /// Found version.
         actual: u32,
     },
+    /// An active policy already occupies the exact scope.
+    #[error("policy scope already occupied: {scope:?}")]
+    PolicyScopeOccupied {
+        /// Occupied scope.
+        scope: PolicyScope,
+    },
+    /// The policy identifier was never created.
+    #[error("policy {policy_id} not found")]
+    PolicyNotFound {
+        /// Missing policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The policy was soft-deleted and cannot be reactivated.
+    #[error("policy {policy_id} is deleted")]
+    PolicyDeleted {
+        /// Deleted policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The global fallback policy cannot be deleted.
+    #[error("cannot delete seeded global policy")]
+    CannotDeleteSeededGlobalPolicy,
     /// The named policy version does not exist.
     #[error("unknown version {version} of policy {policy_id}")]
     UnknownPolicyVersion {
@@ -377,6 +447,10 @@ impl From<StorageError> for DomainError {
             StorageError::VersionConflict { expected, actual } => {
                 Self::VersionConflict { expected, actual }
             }
+            StorageError::PolicyScopeOccupied { scope } => Self::PolicyScopeOccupied { scope },
+            StorageError::PolicyNotFound { policy_id } => Self::PolicyNotFound { policy_id },
+            StorageError::PolicyDeleted { policy_id } => Self::PolicyDeleted { policy_id },
+            StorageError::CannotDeleteSeededGlobalPolicy => Self::CannotDeleteSeededGlobalPolicy,
             StorageError::UnknownPolicyVersion { policy_id, version } => {
                 Self::UnknownPolicyVersion { policy_id, version }
             }
@@ -406,6 +480,16 @@ impl From<StorageError> for DomainError {
                 field: "cursor",
                 reason: tokens::CURSOR_INVALID,
             },
+            // The transaction evaluated and refused; the same closed failures the
+            // gear lifts when it evaluates outside one.
+            StorageError::EvaluationFailed { engine_id, failure } => {
+                super::engines::lift_evaluation(&engine_id, failure)
+            }
+            // The caller prepares the artifact and retries. Reaching this lift
+            // means the bounded retry budget was spent: an internal condition.
+            StorageError::PreparationRequired { policy_id, version } => Self::Internal(format!(
+                "artifact for policy {policy_id} version {version} was never prepared"
+            )),
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
             // Detected at bootstrap and fatal there. A runtime occurrence is a
             // contract violation of the plugin, hence internal.

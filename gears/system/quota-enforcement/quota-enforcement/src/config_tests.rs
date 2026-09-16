@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    CatalogSection, ElectionTimingConfig, GaugesSection, MetricsConfig, QuotaEnforcementConfig,
-    QuotasSection,
+    CatalogSection, ElectionTimingConfig, GaugesSection, MetricsConfig, PoliciesSection,
+    QuotaEnforcementConfig, QuotasSection,
 };
 
 #[test]
@@ -218,6 +218,146 @@ fn the_quotas_section_defaults_to_the_prd_bounds_and_rejects_each_zero_or_oversi
         .validate()
         .is_ok(),
         "a zero grace serves nothing stale and is allowed"
+    );
+}
+
+#[test]
+fn the_policies_section_defaults_to_the_feature_bounds_and_rejects_each_zero_or_oversize() {
+    let section = PoliciesSection::default();
+    let limits = section.to_limits().expect("defaults are valid");
+    assert_eq!(
+        limits.evaluation.upper_timeout_ms.get(),
+        5,
+        "feature default 5 ms"
+    );
+    assert_eq!(limits.evaluation.cost_limit.get(), 10_000);
+    assert_eq!(limits.authoring.config_bytes, 16_384);
+    assert_eq!(limits.authoring.comment_bytes, 1_024);
+    assert_eq!(limits.authoring.list_limit, 50);
+    assert_eq!(limits.artifact_cache_entries.get(), 512);
+    assert_eq!(limits.preparation_max_attempts.get(), 3);
+    assert_eq!(limits.snapshot.bytes, 65_536);
+    assert_eq!(limits.snapshot.schemas, 32);
+    assert_eq!(limits.snapshot.depth, 32);
+
+    // The clamp is what the budget is built from: a persisted request above
+    // it is cut down, a request below it is honoured, no request means 5 ms.
+    let budget = limits.evaluation.budget(Some(500)).expect("clamped");
+    assert_eq!(budget.timeout(), Duration::from_millis(5));
+    let budget = limits.evaluation.budget(Some(2)).expect("under the clamp");
+    assert_eq!(budget.timeout(), Duration::from_millis(2));
+
+    let cases: Vec<(PoliciesSection, &str)> = vec![
+        (
+            PoliciesSection {
+                evaluation_timeout_upper_ms: 0,
+                ..PoliciesSection::default()
+            },
+            "evaluation_timeout_upper_ms",
+        ),
+        (
+            PoliciesSection {
+                evaluation_timeout_upper_ms: PoliciesSection::MAX_EVALUATION_TIMEOUT_MS + 1,
+                ..PoliciesSection::default()
+            },
+            "evaluation_timeout_upper_ms",
+        ),
+        (
+            PoliciesSection {
+                evaluation_cost_limit: 0,
+                ..PoliciesSection::default()
+            },
+            "evaluation_cost_limit",
+        ),
+        (
+            PoliciesSection {
+                config_max_bytes: 0,
+                ..PoliciesSection::default()
+            },
+            "config_max_bytes",
+        ),
+        (
+            PoliciesSection {
+                config_max_bytes: PoliciesSection::MAX_CONFIG_BYTES + 1,
+                ..PoliciesSection::default()
+            },
+            "config_max_bytes",
+        ),
+        (
+            PoliciesSection {
+                comment_max_bytes: 0,
+                ..PoliciesSection::default()
+            },
+            "comment_max_bytes",
+        ),
+        (
+            PoliciesSection {
+                list_max_limit: 0,
+                ..PoliciesSection::default()
+            },
+            "list_max_limit",
+        ),
+        (
+            PoliciesSection {
+                artifact_cache_entries: 0,
+                ..PoliciesSection::default()
+            },
+            "artifact_cache_entries",
+        ),
+        (
+            PoliciesSection {
+                preparation_max_attempts: 0,
+                ..PoliciesSection::default()
+            },
+            "preparation_max_attempts",
+        ),
+        (
+            PoliciesSection {
+                snapshot_max_bytes: 0,
+                ..PoliciesSection::default()
+            },
+            "snapshot_max_bytes",
+        ),
+        (
+            PoliciesSection {
+                snapshot_max_bytes: PoliciesSection::MAX_SNAPSHOT_BYTES + 1,
+                ..PoliciesSection::default()
+            },
+            "snapshot_max_bytes",
+        ),
+        (
+            PoliciesSection {
+                snapshot_max_schemas: 0,
+                ..PoliciesSection::default()
+            },
+            "snapshot_max_schemas",
+        ),
+        (
+            PoliciesSection {
+                snapshot_max_depth: 0,
+                ..PoliciesSection::default()
+            },
+            "snapshot_max_depth",
+        ),
+    ];
+    for (section, field) in cases {
+        let err = section.validate().expect_err("rejected");
+        assert!(err.to_string().contains(field), "{field}: {err}");
+    }
+
+    let whole: QuotaEnforcementConfig =
+        serde_json::from_str(r#"{ "policies": { "evaluation_timeout_upper_ms": 20 } }"#)
+            .expect("partial section");
+    whole.validate().expect("valid");
+    assert_eq!(whole.policies.evaluation_timeout_upper_ms, 20);
+    assert_eq!(
+        whole.policies.list_max_limit, 50,
+        "untouched fields keep defaults"
+    );
+    assert!(
+        serde_json::from_str::<QuotaEnforcementConfig>(r#"{ "policies": { "timeout": 1 } }"#)
+            .is_err(),
+        "unknown keys are rejected"
     );
 }
 

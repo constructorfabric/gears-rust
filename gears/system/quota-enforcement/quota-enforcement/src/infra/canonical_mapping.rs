@@ -32,6 +32,9 @@ pub mod reason {
     pub const DEPENDENCY_UNAVAILABLE: &str = "DEPENDENCY_UNAVAILABLE";
     /// A reserved capability (`rate` Quotas in P1).
     pub const NOT_YET_IMPLEMENTED: &str = "NOT_YET_IMPLEMENTED";
+    /// An engine Decision broke the closed Debit-Plan invariant set. Carried
+    /// as the leading sub-token of an `Internal` detail (DESIGN section 3.3).
+    pub const INVARIANT_VIOLATION: &str = "INVARIANT_VIOLATION";
 }
 
 impl From<DomainError> for CanonicalError {
@@ -43,6 +46,14 @@ impl From<DomainError> for CanonicalError {
             | DomainError::ConstraintContractMismatch { .. }
             | DomainError::MetricClassificationInvalid { .. }
             | DomainError::NotYetImplemented { .. } => quota_lifecycle(err),
+
+            DomainError::InvalidPolicy {
+                field,
+                reason,
+                detail,
+            } => PolicyResource::invalid_argument()
+                .with_field_violation(field, detail, reason)
+                .create(),
 
             // --- 400 InvalidArgument ---
             DomainError::InvalidArgument { field, reason } => QuotaResource::invalid_argument()
@@ -124,24 +135,19 @@ impl From<DomainError> for CanonicalError {
                     )
                     .create()
             }
-            DomainError::UnknownPolicyVersion { policy_id, version } => {
-                PolicyResource::failed_precondition()
-                    .with_precondition_violation(
-                        format!("{policy_id}@{version}"),
-                        format!("unknown version {version} of policy {policy_id}"),
-                        "UNKNOWN_POLICY_VERSION",
-                    )
-                    .create()
-            }
-            DomainError::VersionRolledBack { policy_id, version } => {
-                PolicyResource::failed_precondition()
-                    .with_precondition_violation(
-                        format!("{policy_id}@{version}"),
-                        format!("version {version} of policy {policy_id} was rolled back"),
-                        "VERSION_ROLLED_BACK",
-                    )
-                    .create()
-            }
+            // --- engine evaluation (504 / 429 / 500) ---
+            DomainError::EngineTimeout { .. }
+            | DomainError::EngineCostExceeded { .. }
+            | DomainError::InvariantViolation { .. }
+            | DomainError::EngineFailure { .. } => engine(err),
+
+            // --- policy lifecycle, operator surface (404 / 409 / 400) ---
+            DomainError::PolicyScopeOccupied { .. }
+            | DomainError::PolicyNotFound { .. }
+            | DomainError::PolicyDeleted { .. }
+            | DomainError::CannotDeleteSeededGlobalPolicy
+            | DomainError::UnknownPolicyVersion { .. }
+            | DomainError::VersionRolledBack { .. } => policy(err),
 
             // --- 403 PermissionDenied (no PDP detail on the wire) ---
             DomainError::PdpDenied { .. } => QuotaResource::permission_denied()
@@ -297,6 +303,82 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
             reason::NOT_YET_IMPLEMENTED
         ))
         .create(),
+        other => CanonicalError::from(other),
+    }
+}
+
+/// The engine-evaluation arms (DESIGN section 3.3). The response never carries
+/// what the engine said: engine detail can quote operator config or request
+/// values, so it goes to the log and the wire gets the class of failure.
+fn engine(err: DomainError) -> CanonicalError {
+    match err {
+        DomainError::EngineTimeout { engine_id } => PolicyResource::deadline_exceeded(format!(
+            "engine {engine_id} exceeded its evaluation budget"
+        ))
+        .create(),
+        DomainError::EngineCostExceeded { engine_id } => PolicyResource::resource_exhausted(
+            format!("engine {engine_id} exceeded its evaluation cost limit"),
+        )
+        .with_quota_violation("evaluation cost", "ENGINE_COST_EXCEEDED")
+        .create(),
+        // The token leads the detail, as the 501 lift does; the invariant name
+        // is from the closed set of four and identifies no caller data.
+        DomainError::InvariantViolation { invariant, .. } => {
+            CanonicalError::internal(format!("{}: {invariant}", reason::INVARIANT_VIOLATION))
+                .create()
+        }
+        DomainError::EngineFailure { .. } => {
+            CanonicalError::internal("engine evaluation failed").create()
+        }
+        other => CanonicalError::from(other),
+    }
+}
+
+/// The policy-lifecycle arms, split out to keep `From` inside the line budget.
+fn policy(err: DomainError) -> CanonicalError {
+    match err {
+        DomainError::PolicyScopeOccupied { scope } => {
+            PolicyResource::already_exists(format!("POLICY_SCOPE_OCCUPIED: {scope:?}"))
+                .with_resource(format!("{scope:?}"))
+                .create()
+        }
+        DomainError::PolicyNotFound { policy_id } => {
+            PolicyResource::not_found(format!("policy {policy_id} not found"))
+                .with_resource(policy_id.to_string())
+                .create()
+        }
+        DomainError::PolicyDeleted { policy_id } => PolicyResource::failed_precondition()
+            .with_precondition_violation(
+                policy_id.to_string(),
+                "policy is deleted",
+                "POLICY_DELETED",
+            )
+            .create(),
+        DomainError::CannotDeleteSeededGlobalPolicy => PolicyResource::failed_precondition()
+            .with_precondition_violation(
+                "global",
+                "global policy cannot be deleted",
+                "CANNOT_DELETE_SEEDED_GLOBAL_POLICY",
+            )
+            .create(),
+        DomainError::UnknownPolicyVersion { policy_id, version } => {
+            PolicyResource::failed_precondition()
+                .with_precondition_violation(
+                    format!("{policy_id}@{version}"),
+                    format!("unknown version {version} of policy {policy_id}"),
+                    "UNKNOWN_POLICY_VERSION",
+                )
+                .create()
+        }
+        DomainError::VersionRolledBack { policy_id, version } => {
+            PolicyResource::failed_precondition()
+                .with_precondition_violation(
+                    format!("{policy_id}@{version}"),
+                    format!("version {version} of policy {policy_id} was rolled back"),
+                    "VERSION_ROLLED_BACK",
+                )
+                .create()
+        }
         other => CanonicalError::from(other),
     }
 }

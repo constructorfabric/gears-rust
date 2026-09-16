@@ -1239,22 +1239,16 @@ pub struct IdempotencyScope {
     pub key: String,
 }
 
-/// What a mutating primitive persists as the idempotency record, in the same
-/// transaction as the mutation (invariants I1 and I2).
+/// The caller's half of an idempotency record: the key and the digest a replay
+/// is compared against. What is recorded under it — the decision and the policy
+/// that produced it — is the transaction's own, never the caller's, so a replay
+/// returns what actually happened (invariants I1 and I2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyWrite {
     /// Full scope.
     pub scope: IdempotencyScope,
     /// Canonical payload digest for replay comparison.
     pub payload_hash: PayloadHash,
-    /// The outcome to replay verbatim.
-    pub decision: Decision,
-    /// Engine that produced the decision.
-    pub engine_id: String,
-    /// Policy that produced the decision.
-    pub policy_id: PolicyId,
-    /// Policy version that produced the decision.
-    pub policy_version: u32,
 }
 
 /// A stored idempotency record.
@@ -1266,12 +1260,13 @@ pub struct IdempotencyRecord {
     pub payload_hash: PayloadHash,
     /// Schema-versioned decision blob (top-level `__version`).
     pub decision_blob: Value,
-    /// Engine that produced the decision.
-    pub engine_id: String,
-    /// Policy that produced the decision.
-    pub policy_id: PolicyId,
-    /// Policy version that produced the decision.
-    pub policy_version: u32,
+    /// Engine that produced the decision. Absent for a primitive that
+    /// evaluates no policy, such as an operator credit.
+    pub engine_id: Option<String>,
+    /// Policy that produced the decision, when one was selected.
+    pub policy_id: Option<PolicyId>,
+    /// Version of that policy, when one was selected.
+    pub policy_version: Option<u32>,
     /// Record creation time.
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
@@ -1284,6 +1279,20 @@ pub struct IdempotencyRecord {
 // Events and mutation results
 // ---------------------------------------------------------------------------
 
+/// Ownership of an event. Platform policy events have no tenant identity.
+/// Tenant events retain their top-level `tenant_id` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NotificationScope {
+    /// A tenant-owned Quota, lease, or consumption event.
+    Tenant {
+        /// Owning tenant.
+        tenant_id: TenantId,
+    },
+    /// A platform-wide policy event, independent of the operator's tenant.
+    Platform,
+}
+
 /// Same-transaction outbox event (invariant I11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationEvent {
@@ -1291,8 +1300,9 @@ pub struct NotificationEvent {
     pub event_id: EventId,
     /// Catalog kind.
     pub kind: NotificationEventKind,
-    /// Owning tenant.
-    pub tenant_id: TenantId,
+    /// Explicit ownership scope; platform events never carry a synthetic tenant.
+    #[serde(flatten)]
+    pub scope: NotificationScope,
     /// Target Quota, when applicable.
     #[serde(default)]
     pub quota_id: Option<QuotaId>,
@@ -1378,11 +1388,37 @@ pub struct ExpiredLease {
 pub struct BatchDebitItem {
     /// The item's applicable subject set.
     pub applicable: ApplicableQuotas,
-    /// The item's debit plan.
-    pub plan: DebitPlan,
+    /// The item's requested amount. The plan is the transaction's to compute.
+    pub amount: u64,
+    /// Validated request projection value for this item.
+    pub request: Value,
+    /// Validated resource projection value, `null` when the item has none.
+    pub resource: Value,
     /// Optional per-item idempotency scope.
     #[serde(default)]
     pub item_scope: Option<IdempotencyScope>,
+}
+
+/// What an evaluated mutation committed: the decision the transaction's own
+/// engine invocation produced, and the counters the applied plan left behind.
+/// A denial commits no counter change and still occupies the idempotency key,
+/// so replaying a denial denies again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluatedDebit {
+    /// The decision the transaction evaluated, validated before any mutation.
+    pub decision: Decision,
+    /// Counter state after the plan; empty counters on a denial.
+    pub mutation: MutationResult,
+}
+
+/// What an evaluated lease acquisition committed. A denied acquisition holds
+/// nothing and carries no token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluatedLease {
+    /// The decision the transaction evaluated.
+    pub decision: Decision,
+    /// The acquired lease, absent when the decision denied the operation.
+    pub token: Option<LeaseToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,10 +1492,91 @@ pub enum PolicyScope {
     },
 }
 
+/// Whether a policy transition actually moved state, or replayed a settled one.
+///
+/// A replayed rollback onto the already-active target, or a repeated delete of
+/// an already-deleted policy, commits no audit row and enqueues no event. The
+/// caller must therefore not count a `policy_version_transitions_total` for it,
+/// which is why the distinction is a variant rather than a flag: matching is
+/// the only way to reach the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionOutcome<T> {
+    /// State moved; the audit row and events committed with it.
+    Applied(T),
+    /// Nothing changed; no audit row and no event were written.
+    NoOp(T),
+}
+
+impl<T> TransitionOutcome<T> {
+    /// The value either way, discarding whether it moved.
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Applied(value) | Self::NoOp(value) => value,
+        }
+    }
+
+    /// Borrow the value either way.
+    pub const fn get(&self) -> &T {
+        match self {
+            Self::Applied(value) | Self::NoOp(value) => value,
+        }
+    }
+
+    /// Whether state actually moved, and so whether a transition may be counted.
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
+/// Public create input. Actor identity and validation snapshots are server-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySpec {
+    /// Scope.
+    pub scope: PolicyScope,
+    /// Registered engine identifier.
+    pub engine_id: String,
+    /// Engine-validated configuration.
+    pub engine_config: Value,
+    /// Per-policy evaluation timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Operator description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Public update input. Creates a new immutable version after operator admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyPatch {
+    /// Expected current version. Lost-update protection.
+    pub if_match_version: u32,
+    /// New engine identifier.
+    #[serde(default)]
+    pub engine_id: Option<String>,
+    /// New engine configuration.
+    #[serde(default)]
+    pub engine_config: Option<Value>,
+    /// New timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 /// Create input for a Policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDraft {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: crate::engine::PolicySchemaSnapshot,
     /// Scope.
     pub scope: PolicyScope,
     /// Registered engine identifier.
@@ -1483,6 +1600,9 @@ pub struct PolicyDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyUpdate {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: Option<crate::engine::PolicySchemaSnapshot>,
     /// Expected current version. Lost-update protection.
     pub if_match_version: u32,
     /// New engine identifier.
@@ -1504,6 +1624,9 @@ pub struct PolicyUpdate {
 /// One immutable Policy version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyVersion {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: crate::engine::PolicySchemaSnapshot,
     /// Stable policy identifier.
     pub policy_id: PolicyId,
     /// Monotonic version number, first version is 1.
@@ -1514,7 +1637,8 @@ pub struct PolicyVersion {
     pub engine_id: String,
     /// Engine configuration.
     pub engine_config: Value,
-    /// Evaluation timeout in milliseconds.
+    /// Requested timeout in milliseconds; `None` uses the default.
+    /// Clamp against the loaded operator bound on each evaluation.
     pub timeout_ms: Option<u64>,
     /// Operator description.
     pub description: Option<String>,

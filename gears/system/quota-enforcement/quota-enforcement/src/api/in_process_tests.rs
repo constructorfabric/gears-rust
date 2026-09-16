@@ -62,6 +62,7 @@ fn unbound_service() -> Arc<Service> {
             list_max_limit: 500,
             list_max_ids: 100,
         },
+        crate::test_support::policy_limits(),
     ))
 }
 
@@ -78,6 +79,11 @@ async fn bound_service() -> Arc<Service> {
         .expect("catalogue");
     service
         .bind(Bound {
+            engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+            artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
+                std::num::NonZeroUsize::new(256).expect("capacity"),
+                std::num::NonZeroUsize::new(2).expect("permits"),
+            )),
             storage: Arc::new(InMemoryStorage::new()),
             coordinator: Arc::new(NoopCoordinator),
             catalog: Arc::new(catalog),

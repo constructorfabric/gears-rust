@@ -145,6 +145,8 @@ members = [
     "gears/system/quota-enforcement/quota-enforcement-sdk",
     "gears/system/quota-enforcement/quota-enforcement",
     "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
+    "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive",
+    "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
@@ -299,6 +301,8 @@ string_lit_as_bytes = "deny"
 verbose_file_reads = "deny"
 
 [workspace.dependencies]
+cel-core = "=0.5.1"
+quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.7.3", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.15", path = "libs/toolkit-http" }
@@ -374,6 +378,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.4.0
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.1", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.11", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.9", path = "gears/system/usage-collector/usage-collector-sdk" }
+quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 
 # BSS gears (ported from vhp-core)

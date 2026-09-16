@@ -10,8 +10,10 @@ use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ActiveQuotaCounts, DeactivateOutcome, EventId, NotificationEvent, NotificationEventKind,
-    PageRequest, PageResult, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId,
-    QuotaPatch, SubjectRef, TenantId,
+    PageRequest, PageResult, PolicyDraft, PolicyId, PolicySchemaSnapshot, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError, SubjectRef, TenantId,
+    TransitionOutcome,
 };
 use sea_orm::EntityTrait;
 use sea_orm_migration::MigratorTrait;
@@ -21,10 +23,10 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::{OutboxHandle, OutboxMessageId};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db, connect_db};
-use toolkit_security::AccessScope;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use crate::domain::ports::{Actor, QuotaStore, StoreError};
+use crate::domain::ports::{Actor, PolicyStore, QuotaStore, StoreError};
 use crate::infra::outbox::{EnqueueError, NotificationEnqueuer, QeOutbox, start_outbox};
 use crate::infra::storage::Migrator;
 
@@ -105,7 +107,7 @@ pub fn quota_changed(tenant: TenantId) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
-        tenant_id: tenant,
+        scope: quota_enforcement_sdk::NotificationScope::Tenant { tenant_id: tenant },
         quota_id: None,
         policy_id: None,
         subject: None,
@@ -275,5 +277,159 @@ impl QuotaStore for FakeQuotaStore {
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError> {
         self.check(None)?;
         Ok(ActiveQuotaCounts::default())
+    }
+}
+
+/// A policy store double that records seeding attempts and can pretend the
+/// global scope is already occupied, so bootstrap's idempotence is testable
+/// without a database.
+#[derive(Default)]
+pub struct FakePolicyStore {
+    occupied: Mutex<Option<PolicyVersion>>,
+    creates: Mutex<Vec<PolicyDraft>>,
+    fail: Mutex<Option<StorageError>>,
+}
+
+impl FakePolicyStore {
+    /// A store whose global scope already holds `existing`.
+    pub fn holding(existing: PolicyVersion) -> Self {
+        Self {
+            occupied: Mutex::new(Some(existing)),
+            ..Self::default()
+        }
+    }
+
+    /// A store whose create loses the seeding race with `error`.
+    pub fn refusing(error: StorageError) -> Self {
+        Self {
+            fail: Mutex::new(Some(error)),
+            ..Self::default()
+        }
+    }
+
+    /// Every draft a create was asked to persist.
+    pub fn creates(&self) -> Vec<PolicyDraft> {
+        self.creates.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl PolicyStore for FakePolicyStore {
+    async fn create_policy(
+        &self,
+        _ctx: &SecurityContext,
+        draft: PolicyDraft,
+        _events: &[NotificationEvent],
+    ) -> Result<PolicyVersion, StorageError> {
+        self.creates.lock().expect("lock").push(draft.clone());
+        if let Some(error) = self.fail.lock().expect("lock").clone() {
+            return Err(error);
+        }
+        Ok(seeded_version(draft))
+    }
+
+    async fn update_policy(
+        &self,
+        _ctx: &SecurityContext,
+        policy_id: PolicyId,
+        _update: PolicyUpdate,
+        _events: &[NotificationEvent],
+    ) -> Result<PolicyVersion, StorageError> {
+        Err(StorageError::PolicyNotFound { policy_id })
+    }
+
+    async fn rollback_policy(
+        &self,
+        _ctx: &SecurityContext,
+        policy_id: PolicyId,
+        _target_version: u32,
+        _comment: Option<String>,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
+        Err(StorageError::PolicyNotFound { policy_id })
+    }
+
+    async fn delete_policy(
+        &self,
+        _ctx: &SecurityContext,
+        policy_id: PolicyId,
+        _comment: Option<String>,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<()>, StorageError> {
+        Err(StorageError::PolicyNotFound { policy_id })
+    }
+
+    async fn read_policy(
+        &self,
+        _scope: &PolicyScope,
+    ) -> Result<Option<PolicyVersion>, StorageError> {
+        Ok(self.occupied.lock().expect("lock").clone())
+    }
+
+    async fn read_active_policy_by_id(
+        &self,
+        _policy_id: &PolicyId,
+    ) -> Result<Option<PolicyVersion>, StorageError> {
+        Ok(self.occupied.lock().expect("lock").clone())
+    }
+
+    async fn read_active_policies(&self) -> Result<Vec<PolicyVersion>, StorageError> {
+        Ok(self
+            .occupied
+            .lock()
+            .expect("lock")
+            .clone()
+            .into_iter()
+            .collect())
+    }
+
+    async fn read_policy_version(
+        &self,
+        _policy_id: &PolicyId,
+        _version: u32,
+    ) -> Result<Option<PolicyVersion>, StorageError> {
+        Ok(None)
+    }
+
+    async fn list_policy_versions(
+        &self,
+        policy_id: &PolicyId,
+        _page: PageRequest,
+    ) -> Result<PageResult<PolicyVersionMeta>, StorageError> {
+        Err(StorageError::PolicyNotFound {
+            policy_id: policy_id.clone(),
+        })
+    }
+}
+
+/// The version a seeding create would have written.
+pub fn seeded_version(draft: PolicyDraft) -> PolicyVersion {
+    PolicyVersion {
+        policy_id: PolicyId::global(),
+        version: 1,
+        scope: draft.scope,
+        engine_id: draft.engine_id,
+        engine_config: draft.engine_config,
+        timeout_ms: draft.timeout_ms,
+        description: draft.description,
+        state: PolicyVersionState::Active,
+        created_at: OffsetDateTime::now_utc(),
+        created_by: draft.created_by,
+        comment: draft.comment,
+        schema_snapshot: draft.schema_snapshot,
+    }
+}
+
+/// The `most-restrictive-wins` global policy the gear seeds at bootstrap.
+pub fn global_policy_draft() -> PolicyDraft {
+    PolicyDraft {
+        scope: PolicyScope::Global,
+        engine_id: "most-restrictive-wins".to_owned(),
+        engine_config: json!({}),
+        timeout_ms: None,
+        description: Some("platform default resolution policy".to_owned()),
+        comment: Some("seeded at bootstrap".to_owned()),
+        created_by: String::new(),
+        schema_snapshot: PolicySchemaSnapshot::default(),
     }
 }

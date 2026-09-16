@@ -234,3 +234,33 @@ async fn extra_properties_reach_the_pdp_and_never_override_the_target_tenant() {
         "the explicit target tenant is authoritative"
     );
 }
+
+#[tokio::test]
+async fn platform_operator_accepts_explicit_unconstrained_permit() {
+    let (admission, metrics) = admission(Arc::new(PermitUnconstrainedPdp));
+    let admitted = admission
+        .admit_operator(&ctx(), actions::CREATE)
+        .await
+        .expect("operator permit");
+    assert!(admitted.access_scope().is_unconstrained());
+    assert!(metrics.denials().is_empty());
+}
+
+#[tokio::test]
+async fn platform_operator_rejects_denial_unavailability_and_row_constraints() {
+    let (denied, _) = admission(Arc::new(DenyAllPdp));
+    assert!(matches!(
+        denied.admit_operator(&ctx(), actions::CREATE).await,
+        Err(DomainError::PdpDenied { .. })
+    ));
+    let (unavailable, _) = admission(Arc::new(FailingPdp));
+    assert!(matches!(
+        unavailable.admit_operator(&ctx(), actions::CREATE).await,
+        Err(DomainError::PdpUnavailable { .. })
+    ));
+    let (constrained, _) = admission(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])));
+    assert!(matches!(
+        constrained.admit_operator(&ctx(), actions::CREATE).await,
+        Err(DomainError::PdpDenied { .. })
+    ));
+}

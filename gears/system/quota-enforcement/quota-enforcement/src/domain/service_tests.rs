@@ -29,6 +29,7 @@ fn service() -> Service {
         Admission::new(enforcer, Arc::new(NoopMetrics)),
         Arc::new(Readiness::new()),
         limits(),
+        crate::test_support::policy_limits(),
     )
 }
 
@@ -63,6 +64,11 @@ fn dependencies_are_not_ready_until_bound_and_bind_happens_once() {
     );
 
     let bound = Bound {
+        engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+        artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
+            std::num::NonZeroUsize::new(256).expect("capacity"),
+            std::num::NonZeroUsize::new(2).expect("permits"),
+        )),
         storage: Arc::new(InMemoryStorage::new()),
         coordinator: Arc::new(NoopCoordinator),
         catalog: Arc::new(ProjectionContractCatalog::empty()),

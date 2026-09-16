@@ -12,7 +12,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use quota_enforcement_sdk::{NotificationEvent, TenantId};
+use quota_enforcement_sdk::{NotificationEvent, NotificationScope, TenantId};
 use toolkit_db::Db;
 use toolkit_db::outbox::{EnqueueMessage, Outbox, OutboxError, OutboxHandle, OutboxMessageId};
 use toolkit_db::secure::DBRunner;
@@ -115,7 +115,11 @@ impl NotificationEnqueuer for QeOutbox {
             .iter()
             .zip(payloads)
             .map(|(event, payload)| EnqueueMessage {
-                partition: Self::partition_for(event.tenant_id),
+                partition: match event.scope {
+                    NotificationScope::Tenant { tenant_id } => Self::partition_for(tenant_id),
+                    // All policy transitions share one ordered platform stream.
+                    NotificationScope::Platform => 0,
+                },
                 payload,
                 payload_type: event.kind.as_str(),
             })

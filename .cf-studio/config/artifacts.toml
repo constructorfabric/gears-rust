@@ -347,6 +347,26 @@ name = "Storage Plugin Tests"
 path = "{system_root}/plugins/{system}-storage-plugin/tests"
 extensions = [".rs"]
 
+[[systems.autodetect.codebase]]
+name = "Most Restrictive Engine src"
+path = "{system_root}/plugins/{system}-engine-most-restrictive/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Most Restrictive Engine tests"
+path = "{system_root}/plugins/{system}-engine-most-restrictive/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "CEL Engine src"
+path = "{system_root}/plugins/{system}-engine-cel/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "CEL Engine tests"
+path = "{system_root}/plugins/{system}-engine-cel/tests"
+extensions = [".rs"]
+
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
 # Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
 # artifacts are detected as belonging to tr-plugin, not to account-management.

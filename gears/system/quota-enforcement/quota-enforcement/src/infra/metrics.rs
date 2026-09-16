@@ -13,12 +13,13 @@
 use std::sync::Arc;
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Meter, ObservableGauge};
+use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 
 use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::LifecycleCounts;
 use crate::domain::ports::metrics::{
-    DenialReason, QeMetrics, REASON_LABEL, SURFACE_LABEL, ValidationReason, ValidationSurface,
+    DenialReason, EngineLabel, PolicyTransition, QeMetrics, REASON_LABEL, SURFACE_LABEL,
+    ValidationReason, ValidationSurface,
 };
 use crate::infra::lifecycle_gauges::{
     LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
@@ -38,6 +39,11 @@ pub const ADMITTED_METRIC_VIOLATIONS_TOTAL: &str = "admitted_metric_violations_t
 // @cpt-dod:cpt-cf-quota-enforcement-dod-telemetry-conventions:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-contract-validation-telemetry:p1
 pub struct QeMetricsMeter {
+    engine_bootstrap_failures: Counter<u64>,
+    engine_evaluation: Histogram<f64>,
+    plan_violations: Counter<u64>,
+    policy_transitions: Counter<u64>,
+    policy_conflicts: Counter<u64>,
     denials: Counter<u64>,
     contract_validation_failures: Counter<u64>,
     admitted_metric_violations: Counter<u64>,
@@ -93,6 +99,22 @@ impl QeMetricsMeter {
         ];
         // @cpt-end:cpt-cf-quota-enforcement-algo-telemetry-emission:p1:inst-tel-closed
         Self {
+            engine_bootstrap_failures: meter
+                .u64_counter(config.instrument_name("engine_bootstrap_failures_total"))
+                .build(),
+            engine_evaluation: meter
+                .f64_histogram(config.instrument_name("engine_evaluation_seconds"))
+                .with_unit("s")
+                .build(),
+            plan_violations: meter
+                .u64_counter(config.instrument_name("debit_plan_invariant_violations_total"))
+                .build(),
+            policy_transitions: meter
+                .u64_counter(config.instrument_name("policy_version_transitions_total"))
+                .build(),
+            policy_conflicts: meter
+                .u64_counter(config.instrument_name("policy_version_conflict_rejections_total"))
+                .build(),
             denials,
             contract_validation_failures,
             admitted_metric_violations,
@@ -125,6 +147,39 @@ impl QeMetricsMeter {
 }
 
 impl QeMetrics for QeMetricsMeter {
+    fn record_engine_bootstrap_failure(&self, engine: EngineLabel) {
+        self.engine_bootstrap_failures
+            .add(1, &[KeyValue::new("engine_id", engine.as_label())]);
+    }
+    fn record_engine_evaluation(&self, engine: EngineLabel, elapsed: std::time::Duration) {
+        self.engine_evaluation.record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new("engine_id", engine.as_label())],
+        );
+    }
+    fn record_plan_violation(
+        &self,
+        engine: EngineLabel,
+        invariant: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    ) {
+        self.plan_violations.add(
+            1,
+            &[
+                KeyValue::new("engine_id", engine.as_label()),
+                KeyValue::new("invariant", invariant.to_string()),
+            ],
+        );
+    }
+    fn record_policy_transition(&self, transition: PolicyTransition) {
+        self.policy_transitions.add(
+            1,
+            &[KeyValue::new("transition_kind", transition.as_label())],
+        );
+    }
+    fn record_policy_conflict(&self) {
+        self.policy_conflicts.add(1, &[]);
+    }
+
     fn record_denial(&self, reason: DenialReason) {
         self.add_denial(reason);
     }

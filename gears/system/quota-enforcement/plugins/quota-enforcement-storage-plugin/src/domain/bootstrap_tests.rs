@@ -5,9 +5,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use quota_enforcement_sdk::{BootstrapBundle, CONTRACT_MAJOR, ConfigDefaults, StorageError};
+use quota_enforcement_sdk::{
+    BootstrapBundle, CONTRACT_MAJOR, ConfigDefaults, PolicyScope, PolicyVersion, StorageError,
+};
 use sea_orm::{ActiveValue, EntityTrait};
 use sea_orm_migration::MigratorTrait;
+use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{SecureEntityExt, secure_insert};
@@ -15,14 +18,14 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 use toolkit_security::AccessScope;
 
 use super::StoragePlugin;
-use crate::domain::ports::{FoundationStore, SeedReport, StoreError};
+use crate::domain::ports::{FoundationStore, PolicyStore, SeedReport, StoreError};
 use crate::infra::storage::entity::{
     DEFAULT_KEY, contention_timeout_config, idempotency_retention_config, lease_capacity_config,
     schema_meta,
 };
 use crate::infra::storage::repo::config_repo;
 use crate::infra::storage::{Migrator, SqlFoundationStore};
-use crate::test_support::FakeQuotaStore;
+use crate::test_support::{FakePolicyStore, FakeQuotaStore, global_policy_draft, seeded_version};
 
 async fn test_db() -> Db {
     let opts = ConnectOpts {
@@ -54,11 +57,16 @@ fn sql_plugin(db: &Db) -> StoragePlugin {
     StoragePlugin::new(
         Arc::new(SqlFoundationStore::new(db.clone())),
         Arc::new(FakeQuotaStore::default()),
+        Arc::new(FakePolicyStore::default()),
     )
 }
 
 fn fake_plugin(store: FakeStore) -> StoragePlugin {
-    StoragePlugin::new(Arc::new(store), Arc::new(FakeQuotaStore::default()))
+    StoragePlugin::new(
+        Arc::new(store),
+        Arc::new(FakeQuotaStore::default()),
+        Arc::new(FakePolicyStore::default()),
+    )
 }
 
 /// Store double for the domain-only paths: no database involved.
@@ -290,4 +298,106 @@ async fn a_default_that_does_not_fit_its_column_is_an_internal_error() {
     assert!(matches!(err, StorageError::Internal(_)), "{err:?}");
     assert!(err.to_string().contains("contention_timeout_ms"), "{err}");
     assert_eq!(count::<contention_timeout_config::Entity>(&db).await, 0);
+}
+
+/// The bundle a gear that has registered its engines supplies.
+fn seeding_bundle() -> BootstrapBundle {
+    BootstrapBundle {
+        global_policy: Some(global_policy_draft()),
+        ..BootstrapBundle::foundation()
+    }
+}
+
+#[tokio::test]
+async fn a_bundle_without_a_global_policy_seeds_none() {
+    let policies = Arc::new(FakePolicyStore::default());
+    let db = test_db().await;
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db)),
+        Arc::new(FakeQuotaStore::default()),
+        Arc::clone(&policies) as Arc<dyn PolicyStore>,
+    );
+    plugin
+        .bootstrap(&BootstrapBundle::foundation())
+        .await
+        .expect("bootstrap");
+    assert!(
+        policies.creates().is_empty(),
+        "a gear with no registered engine seeds no policy"
+    );
+}
+
+#[tokio::test]
+async fn the_global_policy_is_seeded_once_and_never_reset() {
+    let policies = Arc::new(FakePolicyStore::default());
+    let db = test_db().await;
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db.clone())),
+        Arc::new(FakeQuotaStore::default()),
+        Arc::clone(&policies) as Arc<dyn PolicyStore>,
+    );
+    plugin.bootstrap(&seeding_bundle()).await.expect("first");
+    let seeded = policies.creates();
+    assert_eq!(seeded.len(), 1);
+    assert_eq!(seeded[0].engine_id, "most-restrictive-wins");
+    assert_eq!(seeded[0].engine_config, json!({}));
+    assert_eq!(seeded[0].scope, PolicyScope::Global);
+
+    // An operator has since updated the global policy. A later bootstrap must
+    // find the scope occupied and leave their version alone, which is why the
+    // check is a scope read and not a blind insert.
+    let operator_version = PolicyVersion {
+        engine_id: "cel".to_owned(),
+        version: 7,
+        ..seeded_version(global_policy_draft())
+    };
+    let occupied = Arc::new(FakePolicyStore::holding(operator_version));
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db)),
+        Arc::new(FakeQuotaStore::default()),
+        Arc::clone(&occupied) as Arc<dyn PolicyStore>,
+    );
+    plugin.bootstrap(&seeding_bundle()).await.expect("second");
+    assert!(
+        occupied.creates().is_empty(),
+        "repeated bootstrap never resets an operator-updated global policy"
+    );
+}
+
+#[tokio::test]
+async fn losing_the_seeding_race_is_success_and_any_other_failure_is_not() {
+    let db = test_db().await;
+    let raced = Arc::new(FakePolicyStore::refusing(
+        StorageError::PolicyScopeOccupied {
+            scope: PolicyScope::Global,
+        },
+    ));
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db.clone())),
+        Arc::new(FakeQuotaStore::default()),
+        Arc::clone(&raced) as Arc<dyn PolicyStore>,
+    );
+    // Two replicas both saw an empty scope. The live-scope unique index picks
+    // one; the loser's policy is the winner's, so it is ready either way.
+    plugin
+        .bootstrap(&seeding_bundle())
+        .await
+        .expect("a concurrent replica seeding first is not a failure");
+    assert_eq!(raced.creates().len(), 1);
+
+    let broken = Arc::new(FakePolicyStore::refusing(StorageError::Internal(
+        "disk".to_owned(),
+    )));
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db)),
+        Arc::new(FakeQuotaStore::default()),
+        broken,
+    );
+    assert!(
+        matches!(
+            plugin.bootstrap(&seeding_bundle()).await,
+            Err(StorageError::Internal(_))
+        ),
+        "a real seeding failure fails readiness"
+    );
 }

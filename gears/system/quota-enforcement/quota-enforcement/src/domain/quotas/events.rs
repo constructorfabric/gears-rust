@@ -49,7 +49,7 @@ pub fn quota_changed(
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
-        tenant_id,
+        scope: quota_enforcement_sdk::NotificationScope::Tenant { tenant_id },
         quota_id,
         policy_id: None,
         subject,

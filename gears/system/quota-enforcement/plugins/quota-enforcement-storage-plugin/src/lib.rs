@@ -20,4 +20,4 @@ pub use gear::StoragePluginGear;
 pub use infra::outbox::{
     NOTIFICATION_PARTITIONS, NOTIFICATION_QUEUE, NotificationEnqueuer, QeOutbox, start_outbox,
 };
-pub use infra::storage::{OUTBOX_TABLE_PREFIX, SqlFoundationStore, SqlQuotaStore};
+pub use infra::storage::{OUTBOX_TABLE_PREFIX, SqlFoundationStore, SqlPolicyStore, SqlQuotaStore};

@@ -11,7 +11,7 @@ use tracing::info;
 use crate::config::StoragePluginConfig;
 use crate::domain::StoragePlugin;
 use crate::infra::outbox::{NotificationEnqueuer, QeOutbox};
-use crate::infra::storage::{SqlFoundationStore, SqlQuotaStore};
+use crate::infra::storage::{SqlFoundationStore, SqlPolicyStore, SqlQuotaStore};
 
 /// GTS instance segment this backend will register under once the full
 /// `QuotaEnforcementStoragePluginV1` implementation is wired.
@@ -75,6 +75,7 @@ impl Gear for StoragePluginGear {
         let plugin = Arc::new(StoragePlugin::new(
             Arc::new(SqlFoundationStore::new(db.db())),
             Arc::new(SqlQuotaStore::new(db.db(), self.notification_enqueuer())),
+            Arc::new(SqlPolicyStore::new(db.db(), self.notification_enqueuer())),
         ));
         self.plugin
             .set(plugin)

@@ -46,6 +46,18 @@
 //!   rule against the row it read, but two concurrent patches can each pass
 //!   that check; storage is authoritative.
 //!
+//! # In-transaction evaluation
+//!
+//! `apply_debit_plan`, `apply_batch_debit` and `acquire_lease` accept no
+//! decision. The plugin selects the applicable policy, materializes the engine
+//! environment from rows it has already locked, and calls the caller's
+//! synchronous evaluator inside the transaction. The decision that comes back
+//! is validated before a counter moves and is recorded with the mutation, so
+//! what a replay returns is what the transaction did. A compiled artifact the
+//! transaction cannot find is not a failure of the operation: it rolls back
+//! and reports [`StorageError::PreparationRequired`], and the caller compiles
+//! outside any transaction and calls again.
+//!
 //! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
 //! and binds it through `SecureConn`. No scoped operation runs without it.
 
@@ -56,12 +68,14 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 
+use crate::engine::{EvaluationFailure, EvaluationLimits, TransactionEvaluator};
 use crate::models::{
     ActiveQuotaCounts, ApplicableQuotas, BatchDebitItem, BootstrapBundle, ConfigDefaults,
-    DeactivateOutcome, DebitPlan, ExpiredLease, IdempotencyRecord, IdempotencyScope,
-    IdempotencyWrite, LeaseToken, MutationResult, NotificationEvent, PageRequest, PageResult,
-    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
+    DeactivateOutcome, EvaluatedDebit, EvaluatedLease, ExpiredLease, IdempotencyRecord,
+    IdempotencyScope, IdempotencyWrite, LeaseToken, MutationResult, NotificationEvent, PageRequest,
+    PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
     ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
+    TransitionOutcome,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -124,6 +138,27 @@ pub enum StorageError {
         /// Version found in storage.
         actual: u32,
     },
+    /// An active policy already occupies the exact scope.
+    #[error("policy scope already occupied: {scope:?}")]
+    PolicyScopeOccupied {
+        /// Occupied scope.
+        scope: PolicyScope,
+    },
+    /// The policy identifier was never created.
+    #[error("policy {policy_id} not found")]
+    PolicyNotFound {
+        /// Missing policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The policy was soft-deleted and cannot be reactivated.
+    #[error("policy {policy_id} is deleted")]
+    PolicyDeleted {
+        /// Deleted policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The global fallback policy cannot be deleted.
+    #[error("cannot delete seeded global policy")]
+    CannotDeleteSeededGlobalPolicy,
     /// The named policy version does not exist.
     #[error("unknown version {version} of policy {policy_id}")]
     UnknownPolicyVersion {
@@ -201,6 +236,28 @@ pub enum StorageError {
     #[error("malformed continuation cursor")]
     InvalidCursor,
 
+    // --- in-transaction evaluation ---
+    /// The policy the transaction selected has no resident compiled artifact.
+    /// Nothing was written and the transaction rolled back: compile the named
+    /// version outside any transaction, publish it, and call again. The retry
+    /// budget is the caller's (`preparation_max_attempts`).
+    #[error("policy {policy_id} version {version} must be prepared before evaluation")]
+    PreparationRequired {
+        /// Policy the transaction selected.
+        policy_id: PolicyId,
+        /// Version it selected.
+        version: u32,
+    },
+    /// The engine refused, or its decision violated a shared plan invariant.
+    /// The transaction rolled back; no counter moved and no record was kept.
+    #[error("evaluation by engine `{engine_id}` failed: {failure}")]
+    EvaluationFailed {
+        /// Engine of the policy the transaction selected.
+        engine_id: String,
+        /// The closed engine or invariant failure, for the caller to lift.
+        failure: EvaluationFailure,
+    },
+
     // --- operational ---
     /// Transport or backend reachability failure.
     #[error("storage backend unavailable: {0}")]
@@ -216,6 +273,54 @@ pub enum StorageError {
     /// Last-resort opaque failure.
     #[error("storage plugin internal error: {0}")]
     Internal(String),
+}
+
+/// One mutation the plugin evaluates inside its own transaction.
+///
+/// The caller supplies the request-shaped half of the environment and the
+/// bounds its configuration fixes. Everything the decision depends on —
+/// which policy applies, what the counters currently are — is read by the
+/// transaction under its own locks, so no decision can be computed against a
+/// state the mutation does not then apply to.
+pub struct EvaluatedMutation<'a> {
+    /// PDP-authorized, catalogue-mapped subject set of the operation.
+    pub applicable: &'a ApplicableQuotas,
+    /// Requested amount.
+    pub amount: u64,
+    /// Validated request projection value.
+    pub request: &'a serde_json::Value,
+    /// Validated resource projection value, `null` when the operation has none.
+    pub resource: &'a serde_json::Value,
+    /// The owner projection the catalogue resolved as this metric's user tier.
+    /// Every other projection is the tenant fallback tier.
+    pub user_projection: Option<&'a gts::GtsTypeId>,
+    /// The operator clamp this deployment loaded. The budget is resolved from
+    /// it against the policy the transaction selects, never before: the caller
+    /// does not know which version that will be, and an activation between the
+    /// two would otherwise apply the previous version's requested timeout.
+    pub limits: EvaluationLimits,
+    /// Idempotency key and payload digest. The record written under it carries
+    /// the decision this transaction produced.
+    pub idempotency: &'a IdempotencyWrite,
+    /// Synchronous, side-effect-free evaluation callback. It performs no I/O,
+    /// holds no database handle, and may be retried after preparation.
+    pub evaluate: &'a TransactionEvaluator<'a>,
+}
+
+/// An atomic batch under one envelope key. Every item is evaluated and applied
+/// in the same transaction, or none is.
+pub struct EvaluatedBatch<'a> {
+    /// Envelope idempotency key and payload digest.
+    pub envelope: &'a IdempotencyWrite,
+    /// The items, each carrying its own subject set and requested amount.
+    pub items: &'a [BatchDebitItem],
+    /// The owner projection resolved as the user tier, shared by every item.
+    pub user_projection: Option<&'a gts::GtsTypeId>,
+    /// The operator clamp each item's budget is resolved from, against the
+    /// policy that item's evaluation selects.
+    pub limits: EvaluationLimits,
+    /// Synchronous, side-effect-free evaluation callback.
+    pub evaluate: &'a TransactionEvaluator<'a>,
 }
 
 /// Pluggable persistence for Quotas, counters, leases, policies, idempotency
@@ -357,26 +462,45 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- counter mutation ---
 
-    /// Apply a debit plan atomically across every named Quota.
+    /// Select the applicable policy, evaluate it against the locked Quota rows,
+    /// and apply the resulting plan atomically (I1, I2, I9).
+    ///
+    /// The plan is the transaction's, never the caller's: selection walks from
+    /// the metric policy to the global fallback inside the same transaction
+    /// that mutates the counters.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::PreparationRequired`] when the selected version has no
+    ///   resident artifact. Nothing was written; prepare and call again.
+    /// - [`StorageError::EvaluationFailed`] when the engine refused or its
+    ///   decision violated a plan invariant. Nothing was written.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay with a
+    ///   different payload (I2).
+    /// - [`StorageError::QuotaDeactivated`] when a planned Quota is inactive.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn apply_debit_plan(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
-        applicable: &ApplicableQuotas,
-        plan: &DebitPlan,
-        idempotency: &IdempotencyWrite,
+        mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError>;
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
 
-    /// Apply an atomic batch of debit plans under one envelope key.
+    /// Evaluate and apply every item of an atomic batch under one envelope key.
+    /// A failure on any item leaves the whole batch unwritten.
+    ///
+    /// # Errors
+    ///
+    /// The variants of [`QuotaEnforcementStoragePluginV1::apply_debit_plan`],
+    /// raised for the first item that fails.
     async fn apply_batch_debit(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
-        envelope: &IdempotencyWrite,
-        items: &[BatchDebitItem],
+        batch: &EvaluatedBatch<'_>,
         events: &[NotificationEvent],
-    ) -> Result<Vec<MutationResult>, StorageError>;
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError>;
 
     /// Credit one named Quota.
     async fn apply_credit(
@@ -401,16 +525,21 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- leases ---
 
-    /// Acquire holds on every Quota of `plan` atomically (I5, I7, I8).
+    /// Evaluate the applicable policy and hold the resulting plan atomically
+    /// (I5, I7, I8). A denied acquisition holds nothing and returns no token.
+    ///
+    /// # Errors
+    ///
+    /// The variants of [`QuotaEnforcementStoragePluginV1::apply_debit_plan`],
+    /// plus [`StorageError::LeaseInflightLimitExceeded`] (I7) and
+    /// [`StorageError::LeaseContentionTimeout`] (I8).
     async fn acquire_lease(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
-        applicable: &ApplicableQuotas,
-        plan: &DebitPlan,
+        mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
-        idempotency: &IdempotencyWrite,
-    ) -> Result<LeaseToken, StorageError>;
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
 
     /// Convert an active lease into a debit. `actual_amount` defaults to the
     /// reserved amount.
@@ -457,6 +586,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     // --- policies (platform-wide, operator-scoped) ---
 
     /// Create version 1 of a new policy.
+    ///
+    /// # Errors
+    /// `PolicyScopeOccupied` if a live policy occupies the exact scope; backend
+    /// errors leave no version, transition audit or event committed.
     async fn create_policy(
         &self,
         ctx: &SecurityContext,
@@ -465,6 +598,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<PolicyVersion, StorageError>;
 
     /// Create the next immutable version. Enforces `if_match_version`.
+    ///
+    /// # Errors
+    /// `PolicyNotFound`, `PolicyDeleted`, or `VersionConflict`; version exhaustion
+    /// and backend failures are `Internal`. Failures commit no writes or events.
     async fn update_policy(
         &self,
         ctx: &SecurityContext,
@@ -473,7 +610,13 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError>;
 
-    /// Make `target_version` active again.
+    /// Make `target_version` active again. Replaying the active target changes
+    /// nothing and emits no event or audit entry, and reports `NoOp` carrying the
+    /// already-active version. Version creation fields remain immutable.
+    ///
+    /// # Errors
+    /// `PolicyNotFound`, `PolicyDeleted`, `UnknownPolicyVersion`,
+    /// `VersionRolledBack`, or a backend failure; no partial transition commits.
     async fn rollback_policy(
         &self,
         ctx: &SecurityContext,
@@ -481,22 +624,47 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         target_version: u32,
         comment: Option<String>,
         events: &[NotificationEvent],
-    ) -> Result<PolicyVersion, StorageError>;
+    ) -> Result<TransitionOutcome<PolicyVersion>, StorageError>;
 
-    /// Soft-delete a narrow-scope policy. Idempotent on retry.
+    /// Soft-delete a narrow-scope policy. A retry against an already-deleted
+    /// policy reports `NoOp` and writes neither a new event nor an audit row.
+    ///
+    /// # Errors
+    /// `CannotDeleteSeededGlobalPolicy`, `PolicyNotFound`, or a backend failure.
     async fn delete_policy(
         &self,
         ctx: &SecurityContext,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
-    ) -> Result<(), StorageError>;
+    ) -> Result<TransitionOutcome<()>, StorageError>;
 
-    /// The latest active version at `scope`, if any.
+    /// The latest active version at the exact `scope`, if any. No fallback.
+    ///
+    /// # Errors
+    /// A backend failure. An unoccupied scope is `Ok(None)`.
     async fn read_policy(&self, scope: &PolicyScope)
     -> Result<Option<PolicyVersion>, StorageError>;
 
-    /// One specific version, if it exists.
+    /// Active version of one policy ID; a deleted policy has no active version.
+    ///
+    /// # Errors
+    /// Backend failure; missing or deleted IDs return `Ok(None)`.
+    async fn read_active_policy_by_id(
+        &self,
+        policy_id: &PolicyId,
+    ) -> Result<Option<PolicyVersion>, StorageError>;
+
+    /// Caller-less active-policy snapshot for bootstrap catalogue validation.
+    ///
+    /// # Errors
+    /// Backend failure. This is an internal platform read, not a public list API.
+    async fn read_active_policies(&self) -> Result<Vec<PolicyVersion>, StorageError>;
+
+    /// One specific retained version, including terminal versions, if it exists.
+    ///
+    /// # Errors
+    /// A backend failure. A missing version is `Ok(None)`.
     async fn read_policy_version(
         &self,
         policy_id: &PolicyId,
@@ -504,6 +672,9 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<Option<PolicyVersion>, StorageError>;
 
     /// Ordered version list of a policy.
+    ///
+    /// # Errors
+    /// `PolicyNotFound`, `InvalidCursor`, or a backend failure.
     async fn list_policy_versions(
         &self,
         policy_id: &PolicyId,

@@ -80,3 +80,74 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
         page: PageRequest,
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError>;
 }
+
+/// Platform operator policy surface. Every method requires explicit PDP admission.
+/// Identity and trusted schema snapshots are supplied by the service, not callers.
+#[async_trait]
+pub trait QuotaOperatorClientV1: Send + Sync + 'static {
+    /// Create and activate version one at an unoccupied scope.
+    ///
+    /// # Errors
+    /// Authorization/configuration errors, or `AlreadyExists` for an occupied scope.
+    async fn create_policy(
+        &self,
+        ctx: &SecurityContext,
+        spec: crate::PolicySpec,
+    ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
+
+    /// Create a new immutable version conditional on the active version.
+    ///
+    /// # Errors
+    /// Authorization/validation errors, unknown/deleted policy, or version conflict.
+    async fn update_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: crate::PolicyId,
+        patch: crate::PolicyPatch,
+    ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
+
+    /// Activate a permissible historical version; retrying the active target is a no-op.
+    ///
+    /// # Errors
+    /// Authorization errors, unknown/terminal version, or incompatible saved schemas.
+    async fn rollback_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: crate::PolicyId,
+        target_version: u32,
+        comment: Option<String>,
+    ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
+
+    /// Soft-delete a metric policy, preserving history. A repeated delete is a no-op.
+    ///
+    /// # Errors
+    /// Authorization errors, unknown policy, or attempted deletion of the global policy.
+    async fn delete_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: crate::PolicyId,
+        comment: Option<String>,
+    ) -> Result<(), QuotaEnforcementError>;
+
+    /// Read the active version, or a specific retained historical version.
+    ///
+    /// # Errors
+    /// Authorization errors or an unknown policy/version; a deleted policy has no active version.
+    async fn read_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: crate::PolicyId,
+        version: Option<u32>,
+    ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
+
+    /// Read one page of immutable policy history.
+    ///
+    /// # Errors
+    /// Authorization errors, an unknown policy or invalid pagination input.
+    async fn list_policy_versions(
+        &self,
+        ctx: &SecurityContext,
+        id: crate::PolicyId,
+        page: PageRequest,
+    ) -> Result<PageResult<crate::PolicyVersionMeta>, QuotaEnforcementError>;
+}
