@@ -39,6 +39,86 @@ env:
   RUSTFLAGS: "-C debuginfo=0"
 
 jobs:
+  # Cheap, always-on guard: pure text parsing, no Docker daemon, no toolchain.
+  # Catches the two ways these pins drift silently - the Rust version getting
+  # out of step with rust-toolchain.toml, and a FROM line losing its digest.
+  docker-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check Docker base-image pins
+        run: make docker-pins
+
+  # Which PRs are worth paying the in-image build for. e2e.yml has no `push`
+  # trigger, so gating on pushes would be a no-op; the real gap is a PR that
+  # edits the docker lane and merges without it ever being built.
+  docker-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Detect changed paths
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            docker:
+              - 'testing/docker/**'
+              - '**/*.Dockerfile'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'tools/scripts/ci.py'
+              - '.github/workflows/e2e.yml'
+
+  # Guard for the docker lane. It is NOT part of the `e2e` job below: that one
+  # builds on the runner, this one builds inside an image, and the two failure
+  # modes are unrelated. Until this job existed nothing in CI ran `docker build`
+  # at all, which is how every Dockerfile in the repo came to reference a
+  # package that does not exist (#4798).
+  #
+  # Scheduled/manual only — a full in-image workspace build is too slow to put
+  # on every PR. It builds with BUILD_PROFILE=dev for the same reason; the image
+  # is a functional test subject here, not a performance subject.
+  e2e-docker:
+    needs: docker-changes
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      needs.docker-changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      E2E_DOCKER_BUILD_PROFILE: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r testing/e2e/requirements.txt
+
+      - name: Run E2E tests in Docker
+        run: make e2e-docker-smoke
+
+      # No log-dump step here: ci.py captures compose logs itself, before its own
+      # teardown. A step at this point would run after the containers are gone.
+      - name: Tear down
+        if: always()
+        run: docker compose -f testing/docker/docker-compose.yml down -v || true
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45

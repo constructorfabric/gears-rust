@@ -274,7 +274,7 @@ setup: .setup-stamp py-env
 # |             | - Ensures clean compilation across all targets and features          |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
+.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs docker-pins cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -374,6 +374,13 @@ lint:
 
 ## Validate GTS identifiers in .md and .json files (DE0903)
 # Uses gts-validator binary (install via: cargo install gts-validator)
+
+## Check Dockerfile base images are digest-pinned and match rust-toolchain.toml
+# Uses PYTHON_BOOTSTRAP, not the venv: this check is pure stdlib text parsing,
+# so it must stay runnable without `make py-env` first.
+docker-pins:
+	$(call print_target_banner)
+	$(PYTHON_BOOTSTRAP) tools/scripts/ci.py docker-pins
 
 gts-docs:
 	$(call print_target_banner)
@@ -1302,7 +1309,7 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: fmt cfs-validate clippy lychee security dylint gts-docs test
+check: fmt cfs-validate docker-pins clippy lychee security dylint gts-docs test
 	$(call print_target_banner)
 
 # Lightweight quality check for gear-scoped CI (gear-scoped-ci.yml).
