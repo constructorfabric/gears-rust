@@ -33,6 +33,7 @@ use crate::config::AccountManagementConfig;
 use crate::domain::bootstrap::BootstrapService;
 use crate::domain::conversion::repo::ConversionRepo;
 use crate::domain::conversion::service::{ConversionScope, ConversionService};
+use crate::domain::error::DomainError;
 use crate::domain::integrity_check::{IntegrityChecker, run_integrity_check_loop};
 use crate::domain::metadata::registry::MetadataSchemaRegistry;
 use crate::domain::metadata::repo::MetadataRepo;
@@ -54,8 +55,7 @@ use crate::infra::storage::repo_impl::{
     AmDbProvider, ConversionRepoImpl, MetadataRepoImpl, TenantHierarchyReadAdapter, TenantRepoImpl,
 };
 use crate::infra::types_registry::{
-    GtsMetadataSchemaRegistry, GtsTenantTypeChecker, RootTypeAwareRegistryClient,
-    reconcile_root_type,
+    GtsMetadataSchemaRegistry, GtsTenantTypeChecker, register_root_type,
 };
 use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
@@ -543,28 +543,32 @@ fn validate_existing_root_binding(
     existing_type_uuid: uuid::Uuid,
     bootstrap: Option<&crate::domain::bootstrap::BootstrapConfig>,
     root_type: &crate::domain::root_type::RootTypeConfig,
-) -> anyhow::Result<()> {
+) -> Result<(), DomainError> {
     if let Some(boot_cfg) = bootstrap
         && existing_root_id != boot_cfg.root_id
     {
-        anyhow::bail!(
-            "existing platform root has id={existing_root_id}, but bootstrap.root_id={}; an explicit root migration is required",
-            boot_cfg.root_id
-        );
+        return Err(DomainError::RootBindingMismatch {
+            detail: format!(
+                "existing platform root has id={existing_root_id}, but bootstrap.root_id={}; an explicit root migration is required",
+                boot_cfg.root_id
+            ),
+        });
     }
     let configured_type_uuid = gts::GtsId::try_new(root_type.gts_id.as_ref())
-        .map_err(|error| {
-            anyhow::anyhow!(
+        .map_err(|error| DomainError::InvalidTenantType {
+            detail: format!(
                 "invalid root_tenant_type.gts_id {}: {error}",
                 root_type.gts_id
-            )
+            ),
         })?
         .to_uuid();
     if existing_type_uuid != configured_type_uuid {
-        anyhow::bail!(
-            "existing platform root {existing_root_id} has tenant_type_uuid={existing_type_uuid}, but configured root_tenant_type.gts_id {} resolves to {configured_type_uuid}; an explicit root/schema migration is required",
-            root_type.gts_id
-        );
+        return Err(DomainError::RootBindingMismatch {
+            detail: format!(
+                "existing platform root {existing_root_id} has tenant_type_uuid={existing_type_uuid}, but configured root_tenant_type.gts_id {} resolves to {configured_type_uuid}; an explicit root/schema migration is required",
+                root_type.gts_id
+            ),
+        });
     }
     Ok(())
 }
@@ -698,23 +702,20 @@ impl Gear for AccountManagementGear {
         //     service-layer CRUD return value.
         //   * the `IdpPluginSpecV1` instance enumeration used by the
         //     vendor-based plugin selection block immediately below.
-        let legacy_types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
+        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
             .client_hub()
             .get::<dyn types_registry_sdk::TypesRegistryClient>()
             .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
 
-        // The root-type contract is reconciled independently from the optional
-        // bootstrap saga and its `strict` policy. Once reconciled, every AM read
-        // of that configured root is routed back to authoritative storage; only
-        // unrelated entities continue through the temporary legacy catalogue.
-        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = if let Some(
-            root_cfg,
-        ) =
-            root_type.as_ref()
-        {
-            // `tenant_type_uuid` is the durable create-once binding between
-            // an existing root row and its configured GTS contract. Reject
-            // drift before mutating the registry and before non-strict
+        // The root-type contract is registered independently from the optional
+        // bootstrap saga and its `strict` policy. At this point Types Registry
+        // is still in configuration mode: registration stages the AM-owned
+        // document, and its system `post_init` validates the complete catalogue
+        // before stateful gears (including AM bootstrap) start.
+        if let Some(root_cfg) = root_type.as_ref() {
+            // `tenant_type_uuid` is the durable create-once binding between an
+            // existing root row and its configured GTS contract. Reject drift
+            // before mutating the process-local catalogue and before non-strict
             // bootstrap policy can suppress it.
             if let Some(existing_root) = repo
                 .find_platform_root(&toolkit_db::secure::AccessScope::allow_all())
@@ -728,37 +729,20 @@ impl Gear for AccountManagementGear {
                 )?;
             }
 
-            let persistent_registry: Arc<dyn types_registry_sdk::TypesRegistryEntities> = ctx
-                    .client_hub()
-                    .get::<dyn types_registry_sdk::TypesRegistryEntities>()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to get persistent TypesRegistryEntities for root-type reconciliation: {e}"
-                        )
-                    })?;
-            let outcome = reconcile_root_type(Arc::clone(&persistent_registry), root_cfg)
+            register_root_type(types_registry.as_ref(), root_cfg)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "account-management root tenant type reconciliation failed: {error}"
+                        "account-management root tenant type registration failed: {error}"
                     )
                 })?;
 
             info!(
                 target: "am.root_tenant_type",
                 root_tenant_type = %root_cfg.gts_id,
-                ?outcome,
-                "root tenant type reconciled with authoritative Types Registry storage"
+                "root tenant type registered for Types Registry startup validation"
             );
-
-            Arc::new(RootTypeAwareRegistryClient::new(
-                Arc::clone(&legacy_types_registry),
-                persistent_registry,
-                root_cfg.clone(),
-            )?)
-        } else {
-            legacy_types_registry
-        };
+        }
 
         info!("types-registry client resolved from client hub; enabling GTS tenant-type checker");
         let tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync> =
@@ -1429,6 +1413,24 @@ impl RestApiCapability for AccountManagementGear {
     }
 }
 
+fn handle_bootstrap_failure(err: DomainError, strict: bool) -> anyhow::Result<()> {
+    match err {
+        mismatch @ DomainError::RootBindingMismatch { .. } => Err(anyhow::anyhow!(
+            "platform bootstrap detected a lifecycle-fatal root binding mismatch: {mismatch}"
+        )),
+        err if strict => Err(anyhow::anyhow!(
+            "platform bootstrap saga failed (strict mode): {err}"
+        )),
+        err => {
+            tracing::warn!(
+                error = %err,
+                "platform bootstrap saga failed (non-strict); proceeding without root"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Run a validated bootstrap saga with cancellation support.
 /// Called from `serve()` with the runtime's `CancellationToken`.
 async fn run_bootstrap_saga(
@@ -1447,16 +1449,7 @@ async fn run_bootstrap_saga(
             info!(root_id = %root.id, "platform bootstrap saga completed");
             Ok(())
         }
-        Err(err) if strict => Err(anyhow::anyhow!(
-            "platform bootstrap saga failed (strict mode): {err}"
-        )),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "platform bootstrap saga failed (non-strict); proceeding without root"
-            );
-            Ok(())
-        }
+        Err(err) => handle_bootstrap_failure(err, strict),
     }
 }
 

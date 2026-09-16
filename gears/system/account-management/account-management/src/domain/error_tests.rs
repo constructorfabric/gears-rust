@@ -342,6 +342,7 @@ impl DomainError {
             Self::UnsupportedOperation { .. } => "unsupported_operation",
             Self::IntegrityCheckInProgress => "integrity_check_in_progress",
             Self::IntegrityCheckLeaseLost => "integrity_check_lease_lost",
+            Self::RootBindingMismatch { .. } => "root_binding_mismatch",
             Self::Internal { .. } => "internal",
         }
     }
@@ -393,7 +394,7 @@ impl DomainError {
             Self::ServiceUnavailable { .. } | Self::IdpUnavailable { .. } => 503,
             Self::UnsupportedOperation { .. } => 501,
             Self::IntegrityCheckInProgress | Self::IntegrityCheckLeaseLost => 429,
-            Self::Internal { .. } => 500,
+            Self::RootBindingMismatch { .. } | Self::Internal { .. } => 500,
         }
     }
 }

@@ -538,7 +538,6 @@ async fn a_compatibility_baseline_created_after_evaluation_is_compared_on_the_re
                     &allow_all(),
                     &candidate,
                     &common::limits(),
-                    "types-registry",
                     LATER,
                 )
                 .await
@@ -607,7 +606,6 @@ async fn a_creation_whose_dependency_moved_after_evaluation_rolls_the_commit_bac
                     &allow_all(),
                     &candidate,
                     &common::limits(),
-                    "types-registry",
                     LATER,
                 )
                 .await

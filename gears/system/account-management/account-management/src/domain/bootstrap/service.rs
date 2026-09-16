@@ -365,9 +365,9 @@ impl<R: TenantRepo> BootstrapService<R> {
     /// A row stuck in `Provisioning` whose in-band compensation
     /// failed to confirm IdP-side cleanup, or a deadline-exhausted
     /// peer-wait surfaces as `Err(_)` rather than `Ok(Provisioning)`
-    /// — the strict-mode `init` gate in
-    /// `gear::run_bootstrap_phase` decides whether to abort or
-    /// proceed without an active root.
+    /// — the strict-mode lifecycle gate in `gear::run_bootstrap_saga`
+    /// decides whether to abort or proceed without an active root. Root-binding
+    /// mismatch is the exception: it is always lifecycle-fatal.
     ///
     /// # Errors
     ///
@@ -376,6 +376,9 @@ impl<R: TenantRepo> BootstrapService<R> {
     ///   deadline elapsed while peer-waiting.
     /// * [`DomainError::UnsupportedOperation`] when the `IdP` plugin signals
     ///   it cannot perform root provisioning at all (compensated).
+    /// * [`DomainError::RootBindingMismatch`] when the durable platform-root ID
+    ///   or type UUID differs from configuration. Lifecycle wiring must never
+    ///   downgrade this through `bootstrap.strict`.
     /// * [`DomainError::Internal`] for ambiguous `IdP` outcomes (provisioning
     ///   row left for reaper) and for invariant-violation root states.
     #[tracing::instrument(skip_all, fields(root_id = %self.cfg.root_id))]
@@ -677,15 +680,11 @@ impl<R: TenantRepo> BootstrapService<R> {
                     provisioning_root: inserted,
                 }
             }
-            // `ux_tenants_single_root` partial unique index surfaces
-            // a concurrent winner OR a root-id drift (configured
-            // `root_id` doesn't match the existing root row) as
-            // `AlreadyExists`. The first case resolves on the next
-            // `classify`; the second case produces an oscillating
-            // `NoRoot → AlreadyExists → NoRoot` loop because the
-            // classify is filtered by the configured id. Cap the
-            // consecutive streak so a drifted config escalates to a
-            // clean invariant error instead of spinning init.
+            // `ux_tenants_single_root` partial unique index surfaces a
+            // concurrent winner as `AlreadyExists`. The next platform-root
+            // classification normally observes that winner and validates its
+            // binding. Cap the consecutive streak so an indefinitely stale
+            // repository view still fails startup instead of spinning init.
             Err(DomainError::AlreadyExists { .. }) => {
                 ctx.already_exists_streak += 1;
                 if ctx.already_exists_streak >= MAX_ALREADY_EXISTS_STREAK {
@@ -704,10 +703,12 @@ impl<R: TenantRepo> BootstrapService<R> {
                         root_id = %self.cfg.root_id,
                         "configured root_id does not match the existing platform root; aborting init"
                     );
-                    return BootstrapState::Terminal(Err(DomainError::internal(format!(
-                        "platform root already exists with a different id; configured root_id={} cannot be inserted (likely a config drift between platform restarts)",
-                        self.cfg.root_id
-                    ))));
+                    return BootstrapState::Terminal(Err(DomainError::RootBindingMismatch {
+                        detail: format!(
+                            "platform root already exists with a different id; configured root_id={} cannot be inserted (likely config drift between platform restarts)",
+                            self.cfg.root_id
+                        ),
+                    }));
                 }
                 emit_metric(
                     AM_BOOTSTRAP_LIFECYCLE,
@@ -969,10 +970,12 @@ impl<R: TenantRepo> BootstrapService<R> {
         };
 
         if existing.id != self.cfg.root_id {
-            return Err(DomainError::internal(format!(
-                "platform root already exists with id {}, but configured root_id is {}; an explicit root migration is required",
-                existing.id, self.cfg.root_id
-            )));
+            return Err(DomainError::RootBindingMismatch {
+                detail: format!(
+                    "platform root already exists with id {}, but configured root_id is {}; an explicit root migration is required",
+                    existing.id, self.cfg.root_id
+                ),
+            });
         }
 
         let configured_type_uuid = gts::GtsId::try_new(self.root_type.gts_id.as_ref())
@@ -984,10 +987,15 @@ impl<R: TenantRepo> BootstrapService<R> {
             })?
             .to_uuid();
         if existing.tenant_type_uuid != configured_type_uuid {
-            return Err(DomainError::internal(format!(
-                "platform root {} has tenant_type_uuid={}, but configured root_tenant_type.gts_id {} resolves to {}; an explicit root/schema migration is required",
-                existing.id, existing.tenant_type_uuid, self.root_type.gts_id, configured_type_uuid
-            )));
+            return Err(DomainError::RootBindingMismatch {
+                detail: format!(
+                    "platform root {} has tenant_type_uuid={}, but configured root_tenant_type.gts_id {} resolves to {}; an explicit root/schema migration is required",
+                    existing.id,
+                    existing.tenant_type_uuid,
+                    self.root_type.gts_id,
+                    configured_type_uuid
+                ),
+            });
         }
 
         Ok(match existing.status {

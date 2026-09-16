@@ -313,48 +313,6 @@ impl EntityRepo {
         Ok((result.rows_affected == 1).then_some(next_resource_version))
     }
 
-    /// Atomically adopt ownership attribution without changing schema content.
-    /// The entity resource version advances because `owning_gear` is part of the
-    /// externally visible entity representation.
-    pub async fn compare_and_swap_owning_gear(
-        runner: &impl DBRunner,
-        scope: &AccessScope,
-        gts_id: &str,
-        expected_resource_version: i64,
-        expected_owning_gear: Option<&str>,
-        owning_gear: &str,
-        now: OffsetDateTime,
-    ) -> Result<bool, ScopeError> {
-        let next_resource_version = expected_resource_version.checked_add(1).ok_or_else(|| {
-            ScopeError::Db(DbErr::Custom(
-                "resource_version cannot advance past i64::MAX".to_owned(),
-            ))
-        })?;
-        let owner_match = match expected_owning_gear {
-            Some(owner) => entity::Column::OwningGear.eq(owner),
-            None => entity::Column::OwningGear.is_null(),
-        };
-        let result = entity::Entity::update_many()
-            .secure()
-            .col_expr(entity::Column::OwningGear, Expr::value(owning_gear))
-            .col_expr(
-                entity::Column::ResourceVersion,
-                Expr::value(next_resource_version),
-            )
-            .col_expr(entity::Column::UpdatedAt, Expr::value(now))
-            .filter(
-                Condition::all()
-                    .add(entity::Column::GtsId.eq(gts_id))
-                    .add(entity::Column::ResourceVersion.eq(expected_resource_version))
-                    .add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active))
-                    .add(owner_match),
-            )
-            .scope_with(scope)
-            .exec(runner)
-            .await?;
-        Ok(result.rows_affected == 1)
-    }
-
     /// Turn an active entity into a tombstone under the same compare-and-swap.
     ///
     /// `lifecycle_status` and `deleted_at` move together because

@@ -49,9 +49,6 @@ pub struct Model {
     pub idempotency_key: String,
     pub idempotency_scope_hash: Vec<u8>,
     pub request_fingerprint: Vec<u8>,
-    /// Trusted in-process attribution propagated to newly admitted entities.
-    /// It never participates in authorization.
-    pub owning_gear: Option<String>,
     /// Progress only. `Completed` means every item is terminal; outcomes stay on
     /// `operation_item` and are not aggregated here.
     pub status: OperationStatus,

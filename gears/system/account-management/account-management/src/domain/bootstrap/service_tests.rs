@@ -309,7 +309,7 @@ async fn classify_rejects_root_type_binding_drift() {
         .expect_err("root type drift must fail classification");
 
     assert!(
-        matches!(error, DomainError::Internal { ref diagnostic, .. } if diagnostic.contains("tenant_type_uuid")),
+        matches!(error, DomainError::RootBindingMismatch { ref detail } if detail.contains("tenant_type_uuid")),
         "unexpected error: {error:?}"
     );
 }
@@ -1143,16 +1143,16 @@ async fn run_rejects_existing_root_id_drift_before_insert() {
     let err = svc
         .run()
         .await
-        .expect_err("drifted root_id must abort with Internal during classification");
+        .expect_err("drifted root_id must abort during classification");
 
     match &err {
-        DomainError::Internal { diagnostic, .. } => {
+        DomainError::RootBindingMismatch { detail } => {
             assert!(
-                diagnostic.contains("configured root_id"),
-                "Internal must explain the drift, got: {diagnostic}"
+                detail.contains("configured root_id"),
+                "binding mismatch must explain the drift, got: {detail}"
             );
         }
-        other => panic!("expected Internal (root_id drift), got {other:?}"),
+        other => panic!("expected RootBindingMismatch, got {other:?}"),
     }
     assert_eq!(
         idp.provision_call_count(),

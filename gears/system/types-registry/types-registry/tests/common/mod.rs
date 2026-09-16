@@ -179,7 +179,6 @@ pub async fn seed_operation_item(
             idempotency_key: Set(format!("idem-{op_id}")),
             idempotency_scope_hash: Set(vec![0x01]),
             request_fingerprint: Set(vec![0x02]),
-            owning_gear: Set(None),
             status: Set(OperationStatus::Completed),
             created_at: Set(now),
             started_at: Set(Some(now)),
@@ -256,7 +255,6 @@ pub async fn seed_pending_revision_item_with(
             // `read_operation` requires both digests to be 32 bytes.
             idempotency_scope_hash: Set(vec![0x01; 32]),
             request_fingerprint: Set(vec![0x02; 32]),
-            owning_gear: Set(None),
             status: Set(OperationStatus::Running),
             created_at: Set(now),
             started_at: Set(Some(now)),

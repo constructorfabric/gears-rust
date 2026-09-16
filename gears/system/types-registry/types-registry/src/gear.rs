@@ -8,13 +8,10 @@ use toolkit::contracts::{DatabaseCapability, SystemCapability};
 use toolkit::{Gear, GearCtx, RestApiCapability};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info, warn};
-use types_registry_sdk::{
-    RegisterResult, RegisterSummary, TypesRegistryClient, TypesRegistryEntities,
-};
+use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::{NullDispatch, OperationDispatch};
-use crate::domain::entities_client::TypesRegistryEntitiesClient;
 use crate::domain::local_client::TypesRegistryLocalClient;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;
@@ -208,14 +205,10 @@ impl Gear for TypesRegistryGear {
                 crate::domain::registry_service::AdmissionMode::Inline,
                 Arc::clone(&metrics),
             ));
-            let entities_api: Arc<dyn TypesRegistryEntities> =
-                Arc::new(TypesRegistryEntitiesClient::new(Arc::clone(&registry)));
             self.registry
                 .set(registry)
                 .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-            ctx.client_hub()
-                .register::<dyn TypesRegistryEntities>(entities_api);
-            info!("types_registry database-backed admission path and persistent client wired");
+            info!("types_registry database-backed admission path wired");
         } else {
             tracing::warn!(
                 "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \

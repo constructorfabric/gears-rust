@@ -29,7 +29,7 @@ use crate::domain::tenant::test_support::{
 
 use crate::domain::bootstrap::BootstrapService;
 use crate::domain::tenant::TenantRepo;
-use crate::gear::validate_existing_root_binding;
+use crate::gear::{handle_bootstrap_failure, validate_existing_root_binding};
 
 const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
 const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
@@ -74,16 +74,7 @@ async fn run_bootstrap_phase<R: TenantRepo + 'static>(
             tracing::info!(root_id = %root.id, "platform bootstrap saga completed");
             Ok(())
         }
-        Err(err) if strict => Err(anyhow::anyhow!(
-            "platform bootstrap saga failed (strict mode): {err}"
-        )),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "platform bootstrap saga failed (non-strict); proceeding without root"
-            );
-            Ok(())
-        }
+        Err(err) => handle_bootstrap_failure(err, strict),
     }
 }
 
@@ -392,22 +383,80 @@ async fn run_bootstrap_phase_nonstrict_run_failure_proceeds() {
         registry,
     )
     .await
-    .expect("non-strict + saga failure must proceed (logged)");
+    .expect("non-strict + ordinary saga failure must proceed (logged)");
+}
+
+#[tokio::test]
+async fn run_bootstrap_phase_nonstrict_root_id_drift_is_fatal() {
+    let repo = Arc::new(FakeTenantRepo::new());
+    let expected_type = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    seed_root_with_binding(
+        &repo,
+        Uuid::from_u128(0xDEAD),
+        expected_type,
+        TenantStatus::Active,
+    );
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+
+    let error = run_bootstrap_phase(
+        Some(valid_bootstrap_cfg(false)),
+        false,
+        repo,
+        idp.clone() as Arc<dyn IdpPluginClient>,
+        stub_types_registry(),
+    )
+    .await
+    .expect_err("root id drift must bypass bootstrap.strict=false");
+
+    assert!(error.to_string().contains("root binding mismatch"));
+    assert_eq!(idp.provision_call_count(), 0);
+}
+
+#[tokio::test]
+async fn run_bootstrap_phase_nonstrict_root_type_drift_is_fatal() {
+    let repo = Arc::new(FakeTenantRepo::new());
+    seed_root_with_binding(&repo, root_id(), Uuid::nil(), TenantStatus::Active);
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+
+    let error = run_bootstrap_phase(
+        Some(valid_bootstrap_cfg(false)),
+        false,
+        repo,
+        idp.clone() as Arc<dyn IdpPluginClient>,
+        stub_types_registry(),
+    )
+    .await
+    .expect_err("root type drift must bypass bootstrap.strict=false");
+
+    assert!(error.to_string().contains("root binding mismatch"));
+    assert_eq!(idp.provision_call_count(), 0);
 }
 
 fn seed_root_at_status(repo: &FakeTenantRepo, status: TenantStatus) {
+    let tenant_type_uuid = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    seed_root_with_binding(repo, root_id(), tenant_type_uuid, status);
+}
+
+fn seed_root_with_binding(
+    repo: &FakeTenantRepo,
+    id: Uuid,
+    tenant_type_uuid: Uuid,
+    status: TenantStatus,
+) {
     use crate::domain::tenant::model::TenantModel;
     use time::OffsetDateTime;
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
     repo.insert_tenant_raw(TenantModel {
-        id: root_id(),
+        id,
         parent_id: None,
         name: "platform-root".into(),
         status,
         self_managed: false,
-        tenant_type_uuid: gts::GtsId::try_new(ROOT_TENANT_TYPE)
-            .expect("valid root type")
-            .to_uuid(),
+        tenant_type_uuid,
         depth: 0,
         created_at: now,
         updated_at: now,
@@ -538,17 +587,18 @@ mod no_seed_startup_tests {
     };
     use sea_orm_migration::{MigrationTrait, MigratorTrait};
     use serde_json::{Value, json};
+    use toolkit::contracts::SystemCapability;
+    use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
     use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
     use toolkit_security::PlatformSecurityContext;
-    use types_registry_sdk::{TypesRegistryClient, TypesRegistryEntities};
+    use types_registry_sdk::TypesRegistryClient;
 
     use crate::gear::AccountManagementGear;
-    use crate::infra::types_registry::root_type::validate_persisted_root;
 
-    use super::{ROOT_TENANT_TYPE, root_type_cfg};
+    use super::ROOT_TENANT_TYPE;
 
     struct StartupConfig {
         account_management: Value,
@@ -610,7 +660,7 @@ mod no_seed_startup_tests {
     }
 
     #[tokio::test]
-    async fn full_init_reconciles_and_reads_root_without_a_legacy_seed() {
+    async fn full_init_registers_and_validates_root_without_a_yaml_seed() {
         let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
             account_management: json!({
                 "config": {
@@ -631,8 +681,8 @@ mod no_seed_startup_tests {
         hub.register::<dyn AuthZResolverApi>(authz);
 
         // Initialize the actual Types Registry gear with its default, seedless
-        // configuration. This publishes both the legacy process-local client
-        // and the authoritative persistent client in production order.
+        // configuration. This publishes the process-local client in
+        // configuration mode, before its ready transition.
         let types_registry_gear = types_registry::gear::TypesRegistryGear::default();
         let types_registry_ctx = context(
             "types-registry",
@@ -645,23 +695,12 @@ mod no_seed_startup_tests {
             .await
             .expect("Types Registry init");
 
-        let legacy = hub
+        let registry = hub
             .get::<dyn TypesRegistryClient>()
-            .expect("legacy Types Registry client");
-        let persistent = hub
-            .get::<dyn TypesRegistryEntities>()
-            .expect("persistent Types Registry client");
+            .expect("Types Registry client");
         assert!(
-            legacy.get_type_schema(ROOT_TENANT_TYPE).await.is_err(),
-            "the test must not accidentally provide a legacy root seed"
-        );
-        assert!(
-            persistent
-                .get_entity(ROOT_TENANT_TYPE)
-                .await
-                .expect("initial persistent read")
-                .is_none(),
-            "the test must begin without a persistent root"
+            registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err(),
+            "the test must not accidentally provide a YAML root seed"
         );
 
         // Initialize the actual Resource Group gear so AM resolves its normal
@@ -699,30 +738,37 @@ mod no_seed_startup_tests {
         account_management_gear
             .init(&account_management_ctx)
             .await
-            .expect("AM init without legacy root seed");
+            .expect("AM init without a YAML root seed");
 
-        let stored = persistent
-            .get_entity(ROOT_TENANT_TYPE)
+        // AM registration happens while the registry is in configuration mode,
+        // so the staged definition is intentionally not readable yet.
+        assert!(registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err());
+
+        let sys = SystemContext::new(
+            uuid::Uuid::new_v4(),
+            Arc::new(GearManager::new()),
+            Arc::new(GrpcInstallerStore::new()),
+        );
+        types_registry_gear
+            .post_init(&sys)
             .await
-            .expect("authoritative root read")
-            .expect("AM persisted root");
-        validate_persisted_root(&stored, &root_type_cfg()).expect("persisted AM root contract");
+            .expect("Types Registry semantic validation and ready transition");
 
-        // Bootstrap receives the root-aware overlay, proving the ordinary AM
-        // runtime read succeeds even though the globally registered legacy
-        // client still has no platform-root entry.
-        let root_aware = account_management_gear
-            .bootstrap_params
-            .lock()
-            .as_ref()
-            .expect("validated bootstrap parameters")
-            .types_registry
-            .clone();
-        let runtime_root = root_aware
+        let runtime_root = registry
             .get_type_schema(ROOT_TENANT_TYPE)
             .await
-            .expect("AM authoritative root read");
+            .expect("validated in-memory root type");
         assert_eq!(runtime_root.type_id.as_ref(), ROOT_TENANT_TYPE);
-        assert!(legacy.get_type_schema(ROOT_TENANT_TYPE).await.is_err());
+        assert_eq!(
+            runtime_root.effective_traits(),
+            json!({"allowed_parent_types": [], "idp_provisioning": false})
+        );
+        assert_eq!(
+            runtime_root
+                .parent
+                .as_ref()
+                .map(|parent| parent.type_id.as_ref()),
+            Some("gts.cf.core.am.tenant_type.v1~")
+        );
     }
 }

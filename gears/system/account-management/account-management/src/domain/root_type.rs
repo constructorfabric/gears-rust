@@ -1,7 +1,7 @@
 //! Account Management's concrete platform-root tenant-type contract.
 //!
 //! This configuration is independent from the optional root-tenant bootstrap
-//! saga: deployments may reconcile the shared schema while creating the tenant
+//! saga: deployments may register the shared schema while creating the tenant
 //! out of band.
 
 use gts::GtsId;

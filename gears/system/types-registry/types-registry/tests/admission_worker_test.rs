@@ -20,9 +20,7 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::AdmissionFailureReason;
-use types_registry::domain::admission::acceptance::{
-    AcceptanceContext, AcceptanceError, accept, accept_owned,
-};
+use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::unit::{EvaluationTarget, commit_creation, evaluate};
 use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
@@ -67,61 +65,36 @@ fn schema(gts_id: &str) -> Value {
 }
 
 async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content: Value) -> Uuid {
-    submit_with_owner(db, key, gts_id, content, None).await
-}
-
-async fn submit_with_owner(
-    db: &Arc<DBProvider<DbError>>,
-    key: &str,
-    gts_id: &str,
-    content: Value,
-    owning_gear: Option<&str>,
-) -> Uuid {
     let provider: DBProvider<AcceptanceError> = DBProvider::new(db.db());
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    let request = SubmitRequest {
-        idempotency_key: key.to_owned(),
-        kind: domain_enums::OperationKind::Registration,
-        dry_run: false,
-        candidates: vec![Candidate {
-            gts_id: gts_id.to_owned(),
-            content: Some(content),
-            expected_resource_version: None,
-            force: false,
-        }],
-    };
-    let acceptance_ctx = AcceptanceContext {
-        policy: &policy,
-        config: &config,
-        metrics: &common::metrics(),
-    };
-    let accepted = if owning_gear.is_some() {
-        accept_owned(
-            &stores(),
-            &provider,
-            &allow_all(),
-            &acceptance_ctx,
-            &dispatch,
-            &request,
-            owning_gear,
-            NOW,
-        )
-        .await
-    } else {
-        accept(
-            &stores(),
-            &provider,
-            &allow_all(),
-            &acceptance_ctx,
-            &dispatch,
-            &request,
-            NOW,
-        )
-        .await
-    };
-    accepted.expect("accepted").operation_id
+    accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &AcceptanceContext {
+            policy: &policy,
+            config: &config,
+            metrics: &common::metrics(),
+        },
+        &dispatch,
+        &SubmitRequest {
+            idempotency_key: key.to_owned(),
+            kind: domain_enums::OperationKind::Registration,
+            dry_run: false,
+            candidates: vec![Candidate {
+                gts_id: gts_id.to_owned(),
+                content: Some(content),
+                expected_resource_version: None,
+                force: false,
+            }],
+        },
+        NOW,
+    )
+    .await
+    .expect("accepted")
+    .operation_id
 }
 
 fn worker_provider(db: &Arc<DBProvider<DbError>>) -> DBProvider<WorkerError> {
@@ -262,61 +235,6 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
     assert_eq!(ops[0].status, storage_enums::OperationStatus::Completed);
     assert!(ops[0].started_at.is_some());
     assert!(ops[0].completed_at.is_some());
-}
-
-#[tokio::test]
-async fn trusted_operation_ownership_reaches_the_created_entity() {
-    let db = test_db().await;
-    let operation_id = submit_with_owner(
-        &db,
-        "owned-k1",
-        CF_TYPE,
-        schema(CF_TYPE),
-        Some("account-management"),
-    )
-    .await;
-
-    let provider = worker_provider(&db);
-    let conn = provider.conn().expect("conn");
-    let operations = operation::Entity::find()
-        .secure()
-        .scope_with(&allow_all())
-        .all(&conn)
-        .await
-        .expect("operation read");
-    let operation = operations
-        .iter()
-        .find(|operation| operation.id == operation_id)
-        .expect("operation");
-    assert_eq!(operation.owning_gear.as_deref(), Some("account-management"));
-
-    run_operation(
-        &stores(),
-        &provider,
-        &allow_all(),
-        Tuning {
-            limits: &common::limits(),
-            worker: &common::worker_settings(),
-            metrics: &common::metrics(),
-            allow_compatibility_force: false,
-        },
-        operation_id,
-        LATER,
-    )
-    .await
-    .expect("admission");
-
-    let entities = entity::Entity::find()
-        .secure()
-        .scope_with(&allow_all())
-        .all(&conn)
-        .await
-        .expect("entity read");
-    assert_eq!(entities.len(), 1);
-    assert_eq!(
-        entities[0].owning_gear.as_deref(),
-        Some("account-management")
-    );
 }
 
 /// The current-state row's digest is stable across two identical materializations,
@@ -471,7 +389,6 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
                     &allow_all(),
                     &unit,
                     &common::limits(),
-                    "types-registry",
                     LATER,
                 )
                 .await

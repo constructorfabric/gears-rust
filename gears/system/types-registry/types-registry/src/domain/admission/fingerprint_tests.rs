@@ -30,7 +30,6 @@ fn input<'a>(candidates: &'a [FingerprintCandidate<'a>]) -> FingerprintInput<'a>
         tenant_id: None,
         principal_id: Uuid::nil(),
         ownership_scope: OwnershipScope::Global,
-        owning_gear: None,
         candidates,
     }
 }

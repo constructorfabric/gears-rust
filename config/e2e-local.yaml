@@ -121,11 +121,12 @@ gears:
       server: "sqlite_users"
       file: "types_registry.db"
     config:
-      # The platform-root tenant type is owned and reconciled by AM in
-      # authoritative storage. This customer type remains deployment-owned E2E
-      # data used by the AM suite for children under the platform root. It allows
-      # nesting under either the platform root or another customer so the suite
-      # can build multi-level hierarchies for metadata-inheritance tests.
+      # AM registers the platform-root tenant type through the process-local
+      # Types Registry client during startup. This customer type remains
+      # deployment-owned E2E data used by the AM suite for children under the
+      # platform root. It allows nesting under either the platform root or
+      # another customer so the suite can build multi-level hierarchies for
+      # metadata-inheritance tests.
       entities:
         - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
           # JSON Schema dialect (NOT the parent type — derivation is encoded

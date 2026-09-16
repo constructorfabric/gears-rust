@@ -183,7 +183,6 @@ pub struct Validated {
     pub idempotency_key: String,
     pub idempotency_scope_hash: ScopeHash,
     pub request_fingerprint: RequestFingerprint,
-    pub owning_gear: Option<String>,
     pub items: Vec<NewOperationItem>,
 }
 
@@ -194,14 +193,6 @@ pub struct Validated {
 pub fn validate(
     ctx: &AcceptanceContext<'_>,
     request: &SubmitRequest,
-) -> Result<Validated, AcceptanceError> {
-    validate_with_owner(ctx, request, None)
-}
-
-fn validate_with_owner(
-    ctx: &AcceptanceContext<'_>,
-    request: &SubmitRequest,
-    owning_gear: Option<&str>,
 ) -> Result<Validated, AcceptanceError> {
     // --- step 1: envelope and batch size ---------------------------------
     let key = request.idempotency_key.trim();
@@ -437,10 +428,8 @@ fn validate_with_owner(
             tenant_id: None,
             principal_id: P0_PRINCIPAL_ID,
             ownership_scope: OwnershipScope::Global,
-            owning_gear,
             candidates: &fingerprint_candidates,
         }),
-        owning_gear: owning_gear.map(str::to_owned),
         items,
     })
 }
@@ -463,22 +452,7 @@ pub async fn accept(
     request: &SubmitRequest,
     now: OffsetDateTime,
 ) -> Result<Accepted, AcceptanceError> {
-    accept_owned(stores, db, scope, ctx, dispatch, request, None, now).await
-}
-
-/// Accept an in-process submission with trusted ownership attribution.
-#[allow(clippy::too_many_arguments)]
-pub async fn accept_owned(
-    stores: &Arc<dyn Stores>,
-    db: &DBProvider<AcceptanceError>,
-    scope: &AccessScope,
-    ctx: &AcceptanceContext<'_>,
-    dispatch: &Arc<dyn OperationDispatch>,
-    request: &SubmitRequest,
-    owning_gear: Option<&str>,
-    now: OffsetDateTime,
-) -> Result<Accepted, AcceptanceError> {
-    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, owning_gear, now).await;
+    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
     // Count at the shared exit so every refusal is covered.
     if let Err(error) = &accepted {
         let reason = error.reason();
@@ -501,7 +475,6 @@ pub async fn accept_owned(
 }
 
 /// [`accept`]'s body.
-#[allow(clippy::too_many_arguments)]
 async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
@@ -509,10 +482,9 @@ async fn accept_inner(
     ctx: &AcceptanceContext<'_>,
     dispatch: &Arc<dyn OperationDispatch>,
     request: &SubmitRequest,
-    owning_gear: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Accepted, AcceptanceError> {
-    let validated = Arc::new(validate_with_owner(ctx, request, owning_gear)?);
+    let validated = Arc::new(validate(ctx, request)?);
 
     // Replay before insert: the common case for a retrying client, and one read
     // against `operation` rather than a failed insert.
@@ -552,7 +524,6 @@ async fn accept_inner(
                             idempotency_key: validated.idempotency_key.clone(),
                             idempotency_scope_hash: validated.idempotency_scope_hash,
                             request_fingerprint: validated.request_fingerprint,
-                            owning_gear: validated.owning_gear.clone(),
                             now,
                         },
                     )

@@ -46,7 +46,7 @@ pub struct AccountManagementConfig {
 
     /// AM-owned concrete platform-root tenant-type contract. Independent from
     /// tenant bootstrap so a deployment that creates its root out of band still
-    /// reconciles the shared schema.
+    /// registers the shared schema during startup.
     pub root_tenant_type: Option<RootTypeConfig>,
 
     /// Optional platform-bootstrap saga configuration. `None` means no
@@ -474,7 +474,7 @@ impl Default for IdpConfig {
 impl AccountManagementConfig {
     /// Resolve the independent root-type contract, accepting the former
     /// bootstrap fields during migration. Two supplied sources must agree.
-    /// Bootstrap requires a root-type contract, but root-type reconciliation
+    /// Bootstrap requires a root-type contract, but root-type registration
     /// does not require bootstrap.
     ///
     /// # Errors
