@@ -1,4 +1,4 @@
-//! Policy and retention-rule intent methods (P2-M1).
+//! Policy and retention-rule intent methods.
 
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
@@ -13,7 +13,7 @@ use crate::infra::storage::repo::InsertRetentionRule;
 use crate::infra::storage::store::Store;
 
 impl Store {
-    // ── policy store (P2-M1) ─────────────────────────────────────────────────
+    // ── policy store ──────────────────────────────────────────────────────────
 
     /// Fetch the policy for a given `(policy_scope, scope_owner_id)` within a
     /// tenant. Returns `None` when no policy has been configured for that scope.
@@ -34,12 +34,12 @@ impl Store {
     /// Upsert (replace) the policy for a given `(policy_scope, scope_owner_id)`.
     /// Returns the new `policy_id`.
     ///
-    /// P2 remediation 2.4: `PolicyRepo::upsert` internally does a
-    /// `delete_many()` followed by an independent `insert` — two statements
-    /// that used to run outside any transaction, leaving a window where two
-    /// concurrent callers for the same scope could each see nothing to
-    /// delete and both insert, corrupting the at-most-one-row-per-scope
-    /// invariant. Wrapping the pair in an explicit DB transaction here (same
+    /// `PolicyRepo::upsert` internally does a `delete_many()` followed by an
+    /// independent `insert`. Run outside any transaction, this leaves a
+    /// window where two concurrent callers for the same scope could each see
+    /// nothing to delete and both insert, corrupting the
+    /// at-most-one-row-per-scope invariant. Wrapping the pair in an explicit
+    /// DB transaction here (same
     /// `self.db.db().transaction_ref_mapped(...)` pattern
     /// `rebind_version_backend` uses in `store/versions.rs`) serializes
     /// concurrent upserts for an *existing* row via the DELETE's row lock: a

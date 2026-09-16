@@ -15,6 +15,12 @@
 //! crash). Step (4) is best-effort: if directory fsync is unsupported or
 //! fails, a warning is logged and `put` still returns `Ok`, since the blob
 //! itself is already durably in place after the rename.
+//!
+//! `publish_exclusive` (the sidecar's single-shot upload path) follows the
+//! same write-to-temp-then-publish shape, but its publish step is a
+//! `std::fs::hard_link` instead of a `rename` — see
+//! [`StorageBackend::publish_exclusive`] for why a `PUT` token replay must
+//! not be allowed to overwrite an already-published object.
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +35,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
-use super::{BackendCapabilities, StorageBackend};
+use super::{BackendCapabilities, PublishOutcome, StorageBackend};
 
 /// Filesystem-backed blob store rooted at a configured directory.
 pub struct LocalFsBackend {
@@ -135,6 +141,70 @@ impl LocalFsBackend {
         Ok(())
     }
 
+    /// Atomically publish an already-written-and-fsynced temp file at
+    /// `target` **iff `target` does not already exist** (create-exclusive;
+    /// see [`StorageBackend::publish_exclusive`]'s doc comment for why this
+    /// must not silently replace an existing object like
+    /// [`Self::publish_tmp`] does).
+    ///
+    /// `std::fs::hard_link` creates a second directory entry pointing at
+    /// `tmp`'s inode and, per POSIX `link(2)`, atomically fails with
+    /// `AlreadyExists` if `target` already names something — unlike
+    /// `rename`, which would silently replace it. On success, `tmp`'s own
+    /// directory entry is then removed (the data now lives solely under
+    /// `target`; the underlying inode is not freed since a link still refers
+    /// to it) and the parent directory is best-effort fsynced exactly like
+    /// `publish_tmp`.
+    ///
+    /// Returns `Ok(true)` if this call created `target`, `Ok(false)` if
+    /// `target` already existed — the caller is responsible for cleaning up
+    /// `tmp` in that case (this method never touches `tmp` on the
+    /// already-exists path, so a caller that wants to inspect it first
+    /// still can).
+    async fn publish_tmp_exclusive(
+        &self,
+        tmp: &Path,
+        target: &Path,
+        parent: Option<&Path>,
+    ) -> Result<bool, DomainError> {
+        match tokio::fs::hard_link(tmp, target).await {
+            Ok(()) => {
+                self.finish_exclusive_publish(tmp, parent).await;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(self.io_err(e)),
+        }
+    }
+
+    /// Best-effort cleanup + durability tail of a successful hard-link
+    /// publish: remove the temp file's own directory entry (the data now
+    /// lives solely under `target`, via the hard link) and fsync the parent
+    /// directory, mirroring `publish_tmp`'s own post-rename tail. Both steps
+    /// are best-effort and only logged on failure, never fatal — split out
+    /// of `publish_tmp_exclusive` to keep its own cognitive complexity down.
+    async fn finish_exclusive_publish(&self, tmp: &Path, parent: Option<&Path>) {
+        // Best-effort: a failure here just leaves a harmless extra link,
+        // cleaned up like any other stray `*.tmp.*` by the
+        // orphan-reconciliation sweep.
+        if let Err(e) = tokio::fs::remove_file(tmp).await {
+            tracing::warn!(
+                error = ?e,
+                "failed to remove temp file's directory entry after hard-link publish"
+            );
+        }
+
+        if self.fsync_parent_dir
+            && let Some(parent) = parent
+            && let Err(e) = self.fsync_dir(parent).await
+        {
+            tracing::warn!(
+                error = ?e,
+                "parent-dir fsync failed or unsupported by this filesystem, continuing"
+            );
+        }
+    }
+
     /// Stream `stream`'s chunks into `tmp`, hashing incrementally and
     /// aborting (without waiting for the rest of the stream) the moment the
     /// running byte count exceeds `max_size`. Returns `(bytes_written,
@@ -162,6 +232,88 @@ impl LocalFsBackend {
         let bytes_written = hasher.len();
         let digest = hash::digest_to_array(hasher.finalize());
         Ok((bytes_written, digest))
+    }
+
+    /// Fixed-size chunk length shared by [`Self::chunked_file_stream`]'s two
+    /// callers (`get_stream`/`get_range_stream`) — matches the chunk size
+    /// `write_stream_to_tmp`'s write side effectively uses via its
+    /// caller-supplied stream, and is small enough that a single in-flight
+    /// chunk is never a meaningful memory concern.
+    const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Shared chunked-read core for `get_stream` (whole-object) and
+    /// `get_range_stream` (a resolved byte range): pulls up to
+    /// [`Self::READ_CHUNK_SIZE`] bytes at a time from `file` — already
+    /// positioned via `seek` by the caller when a range read starts mid-file
+    /// — stopping at EOF (`remaining: None`, the whole-file case) or once
+    /// exactly `remaining` bytes have been yielded (a resolved range's
+    /// length, so a range read never reads even one byte past its own end).
+    ///
+    /// Returns `BoxStream<'static, _>` rather than borrowing `&self`: `file`
+    /// is moved wholesale into the `unfold` state and nothing here ever
+    /// touches `self` again, so the stream owns everything it needs outright
+    /// — see [`StorageBackend::get_stream`]'s doc comment for why that
+    /// `'static` bound matters (it is what lets the sidecar hand the stream
+    /// straight to `axum::body::Body::from_stream`).
+    ///
+    /// `state` in the `unfold` closure is `None` once a read has errored or
+    /// the file/range is exhausted, so the stream terminates cleanly rather
+    /// than re-polling a file handle that already reported an error.
+    ///
+    /// Reaching EOF (`read` returns `Ok(0)`) while `remaining` still
+    /// names an outstanding byte count (i.e. the file turned out shorter
+    /// than the length the caller committed to -- `get_range_stream`'s
+    /// resolved range length, or `get_stream`'s already-observed
+    /// `Content-Length`) is a genuine short-read: the caller already told an
+    /// HTTP client how many bytes to expect, so silently ending the stream
+    /// here would just hand back a body shorter than its own
+    /// `Content-Length` with no diagnostic. That case yields an
+    /// `UnexpectedEof` error instead of ending the stream cleanly.
+    ///
+    /// Both of this module's callers pass a length: `get_range_stream` its
+    /// resolved range, `get_stream` the size it observed when it opened the
+    /// handle. `remaining: None` therefore means only "read to EOF, no
+    /// length was ever promised" -- kept for callers that legitimately do not
+    /// know the size up front, where an `Ok(0)` simply ends the stream.
+    fn chunked_file_stream(
+        file: tokio::fs::File,
+        remaining: Option<u64>,
+    ) -> BoxStream<'static, std::io::Result<Bytes>> {
+        let stream =
+            futures::stream::unfold((Some(file), remaining), |(state, remaining)| async move {
+                let mut file = state?;
+                if remaining == Some(0) {
+                    return None;
+                }
+                let want = remaining.map_or(Self::READ_CHUNK_SIZE, |r| {
+                    usize::try_from(r)
+                        .unwrap_or(usize::MAX)
+                        .min(Self::READ_CHUNK_SIZE)
+                });
+                let mut buf = vec![0u8; want];
+                match file.read(&mut buf).await {
+                    // `remaining == Some(0)` is already handled above, so
+                    // reaching an EOF read with `remaining: Some(r)` here
+                    // means `r > 0`: the file ended before yielding the
+                    // bytes the caller expected.
+                    Ok(0) => remaining.map(|r| {
+                        (
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!("file ended {r} byte(s) short of the expected read length"),
+                            )),
+                            (None, None),
+                        )
+                    }),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        let next_remaining = remaining.map(|r| r - n as u64);
+                        Some((Ok(Bytes::from(buf)), (Some(file), next_remaining)))
+                    }
+                    Err(e) => Some((Err(e), (None, None))),
+                }
+            });
+        Box::pin(stream)
     }
 }
 
@@ -236,45 +388,87 @@ impl StorageBackend for LocalFsBackend {
         Ok((bytes_written, digest))
     }
 
+    /// Create-exclusive publish. Writes + hashes the stream into a temp file
+    /// exactly like `put_stream`, but publishes it via
+    /// [`Self::publish_tmp_exclusive`]
+    /// (hard-link, atomically fails on an existing target) instead of
+    /// `publish_tmp`'s unconditional rename. See
+    /// [`StorageBackend::publish_exclusive`] for the full contract.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let (target, parent) = self.prepare_target(path).await?;
+        let tmp = Self::tmp_path_for(&target);
+
+        let write_result = self.write_stream_to_tmp(&tmp, stream, max_size).await;
+        let (bytes_written, digest) = match write_result {
+            Ok(v) => v,
+            Err(e) => {
+                drop(tokio::fs::remove_file(&tmp).await);
+                return Err(e);
+            }
+        };
+
+        match self
+            .publish_tmp_exclusive(&tmp, &target, parent.as_deref())
+            .await
+        {
+            Ok(true) => Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: true,
+            }),
+            Ok(false) => {
+                // The destination already existed: it was never touched.
+                // `tmp` still holds this attempt's freshly-written (but
+                // never linked) bytes and must be cleaned up like any other
+                // rejected upload.
+                drop(tokio::fs::remove_file(&tmp).await);
+                Ok(PublishOutcome {
+                    bytes_written,
+                    digest,
+                    created: false,
+                })
+            }
+            Err(e) => {
+                drop(tokio::fs::remove_file(&tmp).await);
+                Err(e)
+            }
+        }
+    }
+
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
         let target = self.resolve(path)?;
         let data = tokio::fs::read(&target).await.map_err(|e| self.io_err(e))?;
         Ok(Bytes::from(data))
     }
 
-    /// Stream the blob at `path` from disk in fixed-size chunks via manual
-    /// `AsyncReadExt` reads, so a read-back (e.g. finalize's) never
+    /// Stream the blob at `path` from disk in fixed-size chunks, so a
+    /// read-back (e.g. finalize's) or a whole-object download never
     /// materializes more than one chunk of the file in memory regardless of
-    /// its size. This crate does not otherwise depend on `tokio-util`, so
-    /// this deliberately avoids `ReaderStream` rather than pulling in a new
-    /// dependency for a single call site.
+    /// its size. Delegates to [`Self::chunked_file_stream`] with no length
+    /// cap (`remaining: None`, i.e. read to EOF) — see that method's doc
+    /// comment for the shared chunking mechanics it and
+    /// [`Self::get_range_stream`] both build on.
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
-        const CHUNK_SIZE: usize = 64 * 1024;
-
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let target = self.resolve(path)?;
         let file = tokio::fs::File::open(&target)
             .await
             .map_err(|e| self.io_err(e))?;
-
-        // `state` is `None` once a read has errored or the file is exhausted,
-        // so the stream terminates cleanly rather than re-polling a file
-        // handle that already reported an error.
-        let stream = futures::stream::unfold(Some(file), |state| async move {
-            let mut file = state?;
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            match file.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(n) => {
-                    buf.truncate(n);
-                    Some((Ok(Bytes::from(buf)), Some(file)))
-                }
-                Err(e) => Some((Err(e), None)),
-            }
-        });
-        Ok(Box::pin(stream))
+        // Bound the stream by the length observed at open time rather than
+        // reading to EOF. The sidecar declares `Content-Length` from a `stat`
+        // taken just before this call, so a file truncated in between would
+        // otherwise end the body early and leave the client with a response
+        // shorter than its own header and no diagnostic. With the length
+        // passed in, `chunked_file_stream` surfaces `UnexpectedEof` instead.
+        let len = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+        Ok(Self::chunked_file_stream(file, Some(len)))
     }
 
     /// Native range read: seek to the requested offset and read only the
@@ -304,9 +498,40 @@ impl StorageBackend for LocalFsBackend {
         Ok(Bytes::from(buf))
     }
 
+    /// Native streaming range read: resolve the range against the file's
+    /// real length (identical to `get_range`'s own resolution/clamping), seek
+    /// once, then hand off to the same [`Self::chunked_file_stream`] core
+    /// `get_stream` uses — bounded this time by the range's length — so a
+    /// `Range` request (including `bytes=0-`, which resolves to the whole
+    /// object and is the very first request many media players issue) never
+    /// allocates a `len`-sized buffer up front the way the old
+    /// `get_range`-based response path did.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let target = self.resolve(path)?;
+        let mut file = tokio::fs::File::open(&target)
+            .await
+            .map_err(|e| self.io_err(e))?;
+        let total = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+        let Some((start, end)) = range.resolve(total) else {
+            return Err(DomainError::validation("range", "unsatisfiable byte range"));
+        };
+        // `resolve` yields an inclusive end; clamp defensively against `total`
+        // exactly like `get_range` does.
+        let end = end.min(total.saturating_sub(1));
+        let len = end - start + 1;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| self.io_err(e))?;
+        Ok(Self::chunked_file_stream(file, Some(len)))
+    }
+
     /// Cheap stat: reads only the file's metadata, never its content, so
-    /// range-aware callers (P2 1.11) can resolve a `Range` request without
-    /// paying for a full read first.
+    /// range-aware callers can resolve a `Range` request without paying for
+    /// a full read first.
     async fn size(&self, path: &str) -> Result<u64, DomainError> {
         let target = self.resolve(path)?;
         let meta = tokio::fs::metadata(&target)
@@ -336,13 +561,24 @@ impl StorageBackend for LocalFsBackend {
         }
     }
 
+    /// Native combined stat: a single `stat(2)` distinguishes "not
+    /// found" (`Ok(None)`) from "present, this many bytes" (`Ok(Some(len))`)
+    /// from a genuine I/O fault (`Err`), where `exists` followed by `size`
+    /// would need two separate syscalls.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let target = self.resolve(path)?;
+        match tokio::fs::metadata(&target).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(self.io_err(e)),
+        }
+    }
+
     /// Walk the root directory recursively and return all file paths as
     /// backend-relative paths in the form `"/{component}/{component}"`.
     ///
     /// Non-existent root (fresh install with no uploads yet) returns an empty
     /// vec rather than an error.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         // If the root does not exist yet (no blobs written), return empty.
         match tokio::fs::metadata(&self.root).await {

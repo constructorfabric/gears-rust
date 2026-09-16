@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{PolicyBody, PolicyScope, StoredPolicy};
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::policy::{ActiveModel, Column, Entity, Model};
 
 /// Repository over the `policies` table.
@@ -59,8 +59,8 @@ impl PolicyRepo {
     /// this first deletes any existing row for that combination, then inserts the
     /// new one.
     ///
-    /// P2 remediation 2.4: callers (`Store::upsert_policy`) run this inside an
-    /// explicit DB transaction so the delete+insert pair is atomic, and the
+    /// Callers (`Store::upsert_policy`) run this inside an explicit DB
+    /// transaction so the delete+insert pair is atomic, and the
     /// `policies_user_scope_unique_idx` / `policies_tenant_scope_unique_idx`
     /// partial unique indexes (migration `m20260706_000003`) act as a
     /// backstop against the remaining no-existing-row race between two
@@ -105,9 +105,24 @@ impl PolicyRepo {
             created_at: Set(now),
             updated_at: Set(now),
         };
+        // Two concurrent first-time upserts for the same
+        // `(tenant_id, scope, scope_owner_id)` both see nothing to delete
+        // above and both reach this insert; the partial unique indexes
+        // (`policies_tenant_scope_unique_idx` / `policies_user_scope_unique_idx`,
+        // migration `m20260706_000003_policies_unique_scope.rs`) are what
+        // stops the loser from creating a second row. Classify that loss as
+        // a conflict rather than an opaque `db_err` 500, so the losing
+        // caller gets a 409 it can react to (re-fetch via `get` and, if it
+        // still wants its own values, retry the upsert against the row that
+        // won).
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(db_err)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a policy for this scope was just created by a concurrent request",
+                )
+            })?;
         Ok(policy_id)
     }
 }

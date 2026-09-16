@@ -3,7 +3,7 @@
 Exercises the real LocalFsBackend end-to-end with a live server + sidecar:
 
     create → upload bytes (sidecar finalizes) → verify on-disk temp file
-           → bind → download-url → GET bytes → assert bytes
+           → auto-bind verified → download-url → GET bytes → assert bytes
            → delete → verify on-disk file gone → assert control-plane 404
 
 The sidecar writes blobs to a session-scoped ``tempfile.mkdtemp`` root shared
@@ -13,7 +13,8 @@ directly from disk between the HTTP steps to prove the bytes really landed.
 Architecture note — the real download path:
     After the sidecar PUTs bytes and calls back the control-plane finalize
     endpoint, the version is ``available``.  The client then:
-    1. ``POST /files/{id}/bind`` — swaps the content pointer.
+    1. The finalize callback has already swapped the content pointer
+       (`bind: "auto"`, the default).
     2. ``GET /files/{id}/download-url`` — issues a signed sidecar download URL.
     3. ``GET`` the returned URL directly against the sidecar.
     This is the exact path a production deployment follows.
@@ -40,10 +41,10 @@ def test_localfs_single_part_full_lifecycle(
     fs_storage_root: str,
     gts_file_type: str,
 ):
-    """Single-part LocalFs lifecycle: create → upload → disk verify → bind → download → delete.
+    """Single-part LocalFs lifecycle: create → upload → disk verify → download → delete.
 
     Seam coverage:
-    * Route wiring (POST /files, POST /bind, GET /download-url, DELETE /files/{id})
+    * Route wiring (POST /files, GET /files/{id}, GET /download-url, DELETE /files/{id})
     * Signed-URL issuance (control plane → sidecar)
     * Byte transport (PUT to sidecar)
     * Sidecar finalize callback (POST /versions/{id}/finalize on control plane)
@@ -107,16 +108,18 @@ def test_localfs_single_part_full_lifecycle(
         f"  path:     {on_disk_path}"
     )
 
-    # ── 4. Bind the version (first bind — no If-Match required) ──────────
-    # The sidecar finalize callback has marked the version ``available``.
-    bind_resp = client.post(
-        f"{API_BASE}/files/{file_id}/bind",
-        json={"version_id": version_id},
+    # ── 4. The upload already bound the content (auto-bind) ──────────────
+    # The sidecar's finalize callback marks the version ``available`` and, for
+    # a `bind: "auto"` upload (the default), swaps the content pointer in the
+    # same transaction. A separate `POST /bind` is therefore not part of this
+    # flow any more, and issuing one without `If-Match` is now rejected with
+    # `412`-style `IF_MATCH` semantics precisely because content is already
+    # bound. Verify the pointer moved instead of re-binding it.
+    bound_resp = client.get(f"{API_BASE}/files/{file_id}")
+    assert bound_resp.status_code == 200, (
+        f"GET /files/{file_id} failed: {bound_resp.status_code}\n{bound_resp.text}"
     )
-    assert bind_resp.status_code == 200, (
-        f"POST /files/{file_id}/bind failed: {bind_resp.status_code}\n{bind_resp.text}"
-    )
-    bound_file = bind_resp.json()
+    bound_file = bound_resp.json()
     assert bound_file.get("content_id") == version_id, (
         f"Expected content_id={version_id!r}, got: {bound_file.get('content_id')!r}"
     )

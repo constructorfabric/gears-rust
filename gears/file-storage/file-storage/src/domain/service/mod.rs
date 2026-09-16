@@ -57,8 +57,6 @@ pub struct ServiceConfig {
     pub max_page_size: u64,
     /// Window (seconds) for which an idempotency key is retained.
     /// After this window, a retry with the same key is treated as a fresh request.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
     pub idempotency_ttl_secs: u64,
 }
 
@@ -72,6 +70,25 @@ pub struct UploadTicket {
     pub upload_url: String,
 }
 
+/// Outcome of the token-authenticated finalize callback (upload-flow
+/// redesign) — the single-part half of the ONE shared bind-state model
+/// (`domain::multipart::BindState`): surfaced to the uploading client by the
+/// sidecar as fixed `PUT`-response headers — `X-FS-Bound: true` + `ETag` on
+/// a won CAS, `X-FS-Bound: conflict` + `X-FS-Current-ETag` on a lost one.
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub struct FinalizeByTokenOutcome {
+    /// `None` — the token did not request a bind (staged/manual mode).
+    /// `Some(Bound)` / `Some(Conflict)` otherwise (`Manual` is never
+    /// produced here — a manual-mode token simply has no bind claim).
+    pub bind_state: Option<crate::domain::multipart::BindState>,
+    /// Content ETag after a successful bind (`Bound` only).
+    pub etag: Option<String>,
+    /// The file's CURRENT content ETag on a lost CAS (`Conflict` only) —
+    /// what a manual rebind's `If-Match` needs, no re-upload required.
+    pub current_etag: Option<String>,
+}
+
 /// Result of `download-url`: the signed URL plus the content ETag.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
@@ -82,7 +99,6 @@ pub struct DownloadTicket {
 }
 
 /// Quota metric name used for storage preflight checks.
-/// @cpt-cf-file-storage-fr-storage-quota
 pub(super) const QUOTA_METRIC_NAME: &str =
     gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1");
 
@@ -101,8 +117,6 @@ pub struct FileService {
     pub(super) quota_client: Option<Arc<dyn QuotaClient>>,
     /// Optional usage reporter. `None` means no usage deltas are reported.
     /// Failures are fire-and-forget: the adapter logs and swallows them.
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
     pub(super) usage_reporter: Option<Arc<dyn UsageReporter>>,
     /// Metrics port (P2 1.8 remediation). Defaults to a no-op implementation
     /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
@@ -182,6 +196,20 @@ impl FileService {
         constraints: UploadConstraints,
         download_meta: Option<(String, String)>,
     ) -> Result<String, DomainError> {
+        self.sign_url_with_bind(op, v, constraints, download_meta, false)
+    }
+
+    /// [`Self::sign_url`] with an explicit `bind_on_finalize` claim
+    /// (upload-flow redesign). Only the new-file `create_file` path with
+    /// `bind: "auto"` passes `true` — see `Claims::bind_on_finalize`.
+    pub(super) fn sign_url_with_bind(
+        &self,
+        op: Op,
+        v: &VersionRef,
+        constraints: UploadConstraints,
+        download_meta: Option<(String, String)>,
+        bind_on_finalize: bool,
+    ) -> Result<String, DomainError> {
         // P2 2.13: resolve (and validate) the path segment before doing any
         // signing work, so a rejected `op` never wastes a token mint.
         let verb = content_verb(op)?;
@@ -206,6 +234,7 @@ impl FileService {
             request_id: Uuid::now_v7().to_string(),
             content_type,
             etag,
+            bind_on_finalize,
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -221,20 +250,14 @@ impl FileService {
     // ── audit helpers (P2-M4) ────────────────────────────────────────────────
 
     /// Extract a stable actor kind string from the `SecurityContext`.
-    // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-actor-kind
     pub(super) fn actor_kind(ctx: &SecurityContext) -> &'static str {
         match ctx.subject_type() {
             Some("app") => "app",
             _ => "user",
         }
     }
-    // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-actor-kind
 
     /// Build a success audit entry for a file-scoped write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-dod:cpt-cf-file-storage-dod-audit-trail-transactional-write:p1
-    // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-identity
     pub(super) fn audit_ok(
         ctx: &SecurityContext,
         file_id: Option<Uuid>,
@@ -250,15 +273,11 @@ impl FileService {
             detail,
         )
     }
-    // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-identity
 
     // ── usage reporting helpers (P2-M5) ──────────────────────────────────────
 
     /// Fire-and-forget usage delta report. Failures are logged but never
     /// propagated — a failing usage reporter must not block file operations.
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
-    // @cpt-begin:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-noop-if-unwired
     pub(super) fn report_usage(&self, delta: UsageDelta) {
         if let Some(reporter) = self.usage_reporter.clone() {
             tokio::spawn(async move {
@@ -266,11 +285,8 @@ impl FileService {
             });
         }
     }
-    // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-noop-if-unwired
 
     /// Build a [`FileEvent`] for a write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub(super) fn make_file_event(
         tenant_id: Uuid,
         owner_id: Uuid,

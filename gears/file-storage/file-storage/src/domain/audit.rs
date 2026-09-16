@@ -9,10 +9,6 @@
 //! persistence repo layer for these types.
 //!
 //! [`Store`]: crate::infra::storage::Store
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
-//! @cpt-cf-file-storage-fr-file-events
 
 #![allow(unknown_lints, de0309_must_have_domain_model)]
 
@@ -20,8 +16,6 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The canonical set of write operations that are audited.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOperation {
@@ -42,21 +36,13 @@ pub enum AuditOperation {
     /// `POST /files/{id}/versions/{vid}/finalize` — version bytes finalised.
     FinalizeVersion,
     /// Background sweep deleted a version or file due to a retention policy.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     RetentionDelete,
     /// A file's content was moved from one backend to another.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
     BackendMigrate,
     /// A pending version or multipart session was cleaned up by the orphan
     /// reconciliation sweep.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     OrphanReconcile,
     /// Ownership of a file was transferred from one owner to another.
-    ///
-    /// @cpt-cf-file-storage-fr-ownership-transfer
     TransferOwnership,
 }
 
@@ -104,8 +90,6 @@ impl AuditOutcome {
 /// Built by the control-plane services (and the cleanup engine) and handed to
 /// the `Store`, which enqueues it in the same transaction as the mutation it
 /// describes — the file-event counterpart to [`AuditEntry`].
-///
-/// @cpt-cf-file-storage-fr-file-events
 #[derive(Debug, Clone)]
 pub struct FileEvent {
     pub tenant_id: Uuid,
@@ -118,9 +102,6 @@ pub struct FileEvent {
 /// All data needed to emit one audit row.
 ///
 /// Build with [`AuditEntry::new`]; the `Store` inserts it transactionally.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
@@ -137,9 +118,6 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     /// Create an audit entry for a successful write.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-construct
     pub fn success(
         tenant_id: Uuid,
         actor_kind: impl Into<String>,
@@ -159,7 +137,6 @@ impl AuditEntry {
             occurred_at: OffsetDateTime::now_utc(),
         }
     }
-    // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-construct
 
     /// Create an audit entry for a failed write attempt.
     pub fn failure(
