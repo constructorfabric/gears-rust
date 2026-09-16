@@ -1114,6 +1114,67 @@ fn bootstrap_cfg_long_deadline() -> BootstrapConfig {
 }
 
 #[tokio::test]
+async fn insert_retry_exhaustion_surfaces_service_unavailable() {
+    let repo = Arc::new(FakeTenantRepo::new());
+    let now = OffsetDateTime::now_utc();
+    repo.insert_tenant_raw(TenantModel {
+        id: Uuid::from_u128(0xDEAD),
+        parent_id: None,
+        name: "concurrent-root".into(),
+        status: TenantStatus::Active,
+        self_managed: false,
+        tenant_type_uuid: root_type_uuid(),
+        depth: 0,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    });
+
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+    let svc = BootstrapService::new(
+        Arc::clone(&repo),
+        idp as Arc<dyn IdpPluginClient>,
+        bootstrap_cfg_long_deadline(),
+        root_type_cfg(),
+    )
+    .with_types_registry(StubTypesRegistry::arc());
+    let mut ctx = RunCtx {
+        scope: AccessScope::allow_all(),
+        deadline: Instant::now() + std::time::Duration::from_secs(30),
+        cap: std::time::Duration::from_secs(1),
+        stuck_threshold: time::Duration::seconds(60),
+        backoff: std::time::Duration::from_secs(1),
+        pending_takeover_precheck: false,
+        already_exists_streak: 0,
+    };
+
+    for attempt in 1..MAX_ALREADY_EXISTS_STREAK {
+        assert!(
+            matches!(
+                svc.step_insert(&mut ctx).await,
+                BootstrapState::Sleep {
+                    reason: SleepReason::AlreadyExistsRetry
+                }
+            ),
+            "attempt {attempt} must reclassify after losing the insert race"
+        );
+    }
+
+    let err = match svc.step_insert(&mut ctx).await {
+        BootstrapState::Terminal(Err(err)) => err,
+        _ => panic!("retry exhaustion must be terminal"),
+    };
+    assert!(
+        matches!(
+            err,
+            DomainError::ServiceUnavailable { ref detail, .. }
+                if detail.contains("repository view did not expose")
+        ),
+        "an unobserved concurrent winner must not be reported as binding drift: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn run_rejects_existing_root_id_drift_before_insert() {
     let repo = Arc::new(FakeTenantRepo::new());
     let now = OffsetDateTime::now_utc();

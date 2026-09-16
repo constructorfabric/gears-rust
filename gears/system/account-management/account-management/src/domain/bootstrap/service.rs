@@ -693,22 +693,19 @@ impl<R: TenantRepo> BootstrapService<R> {
                         MetricKind::Counter,
                         &[
                             ("phase", "failed"),
-                            ("classification", "root_id_drift"),
-                            ("outcome", "failure"),
+                            ("classification", "concurrent_insert_unobserved"),
+                            ("outcome", "retry_exhausted"),
                         ],
                     );
                     warn!(
                         target: "am.bootstrap",
                         streak = ctx.already_exists_streak,
                         root_id = %self.cfg.root_id,
-                        "configured root_id does not match the existing platform root; aborting init"
+                        "platform root insert repeatedly conflicted, but classification did not expose the concurrent winner"
                     );
-                    return BootstrapState::Terminal(Err(DomainError::RootBindingMismatch {
-                        detail: format!(
-                            "platform root already exists with a different id; configured root_id={} cannot be inserted (likely config drift between platform restarts)",
-                            self.cfg.root_id
-                        ),
-                    }));
+                    return BootstrapState::Terminal(Err(DomainError::service_unavailable(
+                        "platform root insert repeatedly conflicted, but the repository view did not expose the concurrent winner",
+                    )));
                 }
                 emit_metric(
                     AM_BOOTSTRAP_LIFECYCLE,
