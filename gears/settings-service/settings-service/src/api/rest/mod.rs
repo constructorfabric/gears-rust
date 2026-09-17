@@ -27,3 +27,7 @@ mod read_surface_tests;
 #[cfg(test)]
 #[path = "category_surface_tests.rs"]
 mod category_surface_tests;
+
+#[cfg(test)]
+#[path = "access_surface_tests.rs"]
+mod access_surface_tests;

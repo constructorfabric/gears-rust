@@ -890,6 +890,21 @@ impl RestHarness {
             search,
             Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let access = Arc::new(crate::domain::access::AccessService::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::access_repo::AccessRepo,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
+            Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
+            Arc::clone(&inner.cache),
+        ));
+        let router = crate::api::rest::access_routes::register_routes(
+            router,
+            &openapi,
+            access,
+            Arc::clone(&inner.db),
             enforcer,
         );
         Self { inner, router }
