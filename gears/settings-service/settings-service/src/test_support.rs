@@ -822,6 +822,58 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
     }
 }
 
+/// A step-up verifier that accepts whatever it is shown.
+///
+/// The freshness rules themselves are pinned by `infra/step_up_tests.rs`
+/// against a fake `AuthN` resolver; what a surface test needs is the gate
+/// open or shut, so the port is doubled rather than the platform behind it.
+struct FreshStepUp;
+
+/// A step-up verifier that refuses everything as stale.
+struct StaleStepUp;
+
+fn five_minute_requirement() -> crate::domain::stepup::StepUpRequirement {
+    crate::domain::stepup::StepUpRequirement {
+        max_age: crate::domain::stepup::StepUpRequirement::MAX_AGE_CEILING,
+        acr_values: Vec::new(),
+        amr_values: Vec::new(),
+    }
+}
+
+#[async_trait]
+impl crate::domain::stepup::StepUpVerifier for FreshStepUp {
+    async fn verify(
+        &self,
+        _token: Option<&str>,
+        _subject: &crate::domain::stepup::StepUpSubject,
+    ) -> Result<(), crate::domain::stepup::StepUpRefusal> {
+        Ok(())
+    }
+
+    fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
+        static REQUIREMENT: std::sync::OnceLock<crate::domain::stepup::StepUpRequirement> =
+            std::sync::OnceLock::new();
+        REQUIREMENT.get_or_init(five_minute_requirement)
+    }
+}
+
+#[async_trait]
+impl crate::domain::stepup::StepUpVerifier for StaleStepUp {
+    async fn verify(
+        &self,
+        _token: Option<&str>,
+        _subject: &crate::domain::stepup::StepUpSubject,
+    ) -> Result<(), crate::domain::stepup::StepUpRefusal> {
+        Err(crate::domain::stepup::StepUpRefusal::Stale)
+    }
+
+    fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
+        static REQUIREMENT: std::sync::OnceLock<crate::domain::stepup::StepUpRequirement> =
+            std::sync::OnceLock::new();
+        REQUIREMENT.get_or_init(five_minute_requirement)
+    }
+}
+
 /// What a request answered with: the status, the decoded body, and the two
 /// headers a conditional write needs to follow a read.
 pub struct Answer {
@@ -829,6 +881,9 @@ pub struct Answer {
     pub body: Value,
     pub etag: Option<String>,
     pub location: Option<String>,
+    /// Every response header as text, for the ones a test reads by name —
+    /// the RFC 9470 challenge among them.
+    pub headers: HashMap<String, String>,
 }
 
 /// The gear's read surface, registered exactly as the gear registers it and
@@ -847,19 +902,28 @@ pub struct RestHarness {
 }
 
 impl RestHarness {
-    /// Build the read surface over a fresh database, with every authorization
-    /// decision allowed.
+    /// Build the surface over a fresh database, with every authorization
+    /// decision allowed and a step-up assertion that passes.
     pub async fn new() -> Self {
-        Self::build(Arc::new(AllowAll)).await
+        Self::build(Arc::new(AllowAll), Arc::new(FreshStepUp)).await
     }
 
     /// The same surface with every authorization decision denied, for the
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
-        Self::build(Arc::new(DenyAll)).await
+        Self::build(Arc::new(DenyAll), Arc::new(FreshStepUp)).await
     }
 
-    async fn build(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Self {
+    /// The same surface where the caller's last re-authentication is too old,
+    /// for the tests that assert the second gate.
+    pub async fn stale_step_up() -> Self {
+        Self::build(Arc::new(AllowAll), Arc::new(StaleStepUp)).await
+    }
+
+    async fn build(
+        pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
+        step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+    ) -> Self {
         let inner = ResolutionHarness::new().await;
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
@@ -904,6 +968,35 @@ impl RestHarness {
             router,
             &openapi,
             access,
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        // The declaration surface. The types registry is the SDK's own mock:
+        // the reads only ask it for a type's traits, and an answer it does not
+        // have degrades to an empty trait set rather than failing the read.
+        let types: Arc<dyn types_registry_sdk::TypesRegistryClient> =
+            Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new());
+        let declarations = Arc::new(crate::domain::declaration::DeclarationService::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            Arc::clone(&types),
+        ));
+        let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::category_repo::CategoryRepo,
+            crate::infra::storage::value_repo::ValueRepo,
+            Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
+                resolution_catalogue(),
+            )),
+            Arc::new(RecordingRegistrar::default()),
+            step_up,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::clone(&inner.cache),
+        ));
+        let router = crate::api::rest::declaration_routes::register_routes(
+            router,
+            &openapi,
+            declarations,
+            admin,
             Arc::clone(&inner.db),
             enforcer,
         );
@@ -957,6 +1050,16 @@ impl RestHarness {
             .get(axum::http::header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        let headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
+            })
+            .collect();
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("a bounded body");
@@ -966,6 +1069,7 @@ impl RestHarness {
             body,
             etag,
             location,
+            headers,
         }
     }
 

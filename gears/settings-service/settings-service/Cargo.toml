@@ -73,6 +73,9 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 # Drives a request through the real router in the REST tests: the routes are
 # registered exactly as the gear registers them, and `oneshot` answers.
 tower = { workspace = true }
+# `MockTypesRegistryClient`, the SDK's own double for the registry the
+# declaration reads ask for a type's traits.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 # The SQLite driver the repository tests run against. Only the driver: the
 # runtime and TLS come from the workspace, which pins `runtime-tokio` and
 # routes TLS through `sqlx/tls-rustls-aws-lc-rs` for the reason its own
