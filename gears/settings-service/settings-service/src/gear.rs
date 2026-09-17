@@ -565,11 +565,25 @@ impl RestApiCapability for SettingsService {
             self.writes()?,
             self.enforcer()?,
         );
-        Ok(crate::api::rest::access_routes::register_routes(
+        let router = crate::api::rest::access_routes::register_routes(
             router,
             openapi,
             self.access()?,
             self.db()?,
+            self.enforcer()?,
+        );
+        // Search: the dialect is the database's, decided here once, where the
+        // provider is at hand; the service is otherwise stateless.
+        let db = self.db()?;
+        let search = Arc::new(crate::domain::search::service::SearchService::new(
+            crate::infra::storage::search_repo::SearchRepo::new(db.db().backend()),
+        ));
+        Ok(crate::api::rest::search_routes::register_routes(
+            router,
+            openapi,
+            search,
+            self.resolver()?,
+            db,
             self.enforcer()?,
         ))
     }

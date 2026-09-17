@@ -11,6 +11,8 @@ pub mod dto;
 pub mod handlers;
 pub mod routes;
 pub mod search_dto;
+pub mod search_handlers;
+pub mod search_routes;
 pub mod setting_dto;
 pub mod setting_handlers;
 pub mod setting_routes;

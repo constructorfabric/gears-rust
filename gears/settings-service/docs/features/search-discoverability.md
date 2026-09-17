@@ -67,7 +67,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 ### Search Settings
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-flow-search-discoverability-search`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-flow-search-discoverability-search`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
@@ -81,17 +81,17 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 - A cursor minted for a different query, target or corpus
 
 **Steps**:
-1. [ ] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit` and `cursor`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
-2. [ ] - `p2` - Authorize `read` on the value resource once for the request; its constraints are the secure scope of the declarations query, so a setting the caller may not read is absent from the results and from the count - `inst-sd-search-2`
-3. [ ] - `p2` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-sd-search-3`
-4. [ ] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver: an override the caller could not read is never matched - `inst-sd-search-4`
-5. [ ] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
-6. [ ] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
+1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit` and `cursor`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
+2. [x] - `p2` - Authorize `read` on the value resource once for the request; its constraints are the secure scope of the declarations query, so a setting the caller may not read is absent from the results and from the count - `inst-sd-search-2`
+3. [x] - `p2` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-sd-search-3`
+4. [x] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver: an override the caller could not read is never matched - `inst-sd-search-4`
+5. [x] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
+6. [x] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
 7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
 8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row - `inst-sd-search-8`
 9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
-10. [ ] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it - `inst-sd-search-10`
-11. [ ] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
+10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it - `inst-sd-search-10`
+11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -143,7 +143,7 @@ No stateful entity: search reads and stores nothing.
 
 ### Search Surface
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-surface`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-surface`
 
 `GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit` and `cursor`, refuse OData options, and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing.
 
