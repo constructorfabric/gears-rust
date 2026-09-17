@@ -19,3 +19,7 @@ pub mod setting_routes;
 pub mod value_dto;
 pub mod value_handlers;
 pub mod value_routes;
+
+#[cfg(test)]
+#[path = "read_surface_tests.rs"]
+mod read_surface_tests;

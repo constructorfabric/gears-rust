@@ -70,6 +70,9 @@ toolkit-macros = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Drives a request through the real router in the REST tests: the routes are
+# registered exactly as the gear registers them, and `oneshot` answers.
+tower = { workspace = true }
 # The SQLite driver the repository tests run against. Only the driver: the
 # runtime and TLS come from the workspace, which pins `runtime-tokio` and
 # routes TLS through `sqlx/tls-rustls-aws-lc-rs` for the reason its own

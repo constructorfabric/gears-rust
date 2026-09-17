@@ -771,3 +771,176 @@ impl crate::domain::ports::SecretResolveGate for DenyAllGate {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// The REST harness
+// ---------------------------------------------------------------------------
+
+/// A policy decision point that allows everything, with no scope constraints.
+///
+/// The read surface asks with `require_constraints(false)`, so an unconstrained
+/// allow yields an unrestricted `AccessScope` — the grant a platform
+/// administrator holds. What a test exercises through it is therefore the
+/// gear's **own** rules (the subtree check, tenant access, masking), not the
+/// policy manager's, which is a different system with its own tests.
+struct AllowAll;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowAll {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// A policy decision point that denies everything.
+struct DenyAll;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: false,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// The gear's read surface, registered exactly as the gear registers it and
+/// answering real requests.
+///
+/// The point of going through the router rather than calling a handler is that
+/// the parts only a request exercises are the parts that carry the contract:
+/// the query string is parsed by the same extractors, an unsupported `OData`
+/// option is refused where a client would meet it, and a refusal is rendered
+/// by the error layer into the status code the API promises.
+pub struct RestHarness {
+    /// The resolution fixtures underneath: the database, the tenant tree and
+    /// the seeding helpers.
+    pub inner: ResolutionHarness,
+    router: axum::Router,
+}
+
+impl RestHarness {
+    /// Build the read surface over a fresh database, with every authorization
+    /// decision allowed.
+    pub async fn new() -> Self {
+        Self::build(Arc::new(AllowAll)).await
+    }
+
+    /// The same surface with every authorization decision denied, for the
+    /// tests that assert the gate rather than what is behind it.
+    pub async fn denying() -> Self {
+        Self::build(Arc::new(DenyAll)).await
+    }
+
+    async fn build(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Self {
+        let inner = ResolutionHarness::new().await;
+        let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
+        let openapi = toolkit::api::OpenApiRegistryImpl::new();
+        let search = Arc::new(crate::domain::search::service::SearchService::new(
+            crate::infra::storage::search_repo::SearchRepo::new(inner.db.db().backend()),
+        ));
+        let router = crate::api::rest::setting_routes::register_routes(
+            axum::Router::new(),
+            &openapi,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let router = crate::api::rest::search_routes::register_routes(
+            router,
+            &openapi,
+            search,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&inner.db),
+            enforcer,
+        );
+        Self { inner, router }
+    }
+
+    /// Send a `GET` as the given tenant's administrator and answer with the
+    /// status and the decoded body.
+    pub async fn get(&self, uri: &str, caller: Uuid) -> (axum::http::StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let mut request = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("a well-formed request");
+        request.extensions_mut().insert(context_for(caller));
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("a bounded body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// Record an access restriction for a `(setting, tenant)` pair, the way an
+    /// ancestor's administrator would.
+    pub async fn restrict(
+        &self,
+        declaration_id: Uuid,
+        tenant: Uuid,
+        access: crate::domain::access::TenantAccess,
+    ) {
+        use crate::domain::access::AccessRepository as _;
+        let conn = self.inner.db.conn().expect("connection");
+        crate::infra::storage::access_repo::AccessRepo
+            .upsert(
+                &conn,
+                &AccessScope::allow_all(),
+                crate::domain::access::RestrictionDraft {
+                    declaration_id,
+                    tenant_id: tenant,
+                    access,
+                    set_by: "an ancestor's administrator".to_owned(),
+                },
+            )
+            .await
+            .expect("restriction");
+    }
+
+    /// The items of a paginated answer, or an empty list when the body is a
+    /// problem document.
+    pub async fn items(&self, uri: &str, caller: Uuid) -> Vec<Value> {
+        let (_, body) = self.get(uri, caller).await;
+        body.get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// An interactive administrator of one tenant.
+pub fn context_for(tenant: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant)
+        .subject_type(crate::domain::stepup::USER_SUBJECT_TYPE)
+        .build()
+        .expect("context")
+}
