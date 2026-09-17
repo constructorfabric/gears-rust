@@ -822,58 +822,6 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
     }
 }
 
-/// A step-up verifier that accepts whatever it is shown.
-///
-/// The freshness rules themselves are pinned by `infra/step_up_tests.rs`
-/// against a fake `AuthN` resolver; what a surface test needs is the gate
-/// open or shut, so the port is doubled rather than the platform behind it.
-struct FreshStepUp;
-
-/// A step-up verifier that refuses everything as stale.
-struct StaleStepUp;
-
-fn five_minute_requirement() -> crate::domain::stepup::StepUpRequirement {
-    crate::domain::stepup::StepUpRequirement {
-        max_age: crate::domain::stepup::StepUpRequirement::MAX_AGE_CEILING,
-        acr_values: Vec::new(),
-        amr_values: Vec::new(),
-    }
-}
-
-#[async_trait]
-impl crate::domain::stepup::StepUpVerifier for FreshStepUp {
-    async fn verify(
-        &self,
-        _token: Option<&str>,
-        _subject: &crate::domain::stepup::StepUpSubject,
-    ) -> Result<(), crate::domain::stepup::StepUpRefusal> {
-        Ok(())
-    }
-
-    fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
-        static REQUIREMENT: std::sync::OnceLock<crate::domain::stepup::StepUpRequirement> =
-            std::sync::OnceLock::new();
-        REQUIREMENT.get_or_init(five_minute_requirement)
-    }
-}
-
-#[async_trait]
-impl crate::domain::stepup::StepUpVerifier for StaleStepUp {
-    async fn verify(
-        &self,
-        _token: Option<&str>,
-        _subject: &crate::domain::stepup::StepUpSubject,
-    ) -> Result<(), crate::domain::stepup::StepUpRefusal> {
-        Err(crate::domain::stepup::StepUpRefusal::Stale)
-    }
-
-    fn requirement(&self) -> &crate::domain::stepup::StepUpRequirement {
-        static REQUIREMENT: std::sync::OnceLock<crate::domain::stepup::StepUpRequirement> =
-            std::sync::OnceLock::new();
-        REQUIREMENT.get_or_init(five_minute_requirement)
-    }
-}
-
 /// What a request answered with: the status, the decoded body, and the two
 /// headers a conditional write needs to follow a read.
 pub struct Answer {
@@ -898,6 +846,12 @@ pub struct RestHarness {
     /// The resolution fixtures underneath: the database, the tenant tree and
     /// the seeding helpers.
     pub inner: ResolutionHarness,
+    /// Where a secret's plaintext went, for the tests that assert it left the
+    /// settings row.
+    pub secrets: Arc<RecordingSecrets>,
+    /// What the write path published, for the tests that assert the event as
+    /// well as the answer.
+    pub published: Arc<RecordingPublisher>,
     router: axum::Router,
 }
 
@@ -905,19 +859,25 @@ impl RestHarness {
     /// Build the surface over a fresh database, with every authorization
     /// decision allowed and a step-up assertion that passes.
     pub async fn new() -> Self {
-        Self::build(Arc::new(AllowAll), Arc::new(FreshStepUp)).await
+        Self::build(Arc::new(AllowAll), Arc::new(FixedStepUp::verified())).await
     }
 
     /// The same surface with every authorization decision denied, for the
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
-        Self::build(Arc::new(DenyAll), Arc::new(FreshStepUp)).await
+        Self::build(Arc::new(DenyAll), Arc::new(FixedStepUp::verified())).await
     }
 
     /// The same surface where the caller's last re-authentication is too old,
     /// for the tests that assert the second gate.
     pub async fn stale_step_up() -> Self {
-        Self::build(Arc::new(AllowAll), Arc::new(StaleStepUp)).await
+        Self::build(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::refusing(
+                crate::domain::stepup::StepUpRefusal::Stale,
+            )),
+        )
+        .await
     }
 
     async fn build(
@@ -980,6 +940,7 @@ impl RestHarness {
             crate::infra::storage::declaration_repo::DeclarationRepo,
             Arc::clone(&types),
         ));
+        let step_up_for_writes = Arc::clone(&step_up);
         let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,
             crate::infra::storage::category_repo::CategoryRepo,
@@ -998,9 +959,41 @@ impl RestHarness {
             declarations,
             admin,
             Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        // The write surface. Every port behind it is doubled except the
+        // repositories and the audit store, which run for real against the
+        // same database the reads use.
+        let secrets = Arc::new(RecordingSecrets::default());
+        let published = Arc::new(RecordingPublisher::default());
+        let writer = Arc::new(crate::domain::writes::ValueWriter::new(
+            crate::infra::storage::value_repo::ValueRepo,
+            Arc::clone(&inner.resolver),
+            Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
+                resolution_catalogue(),
+            )),
+            crate::infra::storage::audit_store::AuditStore,
+            step_up_for_writes,
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
+            Arc::new(crate::domain::ports::NoMetrics),
+        ));
+        let coordinator = Arc::new(crate::infra::value_writes::WriteCoordinator::new(
+            Arc::clone(&inner.db),
+            writer,
+        ));
+        let router = crate::api::rest::value_routes::register_routes(
+            router,
+            &openapi,
+            coordinator,
             enforcer,
         );
-        Self { inner, router }
+        Self {
+            inner,
+            secrets,
+            published,
+            router,
+        }
     }
 
     /// Send a `GET` as the given tenant's administrator and answer with the
@@ -1020,6 +1013,20 @@ impl RestHarness {
         if_match: Option<&str>,
         caller: Uuid,
     ) -> Answer {
+        self.send_as(method, uri, body, if_match, context_for(caller))
+            .await
+    }
+
+    /// The same, as a caller the test builds itself — a service principal, for
+    /// the rules that turn on there being a person behind the request.
+    pub async fn send_as(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        if_match: Option<&str>,
+        caller: SecurityContext,
+    ) -> Answer {
         use tower::ServiceExt as _;
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
         if body.is_some() {
@@ -1032,7 +1039,7 @@ impl RestHarness {
             axum::body::Body::from(serde_json::to_vec(&json).expect("serializes"))
         });
         let mut request = builder.body(payload).expect("a well-formed request");
-        request.extensions_mut().insert(context_for(caller));
+        request.extensions_mut().insert(caller);
         let response = self
             .router
             .clone()
@@ -1110,11 +1117,26 @@ impl RestHarness {
 }
 
 /// An interactive administrator of one tenant.
+///
+/// The subject is derived from the tenant rather than drawn fresh, so the same
+/// administrator is recognisable across requests — which is what a single-use
+/// token staged by one request and claimed by the next depends on.
 pub fn context_for(tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
-        .subject_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v5(&Uuid::NAMESPACE_OID, tenant.as_bytes()))
         .subject_tenant_id(tenant)
         .subject_type(crate::domain::stepup::USER_SUBJECT_TYPE)
+        .build()
+        .expect("context")
+}
+
+/// A service principal of one tenant: no person behind it, so a declaration
+/// that requires a recent re-authentication has nobody to ask.
+pub fn service_context_for(tenant: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v5(&Uuid::NAMESPACE_DNS, tenant.as_bytes()))
+        .subject_tenant_id(tenant)
+        .subject_type("gts.cf.core.security.subject_service.v1~")
         .build()
         .expect("context")
 }

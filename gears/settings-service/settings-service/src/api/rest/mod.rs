@@ -35,3 +35,7 @@ mod access_surface_tests;
 #[cfg(test)]
 #[path = "declaration_surface_tests.rs"]
 mod declaration_surface_tests;
+
+#[cfg(test)]
+#[path = "value_surface_tests.rs"]
+mod value_surface_tests;
