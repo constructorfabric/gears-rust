@@ -45,7 +45,7 @@ fn etag_of(model: &category::Model) -> ETag {
 }
 // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-precondition:p1:inst-gf-precond-2
 
-fn to_domain(model: category::Model) -> Result<Category, DomainError> {
+pub(crate) fn to_domain(model: category::Model) -> Result<Category, DomainError> {
     let etag = etag_of(&model);
     Ok(Category {
         id: model.id,

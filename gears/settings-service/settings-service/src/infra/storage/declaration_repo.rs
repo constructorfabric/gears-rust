@@ -32,7 +32,7 @@ const DECLARATION_LIMIT_CFG: LimitCfg = LimitCfg {
 /// Persistence for declarations.
 pub struct DeclarationRepo;
 
-fn to_domain(model: declaration::Model) -> Declaration {
+pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
     Declaration {
         id: model.id,
         key: model.key,
@@ -86,7 +86,7 @@ fn db_error(err: impl std::fmt::Display) -> DomainError {
 /// The null arm is what keeps an undomained declaration universally visible;
 /// without it every declaration with no domain vanishes for every scoped
 /// administrator.
-fn apply_visibility(
+pub(crate) fn apply_visibility(
     select: sea_orm::Select<DeclarationEntity>,
     visibility: &DomainVisibility,
 ) -> sea_orm::Select<DeclarationEntity> {

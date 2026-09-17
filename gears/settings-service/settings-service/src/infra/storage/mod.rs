@@ -17,4 +17,5 @@ pub mod entity;
 pub mod migrations;
 pub mod odata_mapper;
 pub mod pending_secret_repo;
+pub mod search_repo;
 pub mod value_repo;

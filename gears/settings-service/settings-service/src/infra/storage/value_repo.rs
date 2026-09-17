@@ -16,7 +16,7 @@ use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ValueRepo;
 
-fn to_domain(model: setting_value::Model) -> StoredValue {
+pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
     StoredValue {
         id: model.id,
         declaration_id: model.declaration_id,
@@ -50,7 +50,7 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
 
 /// Only the subject-less track: rows carrying a subject pair belong to the
 /// subject dimension and never answer a request that named no subject.
-fn subjectless() -> sea_orm::Condition {
+pub(crate) fn subjectless() -> sea_orm::Condition {
     sea_orm::Condition::all().add(setting_value::Column::SubjectType.is_null())
 }
 

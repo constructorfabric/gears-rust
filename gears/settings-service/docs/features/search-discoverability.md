@@ -87,8 +87,8 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 4. [ ] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver: an override the caller could not read is never matched - `inst-sd-search-4`
 5. [ ] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
 6. [ ] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
-7. [ ] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
-8. [ ] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row - `inst-sd-search-8`
+7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
+8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row - `inst-sd-search-8`
 9. [ ] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
 10. [ ] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it - `inst-sd-search-10`
 11. [ ] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
@@ -97,7 +97,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 ### Query Validation and Pattern
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-needle`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-needle`
 
 **Input**: The raw `q` parameter
 
@@ -106,21 +106,21 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 **Steps**:
 1. [x] - `p2` - Trim `q`; **IF** fewer than two characters or more than two hundred remain → refuse on field `q` - `inst-sd-needle-1`
 2. [x] - `p2` - Build the pattern `%needle%` with `%`, `_` and `\` escaped by `\`, and declare `ESCAPE '\'` on every predicate that uses it, because SQLite has no default escape character - `inst-sd-needle-2`
-3. [ ] - `p2` - Choose the operator by dialect: `ILIKE` on PostgreSQL over exactly the expressions the trigram indexes are built on, `LIKE` on SQLite where the match is a scan; the two branches differ in spelling only - `inst-sd-needle-3`
+3. [x] - `p2` - Choose the operator by dialect: `ILIKE` on PostgreSQL over exactly the expressions the trigram indexes are built on, `LIKE` on SQLite where the match is a scan; the two branches differ in spelling only - `inst-sd-needle-3`
 
 ### Corpus by Classification
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-corpus`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-corpus`
 
 **Input**: The caller's `read_unmasked` decision, the bounded tenant set
 
 **Output**: The predicates that admit a stored value to matching
 
 **Steps**:
-1. [ ] - `p2` - Exclude every `secret` row by predicate — `secret_ref IS NULL` and a classification in the corpus — so a secret cannot be discovered through match existence, count or timing - `inst-sd-corpus-1`
-2. [ ] - `p2` - Admit `pii` rows only when the caller holds `read_unmasked`; otherwise the corpus is `public` alone and PII content is unreachable through a match - `inst-sd-corpus-2`
-3. [ ] - `p2` - Exclude a JSON `null` Schema Default from the default corpus, since its text projection is the literal `null` and would match that word on every such setting - `inst-sd-corpus-3`
-4. [ ] - `p2` - State the classification predicate identically in the page query and in the override query, so on PostgreSQL each is served by the matching half of the split index pair and correctness rests on the predicate, not on the plan - `inst-sd-corpus-4`
+1. [x] - `p2` - Exclude every `secret` row by predicate — `secret_ref IS NULL` and a classification in the corpus — so a secret cannot be discovered through match existence, count or timing - `inst-sd-corpus-1`
+2. [x] - `p2` - Admit `pii` rows only when the caller holds `read_unmasked`; otherwise the corpus is `public` alone and PII content is unreachable through a match - `inst-sd-corpus-2`
+3. [x] - `p2` - Exclude a JSON `null` Schema Default from the default corpus, since its text projection is the literal `null` and would match that word on every such setting - `inst-sd-corpus-3`
+4. [x] - `p2` - State the classification predicate identically in the page query and in the override query, so on PostgreSQL each is served by the matching half of the split index pair and correctness rests on the predicate, not on the plan - `inst-sd-corpus-4`
 
 ### Matched-Field Attribution
 
@@ -155,7 +155,7 @@ No stateful entity: search reads and stores nothing.
 
 ### Classification-Aware Corpus
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-corpus`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-corpus`
 
 A `secret` value **MUST NOT** be matched under any query; a `pii` value **MUST** be matched only for a caller holding `read_unmasked`; an override **MUST** be matched only at the target and its non-standalone descendants; a JSON `null` default **MUST NOT** match.
 
@@ -179,7 +179,7 @@ A hit **MUST** carry the setting key, declaration id, leaf slug, description, it
 
 ### Dialect
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-dialect`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-dialect`
 
 On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed expressions; on SQLite they **MUST** use `LIKE` with the same escaping; the query **MUST** be one statement per page plus one per override set, whatever the dialect.
 
