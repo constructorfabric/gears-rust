@@ -167,7 +167,7 @@ A `secret` value **MUST NOT** be matched under any query; a `pii` value **MUST**
 
 ### Hits
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-hits`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-hits`
 
 A hit **MUST** carry the setting key, declaration id, leaf slug, description, its category as `{id, key, name}`, the matched field from `key | description | category_name | default_value | value`, and the declaration's `mode`; an override hit **MUST** name `scope` and `tenant_id`; a value **MUST** be present only on a `value` or `default_value` hit and masked by classification as a read would mask it.
 
