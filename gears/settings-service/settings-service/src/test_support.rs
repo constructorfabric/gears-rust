@@ -822,6 +822,15 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
     }
 }
 
+/// What a request answered with: the status, the decoded body, and the two
+/// headers a conditional write needs to follow a read.
+pub struct Answer {
+    pub status: axum::http::StatusCode,
+    pub body: Value,
+    pub etag: Option<String>,
+    pub location: Option<String>,
+}
+
 /// The gear's read surface, registered exactly as the gear registers it and
 /// answering real requests.
 ///
@@ -857,8 +866,19 @@ impl RestHarness {
         let search = Arc::new(crate::domain::search::service::SearchService::new(
             crate::infra::storage::search_repo::SearchRepo::new(inner.db.db().backend()),
         ));
-        let router = crate::api::rest::setting_routes::register_routes(
+        let categories = Arc::new(crate::domain::category::CategoryService::new(
+            crate::infra::storage::category_repo::CategoryRepo,
+            crate::infra::storage::audit_store::AuditStore,
+        ));
+        let router = crate::api::rest::routes::register_routes(
             axum::Router::new(),
+            &openapi,
+            categories,
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let router = crate::api::rest::setting_routes::register_routes(
+            router,
             &openapi,
             Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
@@ -878,12 +898,32 @@ impl RestHarness {
     /// Send a `GET` as the given tenant's administrator and answer with the
     /// status and the decoded body.
     pub async fn get(&self, uri: &str, caller: Uuid) -> (axum::http::StatusCode, Value) {
+        let answer = self.send("GET", uri, None, None, caller).await;
+        (answer.status, answer.body)
+    }
+
+    /// Send any request: a method, a URI, an optional JSON body and an
+    /// optional `If-Match`, as the given tenant's administrator.
+    pub async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        if_match: Option<&str>,
+        caller: Uuid,
+    ) -> Answer {
         use tower::ServiceExt as _;
-        let mut request = axum::http::Request::builder()
-            .method("GET")
-            .uri(uri)
-            .body(axum::body::Body::empty())
-            .expect("a well-formed request");
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        if let Some(tag) = if_match {
+            builder = builder.header("if-match", tag);
+        }
+        let payload = body.map_or_else(axum::body::Body::empty, |json| {
+            axum::body::Body::from(serde_json::to_vec(&json).expect("serializes"))
+        });
+        let mut request = builder.body(payload).expect("a well-formed request");
         request.extensions_mut().insert(context_for(caller));
         let response = self
             .router
@@ -892,11 +932,26 @@ impl RestHarness {
             .await
             .expect("the router answers");
         let status = response.status();
+        let etag = response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("a bounded body");
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, body)
+        Answer {
+            status,
+            body,
+            etag,
+            location,
+        }
     }
 
     /// Record an access restriction for a `(setting, tenant)` pair, the way an

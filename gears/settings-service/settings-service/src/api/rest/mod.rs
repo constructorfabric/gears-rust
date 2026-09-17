@@ -23,3 +23,7 @@ pub mod value_routes;
 #[cfg(test)]
 #[path = "read_surface_tests.rs"]
 mod read_surface_tests;
+
+#[cfg(test)]
+#[path = "category_surface_tests.rs"]
+mod category_surface_tests;
