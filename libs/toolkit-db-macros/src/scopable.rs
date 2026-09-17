@@ -201,7 +201,15 @@ fn generate_scope_properties(config: &SecureConfig, span: Span) -> TokenStream {
 fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()> {
     let struct_span = input.span();
 
-    // If unrestricted is set, no other attributes should be present
+    // If unrestricted is set, no other attributes should be present.
+    //
+    // `pep_props` belongs in this list, not only in the parse-time guard in
+    // `parse_secure_attrs`: that guard reads `config.unrestricted`, so it only
+    // fires when `unrestricted` was written *before* the `pep_prop`. Written
+    // after, the declared property reached the `unrestricted` branch of
+    // `expand_derive_scopable`, which emits an empty `SCOPE_PROPERTIES` -- so
+    // the property was dropped in silence and the entity came out fully
+    // unscoped. Attribute order decided whether that was a hard error.
     if let Some(unrestricted_span) = config.unrestricted {
         let has_other = config.tenant_col.is_some()
             || config.no_tenant.is_some()
@@ -210,7 +218,8 @@ fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()
             || config.owner_col.is_some()
             || config.no_owner.is_some()
             || config.type_col.is_some()
-            || config.no_type.is_some();
+            || config.no_type.is_some()
+            || !config.pep_props.is_empty();
 
         if has_other {
             return Err(syn::Error::new(
