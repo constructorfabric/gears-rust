@@ -32,11 +32,11 @@ use crate::test_support::{
     FakeSource, RecordingAudit, RecordingPublisher, RecordingRegistrar, sqlite_provider,
 };
 
-const BOOL: &str = "gts.cf.toolkit.settings.type_bool_flag.v1~";
-const PORT: &str = "gts.cf.toolkit.settings.type_port.v1~";
-const SECRET: &str = "gts.cf.toolkit.settings.type_secret_string.v1~";
-const NARROW_PORT: &str = "gts.cf.toolkit.settings.type_narrow_port.v1~";
-const STRING: &str = "gts.cf.toolkit.settings.type_string.v1~";
+const BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
+const PORT: &str = "gts.cf.core.settings.type_port.v1~";
+const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
+const NARROW_PORT: &str = "gts.cf.core.settings.type_narrow_port.v1~";
+const STRING: &str = "gts.cf.core.settings.type_string.v1~";
 const MODULE: &str = "settings-demo";
 
 fn catalogue() -> FakeSource {
@@ -481,7 +481,7 @@ async fn an_unknown_value_type_is_refused() {
     let h = Harness::new().await;
     let unknown = ContributedDeclaration::new(
         key("network", "mystery", 1),
-        "gts.cf.toolkit.settings.type_nope.v1~".to_owned(),
+        "gts.cf.core.settings.type_nope.v1~".to_owned(),
         json!(1),
         ScopeClass::Global,
     );

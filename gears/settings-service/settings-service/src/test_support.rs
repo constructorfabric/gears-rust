@@ -347,8 +347,8 @@ impl TenantHierarchy for FakeHierarchy {
 // standalone child of `a`; a category, declarations and rows written through
 // the real repositories over an in-memory database.
 
-pub const BOOL: &str = "gts.cf.toolkit.settings.type_bool_flag.v1~";
-pub const SECRET: &str = "gts.cf.toolkit.settings.type_secret_string.v1~";
+pub const BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
+pub const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
 
 pub fn resolution_catalogue() -> FakeSource {
     FakeSource::default()

@@ -49,7 +49,7 @@ async fn migrated() -> DatabaseConnection {
                     last_change_at, created_at, updated_at, created_by)
                  VALUES ('{id}',
                          'gts.cf.core.settings.setting_type.v1~acme.settings.network.{leaf}.v1~',
-                         '{leaf}', 'gts.cf.toolkit.settings.type_bool_flag.v1~', '{CATEGORY_ID}',
+                         '{leaf}', 'gts.cf.core.settings.type_bool_flag.v1~', '{CATEGORY_ID}',
                          'true', 'cascading', 'now', 'now', 'now', 'tester');"
             ),
         )

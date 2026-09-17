@@ -136,7 +136,7 @@ function renderRows() {
     const name = document.createElement("td");
     name.innerHTML = `<b>${leaf(key)}</b><br><span class="muted">${row.declaration ? row.declaration.description || "" : ""}</span>`;
     const type = document.createElement("td");
-    type.textContent = row.declaration ? row.declaration.value_type_id.replace("gts.cf.toolkit.settings.type_", "").replace(".v1~", "") : "?";
+    type.textContent = row.declaration ? row.declaration.value_type_id.replace("gts.cf.core.settings.type_", "").replace(".v1~", "") : "?";
     const value = document.createElement("td");
     value.className = "value";
     const source = document.createElement("td");

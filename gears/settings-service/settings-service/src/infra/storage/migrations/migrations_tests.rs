@@ -34,6 +34,7 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260907_000001_audit_records".to_owned(),
             "m20260907_000002_tenant_permissions".to_owned(),
             "m20260915_000001_pending_secrets".to_owned(),
+            "m20260917_000001_value_type_namespace".to_owned(),
         ]
     );
 }

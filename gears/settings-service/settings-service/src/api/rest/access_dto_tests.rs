@@ -23,7 +23,7 @@ fn declaration() -> Declaration {
         id: Uuid::nil(),
         key: KEY.to_owned(),
         leaf_slug: "proxy".to_owned(),
-        value_type_id: "gts.cf.toolkit.settings.type_bool_flag.v1~".to_owned(),
+        value_type_id: "gts.cf.core.settings.type_bool_flag.v1~".to_owned(),
         category_id: Uuid::nil(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
