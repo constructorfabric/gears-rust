@@ -1,6 +1,6 @@
 # Multi-stage build for cf-gears-server API backend
 # Stage 1: Builder
-FROM rust:1.95.0-bookworm@sha256:6bb82db0878825e157664188b319c875de4f1fff5d70f5917b3a3f1974b472e4 AS builder
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
 
 # Build arguments for cargo features
 ARG CARGO_FEATURES
@@ -35,7 +35,7 @@ RUN if [ -n "$CARGO_FEATURES" ]; then \
     fi
 
 # Stage 2: Runtime - must match builder's base OS
-FROM debian:13.3-slim
+FROM debian:13.6-slim
 
 WORKDIR /app
 

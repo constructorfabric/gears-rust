@@ -20,9 +20,6 @@ pub const DEFAULT_TENANT_ID: Uuid = uuid!("00000000-df51-5b42-9538-d2b56b7ee953"
 /// In production deployments, subject IDs come from the authentication layer.
 pub const DEFAULT_SUBJECT_ID: Uuid = uuid!("11111111-6a88-4768-9dfc-6bcd5187d9ed");
 
-/// Default GTS type ID placeholder.
-pub const GTS_DEFAULT_TYPE_ID: Uuid = uuid!("22222222-0000-0000-0000-000000000001");
-
 /// Header (HTTP) / metadata (gRPC) key carrying the platform-plane internal
 /// credential. Always lower-case (canonical for both HTTP/2 and gRPC metadata).
 ///

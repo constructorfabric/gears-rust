@@ -16,12 +16,13 @@
 
 use std::sync::Arc;
 
-use gts::{GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
+use gts::{CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbTx};
 use toolkit_macros::domain_model;
+use tracing::Span;
 use uuid::Uuid;
 
 use super::bounds::{check_closure, materialize_bounded};
@@ -35,17 +36,19 @@ use super::revision::{
 use super::unchanged::{self, UnchangedCandidate};
 use super::vector::{self, RevisionVector, VectorDrift};
 use crate::config::Limits;
-use crate::domain::admission::AdmissionFailureReason;
+use crate::domain::admission::{AdmissionFailureReason, Precondition};
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash};
+use crate::domain::compat::{self, Baseline};
 use crate::domain::dependency::{DependencyEdge, extract_edges};
-use crate::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
+use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
 use crate::domain::family::{FamilyKey, admits_new_member, family_key};
-use crate::domain::gts_store::{UnitDocument, UnitStore, load_unit_store};
-use crate::domain::ports::metrics::AdmissionMetrics;
+use crate::domain::gts_store::{CommittedSchema, UnitDocument, UnitStore, load_unit_store};
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels};
 use crate::domain::ports::{
-    NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewRevision,
-    OperationItemRow, Stores, snapshot_read,
+    ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision,
+    NewRevision, OperationItemRow, Stores, snapshot_read,
 };
+use crate::observability::{self, CompatFacts};
 
 /// The owning gear recorded on a P0 admission.
 ///
@@ -62,7 +65,11 @@ pub const P0_OWNING_GEAR: &str = "types-registry";
 pub enum EvaluatedOutcome {
     /// D3's artifacts, materialized at admission so the read path recomputes
     /// nothing.
-    TypeSchema { artifacts: MaterializedArtifacts },
+    TypeSchema {
+        artifacts: MaterializedArtifacts,
+        /// GTS's root modifier, carried to the commit-time live-Instance guard.
+        is_abstract: bool,
+    },
     /// The Type Schema revision this value was validated against. Recorded rather
     /// than re-derived: the schema's current revision may move afterwards, and this
     /// is the record of which rules the value passed.
@@ -96,10 +103,122 @@ pub struct EvaluatedUnit {
     pub content_hash: Vec<u8>,
     pub outcome: EvaluatedOutcome,
     pub operation_item_id: i64,
+    /// The effective ADR-0004 waiver, persisted as `compat_forced`.
+    /// Remains true for a compatible candidate if the waiver is still authorized;
+    /// ADR-0003 withdraws the whole-history guarantee for any forced step.
+    pub compat_forced: bool,
     /// The candidate's outgoing edges, by target **identifier** (T13).
     pub edges: Vec<DependencyEdge>,
     /// The database state on which this evaluation's verdict rests.
     pub vector: RevisionVector,
+    /// Which pass produced this unit, for the series its commit emits (T20).
+    /// Carried on the unit rather than threaded through every commit signature:
+    /// each commit already takes the unit, and a separate argument would be one
+    /// more place the two could disagree.
+    pub labels: PassLabels,
+}
+
+/// Owned baseline snapshot passed into `spawn_blocking`, with refusal provenance.
+#[domain_model]
+#[derive(Clone, Debug)]
+enum BaselineDocument {
+    /// No comparison is owed. Which exemption it was stays on the [`Baseline`] the
+    /// choice came from, so it is not carried a second time here.
+    Exempt,
+    /// Baseline content for comparison; identifier and revision for tracing.
+    Present {
+        gts_id: String,
+        revision_no: i32,
+        content: Value,
+    },
+    /// No predecessor to compare yet. The commit-time family gate checks existence
+    /// after shape conflicts, which take precedence. This is always a creation.
+    ///
+    /// The absent predecessor remains in the revision vector: if it appears before
+    /// commit, `VectorDrift::Appeared` triggers rollback and a fresh comparison.
+    PredecessorAbsent,
+}
+
+/// Read the baseline from the comparison store's snapshot (SPEC §8.1 step 3).
+///
+/// Cross-minor content is already in `loaded`; only `CurrentRevision` needs
+/// a query because the candidate overlay replaced its committed document.
+/// Its observed version must match the accepted precondition: the commit CAS
+/// then protects the same baseline that evaluation compared against.
+/// Take `loaded` by value: `UnitStore` is not `Sync` and cannot be borrowed
+/// across awaits.
+async fn read_baseline(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    candidate_id: &str,
+    precondition: Precondition,
+    choice: &Baseline,
+    loaded: Option<CommittedSchema>,
+) -> Result<Result<BaselineDocument, ItemFailure>, WorkerError> {
+    let gts_id = match choice {
+        Baseline::Exempt(_) => return Ok(Ok(BaselineDocument::Exempt)),
+        Baseline::PrecedingMinor { gts_id } => {
+            // Absent from the loaded closure is absent from the database: the
+            // identifier was passed as a root, so a row would have been read.
+            return Ok(Ok(match loaded {
+                Some(committed) => BaselineDocument::Present {
+                    gts_id: gts_id.clone(),
+                    revision_no: committed.revision_no,
+                    content: committed.content,
+                },
+                None => BaselineDocument::PredecessorAbsent,
+            }));
+        }
+        Baseline::CurrentRevision => candidate_id,
+    };
+    // Match revision_entity's refusal order in the evaluation snapshot. Deleted
+    // predecessors remain valid baselines; that creation arm returned above.
+    let Some(entity) = stores.find_by_gts_id(tx, scope, gts_id).await? else {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::PreconditionFailed,
+            format!("'{gts_id}' does not exist, so a revision has no baseline to compare against"),
+        )));
+    };
+    if entity.lifecycle_status == LifecycleStatus::Deleted {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::EntityDeleted,
+            format!("'{gts_id}' is deleted; a revision cannot be admitted onto a withdrawn entity"),
+        )));
+    }
+    // A future precondition must not become valid after comparison against an
+    // older baseline. The candidate itself is excluded from the revision vector.
+    if let Precondition::Version(expected) = precondition
+        && entity.resource_version != expected
+    {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::PreconditionFailed,
+            format!(
+                "'{gts_id}' has resource_version {}, not expected {expected}, \
+                 in the evaluation snapshot",
+                entity.resource_version
+            ),
+        )));
+    }
+    let current = stores
+        .current_documents(tx, scope, &[entity.id])
+        .await?
+        .pop()
+        .ok_or_else(|| WorkerError::CurrentStateMissing {
+            gts_id: gts_id.to_owned(),
+            entity_id: entity.id,
+        })?;
+    let content = serde_json::from_str(&current.raw_schema).map_err(|source| {
+        WorkerError::BaselineUnparsable {
+            gts_id: gts_id.to_owned(),
+            source,
+        }
+    })?;
+    Ok(Ok(BaselineDocument::Present {
+        gts_id: gts_id.to_owned(),
+        revision_no: current.revision_no,
+        content,
+    }))
 }
 
 /// Claim the write order as the first statement of every commit transaction.
@@ -124,6 +243,11 @@ enum EvaluationSnapshot {
         schema_pair: Option<(i64, i32)>,
         vector: RevisionVector,
         edges: Vec<DependencyEdge>,
+        /// Parsed inside the snapshot, after a probe miss, and carried out because
+        /// the comparison in the blocking task reads it.
+        content: Value,
+        /// Boxed to keep the variant's size off the `Unchanged` arm.
+        baseline: Box<BaselineDocument>,
     },
 }
 
@@ -135,153 +259,292 @@ pub enum PreparedUnit {
     Unchanged(Arc<UnchangedCandidate>),
 }
 
-/// Probe once when requested, then evaluate a miss from the same snapshot.
-/// Validation and artifact materialization run after the snapshot closes.
-///
-/// Builds the unit's transient store from the database (D2), asks `gts-rust` to
-/// validate the candidate, and materializes D3's artifacts. The store is dropped
-/// when this returns: nothing is retained anywhere, and the next invocation reads
-/// the database again.
-///
-/// Resolution budgets apply before commit; `activation_write_set` also bounds reverse impact.
-///
-/// # Errors
-/// [`WorkerError`] for an infrastructure failure, which the outbox handler must
-/// retry. A content failure is an [`ItemFailure`] in the `Ok(Err(..))` position: an
-/// *outcome*, not a fault, and retrying it would answer the same forever.
-#[allow(clippy::too_many_arguments)]
-pub async fn evaluate(
-    stores: &Arc<dyn Stores>,
-    db: &DBProvider<WorkerError>,
+/// Inputs for applying a prepared registration in the caller's transaction.
+#[domain_model]
+pub(super) struct CommitRequest<'a> {
+    pub prepared: &'a PreparedUnit,
+    pub precondition: Precondition,
+    pub now: OffsetDateTime,
+    pub limits: Limits,
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
+}
+
+/// Select the commit from the stored precondition for both execution modes.
+/// The caller supplies either persistent stores or the dry-run view, and owns
+/// the transaction boundary and any retries.
+pub(super) async fn commit_prepared_in(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
-    gts_id: &str,
-    canonical_body: &str,
+    request: CommitRequest<'_>,
+) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
+    let CommitRequest {
+        prepared,
+        precondition,
+        now,
+        limits,
+        metrics,
+    } = request;
+    let unit = match prepared {
+        PreparedUnit::Unchanged(candidate) => {
+            return unchanged::commit(stores, tx, scope, candidate, now).await;
+        }
+        PreparedUnit::Evaluated(unit) => unit,
+    };
+    match precondition {
+        Precondition::MustNotExist => commit_creation(stores, tx, scope, unit, &limits, now)
+            .await
+            .map(|result| result.map(RevisionCommit::Admitted)),
+        Precondition::Version(expected) => {
+            commit_revision(stores, tx, scope, unit, expected, &limits, now, metrics).await
+        }
+    }
+}
+
+/// Stored inputs for one evaluation, named to prevent positional mix-ups.
+#[domain_model]
+#[derive(Clone, Copy, Debug)]
+pub struct EvaluationTarget<'a> {
+    pub gts_id: &'a str,
+    /// The canonicalized authored document, as acceptance stored it.
+    pub canonical_body: &'a str,
+    pub operation_item_id: i64,
+    /// The accepted optimistic precondition. It is what separates a creation from a
+    /// revision, and therefore which definition the candidate is compared against.
+    pub precondition: Precondition,
+    /// Accepted waiver request, subject to worker and baseline re-authorization.
+    pub force: bool,
+    /// Which pass this evaluation belongs to, for the series it emits (T20).
+    pub labels: PassLabels,
+}
+
+/// Plan evaluation before reading state, shared by committing and dry-run paths.
+#[domain_model]
+#[derive(Clone, Debug)]
+struct EvaluationPlan {
+    id: GtsId,
+    candidate_id: String,
+    canonical_body: String,
+    baseline_choice: Baseline,
+    /// The preceding minor, when there is one: an entity no candidate names, so
+    /// its own bases and stored `$ref` targets reach the store only as an extra
+    /// closure root.
+    baseline_roots: Vec<String>,
+    conforming_type: Option<String>,
+    precondition: Precondition,
     operation_item_id: i64,
-    limits: &Limits,
-    probe_item: Option<&OperationItemRow>,
-) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
-    let limits = *limits;
+    force: bool,
+    labels: PassLabels,
+}
+
+/// Decide the plan, or refuse the candidate on what its identifier alone says.
+fn plan_evaluation(target: EvaluationTarget<'_>) -> Result<EvaluationPlan, ItemFailure> {
+    let EvaluationTarget {
+        gts_id,
+        canonical_body,
+        operation_item_id,
+        precondition,
+        force,
+        labels,
+    } = target;
     let id = match GtsId::try_new(gts_id) {
         Ok(id) => id,
         // Acceptance already refused a non-canonical identifier, so reaching here
         // means the stored row disagrees with the rules that admitted it.
         Err(e) => {
-            return Ok(Err(ItemFailure::new(
+            return Err(ItemFailure::new(
                 AdmissionFailureReason::InvalidIdentifier,
                 format!("stored identifier '{gts_id}' does not parse: {e}"),
-            )));
+            ));
         }
+    };
+    // Select from the identifier and accepted precondition before reading storage.
+    let baseline_choice = match compat::select_baseline(&id, precondition) {
+        Ok(choice) => choice,
+        // Acceptance rejects unreadable versions; fail closed if a stored row contains one.
+        Err(unreadable) => {
+            return Err(ItemFailure::new(
+                compat::UnreadableVersion::REASON,
+                unreadable.to_string(),
+            ));
+        }
+    };
+    let baseline_roots: Vec<String> = match &baseline_choice {
+        Baseline::PrecedingMinor { gts_id } => vec![gts_id.clone()],
+        _ => Vec::new(),
     };
     // The conforming type's `(entity_id, revision_no)` is read in the same snapshot as
     // the store: the recorded revision must be the one that validated the value.
     let conforming_type = (!id.is_type()).then(|| id.get_type_id()).flatten();
     let candidate_id = id.id().to_owned();
-    let snapshot = {
-        let stores = Arc::clone(stores);
-        let scope = scope.clone();
-        let conforming_type = conforming_type.clone();
-        let probe_item = probe_item.cloned();
-        let canonical_body = canonical_body.to_owned();
-        let id = id.clone();
-        db.transaction_with_config(snapshot_read(&db.db()), move |tx| {
-            Box::pin(async move {
-                if let Some(item) = probe_item
-                    && let Some(candidate) =
-                        unchanged::probe(stores.as_ref(), tx, &scope, &item, &canonical_body)
-                            .await?
-                {
-                    return Ok(Ok(EvaluationSnapshot::Unchanged(candidate)));
-                }
-                let content: Value = match serde_json::from_str(&canonical_body) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        return Ok(Err(ItemFailure::new(
-                            AdmissionFailureReason::InvalidDocument,
-                            format!("stored request payload is not valid JSON: {e}"),
-                        )));
-                    }
-                };
+    Ok(EvaluationPlan {
+        id,
+        candidate_id,
+        canonical_body: canonical_body.to_owned(),
+        baseline_choice,
+        baseline_roots,
+        conforming_type,
+        precondition,
+        operation_item_id,
+        force,
+        labels,
+    })
+}
 
-                // Extract only after a probe miss, before loading the dependency store.
-                let edges = match extract_edges(&id, &content) {
-                    Ok(edges) => edges,
-                    Err(e) => {
-                        return Ok(Err(ItemFailure::new(
-                            AdmissionFailureReason::InvalidSchema,
-                            e.to_string(),
-                        )));
-                    }
-                };
-
-                let candidates = vec![UnitDocument {
-                    gts_id: id.id().to_owned(),
-                    content,
-                }];
-                let store = load_unit_store(stores.as_ref(), tx, &scope, candidates)
-                    .await
-                    .map_err(WorkerError::StoreBuild)?;
-                let pair = match conforming_type {
-                    Some(type_id) => {
-                        let entity = stores.find_by_gts_id(tx, &scope, &type_id).await?;
-                        match entity {
-                            Some(row) => stores
-                                .current_schema_projections(tx, &scope, &[row.id])
-                                .await?
-                                .into_iter()
-                                .find(|current| current.entity_id == row.id)
-                                .map(|current| (row.id, current.cas.revision_no)),
-                            None => None,
-                        }
-                    }
-                    None => None,
-                };
-                // Derive the vector from the same snapshot as the validated documents (D4).
-                let vector = vector::derive_from(
-                    stores.as_ref(),
-                    tx,
-                    &scope,
-                    &candidate_id,
-                    store.roots(),
-                    store.closure_entities(),
-                    limits.activation_write_set,
-                )
-                .await?;
-                let vector = match vector {
-                    Ok(vector) => vector,
-                    Err(failure) => return Ok(Err(failure)),
-                };
-                Ok(Ok(EvaluationSnapshot::Loaded {
-                    store: Box::new(store),
-                    schema_pair: pair,
-                    vector,
-                    edges,
-                }))
-            })
-        })
-        .await?
+/// Read evaluation inputs from the caller's snapshot.
+async fn read_evaluation_snapshot(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    plan: &EvaluationPlan,
+    probe_item: Option<&OperationItemRow>,
+    limits: &Limits,
+) -> Result<Result<EvaluationSnapshot, ItemFailure>, WorkerError> {
+    if let Some(item) = probe_item
+        && let Some(candidate) =
+            unchanged::probe(stores, tx, scope, item, &plan.canonical_body).await?
+    {
+        return Ok(Ok(EvaluationSnapshot::Unchanged(candidate)));
+    }
+    let content: Value = match serde_json::from_str(&plan.canonical_body) {
+        Ok(content) => content,
+        Err(e) => {
+            return Ok(Err(ItemFailure::new(
+                AdmissionFailureReason::InvalidDocument,
+                format!("stored request payload is not valid JSON: {e}"),
+            )));
+        }
     };
-    let (store, schema_pair, vector, edges) = match snapshot {
-        Ok(EvaluationSnapshot::Loaded {
+
+    // Extract only after a probe miss, before loading the dependency store.
+    let edges = match extract_edges(&plan.id, &content) {
+        Ok(edges) => edges,
+        Err(e) => {
+            return Ok(Err(ItemFailure::new(
+                AdmissionFailureReason::InvalidSchema,
+                e.to_string(),
+            )));
+        }
+    };
+
+    // SPEC §8.1 step 7: quarantine the extracted dependency edges before loading
+    // targets. Their identifiers suffice; unchanged content never reaches this check.
+    if let Err(breach) = compat::quarantine(&plan.id, &edges) {
+        return Ok(Err(ItemFailure::new(breach.reason(), breach.to_string())));
+    }
+
+    let candidates = vec![UnitDocument {
+        gts_id: plan.candidate_id.clone(),
+        content: content.clone(),
+    }];
+    let store = load_unit_store(stores, tx, scope, candidates, &plan.baseline_roots)
+        .await
+        .map_err(WorkerError::StoreBuild)?;
+    // Looked up before the await: `UnitStore` is not `Sync`, so the
+    // borrow must end before the future may be sent.
+    let loaded = match &plan.baseline_choice {
+        Baseline::PrecedingMinor { gts_id } => store.committed_schema(gts_id).cloned(),
+        Baseline::Exempt(_) | Baseline::CurrentRevision => None,
+    };
+    let baseline = match read_baseline(
+        stores,
+        tx,
+        scope,
+        &plan.candidate_id,
+        plan.precondition,
+        &plan.baseline_choice,
+        loaded,
+    )
+    .await?
+    {
+        Ok(baseline) => baseline,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let pair = match &plan.conforming_type {
+        Some(type_id) => {
+            let entity = stores.find_by_gts_id(tx, scope, type_id).await?;
+            match entity {
+                Some(row) => stores
+                    .current_schema_projections(tx, scope, &[row.id])
+                    .await?
+                    .into_iter()
+                    .find(|current| current.entity_id == row.id)
+                    .map(|current| (row.id, current.cas.revision_no)),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    // Derive the vector from the same snapshot as the validated documents (D4).
+    let vector = vector::derive_from(
+        stores,
+        tx,
+        scope,
+        &plan.candidate_id,
+        store.roots(),
+        store.closure_entities(),
+        limits.activation_write_set,
+    )
+    .await?;
+    let vector = match vector {
+        Ok(vector) => vector,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    Ok(Ok(EvaluationSnapshot::Loaded {
+        store: Box::new(store),
+        schema_pair: pair,
+        vector,
+        edges,
+        content,
+        baseline: Box::new(baseline),
+    }))
+}
+
+/// Validate and materialize, away from the executor.
+///
+/// No transaction is open on [`evaluate`]'s path: it closes its snapshot before
+/// calling this. [`evaluate_in`] is the exception, and deliberately so — see its
+/// documentation for what that costs and why the pass cannot avoid it.
+async fn finish_evaluation(
+    plan: EvaluationPlan,
+    snapshot: EvaluationSnapshot,
+    limits: Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let (store, schema_pair, vector, edges, content, baseline) = match snapshot {
+        EvaluationSnapshot::Loaded {
             store,
             schema_pair,
             vector,
             edges,
-        }) => (store, schema_pair, vector, edges),
-        Ok(EvaluationSnapshot::Unchanged(candidate)) => {
+            content,
+            baseline,
+        } => (store, schema_pair, vector, edges, content, baseline),
+        EvaluationSnapshot::Unchanged(candidate) => {
             return Ok(Ok(PreparedUnit::Unchanged(Arc::new(candidate))));
         }
-        Err(failure) => return Ok(Err(failure)),
     };
 
-    let canonical_body = canonical_body.to_owned();
+    // Capture the unit span before `spawn_blocking`, which does not inherit it.
+    let span = Span::current();
+    let metrics = Arc::clone(metrics);
     tokio::task::spawn_blocking(move || {
         evaluate_loaded(
             *store,
-            &id,
-            conforming_type,
+            &plan.id,
+            plan.conforming_type.clone(),
             schema_pair,
-            canonical_body,
-            operation_item_id,
+            plan.canonical_body,
+            &content,
+            &baseline,
+            CompatReporting::new(
+                &span,
+                metrics.as_ref(),
+                &plan.baseline_choice,
+                plan.force,
+                plan.labels,
+            ),
+            plan.operation_item_id,
             edges,
             vector,
             &limits,
@@ -290,6 +553,80 @@ pub async fn evaluate(
     .await
     .map_err(WorkerError::EvaluationTask)?
     .map(|result| result.map(|unit| PreparedUnit::Evaluated(Arc::new(unit))))
+}
+
+/// Probe once when requested, then evaluate a miss from the same snapshot.
+/// After closing it, validate via `gts-rust`, materialize artifacts and drop the
+/// transient store. Resolution budgets apply before commit;
+/// `activation_write_set` also bounds reverse impact.
+///
+/// # Errors
+/// [`WorkerError`] for infrastructure failure; `Ok(Err(ItemFailure))` for refusal.
+pub async fn evaluate(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    target: EvaluationTarget<'_>,
+    limits: &Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+    probe_item: Option<&OperationItemRow>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let plan = match plan_evaluation(target) {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let limits = *limits;
+    let snapshot = {
+        let stores = Arc::clone(stores);
+        let scope = scope.clone();
+        let plan = plan.clone();
+        let probe_item = probe_item.cloned();
+        db.transaction_with_config(snapshot_read(&db.db()), move |tx| {
+            Box::pin(async move {
+                read_evaluation_snapshot(
+                    stores.as_ref(),
+                    tx,
+                    &scope,
+                    &plan,
+                    probe_item.as_ref(),
+                    &limits,
+                )
+                .await
+            })
+        })
+        .await?
+    };
+    match snapshot {
+        Ok(snapshot) => finish_evaluation(plan, snapshot, limits, metrics).await,
+        Err(failure) => Ok(Err(failure)),
+    }
+}
+
+/// [`evaluate`] within the caller's snapshot, used by whole-batch dry runs.
+///
+/// Hold one pooled connection across validation so each candidate sees earlier
+/// virtual commits. The hold spans at most `limits.batch_candidates` validations
+/// (default 100); moving validation outside would lose batch semantics.
+///
+/// # Errors
+/// As [`evaluate`].
+pub async fn evaluate_in(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    target: EvaluationTarget<'_>,
+    limits: &Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+    probe_item: Option<&OperationItemRow>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let plan = match plan_evaluation(target) {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    match read_evaluation_snapshot(stores, tx, scope, &plan, probe_item, limits).await? {
+        Ok(snapshot) => finish_evaluation(plan, snapshot, *limits, metrics).await,
+        Err(failure) => Ok(Err(failure)),
+    }
 }
 
 /// Run the CPU-heavy `gts-rust` validation and artifact materialization away from
@@ -302,6 +639,9 @@ fn evaluate_loaded(
     conforming_type: Option<String>,
     schema_pair: Option<(i64, i32)>,
     canonical_body: String,
+    content: &Value,
+    baseline: &BaselineDocument,
+    reporting: CompatReporting<'_>,
     operation_item_id: i64,
     edges: Vec<DependencyEdge>,
     vector: RevisionVector,
@@ -324,7 +664,10 @@ fn evaluate_loaded(
             Ok(artifacts) => artifacts,
             Err(failure) => return Ok(Err(failure)),
         };
-        EvaluatedOutcome::TypeSchema { artifacts }
+        EvaluatedOutcome::TypeSchema {
+            artifacts,
+            is_abstract: resolved.is_abstract,
+        }
     } else {
         // `Some` for every parsed Instance identifier: `get_type_id()` is `None` only
         // for a single segment, which `try_new` above already refused.
@@ -368,6 +711,11 @@ fn evaluate_loaded(
         }
     };
 
+    // Validate the candidate before judging its compatibility with another document.
+    if let Err(failure) = check_compatibility(&mut store, id, content, baseline, reporting) {
+        return Ok(Err(failure));
+    }
+
     let content_hash = content_hash(&canonical_body);
     Ok(Ok(EvaluatedUnit {
         gts_id: id.id().to_owned(),
@@ -381,10 +729,215 @@ fn evaluate_loaded(
         content_hash,
         outcome,
         operation_item_id,
+        compat_forced: reporting.forced,
         edges,
         vector,
+        labels: reporting.labels,
     }))
 }
+
+/// Report compatibility to both the unit span and verdict counter.
+/// Capture the span before crossing the `spawn_blocking` boundary.
+#[derive(Clone, Copy)]
+struct CompatReporting<'a> {
+    span: &'a Span,
+    /// The port itself, not a reference to the `Arc` holding it: the only thing
+    /// done through it is a trait call.
+    metrics: &'a dyn AdmissionMetrics,
+    /// Which baseline was selected, known before any row is read.
+    choice: &'a Baseline,
+    /// Effective waiver shared by the refusal decision, metrics, and revision provenance.
+    forced: bool,
+    /// Which pass this verdict belongs to; only `dry_run` reaches the counter.
+    labels: PassLabels,
+}
+
+impl<'a> CompatReporting<'a> {
+    /// Re-authorize the stored waiver against the selected baseline.
+    /// Only cross-minor checks are waivable (ADR-0004).
+    fn new(
+        span: &'a Span,
+        metrics: &'a dyn AdmissionMetrics,
+        choice: &'a Baseline,
+        accepted_force: bool,
+        labels: PassLabels,
+    ) -> Self {
+        Self {
+            span,
+            metrics,
+            choice,
+            forced: accepted_force && choice.waivable(),
+            labels,
+        }
+    }
+
+    /// Record one check's outcome. A `verdict` of `None` means no comparison ran, so
+    /// nothing is counted — there is no fourth label value for "no baseline".
+    fn record(
+        &self,
+        baseline_gts_id: Option<&str>,
+        baseline_revision: Option<i32>,
+        verdict: Option<CompatibilityVerdict>,
+    ) {
+        observability::record_compat_facts(
+            self.span,
+            CompatFacts {
+                baseline: self.choice,
+                gts_id: baseline_gts_id,
+                revision: baseline_revision,
+                verdict,
+            },
+        );
+        if let Some(verdict) = verdict {
+            self.metrics
+                .compat_verdict(verdict, self.forced, self.labels);
+        }
+    }
+}
+
+/// Compare the candidate with its baseline (ADR-0003).
+///
+/// Admit compatible, waived, or exempt candidates. Refusals are terminal
+/// [`ItemFailure`] values; an unresolvable baseline has its own reason.
+fn check_compatibility(
+    store: &mut UnitStore,
+    id: &GtsId,
+    candidate: &Value,
+    baseline: &BaselineDocument,
+    reporting: CompatReporting<'_>,
+) -> Result<(), ItemFailure> {
+    let (baseline_id, baseline_revision, baseline_content) = match baseline {
+        // The family gate handles an absent predecessor. Neither case emits a verdict.
+        BaselineDocument::Exempt | BaselineDocument::PredecessorAbsent => {
+            reporting.record(None, None, None);
+            return Ok(());
+        }
+        BaselineDocument::Present {
+            gts_id,
+            revision_no,
+            content,
+        } => (gts_id, *revision_no, content),
+    };
+
+    // Pin the dialect before comparison so drift has its own refusal and no verdict.
+    // Instances have no declared dialect and are exempt.
+    if id.is_type()
+        && let Err(drift) = compat::dialect_pin(
+            compat::BaselineDoc::new(baseline_content),
+            compat::CandidateDoc::new(candidate),
+        )
+    {
+        reporting.record(Some(baseline_id), Some(baseline_revision), None);
+        return Err(ItemFailure::new(
+            compat::DialectDrift::REASON,
+            format!(
+                "'{}' cannot revise baseline '{baseline_id}': {drift}",
+                id.id()
+            ),
+        ));
+    }
+
+    let comparison = match compat::backward_comparison(
+        store.store_mut(),
+        compat::BaselineDoc::new(baseline_content),
+        compat::CandidateDoc::new(candidate),
+    ) {
+        Ok(comparison) => comparison,
+        Err(error) => {
+            // No verdict is recorded and none is counted: the check did not run,
+            // which is not the same fact as running and coming out undecided.
+            reporting.record(Some(baseline_id), Some(baseline_revision), None);
+            return Err(ItemFailure::new(
+                AdmissionFailureReason::BaselineUnresolvable,
+                format!(
+                    "'{}' could not be compared against baseline '{baseline_id}': {error}",
+                    id.id()
+                ),
+            ));
+        }
+    };
+    let verdict = comparison.backward_compatibility();
+    reporting.record(Some(baseline_id), Some(baseline_revision), Some(verdict));
+    let waived = reporting.forced;
+    if waived && verdict != CompatibilityVerdict::Compatible {
+        // Log the waiver decision; commit-time checks may still refuse the candidate.
+        // Enter the captured span because this runs inside `spawn_blocking`.
+        let _entered = reporting.span.enter();
+        tracing::warn!(
+            gts_id = %id.id(),
+            baseline_gts_id = %baseline_id,
+            baseline_revision,
+            verdict = verdict.as_str(),
+            "types_registry waived a non-compatible verdict on ADR-0004 force; the \
+             candidate remains subject to the commit-time checks"
+        );
+    }
+    match compat::refusal(verdict, waived) {
+        None => Ok(()),
+        // Include offending paths to locate the incompatible levels (ADR-0003).
+        Some(reason) => Err(ItemFailure::new(
+            reason,
+            format!(
+                "'{}' is not backward compatible with baseline '{baseline_id}' \
+                 (verdict {}): {}",
+                id.id(),
+                verdict.as_str(),
+                diagnostics_summary(&comparison),
+            ),
+        )),
+    }
+}
+
+/// Maximum diagnostics included in a refusal message.
+const MAX_REPORTED_DIAGNOSTICS: usize = 20;
+
+/// Maximum path bytes per diagnostic; property names are caller-controlled,
+/// so the entry cap alone cannot bound the payload.
+const MAX_REPORTED_PATH_BYTES: usize = 200;
+
+/// The backward diagnostics as `finding at path` pairs, in the order `gts-rust`
+/// reported them, capped at [`MAX_REPORTED_DIAGNOSTICS`] entries of
+/// [`MAX_REPORTED_PATH_BYTES`] each, with the remainder counted.
+fn diagnostics_summary(comparison: &gts::SchemaComparison) -> String {
+    let total = comparison.backward_diagnostics.len();
+    if total == 0 {
+        return "no diagnostic evidence".to_owned();
+    }
+    let shown = comparison
+        .backward_diagnostics
+        .iter()
+        .take(MAX_REPORTED_DIAGNOSTICS)
+        .map(|d| {
+            let prefix = path_prefix(&d.path);
+            // Keep the persisted marker ASCII, as required by the workspace lint.
+            let marker = if prefix.len() < d.path.len() {
+                "...(truncated)"
+            } else {
+                ""
+            };
+            format!("{:?} at {prefix}{marker}", d.finding)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    match total.saturating_sub(MAX_REPORTED_DIAGNOSTICS) {
+        0 => shown,
+        remaining => format!("{shown}; and {remaining} more"),
+    }
+}
+
+/// Truncate at a UTF-8 boundary, without adding presentation markers.
+fn path_prefix(path: &str) -> &str {
+    // `floor_char_boundary` is unstable, so walk back to one.
+    let mut cut = path.len().min(MAX_REPORTED_PATH_BYTES);
+    while cut > 0 && !path.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &path[..cut]
+}
+
+#[cfg(test)]
+#[path = "unit_tests.rs"]
+mod unit_tests;
 
 /// Resolve and replace an admitted entity's outgoing edges.
 async fn replace_edges(
@@ -543,7 +1096,7 @@ pub async fn commit_creation(
 
     let revision_no = 1;
     match &unit.outcome {
-        EvaluatedOutcome::TypeSchema { artifacts } => {
+        EvaluatedOutcome::TypeSchema { artifacts, .. } => {
             stores
                 .insert_schema_revision(
                     tx,
@@ -558,7 +1111,7 @@ pub async fn commit_creation(
                         // and that cannot be reconstructed later (ADR-0003).
                         gts_spec_version: GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: GTS_IMPLEMENTATION_VERSION.to_owned(),
-                        compat_forced: false,
+                        compat_forced: unit.compat_forced,
                         operation_item_id: unit.operation_item_id,
                         now,
                     },
@@ -632,8 +1185,12 @@ pub async fn commit_creation(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            entity.resource_version,
+            // On the dry-run path `stores` is the `AdmissionView`, so this
+            // write issues no SQL: the overlay keeps it and the pass publishes
+            // it to the real row afterwards. The shape still has to be the
+            // dry-run one, because that is the row publication writes and
+            // `ck_tr_operation_item_state` checks.
+            ItemSuccess::registration(unit.labels.dry_run, revision_no, entity.resource_version),
             now,
         )
         .await?
@@ -750,6 +1307,29 @@ pub async fn commit_revision(
         return Ok(Err(failure));
     }
 
+    // JSON Schema compatibility does not enforce GTS's abstract modifier. This
+    // read shares the write-order claim with Instance creation, so an Instance
+    // cannot appear between the check and this revision becoming current.
+    if matches!(
+        unit.outcome,
+        EvaluatedOutcome::TypeSchema {
+            is_abstract: true,
+            ..
+        }
+    ) && stores
+        .has_live_direct_instances(tx, scope, entity.id)
+        .await?
+    {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::DependentInvalid,
+            format!(
+                "'{}' cannot become abstract while it has live direct Instances; \
+                 nothing was committed",
+                unit.gts_id
+            ),
+        )));
+    }
+
     // One statement carrying the precondition, so there is no window between
     // checking the version and moving it. `None` is the lost race — the version
     // moved, or the entity was deleted, both of which the statement's `WHERE`
@@ -774,7 +1354,7 @@ pub async fn commit_revision(
     })?;
 
     match &unit.outcome {
-        EvaluatedOutcome::TypeSchema { artifacts } => {
+        EvaluatedOutcome::TypeSchema { artifacts, .. } => {
             let CurrentContent::TypeSchema { cas, .. } = &current else {
                 // A mismatched variant means the stored kind-specific rows disagree.
                 return Err(WorkerError::CurrentStateMissing {
@@ -793,7 +1373,7 @@ pub async fn commit_revision(
                         content_hash: unit.content_hash.clone(),
                         gts_spec_version: GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: GTS_IMPLEMENTATION_VERSION.to_owned(),
-                        compat_forced: false,
+                        compat_forced: unit.compat_forced,
                         operation_item_id: unit.operation_item_id,
                         now,
                     },
@@ -880,8 +1460,9 @@ pub async fn commit_revision(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            resource_version,
+            // See `commit_creation`: the shape a dry run records is the one
+            // publication will write, so it must satisfy the item CHECK.
+            ItemSuccess::registration(unit.labels.dry_run, revision_no, resource_version),
             now,
         )
         .await?
@@ -916,7 +1497,7 @@ async fn refresh_reverse_impact(
     match refresh_dependents(stores, tx, scope, &[entity_id], limits, now).await? {
         Ok(outcome) => {
             // Record only write sets that actually commit.
-            metrics.observe_activation_write_set(outcome.refreshed.len());
+            metrics.observe_activation_write_set(outcome.refreshed.len(), unit.labels);
             tracing::debug!(
                 gts_id = %unit.gts_id,
                 refreshed = outcome.refreshed.len(),

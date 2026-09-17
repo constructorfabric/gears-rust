@@ -157,7 +157,7 @@ async fn pg_watch_004_watch_prefix_unsupported() {
     let cache = handle.cache();
 
     assert!(
-        !cache.features().prefix_watch,
+        !cache.features().prefix_watch(),
         "PG-WATCH-004: prefix_watch must be false"
     );
     let result = cache.watch_prefix("svc/").await;

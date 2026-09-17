@@ -190,13 +190,19 @@ Absence fails the candidate retryably, like a base not yet registered. It is not
 
 Every mutation kind accepts a dry-run request: it runs the complete check sequence and commits nothing — no logical entity, no revision, no current-pointer move, no `resource_version` advance, no lifecycle transition, no removal. Per-candidate statuses and diagnostics are what the real operation would have produced against the state observed during the run. A candidate that would have committed carries no revision and no resulting resource version, because nothing was written; that is the one respect in which the result differs from the one it predicts.
 
+**Predict the whole batch** over one coherent base plus earlier successful candidates' hypothetical changes, in dependency order. In-batch references and Instance conformance see those changes. Discard refused or failed candidates' changes and block their dependents.
+
+**Issue no entity-state writes or `entity_write_order` claims.** Per-candidate rollback loses earlier effects; a batch transaction with savepoints preserves them but holds the shared write-order claim through all validations, blocking real writers. Use a snapshot and virtual changes instead. Verify zero write attempts with an instrumented adapter; unchanged final tables alone also permit rollback.
+
+Operation, outcome, idempotency and dispatch records remain durable under the ordinary protocol.
+
 It is a mode rather than a separate validation operation, for the reason given under *Sub-choices within the selected option*, below.
 
 The mode participates in the request fingerprint. Without that, a dry run and the real submission that follows it collapse under one `Idempotency-Key`: the second request replays the first's stored operation and never executes. That is a silent lost write, and it is the reason the fingerprint list above names the mode explicitly.
 
 The acceptance shape does not change. A dry run returns `202` with an operation UUID and is polled like any other, which is not uniformity for its own sake: when P2 hooks exist a dry run **must** invoke every hook the real operation would, or it stops predicting admission precisely where the stakes are highest — and hook duration is unbounded. Giving the mode a synchronous contract in P1 would therefore mean withdrawing it in P2, which is the client-contract break this ADR exists to avoid.
 
-A dry run is not a guarantee of admission and must not be presented as one. Its verdict is relative to the state it observed: a target's `resource_version` may advance, a dependency may admit a new revision, or the entity may be deleted before the real submission.
+A dry run guarantees matching verdicts on identical initial state with no intervening writer. It reserves nothing and predicts neither infrastructure failures nor concurrent races; a later submission rechecks live state.
 
 **Purge is outside this ADR, and its dry run is separate.** ADR-0013 defines purge as a synchronous platform-plane job with no operation, request key, per-candidate row, or outbox message.
 
@@ -346,6 +352,8 @@ This decision is confirmed when:
 * Types Registry reaches ready state before any domain gear registers definitions;
 * tenant-scoped control-plane registration is rejected and Source Claim invariants are enforced without P2 hooks;
 * a dry run of each mutation kind reports the same per-candidate statuses and diagnostics as the real operation while leaving every entity, revision, current pointer, resource version, and lifecycle status untouched, and returns no revision and no resulting resource version for a candidate that would have committed;
+* batch dry-run/commit parity on identical initial state covers in-batch references, Instances invalidated by preceding revisions, and dependant-first deletion;
+* an instrumented adapter observes no dry-run entity-state write or `entity_write_order` claim;
 * a dry run and a real submission carrying the same scoped key are treated as different requests, so the real submission executes rather than replaying the dry run;
 
 ## Pros and Cons of the Options

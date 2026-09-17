@@ -189,32 +189,6 @@ fn a_batch_over_the_limit_is_refused_with_both_numbers() {
     }
 }
 
-/// Deletion has its own protocol and its own precondition rule (T20). Refused
-/// loudly rather than accepted into an operation whose rules do not exist yet.
-#[test]
-fn a_deletion_is_refused_until_t20() {
-    let pair = closed();
-    let mut req = request(vec![candidate(CF_TYPE)]);
-    req.kind = OperationKind::Deletion;
-    assert!(matches!(
-        run(&pair, &req),
-        Err(AcceptanceError::UnsupportedOperationKind)
-    ));
-}
-
-/// Dry Run needs T20's rollback-only evaluation transaction. Until that path
-/// exists it is refused before acceptance, so no operation can be stranded.
-#[test]
-fn a_dry_run_is_refused_until_t20() {
-    let pair = closed();
-    let mut req = request(vec![candidate(CF_TYPE)]);
-    req.dry_run = true;
-    assert!(matches!(
-        run(&pair, &req),
-        Err(AcceptanceError::DryRunNotAccepted)
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // Step 2: identifiers
 // ---------------------------------------------------------------------------
@@ -567,9 +541,7 @@ fn force_is_refused_while_the_deployment_disallows_it() {
     ));
 }
 
-/// With `force` permitted, the candidate must still *have* a cross-minor check to
-/// waive. No-op shapes keep their precise refusal; a real case stays unavailable
-/// until T17 can both evaluate it and persist its provenance.
+/// Even with the deployment flag enabled, only a cross-minor baseline is waivable.
 #[test]
 fn force_needs_a_cross_minor_check_to_waive() {
     let (policy, mut config) = closed();
@@ -596,6 +568,14 @@ fn force_needs_a_cross_minor_check_to_waive() {
             }
         }
     }
+}
+
+/// Acceptance persists the cross-minor waiver request for the worker.
+#[test]
+fn force_on_a_later_minor_is_accepted_and_travels_on_the_item() {
+    let (policy, mut config) = closed();
+    config.allow_compatibility_force = true;
+    let pair = (policy, config);
 
     let mut req = request(vec![candidate(gts_id!("cf.core.example.type.v2.1~"))]);
     req.candidates[0].force = true;
@@ -603,10 +583,61 @@ fn force_needs_a_cross_minor_check_to_waive() {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
     }));
-    assert!(matches!(
-        run(&pair, &req),
-        Err(AcceptanceError::ForceCompatibilityUnavailable { .. })
-    ));
+    let validated = run(&pair, &req).expect("a later minor has a cross-minor check to waive");
+    assert!(
+        validated.items[0].compat_forced,
+        "the flag is durable state: the worker reads the item, and after T21 that is \
+         all it reads",
+    );
+}
+
+/// The precondition selects an intra-entity revision, which `force` cannot waive.
+#[test]
+fn force_cannot_waive_the_intra_entity_edge_of_a_revision() {
+    let (policy, mut config) = closed();
+    config.allow_compatibility_force = true;
+    let pair = (policy, config);
+
+    let id = gts_id!("cf.core.example.type.v2~");
+    let mut req = request(vec![candidate(id)]);
+    req.candidates[0].force = true;
+    req.candidates[0].expected_resource_version = Some(3);
+    req.candidates[0].content = Some(json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+    }));
+    match run(&pair, &req) {
+        Err(AcceptanceError::ForceHasNothingToWaive { gts_id }) => assert_eq!(gts_id, id),
+        other => panic!("expected ForceHasNothingToWaive, got {other:?}"),
+    }
+}
+
+/// T20 made Dry Run acceptable, so the force gate is now what refuses this
+/// request — and it refuses it for the deployment setting, not for the mode. A
+/// dry run is a mode of the ordinary path and waives no check of its own.
+#[test]
+fn a_forced_dry_run_reaches_the_force_gate_and_is_refused_there() {
+    let pair = closed();
+    let mut req = request(vec![candidate(gts_id!("cf.core.example.type.v1.2~"))]);
+    req.dry_run = true;
+    req.candidates[0].force = true;
+    req.candidates[0].content = Some(json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+    }));
+    match run(&pair, &req) {
+        Err(AcceptanceError::ForceNotPermitted { .. }) => {}
+        other => panic!("expected ForceNotPermitted, got {other:?}"),
+    }
+}
+
+/// An ordinary candidate carries the flag as `false`, so `compat_forced` is a
+/// reading of the request rather than a default nobody set.
+#[test]
+fn a_candidate_without_force_records_the_flag_as_false() {
+    let pair = closed();
+    let validated = run(&pair, &request(vec![candidate(CF_TYPE)])).expect("accepted");
+    assert!(!validated.items[0].compat_forced);
 }
 
 // ---------------------------------------------------------------------------
@@ -650,4 +681,126 @@ fn a_minor_bearing_type_schema_cannot_be_content_revised() {
         Err(AcceptanceError::MinorTypeSchemaRevision { gts_id }) => assert_eq!(gts_id, id),
         other => panic!("expected MinorTypeSchemaRevision, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deletion (T20)
+// ---------------------------------------------------------------------------
+
+/// A deletion names an existing entity and a version, and submits no document.
+fn deletion(gts_id: &str, expected_resource_version: Option<i64>) -> Candidate {
+    Candidate {
+        gts_id: gts_id.to_owned(),
+        content: None,
+        expected_resource_version,
+        force: false,
+    }
+}
+
+fn deletion_request(candidates: Vec<Candidate>) -> SubmitRequest {
+    SubmitRequest {
+        idempotency_key: "del-1".to_owned(),
+        kind: OperationKind::Deletion,
+        dry_run: false,
+        candidates,
+    }
+}
+
+#[test]
+fn a_deletion_is_accepted_with_a_positive_precondition() {
+    let accepted = run(
+        &closed(),
+        &deletion_request(vec![deletion(CF_TYPE, Some(3))]),
+    )
+    .expect("a well-formed deletion is accepted");
+    assert_eq!(accepted.kind, OperationKind::Deletion);
+    assert_eq!(accepted.items.len(), 1);
+    assert_eq!(accepted.items[0].precondition, Precondition::Version(3));
+}
+
+/// **Not** "delete if present". An absent version is a refusal, because the only
+/// other reading is a deletion that races whoever last wrote the entity.
+#[test]
+fn a_deletion_without_a_precondition_is_refused() {
+    match run(&closed(), &deletion_request(vec![deletion(CF_TYPE, None)])) {
+        Err(AcceptanceError::DeletionRequiresVersion { gts_id }) => assert_eq!(gts_id, CF_TYPE),
+        other => panic!("expected DeletionRequiresVersion, got {other:?}"),
+    }
+}
+
+/// A deletion carrying a document is a confused request, not a deletion with a
+/// harmless extra field: nothing downstream would ever read it.
+#[test]
+fn a_deletion_carrying_content_is_refused() {
+    let mut candidate = deletion(CF_TYPE, Some(1));
+    candidate.content = Some(schema());
+    match run(&closed(), &deletion_request(vec![candidate])) {
+        Err(AcceptanceError::DeletionCarriesContent { gts_id }) => assert_eq!(gts_id, CF_TYPE),
+        other => panic!("expected DeletionCarriesContent, got {other:?}"),
+    }
+}
+
+/// `force` waives a compatibility check (ADR-0004), and a deletion runs none.
+#[test]
+fn a_forced_deletion_is_refused_because_there_is_nothing_to_waive() {
+    let mut candidate = deletion(CF_TYPE, Some(1));
+    candidate.force = true;
+    let config = TypesRegistryConfig {
+        allow_compatibility_force: true,
+        ..TypesRegistryConfig::default()
+    };
+    let pair = (RegistrationPolicy::default(), config);
+    match run(&pair, &deletion_request(vec![candidate])) {
+        Err(AcceptanceError::ForceHasNothingToWaive { gts_id }) => assert_eq!(gts_id, CF_TYPE),
+        other => panic!("expected ForceHasNothingToWaive, got {other:?}"),
+    }
+}
+
+/// The registration policy governs what may **appear** in a region. Applying it
+/// to a deletion would let closing a region freeze the entities inside it, which
+/// is a different and unasked-for power.
+#[test]
+fn a_deletion_is_not_gated_by_the_registration_policy() {
+    // The default policy admits `cf` only, so registering this identifier fails.
+    assert!(run(&closed(), &request(vec![candidate(ACME_TYPE)])).is_err());
+    run(
+        &closed(),
+        &deletion_request(vec![deletion(ACME_TYPE, Some(1))]),
+    )
+    .expect("a deletion passes the policy gate untouched");
+}
+
+/// ADR-0004 makes a minor-bearing Type Schema content-**immutable**; it does not
+/// make it undeletable.
+#[test]
+fn a_minor_bearing_type_schema_can_be_deleted() {
+    let minor = gts_id!("cf.core.example.thing.v1.1~");
+    run(&closed(), &deletion_request(vec![deletion(minor, Some(2))]))
+        .expect("content immutability is not a deletion rule");
+}
+
+/// Every identifier rule still applies: a deletion cannot name a shape the
+/// registry could never have admitted.
+#[test]
+fn a_deletion_still_obeys_the_identifier_profile() {
+    let uuid_tail = gts_id!("cf.core.example.type.v1~01890c7e-0000-7000-8000-000000000000");
+    assert!(matches!(
+        run(
+            &closed(),
+            &deletion_request(vec![deletion(uuid_tail, Some(1))]),
+        ),
+        Err(AcceptanceError::ExplicitUuidTail { .. }),
+    ));
+}
+
+/// The stored payload is JSON `null`: the item's CHECK requires a non-null
+/// payload while the item is pending, and a deletion submitted no document.
+#[test]
+fn a_deletion_item_records_the_absence_of_a_document() {
+    let accepted = run(
+        &closed(),
+        &deletion_request(vec![deletion(CF_TYPE, Some(1))]),
+    )
+    .expect("accepted");
+    assert_eq!(accepted.items[0].request_payload, "null");
 }

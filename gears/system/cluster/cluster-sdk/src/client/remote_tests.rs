@@ -84,7 +84,7 @@ fn the_sync_accessors_fail_safe_before_a_descriptor_is_fetched() {
 
     let cache = client.cache_backend("orders").expect("a handle");
     assert_eq!(cache.consistency(), CacheConsistency::EventuallyConsistent);
-    assert!(!cache.features().prefix_watch);
+    assert!(!cache.features().prefix_watch());
     assert_eq!(cache.provider_name(), "unknown");
 
     let lock = client.lock_backend("orders").expect("a handle");

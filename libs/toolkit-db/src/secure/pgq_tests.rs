@@ -1013,17 +1013,12 @@ fn the_exact_value_list_is_bound_when_elements_differ() {
 /// element traversing every tenant's rows, so it is refused: "no predicate" is
 /// reachable only from an explicitly unconstrained scope.
 #[test]
-fn an_empty_constraint_scope_is_refused_for_elements() {
-    let scope =
-        AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
-            vec![],
-        )]);
-    assert!(!scope.is_unconstrained() && !scope.is_deny_all());
-
-    let err = two_hop(&scope).expect_err("an empty predicate must be refused");
+fn an_empty_constraint_is_refused_at_construction() {
+    // The shape itself is now unbuildable: an AND over no filters matches every
+    // row, so it cannot be handed to a compiler in the first place.
     assert!(
-        matches!(err, ScopeError::Invalid(msg) if msg.contains("empty predicate")),
-        "unexpected error: {err}"
+        toolkit_security::access_scope::ScopeConstraint::try_new(vec![]).is_err(),
+        "an empty constraint must not be constructible"
     );
 }
 

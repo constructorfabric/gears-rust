@@ -1,0 +1,5 @@
+error: duplicate `#[streaming]` attribute: a streaming method declares it exactly once (the open selector goes in that one attribute)
+  --> tests/ui/fail/grpc_streaming_duplicate_attribute.rs:23:5
+   |
+23 |     #[streaming(open = immediate)]
+   |     ^

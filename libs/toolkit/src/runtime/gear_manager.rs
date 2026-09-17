@@ -207,14 +207,70 @@ impl GearInstance {
 
 /// Central registry that tracks all running gear instances in the system.
 /// Provides discovery, health tracking, and round-robin load balancing.
-#[derive(Clone)]
+///
+/// Always shared as an `Arc<GearManager>` and NOT `Clone`: a by-value clone
+/// would deep-copy the `DashMap` directories while sharing the guards, so the
+/// registration lock would no longer serialize the map it guards.
 #[must_use]
 pub struct GearManager {
     inner: DashMap<String, Vec<Arc<GearInstance>>>,
     rr_counters: DashMap<String, usize>,
     hb_ttl: Duration,
     hb_grace: Duration,
+    /// Serializes gRPC-service-name ownership check + insert in
+    /// [`register_instance`](Self::register_instance) so two
+    /// gears cannot both pass an "unowned" check and then both commit the same
+    /// name. `DashMap` locks per entry, giving no boundary across the
+    /// cross-gear ownership scan and the single-entry write; this gate provides
+    /// it.
+    ///
+    /// Contract: every operation that *creates* a name→gear binding must hold
+    /// this lock — today `register_instance`, `set_grpc_service_owners`, and
+    /// `merge_authoritative_grpc_service_owners`. `deregister` / `evict_stale`
+    /// only *free* names and `mark_*` / `update_heartbeat` only touch instance
+    /// state, so they cannot create a second owner and need not take it. Any
+    /// future mutator that can bind a name must.
+    reg_lock: parking_lot::Mutex<()>,
+    /// Authoritative gRPC-service-name -> owning-gear map. When a name appears
+    /// here, ownership is fixed to the named gear: only that gear may advertise
+    /// it and no other gear can ever claim it, regardless of which registered
+    /// first — the stable ownership source the dynamic registration scan is
+    /// not. Populated by the runtime at startup (see
+    /// [`set_grpc_service_owners`](Self::set_grpc_service_owners)); names absent
+    /// from the map fall back to first-registration ownership.
+    service_owners: parking_lot::RwLock<HashMap<String, String>>,
 }
+
+/// Returned by [`GearManager::register_instance`] when an instance
+/// advertises a gRPC service name already owned by a *different* gear. The
+/// store is left unchanged; the caller maps this onto a gRPC status (see
+/// `DirectoryServiceNameConflict`), whose code depends on [`recoverable`].
+///
+/// [`recoverable`]: Self::recoverable
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcServiceNameConflict {
+    /// The gRPC service name that is already owned.
+    pub service_name: String,
+    /// The gear that currently owns `service_name`.
+    pub owner: String,
+    /// Whether waiting could clear the conflict: `false` when the name is pinned
+    /// to `owner` by the authoritative ownership map (permanent), `true` when
+    /// `owner` merely currently advertises it (clears when it deregisters). Set
+    /// at the two rejection sites in [`GearManager::register_instance`].
+    pub recoverable: bool,
+}
+
+impl std::fmt::Display for GrpcServiceNameConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gRPC service name '{}' is already owned by gear '{}'",
+            self.service_name, self.owner
+        )
+    }
+}
+
+impl std::error::Error for GrpcServiceNameConflict {}
 
 impl std::fmt::Debug for GearManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +291,8 @@ impl GearManager {
             rr_counters: DashMap::new(),
             hb_ttl: Duration::from_secs(15),
             hb_grace: Duration::from_secs(30),
+            reg_lock: parking_lot::Mutex::new(()),
+            service_owners: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -244,7 +302,61 @@ impl GearManager {
         self
     }
 
-    /// Register or update a gear instance
+    /// Install the authoritative gRPC-service-name -> owning-gear map.
+    ///
+    /// A listed name may be advertised only by its owner (enforced in
+    /// [`register_instance`](Self::register_instance)), closing the hole where a
+    /// gear could squat another's service name by registering first; unlisted
+    /// names keep first-registration ownership. Seeded from operator config, then
+    /// layered with the compiled-in owners via
+    /// [`merge_authoritative_grpc_service_owners`](Self::merge_authoritative_grpc_service_owners) —
+    /// both at startup, before any gear self-registers.
+    ///
+    /// Taken under `reg_lock` so it can't interleave with an in-flight
+    /// [`register_instance`](Self::register_instance) check + commit.
+    pub fn set_grpc_service_owners(&self, owners: HashMap<String, String>) {
+        let _gate = self.reg_lock.lock();
+        *self.service_owners.write() = owners;
+    }
+
+    /// Merge a compiled-in `service_name -> gear` map into the ownership map,
+    /// overriding any conflicting operator-configured entry.
+    ///
+    /// The compiled binary is ground truth — a gear physically *provides* the
+    /// service — so config must not reassign that name elsewhere (that would
+    /// re-open the squat); a disagreeing entry is overridden and warned. Names
+    /// absent here (e.g. remote / out-of-process gears) keep their configured
+    /// owner.
+    ///
+    /// Runs once in the runtime's gRPC phase before self-registration, under
+    /// `reg_lock` like [`set_grpc_service_owners`](Self::set_grpc_service_owners).
+    pub fn merge_authoritative_grpc_service_owners(&self, authoritative: HashMap<String, String>) {
+        let _gate = self.reg_lock.lock();
+        let mut owners = self.service_owners.write();
+        for (service_name, gear) in authoritative {
+            if let Some(configured) = owners.get(&service_name)
+                && configured != &gear
+            {
+                tracing::warn!(
+                    service = %service_name,
+                    configured_owner = %configured,
+                    compiled_owner = %gear,
+                    "grpc-service-owners: operator config assigned a compiled-in service name to a \
+                     different gear; the compiled-in provider is authoritative and overrides it"
+                );
+            }
+            owners.insert(service_name, gear);
+        }
+    }
+
+    /// Register or update a gear instance, enforcing single-gear ownership of
+    /// every gRPC service name it advertises — atomically.
+    ///
+    /// The ownership check ([`check_grpc_service_ownership`](Self::check_grpc_service_ownership))
+    /// and the insert run under one registration lock, so two gears cannot both
+    /// pass an "unowned" check and then both commit the same name — a
+    /// check-then-write race the per-entry `DashMap` locks do not prevent. On a
+    /// conflict the store is left untouched.
     ///
     /// Re-registering an existing `instance_id` is an idempotent endpoint /
     /// metadata refresh, NOT a liveness reset: the existing runtime state
@@ -254,7 +366,17 @@ impl GearManager {
     /// `oop_registration::presence_loop`) would knock a `Healthy` instance back
     /// to `Registered`, dropping it out of gRPC round-robin until the next
     /// heartbeat. It would also race with concurrent `update_heartbeat` calls.
-    pub fn register_instance(&self, instance: Arc<GearInstance>) {
+    ///
+    /// # Errors
+    /// Returns [`GrpcServiceNameConflict`] if an advertised gRPC service name is
+    /// owned by, or currently advertised by, another gear.
+    pub fn register_instance(
+        &self,
+        instance: Arc<GearInstance>,
+    ) -> Result<(), GrpcServiceNameConflict> {
+        let _gate = self.reg_lock.lock();
+        self.check_grpc_service_ownership(&instance)?;
+
         let gear = instance.gear.clone();
         let mut vec = self.inner.entry(gear).or_default();
         // replace by instance_id if it already exists
@@ -266,6 +388,83 @@ impl GearManager {
         } else {
             vec.push(instance);
         }
+        Ok(())
+    }
+
+    /// Authorize every gRPC service name `instance` advertises, resolving
+    /// ownership in two tiers:
+    ///
+    /// 1. **Declared (authoritative).** If a name appears in the configured
+    ///    ownership map (see
+    ///    [`set_grpc_service_owners`](Self::set_grpc_service_owners)), only the
+    ///    declared owner may advertise it — any other gear is rejected even if
+    ///    it registers first. This stops a gear from squatting a name it was
+    ///    never assigned.
+    /// 2. **First-registration (fallback).** For names absent from that map, the
+    ///    first gear to register the name owns it.
+    ///
+    /// Authorization is necessary but not sufficient: a name currently
+    /// advertised by a *different* gear always conflicts, so even the declared
+    /// owner is refused while a stale advertiser still holds it (e.g. one that
+    /// registered under a previous ownership map before
+    /// [`set_grpc_service_owners`](Self::set_grpc_service_owners) reassigned the
+    /// name). This keeps ownership from splitting across two advertisers; the
+    /// declared owner succeeds once the stale holder deregisters or expires. A
+    /// name held by the *same* gear is always fine (re-register / additional
+    /// instance).
+    ///
+    /// Must be called with `reg_lock` held so the check stays atomic with the
+    /// caller's subsequent insert.
+    fn check_grpc_service_ownership(
+        &self,
+        instance: &GearInstance,
+    ) -> Result<(), GrpcServiceNameConflict> {
+        // Tier 1: reject a declared name claimed by a non-owner; the rest (the
+        // declared owner, and undeclared names) still need the tier-2 scan.
+        let declared = self.service_owners.read();
+        let mut to_scan: Vec<&str> = Vec::new();
+        for service_name in instance.grpc_services.keys() {
+            match declared.get(service_name) {
+                Some(owner) if *owner != instance.gear => {
+                    // Tier 1: the name is pinned to another gear by the
+                    // authoritative map — permanent, waiting cannot clear it.
+                    return Err(GrpcServiceNameConflict {
+                        service_name: service_name.clone(),
+                        owner: owner.clone(),
+                        recoverable: false,
+                    });
+                }
+                _ => to_scan.push(service_name),
+            }
+        }
+        drop(declared);
+        if to_scan.is_empty() {
+            return Ok(());
+        }
+
+        // Tier 2: one pass over the directory, checking every candidate name per
+        // instance visited rather than re-scanning once per name. A name already
+        // held by a *different* gear conflicts.
+        for entry in &self.inner {
+            if entry.key() == &instance.gear {
+                continue; // same gear: re-register / additional instance is fine
+            }
+            for existing in entry.value() {
+                if let Some(&name) = to_scan
+                    .iter()
+                    .find(|&&n| existing.grpc_services.contains_key(n))
+                {
+                    // Tier 2: a *different* gear currently advertises the name —
+                    // recoverable, it clears when that holder deregisters/expires.
+                    return Err(GrpcServiceNameConflict {
+                        service_name: name.to_owned(),
+                        owner: entry.key().clone(),
+                        recoverable: true,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Mark an instance as ready
@@ -498,6 +697,28 @@ impl GearManager {
             .and_then(|inst| inst.rest_endpoint.clone())
     }
 
+    /// Return a gear that currently advertises the gRPC service `service_name`,
+    /// if any (any instance state counts); in the misconfigured multi-owner case
+    /// the first match in iteration order.
+    ///
+    /// Test-only: [`register_instance`](Self::register_instance) enforces single
+    /// ownership with its own inline scan, so this is not part of the public
+    /// surface — it exists purely to let the tests below assert who owns a name.
+    #[cfg(test)]
+    #[must_use]
+    fn grpc_service_owner(&self, service_name: &str) -> Option<String> {
+        for entry in &self.inner {
+            if entry
+                .value()
+                .iter()
+                .any(|inst| inst.grpc_services.contains_key(service_name))
+            {
+                return Some(entry.key().clone());
+            }
+        }
+        None
+    }
+
     /// Retrieve the `OpenAPI` spec of a gear, taken from the first registered
     /// instance that published one.
     #[must_use]
@@ -533,13 +754,22 @@ mod tests {
                 .with_version("1.0.0"),
         );
 
-        dir.register_instance(instance);
+        seed(&dir, instance);
 
         let instances = dir.instances_of("test_gear");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].instance_id, instance_id);
         assert_eq!(instances[0].gear, "test_gear");
         assert_eq!(instances[0].version, Some("1.0.0".to_owned()));
+    }
+
+    /// Seed the registry in a test. The fixture is assumed to advertise no
+    /// conflicting gRPC service name, so a conflict is a bug in the test, not
+    /// an expected outcome — surface it loudly rather than swallowing it.
+    #[track_caller]
+    fn seed(mgr: &GearManager, instance: Arc<GearInstance>) {
+        mgr.register_instance(instance)
+            .expect("test fixture must not create a gRPC service-name conflict");
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -555,15 +785,19 @@ mod tests {
         let instance_id = Uuid::new_v4();
 
         // Initial registration carries a shard label.
-        dir.register_instance(Arc::new(
-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
-        ));
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+            ),
+        );
 
         // A label-less re-registration (e.g. periodic self-heal / REST
         // augmentation) must NOT wipe the stored labels.
-        dir.register_instance(Arc::new(
-            GearInstance::new("shard-gear", instance_id).with_version("2.0.0"),
-        ));
+        seed(
+            &dir,
+            Arc::new(GearInstance::new("shard-gear", instance_id).with_version("2.0.0")),
+        );
 
         let registered = dir.instances_of("shard-gear");
         assert_eq!(registered.len(), 1);
@@ -580,13 +814,19 @@ mod tests {
         let dir = GearManager::new();
         let instance_id = Uuid::new_v4();
 
-        dir.register_instance(Arc::new(
-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
-        ));
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+            ),
+        );
         // An explicit non-empty set replaces the stored one wholesale.
-        dir.register_instance(Arc::new(
-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "8")])),
-        ));
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "8")])),
+            ),
+        );
 
         let registered = dir.instances_of("shard-gear");
         assert_eq!(registered.len(), 1);
@@ -602,8 +842,8 @@ mod tests {
         let instance1 = Arc::new(GearInstance::new("test_gear", id1));
         let instance2 = Arc::new(GearInstance::new("test_gear", id2));
 
-        dir.register_instance(instance1);
-        dir.register_instance(instance2);
+        seed(&dir, instance1);
+        seed(&dir, instance2);
 
         let registered = dir.instances_of("test_gear");
         assert_eq!(registered.len(), 2);
@@ -620,11 +860,11 @@ mod tests {
 
         let initial_instance =
             Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
-        dir.register_instance(initial_instance);
+        seed(&dir, initial_instance);
 
         let updated_instance =
             Arc::new(GearInstance::new("test_gear", instance_id).with_version("2.0.0"));
-        dir.register_instance(updated_instance);
+        seed(&dir, updated_instance);
 
         let registered = dir.instances_of("test_gear");
         assert_eq!(registered.len(), 1, "Should not duplicate instance");
@@ -637,9 +877,10 @@ mod tests {
         let instance_id = Uuid::new_v4();
 
         // Register, then heartbeat so the instance is Healthy (routable).
-        dir.register_instance(Arc::new(
-            GearInstance::new("test_gear", instance_id).with_version("1.0.0"),
-        ));
+        seed(
+            &dir,
+            Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0")),
+        );
         dir.update_heartbeat("test_gear", instance_id, Instant::now());
         assert!(matches!(
             dir.instances_of("test_gear")[0].state(),
@@ -649,9 +890,10 @@ mod tests {
         // A periodic self-heal re-registration must NOT reset liveness back to
         // Registered — otherwise the instance drops out of gRPC round-robin
         // until the next heartbeat (the "split-brain" flap).
-        dir.register_instance(Arc::new(
-            GearInstance::new("test_gear", instance_id).with_version("2.0.0"),
-        ));
+        seed(
+            &dir,
+            Arc::new(GearInstance::new("test_gear", instance_id).with_version("2.0.0")),
+        );
 
         let instances = dir.instances_of("test_gear");
         assert_eq!(instances.len(), 1);
@@ -672,7 +914,7 @@ mod tests {
         let instance_id = Uuid::new_v4();
 
         let initial = Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
-        dir.register_instance(initial);
+        seed(&dir, initial);
         dir.update_heartbeat("test_gear", instance_id, Instant::now());
         assert!(matches!(
             dir.instances_of("test_gear")[0].state(),
@@ -698,7 +940,7 @@ mod tests {
                                 8000u16 + u16::try_from(i % 10).expect("i % 10 fits in u16"),
                             )),
                     );
-                    dir.register_instance(reinst);
+                    seed(&dir, reinst);
                 }
             });
         });
@@ -721,7 +963,7 @@ mod tests {
         let instance_id = Uuid::new_v4();
         let instance = Arc::new(GearInstance::new("test_gear", instance_id));
 
-        dir.register_instance(instance);
+        seed(&dir, instance);
 
         dir.mark_ready("test_gear", instance_id);
 
@@ -737,7 +979,7 @@ mod tests {
         let instance = Arc::new(GearInstance::new("test_gear", instance_id));
         let initial_heartbeat = instance.last_heartbeat();
 
-        dir.register_instance(instance);
+        seed(&dir, instance);
 
         // Sleep to ensure time difference
         sleep(Duration::from_millis(10));
@@ -758,9 +1000,9 @@ mod tests {
         let instance2 = Arc::new(GearInstance::new("gear_b", Uuid::new_v4()));
         let instance3 = Arc::new(GearInstance::new("gear_a", Uuid::new_v4()));
 
-        dir.register_instance(instance1);
-        dir.register_instance(instance2);
-        dir.register_instance(instance3);
+        seed(&dir, instance1);
+        seed(&dir, instance2);
+        seed(&dir, instance3);
 
         let all = dir.all_instances();
         assert_eq!(all.len(), 3);
@@ -779,8 +1021,8 @@ mod tests {
         let instance1 = Arc::new(GearInstance::new("test_gear", id1));
         let instance2 = Arc::new(GearInstance::new("test_gear", id2));
 
-        dir.register_instance(instance1);
-        dir.register_instance(instance2);
+        seed(&dir, instance1);
+        seed(&dir, instance2);
 
         // Pick three times to verify round-robin behavior
         let picked1 = dir.pick_instance_round_robin("test_gear").unwrap();
@@ -896,7 +1138,7 @@ mod tests {
             .and_then(|t| t.checked_sub(Duration::from_millis(10)))
             .expect("test duration subtraction should not underflow");
 
-        dir.register_instance(Arc::new(instance));
+        seed(&dir, Arc::new(instance));
 
         dir.evict_stale(now);
         let instances = dir.instances_of("test_gear");
@@ -924,12 +1166,12 @@ mod tests {
         // Create two instances: one healthy, one quarantined
         let healthy_id = Uuid::new_v4();
         let healthy = Arc::new(GearInstance::new("test_gear", healthy_id));
-        dir.register_instance(healthy);
+        seed(&dir, healthy);
         dir.update_heartbeat("test_gear", healthy_id, Instant::now());
 
         let quarantined_id = Uuid::new_v4();
         let quarantined = Arc::new(GearInstance::new("test_gear", quarantined_id));
-        dir.register_instance(quarantined);
+        seed(&dir, quarantined);
         dir.mark_quarantined("test_gear", quarantined_id);
 
         // RR should only pick the healthy instance
@@ -948,7 +1190,7 @@ mod tests {
                 .with_rest_endpoint(Endpoint::http("billing", 8080))
                 .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
         );
-        dir.register_instance(instance);
+        seed(&dir, instance);
 
         let rest = dir.pick_rest_endpoint_round_robin("billing").unwrap();
         assert_eq!(rest.uri, "http://billing:8080");
@@ -966,7 +1208,7 @@ mod tests {
             GearInstance::new("grpc_only", id)
                 .with_grpc_service("some.Service", Endpoint::http("127.0.0.1", 9000)),
         );
-        dir.register_instance(instance);
+        seed(&dir, instance);
 
         assert!(dir.pick_rest_endpoint_round_robin("grpc_only").is_none());
         assert!(dir.openapi_spec_of("grpc_only").is_none());
@@ -984,8 +1226,8 @@ mod tests {
         let inst2 = Arc::new(
             GearInstance::new("web", id2).with_rest_endpoint(Endpoint::http("127.0.0.1", 8002)),
         );
-        dir.register_instance(inst1);
-        dir.register_instance(inst2);
+        seed(&dir, inst1);
+        seed(&dir, inst2);
         dir.update_heartbeat("web", id1, Instant::now());
         dir.update_heartbeat("web", id2, Instant::now());
 
@@ -1013,8 +1255,8 @@ mod tests {
                 .with_grpc_service("test.Service", Endpoint::http("127.0.0.1", 8002)),
         );
 
-        dir.register_instance(inst1);
-        dir.register_instance(inst2);
+        seed(&dir, inst1);
+        seed(&dir, inst2);
 
         // Mark both as healthy
         dir.update_heartbeat("test_gear", id1, Instant::now());
@@ -1048,10 +1290,13 @@ mod tests {
         // instance pickers' not-ready fallback rather than failing closed.
         let dir = GearManager::new();
         let id = Uuid::new_v4();
-        dir.register_instance(Arc::new(
-            GearInstance::new("worker", id)
-                .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
-        ));
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("worker", id)
+                    .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
+            ),
+        );
         // No heartbeat: the instance stays Registered (not serving).
         assert!(matches!(
             dir.instances_of("worker")[0].state(),
@@ -1069,13 +1314,168 @@ mod tests {
     }
 
     #[test]
+    fn grpc_service_owner_reports_owning_gear_regardless_of_health() {
+        let dir = GearManager::new();
+
+        // A freshly-registered (not-yet-serving) instance still owns its name.
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("authz-resolver", Uuid::new_v4()).with_grpc_service(
+                    "cf.authz.v1.AuthzService",
+                    Endpoint::http("127.0.0.1", 9000),
+                ),
+            ),
+        );
+
+        assert_eq!(
+            dir.grpc_service_owner("cf.authz.v1.AuthzService")
+                .as_deref(),
+            Some("authz-resolver"),
+            "the advertising gear owns the name even while only Registered"
+        );
+        assert!(
+            dir.grpc_service_owner("unowned.Service").is_none(),
+            "an unadvertised name has no owner"
+        );
+    }
+
+    /// The production invariant behind the above: a `Registered`-but-not-healthy
+    /// owner still blocks another gear's claim of the same name through
+    /// `register_instance` (ownership does not wait on the owner becoming healthy).
+    #[test]
+    fn registered_but_unhealthy_owner_blocks_another_gears_claim() {
+        let dir = GearManager::new();
+        let owner_id = Uuid::new_v4();
+
+        // Owner claims the name and never heartbeats -> stays Registered.
+        dir.register_instance(Arc::new(
+            GearInstance::new("authz-resolver", owner_id).with_grpc_service(
+                "cf.authz.v1.AuthzService",
+                Endpoint::http("127.0.0.1", 9000),
+            ),
+        ))
+        .expect("first claim of an unowned name succeeds");
+        assert!(matches!(
+            dir.instances_of("authz-resolver")[0].state(),
+            InstanceState::Registered
+        ));
+
+        // A different gear is rejected via the production path, health regardless.
+        let conflict = dir
+            .register_instance(Arc::new(
+                GearInstance::new("impostor", Uuid::new_v4()).with_grpc_service(
+                    "cf.authz.v1.AuthzService",
+                    Endpoint::http("127.0.0.1", 9001),
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.owner, "authz-resolver");
+    }
+
+    #[test]
+    fn deregister_releases_grpc_service_name_to_another_gear() {
+        let dir = GearManager::new();
+        let service = "cf.authz.v1.AuthzService";
+        let owner_id = Uuid::new_v4();
+
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("authz-resolver", owner_id)
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+            ),
+        );
+
+        // While the owner is registered, a different gear cannot claim the name.
+        dir.register_instance(Arc::new(
+            GearInstance::new("successor", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+        ))
+        .unwrap_err();
+
+        // Deregistering the owner releases the name...
+        dir.deregister("authz-resolver", owner_id);
+        assert!(
+            dir.grpc_service_owner(service).is_none(),
+            "the name is unowned once its owner deregisters"
+        );
+
+        // ...so a different gear may now claim it.
+        dir.register_instance(Arc::new(
+            GearInstance::new("successor", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+        ))
+        .expect("a released gRPC service name must be claimable by another gear");
+        assert_eq!(
+            dir.grpc_service_owner(service).as_deref(),
+            Some("successor")
+        );
+    }
+
+    #[test]
+    fn eviction_releases_grpc_service_name_only_after_full_evict() {
+        let ttl = Duration::from_millis(50);
+        let grace = Duration::from_millis(50);
+        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
+        let service = "cf.authz.v1.AuthzService";
+
+        let now = Instant::now();
+        let owner = GearInstance::new("authz-resolver", Uuid::new_v4())
+            .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000));
+        // Stale from the start so the first eviction pass quarantines it.
+        owner.inner.write().last_heartbeat = now
+            .checked_sub(ttl)
+            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
+            .expect("test duration subtraction should not underflow");
+        seed(&dir, Arc::new(owner));
+
+        // First pass only *quarantines* the dead gear — it is not yet evicted,
+        // so it still owns the name and a successor is rejected. A dead gear
+        // keeps blocking its gRPC name (regardless of health) until fully
+        // evicted, i.e. for hb_ttl + hb_grace.
+        dir.evict_stale(now);
+        assert!(matches!(
+            dir.instances_of("authz-resolver")[0].state(),
+            InstanceState::Quarantined
+        ));
+        let conflict = dir
+            .register_instance(Arc::new(
+                GearInstance::new("successor", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            conflict.owner, "authz-resolver",
+            "a quarantined-but-not-evicted owner still holds the name"
+        );
+
+        // Second pass past the grace period fully evicts it, releasing the name
+        // so another gear may take it over.
+        dir.evict_stale(now + grace + Duration::from_millis(10));
+        assert!(
+            dir.grpc_service_owner(service).is_none(),
+            "eviction hands the name back once the grace period lapses"
+        );
+        dir.register_instance(Arc::new(
+            GearInstance::new("successor", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
+        ))
+        .expect("an evicted owner's gRPC name must be claimable by another gear");
+        assert_eq!(
+            dir.grpc_service_owner(service).as_deref(),
+            Some("successor")
+        );
+    }
+
+    #[test]
     fn test_deregister_clears_rr_counters() {
         let dir = GearManager::new();
         let id = Uuid::new_v4();
         let instance = Arc::new(
             GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
         );
-        dir.register_instance(instance);
+        seed(&dir, instance);
         dir.update_heartbeat("web", id, Instant::now());
 
         // Exercise both round-robin counters so the keys are created.
@@ -1108,7 +1508,7 @@ mod tests {
             .and_then(|t| t.checked_sub(Duration::from_millis(10)))
             .expect("test duration subtraction should not underflow");
 
-        dir.register_instance(instance);
+        seed(&dir, instance);
         assert!(dir.pick_rest_endpoint_round_robin("web").is_some());
 
         assert!(dir.rr_counters.contains_key("rest:web"));
@@ -1126,5 +1526,285 @@ mod tests {
         assert!(dir.instances_of("web").is_empty());
         assert!(!dir.rr_counters.contains_key("web"));
         assert!(!dir.rr_counters.contains_key("rest:web"));
+    }
+
+    #[test]
+    fn register_instance_rejects_cross_gear_grpc_name() {
+        let mgr = GearManager::new();
+        let service = "cf.authz.v1.AuthzService";
+
+        mgr.register_instance(Arc::new(
+            GearInstance::new("authz-resolver", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        ))
+        .expect("claiming an unowned service name must succeed");
+
+        // A different gear claiming the same name is rejected, store untouched.
+        let conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("evil", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.service_name, service);
+        assert_eq!(conflict.owner, "authz-resolver");
+        assert!(mgr.instances_of("evil").is_empty());
+
+        // The owning gear may add another instance under the same name.
+        mgr.register_instance(Arc::new(
+            GearInstance::new("authz-resolver", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
+        ))
+        .expect("the owning gear may add another instance for its own service");
+    }
+
+    #[test]
+    fn declared_ownership_beats_registration_order() {
+        let mgr = GearManager::new();
+        let service = "cf.authz.v1.AuthzService";
+
+        // Config declares the name is owned by `authz`.
+        mgr.set_grpc_service_owners(HashMap::from([(service.to_owned(), "authz".to_owned())]));
+
+        // A squatter registering *first* cannot claim a declared name; it is
+        // rejected with the declared owner, and the store is untouched.
+        let conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("evil", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.service_name, service);
+        assert_eq!(conflict.owner, "authz");
+        assert!(
+            !conflict.recoverable,
+            "a declared-owner conflict is pinned by config (permanent)"
+        );
+        assert!(mgr.instances_of("evil").is_empty());
+
+        // The declared owner is always admitted, even coming in second.
+        mgr.register_instance(Arc::new(
+            GearInstance::new("authz", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        ))
+        .expect("the declared owner must be admitted");
+        assert_eq!(mgr.grpc_service_owner(service).as_deref(), Some("authz"));
+    }
+
+    /// A gear can own an undeclared name via first-registration, after which a
+    /// `set_grpc_service_owners` call reassigns that name to a different declared
+    /// owner. The declared owner is authorized, but must not begin advertising
+    /// the name while the original holder is still serving it — that would split
+    /// ownership between two advertisers. It is refused until the stale holder is
+    /// gone, then admitted.
+    #[test]
+    fn declared_owner_refused_while_a_stale_advertiser_still_holds_the_name() {
+        let mgr = GearManager::new();
+        let service = "cf.authz.v1.AuthzService";
+        let holder = Uuid::new_v4();
+
+        // `first` claims the name via first-registration (not yet declared).
+        mgr.register_instance(Arc::new(
+            GearInstance::new("first", holder)
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        ))
+        .expect("claiming an undeclared, unowned name must succeed");
+
+        // The map is (re)installed, declaring the name is owned by `authz`.
+        mgr.set_grpc_service_owners(HashMap::from([(service.to_owned(), "authz".to_owned())]));
+
+        // The declared owner is authorized, but `first` is still advertising the
+        // name: admitting `authz` now would split ownership, so it is rejected.
+        let conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("authz", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.service_name, service);
+        assert_eq!(
+            conflict.owner, "first",
+            "the current holder is the conflicting owner"
+        );
+        assert!(
+            conflict.recoverable,
+            "a stale-advertiser conflict clears once the holder deregisters"
+        );
+        assert!(mgr.instances_of("authz").is_empty());
+
+        // Once the stale holder is gone, the declared owner is admitted and owns
+        // the name outright — no split.
+        mgr.deregister("first", holder);
+        mgr.register_instance(Arc::new(
+            GearInstance::new("authz", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
+        ))
+        .expect("the declared owner must be admitted once the stale holder is gone");
+        assert_eq!(mgr.grpc_service_owner(service).as_deref(), Some("authz"));
+    }
+
+    /// The compiled-in (authoritative) map overrides a conflicting operator
+    /// entry — the binary that *provides* a service name wins over config that
+    /// tries to reassign it — while operator entries for names the binary does
+    /// not know about are preserved. A subsequent registration is governed by
+    /// the merged result.
+    #[test]
+    fn authoritative_owners_override_conflicting_config_and_keep_the_rest() {
+        let mgr = GearManager::new();
+
+        // Operator config: one name that a compiled gear also provides (a
+        // reassignment attempt), and one the binary does not compile in.
+        mgr.set_grpc_service_owners(HashMap::from([
+            ("cf.authz.v1.AuthzService".to_owned(), "impostor".to_owned()),
+            ("remote.only.Service".to_owned(), "remote-gear".to_owned()),
+        ]));
+
+        // Compiled registry says authz-resolver provides the authz service.
+        mgr.merge_authoritative_grpc_service_owners(HashMap::from([(
+            "cf.authz.v1.AuthzService".to_owned(),
+            "authz-resolver".to_owned(),
+        )]));
+
+        // Compiled-in provider wins the conflict; the remote-only entry stays.
+        let conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("impostor", Uuid::new_v4()).with_grpc_service(
+                    "cf.authz.v1.AuthzService",
+                    Endpoint::http("127.0.0.1", 9000),
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.owner, "authz-resolver");
+        assert!(
+            !conflict.recoverable,
+            "a pinned compiled-in owner is permanent"
+        );
+
+        mgr.register_instance(Arc::new(
+            GearInstance::new("authz-resolver", Uuid::new_v4()).with_grpc_service(
+                "cf.authz.v1.AuthzService",
+                Endpoint::http("127.0.0.1", 9001),
+            ),
+        ))
+        .expect("the compiled-in provider owns its service name");
+
+        // The operator entry for the name absent from the compiled map is intact.
+        let remote_conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("squatter", Uuid::new_v4())
+                    .with_grpc_service("remote.only.Service", Endpoint::http("127.0.0.1", 9002)),
+            ))
+            .unwrap_err();
+        assert_eq!(remote_conflict.owner, "remote-gear");
+    }
+
+    #[test]
+    fn names_absent_from_declared_map_keep_first_registration_ownership() {
+        let mgr = GearManager::new();
+        // The map declares one name but says nothing about `worker.Svc`.
+        mgr.set_grpc_service_owners(HashMap::from([(
+            "cf.authz.v1.AuthzService".to_owned(),
+            "authz".to_owned(),
+        )]));
+        let service = "worker.Svc";
+
+        mgr.register_instance(Arc::new(
+            GearInstance::new("worker-a", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        ))
+        .expect("claiming an undeclared, unowned name must succeed");
+
+        let conflict = mgr
+            .register_instance(Arc::new(
+                GearInstance::new("worker-b", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .unwrap_err();
+        assert_eq!(conflict.owner, "worker-a");
+        assert!(
+            conflict.recoverable,
+            "a first-registration conflict clears if the holder leaves"
+        );
+    }
+
+    /// Under contention, the atomic check+insert admits exactly one owner for a
+    /// gRPC service name: N gears race to claim the same unowned name and only
+    /// one commits, closing the check-then-write race the per-entry `DashMap`
+    /// locks leave open.
+    #[test]
+    fn concurrent_register_admits_exactly_one_owner() {
+        use std::sync::Barrier;
+
+        let mgr = Arc::new(GearManager::new());
+        let service = "cf.authz.v1.AuthzService";
+        let racers = 16;
+        let barrier = Arc::new(Barrier::new(racers));
+
+        #[expect(
+            clippy::needless_collect,
+            reason = "a lazy iterator would join before all racers spawn, deadlocking the Barrier"
+        )]
+        let handles: Vec<_> = (0..racers)
+            .map(|i| {
+                let mgr = Arc::clone(&mgr);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let gear = format!("gear-{i}");
+                    let instance = Arc::new(
+                        GearInstance::new(gear.clone(), Uuid::new_v4()).with_grpc_service(
+                            service,
+                            Endpoint::http("127.0.0.1", 9000 + u16::try_from(i).unwrap()),
+                        ),
+                    );
+                    // Release all threads at once to maximise contention.
+                    barrier.wait();
+                    (gear, mgr.register_instance(instance))
+                })
+            })
+            .collect();
+
+        let results: Vec<(String, Result<(), GrpcServiceNameConflict>)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("registration thread must not panic"))
+            .collect();
+
+        // Exactly one gear wins the race.
+        let winners: Vec<&str> = results
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(gear, _)| gear.as_str())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one competing registration must win"
+        );
+        let winner = winners[0];
+
+        // Every loser is rejected with a conflict naming the winning gear — the
+        // `owner` surfaced in the server-side warn log and the operator's
+        // remediation hint, so it must be the gear that actually committed, not
+        // just any error.
+        for (gear, result) in &results {
+            if gear == winner {
+                continue;
+            }
+            let conflict = result
+                .as_ref()
+                .expect_err("a losing registration must be rejected, not silently dropped");
+            assert_eq!(conflict.service_name, service);
+            assert_eq!(
+                conflict.owner.as_str(),
+                winner,
+                "every loser's conflict must name the single winning gear as owner"
+            );
+        }
+
+        // ...and the store resolves the contested name to exactly that winner.
+        assert_eq!(
+            mgr.grpc_service_owner(service).as_deref(),
+            Some(winner),
+            "the contested name must resolve to the one gear that won"
+        );
     }
 }

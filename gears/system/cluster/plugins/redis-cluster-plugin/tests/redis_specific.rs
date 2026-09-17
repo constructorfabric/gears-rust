@@ -1410,7 +1410,7 @@ async fn rd_spec_010_cluster_mode_declares_no_prefix_watch() {
     let cache = handle.cache();
 
     assert!(
-        !cache.features().prefix_watch,
+        !cache.features().prefix_watch(),
         "cluster mode must declare no native prefix watch: keyspace notifications are node-local, \
          so a prefix watcher would miss every expiry outside its subscriber's shard. The SDK's \
          PollingPrefixWatch is the honest fallback (DESIGN.md sec 4.3, sec 13 D2)"

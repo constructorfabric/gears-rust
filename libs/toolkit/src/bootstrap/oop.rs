@@ -491,7 +491,20 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         .and_then(|cfg| crate::telemetry::init::init_metrics_provider(cfg).err());
 
     // Initialize logging with MERGED config (master base + local override)
-    init_logging_unified(&merged_logging, &config.server.home_dir, otel_layer);
+    // Trace-id injection follows the same rule as the other telemetry
+    // settings: it comes from the master's rendered config, never the local one.
+    #[cfg(feature = "otel")]
+    let inject_trace_ids =
+        otel_cfg.is_some_and(crate::telemetry::OpenTelemetryConfig::inject_trace_ids_into_logs);
+    #[cfg(not(feature = "otel"))]
+    let inject_trace_ids = false;
+
+    init_logging_unified(
+        &merged_logging,
+        &config.server.home_dir,
+        otel_layer,
+        inject_trace_ids,
+    );
 
     // Now that logging is available, report deferred metrics init error
     #[cfg(feature = "otel")]
@@ -640,6 +653,12 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         info!("Gear runtime completed successfully");
     }
 
+    // Graceful shutdown - flush remaining telemetry. An OoP gear is a separate
+    // OS process owning its own global providers, so the in-process host's
+    // flush in `bootstrap::run` does not cover it.
+    #[cfg(feature = "otel")]
+    crate::bootstrap::run::tracing_shutdown().await;
+
     result
 }
 
@@ -730,10 +749,15 @@ async fn build_internal_authenticator(
         return Ok(None);
     };
 
-    // Dependency-light providers (shared-secret) build directly here.
-    if let Some(authenticator) = cfg.build_authenticator() {
-        info!("Initializing shared-secret platform-plane authenticator");
-        return Ok(Some(authenticator));
+    // Dependency-light providers (shared-secret) build directly here. An
+    // unusable secret is an error rather than a fallthrough: dropping to the
+    // kube branch below would report the wrong problem entirely.
+    match cfg.build_authenticator()? {
+        toolkit_security::BuiltAuthenticator::Built(authenticator) => {
+            info!("Initializing shared-secret platform-plane authenticator");
+            return Ok(Some(authenticator));
+        }
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
     }
 
     #[cfg(feature = "k8s-auth")]
@@ -744,6 +768,7 @@ async fn build_internal_authenticator(
             let authenticator = toolkit_k8s_auth::build_cached_k8s_authenticator(
                 audiences,
                 Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+                None,
             )
             .await
             .context("failed to initialize Kubernetes TokenReview authenticator")?;

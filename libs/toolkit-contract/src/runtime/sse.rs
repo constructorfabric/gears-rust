@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 
 use toolkit_canonical_errors::Problem;
 
+use crate::ir::binding::StreamFraming;
 use crate::runtime::transport_error::TransportError;
 
 /// Adapter that lifts a `Display`-only error into an `Error + Send + Sync + 'static`
@@ -76,22 +77,27 @@ impl LastEventId {
 /// Maximum bytes the parser accumulates for a not-yet-terminated line ([`SseStream::buf`])
 /// or for a not-yet-dispatched event's `data:` payload ([`SseStream::event_data`])
 /// before treating the peer as protocol-violating and terminating the stream
-/// with [`TransportError::sse`]. Generous enough for any realistic single
+/// with [`TransportError::Framing`]. Generous enough for any realistic single
 /// event; guards against unbounded memory growth from a misbehaving peer.
 const MAX_ACCUMULATED_BYTES: usize = 16 * 1024 * 1024;
 
-/// Shared monotonic counter bumped every time the parser receives a byte chunk
-/// from the wire — **including** chunks that carry only keepalive comments or
-/// other non-dispatching frames. Streaming clients snapshot it around an idle
-/// wait so a low-data-rate stream kept alive purely by `:keepalive` comments is
-/// recognised as *active* rather than *idle* (the idle timeout must be idle).
+/// Shared monotonic counter bumped every time a streaming parser receives a
+/// byte chunk from the wire — **including** chunks that dispatch no item (SSE
+/// keepalive comments, a multipart part header block arriving on its own).
+/// Streaming clients snapshot it around an idle wait so a low-data-rate stream
+/// kept alive purely by non-dispatching traffic is recognised as *active*
+/// rather than *idle* (the idle timeout must be idle).
+///
+/// Framing-neutral so the streaming driver can apply one idle rule to every
+/// framing: [`crate::runtime::multipart::MultipartStream`] exposes the same
+/// handle as [`SseStream`] does.
 ///
 /// Wraps `Arc<AtomicU64>` as a newtype so the atomic choice isn't part of the
 /// public surface.
 #[derive(Clone, Debug, Default)]
-pub struct SseActivity(Arc<AtomicU64>);
+pub struct StreamActivity(Arc<AtomicU64>);
 
-impl SseActivity {
+impl StreamActivity {
     /// Create a fresh activity counter at generation 0.
     #[must_use]
     pub fn new() -> Self {
@@ -105,8 +111,9 @@ impl SseActivity {
         self.0.load(Ordering::Relaxed)
     }
 
-    /// Record that a wire chunk arrived.
-    fn bump(&self) {
+    /// Record that a wire chunk arrived. Crate-visible so every framing
+    /// parser in [`crate::runtime`] can bump the same counter.
+    pub(crate) fn bump(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -151,7 +158,7 @@ where
         done: false,
         explicit_done: false,
         last_event_id,
-        activity: SseActivity::new(),
+        activity: StreamActivity::new(),
         _marker: std::marker::PhantomData,
     }
 }
@@ -186,7 +193,7 @@ pub struct SseStream<T, S> {
     /// latter as reconnect-eligible instead of a silent success.
     explicit_done: bool,
     last_event_id: LastEventId,
-    activity: SseActivity,
+    activity: StreamActivity,
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
@@ -210,9 +217,9 @@ impl<T, S> SseStream<T, S> {
 
     /// Returns a clone of the shared wire-activity counter. The streaming client
     /// snapshots it around an idle-timeout wait so keepalive-only traffic keeps
-    /// the stream alive (see [`SseActivity`]).
+    /// the stream alive (see [`StreamActivity`]).
     #[must_use]
-    pub fn activity_handle(&self) -> SseActivity {
+    pub fn activity_handle(&self) -> StreamActivity {
         self.activity.clone()
     }
 }
@@ -293,7 +300,8 @@ where
                         || this.event_data.len() > MAX_ACCUMULATED_BYTES
                     {
                         this.done = true;
-                        return Poll::Ready(Some(Err(TransportError::sse(
+                        return Poll::Ready(Some(Err(TransportError::framing(
+                            StreamFraming::ServerSentEvents,
                             "SSE frame exceeds maximum accumulated size; aborting stream",
                         ))));
                     }
@@ -332,9 +340,10 @@ fn drain_buffer<T: DeserializeOwned + 'static>(
                 }
             }
             Err(e) => {
-                out.push_back(Err(TransportError::sse(format!(
-                    "invalid UTF-8 in SSE frame: {e}"
-                ))));
+                out.push_back(Err(TransportError::framing(
+                    StreamFraming::ServerSentEvents,
+                    format!("invalid UTF-8 in SSE frame: {e}"),
+                )));
             }
         }
     }
@@ -471,7 +480,10 @@ fn dispatch_event<T: DeserializeOwned + 'static>(
 fn parse_problem(payload: &str) -> TransportError {
     match serde_json::from_str::<Problem>(payload) {
         Ok(p) => TransportError::problem(p),
-        Err(e) => TransportError::sse(format!("malformed error event: {e}")),
+        Err(e) => TransportError::framing(
+            StreamFraming::ServerSentEvents,
+            format!("malformed error event: {e}"),
+        ),
     }
 }
 

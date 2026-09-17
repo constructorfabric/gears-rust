@@ -1,0 +1,5 @@
+error: unknown stream framing `bogus`; expected sse or multipart_mixed
+  --> tests/ui/fail/rest_streaming_unknown_framing.rs:17:17
+   |
+17 |     #[streaming(bogus)]
+   |                 ^^^^^

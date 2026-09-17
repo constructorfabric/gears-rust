@@ -10,17 +10,17 @@ use tokio::sync::{Notify, RwLock};
 
 use super::manager::OutboxBuilder;
 use super::prioritizer::SharedPrioritizer;
+use super::record::{Record, RecordItem, Records};
 use super::statements::OutboxStatements;
 use super::store::OutboxStore;
-use super::types::{EnqueueMessage, OutboxConfig, OutboxError, OutboxMessageId};
+use super::subscription::{Mailbox, TraceRegistry, TraceSubscription, TraceWatch};
+use super::trace::{TraceOutcome, TraceState};
+use super::types::{OutboxConfig, OutboxError, OutboxMessageId};
 use crate::Db;
 use crate::secure::SeaOrmRunner;
 
 /// Per-partition notify map shared between sequencer and processors.
 type PartitionNotifyMap = Arc<HashMap<i64, Arc<Notify>>>;
-
-/// Maximum payload size in bytes (64 KiB).
-const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 
 /// Max rows per multi-row INSERT statement to avoid parameter limits.
 const BATCH_CHUNK_SIZE: usize = 100;
@@ -41,6 +41,24 @@ pub struct Outbox {
     /// Per-partition notify map for direct signaling from sequencer to processors.
     /// Set once during `start()` after all processors are spawned.
     partition_notify: RwLock<Option<PartitionNotifyMap>>,
+    /// Who this instance is, and who is waiting for a completion. Shared with
+    /// the ack path so a completion this instance both finishes and owns is
+    /// delivered without a query.
+    mailbox: Arc<Mailbox>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct TraceStatusRow {
+    trace: String,
+    queue: String,
+    entities: i64,
+    pending: i64,
+    failures: i64,
+    attempts: i64,
+    last_error: Option<String>,
+    retrying_since: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -67,8 +85,13 @@ impl Outbox {
     #[must_use]
     pub(crate) fn new_with_backend(config: OutboxConfig, backend: DbBackend) -> Self {
         let statements = Arc::new(OutboxStatements::new(backend, &config.tables));
+        let mailbox = Arc::new(Mailbox::new(
+            config.instance_id.clone(),
+            TraceRegistry::new(),
+        ));
         Self {
             config,
+            mailbox,
             statements,
             partitions: DashMap::new(),
             partition_to_queue: DashMap::new(),
@@ -76,6 +99,185 @@ impl Outbox {
             prioritizer: RwLock::new(None),
             partition_notify: RwLock::new(None),
         }
+    }
+
+    /// Register interest in a traced batch's completion.
+    ///
+    /// Do this **before** the enqueuing transaction commits. A completion
+    /// cannot precede that commit, so registering first means nothing can be
+    /// missed; registering afterwards races the pipeline.
+    ///
+    /// The trace must be the same unique id the batch was enqueued under. The
+    /// outbox does not resolve trace collisions, so subscribing to a trace that
+    /// another live batch also uses can resolve this waiter from that batch.
+    ///
+    /// ```ignore
+    /// let sub = outbox.subscribe("import-2026-09-08")?;
+    /// db.in_transaction(|txn| async move {
+    ///     orders_repo.insert(txn, &orders).await?;
+    ///     outbox.enqueue_batch(txn, batch).await
+    /// }).await?;
+    /// let outcome = sub.await;
+    /// ```
+    ///
+    /// Dropping the returned subscription releases it and issues no statement.
+    ///
+    /// Rejects a trace the enqueue path would also reject (empty, over 256
+    /// bytes, or non-printable), so a subscription is never registered against a
+    /// trace nothing could ever be enqueued or delivered under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::InvalidTrace`] or [`OutboxError::TraceTooLong`] if
+    /// the trace is not a valid 1-256 byte printable-ASCII id.
+    pub fn subscribe(&self, trace: &str) -> Result<TraceSubscription, OutboxError> {
+        super::validation::validate_trace(trace)?;
+        Ok(self.mailbox.subscriptions().subscribe(trace))
+    }
+
+    /// Run `on_complete` when a traced batch finishes, without holding a future.
+    ///
+    /// The callback runs on a spawned task - never inline in a worker - so a
+    /// slow handler cannot stall the pipeline. It is handed `None` if this
+    /// process can no longer answer (the durable answer is then
+    /// [`Outbox::trace_status`]). Dropping the returned [`TraceWatch`] stops the
+    /// watch; keep it for as long as the callback matters.
+    ///
+    /// ```ignore
+    /// let _guard = outbox.watch_trace("import-1", |outcome| match outcome {
+    ///     Some(o) => info!(clean = o.is_clean(), "done"),
+    ///     None => { /* process gone; read trace_status */ }
+    /// })?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::InvalidTrace`] or [`OutboxError::TraceTooLong`] if
+    /// the trace is not a valid 1-256 byte printable-ASCII id.
+    pub fn watch_trace<F>(&self, trace: &str, on_complete: F) -> Result<TraceWatch, OutboxError>
+    where
+        F: FnOnce(Option<TraceOutcome>) + Send + 'static,
+    {
+        let sub = self.subscribe(trace)?;
+        let handle = tokio::spawn(async move { on_complete(sub.completion().await) });
+        Ok(TraceWatch::new(handle))
+    }
+
+    /// Like [`Outbox::watch_trace`], but the callback also sees every retry
+    /// state, and fires a final time on completion.
+    ///
+    /// The callback runs on a spawned task and stops after the terminal
+    /// [`TraceState::Completed`], or when this process can no longer answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxError::InvalidTrace`] or [`OutboxError::TraceTooLong`] if
+    /// the trace is not a valid 1-256 byte printable-ASCII id.
+    pub fn watch_trace_events<F>(
+        &self,
+        trace: &str,
+        mut on_event: F,
+    ) -> Result<TraceWatch, OutboxError>
+    where
+        F: FnMut(TraceState) + Send + 'static,
+    {
+        let mut sub = self.subscribe(trace)?;
+        let handle = tokio::spawn(async move {
+            while let Some(state) = sub.next().await {
+                let done = matches!(state, TraceState::Completed(_));
+                on_event(state);
+                if done {
+                    break;
+                }
+            }
+        });
+        Ok(TraceWatch::new(handle))
+    }
+
+    /// How many traced batches this instance is currently waiting on.
+    ///
+    /// Zero means the notifier issues no query at all, so this is also the
+    /// answer to "is this instance polling for mail right now".
+    #[must_use]
+    pub fn outstanding_traces(&self) -> usize {
+        self.mailbox.subscriptions().len()
+    }
+
+    /// Who this instance is and who is waiting, for the ack path.
+    pub(crate) fn mailbox(&self) -> Arc<Mailbox> {
+        Arc::clone(&self.mailbox)
+    }
+
+    /// Record a traced submission.
+    ///
+    /// `pending` starts at the batch's entity count and the ack counts it
+    /// down, so completion is a fact about the row rather than something
+    /// anyone has to compute. The row's numeric `id` is never read back - the
+    /// body rows carry the caller's `trace` string, which is what the ack
+    /// counts down against, so there is nothing to thread from here.
+    async fn insert_trace_row(
+        &self,
+        runner: &SeaOrmRunner<'_>,
+        trace: &str,
+        queue: &str,
+        entities: i64,
+    ) -> Result<(), OutboxError> {
+        let store = OutboxStore::new(self.statements());
+        let conn = runner.executor();
+        store
+            .exec_insert_trace(&conn, trace, self.instance_id(), queue, entities)
+            .await?;
+        Ok(())
+    }
+
+    /// What became of a traced batch.
+    ///
+    /// Answers from the trace row, which outlives both the messages it
+    /// describes and the instance that enqueued them - so this is what a
+    /// restarted process asks when its in-memory subscription died with it.
+    /// Returns `None` once the row has been swept, which for a completed trace
+    /// means it finished and was collected.
+    ///
+    /// Nothing requires a caller's traces to be unique; the most recently
+    /// enqueued one is reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails.
+    pub async fn trace_status(
+        &self,
+        db: &(impl crate::secure::DBRunner + Sync + ?Sized),
+        trace: &str,
+    ) -> Result<Option<super::trace::TraceStatus>, OutboxError> {
+        let store = OutboxStore::new(self.statements());
+        let runner = db.as_seaorm();
+        let conn = runner.executor();
+        let row = TraceStatusRow::find_by_statement(Statement::from_sql_and_values(
+            store.backend(),
+            store.trace_status(),
+            [trace.into()],
+        ))
+        .one(&conn)
+        .await?;
+
+        Ok(row.map(|row| super::trace::TraceStatus {
+            trace: row.trace,
+            queue: row.queue,
+            entities: row.entities,
+            pending: row.pending,
+            failures: row.failures,
+            attempts: row.attempts,
+            last_error: row.last_error,
+            retrying_since: row.retrying_since,
+            created_at: row.created_at,
+            completed_at: row.completed_at,
+        }))
+    }
+
+    /// This instance's name, as trace completions are addressed.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        self.config.instance_id.as_str()
     }
 
     /// Register a queue with `num_partitions` partitions `[0, num_partitions)`.
@@ -187,7 +389,7 @@ impl Outbox {
     }
 
     /// Insert a vacuum counter row for each partition ID (idempotent via
-    /// `ON CONFLICT DO NOTHING`).
+    /// insert-or-ignore).
     async fn ensure_vacuum_counter_rows<C: ConnectionTrait>(
         conn: &C,
         store: &OutboxStore<'_>,
@@ -230,43 +432,36 @@ impl Outbox {
             })
     }
 
-    /// Validate payload size.
-    fn validate_payload(payload: &[u8]) -> Result<(), OutboxError> {
-        if payload.len() > MAX_PAYLOAD_SIZE {
-            return Err(OutboxError::PayloadTooLarge {
-                size: payload.len(),
-                max: MAX_PAYLOAD_SIZE,
-            });
-        }
-        Ok(())
-    }
-
-    /// Enqueue a single message. Accepts `&impl DBRunner` — use within a transaction
+    /// Record one entity. Accepts `&impl DBRunner` - use within a transaction
     /// for atomicity with business data, or with a standalone connection.
+    ///
+    /// Every rule that can be checked without the database was checked when the
+    /// [`Record`] was built, so the only rejections left are an unregistered
+    /// queue, a partition out of range, and the database itself.
     ///
     /// # Errors
     ///
-    /// Returns an error on validation failure or database error.
+    /// Returns an error if the queue is not registered, the partition is out of
+    /// range, or the database rejects the write.
     pub async fn enqueue(
         &self,
         db: &(impl crate::secure::DBRunner + Sync + ?Sized),
-        queue: &str,
-        partition: u32,
-        payload: Vec<u8>,
-        payload_type: &str,
+        msg: Record<'_>,
     ) -> Result<OutboxMessageId, OutboxError> {
-        super::validation::validate_queue_name(queue)?;
-        super::validation::validate_payload_type(payload_type)?;
-        Self::validate_payload(&payload)?;
-        let partition_id = self.resolve_partition(queue, partition)?;
+        let (queue, item, trace) = msg.into_parts();
+        let partition_id = self.resolve_partition(queue, item.partition)?;
 
         let runner = db.as_seaorm();
+        if let Some(trace) = trace {
+            self.insert_trace_row(&runner, trace, queue, 1).await?;
+        }
         let incoming_id = Self::insert_body_and_incoming(
             &runner,
             self.statements(),
             partition_id,
-            payload,
-            payload_type,
+            item.payload,
+            item.payload_type,
+            trace,
         )
         .await?;
 
@@ -275,31 +470,42 @@ impl Outbox {
         Ok(OutboxMessageId(incoming_id))
     }
 
-    /// Enqueue a batch of items for a single queue.
-    /// All validation happens before any DB writes — a single invalid message
-    /// rejects the entire batch.
+    /// Enqueue a batch of entities for a single queue.
+    ///
+    /// All partitions are resolved before any DB write - one unresolvable
+    /// entity rejects the whole batch, matching the validation the
+    /// [`Records`] already performed as a whole.
     ///
     /// # Errors
     ///
-    /// Returns an error on validation failure or database error.
+    /// Returns an error if the queue is not registered, any partition is out of
+    /// range, or the database rejects the write.
     pub async fn enqueue_batch(
         &self,
         db: &(impl crate::secure::DBRunner + Sync + ?Sized),
-        queue: &str,
-        items: &[EnqueueMessage<'_>],
+        batch: Records<'_>,
     ) -> Result<Vec<OutboxMessageId>, OutboxError> {
-        // Validate ALL items first
-        super::validation::validate_queue_name(queue)?;
+        let (queue, items, trace) = batch.into_parts();
+
         let mut resolved = Vec::with_capacity(items.len());
-        for item in items {
-            super::validation::validate_payload_type(item.payload_type)?;
-            Self::validate_payload(&item.payload)?;
-            let partition_id = self.resolve_partition(queue, item.partition)?;
-            resolved.push(partition_id);
+        for item in &items {
+            resolved.push(self.resolve_partition(queue, item.partition)?);
         }
 
         let runner = db.as_seaorm();
-        let ids = Self::insert_batch(&runner, self.statements(), &resolved, items).await?;
+        if let Some(trace) = trace {
+            // Propagate rather than clamp: an i64::MAX count would write a
+            // `pending` that can never reach zero, so the subscriber would wait
+            // for ever. (Unreachable below usize::MAX > i64::MAX, but the type
+            // permits it, so it is an error not a silent floor.)
+            let entities =
+                i64::try_from(items.len()).map_err(|_| OutboxError::TracedBatchTooLarge {
+                    entities: items.len(),
+                })?;
+            self.insert_trace_row(&runner, trace, queue, entities)
+                .await?;
+        }
+        let ids = Self::insert_batch(&runner, self.statements(), &resolved, &items, trace).await?;
 
         // Push dirty for each distinct partition_id in the batch
         for &pid in &resolved {
@@ -314,7 +520,8 @@ impl Outbox {
         runner: &SeaOrmRunner<'_>,
         statements: &OutboxStatements,
         partition_ids: &[i64],
-        items: &[EnqueueMessage<'_>],
+        items: &[RecordItem<'_>],
+        trace: Option<&str>,
     ) -> Result<Vec<OutboxMessageId>, OutboxError> {
         let backend = Self::runner_backend(runner);
         debug_assert_eq!(backend, statements.backend());
@@ -322,20 +529,22 @@ impl Outbox {
         if let Some(c) = Self::conn_requiring_composite_write_tx(runner) {
             let txn = c.begin().await?;
             let exec = DatabaseExecutor::Transaction(&txn);
-            let ids = Self::insert_batch_on_conn(&exec, statements, partition_ids, items).await?;
+            let ids =
+                Self::insert_batch_on_conn(&exec, statements, partition_ids, items, trace).await?;
             txn.commit().await?;
             return Ok(ids);
         }
 
         let conn = runner.executor();
-        Self::insert_batch_on_conn(&conn, statements, partition_ids, items).await
+        Self::insert_batch_on_conn(&conn, statements, partition_ids, items, trace).await
     }
 
     async fn insert_batch_on_conn(
         conn: &DatabaseExecutor<'_>,
         statements: &OutboxStatements,
         partition_ids: &[i64],
-        items: &[EnqueueMessage<'_>],
+        items: &[RecordItem<'_>],
+        trace: Option<&str>,
     ) -> Result<Vec<OutboxMessageId>, OutboxError> {
         let store = OutboxStore::new(statements);
 
@@ -347,9 +556,9 @@ impl Outbox {
 
         // Insert body rows in chunks
         for chunk in items.chunks(BATCH_CHUNK_SIZE) {
-            let payloads: Vec<(&[u8], &str)> = chunk
+            let payloads: Vec<(&[u8], &str, Option<&str>)> = chunk
                 .iter()
-                .map(|item| (item.payload.as_slice(), item.payload_type))
+                .map(|item| (item.payload.as_slice(), item.payload_type, trace))
                 .collect();
             let chunk_ids = store.exec_insert_body_batch(conn, &payloads).await?;
             all_body_ids.extend(chunk_ids);
@@ -377,6 +586,7 @@ impl Outbox {
         partition_id: i64,
         payload: Vec<u8>,
         payload_type: &str,
+        trace: Option<&str>,
     ) -> Result<i64, OutboxError> {
         let backend = Self::runner_backend(runner);
         debug_assert_eq!(backend, statements.backend());
@@ -390,6 +600,7 @@ impl Outbox {
                     partition_id,
                     payload,
                     payload_type,
+                    trace,
                 )
                 .await?;
             txn.commit().await?;
@@ -399,7 +610,7 @@ impl Outbox {
         let conn = runner.executor();
         let store = OutboxStore::new(statements);
         let incoming_id = store
-            .exec_insert_body_and_incoming(&conn, partition_id, payload, payload_type)
+            .exec_insert_body_and_incoming(&conn, partition_id, payload, payload_type, trace)
             .await?;
 
         Ok(incoming_id)
@@ -647,6 +858,44 @@ mod tests {
         make_outbox(OutboxConfig::default())
     }
 
+    // -- subscribe validation tests --
+
+    #[test]
+    fn subscribe_rejects_an_invalid_trace() {
+        let outbox = make_default_outbox();
+        assert!(matches!(
+            outbox.subscribe(""),
+            Err(OutboxError::InvalidTrace { .. })
+        ));
+        assert!(matches!(
+            outbox.subscribe(&"a".repeat(257)),
+            Err(OutboxError::TraceTooLong { .. })
+        ));
+        assert!(matches!(
+            outbox.subscribe("bad\u{7f}control"),
+            Err(OutboxError::InvalidTrace { .. })
+        ));
+        assert!(outbox.subscribe("import-2026-09-08").is_ok());
+    }
+
+    #[test]
+    fn outstanding_traces_counts_live_subscriptions() {
+        let outbox = make_default_outbox();
+        assert_eq!(outbox.outstanding_traces(), 0);
+        let sub = outbox.subscribe("t1").unwrap();
+        assert_eq!(
+            outbox.outstanding_traces(),
+            1,
+            "a live subscription is outstanding traced work"
+        );
+        drop(sub);
+        assert_eq!(
+            outbox.outstanding_traces(),
+            0,
+            "dropping the subscription clears the count"
+        );
+    }
+
     // -- resolve_partition tests --
 
     #[test]
@@ -683,27 +932,77 @@ mod tests {
         ));
     }
 
-    // -- validate_payload tests --
+    // -- request building rejects before the database is involved --
+    // The rules themselves are covered in `validation.rs`; these assert that
+    // building a request is where they are applied, so a rejected submission
+    // has issued no statement.
 
     #[test]
-    fn validate_payload_oversized() {
-        let oversized = vec![0u8; MAX_PAYLOAD_SIZE + 1];
-        let err = Outbox::validate_payload(&oversized).unwrap_err();
+    fn building_rejects_an_oversized_payload() {
+        let oversized = vec![0u8; crate::outbox::validation::MAX_PAYLOAD_SIZE + 1];
+        let err = Record::to("orders", 0)
+            .payload(oversized, "application/json")
+            .build()
+            .unwrap_err();
         assert!(matches!(err, OutboxError::PayloadTooLarge { .. }));
     }
 
     #[test]
-    fn validate_payload_at_exact_limit() {
-        let exact = vec![0u8; MAX_PAYLOAD_SIZE];
-        assert!(Outbox::validate_payload(&exact).is_ok());
+    fn building_rejects_a_bad_queue_name() {
+        let err = Record::to("orders/v2", 0)
+            .payload(vec![1], "application/json")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, OutboxError::InvalidQueueName { .. }));
     }
 
     #[test]
-    fn validate_payload_empty() {
-        assert!(Outbox::validate_payload(&[]).is_ok());
+    fn building_rejects_an_over_long_trace() {
+        let err = Record::to("orders", 0)
+            .payload(vec![1], "application/json")
+            .trace(&"t".repeat(257))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OutboxError::TraceTooLong {
+                size: 257,
+                max: 256
+            }
+        ));
     }
 
-    // -- enqueue_batch validation tests (no DB needed) --
+    #[test]
+    fn a_batch_is_rejected_whole_on_one_bad_entity() {
+        let err = Records::to("orders")
+            .payload_type("application/json")
+            .push(0, vec![1])
+            .push(
+                1,
+                vec![0u8; crate::outbox::validation::MAX_PAYLOAD_SIZE + 1],
+            )
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, OutboxError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn a_batch_carries_its_own_trace_and_totals() {
+        let batch = Records::to("orders")
+            .payload_type("application/json")
+            .trace("import-2026-09-08")
+            .push(0, vec![1, 2, 3])
+            .push_with_type(1, vec![4, 5], "application/vnd.legacy+json")
+            .build()
+            .unwrap();
+        assert_eq!(batch.queue(), "orders");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.bytes(), 5);
+        assert!(!batch.is_empty());
+        // The trace the name promises: it must survive the build onto the batch.
+        let (_, _, trace) = batch.into_parts();
+        assert_eq!(trace, Some("import-2026-09-08"));
+    }
 
     #[tokio::test]
     async fn enqueue_batch_rejects_out_of_range_partition() {
@@ -712,13 +1011,6 @@ mod tests {
 
         let err = outbox.resolve_partition("q", 5).unwrap_err();
         assert!(matches!(err, OutboxError::PartitionOutOfRange { .. }));
-    }
-
-    #[tokio::test]
-    async fn enqueue_batch_rejects_oversized_payload() {
-        let oversized = vec![0u8; MAX_PAYLOAD_SIZE + 1];
-        let err = Outbox::validate_payload(&oversized).unwrap_err();
-        assert!(matches!(err, OutboxError::PayloadTooLarge { .. }));
     }
 
     // -- flush tests --

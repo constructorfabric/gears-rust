@@ -37,6 +37,32 @@ pub struct InfraOutboxEnqueuer {
     num_partitions: u32,
 }
 
+/// Build one outbox message for this gear.
+///
+/// Every queue here carries JSON, so the payload type is stated once rather
+/// than at each of the six call sites, and a rejected request becomes a domain
+/// error before any statement runs.
+fn outbox_message(
+    queue: &str,
+    partition: u32,
+    payload: Vec<u8>,
+) -> Result<toolkit_db::outbox::Record<'_>, DomainError> {
+    toolkit_db::outbox::Record::to(queue, partition)
+        .payload(payload, "application/json")
+        .build()
+        .map_err(|e| match e {
+            // A caller-driven oversize payload is a bad request, not a server
+            // fault: queue and payload type are gear constants here, so this is
+            // the only build rejection a caller can actually provoke.
+            toolkit_db::outbox::OutboxError::PayloadTooLarge { size, max } => {
+                DomainError::validation(format!(
+                    "payload too large: {size} bytes exceeds max {max}"
+                ))
+            }
+            other => DomainError::internal(format!("outbox request: {other}")),
+        })
+}
+
 impl InfraOutboxEnqueuer {
     pub(crate) fn new(
         usage_queue_name: String,
@@ -101,10 +127,7 @@ impl InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.thread_summary_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.thread_summary_queue_name, partition, payload)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
@@ -134,10 +157,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.usage_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.usage_queue_name, partition, payload)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
@@ -165,10 +185,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.cleanup_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.cleanup_queue_name, partition, payload)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
@@ -198,10 +215,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.chat_cleanup_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.chat_cleanup_queue_name, partition, payload)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
@@ -234,10 +248,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.audit_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.audit_queue_name, partition, payload)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("audit outbox enqueue: {e}")))?;
@@ -265,10 +276,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         self.outbox()
             .enqueue(
                 runner,
-                &self.thread_summary_queue_name,
-                partition,
-                serialized,
-                "application/json",
+                outbox_message(&self.thread_summary_queue_name, partition, serialized)?,
             )
             .await
             .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
@@ -549,6 +557,18 @@ mod tests {
             dedupe_key: None,
             system_task_type: None,
         }
+    }
+
+    #[test]
+    fn oversize_payload_is_a_validation_error_not_internal() {
+        // 64 KiB is the outbox cap; one byte over is caller-driven and must
+        // surface as a 4xx, not a 500.
+        let too_big = vec![0u8; 64 * 1024 + 1];
+        let err = outbox_message("q", 0, too_big).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected a validation error, got {err:?}"
+        );
     }
 
     fn make_outbox_message(payload: Vec<u8>) -> OutboxMessage {

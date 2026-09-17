@@ -605,7 +605,9 @@ fn visible_ids_for(state: &RepoState, scope: &AccessScope) -> Option<HashSet<Uui
                 // `tenants` entity. Prod secure-extension would
                 // `None` out the constraint; fake mirrors by failing
                 // closed.
-                ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_) => HashSet::new(),
+                // ...and any variant a newer library adds, for the same reason:
+                // a predicate this fake cannot resolve must not silently widen.
+                _ => HashSet::new(),
             };
             per_constraint = Some(match per_constraint {
                 None => filter_ids,

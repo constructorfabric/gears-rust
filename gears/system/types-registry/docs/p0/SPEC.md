@@ -334,17 +334,30 @@ out of scope):
    A minor on a Type Schema identifier is admissible under any prefix.
 5. Declared dialect, Type Schema candidates — top-level `$schema` present and in the
    closed Draft-07 spelling set; any `$schema` below the root must not differ (ADR-0014).
-6. `force` per candidate — refuse where `allow_compatibility_force` is off, or where the
-   candidate has no cross-minor check to waive. Until T17, also refuse every surviving
-   `force`: there is no comparison to waive and no truthful `compat_forced` to record yet.
-7. ADR-0015 quarantine — refuse a stable candidate whose immediate base or `$ref` targets
-   include a major-0 identifier. `x-gts-ref` is outside the quarantine.
+6. `force` per candidate — require `allow_compatibility_force` and a waivable
+   cross-minor baseline from `compat::select_baseline`. Intra-entity revisions are
+   never waivable. Store the request on `operation_item.compat_forced`; each worker
+   pass rechecks the deployment setting and baseline eligibility. The revision's
+   `compat_forced` records the effective waiver.
+7. ADR-0015 quarantine — the worker refuses stable candidates whose immediate base,
+   `$ref` target, or conforming type is major 0. `x-gts-ref` is exempt. See below.
 8. Canonicalize through `gts-rust`, compute the request fingerprint, resolve the
    mandatory `Idempotency-Key`.
 
 Ordering invariant that must not be reordered: step 3 precedes any existence lookup, so
 a refusal cannot probe the namespace. Steps 4 and 6 are request-static; family shape and
 whether a waived comparison would fail remain worker decisions inside the commit transaction.
+
+**Worker checks.** Step 7 uses the outgoing edges already extracted in
+`unit::evaluate` for the dependency graph. This keeps quarantine and stored edges
+consistent, preserves worker-side `invalid_schema` refusals for malformed `$ref`s,
+and records quarantine failures as admission-stage `AdmissionFailureReason` values
+(P16). It reads only the request and runs before loading stored rows.
+
+The ADR-0014 dialect pin also runs in the worker: step 5 checks admissibility,
+while the pin needs the baseline document. It runs immediately before comparison
+and reports `dialect_changed`, distinct from `compatibility_undecidable`
+(§16.12, `principle-fail-closed`).
 
 Replay of a matching fingerprint under the same key returns the stored operation —
 `202` while active, `200` when terminal. A different fingerprint under the same key
@@ -399,7 +412,10 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
    because it has no resolved form. The in-batch graph is not acyclic by construction — the
    overlay lets candidates see each other — so the ordering detects a cycle and fails its
    members with `invalid_schema`. Past that refusal there is no condensation step and no
-   atomic group.
+   atomic group. If predecessor edges still prevent ordering, identify the actual cyclic
+   components in the remaining ordering graph and refuse only their members. Candidates
+   downstream of either kind of cycle remain ordered and receive `blocked_by_dependency`
+   or `blocked_by_predecessor` according to their failed blocker; they are not cycle members.
 3. Build the unit's transient `gts-rust` store (D2): the candidates, plus the transitive
    closure of what they consume, read `gts_id`-sorted from the database. Evaluate outside
    any transaction against it: resolution, compat vs
@@ -410,6 +426,17 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
    rather than merely re-reading the same rows. The vector's reads run in the **same**
    transaction as the store build, so the state it records is the state the documents
    being validated came from; only the validation itself is outside a transaction.
+   For an intra-entity compatibility baseline, require its snapshot
+   `entity.resource_version` to equal the accepted `expected_resource_version` before
+   comparison; a mismatch is terminal `precondition_failed`. The commit's precondition
+   then protects the version actually compared. Checking only at commit would let a
+   future expected version become valid after evaluation against an older baseline.
+   Once the dependency store has loaded, this baseline read refuses an absent entity
+   with `precondition_failed`, and a tombstone with `entity_deleted` **before** checking
+   its version. These refusals and a version mismatch precede candidate schema
+   validation and compatibility comparison; a tombstone must never suggest retrying
+   the revision with a newer version. Deleted cross-minor predecessors remain valid
+   comparison baselines.
 4. Commit transaction:
    1. **claim the `entity_write_order` row.** This is the transaction's first statement and
       nothing may precede it, reads included: every step below is an answer about
@@ -430,7 +457,14 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
       revalidates from scratch, bounded by `worker.max_revalidation_attempts`;
       exhaustion terminalizes the item as `failed` with reason
       `revalidation_exhausted`;
-   4. re-test predecessor existence for each minor-bearing candidate;
+   4. re-test predecessor existence for each minor-bearing candidate. Before revising
+      a Type Schema whose own document declares `x-gts-abstract: true`, require no
+      active direct `InstanceOf` dependant; otherwise refuse with `dependent_invalid`.
+      Deleted Instances and Instances of concrete derived types do not block this
+      revision. The presence check runs under the same `entity_write_order` claim as
+      Instance creation, before writing any revision or moving any version. If the
+      abstract revision commits first, the Instance's vector guard instead forces
+      revalidation against the abstract type, which refuses the Instance;
    5. insert the immutable revision, replace the current-state projection, replace the
       entity's outgoing dependency edges;
    6. refresh affected current effective schemas (bounded by `limits.activation_write_set`);
@@ -666,8 +700,15 @@ optional and it is not merely early — a deletion whose recheck runs before it 
 check-then-act on state that can still move, which is the failure the recheck exists to
 prevent.
 
-Dry Run follows the same path in a rollback-only evaluation transaction, then records
-the predicted outcome in a separate short transaction.
+**Dry Run predicts the whole batch without entity-state writes.** Run the same checks in
+dependency order over one read-only snapshot plus earlier successful candidates' virtual
+changes. Merge each tentative layer on success; discard it on refusal or error.
+
+Do not write `version_family`, `entity`, revision, current-pointer or `dependency` rows,
+or claim `entity_write_order`: a prediction must not serialize real writers behind a batch.
+Verify this with an adapter that rejects write attempts; unchanged tables alone permit rollback.
+Operation, outcome, idempotency and dispatch records remain durable. Publish outcomes and
+completion atomically after releasing the snapshot, preserving payloads for recovery on failure.
 
 ### 8.2 Read path, and why no store is held between admissions
 
@@ -979,6 +1020,20 @@ it. What the write path emits is therefore part of the contract, not a by-produc
   a decided-against one in the metrics, not only in the refusal reason — which is what makes
   §16.12 observable in a deployment.
 
+Refusals persist `{reason, message}`, returned unchanged by operation reads. `reason`
+is the stable machine-readable refusal category; `message` is for humans and is not
+a parsing contract. There is no separate `diagnostics` field (PRD, ADR-0003).
+
+For `incompatible_with_baseline` and `compatibility_undecidable`, this build renders
+up to 20 backward findings as `finding at path`, in engine order, and counts omitted
+findings in the message. Each path retains at most 200 UTF-8 bytes, cut at a character
+boundary and followed by `...(truncated)` when shortened. Paths use GTS notation
+(`$`, `$.payload`, etc.); the engine's unbounded human `detail` is not copied.
+Refusals before comparison, such as `dialect_changed` and `baseline_unresolvable`,
+explain their cause without inventing comparison findings. Clients branch on `reason`
+and display `message` without depending on its wording or these implementation limits.
+Successful admissions carry no compatibility diagnostics.
+
 ## 9. Database
 
 `database.sql` is the normative target. P0 creates **10 of its 11 tables**, omitting only
@@ -1046,10 +1101,10 @@ because other documents cite the numbers.
 | C3 | **Struck by D11.** Was: the inventory pull model is in-process-only (§8.4) and `owning_gear` a hardcoded constant, which **blocks** out-of-process gears rather than degrading them | Resolved in P0 — `owning_gear` lands on the inventory records (T22) and every gear pushes its own (T23–T25) |
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
-| C6 | **No PDP.** Reads and writes are authenticated but not authorized, deviating from `06`'s *"every sensitive DB access MUST be covered by a PDP decision"*. Entities are `#[secure(unrestricted)]`, so a tenant-scoped query fails closed rather than leaking. **The sharpest edge is the revision path**: §8.1 step 3 asks the registration policy of creations only — correctly, since the policy governs which regions gain members — and nothing takes its place for an edit, so a caller that reaches the submit route can replace the authored content of any entity the registry holds, a platform-seeded `cf.core.*` schema included, in a region the deployment has closed. Bounded in P0 by transport rather than by policy: the mutation routes are internal-only (C8) | Tracked as C6 in the P1 epic #4628 — prerequisite 1 (the deferred identity-to-permission binding), then an owner/principal check before `unit::commit_revision`, and `tenant_col` + `PolicyEnforcer` (§12) |
+| C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8) | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
 | C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
 | C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
-| C9 | **Implementation sequencing only.** T11 makes revisions executable before T14 refreshes reverse impact and T17 compares compatibility. Content revisions **of** minor-bearing Type Schemas remain permanently refused by ADR-0004 — creating one is admissible (§8.1 step 4), editing it is not; during this window every effective `force` also fails closed, and C8 keeps the database mutation path internal | T14 and T17 close the two gaps at Checkpoints 3 and 4, before T24 exposes any consumer. Strike this row when both checkpoints are complete; striking it removes only the temporary `force` refusal, not the ADR-0004 invariant |
+| C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `force` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T24 exposes consumers. The ADR-0004 restriction remains |
 
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
@@ -1602,6 +1657,7 @@ identifier profile refusals, topological order, baseline selection.
 | Same key, different fingerprint | `409`, original operation untouched |
 | Concurrent acceptance on one key | one winner, loser returns the winner after fingerprint verification |
 | Update with stale `expected_resource_version` | terminal item `precondition_failed`, no silent rebase |
+| Future `expected_resource_version` reached by another admission after evaluation | terminal `precondition_failed`; never commit a candidate compared against an older baseline |
 | Create when identifier exists | terminal item failure, no revision |
 | Concurrent first registration of one family | exactly one succeeds; family ownership is single |
 | Minor admitted while `vM~` exists | refused on shape |
@@ -1610,6 +1666,10 @@ identifier profile refusals, topological order, baseline selection.
 | Batch with one failing dependency | dependent `failed` with `blocked_by_dependency`, independent branches commit |
 | Circular `$ref`, in one batch or closed by a revision | refused as `invalid_schema`; no cyclic edge is ever stored |
 | Revision of a base with N dependents | every dependent's `resolved_schema` and `resolution_fingerprint` refreshed in the same transaction |
+| Revise a concrete Type Schema to abstract while it has a live direct Instance | terminal `dependent_invalid`; schema revision, artifacts, version and Instance value stay unchanged |
+| Revise a base Type Schema to final while it has a live derived Type Schema | refresh refuses with `dependent_invalid`; the base revision is rolled back and both schemas' versions and artifacts stay unchanged |
+| Abstract transition with only deleted direct Instances, or Instances of concrete derived or unrelated types | succeeds; those Instances do not prevent abstraction |
+| Concurrent abstract transition and direct Instance creation, in either commit order | With one competing commit: Instance first refuses the abstract revision with `dependent_invalid`; abstract revision first makes the Instance revalidate and refuse with `invalid_value`. Further drift is subject to the usual `revalidation_exhausted` bound. Both orders asserted on SQLite, PostgreSQL and MySQL |
 | Refresh yielding identical artifacts | fingerprint unchanged, nothing written, `resource_version` not moved |
 | Activation set over the bound | candidate fails, no partial refresh committed |
 | Duplicate worker invocation on one operation | second invocation is a no-op |
@@ -1658,6 +1718,8 @@ identifier profile refusals, topological order, baseline selection.
 | `list_instances` helper over a content-free page | hydrates through `batchGet` and returns payloads, so the call shape consumers use is preserved |
 | Two pods, concurrent dependency change | commit-time revision-vector mismatch rolls back and retries |
 | Dry Run | full check sequence runs, nothing committed, `resource_version` unmoved |
+| Dry Run of a batch | matches real-run statuses/reasons on identical initial state; admits a referrer to an in-batch base and refuses an Instance invalidated by an in-batch revision |
+| Dry Run write attempts | instrumented storage observes no entity-state write or `entity_write_order` claim |
 | Delete with live direct dependent | refused; count reported without identities |
 | Deleted entity | exact read returns it as deleted; list excludes it |
 

@@ -1,0 +1,5 @@
+error: #[contract]: `#[streaming]` takes no framing selector on the base trait. A framing such as `multipart_mixed` names an HTTP media type, and the base contract is transport-agnostic. Declare the framing on the `#[rest_contract]` projection instead. `open = fallible` is allowed here.
+  --> tests/ui/fail/contract_streaming_framing_arg.rs:15:5
+   |
+15 |     #[streaming(multipart_mixed)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
