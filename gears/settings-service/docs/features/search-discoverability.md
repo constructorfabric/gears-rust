@@ -89,7 +89,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 6. [ ] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
 7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
 8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row - `inst-sd-search-8`
-9. [ ] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
+9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
 10. [ ] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it - `inst-sd-search-10`
 11. [ ] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
 
@@ -124,16 +124,16 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 ### Matched-Field Attribution
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-attribution`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-algo-search-discoverability-attribution`
 
 **Input**: A declaration the database returned, its category, the matching override rows
 
 **Output**: The hits for that declaration
 
 **Steps**:
-1. [ ] - `p2` - Test the fields in the order a client is told about them — key, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
+1. [x] - `p2` - Test the fields in the order a client is told about them — key, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
 2. [x] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes - `inst-sd-attr-2`
-3. [ ] - `p2` - **IF** the database matched a declaration but no field and no override names the match in Rust — whitespace inside a JSON projection, or a case fold the two engines disagree on — attribute it to the Schema Default when that is in the corpus, else to the key, so a row the database returned is never silently dropped - `inst-sd-attr-3`
+3. [x] - `p2` - **IF** the database matched a declaration but no field and no override names the match in Rust — whitespace inside a JSON projection, or a case fold the two engines disagree on — attribute it to the Schema Default when that is in the corpus, else to the key, so a row the database returned is never silently dropped - `inst-sd-attr-3`
 
 ## 4. States (CDSL)
 
