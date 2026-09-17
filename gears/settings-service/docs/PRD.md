@@ -352,7 +352,7 @@ The system **MUST** tag every setting and category as Standard or Advanced. When
 
 #### Cross-Field Search
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-fr-search-discoverability`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-fr-search-discoverability`
 
 The system **MUST** let an administrator search settings by key, description, value, or category name and **MUST** return matches as a flat list with category breadcrumbs and an indication of which field matched. Search **MUST** respect the same scope, mode, and tenant-visibility filters as browsing.
 
@@ -884,8 +884,8 @@ Each criterion validates the referenced FR/NFR; the full normative statement liv
 - [ ] A GTS type change that invalidates an existing override marks it `needs-review` and blocks setting it until corrected and revalidated (`cpt-cf-settings-service-fr-typed-value-validation`)
 - [ ] Standard-mode reads exclude Advanced-only settings and categories; mode preference persists per user, not per session (`cpt-cf-settings-service-fr-standard-advanced-mode`)
 - [ ] Reads expose the count of hidden Advanced-only settings per category rather than silently omitting them (`cpt-cf-settings-service-fr-standard-advanced-mode`)
-- [ ] Cross-field search (key/description/value/category) returns a flat list with category breadcrumbs and matched-field indication; respects scope/mode/visibility filters (`cpt-cf-settings-service-fr-search-discoverability`)
-- [ ] Value search covers only defaults/overrides the caller may read in scope; `secret` values are never indexed or matched (no leakage via match existence, count, snippet, or timing); PII authorization is applied before matching so unauthorized callers cannot match PII content; structured-value search matches leaf values under the same rules (`cpt-cf-settings-service-fr-search-discoverability`)
+- [x] Cross-field search (key/description/value/category) returns a flat list with category breadcrumbs and matched-field indication; respects scope/mode/visibility filters (`cpt-cf-settings-service-fr-search-discoverability`)
+- [x] Value search covers only defaults/overrides the caller may read in scope; `secret` values are never indexed or matched (no leakage via match existence, count, snippet, or timing); PII authorization is applied before matching so unauthorized callers cannot match PII content; structured-value search matches leaf values under the same rules (`cpt-cf-settings-service-fr-search-discoverability`)
 - [ ] Tenant-scope revert clears the local override and falls back to the nearest ancestor's override or the platform default; the resulting fallback is communicated before commit (`cpt-cf-settings-service-fr-defaults-revert`)
 - [ ] Platform-scope revert clears the override and falls back to the Schema Default, which remains intact and independent throughout (`cpt-cf-settings-service-fr-defaults-revert`)
 - [ ] A value operation (set/revert/remove-value/clone) takes effect when the caller sets it; the service keeps no pending state before it and has no separate activation step (`cpt-cf-settings-service-fr-set-value`)

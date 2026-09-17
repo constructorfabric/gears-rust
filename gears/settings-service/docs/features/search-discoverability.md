@@ -3,9 +3,9 @@
 
 # Feature: Search & Discoverability
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-featstatus-search-discoverability`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-featstatus-search-discoverability`
 
-- [ ] `p2` - `cpt-cf-settings-service-feature-search-discoverability`
+- [x] `p2` - `cpt-cf-settings-service-feature-search-discoverability`
 
 <!-- toc -->
 
@@ -191,20 +191,20 @@ On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed express
 
 ## 6. Acceptance Criteria
 
-- [ ] A needle matching a setting key yields one declaration-level hit with `matched_field: key` and no scope
-- [ ] A needle matching only a description yields `matched_field: description`
-- [ ] A needle matching only a category's name yields `matched_field: category_name` for every setting in it, with the category as breadcrumb
-- [ ] A needle matching a `public` Schema Default yields `matched_field: default_value` with the default as `value` and no scope
-- [ ] A setting whose Schema Default is JSON `null` is not matched by the needle `null`
-- [ ] A needle matching an override set at a descendant yields a `value` hit naming that tenant and its scope path
-- [ ] An override set at a standalone descendant is not matched from above
-- [ ] An override set outside the target's subtree is not matched
-- [ ] A `secret` value is never matched, whether the needle is its stored reference or any text
-- [ ] A `pii` default or override is matched only for a caller holding `read_unmasked`; without it neither a hit nor a count reveals it
-- [ ] `%`, `_` and `\` in the needle match literally
-- [ ] A retired declaration is not matched
+- [x] A needle matching a setting key yields one declaration-level hit with `matched_field: key` and no scope
+- [x] A needle matching only a description yields `matched_field: description`
+- [x] A needle matching only a category's name yields `matched_field: category_name` for every setting in it, with the category as breadcrumb
+- [x] A needle matching a `public` Schema Default yields `matched_field: default_value` with the default as `value` and no scope
+- [x] A setting whose Schema Default is JSON `null` is not matched by the needle `null`
+- [x] A needle matching an override set at a descendant yields a `value` hit naming that tenant and its scope path
+- [x] An override set at a standalone descendant is not matched from above
+- [x] An override set outside the target's subtree is not matched
+- [x] A `secret` value is never matched, whether the needle is its stored reference or any text
+- [x] A `pii` default or override is matched only for a caller holding `read_unmasked`; without it neither a hit nor a count reveals it
+- [x] `%`, `_` and `\` in the needle match literally
+- [x] A retired declaration is not matched
 - [ ] A declaration `hidden` for the caller is absent from the results
-- [ ] `q` of one character, or of two hundred and one, is refused `400` on field `q`
+- [x] `q` of one character, or of two hundred and one, is refused `400` on field `q`
 - [ ] `$filter`, `$orderby` or `$select` on the resource is refused `400`
-- [ ] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused
-- [ ] Every hit carries its declaration's `mode`, and no hit is withheld by it
+- [x] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused
+- [x] Every hit carries its declaration's `mode`, and no hit is withheld by it

@@ -640,7 +640,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 ### 2.11 Search & Discoverability &mdash; MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-settings-service-feature-search-discoverability`
+- [x] `p2` - **ID**: `cpt-cf-settings-service-feature-search-discoverability`
 
 - **Purpose**: Let an administrator reach any setting from one query — by key, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
 
@@ -662,11 +662,11 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-settings-service-fr-search-discoverability`
+  - [x] `p2` - `cpt-cf-settings-service-fr-search-discoverability`
 
 - **Design Components**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-component-search`
+  - [x] `p1` - `cpt-cf-settings-service-component-search`
 
 - **API**:
   - GET /settings-service/v1/search?q={query}&tenant={tenant_id}
