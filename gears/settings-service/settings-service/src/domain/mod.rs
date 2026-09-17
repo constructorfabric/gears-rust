@@ -11,6 +11,7 @@ pub mod platform_scope;
 pub mod ports;
 pub mod precondition;
 pub mod resolution;
+pub mod search;
 pub mod secrets;
 pub mod stepup;
 pub mod validation;

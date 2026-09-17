@@ -104,8 +104,8 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 **Output**: A validated needle, its `LIKE` pattern, and the dialect's operator
 
 **Steps**:
-1. [ ] - `p2` - Trim `q`; **IF** fewer than two characters or more than two hundred remain → refuse on field `q` - `inst-sd-needle-1`
-2. [ ] - `p2` - Build the pattern `%needle%` with `%`, `_` and `\` escaped by `\`, and declare `ESCAPE '\'` on every predicate that uses it, because SQLite has no default escape character - `inst-sd-needle-2`
+1. [x] - `p2` - Trim `q`; **IF** fewer than two characters or more than two hundred remain → refuse on field `q` - `inst-sd-needle-1`
+2. [x] - `p2` - Build the pattern `%needle%` with `%`, `_` and `\` escaped by `\`, and declare `ESCAPE '\'` on every predicate that uses it, because SQLite has no default escape character - `inst-sd-needle-2`
 3. [ ] - `p2` - Choose the operator by dialect: `ILIKE` on PostgreSQL over exactly the expressions the trigram indexes are built on, `LIKE` on SQLite where the match is a scan; the two branches differ in spelling only - `inst-sd-needle-3`
 
 ### Corpus by Classification
@@ -132,7 +132,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 **Steps**:
 1. [ ] - `p2` - Test the fields in the order a client is told about them — key, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
-2. [ ] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes - `inst-sd-attr-2`
+2. [x] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes - `inst-sd-attr-2`
 3. [ ] - `p2` - **IF** the database matched a declaration but no field and no override names the match in Rust — whitespace inside a JSON projection, or a case fold the two engines disagree on — attribute it to the Schema Default when that is in the corpus, else to the key, so a row the database returned is never silently dropped - `inst-sd-attr-3`
 
 ## 4. States (CDSL)
