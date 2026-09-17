@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::domain::access::TenantAccess;
 use crate::domain::resolution::MASK_TOKEN;
-use crate::test_support::{BOOL, RestHarness};
+use crate::test_support::{BOOL, RestHarness, SECRET, TEXT};
 
 /// The setting key as it travels in a path segment.
 fn encoded(h: &RestHarness, name: &str) -> String {
@@ -380,4 +380,512 @@ async fn an_override_hit_names_the_scope_it_is_set_at() {
     assert_eq!(hit["tenant_id"], json!(h.inner.tree.a.to_string()));
     assert_eq!(hit["value"], json!("alpha"));
     assert_eq!(hit["scope"], json!(format!("/tenants/{}", h.inner.tree.a)));
+}
+
+// ── The review listing ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_review_listing_returns_the_flagged_rows_of_the_subtree_not_resolved_values() {
+    // `needs_review eq true` is a different question from browsing: it asks
+    // which stored overrides stopped validating, so it answers rows — each at
+    // the scope that holds it — rather than one effective value per setting.
+    let h = RestHarness::new().await;
+    let flagged = h.inner.declare("flagged", "cascading", json!(true)).await;
+    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.a, json!(false))
+        .await;
+    h.inner.set(sound, h.inner.tree.a, json!(false)).await;
+
+    let items = h
+        .items(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "one flagged row: {items:?}");
+    let entry = &items[0];
+    assert_eq!(entry["outcome"], json!("needs_review"));
+    assert_eq!(
+        entry["flagged"]["tenant_id"],
+        json!(h.inner.tree.a.to_string()),
+        "the row names the scope that holds it"
+    );
+    assert_eq!(entry["flagged"]["value"], json!(false));
+    assert!(
+        entry["flagged"]["etag"].is_string(),
+        "and carries the tag a correcting write must present: {entry}"
+    );
+    assert_eq!(entry["mode"], json!("standard"));
+    assert!(
+        entry.get("effective").is_none(),
+        "a flagged row is not a resolved value: {entry}"
+    );
+}
+
+#[tokio::test]
+async fn the_review_listing_stops_at_the_targets_own_subtree() {
+    // A flagged row under a sibling is another administrator's to fix.
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner.set_flagged(id, h.inner.tree.c, json!(false)).await;
+
+    let from_the_sibling = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings?tenant={}&$filter=needs_review%20eq%20true",
+                h.inner.tree.a
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert!(
+        from_the_sibling.is_empty(),
+        "a sibling's flagged row is not on this page: {from_the_sibling:?}"
+    );
+
+    let from_the_root = h
+        .items(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(
+        from_the_root.len(),
+        1,
+        "but the root sees it: {from_the_root:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_review_listing_of_a_secret_shows_neither_the_value_nor_its_reference() {
+    // A secret override is a row holding a store reference. The listing exists
+    // so an administrator can find it and correct it, which needs the key and
+    // the scope — not the value, and not the handle to the value either.
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare_typed("api_token", "cascading", json!(""), SECRET, "secret")
+        .await;
+    h.inner
+        .set_flagged_secret(id, h.inner.tree.a, "credstore-ref-1")
+        .await;
+
+    let items = h
+        .items(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["flagged"]["value"], json!(MASK_TOKEN));
+    let wire = items[0].to_string();
+    assert!(!wire.contains("credstore-ref-1"), "{wire}");
+}
+
+// ── Naming keys ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_named_key_with_no_declaration_gets_its_own_entry() {
+    // The console asks about the keys one screen needs. A key that does not
+    // exist is that key's outcome, not a failure of the request: the other
+    // keys on the screen still have answers.
+    let h = RestHarness::new().await;
+    h.inner.declare("declared", "cascading", json!(true)).await;
+    let filter = urlencoding(&format!(
+        "key in ('{}','{}')",
+        h.inner.key("declared"),
+        h.inner.key("never_declared")
+    ));
+
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 2, "both keys are answered: {items:?}");
+    let absent = items
+        .iter()
+        .find(|i| {
+            i["key"]
+                .as_str()
+                .is_some_and(|k| k.contains("never_declared"))
+        })
+        .expect("an entry for the key that does not exist");
+    assert_eq!(absent["outcome"], json!("not_found"));
+    assert!(
+        absent.get("mode").is_none(),
+        "a key with no declaration has no mode to report: {absent}"
+    );
+    let present = items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains("declared.")))
+        .expect("an entry for the declared key");
+    assert_eq!(present["outcome"], json!("resolved"));
+}
+
+#[tokio::test]
+async fn a_named_key_hidden_from_the_caller_is_reported_absent_like_any_other() {
+    // Hidden is 404 everywhere, and the browse page's per-key entry is no
+    // exception: the console must not be able to tell the two apart.
+    let h = RestHarness::new().await;
+    let concealed = h.inner.declare("concealed", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+    let filter = urlencoding(&format!("key eq '{}'", h.inner.key("concealed")));
+
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["outcome"], json!("not_found"));
+}
+
+// ── History ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn history_returns_the_records_the_writes_left_newest_first() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let value = format!(
+        "/settings-service/v1/settings/{}/value",
+        encoded(&h, "proxy")
+    );
+    let first = h
+        .send(
+            "PUT",
+            &value,
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    let tag = first.body["etag"].as_str().expect("a tag").to_owned();
+    h.send(
+        "PUT",
+        &value,
+        Some(json!({ "value": true })),
+        Some(&tag),
+        h.inner.tree.root,
+    )
+    .await;
+
+    let items = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings/{}/history",
+                encoded(&h, "proxy")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 2, "one record per write: {items:?}");
+    assert_eq!(items[0]["operation"], json!("change"), "newest first");
+    assert_eq!(items[0]["pre_value"], json!(false));
+    assert_eq!(items[0]["post_value"], json!(true));
+    assert_eq!(items[0]["outcome"], json!("success"));
+    assert!(items[0]["change_set_id"].is_string());
+    assert!(!items[0]["values_masked"].as_bool().unwrap_or(true));
+    assert!(!items[0]["actor_masked"].as_bool().unwrap_or(true));
+    assert_eq!(items[1]["operation"], json!("create"));
+    assert!(
+        items[1].get("pre_value").is_none(),
+        "a first write has no image before it: {}",
+        items[1]
+    );
+}
+
+#[tokio::test]
+async fn history_of_a_secret_shows_the_mask_token_it_was_recorded_with() {
+    // A secret is never recorded in plaintext, so there is no entitlement that
+    // would unmask it here — the record itself holds the token.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_typed("api_token", "cascading", json!(""), SECRET, "secret")
+        .await;
+    h.send(
+        "PUT",
+        &format!(
+            "/settings-service/v1/settings/{}/value",
+            encoded(&h, "api_token")
+        ),
+        Some(json!({ "value": "hunter2" })),
+        Some("absent"),
+        h.inner.tree.root,
+    )
+    .await;
+
+    let items = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings/{}/history",
+                encoded(&h, "api_token")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["post_value"], json!(MASK_TOKEN));
+    let wire = items[0].to_string();
+    assert!(!wire.contains("hunter2"), "{wire}");
+}
+
+#[tokio::test]
+async fn history_is_read_per_scope() {
+    // Each scope's trail is its own: a change at one tenant is not in another
+    // tenant's history, or an administrator would read changes they cannot see
+    // the values of.
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    h.send(
+        "PUT",
+        &format!(
+            "/settings-service/v1/settings/{}/value?tenant={}",
+            encoded(&h, "proxy"),
+            h.inner.tree.a
+        ),
+        Some(json!({ "value": false })),
+        Some("absent"),
+        h.inner.tree.root,
+    )
+    .await;
+    let history = |tenant| {
+        format!(
+            "/settings-service/v1/settings/{}/history?tenant={tenant}",
+            encoded(&h, "proxy")
+        )
+    };
+
+    assert_eq!(
+        h.items(&history(h.inner.tree.a), h.inner.tree.root)
+            .await
+            .len(),
+        1
+    );
+    assert!(
+        h.items(&history(h.inner.tree.b), h.inner.tree.root)
+            .await
+            .is_empty(),
+        "a descendant that was never written has no trail of its own"
+    );
+}
+
+#[tokio::test]
+async fn history_of_a_retired_declaration_is_still_readable() {
+    // Retiring stops new values; it does not erase what was done. The trail is
+    // what an audit reads afterwards.
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("proxy", "cascading", json!(true)).await;
+    h.send(
+        "PUT",
+        &format!(
+            "/settings-service/v1/settings/{}/value",
+            encoded(&h, "proxy")
+        ),
+        Some(json!({ "value": false })),
+        Some("absent"),
+        h.inner.tree.root,
+    )
+    .await;
+    h.inner.retire(id).await;
+
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}/history",
+                encoded(&h, "proxy")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(1),
+        "the record survives the retirement: {body}"
+    );
+}
+
+#[tokio::test]
+async fn history_of_a_setting_that_was_never_declared_is_absent() {
+    let h = RestHarness::new().await;
+    let (status, _) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}/history",
+                encoded(&h, "never_declared")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 404);
+}
+
+// ── The unmask entitlement ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_pii_value_is_masked_from_a_caller_without_the_entitlement() {
+    // Reading that a setting is configured and reading the personal data in it
+    // are two decisions. A caller holding the first and not the second sees the
+    // setting, its source and its tag — everything but the value.
+    let h = RestHarness::without_pii_entitlement().await;
+    let id = h
+        .inner
+        .declare_typed("contact_email", "cascading", json!(""), TEXT, "pii")
+        .await;
+    h.inner
+        .set(id, h.inner.tree.root, json!("someone@example.test"))
+        .await;
+
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}",
+                encoded(&h, "contact_email")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "the read itself is allowed: {body}");
+    assert_eq!(body["value"], json!(MASK_TOKEN));
+    assert_eq!(
+        body["source"],
+        json!("own_override"),
+        "the source still shows"
+    );
+    assert!(body["etag"].is_string());
+    assert!(!body.to_string().contains("someone@example.test"));
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    let entry = items
+        .iter()
+        .find(|i| {
+            i["key"]
+                .as_str()
+                .is_some_and(|k| k.contains("contact_email"))
+        })
+        .expect("the setting is on the page");
+    assert_eq!(entry["effective"]["value"], json!(MASK_TOKEN));
+}
+
+#[tokio::test]
+async fn the_entitlement_unmasks_the_same_value() {
+    // The counterpart, so the masking above is the entitlement's doing and not
+    // the classification's alone.
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare_typed("contact_email", "cascading", json!(""), TEXT, "pii")
+        .await;
+    h.inner
+        .set(id, h.inner.tree.root, json!("someone@example.test"))
+        .await;
+
+    let (_, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}",
+                encoded(&h, "contact_email")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(body["value"], json!("someone@example.test"));
+}
+
+#[tokio::test]
+async fn history_of_a_pii_setting_masks_both_images_without_the_entitlement() {
+    // The trail records what the value was. Without the entitlement it reports
+    // that a change happened, who made it and when, and not what the value was.
+    let h = RestHarness::without_pii_entitlement().await;
+    h.inner
+        .declare_typed("contact_email", "cascading", json!(""), TEXT, "pii")
+        .await;
+    let uri = format!(
+        "/settings-service/v1/settings/{}/value",
+        encoded(&h, "contact_email")
+    );
+    let first = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({ "value": "first@example.test" })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    let tag = first.body["etag"].as_str().expect("a tag").to_owned();
+    h.send(
+        "PUT",
+        &uri,
+        Some(json!({ "value": "second@example.test" })),
+        Some(&tag),
+        h.inner.tree.root,
+    )
+    .await;
+
+    let items = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings/{}/history",
+                encoded(&h, "contact_email")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    let latest = &items[0];
+    assert!(latest["values_masked"].as_bool().unwrap_or(false));
+    assert_eq!(latest["pre_value"], json!(MASK_TOKEN));
+    assert_eq!(latest["post_value"], json!(MASK_TOKEN));
+    assert_eq!(
+        latest["operation"],
+        json!("change"),
+        "the change still shows"
+    );
+    assert!(latest["occurred_at"].is_string());
+    let wire = items.iter().map(ToString::to_string).collect::<String>();
+    assert!(!wire.contains("@example.test"), "{wire}");
+}
+
+#[tokio::test]
+async fn a_setting_that_cannot_be_resolved_carries_its_own_outcome_on_the_page() {
+    // One entry failing is that entry's outcome, never the page's: a retired
+    // setting beside a live one must not cost the client the live one's value.
+    let h = RestHarness::new().await;
+    let retired = h.inner.declare("retired", "cascading", json!(true)).await;
+    h.inner.declare("live", "cascading", json!(true)).await;
+    h.inner.retire(retired).await;
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "both are on the page: {items:?}");
+    let gone = items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains("retired")))
+        .expect("the retired setting is listed");
+    assert_eq!(gone["outcome"], json!("retired"));
+    assert!(
+        gone.get("effective").is_none(),
+        "with no value to report: {gone}"
+    );
+    assert!(gone["detail"].is_string(), "and a reason: {gone}");
+    assert_eq!(
+        gone["mode"],
+        json!("standard"),
+        "the tag survives the failure"
+    );
+
+    let live = items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains("live")))
+        .expect("the live setting is listed");
+    assert_eq!(live["outcome"], json!("resolved"));
 }

@@ -349,6 +349,9 @@ impl TenantHierarchy for FakeHierarchy {
 
 pub const BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
 pub const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
+/// A plain string, for the settings whose values are personal data rather than
+/// credentials: classified `pii`, held inline, masked without the entitlement.
+pub const TEXT: &str = "gts.cf.core.settings.type_plain_text.v1~";
 
 pub fn resolution_catalogue() -> FakeSource {
     FakeSource::default()
@@ -363,6 +366,10 @@ pub fn resolution_catalogue() -> FakeSource {
                 "type": "string",
                 "x-gts-traits": { "secret": true }
             }),
+        )
+        .with_type(
+            TEXT,
+            json!({ "$id": format!("gts://{TEXT}"), "type": "string" }),
         )
 }
 
@@ -523,6 +530,19 @@ impl ResolutionHarness {
     pub async fn set_flagged(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
         self.write(declaration_id, tenant, Some(value), None, true)
             .await;
+    }
+
+    /// A secret override that stopped validating: held by reference, as every
+    /// secret row is, and flagged for review.
+    pub async fn set_flagged_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        self.write(
+            declaration_id,
+            tenant,
+            None,
+            Some(secret_ref.to_owned()),
+            true,
+        )
+        .await;
     }
 
     pub async fn set_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
@@ -802,6 +822,32 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowAll {
     }
 }
 
+/// A policy decision point that allows every action but the one that unmasks
+/// `pii` values.
+///
+/// The entitlement is a separate decision from the read, and the interesting
+/// caller is the one that holds the read and not the entitlement — an
+/// administrator who may see that a setting is configured without seeing
+/// personal data in it.
+struct AllowButMasked;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowButMasked {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: request.action.name != "read_unmasked",
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
 /// A policy decision point that denies everything.
 struct DenyAll;
 
@@ -866,6 +912,12 @@ impl RestHarness {
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
         Self::build(Arc::new(DenyAll), Arc::new(FixedStepUp::verified())).await
+    }
+
+    /// The same surface for a caller that may read but may not see `pii`
+    /// values unmasked.
+    pub async fn without_pii_entitlement() -> Self {
+        Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
     }
 
     /// The same surface where the caller's last re-authentication is too old,
