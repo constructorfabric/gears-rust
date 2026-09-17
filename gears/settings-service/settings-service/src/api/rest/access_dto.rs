@@ -88,3 +88,7 @@ pub fn render_readout(readout: &AccessReadout) -> AccessReadDto {
         etag: readout.etag.as_str().to_owned(),
     }
 }
+
+#[cfg(test)]
+#[path = "access_dto_tests.rs"]
+mod access_dto_tests;
