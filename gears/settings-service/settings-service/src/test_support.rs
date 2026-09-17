@@ -966,22 +966,12 @@ impl RestHarness {
         // same database the reads use.
         let secrets = Arc::new(RecordingSecrets::default());
         let published = Arc::new(RecordingPublisher::default());
-        let writer = Arc::new(crate::domain::writes::ValueWriter::new(
-            crate::infra::storage::value_repo::ValueRepo,
-            Arc::clone(&inner.resolver),
-            Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
-                resolution_catalogue(),
-            )),
-            crate::infra::storage::audit_store::AuditStore,
+        let coordinator = write_coordinator(
+            &inner,
+            Arc::clone(&secrets),
+            Arc::clone(&published),
             step_up_for_writes,
-            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
-            Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
-            Arc::new(crate::domain::ports::NoMetrics),
-        ));
-        let coordinator = Arc::new(crate::infra::value_writes::WriteCoordinator::new(
-            Arc::clone(&inner.db),
-            writer,
-        ));
+        );
         let router = crate::api::rest::value_routes::register_routes(
             router,
             &openapi,
@@ -1114,6 +1104,34 @@ impl RestHarness {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+/// The write coordinator over a harness's database.
+///
+/// Every port behind it is doubled except the repositories and the audit
+/// store, which run for real against the same database the reads use.
+pub fn write_coordinator(
+    inner: &ResolutionHarness,
+    secrets: Arc<RecordingSecrets>,
+    published: Arc<RecordingPublisher>,
+    step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+) -> Arc<crate::infra::value_writes::WriteCoordinator> {
+    let writer = Arc::new(crate::domain::writes::ValueWriter::new(
+        crate::infra::storage::value_repo::ValueRepo,
+        Arc::clone(&inner.resolver),
+        Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
+            resolution_catalogue(),
+        )),
+        crate::infra::storage::audit_store::AuditStore,
+        step_up,
+        secrets as Arc<dyn crate::domain::ports::SecretManager>,
+        published as Arc<dyn crate::domain::ports::ChangePublisher>,
+        Arc::new(crate::domain::ports::NoMetrics),
+    ));
+    Arc::new(crate::infra::value_writes::WriteCoordinator::new(
+        Arc::clone(&inner.db),
+        writer,
+    ))
 }
 
 /// An interactive administrator of one tenant.
