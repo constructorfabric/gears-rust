@@ -11058,6 +11058,24 @@
         ],
         "type": "object"
       },
+      "Page_SearchHitDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_SettingItemDto": {
         "properties": {
           "items": {
@@ -17532,6 +17550,94 @@
           "phase",
           "price_eligibility",
           "charge_kind"
+        ],
+        "type": "object"
+      },
+      "SearchCategoryDto": {
+        "description": "The category a hit is filed under. Categories are flat, so this is the\nwhole breadcrumb.",
+        "properties": {
+          "id": {
+            "description": "Category identity.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The category slug, as carried in the setting key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SearchHitDto": {
+        "description": "One search result. A declaration-level hit carries no scope; an override\nhit names the scope where the matched value is set.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/SearchCategoryDto",
+            "description": "The category the setting is filed under."
+          },
+          "declaration_id": {
+            "description": "Identity of the declaration, for a follow-up read.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "description": {
+            "description": "The declaration's description, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "leaf_slug": {
+            "description": "The setting's leaf name.",
+            "type": "string"
+          },
+          "matched_field": {
+            "description": "Which field matched: `key`, `description`, `category_name`,\n`default_value` or `value`.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "`standard` or `advanced`, from the declaration. A tag for grouping,\nnever a filter — no hit is withheld by it.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The scope path where the matched override is set. Absent on a\ndeclaration-level hit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "The tenant owning that scope. Absent on a declaration-level hit.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, description or\ncategory name."
+          }
+        },
+        "required": [
+          "key",
+          "declaration_id",
+          "leaf_slug",
+          "category",
+          "matched_field",
+          "mode"
         ],
         "type": "object"
       },
@@ -54712,6 +54818,121 @@
         "summary": "Edit a declaration's metadata",
         "tags": [
           "settings-declarations"
+        ]
+      }
+    },
+    "/settings-service/v1/search": {
+      "get": {
+        "description": "Cross-field search over every category the caller may see. Matches a setting's key, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter`, `$orderby` and `$select` are refused.",
+        "operationId": "settings_service.search_settings",
+        "parameters": [
+          {
+            "description": "Free text, at least two and at most two hundred characters",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, in settings",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SearchHitDto"
+                }
+              }
+            },
+            "description": "A page of hits, ordered by key, with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Search settings across categories",
+        "tags": [
+          "settings-search"
         ]
       }
     },
