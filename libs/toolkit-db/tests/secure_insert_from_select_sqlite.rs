@@ -36,15 +36,6 @@ mod link {
 impl ScopableEntity for link::Entity {
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

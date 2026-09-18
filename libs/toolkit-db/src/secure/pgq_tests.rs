@@ -39,15 +39,6 @@ mod node {
             ),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }
@@ -86,15 +77,6 @@ mod edge {
             ),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }
@@ -137,15 +119,6 @@ mod owned {
             ),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            Some(Column::OwnerId)
-        }
         fn type_col() -> Option<Column> {
             None
         }
@@ -187,15 +160,6 @@ mod aliased {
             ),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }
@@ -225,15 +189,6 @@ mod closure {
     impl crate::secure::ScopableEntity for Entity {
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-        fn tenant_col() -> Option<Column> {
-            None
-        }
-        fn resource_col() -> Option<Column> {
-            None
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }

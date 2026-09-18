@@ -39,15 +39,6 @@ impl ScopableEntity for tenant_ent::Entity {
         tenant_ent::Column::TenantId,
     )];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(tenant_ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -75,15 +66,6 @@ impl ScopableEntity for unrestricted_ent::Entity {
 
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

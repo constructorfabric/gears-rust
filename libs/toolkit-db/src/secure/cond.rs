@@ -983,15 +983,6 @@ mod tests {
                 ("department_id", Column::DepartmentId),
             ];
 
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }

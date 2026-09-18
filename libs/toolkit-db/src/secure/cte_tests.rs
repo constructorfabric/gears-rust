@@ -39,15 +39,6 @@ mod node {
             (pep_properties::RESOURCE_ID, Column::Id),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }
@@ -80,15 +71,6 @@ mod item {
             (pep_properties::RESOURCE_ID, Column::Id),
         ];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }

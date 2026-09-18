@@ -45,15 +45,6 @@ impl ScopableEntity for tenant_ent::Entity {
         (pep_properties::RESOURCE_ID, tenant_ent::Column::Id),
     ];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(tenant_ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(tenant_ent::Column::Id)
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

@@ -53,18 +53,6 @@ mod dlq_row {
 
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-        fn tenant_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resource_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn owner_col() -> Option<Self::Column> {
-            None
-        }
-
         fn type_col() -> Option<Self::Column> {
             None
         }

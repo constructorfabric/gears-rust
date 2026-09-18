@@ -45,15 +45,6 @@ impl ScopableEntity for ent::Entity {
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] =
         &[(pep_properties::OWNER_TENANT_ID, ent::Column::TenantId)];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

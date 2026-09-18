@@ -41,15 +41,6 @@
 //! use toolkit_db::secure::ScopableEntity;
 //!
 //! impl ScopableEntity for user::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         Some(user::Column::TenantId)  // Multi-tenant entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(user::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }
@@ -57,15 +48,6 @@
 //!
 //! // Global entity (no tenant scoping)
 //! impl ScopableEntity for system_config::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         None  // Global entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(system_config::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }

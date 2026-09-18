@@ -35,15 +35,6 @@ mod test_entity {
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] =
             &[("owner_tenant_id", Column::TenantId)];
 
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            None
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
         fn type_col() -> Option<Column> {
             None
         }

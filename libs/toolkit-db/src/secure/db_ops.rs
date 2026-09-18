@@ -1336,15 +1336,6 @@ mod tests {
                 (pep_properties::RESOURCE_ID, Column::Id),
             ];
 
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1397,15 +1388,6 @@ mod tests {
         impl ScopableEntity for Entity {
             const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-            fn tenant_col() -> Option<Column> {
-                None
-            }
-            fn resource_col() -> Option<Column> {
-                None
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1433,15 +1415,6 @@ mod tests {
         impl ScopableEntity for Entity {
             const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[("id", Column::Id)];
 
-            fn tenant_col() -> Option<Column> {
-                None // Global entity - no tenant column
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1645,15 +1618,6 @@ mod tests {
                 ("city_id", Column::CityId),
             ];
 
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                Some(Column::UserId)
-            }
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1923,15 +1887,6 @@ mod tests {
                 ("score", Column::Score),
             ];
 
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }

@@ -54,15 +54,6 @@ impl ScopableEntity for order_ent::Entity {
         (pep_properties::RESOURCE_ID, order_ent::Column::Id),
     ];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(order_ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(order_ent::Column::Id)
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -106,15 +97,6 @@ impl ScopableEntity for item_ent::Entity {
         (pep_properties::RESOURCE_ID, item_ent::Column::Id),
     ];
 
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(item_ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(item_ent::Column::Id)
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

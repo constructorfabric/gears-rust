@@ -62,67 +62,40 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let entity_ident = syn::Ident::new("Entity", input.ident.span());
 
-    // If unrestricted, generate simple implementation with all None
+    // If unrestricted, generate the empty table: nothing is scopable, so
+    // every accessor the trait derives from it answers None.
     if config.unrestricted.is_some() {
         return Ok(quote! {
             impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
                 const IS_UNRESTRICTED: bool = true;
 
-                fn tenant_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn resource_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn owner_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
                 fn type_col() -> ::core::option::Option<Self::Column> {
                     ::core::option::Option::None
                 }
 
-                // Nothing to scope by, so nothing resolves and the column list
-                // is empty. Both come from the table, as everywhere else.
+                // Nothing to scope by, so nothing resolves, the column list is
+                // empty, and the three dimension accessors `ScopeProperties`
+                // derives from this table all answer `None`.
                 const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
             }
         });
     }
 
-    // Generate tenant_col implementation
-    let tenant_col_impl =
-        generate_col_impl("tenant_col", config.tenant_col.as_ref(), input.ident.span());
-
-    // Generate resource_col implementation
-    let resource_col_impl = generate_col_impl(
-        "resource_col",
-        config.resource_col.as_ref(),
-        input.ident.span(),
-    );
-
-    // Generate owner_col implementation
-    let owner_col_impl =
-        generate_col_impl("owner_col", config.owner_col.as_ref(), input.ident.span());
-
-    // Generate type_col implementation
+    // Only type_col is generated as a method. The tenant, resource and owner
+    // dimensions are the well-known properties of SCOPE_PROPERTIES, and
+    // `ScopeProperties` reads them back out of it, so emitting them here would
+    // put the same column in two places again (issue #4726). type_col has no
+    // property name, so it has nowhere else to come from.
     let type_col_impl = generate_col_impl("type_col", config.type_col.as_ref(), input.ident.span());
 
-    // One table; the trait derives `resolve_property` and `scope_columns`
-    // from it, so the lookup and the list cannot describe different sets.
+    // One table; the trait derives the lookup, the column list and the three
+    // dimension accessors from it, so none of them can describe a different set.
     let scope_properties_impl = generate_scope_properties(&config, input.ident.span());
 
     // Generate the implementation
     Ok(quote! {
         impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
             const IS_UNRESTRICTED: bool = false;
-
-            #tenant_col_impl
-
-            #resource_col_impl
-
-            #owner_col_impl
 
             #type_col_impl
 

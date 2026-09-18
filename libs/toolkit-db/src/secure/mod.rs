@@ -68,15 +68,6 @@
 //! use toolkit_db::secure::ScopableEntity;
 //!
 //! impl ScopableEntity for Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         Some(Column::TenantId)
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }

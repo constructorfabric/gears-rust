@@ -1,36 +1,42 @@
 use sea_orm::EntityTrait;
+use toolkit_security::access_scope::pep_properties;
 
 /// Defines the contract for entities that can be scoped by tenant, resource, owner, and type.
 ///
-/// Each entity implementing this trait must explicitly declare all four scope dimensions:
-/// - `tenant_col()`: Column for tenant-based isolation (multi-tenancy)
-/// - `resource_col()`: Column for resource-level access (typically the primary key)
-/// - `owner_col()`: Column for owner-based filtering
-/// - `type_col()`: Column for type-based filtering
+/// An entity declares two things: the property-to-column table
+/// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES), and
+/// [`type_col()`](Self::type_col).
 ///
-/// **Important**: No implicit defaults are allowed. Every scope dimension must be explicitly
-/// specified as `Some(Column::...)` or `None` to enforce compile-time safety in secure systems.
+/// The tenant, resource and owner dimensions are **not** declared separately.
+/// They are the well-known properties of that same table, and
+/// [`ScopeProperties`] reads them out of it:
+/// `tenant_col()` is `resolve_property("owner_tenant_id")`, `resource_col()` is
+/// `resolve_property("id")` and `owner_col()` is `resolve_property("owner_id")`.
+/// Writing them by hand next to the table would be the same column in two
+/// places with nothing checking that they agree, which is the defect this trait
+/// was reshaped to remove (issue #4726) — one level up from where it was found.
+///
+/// [`type_col`](Self::type_col) stays a method of its own because it has no
+/// property name: no scope can address it, so it cannot come from the table.
+///
+/// **Important**: No implicit defaults are allowed. A dimension is scoped when
+/// the table names its property and unscoped when it does not, and `type_col`
+/// must be answered explicitly.
 ///
 /// # Example (Manual Implementation)
 /// ```rust,ignore
 /// impl ScopableEntity for user::Entity {
-///     // The property-to-column mapping, written once. `resolve_property`
-///     // and `scope_columns` read it (see `ScopeProperties`) and cannot be
-///     // implemented per entity, so they cannot describe different sets.
+///     // The property-to-column mapping, written once. `resolve_property`,
+///     // `scope_columns` and the three dimension accessors read it (see
+///     // `ScopeProperties`) and cannot be implemented per entity, so nothing
+///     // that derives from this table can describe a different set.
 ///     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
-///         ("owner_tenant_id", user::Column::TenantId),
-///         ("id", user::Column::Id),
+///         (pep_properties::OWNER_TENANT_ID, user::Column::TenantId),
+///         (pep_properties::RESOURCE_ID, user::Column::Id),
 ///     ];
 ///
-///     fn tenant_col() -> Option<Self::Column> {
-///         Some(user::Column::TenantId)
-///     }
-///     fn resource_col() -> Option<Self::Column> {
-///         Some(user::Column::Id)
-///     }
-///     fn owner_col() -> Option<Self::Column> {
-///         None
-///     }
+///     // Tenant and resource are scoped, owner is not — all three follow from
+///     // the table above. Only `type_col` is written out.
 ///     fn type_col() -> Option<Self::Column> {
 ///         None
 ///     }
@@ -105,28 +111,6 @@ pub trait ScopableEntity: EntityTrait {
     /// Default: `false` (entity participates in scoping logic)
     const IS_UNRESTRICTED: bool = false;
 
-    /// Returns the column that stores the tenant identifier.
-    ///
-    /// - Multi-tenant entities: `Some(Column::TenantId)`
-    /// - Global/system entities: `None`
-    ///
-    /// Must be explicitly specified via `tenant_col = "..."` or `no_tenant`.
-    fn tenant_col() -> Option<Self::Column>;
-
-    /// Returns the column that stores the primary resource identifier.
-    ///
-    /// Typically the primary key column (e.g., `Column::Id`).
-    ///
-    /// Must be explicitly specified via `resource_col = "..."` or `no_resource`.
-    fn resource_col() -> Option<Self::Column>;
-
-    /// Returns the column that stores the resource owner identifier.
-    ///
-    /// Used for owner-based access control policies.
-    ///
-    /// Must be explicitly specified via `owner_col = "..."` or `no_owner`.
-    fn owner_col() -> Option<Self::Column>;
-
     /// Returns the column that stores the resource type identifier.
     ///
     /// Used for type-based filtering in polymorphic scenarios.
@@ -171,17 +155,20 @@ pub trait ScopableEntity: EntityTrait {
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)];
 }
 
-/// The two ways to read [`ScopableEntity::SCOPE_PROPERTIES`]: look one property
-/// up, or list the columns.
+/// Everything read out of [`ScopableEntity::SCOPE_PROPERTIES`]: look one
+/// property up, list the columns, or ask for one of the three well-known
+/// dimensions.
 ///
 /// Separate from [`ScopableEntity`] on purpose. The blanket implementation
 /// below covers every scopable entity, so an entity **cannot** provide its own
-/// version of either method: coherence rejects a second implementation
-/// (`E0119`). That is what makes "the lookup and the list describe one set" an
+/// version of any of them: coherence rejects a second implementation
+/// (`E0119`). That is what makes "everything here describes one set" an
 /// invariant of the type system rather than a convention — the reason this
-/// trait exists at all is that when both were overridable methods of
-/// `ScopableEntity`, a hand-written entity could and did make them disagree
-/// (issue #4726).
+/// trait exists at all is that when the lookup and the list were both
+/// overridable methods of `ScopableEntity`, a hand-written entity could and did
+/// make them disagree (issue #4726). The dimension accessors are here for the
+/// same reason: declared beside the table they were one column written twice,
+/// with nothing checking that the two spellings agreed.
 ///
 /// Callers get it for free with `E: ScopableEntity`; the trait only has to be
 /// in scope:
@@ -228,6 +215,39 @@ pub trait ScopeProperties: ScopableEntity {
             .iter()
             .map(|(_, column)| *column)
             .collect()
+    }
+
+    /// The column that stores the tenant identifier, or `None` when the entity
+    /// is not tenant-scoped.
+    ///
+    /// Read out of [`ScopableEntity::SCOPE_PROPERTIES`] under the well-known
+    /// property name `owner_tenant_id`, rather than declared beside it. An
+    /// entity that names that property is tenant-scoped, by the same fact that
+    /// makes a PDP constraint on `owner_tenant_id` compile to a predicate on
+    /// this column — so the two cannot disagree.
+    #[must_use]
+    fn tenant_col() -> Option<Self::Column> {
+        Self::resolve_property(pep_properties::OWNER_TENANT_ID)
+    }
+
+    /// The column that stores the primary resource identifier, or `None` when
+    /// the entity is not resource-scoped.
+    ///
+    /// Typically the primary key. Read out of the table under `id`, as
+    /// [`tenant_col`](Self::tenant_col) is.
+    #[must_use]
+    fn resource_col() -> Option<Self::Column> {
+        Self::resolve_property(pep_properties::RESOURCE_ID)
+    }
+
+    /// The column that stores the resource owner identifier, or `None` when the
+    /// entity is not owner-scoped.
+    ///
+    /// Read out of the table under `owner_id`, as
+    /// [`tenant_col`](Self::tenant_col) is.
+    #[must_use]
+    fn owner_col() -> Option<Self::Column> {
+        Self::resolve_property(pep_properties::OWNER_ID)
     }
 }
 
@@ -336,15 +356,6 @@ mod tests {
                 ("department_id", Column::DepartmentId),
             ];
 
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
             fn type_col() -> Option<Column> {
                 None
             }
