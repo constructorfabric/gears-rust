@@ -1583,9 +1583,12 @@ per operation kind:
   fingerprints the sorted, deduplicated union of all item sets. Callers cannot select a concrete projection.
 - `commit` and `release` **MUST** reuse the subject key persisted by the corresponding lease acquisition; they do not
   re-resolve it against the current catalogue.
-- For operations that target a Quota by explicit `quota_id` and do not invoke subject resolution — `credit`, `rollback`
-  — the system **MUST** fingerprint the owning Quota's persisted `(projection_type, subject_id)` pair, read server-side
-  under the same row lock that performs the mutation. The key **MUST NOT** use `quota_id` or an unvalidated subject.
+- For `credit`, which targets a Quota by explicit `quota_id` and invokes no subject resolution, the system **MUST**
+  fingerprint the owning Quota's persisted `(projection_type, subject_id)` pair, read server-side under the same row
+  lock that performs the mutation. The key **MUST NOT** use `quota_id` or an unvalidated subject.
+- `rollback` **MUST** fingerprint the same authorized, catalogue-mapped attribution as the debit it reverses, which the
+  caller supplies and the system re-authorizes, so its scope coincides with the original's however many Quotas that
+  debit's plan spanned. An owning Quota is undefined for a multi-Quota plan, so the credit rule cannot serve here.
 
 These rules keep the four-component scope `(tenant_id, idempotency_subject_key, operation_type, key)` total across every
 write operation and prevent caller-selected projections from fragmenting an applicable user or tenant scope. P1 does
