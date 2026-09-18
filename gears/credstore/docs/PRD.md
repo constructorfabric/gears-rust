@@ -25,8 +25,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [5.4 P1 — Reliability & Concurrency](#54-p1--reliability--concurrency)
   - [5.5 P1 — Secret Types](#55-p1--secret-types)
   - [5.6 P1 — Deprovisioning Lifecycle](#56-p1--deprovisioning-lifecycle)
-  - [5.7 P2 — Planned](#57-p2--planned)
-  - [5.8 P1 — Planned — Credential Records and Secrets](#58-p1--planned--credential-records-and-secrets)
+  - [5.7 P2](#57-p2)
+  - [5.8 P1 — Credential Records and Secrets](#58-p1--credential-records-and-secrets)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
 - [7. Public Library Interfaces](#7-public-library-interfaces)
@@ -65,8 +65,6 @@ NOT IN THIS DOCUMENT (see other templates):
 REQUIREMENT LANGUAGE:
   - Use "MUST" or "SHALL" for mandatory requirements (implicit default)
   - Do not use "SHOULD" or "MAY" — use priority p2/p3 instead
-  - Requirements marked **Planned** are specified but not yet implemented;
-    everything else is implemented.
   - Be specific and clear; no fluff, bloat, duplication, or emoji
   - Keep transport/mechanism detail (endpoints, status codes, headers) out of
     this doc — it lives in DESIGN.md; the PRD states capabilities and outcomes.
@@ -173,7 +171,7 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 **ID**: `cpt-cf-credstore-actor-provisioner`
 
 <!-- cpt-cf-id-content -->
-**Role**: A pipeline or synchronization job (CI/CD, a sync from an external vault) that places secrets into records someone else declared, and rotates them on schedule. Sees no secret it did not itself supply and no catalogue. Shipped today, it also re-supplies a secret to repair a corrupted one; **superseded by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)** (planned), under which repair instead means writing a fresh version. **Needs**: To write a secret under a guarded or last-writer-wins precondition without holding any read action; optionally to create or edit records too, when it owns their definition.
+**Role**: A pipeline or synchronization job (CI/CD, a sync from an external vault) that places secrets into records someone else declared, and rotates them on schedule. Sees no secret it did not itself supply and no catalogue. Repairs a corrupted secret by writing a fresh version. **Needs**: To write a secret under a guarded or last-writer-wins precondition without holding any read action; optionally to create or edit records too, when it owns their definition.
 <!-- cpt-cf-id-content -->
 
 #### Platform Gear
@@ -209,7 +207,7 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 - The gear is a **stateful** gear: it requires a database (PostgreSQL or SQLite; MySQL is rejected at migration time)
 - Exactly one value-store plugin is active per deployment (selected by GTS `vendor` configuration)
 - The gear depends on `authz-resolver`, `tenant-resolver`, and `types-registry`, and initializes at system priority (its consumers, e.g. OAGW, resolve the client during their own init)
-- A background reaper task runs for the lifetime of the gear, sweeping stuck records and refreshing inventory metrics — shipped today. **Withdrawn, superseded by ADR-0006** (planned): no resident reaper; a periodic maintenance job, run on an operator-chosen schedule outside the gear's own lifecycle, performs the equivalent maintenance, and no correctness property depends on it
+- No resident background task runs inside the gear; a periodic maintenance job, run on an operator-chosen schedule outside the gear's own lifecycle, reclaims garbage and expired records, and no correctness property depends on it
 
 ## 4. Scope
 
@@ -222,11 +220,11 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 - Secret shadowing (child overrides parent)
 - Service-to-service retrieval on behalf of arbitrary tenants (OAGW pattern)
 - PDP-based authorization with tenant-scope enforcement at the data layer
-- Crash-safe write and delete lifecycles — shipped: a guarded lifecycle plus a reaper; **superseded by ADR-0006** (planned): immutable secret versions reconciled by a periodic maintenance job, no resident reaper
+- Crash-safe write and delete lifecycles: immutable secret versions reconciled by a periodic maintenance job, no resident reaper
 - Optimistic concurrency: per-secret version with mandatory update/delete preconditions (creation is the only preconditionless write)
 - Gear + plugin architecture with runtime backend selection; in-memory static plugin for development/testing
 - GTS-based credential types with enforceable traits (allowed sharing modes, secret schema validation, size/format limits, expiry)
-- Operational metrics for resolution and lifecycle health — shipped; **superseded by ADR-0006** (planned): metrics reflect the periodic maintenance job's health instead of the withdrawn lifecycle saga; no equivalent inventory count is offered, consistent with the platform's rule against counting queries
+- Operational metrics for resolution and periodic maintenance-job health; no inventory count is offered, consistent with the platform's rule against counting queries
 
 ### 4.2 Out of Scope
 
@@ -249,11 +247,7 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-put-secret`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow a tenant to store a secret with a reference (key), a value, and a sharing mode. Two write operations exist: a create-only operation that fails with a conflict when a secret of the same sharing class already exists, and a precondition-guarded update of an existing secret (see the optimistic-concurrency requirement) that fails with a conflict when the target does not exist — an update never creates. For `tenant` and `shared` modes a write updates the single non-private secret for `(tenant, reference)`; for `private` mode each owner has an independent secret under `(tenant, reference, owner)`. A private secret and a tenant/shared secret with the same reference coexist; a write of one sharing class **MUST NOT** affect the other. Changing a secret between `private` and `tenant`/`shared` is rejected as an unsupported transition.
-
-**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the capability holds, but a credential's record and secret are now written together as one addressable item, with a full replace and a guarded partial update covering what a create and an update covered before (`cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-fr-write-secret`).
-
-**Superseded** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned, `cpt-cf-credstore-fr-immutable-value-versions`): a write MUST create a fresh, immutable secret version and switch the record to it atomically, rather than overwriting a stored secret in place.
+The system **MUST** allow a tenant to store a secret with a reference (key), a value, and a sharing mode, as part of writing the credential record that carries it (`cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-fr-write-secret`). A create-only write fails with a conflict when a secret of the same sharing class already exists; a precondition-guarded update (see the optimistic-concurrency requirement) fails with a conflict when the target does not exist or the precondition is stale — an update never creates. Each write of a secret **MUST** create a fresh, immutable version and switch the record to it atomically, rather than overwriting a stored secret in place (`cpt-cf-credstore-fr-immutable-value-versions`). For `tenant` and `shared` modes a write updates the single non-private secret for `(tenant, reference)`; for `private` mode each owner has an independent secret under `(tenant, reference, owner)`. A private secret and a tenant/shared secret with the same reference coexist; a write of one sharing class **MUST NOT** affect the other. Changing a secret between `private` and `tenant`/`shared` is rejected as an unsupported transition.
 
 **Rationale**: Core capability — tenants manage their own credentials; the coexistence rule makes private and team secrets independent under common names. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -263,9 +257,7 @@ The system **MUST** allow a tenant to store a secret with a reference (key), a v
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-get-secret`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow a caller to retrieve the decrypted value of an accessible secret by reference, together with access metadata: owning tenant, sharing mode, whether the secret was inherited from an ancestor, and its version. Only fully provisioned (`active`) secrets are visible. Not-found and inaccessible are indistinguishable in the response (a single not-found surface).
-
-**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the secret becomes a selectable part of the same record (`cpt-cf-credstore-fr-read-secret`), and the metadata becomes independently readable on its own (`cpt-cf-credstore-fr-get-credential`), so a caller may obtain either half without the other; the metadata no longer names the owning tenant, and a richer inheritance status (`cpt-cf-credstore-fr-inheritance-status`) replaces the inherited flag.
+The system **MUST** allow a caller to retrieve the decrypted value of an accessible secret by reference. The secret is a selectable part of the credential record (`cpt-cf-credstore-fr-read-secret`), and the record's metadata is independently readable on its own (`cpt-cf-credstore-fr-get-credential`), so a caller may obtain either half without the other; the record does not name the owning tenant, and its inheritance status (`cpt-cf-credstore-fr-inheritance-status`) states whether the resolved row is the caller's own, inherited, or an override. Only rows currently holding a secret are visible to a secret read. Not-found and inaccessible are indistinguishable in the response (a single not-found surface).
 
 **Rationale**: Consumers need the value plus enough metadata to understand inheritance and support concurrency control. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-oagw`
 <!-- cpt-cf-id-content -->
@@ -275,11 +267,7 @@ The system **MUST** allow a caller to retrieve the decrypted value of an accessi
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-delete-secret`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow a tenant to delete their own secret by reference (own-tenant only; the private class targets the caller's own private secret). Descendants using a shared secret lose access immediately upon deletion. Deleting a missing backend value is not an error (idempotent delete).
-
-**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): revocation semantics are unchanged, but deletion addresses the credential **record** (removing its secret with it), and a tenant that wants to disable an inherited credential without deleting anything of its own uses suppression instead (`cpt-cf-credstore-fr-suppression`).
-
-**Superseded** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned): deletion becomes an immediate, single-step removal — the deprovisioning status and its reference-retention window are withdrawn, and the reference is free to reuse the instant the delete completes.
+The system **MUST** allow a tenant to delete their own secret by reference (own-tenant only; the private class targets the caller's own private secret), by deleting the credential **record** that carries it. Descendants using a shared secret lose access immediately upon deletion. Deleting a missing backend value is not an error (idempotent delete). Deletion is an immediate, single-step removal: the reference is free to reuse the instant the delete completes, with no intermediate status and no reference-retention window. A tenant that wants to disable an inherited credential without deleting anything of its own uses suppression instead (`cpt-cf-credstore-fr-suppression`).
 
 **Rationale**: Tenants must be able to revoke credentials reliably. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -360,9 +348,7 @@ The system **MUST** support retrieval on behalf of an arbitrary tenant by an aut
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-authz-pdp`
 
 <!-- cpt-cf-id-content -->
-Every operation **MUST** be authorized through the platform PDP: the gear evaluates an access scope for the operation's action — `read` for a read, `write` for a create or an update, `delete` for a delete — against the secret's resolved concrete GTS type (including `generic`), and **MUST** enforce the returned scope on every metadata query at the data layer, enabling per-type policies (e.g., a role that reads `api-key` but not `certificate` secrets). Enforcement is fail-closed: a PDP denial denies the operation; a PDP evaluation failure surfaces as unavailable; out-of-scope or type-denied secrets are indistinguishable from non-existent ones on read.
-
-**Superseded in part** by `cpt-cf-credstore-fr-authz-action-split`: the mechanism — one PDP evaluation per operation against the resolved concrete type, enforced at the data layer, fail-closed — holds unchanged, but the action set does not: the six actions replace `read`/`write`/`delete`, with no synonym for the old pair, so every policy granting them is re-issued. The use cases below describe the shipped combined flow, not the split one.
+Every operation **MUST** be authorized through the platform PDP: the gear evaluates the actions the operation requires — `list`/`read`/`write`/`delete` on the credential record, `read_secret`/`write_secret` on the secret (`cpt-cf-credstore-fr-authz-action-split`) — against the secret's resolved concrete GTS type (including `generic`), and **MUST** enforce the returned scope on every metadata query at the data layer, enabling per-type policies (e.g., a role that reads `api-key` but not `certificate` secrets). Enforcement is fail-closed: a PDP denial denies the operation; a PDP evaluation failure surfaces as unavailable; out-of-scope or type-denied secrets are indistinguishable from non-existent ones on read.
 
 **Rationale**: Real tenant isolation enforced at the data layer, consistent with the platform policy plane; least privilege per action. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -382,7 +368,7 @@ Authorization, sharing-mode enforcement, and hierarchy logic **MUST** live exclu
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-authz-action-split`
 
 <!-- cpt-cf-id-content -->
-Authorization **MUST** distinguish six actions on the credential resource type: `list`, `read`, `write` and `delete` on the record, and `read_secret` and `write_secret` on the secret. The resource type **MUST** be the credential (`gts.cf.core.credstore.credential.v1~` and its derived types), renamed from the shipped `secret.v1~`, so that no shipped permission matches an operation on the new surface; policies granting the shipped actions **MUST** be re-issued against the new type rather than honoured as synonyms. A write **MUST** require `write` when it changes any record field and `write_secret` when it changes the secret, both when it changes both. A read **MUST** require `read`, or `list` when reading several records at once, when it returns any record field, and `read_secret` when it returns the secret, both when it returns both — so a caller reading only the secret needs `read_secret` alone. The purpose an application reads for is expressed by the credential **type** alone: a `read_secret` grant names a concrete type or a GTS wildcard of one, and a service that needs "its own" credentials **MUST** declare its own derived type rather than filing records under a separate label — because the type is immutable once set, a metadata edit can never change who may read a secret.
+Authorization **MUST** distinguish six actions on the credential resource type: `list`, `read`, `write` and `delete` on the record, and `read_secret` and `write_secret` on the secret. The resource type **MUST** be the credential (`gts.cf.core.credstore.credential.v1~` and its derived types); no permission on any other type matches an operation on this surface. A write **MUST** require `write` when it changes any record field and `write_secret` when it changes the secret, both when it changes both. A read **MUST** require `read`, or `list` when reading several records at once, when it returns any record field, and `read_secret` when it returns the secret, both when it returns both — so a caller reading only the secret needs `read_secret` alone. The purpose an application reads for is expressed by the credential **type** alone: a `read_secret` grant names a concrete type or a GTS wildcard of one, and a service that needs "its own" credentials **MUST** declare its own derived type rather than filing records under a separate label — because the type is immutable once set, a metadata edit can never change who may read a secret.
 
 **Rationale**: Enumerating entries, reading a record's metadata, and reading a secret have different blast radius and must be separately grantable; an ambiguous grant would defeat that separation. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
 <!-- cpt-cf-id-content -->
@@ -394,9 +380,7 @@ Authorization **MUST** distinguish six actions on the credential resource type: 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-write-lifecycle`
 
 <!-- cpt-cf-id-content -->
-A secret write that spans metadata and backend **MUST** be crash-safe: a new secret becomes readable only after its value is durably stored in the backend (`provisioning` → `active`), and a failed backend write on the create path rolls the metadata back; on an overwrite of an existing secret a failed or half-completed backend write instead leaves the secret unreadable (fail-closed) until a retried write lands both parts. A crash mid-write leaves a non-readable in-flight record that is swept by a periodic reaper within a configurable timeout. No failure mode may serve a readable secret without a matching value or permanently block the reference.
-
-**Superseded in part** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned, `cpt-cf-credstore-fr-immutable-value-versions`): the crash-safety guarantee is unchanged, but there is no in-flight status and no half-written record — a write only ever produces a fully readable record or none at all, and on an overwrite the old secret keeps serving until the new one is fully in place.
+A secret write that spans metadata and backend **MUST** be crash-safe: a write only ever produces a fully readable record or none at all — there is no in-flight status and no half-written record a reader could observe. On an overwrite of an existing secret, the old secret **MUST** keep serving until the new one is fully in place; an interrupted write **MUST** cost at most an orphaned version that a periodic maintenance process reclaims, never a wrong secret, a closed read, or a permanently blocked reference (`cpt-cf-credstore-fr-immutable-value-versions`).
 
 **Rationale**: Readers must never observe half-written secrets; writers must never permanently wedge a secret name. **Actors**: `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -406,9 +390,7 @@ A secret write that spans metadata and backend **MUST** be crash-safe: a new sec
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-optimistic-concurrency`
 
 <!-- cpt-cf-id-content -->
-Each secret **MUST** carry a monotonic version, exposed on retrieval. Update and delete **MUST** require a caller-supplied precondition ("must exist", or "the specified generation must still be current"), enforced atomically with the metadata commit — every write states its concurrency stance, there are no unconditional overwrites; creation is the only preconditionless write. A failed precondition surfaces as a conflict (lost-update detection); a malformed precondition is a validation error; a missing precondition is a validation error with its own distinct reason.
-
-**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the version is exposed only on the caller's own record; an inherited record carries an opaque validator that changes when the ancestor writes but cannot be used in a write precondition. A record write that changes nothing does not advance the version; a secret write always does. All failed preconditions surface identically.
+Each secret **MUST** carry a monotonic version, exposed on retrieval only on the caller's own record; an inherited record carries an opaque validator that changes when the ancestor writes but cannot be used in a write precondition. Update and delete **MUST** require a caller-supplied precondition ("must exist", or "the specified generation must still be current"), enforced atomically with the metadata commit — every write states its concurrency stance, there are no unconditional overwrites; creation is the only preconditionless write. A record write that changes nothing does not advance the version; a secret write always does. A failed precondition surfaces as a conflict (lost-update detection); a malformed precondition is a validation error; a missing precondition is a validation error with its own distinct reason; all failed preconditions surface identically.
 
 **Rationale**: Lost-update detection for concurrent secret management. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -420,28 +402,26 @@ Each secret **MUST** carry a monotonic version, exposed on retrieval. Update and
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-secret-types`
 
 <!-- cpt-cf-id-content -->
-Each secret **MUST** have a *secret type* chosen at creation (default: `generic`) and immutable thereafter. Secret types are GTS types derived from the credstore base type and registered in the types-registry. **Amended by** [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the base type is renamed from `gts.cf.core.credstore.secret.v1~` to `gts.cf.core.credstore.credential.v1~`, every derived type follows, and the type is also the PDP resource type of the new surface. Each type **MUST** declare enforceable traits that the gear applies uniformly, at minimum: which sharing modes the type permits, rejecting a write that requests a disallowed one (e.g., `personal-token` secrets are private-only and can never be shared); optional structural validation of the secret on write; whether the type is expirable, in which case an expired secret resolves as not-found; and bounds on the secret's size and encoding.
+Each secret **MUST** have a *secret type* chosen at creation (default: `generic`) and immutable thereafter. Secret types are GTS types derived from the credstore base type (`gts.cf.core.credstore.credential.v1~`, [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)) and registered in the types-registry; the type is also the PDP resource type. Each type **MUST** declare enforceable traits that the gear applies uniformly, at minimum: which sharing modes the type permits, rejecting a write that requests a disallowed one (e.g., `personal-token` secrets are private-only and can never be shared); optional structural validation of the secret on write; whether the type is expirable, in which case an expired secret resolves as not-found; and bounds on the secret's size and encoding.
 
-The initial type catalog covers `generic`, `api-key`, `personal-token`, `oauth2-client`, `basic-auth`, `bearer-token`, `certificate`, `ssh-key`, `webhook-hmac`, and `connection-string` (see DESIGN §5.3). Untyped existing secrets behave as `generic` with unchanged semantics. Expired secrets of expirable types resolve as not-found and are cleaned up automatically — shipped today, by the reaper through the deprovisioning lifecycle; **superseded** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned): cleaned up the same way as an ordinary delete.
+The initial type catalog covers `generic`, `api-key`, `personal-token`, `oauth2-client`, `basic-auth`, `bearer-token`, `certificate`, `ssh-key`, `webhook-hmac`, and `connection-string` (see DESIGN §5.3). Untyped existing secrets behave as `generic` with unchanged semantics. Expired secrets of expirable types resolve as not-found and are cleaned up the same way as an ordinary delete, by the periodic maintenance job (`cpt-cf-credstore-fr-immutable-value-versions`).
 
 **Rationale**: Different kinds of secrets have different safe-handling rules; encoding them as GTS type traits gives one enforcement point in the gear, platform-native discoverability/versioning, and per-type policy targeting (PDP) without per-secret ACLs. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
 ### 5.6 P1 — Deprovisioning Lifecycle
 
-#### Crash-Safe Delete (Deprovisioning Saga)
+#### Crash-Safe Delete
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-deprovisioning`
 
 <!-- cpt-cf-id-content -->
-Secret deletion **MUST** be a crash-safe lifecycle symmetric to provisioning: the secret first enters a `deprovisioning` status — at which instant it atomically stops resolving — then the backend secret is deleted, then the metadata record is removed. A failure or crash at any step leaves a non-readable `deprovisioning` record that (a) a client retry of the delete resumes idempotently, and (b) the reaper completes within a configurable timeout. While a reference is deprovisioning, re-creating it **MUST** fail with a retryable conflict (the name is released only after backend cleanup completes).
+Secret deletion **MUST** be crash-safe: deleting a credential removes the backend secret and the metadata record together, and it is free to recreate the reference the instant the delete completes, because a successor write always gets its own secret version and can never collide with a lagging backend cleanup of the old one. A failure to clean up the backend secret **MUST NOT** be visible to the caller or block the delete — the record and the reference are already gone, and cleanup completes through the periodic maintenance process (`cpt-cf-credstore-fr-immutable-value-versions`).
 
-**Superseded** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned): deletion becomes an immediate, single-step removal with no intermediate status and no name-retention window — the reference is free to reuse the instant the delete completes, because a successor write always gets its own secret version and can never collide with a lagging backend cleanup of the old one; crash-safety is unchanged in outcome, and cleanup of the old secret completes through the periodic maintenance job rather than a resident reaper.
-
-**Rationale**: A plain backend-first delete leaves metadata/backend divergence on partial failure with no self-healing owner; the status-driven lifecycle plus reaper makes revocation reliable and observable, and closes the orphaned-backend-secret debt of the write lifecycle (the reaper reconciles backend secrets for all reaped records). **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
+**Rationale**: Deletion must be reliable and observable without leaving metadata/backend divergence on partial failure, and without a name-retention window that a successor write would need to wait out. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
-### 5.7 P2 — Planned
+### 5.7 P2
 
 #### Production Value-Store Backend
 
@@ -453,9 +433,9 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 **Rationale**: The in-memory static plugin is suitable for development and testing only (secrets do not survive process restart). **Actors**: `cpt-cf-credstore-actor-backend`
 <!-- cpt-cf-id-content -->
 
-### 5.8 P1 — Planned — Credential Records and Secrets
+### 5.8 P1 — Credential Records and Secrets
 
-> **Planned, not shipped.** Every requirement in this section is specified by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), both `accepted` but not yet implemented. What ships today is the combined credential-and-secret contract of §5.1 through §5.6. The acceptance criteria in §9 that reference these IDs are planned on the same terms.
+> Every requirement in this section is specified by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md).
 
 #### Credential Record and Secret Split
 
@@ -596,9 +576,9 @@ No operation may read or modify secret metadata outside the caller's PDP-authori
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-observability`
 
 <!-- cpt-cf-id-content -->
-The gear **MUST** emit operational metrics sufficient to detect resolution anomalies and lifecycle divergence: walk-up depth, read outcome (own/inherited/miss), per-dependency latency and outcome (PDP, tenant-resolver, plugin), cross-tenant denials, and lifecycle rollback/reap counters — shipped today. **Superseded** by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned): the withdrawn reaper's counters are replaced by the periodic maintenance job's own, and no inventory count is offered, consistent with the platform's rule against counting queries. Metric labels **MUST NOT** contain secret references or secrets.
+The gear **MUST** emit operational metrics sufficient to detect resolution anomalies and lifecycle divergence: walk-up depth, read outcome (own/inherited/miss), per-dependency latency and outcome (PDP, tenant-resolver, plugin), cross-tenant denials, and periodic-maintenance-job counters (garbage collected, expired records reclaimed); no inventory count is offered, consistent with the platform's rule against counting queries. Metric labels **MUST NOT** contain secret references or secrets.
 
-**Rationale**: Crash-safe writes/deletes and hierarchical resolution — under ADR-0006 (planned), the write/delete lifecycle and periodic maintenance — fail in partial, quiet ways; operators need signals, not log archaeology. **Architecture Allocation**: See DESIGN.md §10 Observability
+**Rationale**: Crash-safe writes/deletes, hierarchical resolution, and periodic maintenance fail in partial, quiet ways; operators need signals, not log archaeology. **Architecture Allocation**: See DESIGN.md §10 Observability
 <!-- cpt-cf-id-content -->
 
 ## 7. Public Library Interfaces
@@ -618,7 +598,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-plugin-client`
 
 <!-- cpt-cf-id-content -->
-**Type**: Rust trait (async) **Stability**: unstable **Description**: Plugin SPI for backend secret stores. Registered in ClientHub with GTS instance scope. Operations: read, write and delete a secret keyed by tenant, key, and an optional owner (present for the private key class, absent for the tenant key class). Returns the secret only — no metadata, no policy. **Breaking Change Policy**: Minor version bump (unstable API)
+**Type**: Rust trait (async) **Stability**: unstable **Description**: Plugin SPI for backend secret stores. Registered in ClientHub with GTS instance scope. Operations: read, write and delete an immutable secret version keyed by tenant and an opaque version id — a write never overwrites an existing id. Returns the secret only — no metadata, no policy, no reference or owner. **Breaking Change Policy**: Minor version bump (unstable API)
 <!-- cpt-cf-id-content -->
 
 ### 7.2 External Integration Contracts
@@ -628,9 +608,9 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] `p1` - **ID**: `cpt-cf-credstore-contract-rest-api`
 
 <!-- cpt-cf-id-content -->
-**Direction**: provided **Protocol/Format**: HTTP/REST, JSON, canonical `Problem` error envelope, under a versioned path served beneath the platform API prefix. Exposes create-only and precondition-guarded update writes, retrieval, and delete over the credential reference, with optional credential-type and expiry inputs on writes, a mandatory precondition on update and delete, and secret-confidentiality response controls. See DESIGN.md for the concrete endpoints, methods, status codes, and headers.
+**Direction**: provided **Protocol/Format**: HTTP/REST, JSON, canonical `Problem` error envelope, under a versioned path served beneath the platform API prefix. Exposes a credential record and its optional secret as one addressable item: a filtered/paginated listing and a point read, both metadata-only by default and disclosing the secret only when explicitly selected; a full-replace write and a merge-patch partial update, each guarded by a mandatory precondition (create-only, guarded-replace, or last-writer-wins); and a delete. See DESIGN.md for the concrete endpoints, methods, status codes, and headers.
 
-**Compatibility**: **not** backward-compatible under [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), which is the point of that decision rather than a side effect. The credential address stops returning the secret by default and starts returning the record; the listing is renamed; the secret becomes a selectable part of the same record and listing addresses rather than moving to a dedicated one; the create path becomes a guarded create-or-replace that stays atomic — record and secret in one request; a merge-style partial update is added (metadata edit, secret rotate, secret remove); and the PDP action set is replaced with no synonym for the old read/write pair, so every policy granting them is re-issued. What **does** hold across the change: the reference stays the caller-chosen name and never becomes an internal row id, the `Problem` envelope and the canonical status mapping are unchanged, the optimistic-concurrency validator keeps its shape for an own record, and secret-confidentiality controls (no intermediary caching, per-secret audit) apply to every address that discloses a secret. Until ADR-0004 is accepted, the endpoints described in DESIGN §4.3.1 are the ones in service and remain backward-compatible within the major version; DESIGN §4.3.2 describes what replaces them.
+**Compatibility**: the reference is the caller-chosen name and never becomes an internal row id; the `Problem` envelope and the canonical status mapping are platform-standard; the optimistic-concurrency validator is generation-bound for an own record; secret-confidentiality controls (no intermediary caching, per-secret audit) apply to every address that discloses a secret.
 <!-- cpt-cf-id-content -->
 
 #### GTS Registration
@@ -656,7 +636,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 **Main Flow**:
 1. Partner tenant stores `partner-openai-key` with a secret and sharing `shared`
 2. Gear evaluates the PDP write scope and the own-tenant gate
-3. The write completes only once the secret is durably stored — shipped today via a guarded provisioning lifecycle; **superseded by ADR-0006** (planned): via a fresh, immutable secret version
+3. The write completes only once the secret is durably stored as a fresh, immutable secret version
 4. Secret is immediately resolvable by the partner and all descendant tenants
 
 **Postconditions**:
@@ -665,7 +645,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 **Alternative Flows**:
 - **Secret already exists (same class)**: secret and sharing updated, version bumped
 - **Create-only write**: fails with a conflict if the reference is taken in that sharing class
-- **Backend write fails**: leaves nothing readable and never permanently blocks the reference — shipped today via rollback of the in-flight record; **superseded by ADR-0006** (planned): no record is created at all, only an orphaned secret version the periodic maintenance job reclaims
+- **Backend write fails**: leaves nothing readable and never permanently blocks the reference — no record is created at all, only an orphaned secret version the periodic maintenance job reclaims
 <!-- cpt-cf-id-content -->
 
 #### UC-002: OAGW Retrieves Secret for Customer (Hierarchical Resolution)
@@ -838,20 +818,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 **Preconditions**:
 - Tenant owns an `active` secret consumed by descendants
 
-**Main Flow — shipped today, superseded by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (planned)**:
-1. Tenant deletes the secret by reference
-2. The secret enters `deprovisioning` — it instantly stops resolving for every consumer
-3. The backend secret is deleted; the metadata record is removed
-
-**Postconditions**:
-- Secret fully revoked; the reference becomes reusable
-
-**Alternative Flows**:
-- **Backend delete fails**: caller gets a retryable failure; the secret already does not resolve; a delete retry or the reaper completes cleanup
-- **Create during deprovisioning**: retryable conflict until the backend secret is cleaned up (bounded by the reaper cadence)
-- **Crash mid-delete**: the reaper finishes the saga within the configured timeout
-
-**Main Flow — planned, ADR-0006**:
+**Main Flow**:
 1. Tenant deletes the secret by reference
 2. The record and reference are removed immediately, with no intermediate status and no name-retention window, and the secret's version is queued for garbage collection
 3. The gear best-effort deletes the backend secret; a failure leaves it queued for the periodic maintenance job, never blocking or re-exposing the reference
@@ -948,12 +915,12 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] Shadowing: the closest accessible secret wins; inaccessible private secrets do not block fallback
 - [ ] OAGW can retrieve secrets on behalf of any tenant it is authorized for, through the standard API
 - [ ] Every operation is PDP-authorized and scope-clamped at the data layer; inaccessible reads are not-found; operation-level denial is refused; a PDP outage fails closed
-- [ ] Half-written secrets are never readable; failed writes roll back; stuck lifecycle records are reaped within the configured timeout — shipped today via a guarded lifecycle; **superseded by ADR-0006** (planned): no in-flight record can exist, because a write only ever produces a fully readable record or none at all; **no background timer runs inside the gear** — the reaper is withdrawn, and the equivalent maintenance work is a periodic job invoked on an operator-chosen schedule, outside the gear's own lifecycle
-- [ ] `p1` **Immutable value versions** (planned, ADR-0006): every write of a secret creates a new version rather than overwriting one in place, and a record only ever comes to reference a version once it is complete; an interrupted write leaves the old secret still served and the new, unreferenced version collected by the periodic maintenance job — never a wrong secret, a closed read, or a reserved reference; no record can be left in an in-flight status
+- [ ] Half-written secrets are never readable: no in-flight record can exist, because a write only ever produces a fully readable record or none at all; **no background timer runs inside the gear** — maintenance runs as a periodic job invoked on an operator-chosen schedule, outside the gear's own lifecycle
+- [ ] `p1` **Immutable value versions**: every write of a secret creates a new version rather than overwriting one in place, and a record only ever comes to reference a version once it is complete; an interrupted write leaves the old secret still served and the new, unreferenced version collected by the periodic maintenance job — never a wrong secret, a closed read, or a reserved reference; no record can be left in an in-flight status
 - [ ] Retrieval exposes the current version and secret-confidentiality controls; update/delete require a precondition, with a conflict on stale versions and a distinct validation error when it is missing
 - [ ] Secrets never appear in log output or metric labels; a non-UTF-8 secret is rejected, not corrupted
-- [ ] Secret types: a write violating the type's sharing, schema, size/format, or expiry rules is rejected with a stable reason; the type is immutable, defaults to `generic`, and is returned in metadata; expired secrets resolve as not-found and are reaped — shipped today; **superseded by ADR-0006** (planned): removed by the periodic maintenance job, same as an ordinary delete
-- [ ] Deprovisioning: a deleted secret stops resolving atomically at delete start; partial delete failures self-heal via retry or reaper; the reference conflicts (retryably) until cleanup completes — shipped today; **superseded by ADR-0006** (planned): the delete is immediate and atomic (the secret stops resolving and the reference is free to reuse the instant it completes, no intermediate status), followed by best-effort backend cleanup the periodic maintenance job guarantees; there is no conflict window, because a successor write never shares the deleted secret's version
+- [ ] Secret types: a write violating the type's sharing, schema, size/format, or expiry rules is rejected with a stable reason; the type is immutable, defaults to `generic`, and is returned in metadata; expired secrets resolve as not-found and are removed by the periodic maintenance job, same as an ordinary delete
+- [ ] Deletion is immediate and atomic: the secret stops resolving and the reference is free to reuse the instant the delete completes, with no intermediate status, followed by best-effort backend cleanup the periodic maintenance job guarantees; there is no conflict window, because a successor write never shares the deleted secret's version
 - [ ] A credential's record and its optional secret share one representation; the default read omits the secret, which appears only when explicitly asked for, gated by `read_secret`, whether reading one credential or listing them
 - [ ] Listing returns credential records only, paginated per the platform cursor contract, filterable and orderable only on allowlisted indexed fields, with no total count, and requires its own authorization action
 - [ ] A single credential can be read by reference, returning the same representation the listing uses; by default the item never carries the secret; explicitly asking for the secret discloses it under `read_secret`; the response always carries the current version validator for the caller's own record; an inaccessible or non-resolving record is indistinguishable in the response
@@ -976,7 +943,6 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 | Database (PostgreSQL / SQLite) | Gear-owned secret metadata | `p1` |
 | Value-store plugin | Per-tenant secret persistence (`static-credstore-plugin` for dev/test; production vault plugin planned) | `p1` |
 | OAGW | Primary consumer of hierarchical secret retrieval (uses the SDK client) | `p1` |
-| PDP policy re-issuance | Existing `read` grants must be re-issued under the six-action split (list records, read record, write record, read secret, write secret, delete) before the split ships | `p1` |
 | Database indexes on secret type and reference | The bulk filtered secret read depends on indexes over the allowlisted metadata fields; without them the read is unindexed and slow | `p1` |
 
 ## 11. Assumptions
@@ -993,10 +959,9 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Secrets leaked through logs/caches | Critical security incident | NFR enforcement (redaction, zeroize, non-cacheable responses), code review |
-| Metadata/backend divergence on partial write or delete failure — shipped today, superseded by ADR-0006 (planned) | Orphaned backend secrets, temporarily wedged references | Compensating rollback; guarded deprovisioning lifecycle; reaper backend reconciliation with configurable timeouts; lifecycle metrics |
-| Garbage until the next maintenance-job run (planned, ADR-0006) | A secret version outlives the switch or delete that superseded it, until the periodic maintenance job's next run | No resident reaper — a scheduled job (daily by default, weekly acceptable) drains the backlog each run in bounded batches; the version is never referenced by any record, so it is a storage cost only, never a correctness risk; a tighter destruction requirement is met by running the job more often |
-| Pending write never completes (planned, ADR-0006) | A write's secret version was stored but the record was never switched to it (crash, or a losing concurrent write whose own cleanup failed) | The maintenance job reclaims an unreferenced version once it exceeds an age threshold; a defensive check refuses to delete a version any live record still references |
-| Expired record lingers in the catalogue and holds its reference until the job (planned, ADR-0006) | An expired credential stops resolving at read time but its record is not removed until the periodic maintenance job's next run or an owner action | A create-only write under that reference conflicts until then; the owner can update or delete the record directly to reclaim the reference immediately rather than waiting for the job |
+| Garbage until the next maintenance-job run | A secret version outlives the switch or delete that superseded it, until the periodic maintenance job's next run | No resident reaper — a scheduled job (daily by default, weekly acceptable) drains the backlog each run in bounded batches; the version is never referenced by any record, so it is a storage cost only, never a correctness risk; a tighter destruction requirement is met by running the job more often |
+| Pending write never completes | A write's secret version was stored but the record was never switched to it (crash, or a losing concurrent write whose own cleanup failed) | The maintenance job reclaims an unreferenced version once it exceeds an age threshold; a defensive check refuses to delete a version any live record still references |
+| Expired record lingers in the catalogue and holds its reference until the job | An expired credential stops resolving at read time but its record is not removed until the periodic maintenance job's next run or an owner action | A create-only write under that reference conflicts until then; the owner can update or delete the record directly to reclaim the reference immediately rather than waiting for the job |
 | PDP or tenant-resolver outage | Operations fail closed (unavailable) | Ancestor-chain cache absorbs blips; dependency metrics for fast diagnosis |
 | Ancestor-chain cache staleness | A re-parented tenant keeps inheriting its former parent's `shared` credentials for up to the cache TTL | Short TTL + LRU. The own-tenant gate is **not** a control here: it validates the caller's tenant, not the ancestors the cached chain names, which is precisely what lets an inherited read work. Closing the window needs a hierarchy version or change signal from the tenant resolver, which is work outside this gear; until then the TTL is the settling time for credential inheritance after a move |
 | In-memory static plugin in non-dev use | Secrets lost on restart | Production vault plugin (`cpt-cf-credstore-fr-production-backend`); deployment policy |
@@ -1007,8 +972,8 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - ~~**Batch retrieval**: should a read support multiple references per call?~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the credential listing gains a secret mode, scoped by an explicit reference list or by a type filter, non-paginated, authorized per item and capped by cardinality (`cpt-cf-credstore-fr-bulk-read-secrets`).
 - ~~**P2/Future — Human vs service access**: should human users be restricted to metadata-only?~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and `cpt-cf-credstore-fr-authz-action-split`: the restriction is expressed by granting metadata actions without the read-secret action, and applies to any principal kind rather than being derived from whether the subject is human.
 - **P2/Future — Audit trails**: structured audit events (actor, tenant, outcome — never secrets) to a tamper-evident platform sink.
-- ~~**P2/Future — Metadata list endpoint**~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), which fixes that a listing exists (`cpt-cf-credstore-fr-list-credentials`) and never carries a secret unless the caller explicitly asks for one — in which case the same listing also serves the bulk secret read (`cpt-cf-credstore-fr-bulk-read-secrets`), under its own cap and without pagination — and by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), which is the dedicated ADR this entry asked for: the listing is rooted at the caller's tenant and resolves upward through the hierarchy, checking the requesting tenant rather than filtering records individually, which is what lets an inherited entry appear at all. Both are `accepted`; the answer stands, pending their implementation.
-- ~~**One item per reference**~~ **Answered** by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Pagination over a reduced result": because the canonical order leads with reference, every record for one reference is contiguous, so a cursor always sits on a reference boundary and no reference can be split across a page. **Still open**: this is the platform's first pagination that reduces records before paging, so its page-boundary behaviour needs its own test suite before the endpoint ships.
+- ~~**P2/Future — Metadata list endpoint**~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), which fixes that a listing exists (`cpt-cf-credstore-fr-list-credentials`) and never carries a secret unless the caller explicitly asks for one — in which case the same listing also serves the bulk secret read (`cpt-cf-credstore-fr-bulk-read-secrets`), under its own cap and without pagination — and by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), which is the dedicated ADR this entry asked for: the listing is rooted at the caller's tenant and resolves upward through the hierarchy, checking the requesting tenant rather than filtering records individually, which is what lets an inherited entry appear at all.
+- ~~**One item per reference**~~ **Answered** by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Pagination over a reduced result": because the canonical order leads with reference, every record for one reference is contiguous, so a cursor always sits on a reference boundary and no reference can be split across a page. **Still open**: this is the platform's first pagination that reduces records before paging, so its page-boundary behaviour needs its own dedicated test suite.
 
 ## 14. Traceability
 
