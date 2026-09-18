@@ -146,3 +146,14 @@ pub enum DependencyKind {
     Derivation,
     InstanceOf,
 }
+
+impl DependencyKind {
+    /// Edge verb used in quarantine refusal messages.
+    pub(crate) const fn quarantine_verb(self) -> &'static str {
+        match self {
+            Self::SchemaRef => "$ref",
+            Self::Derivation => "derive from",
+            Self::InstanceOf => "conform to",
+        }
+    }
+}

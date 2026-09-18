@@ -901,7 +901,7 @@ mod platform_credentials {
     #[tokio::test]
     async fn shared_secret_yields_provider_with_the_secret() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "shared-tok".to_owned(),
+            secret: secrecy::SecretString::from("shared-tok"),
             peer_name: "toolkit-internal".to_owned(),
         };
         let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
@@ -1008,7 +1008,7 @@ mod directory_client_bootstrap {
         // Same guarantee on the credentialed path: the client still builds and
         // a configured credential yields an outbound provider.
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "shared-tok".to_owned(),
+            secret: secrecy::SecretString::from("shared-tok"),
             peer_name: "toolkit-internal".to_owned(),
         };
         let (_client, provider) =

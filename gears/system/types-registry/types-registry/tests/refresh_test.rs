@@ -9,9 +9,11 @@ mod resolution_limits;
 
 use std::sync::Arc;
 
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
+use toolkit_db::secure::SecureEntityExt;
 use toolkit_db::{DBProvider, DbError, DbTx};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
@@ -29,6 +31,7 @@ use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{CurrentTypeSchemaRow, EntityRow};
+use types_registry::infra::storage::entity::type_schema_revision;
 use types_registry::infra::storage::repo::{EntityRepo, InstanceRepo, TypeSchemaRepo};
 
 const NOW: OffsetDateTime = datetime!(2026-08-19 09:15:30 UTC);
@@ -55,12 +58,15 @@ fn worker(db: &Provider) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
-fn base_schema(property: &str) -> Value {
+/// Vary `title` to move the content hash, revision, and dependent artifacts
+/// without changing the accepted-instance set.
+fn base_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{BASE}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": marker,
         "type": "object",
-        "properties": { property: { "type": "string" } },
+        "properties": { "name": { "type": "string" } },
     })
 }
 
@@ -142,6 +148,7 @@ async fn admit_with(
             limits,
             worker: worker_settings,
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         operation_id,
         LATER,
@@ -184,6 +191,101 @@ async fn current(db: &Provider, gts_id: &str) -> CurrentTypeSchemaRow {
         .await
         .expect("read")
         .unwrap_or_else(|| panic!("{gts_id} must have a current row"))
+}
+
+#[tokio::test]
+async fn a_type_with_a_live_direct_instance_cannot_become_abstract() {
+    let db = test_db().await;
+    let mut document = base_schema("concrete");
+    document["x-gts-abstract"] = json!(false);
+    succeeded(&admit(&db, "base", BASE, document.clone(), None).await);
+    succeeded(&admit(&db, "instance", INSTANCE, json!({"name": "live"}), None).await);
+    let before_entity = entity(&db, BASE).await;
+    let before_current = current(&db, BASE).await;
+    let instance_id = entity(&db, INSTANCE).await.id;
+    let conn = db.conn().unwrap();
+    let before_value = InstanceRepo::current_values(&conn, &allow_all(), &[instance_id])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    document["x-gts-abstract"] = json!(true);
+    let outcome = admit(&db, "abstract", BASE, document, Some(1)).await;
+    let failure = outcome.items[0]
+        .failure
+        .as_ref()
+        .expect("abstracting must be refused");
+    assert_eq!(failure.reason, AdmissionFailureReason::DependentInvalid);
+    assert_eq!(outcome.items[0].status, OperationItemStatus::Failed);
+    assert_eq!(entity(&db, BASE).await, before_entity);
+    assert_eq!(current(&db, BASE).await, before_current);
+    let revisions = type_schema_revision::Entity::find()
+        .filter(type_schema_revision::Column::EntityId.eq(before_entity.id))
+        .secure()
+        .scope_with(&allow_all())
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(revisions.len(), 1, "no refused revision was persisted");
+    let after_value = InstanceRepo::current_values(&conn, &allow_all(), &[instance_id])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(after_value.revision_no, before_value.revision_no);
+    assert_eq!(after_value.canonical_value, before_value.canonical_value);
+}
+
+#[tokio::test]
+async fn a_type_with_a_live_derived_type_cannot_become_final() {
+    let db = test_db().await;
+    let mut document = base_schema("extensible");
+    document["x-gts-final"] = json!(false);
+    succeeded(&admit(&db, "base", BASE, document.clone(), None).await);
+    succeeded(&admit(&db, "derived", DERIVED, derived_schema(), None).await);
+    let before_base = (entity(&db, BASE).await, current(&db, BASE).await);
+    let before_derived = (entity(&db, DERIVED).await, current(&db, DERIVED).await);
+
+    let mut final_document = document.clone();
+    final_document["x-gts-final"] = json!(true);
+    assert_eq!(
+        gts::GtsStore::new()
+            .compare_documents(&document, &final_document)
+            .unwrap()
+            .backward_compatibility(),
+        gts::CompatibilityVerdict::Compatible,
+        "JSON Schema comparison alone does not protect the final modifier"
+    );
+    let outcome = admit(&db, "final", BASE, final_document, Some(1)).await;
+    let item = &outcome.items[0];
+    assert_eq!(item.status, OperationItemStatus::Failed);
+    assert_eq!(
+        item.failure.as_ref().expect("final base is refused").reason,
+        AdmissionFailureReason::DependentInvalid
+    );
+    assert_eq!(item.resource_version, None);
+    assert_eq!(item.revision_no, None);
+    assert_eq!(
+        (entity(&db, BASE).await, current(&db, BASE).await),
+        before_base
+    );
+    assert_eq!(
+        (entity(&db, DERIVED).await, current(&db, DERIVED).await),
+        before_derived
+    );
+    let conn = db.conn().unwrap();
+    let revisions = type_schema_revision::Entity::find()
+        .secure()
+        .scope_with(&allow_all())
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        revisions.len(),
+        2,
+        "the refused base revision was rolled back"
+    );
 }
 
 async fn seed_base_and_dependents(db: &Provider) {

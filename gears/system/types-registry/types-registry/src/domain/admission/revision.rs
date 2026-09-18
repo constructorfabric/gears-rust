@@ -44,6 +44,19 @@ pub enum RevisionCommit {
     },
 }
 
+impl RevisionCommit {
+    /// The Registry Reference, which every terminal success carries whichever
+    /// outcome it was (ADR-0012).
+    #[must_use]
+    pub const fn gts_uuid(&self) -> Uuid {
+        match self {
+            Self::Admitted(CommittedUnit { gts_uuid, .. }) | Self::Unchanged { gts_uuid, .. } => {
+                *gts_uuid
+            }
+        }
+    }
+}
+
 /// Current authored content; Type Schemas also carry their mandatory artifact CAS token.
 #[domain_model]
 #[derive(Clone, Debug)]

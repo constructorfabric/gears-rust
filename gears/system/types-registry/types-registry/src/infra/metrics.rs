@@ -3,11 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gts::CompatibilityVerdict;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{InstrumentationScope, KeyValue};
 
 use crate::domain::admission::vector::VectorDrift;
-use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage, TerminalStatus};
 
 /// Instrumentation scope shared by this gear's metrics.
 pub const SCOPE: &str = "cf-gears-types-registry";
@@ -19,6 +20,15 @@ pub const ACTIVATION_WRITE_SET_BUCKETS: [f64; 10] =
 /// Bucket boundaries (seconds) for `types_registry_operation_duration_seconds`.
 pub const OPERATION_DURATION_BUCKETS_SECONDS: [f64; 10] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+
+/// Exhaustive metric-label mapping; new verdict variants require an explicit label.
+const fn verdict_label(verdict: CompatibilityVerdict) -> &'static str {
+    match verdict {
+        CompatibilityVerdict::Compatible => "compatible",
+        CompatibilityVerdict::Incompatible => "incompatible",
+        CompatibilityVerdict::Unknown => "unknown",
+    }
+}
 
 /// The *shape* of a drift, never the identifier that drifted.
 const fn drift_label(drift: &VectorDrift) -> &'static str {
@@ -40,6 +50,8 @@ pub struct AdmissionMetricsMeter {
     candidates: Counter<u64>,
     /// `types_registry_refusals_total{stage,reason}`.
     refusals: Counter<u64>,
+    /// `types_registry_compat_verdicts_total{verdict,forced}`.
+    compat_verdicts: Counter<u64>,
     /// Revalidation retries, by drift.
     revalidations: Counter<u64>,
     /// Dependents rewritten by one revision (SPEC §8.1 step 4.6).
@@ -71,6 +83,15 @@ impl AdmissionMetricsMeter {
                      machine reason",
                 )
                 .build(),
+            compat_verdicts: meter
+                .u64_counter(format!("{prefix}_compat_verdicts_total"))
+                .with_description(
+                    "Compatibility verdicts computed against a baseline \
+                     (compatible / incompatible / unknown), and whether an accepted \
+                     ADR-0004 force waived the check. A candidate owed no comparison \
+                     is not counted here",
+                )
+                .build(),
             revalidations: meter
                 .u64_counter(format!("{prefix}_revalidations_total"))
                 .with_description(
@@ -97,18 +118,39 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
         self.unchanged_probes.add(1, &[KeyValue::new("hit", hit)]);
     }
 
-    fn candidate_terminalized(&self, status: TerminalStatus) {
-        self.candidates
-            .add(1, &[KeyValue::new("status", status.label())]);
+    fn candidate_terminalized(&self, status: TerminalStatus, labels: PassLabels) {
+        self.candidates.add(
+            1,
+            &[
+                KeyValue::new("status", status.label()),
+                KeyValue::new("kind", labels.kind_label()),
+                KeyValue::new("dry_run", labels.dry_run),
+            ],
+        );
     }
 
-    fn refused(&self, stage: RefusalStage, reason: &'static str) {
+    fn refused(&self, stage: RefusalStage, reason: &'static str, labels: PassLabels) {
         self.refusals.add(
             1,
             &[
                 KeyValue::new("stage", stage.label()),
                 // The static type enforces a closed label vocabulary.
                 KeyValue::new("reason", reason),
+                KeyValue::new("kind", labels.kind_label()),
+                KeyValue::new("dry_run", labels.dry_run),
+            ],
+        );
+    }
+
+    fn compat_verdict(&self, verdict: CompatibilityVerdict, forced: bool, labels: PassLabels) {
+        self.compat_verdicts.add(
+            1,
+            &[
+                // The static types enforce both closed vocabularies.
+                KeyValue::new("verdict", verdict_label(verdict)),
+                KeyValue::new("forced", forced),
+                // No `kind`: see the port's documentation — it would be constant.
+                KeyValue::new("dry_run", labels.dry_run),
             ],
         );
     }
@@ -118,7 +160,13 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
             .add(1, &[KeyValue::new("drift", drift_label(drift))]);
     }
 
-    fn observe_activation_write_set(&self, refreshed: usize) {
+    fn observe_activation_write_set(&self, refreshed: usize, labels: PassLabels) {
+        // A dry-run pass rewrote nothing, so it is not an observation about
+        // how close this deployment runs to `limits.activation_write_set`. Skipped
+        // rather than labelled: see the port's documentation.
+        if labels.dry_run {
+            return;
+        }
         // The configured bound fits exactly in `f64` in practice.
         #[allow(clippy::cast_precision_loss)]
         self.activation_write_set.record(refreshed as f64, &[]);

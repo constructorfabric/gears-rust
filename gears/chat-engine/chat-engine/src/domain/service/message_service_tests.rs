@@ -8,6 +8,7 @@ use crate::domain::session::SessionType;
 use uuid::Uuid;
 
 use async_trait::async_trait;
+use chat_engine_sdk::models::{MessagePartType, StreamingCitationEvent, StreamingPartEvent};
 use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
 use chat_engine_sdk::plugin::stream_from_events;
 use parking_lot::Mutex;
@@ -31,8 +32,8 @@ impl MockSessionRepo {
         Arc::new(Self {
             session: Mutex::new(Session {
                 session_id: Uuid::new_v4(),
-                tenant_id: "t".into(),
-                user_id: "u".into(),
+                tenant_id: OWNER_TENANT.to_string().into(),
+                user_id: OWNER_USER.to_string().into(),
                 client_id: None,
                 session_type_id,
                 enabled_capabilities: capabilities,
@@ -210,27 +211,61 @@ enum FinalizeOutcomeSnapshot {
     },
     Cancelled {
         text: String,
+        part_types: Vec<MessagePartType>,
+        citation_count: usize,
     },
     Errored {
         text: String,
         error: String,
         finish_reason: String,
+        part_types: Vec<MessagePartType>,
+        citation_count: usize,
     },
+}
+
+fn part_types_of(parts: &[MessagePartInput]) -> Vec<MessagePartType> {
+    parts.iter().map(|p| p.part_type).collect()
+}
+
+/// Minimal well-formed `FileCitation` for the finalize-path tests.
+fn test_file_citation() -> chat_engine_sdk::models::FileCitation {
+    serde_json::from_value(serde_json::json!({
+        "document_id": "doc-1",
+        "document_name": "Doc One",
+        "quote": "the answer is 42",
+    }))
+    .expect("build file citation")
+}
+
+fn citation_count_of(c: &PartCitations) -> usize {
+    c.file_citations.len() + c.link_citations.len() + c.references.len()
 }
 
 impl From<FinalizeOutcome> for FinalizeOutcomeSnapshot {
     fn from(value: FinalizeOutcome) -> Self {
         match value {
             FinalizeOutcome::Complete { text, metadata, .. } => Self::Complete { text, metadata },
-            FinalizeOutcome::Cancelled { text } => Self::Cancelled { text },
+            FinalizeOutcome::Cancelled {
+                text,
+                extra_parts,
+                citations,
+            } => Self::Cancelled {
+                text,
+                part_types: part_types_of(&extra_parts),
+                citation_count: citation_count_of(&citations),
+            },
             FinalizeOutcome::Errored {
                 text,
                 error,
                 finish_reason,
+                extra_parts,
+                citations,
             } => Self::Errored {
                 text,
                 error,
                 finish_reason: finish_reason.to_string(),
+                part_types: part_types_of(&extra_parts),
+                citation_count: citation_count_of(&citations),
             },
         }
     }
@@ -310,7 +345,8 @@ enum PluginScript {
     Events(Vec<StreamingEvent>),
     PreError(PluginError),
     EventsThenErr(Vec<StreamingEvent>, PluginError),
-    Hang, // never resolves; relies on cancellation
+    Hang,                                // never resolves; relies on cancellation
+    EventsThenHang(Vec<StreamingEvent>), // emits, then relies on cancellation
 }
 
 struct ScriptPlugin {
@@ -355,7 +391,21 @@ impl ChatEngineBackendPlugin for ScriptPlugin {
                 // only way out.
                 Ok(empty_stream_pending())
             }
+            PluginScript::EventsThenHang(events) => {
+                let items: Vec<std::result::Result<StreamingEvent, PluginError>> =
+                    events.into_iter().map(Ok).collect();
+                Ok(futures::stream::iter(items)
+                    .chain(empty_stream_pending())
+                    .boxed())
+            }
         }
+    }
+
+    async fn on_message_recreate(
+        &self,
+        ctx: MessagePluginCtx,
+    ) -> std::result::Result<PluginStream, PluginError> {
+        self.on_message(ctx).await
     }
 
     fn plugin_instance_id(&self) -> &str {
@@ -370,8 +420,14 @@ fn empty_stream_pending() -> PluginStream {
 
 // ----------------- Test fixtures -----------------
 
+/// Owner pair carried by every fixture session in this module. [`make_ctx`]
+/// builds a context for the same pair so the caller is the session owner —
+/// what `owner_guard::ensure_session_owner` requires of an authorized op.
+const OWNER_TENANT: Uuid = Uuid::from_u128(0x0A11);
+const OWNER_USER: Uuid = Uuid::from_u128(0x0B22);
+
 fn make_ctx() -> SecurityContext {
-    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
+    test_support::ctx_for_subject(OWNER_USER, OWNER_TENANT)
 }
 
 fn make_service(
@@ -511,7 +567,99 @@ async fn mid_stream_cancellation_finalizes_with_cancelled() {
     let calls = messages.finalize_calls.lock().clone();
     assert_eq!(calls.len(), 1);
     match &calls[0].1 {
-        FinalizeOutcomeSnapshot::Cancelled { text } => assert_eq!(text, ""),
+        FinalizeOutcomeSnapshot::Cancelled { text, .. } => assert_eq!(text, ""),
+        other => panic!("expected Cancelled finalize, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancellation_persists_parts_and_citations_streamed_before_the_cancel() {
+    // A part the plugin already emitted (here: a tool call it actually made)
+    // is as real as the text accumulated beside it — cancelling the turn must
+    // not drop it while keeping the text. The same holds for mid-stream
+    // citations: the partial text keeps the markers that reference them.
+    let plugin_id = "plugin-part-then-hang";
+    let session_type_id = Uuid::new_v4();
+    let plugin = ScriptPlugin::new(
+        plugin_id,
+        PluginScript::EventsThenHang(vec![
+            StreamingEvent::Part(StreamingPartEvent {
+                message_id: Uuid::nil(),
+                part: MessagePartInput {
+                    part_type: MessagePartType::ToolCall,
+                    content: serde_json::json!({
+                        "tool_call_id": "call_1",
+                        "name": "get_weather",
+                        "arguments": { "city": "Berlin" },
+                    }),
+                    file_citations: vec![],
+                    link_citations: vec![],
+                    references: vec![],
+                },
+            }),
+            StreamingEvent::Citation(StreamingCitationEvent {
+                message_id: Uuid::nil(),
+                part_number: 0,
+                file_citations: vec![test_file_citation()],
+                link_citations: vec![],
+                references: vec![],
+            }),
+        ]),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
+
+    let cancel = CancellationToken::new();
+    let mut stream = svc
+        .send_message(
+            make_request(sessions.session_id()),
+            &make_ctx(),
+            cancel.clone(),
+        )
+        .await
+        .expect("send_message dispatch");
+
+    // Drain until the citation (the last scripted event) reaches the wire, so
+    // the driver has accumulated both it and the part before the cancel.
+    let mut saw_citation = false;
+    while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+    {
+        if matches!(evt, StreamingEvent::Citation(_)) {
+            saw_citation = true;
+            break;
+        }
+    }
+    assert!(
+        saw_citation,
+        "plugin events must reach the wire before cancelling"
+    );
+
+    cancel.cancel();
+    let next = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(
+        matches!(next, Ok(None) | Err(_)),
+        "stream must terminate after cancel"
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let calls = messages.finalize_calls.lock().clone();
+    assert_eq!(calls.len(), 1);
+    match &calls[0].1 {
+        FinalizeOutcomeSnapshot::Cancelled {
+            part_types,
+            citation_count,
+            ..
+        } => {
+            assert_eq!(
+                part_types,
+                &vec![MessagePartType::ToolCall],
+                "the streamed part must survive the cancellation",
+            );
+            assert_eq!(
+                *citation_count, 1,
+                "the mid-stream citation must survive the cancellation",
+            );
+        }
         other => panic!("expected Cancelled finalize, got {other:?}"),
     }
 }
@@ -600,6 +748,115 @@ async fn mid_stream_err_emits_streaming_error_event_and_finalizes() {
         } => {
             assert_eq!(text, "partial");
             assert_eq!(finish_reason, "error");
+        }
+        other => panic!("expected Errored finalize, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mid_stream_error_persists_parts_streamed_before_the_failure() {
+    let plugin_id = "plugin-part-then-err";
+    let session_type_id = Uuid::new_v4();
+    let plugin = ScriptPlugin::new(
+        plugin_id,
+        PluginScript::EventsThenErr(
+            vec![
+                StreamingEvent::Part(StreamingPartEvent {
+                    message_id: Uuid::nil(),
+                    part: MessagePartInput {
+                        part_type: MessagePartType::Links,
+                        content: serde_json::json!({ "links": [{ "url": "https://e.com" }] }),
+                        file_citations: vec![],
+                        link_citations: vec![],
+                        references: vec![],
+                    },
+                }),
+                StreamingEvent::Chunk(StreamingChunkEvent {
+                    message_id: Uuid::nil(),
+                    chunk: "partial".into(),
+                }),
+            ],
+            PluginError::internal("boom"),
+        ),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
+
+    let cancel = CancellationToken::new();
+    let mut stream = svc
+        .send_message(make_request(sessions.session_id()), &make_ctx(), cancel)
+        .await
+        .expect("send_message dispatch");
+    while stream.next().await.is_some() {}
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let calls = messages.finalize_calls.lock().clone();
+    assert_eq!(calls.len(), 1);
+    match &calls[0].1 {
+        FinalizeOutcomeSnapshot::Errored {
+            text, part_types, ..
+        } => {
+            assert_eq!(text, "partial");
+            assert_eq!(
+                part_types,
+                &vec![MessagePartType::Links],
+                "the streamed part must survive the failure",
+            );
+        }
+        other => panic!("expected Errored finalize, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn recreate_pre_stream_failure_finalizes_the_stub_as_errored() {
+    // `dispatch_to_plugin` is the recreate/branch entry point (variant_service
+    // calls it). A plugin that fails before yielding a stream must still leave
+    // the pre-allocated assistant stub finalized — with nothing to preserve,
+    // since no part or citation was streamed.
+    let plugin_id = "plugin-recreate-pre-err";
+    let session_type_id = Uuid::new_v4();
+    let plugin = ScriptPlugin::new(
+        plugin_id,
+        PluginScript::PreError(PluginError::internal("boom")),
+    );
+    let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
+    let (svc, sessions, messages) = make_service(plugin_id, plugin_dyn, session_type_id, None);
+
+    let identity = Identity::new(OWNER_TENANT.to_string(), OWNER_USER.to_string(), None)
+        .expect("identity from owner pair");
+    let assistant_message_id = Uuid::new_v4();
+    let err = svc
+        .dispatch_to_plugin(
+            &identity,
+            sessions.session_id(),
+            session_type_id,
+            plugin_id.to_owned(),
+            assistant_message_id,
+            vec![],
+            None,
+            MessageEventKind::Recreate,
+            CancellationToken::new(),
+        )
+        .await;
+    let err = match err {
+        Ok(_) => panic!("pre-stream plugin failure must surface to the caller"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("boom"), "got {err}");
+
+    let calls = messages.finalize_calls.lock().clone();
+    assert_eq!(calls.len(), 1, "the stub must be finalized exactly once");
+    assert_eq!(calls[0].0, assistant_message_id);
+    match &calls[0].1 {
+        FinalizeOutcomeSnapshot::Errored {
+            text,
+            part_types,
+            citation_count,
+            ..
+        } => {
+            assert!(text.is_empty(), "nothing streamed, so no text");
+            assert!(part_types.is_empty(), "nothing streamed, so no parts");
+            assert_eq!(*citation_count, 0, "nothing streamed, so no citations");
         }
         other => panic!("expected Errored finalize, got {other:?}"),
     }
@@ -793,8 +1050,8 @@ fn make_current_message() -> Message {
 fn make_session(metadata: Option<JsonValue>) -> Session {
     Session {
         session_id: Uuid::new_v4(),
-        tenant_id: SdkTenantId::new("t"),
-        user_id: SdkUserId::new("u"),
+        tenant_id: SdkTenantId::new(OWNER_TENANT.to_string()),
+        user_id: SdkUserId::new(OWNER_USER.to_string()),
         client_id: None,
         session_type_id: None,
         enabled_capabilities: None,
@@ -1934,8 +2191,8 @@ async fn internal_write_copies_owner_pair_from_session() {
 
 use crate::domain::ports::NewUserMessage;
 use crate::domain::service::test_support::{
-    build_message_service, ctx_for_subject, enforcer_allow, enforcer_deny, inmem_db, message_repo,
-    seed_session,
+    build_message_service, ctx_for_subject, enforcer_allow, enforcer_allow_tenant_only,
+    enforcer_allow_unconstrained, enforcer_deny, inmem_db, message_repo, seed_session,
 };
 
 fn harness_text_part(text: &str) -> MessagePartInput {
@@ -2195,4 +2452,124 @@ fn message_metadata_accepts_non_object_json() {
     // opaque client context and only the size cap governs it.
     validate_message_metadata(Some(&serde_json::json!(["a", "b"]))).expect("array accepted");
     validate_message_metadata(Some(&serde_json::json!("plain"))).expect("string accepted");
+}
+
+// ===========================================================================
+// Ownership guard: the PDP scopes the tenant, the gear scopes the owner.
+// `enforcer_allow_tenant_only` models the shipped policy plugins, neither of
+// which emits an `owner_id` predicate.
+// @cpt-cf-chat-engine-nfr-authentication
+// ===========================================================================
+
+/// Point-op read of a same-tenant stranger's message must 404, not resolve.
+#[tokio::test]
+async fn get_message_same_tenant_stranger_is_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let pair = harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let err = svc
+        .resolve_owned_message(
+            &ctx_for_subject(Uuid::new_v4(), tenant),
+            pair.user_message_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "a same-tenant stranger must not read another user's message, got: {err:?}",
+    );
+
+    // Control: the owner still reads it under the same PDP.
+    svc.resolve_owned_message(&ctx_for_subject(owner, tenant), pair.user_message_id)
+        .await
+        .expect("owner reads its own message");
+}
+
+/// The clamp rides into the `WHERE` clause, so a stranger's list is empty
+/// rather than a page of someone else's conversation.
+#[tokio::test]
+async fn list_active_messages_hides_other_users_rows_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let seen = svc
+        .list_active_messages(&ctx_for_subject(Uuid::new_v4(), tenant), sid, None)
+        .await
+        .expect("list is authorized, it is the rows that are scoped away");
+    assert!(
+        seen.is_empty(),
+        "a same-tenant stranger must not list another user's messages, got {} rows",
+        seen.len(),
+    );
+
+    let owned = svc
+        .list_active_messages(&ctx_for_subject(owner, tenant), sid, None)
+        .await
+        .expect("owner lists its own messages");
+    assert!(!owned.is_empty(), "the owner's own page must be intact");
+}
+
+/// Deletes are clamped the same way, and the row survives the attempt.
+#[tokio::test]
+async fn delete_message_by_same_tenant_stranger_is_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let root = harness_seed_pair(&db, sid, tenant, owner).await;
+    let child = message_repo(&db)
+        .insert_user_and_assistant_stub(NewUserMessage {
+            session_id: sid,
+            tenant_id: Some(tenant.to_string()),
+            user_id: Some(owner.to_string()),
+            parent_message_id: Some(root.assistant_message_id),
+            parts: vec![harness_text_part("child")],
+            file_ids: None,
+            metadata: None,
+        })
+        .await
+        .expect("seed child pair");
+
+    let svc = build_message_service(&db, enforcer_allow_tenant_only());
+    let err = svc
+        .delete_message_cascade(
+            &ctx_for_subject(Uuid::new_v4(), tenant),
+            sid,
+            child.user_message_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    svc.resolve_owned_message(&ctx_for_subject(owner, tenant), child.user_message_id)
+        .await
+        .expect("the message must survive a stranger's delete");
+}
+
+/// Unlike the session point-ops, MESSAGE point-ops ask the PDP with
+/// `require_constraints = true`, so an allow carrying no constraints cannot
+/// compile a scope and fails closed before any row is touched. Pinned here so
+/// the fail-closed half of the contract does not silently become an
+/// `allow_all` fast path.
+#[tokio::test]
+async fn get_message_unconstrained_allow_fails_closed() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let pair = harness_seed_pair(&db, sid, tenant, owner).await;
+
+    let svc = build_message_service(&db, enforcer_allow_unconstrained());
+    let err = svc
+        .resolve_owned_message(&ctx_for_subject(owner, tenant), pair.user_message_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "an allow with no constraints must fail closed on a MESSAGE point-op, got: {err:?}",
+    );
 }

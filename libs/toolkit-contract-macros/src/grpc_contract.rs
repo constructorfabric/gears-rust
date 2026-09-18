@@ -20,8 +20,9 @@ use quote::{format_ident, quote};
 use syn::{TraitItem, Type};
 
 use crate::grpc_contract_parse::{GrpcContractModel, GrpcIdempotency, GrpcMethodModel, GrpcParam};
+use crate::model::StreamOpen;
 use crate::projection::{
-    build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
+    Delegation, build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
     is_platform_security_context_type, is_security_context_type, render_method_inputs,
     render_method_return_ty, rewrite_streaming_signature, strip_method_attrs, strip_param_attrs,
 };
@@ -219,9 +220,9 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
             // match `PlatformSecurityContext`.
             strip_param_attrs(method);
             if let Some(model_method) = model_methods.get(&method.sig.ident.to_string()) {
-                if model_method.server_streaming {
+                if let Some(open) = model_method.shape.stream_open() {
                     let (ok, err) = &model_method.result_types;
-                    rewrite_streaming_signature(method, ok, err);
+                    rewrite_streaming_signature(method, ok, err, open);
                 }
                 let arg_idents: Vec<&syn::Ident> = model_method
                     .params
@@ -233,7 +234,7 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
                     base_trait,
                     &model_method.ident,
                     arg_idents,
-                    model_method.server_streaming,
+                    Delegation::for_method(model_method.shape),
                 ));
             }
         }
@@ -282,7 +283,7 @@ fn generate_binding_fn(model: &GrpcContractModel, support: &TokenStream) -> Toke
 fn build_method_binding(method: &GrpcMethodModel, support: &TokenStream) -> TokenStream {
     let method_name = method.ident.to_string();
     let rpc_name = &method.rpc_name;
-    let server_streaming = method.server_streaming;
+    let server_streaming = method.shape.is_streaming();
     let retryable = method.retryable;
     let optional = method.optional;
     let idempotency = idempotency_tokens(method.idempotency, support);
@@ -471,7 +472,7 @@ fn generate_client_method(
 
     let sig_inputs = render_method_inputs(method.params.iter().map(|p| (&p.ident, &p.ty)));
     let (ok_ty, err_ty) = &method.result_types;
-    let return_ty = render_method_return_ty(ok_ty, err_ty, method.server_streaming);
+    let return_ty = render_method_return_ty(ok_ty, err_ty, method.shape);
     let err_convert = quote! {
         |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
     };
@@ -495,7 +496,7 @@ fn generate_client_method(
     // could receive inconsistently.
     let plane = auth_plane(method);
 
-    if method.server_streaming {
+    if method.shape.is_streaming() {
         return generate_streaming_client_method(
             method,
             stubs,
@@ -804,46 +805,92 @@ fn generate_streaming_client_method(
         AuthPlane::None => (quote! {}, quote! {}),
     };
 
-    quote! {
-        fn #method_ident #sig_inputs #return_ty {
-            use ::futures_util::StreamExt as _;
-            let __body_owned = #body_ident;
-            let __client_arc = self.inner.clone();
-            #ctx_clone
+    // Steps shared by both open shapes, in wire order: build the request,
+    // attach credentials, then await the response *headers*. That await is the
+    // open — tonic's client call is `async fn(..) -> Result<Response<Streaming<T>>,
+    // Status>`, so a server that returns a `Status` before its first message
+    // fails exactly here.
+    let open_call = quote! {
+        let __proto: _ = ::std::convert::From::from(__body_owned);
+        #[allow(unused_mut)]
+        let mut __request = ::tonic::Request::new(__proto);
+        #attach_metadata
+        let __response = __client
+            .#rpc_method_ident(__request)
+            .await
+            .map_err(|__s| -> #err_ty {
+                ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
+            })?;
+        let mut __stream = __response.into_inner();
+    };
 
-            ::std::boxed::Box::pin(::async_stream::try_stream! {
-                let mut __client = __client_arc;
-                let __proto: _ = ::std::convert::From::from(__body_owned);
-                #[allow(unused_mut)]
-                let mut __request = ::tonic::Request::new(__proto);
-                #attach_metadata
-                let __response = __client
-                    .#rpc_method_ident(__request)
-                    .await
-                    .map_err(|__s| -> #err_ty {
-                        ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
-                    })?;
-                let mut __stream = __response.into_inner();
-                while let Some(__item) = __stream.next().await {
-                    let __proto_item = __item.map_err(|__s| -> #err_ty {
-                        ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
-                    })?;
-                    // Fallible decode per item: a malformed `via_string` in one
-                    // frame ends the stream with an error instead of panicking
-                    // through whatever task is polling it.
-                    let __out: #ok_ty =
-                        <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
-                            __proto_item,
-                        )
-                        .map_err(|__e| -> #err_ty {
-                            ::std::convert::From::from(
-                                #support::runtime::transport_error::TransportError::serialization(__e),
-                            )
-                        })?;
-                    yield __out;
-                }
-            })
+    // Draining the message stream, once the open has succeeded.
+    let drain_items = quote! {
+        while let Some(__item) = __stream.next().await {
+            let __proto_item = __item.map_err(|__s| -> #err_ty {
+                ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
+            })?;
+            // Fallible decode per item: a malformed `via_string` in one
+            // frame ends the stream with an error instead of panicking
+            // through whatever task is polling it.
+            let __out: #ok_ty =
+                <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
+                    __proto_item,
+                )
+                .map_err(|__e| -> #err_ty {
+                    ::std::convert::From::from(
+                        #support::runtime::transport_error::TransportError::serialization(__e),
+                    )
+                })?;
+            yield __out;
         }
+    };
+
+    // Only reached for a streaming method, so `stream_open()` is always `Some`;
+    // the unreachable `None` takes the awaited path (its `Result`-wrapped shape).
+    match method.shape.stream_open() {
+        // Historical shape: the open and the items are flattened into one
+        // stream, so an open-time `Status` arrives as that stream's first item.
+        // Byte-for-byte as before, since every existing `#[streaming] fn`
+        // method depends on it.
+        Some(StreamOpen::Immediate) => quote! {
+            fn #method_ident #sig_inputs #return_ty {
+                use ::futures_util::StreamExt as _;
+                let __body_owned = #body_ident;
+                let __client_arc = self.inner.clone();
+                #ctx_clone
+
+                ::std::boxed::Box::pin(::async_stream::try_stream! {
+                    let mut __client = __client_arc;
+                    #open_call
+                    #drain_items
+                })
+            }
+        },
+        // Fallible open. The same await, left where the wire puts it instead of
+        // being buried inside the stream, so an open-time `Status` is an `Err`
+        // from the call and no stream is produced. Credential attachment moves
+        // ahead of the open with it: attaching is part of opening, and a
+        // failure to attach should no more become a stream item than a `Status`
+        // should. (`None` — a unary method — is unreachable here and folds in.)
+        Some(StreamOpen::Awaited) | None => quote! {
+            async fn #method_ident #sig_inputs #return_ty {
+                use ::futures_util::StreamExt as _;
+                let __body_owned = #body_ident;
+                let mut __client = self.inner.clone();
+                #ctx_clone
+
+                #open_call
+
+                // Past this point the open has succeeded and only per-message
+                // failures remain.
+                ::std::result::Result::Ok(::std::boxed::Box::pin(
+                    ::async_stream::try_stream! {
+                        #drain_items
+                    }
+                ))
+            }
+        },
     }
 }
 
@@ -976,8 +1023,10 @@ mod tests {
     fn platform_plane_streaming_method_attaches_internal_token() {
         let out = expand(quote! {
             pub trait FooApiGrpc: FooApi {
+                // `fn` — the infallible open. The `async fn` counterpart has
+                // its own test below, since it emits a different body.
                 #[streaming]
-                async fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+                fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
             }
         });
         assert!(out.contains("attach_internal_token"), "got:\n{out}");
@@ -988,12 +1037,56 @@ mod tests {
     fn tenant_plane_streaming_method_attaches_bearer_not_internal_token() {
         let out = expand(quote! {
             pub trait FooApiGrpc: FooApi {
+                // `fn` — see the sibling platform-plane test.
                 #[streaming]
-                async fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+                fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
             }
         });
         assert!(out.contains("attach_bearer"), "got:\n{out}");
         assert!(!out.contains("attach_internal_token"), "got:\n{out}");
+    }
+
+    /// The fallible-open streaming body is a *different* emission from the
+    /// immediate one, so credential attachment needs pinning there separately.
+    ///
+    /// It matters more here than on the immediate path: the `Awaited` body
+    /// hoists the open out of the `async_stream::try_stream!`, and the attach
+    /// has to move with it. Left behind, the request would go out
+    /// unauthenticated and the attach would run against a request already sent.
+    #[test]
+    fn awaited_open_streaming_method_attaches_credentials_before_the_open() {
+        let platform = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming(open = fallible)]
+                async fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            platform.contains("attach_internal_token"),
+            "got:\n{platform}"
+        );
+        assert!(!platform.contains("attach_bearer"), "got:\n{platform}");
+        // The attach must precede the call that opens the stream.
+        let attach = platform
+            .find("attach_internal_token")
+            .expect("attach is emitted");
+        let open = platform
+            .find("watch_thing (__request)")
+            .or_else(|| platform.find("watch_thing(__request)"))
+            .expect("the open call is emitted");
+        assert!(
+            attach < open,
+            "credentials must be attached before the open; got:\n{platform}"
+        );
+
+        let tenant = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming(open = fallible)]
+                async fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(tenant.contains("attach_bearer"), "got:\n{tenant}");
+        assert!(!tenant.contains("attach_internal_token"), "got:\n{tenant}");
     }
 
     #[test]

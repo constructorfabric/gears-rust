@@ -813,7 +813,7 @@ Storage backends follow the **ModKit plugin pattern**: each backend is a GTS typ
 
 ##### Plugin Trait
 
-The event broker SDK defines the storage backend contract following the `Backend` contract type semantics from [PR #1536](https://github.com/cyberfabric/cyberfabric-core/pull/1536) — remote-capable, independent failure domain, errors as RFC 9457 Problem Details, `SecurityContext` as first argument on every method.
+The event broker SDK defines the storage backend contract following the `Backend` contract type semantics from [PR #3622](https://github.com/constructorfabric/gears-rust/issues/3622) — remote-capable, independent failure domain, errors as RFC 9457 Problem Details, `SecurityContext` as first argument on every method.
 
 The trait is deliberately minimal — **four async data methods**. Per-call metadata (config schema, capability flags) lives in the GTS type registration, not on the trait. The backend knows nothing about cluster coordination, notifications, idempotency, or subscriptions. It is pure storage.
 

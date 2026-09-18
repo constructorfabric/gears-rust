@@ -805,6 +805,11 @@ impl HostRuntime {
         if let Some(hub_name) = &self.registry.grpc_hub {
             let mut gears_data = Vec::new();
             let mut seen = HashSet::new();
+            // Compiled-in service_name -> owning-gear map, installed as
+            // authoritative ownership below (see
+            // `GearManager::merge_authoritative_grpc_service_owners`).
+            let mut owners: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             // Collect services from all grpc gears
             for (gear_name, service_gear) in &self.registry.grpc_services {
@@ -833,6 +838,7 @@ impl HostRuntime {
                             ),
                         });
                     }
+                    owners.insert(reg.service_name.to_owned(), gear_name.clone());
                 }
 
                 gears_data.push(crate::runtime::GearInstallers {
@@ -840,6 +846,12 @@ impl HostRuntime {
                     installers,
                 });
             }
+
+            // Ordering matters: this runs after the orchestrator's init seeded
+            // operator config and before the directory-register / OoP-spawn
+            // phases, so ownership is pinned before the first self-registration.
+            self.gear_manager
+                .merge_authoritative_grpc_service_owners(owners);
 
             self.grpc_installers
                 .set(crate::runtime::GrpcInstallerData { gears: gears_data })

@@ -66,8 +66,8 @@ fn stmt(db: &DatabaseConnection, sql: impl Into<String>) -> Statement {
     Statement::from_string(db.get_database_backend(), sql.into())
 }
 
-/// Fresh in-memory SQLite with the initial migration applied and FK
-/// enforcement on — SQLite leaves foreign keys off by default, so the
+/// Fresh in-memory `SQLite` with the initial migration applied and FK
+/// enforcement on — `SQLite` leaves foreign keys off by default, so the
 /// composite-FK test would silently no-op without the PRAGMA.
 async fn migrated_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
@@ -174,6 +174,75 @@ async fn an_existing_schema_gains_the_coordination_state_table_and_seed() {
         1,
         "P0 seeds entity_write_order and nothing else; routing belongs to federation",
     );
+}
+
+/// Upgrade a non-empty installation: existing items receive `compat_forced = false`,
+/// consistent with the previous refusal of effective `force`.
+#[tokio::test]
+async fn an_existing_operation_item_gains_compat_forced_reading_false() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+
+    // A deployment that stopped at the initial migration, with one item in flight.
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("apply the initial migration alone");
+    insert_operation(&db, OP_ID, 1, 0).await;
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (id, operation_id, item_no, gts_id, dry_run, kind, \
+              expected_resource_version, status, request_payload, created_at) \
+             VALUES (1, {OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 1, '{{}}', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert a pending item under the pre-upgrade schema");
+    assert!(
+        exec(
+            &db,
+            "SELECT compat_forced FROM types_registry__operation_item"
+        )
+        .await
+        .is_err(),
+        "the initial migration must not carry the column, which is the whole point",
+    );
+
+    Migrator::up(&db, None).await.expect("apply the rest");
+
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            "SELECT compat_forced FROM types_registry__operation_item WHERE id = 1",
+        ))
+        .await
+        .expect("query the upgraded item")
+        .expect("the item survives the upgrade");
+    assert!(
+        !row.try_get::<bool>("", "compat_forced")
+            .expect("compat_forced"),
+        "an item accepted before waivers existed cannot have been forced",
+    );
+}
+
+/// `SQLite`'s INTEGER boolean needs an explicit 0/1 check.
+#[tokio::test]
+async fn the_lowered_compat_forced_boolean_refuses_a_value_outside_zero_and_one() {
+    let db = migrated_db().await;
+    insert_operation(&db, OP_ID, 1, 0).await;
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (id, operation_id, item_no, gts_id, dry_run, kind, \
+              expected_resource_version, compat_forced, status, request_payload, created_at) \
+             VALUES (1, {OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 7, 1, '{{}}', '{TS}')"
+        ),
+    )
+    .await
+    .expect_err("compat_forced is a boolean; the SQLite lowering must reject 7");
 }
 
 /// The migration preserves a pre-existing table and advanced seed.

@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use cf_system_sdks::directory::{DirectoryClient, DirectoryInvalidArgument, RegisterInstanceInfo};
+use cf_system_sdks::directory::{
+    DirectoryClient, DirectoryInvalidArgument, DirectoryPermissionDenied, RegisterInstanceInfo,
+};
 
 /// Initial retry backoff for registration and dependency polling.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -46,17 +48,47 @@ async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
     }
 }
 
+/// Classification of a failed registration attempt.
+///
+/// Permanence drives the retry decision and is *independent* of any log text, so
+/// a permanent rejection with no remediation hint still stops the loop rather
+/// than being retried forever.
+enum RejectionKind {
+    /// Retrying the identical request can never succeed — stop the backoff and
+    /// log loudly. The optional string is an operator-facing "what to check"
+    /// hint (the rejection *category* is already in the sentinel's `Display`).
+    Permanent(Option<&'static str>),
+    /// Transient or unrecognised — keep retrying with backoff.
+    Transient,
+}
+
+/// Classify a registration error for the retry decision.
+fn classify_rejection(err: &anyhow::Error) -> RejectionKind {
+    if err.is::<DirectoryInvalidArgument>() {
+        return RejectionKind::Permanent(Some("Check its configured labels and endpoint URIs"));
+    }
+    if err.is::<DirectoryPermissionDenied>() {
+        return RejectionKind::Permanent(Some(
+            "Check that this peer is authorized to register this gear (its ServiceAccount \
+             namespace / trust domain allowlist)",
+        ));
+    }
+    RejectionKind::Transient
+}
+
 /// Register `info` with the directory, retrying with exponential backoff.
 ///
 /// Returns `true` if the presence loop should keep running (the directory
-/// accepted the registration, or permanently rejected it), and `false` only if
-/// the task was cancelled.
+/// accepted the registration, or [permanently rejected](classify_rejection)
+/// it), and `false` only if the task was cancelled. A permanent rejection still
+/// returns `true`, so the caller keeps the presence loop alive; see
+/// [`presence_loop`].
 ///
-/// A [`DirectoryInvalidArgument`] rejection (e.g. a mis-configured label or
-/// endpoint URI) is permanent: retrying it can never succeed, so the backoff
-/// retry stops with a loud `error!` rather than spinning forever at `warn!`.
-/// It still returns `true`, so the caller keeps the presence loop alive; see
-/// [`presence_loop`]. All other errors are treated as transient and retried.
+/// **Not cancel-safe under `abort()`:** `cancel` is checked only between attempts,
+/// so the token exits the loop cleanly between RPCs but an abort can drop this
+/// mid-`register_instance`. Shutdown aborts the task then deregisters, so an abort
+/// landing mid-RPC can leave a registration committed after the deregister — a
+/// stale instance until its heartbeat TTL evicts it.
 async fn register_once_with_backoff(
     directory: &Arc<dyn DirectoryClient>,
     info: &RegisterInstanceInfo,
@@ -73,14 +105,14 @@ async fn register_once_with_backoff(
                 return true;
             }
             Err(e) => {
-                if let Some(invalid) = e.downcast_ref::<DirectoryInvalidArgument>() {
+                if let RejectionKind::Permanent(guidance) = classify_rejection(&e) {
                     tracing::error!(
                         gear = %info.gear,
                         instance = %info.instance_id,
-                        error = %invalid,
-                        "registration permanently rejected by the directory (invalid \
-                         argument); this instance may not be discoverable. Check its \
-                         configured labels and endpoint URIs"
+                        error = %e,
+                        guidance = guidance.unwrap_or("(no remediation hint available)"),
+                        "registration permanently rejected by the directory; this instance \
+                         may not be discoverable"
                     );
                     return true;
                 }
@@ -117,12 +149,15 @@ async fn register_once_with_backoff(
 /// Registering *before* the first heartbeat is deliberate: a heartbeat for an
 /// unregistered instance is a no-op on the directory.
 ///
-/// A permanent invalid-argument rejection never tears the presence loop down:
-/// the rejection is logged loudly at every attempt, but the loop keeps sending
-/// heartbeats (so an already-registered instance is not evicted by a transient
-/// directory-side validation change) and keeps retrying the idempotent
-/// re-registration (so it self-heals if the directory later accepts it). Only
-/// cancellation stops the loop.
+/// A [permanent rejection](classify_rejection) (a malformed request or
+/// an authorization denial) never tears the presence loop down: it is logged
+/// loudly at every attempt, but the loop keeps sending heartbeats (so an
+/// already-registered instance is not evicted by a transient directory-side
+/// policy / validation change) and keeps retrying the idempotent
+/// re-registration (so it self-heals if the directory later accepts it). A
+/// *recoverable* rejection — e.g. a gRPC service-name conflict that clears once
+/// the current owner deregisters — is retried with backoff like any transient
+/// error. Only cancellation stops the loop.
 pub(super) async fn presence_loop(
     directory: Arc<dyn DirectoryClient>,
     info: RegisterInstanceInfo,

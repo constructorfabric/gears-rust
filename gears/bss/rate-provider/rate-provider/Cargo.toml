@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider"
-version = "0.1.5"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider core gear: discovers + composes source plugins and registers the composite as a RateProviderV1 plugin the ledger resolves"
@@ -44,8 +44,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-# `DateTime::from_timestamp` in the composite fallback tests.
-chrono = { workspace = true }
+# `OffsetDateTime::from_unix_timestamp` in the composite fallback tests.
+time = { workspace = true }
 # Integration test (tests/discovery.rs): drive DiscoveringRateProvider over a real
 # ClientHub + an in-memory types-registry mock with fake scoped source plugins.
 tokio = { workspace = true }

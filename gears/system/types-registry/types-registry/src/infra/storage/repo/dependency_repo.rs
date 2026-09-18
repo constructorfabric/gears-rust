@@ -4,7 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use gts::GtsId;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait};
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult, Order, QueryFilter,
+    QuerySelect,
+};
 use toolkit_db::secure::{
     AccessScope, DBRunner, RecursiveCte, ScopeError, SecureDeleteExt, SecureEntityExt,
     SecureInsertManyExt,
@@ -13,13 +16,17 @@ use toolkit_db::secure::{
 use super::IN_CHUNK;
 use super::entity_repo::EntityRepo;
 use crate::domain::enums::DependencyKind;
-use crate::domain::ports::{DependencyClosure, EntityRow, ReverseImpact};
+use crate::domain::ports::{
+    CLOSURE_BOUND, DependencyClosure, DependencyEdgeRow, EDGE_PAGE_IDS, EdgeSide, EntityEdge,
+    EntityRow, ReverseImpact,
+};
+use crate::infra::storage::entity::enums::{
+    DependencyKind as StoredDependencyKind, LifecycleStatus,
+};
 use crate::infra::storage::entity::{dependency, entity};
 
-/// Maximum size of one dependency closure.
-///
-/// Independent of `limits.activation_write_set`: this limits reads, not refreshed rows.
-const CLOSURE_BOUND: usize = 512;
+// `CLOSURE_BOUND` lives beside the port so the dry-run admission view, which
+// walks the same relation over an overlay, is bounded by the same number.
 
 /// Name of the forward-closure CTE.
 const FORWARD_CLOSURE_CTE: &str = "forward_closure";
@@ -30,6 +37,272 @@ const REVERSE_IMPACT_CTE: &str = "reverse_impact";
 pub struct DependencyRepo;
 
 impl DependencyRepo {
+    /// Test direct Instance conformance without loading values or walking the graph.
+    /// Both queries apply the supplied scope through `SecureORM`; P0 declares both
+    /// entities `unrestricted`. At most one matching entity is returned,
+    /// irrespective of the number of Instances.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn has_live_direct_instances(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        type_schema_entity_id: i64,
+    ) -> Result<bool, ScopeError> {
+        const DIRECT_INSTANCES: &str = "direct_instances";
+        Ok(entity::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .with_ctes()
+            .cte::<dependency::Entity>(DIRECT_INSTANCES, |query| {
+                query
+                    .filter(dependency::Column::ToEntityId.eq(type_schema_entity_id))
+                    .filter(dependency::Column::Kind.eq(StoredDependencyKind::InstanceOf))
+                    .select_only()
+                    .column(dependency::Column::FromEntityId)
+            })
+            .join_cte(
+                DIRECT_INSTANCES,
+                Condition::all().add(
+                    Expr::col((Alias::new(DIRECT_INSTANCES), Alias::new("from_entity_id")))
+                        .equals((entity::Entity, entity::Column::Id)),
+                ),
+            )
+            .filter(
+                Condition::all().add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active)),
+            )
+            .limit(1)
+            .one(runner)
+            .await?
+            .is_some())
+    }
+
+    /// Count distinct live direct dependants across all edge kinds (SPEC §16.9).
+    /// `x-gts-ref` produces no edge. Limit the read and count to `bound + 1`.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn live_direct_dependents(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_id: i64,
+        bound: usize,
+    ) -> Result<usize, ScopeError> {
+        /// The projection: the dependant's entity id and nothing else, and the
+        /// field is deliberately never read. Identities do not leave this
+        /// function — the refusal reports a count — but the column has to be
+        /// selected for `DISTINCT` to mean "distinct dependants".
+        #[derive(FromQueryResult)]
+        struct DependentId {
+            #[expect(
+                dead_code,
+                reason = "selected so DISTINCT means 'distinct dependants'; the identity itself never leaves this function"
+            )]
+            id: i64,
+        }
+
+        const DIRECT_DEPENDENTS: &str = "direct_dependents";
+        let read_limit = u64::try_from(bound.saturating_add(1)).unwrap_or(u64::MAX);
+        let rows = entity::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .with_ctes()
+            .cte::<dependency::Entity>(DIRECT_DEPENDENTS, |query| {
+                query
+                    .filter(dependency::Column::ToEntityId.eq(entity_id))
+                    .select_only()
+                    .column(dependency::Column::FromEntityId)
+            })
+            .join_cte(
+                DIRECT_DEPENDENTS,
+                Condition::all().add(
+                    Expr::col((Alias::new(DIRECT_DEPENDENTS), Alias::new("from_entity_id")))
+                        .equals((entity::Entity, entity::Column::Id)),
+                ),
+            )
+            .filter(
+                Condition::all().add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active)),
+            )
+            .select_only()
+            .column(entity::Column::Id)
+            .distinct()
+            .limit(read_limit)
+            .all_as::<DependentId>(runner)
+            .await?;
+        Ok(rows.len())
+    }
+
+    /// Read stored edges between the given entities for deletion ordering.
+    /// Filter sources in SQL and targets in Rust to avoid doubling bind parameters.
+    /// External dependants are checked at commit time.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn edges_within(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<EntityEdge>, ScopeError> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let within: HashSet<i64> = entity_ids.iter().copied().collect();
+        let mut pairs: Vec<EntityEdge> = Vec::new();
+        for chunk in entity_ids.chunks(IN_CHUNK) {
+            let rows = dependency::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(
+                    Condition::all()
+                        .add(dependency::Column::FromEntityId.is_in(chunk.iter().copied())),
+                )
+                .all(runner)
+                .await?;
+            pairs.extend(
+                rows.into_iter()
+                    .filter(|row| within.contains(&row.to_entity_id))
+                    .map(|row| EntityEdge {
+                        from_entity_id: row.from_entity_id,
+                        to_entity_id: row.to_entity_id,
+                    }),
+            );
+        }
+        // One dependant can hold two edge kinds to one target; the order cares
+        // only that it waits.
+        pairs.sort_unstable();
+        pairs.dedup();
+        Ok(pairs)
+    }
+
+    /// Page edges in primary-key order, strictly after `after`, with a SQL limit.
+    ///
+    /// # Errors
+    /// [`ScopeError::Invalid`] for too many input IDs; propagates query failures.
+    pub async fn edge_page(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        side: EdgeSide,
+        after: Option<&DependencyEdgeRow>,
+        limit: usize,
+    ) -> Result<Vec<DependencyEdgeRow>, ScopeError> {
+        if entity_ids.len() > EDGE_PAGE_IDS {
+            return Err(ScopeError::Invalid(
+                "an edge page names more entity ids than one statement may carry",
+            ));
+        }
+        if entity_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let keyed = match side {
+            EdgeSide::Outgoing => dependency::Column::FromEntityId,
+            EdgeSide::Incoming => dependency::Column::ToEntityId,
+        };
+        let mut filter = Condition::all().add(keyed.is_in(entity_ids.iter().copied()));
+        if let Some(cursor) = after {
+            filter = filter.add(Self::after_cursor(cursor));
+        }
+        let rows = dependency::Entity::find()
+            .filter(filter)
+            .secure()
+            .scope_with(scope)
+            .order_by(dependency::Column::FromEntityId, Order::Asc)
+            .order_by(dependency::Column::Kind, Order::Asc)
+            .order_by(dependency::Column::ToEntityId, Order::Asc)
+            .limit(u64::try_from(limit).unwrap_or(u64::MAX))
+            .all(runner)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DependencyEdgeRow {
+                from_entity_id: row.from_entity_id,
+                kind: row.kind.into(),
+                to_entity_id: row.to_entity_id,
+            })
+            .collect())
+    }
+
+    /// The lexicographic `(from, kind, to) > cursor` predicate, spelled out
+    /// rather than as a row comparison: `MySQL`, `PostgreSQL` and `SQLite` all
+    /// accept this shape, and `sea_query`'s tuple comparison does not render
+    /// identically on all three.
+    fn after_cursor(cursor: &DependencyEdgeRow) -> Condition {
+        let kind: StoredDependencyKind = cursor.kind.into();
+        Condition::any()
+            .add(dependency::Column::FromEntityId.gt(cursor.from_entity_id))
+            .add(
+                Condition::all()
+                    .add(dependency::Column::FromEntityId.eq(cursor.from_entity_id))
+                    .add(
+                        Condition::any().add(dependency::Column::Kind.gt(kind)).add(
+                            Condition::all()
+                                .add(dependency::Column::Kind.eq(kind))
+                                .add(dependency::Column::ToEntityId.gt(cursor.to_entity_id)),
+                        ),
+                    ),
+            )
+    }
+
+    /// Return up to `limit` distinct live direct dependant IDs, optionally by kind.
+    /// The real path uses [`Self::live_direct_dependents`] to read only a count.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn live_direct_dependent_ids(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_id: i64,
+        kind: Option<DependencyKind>,
+        limit: usize,
+    ) -> Result<Vec<i64>, ScopeError> {
+        /// The projection: the dependant's entity id, which this read returns.
+        #[derive(FromQueryResult)]
+        struct DependentId {
+            id: i64,
+        }
+
+        const DIRECT_DEPENDENT_IDS: &str = "direct_dependent_ids";
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = entity::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .with_ctes()
+            .cte::<dependency::Entity>(DIRECT_DEPENDENT_IDS, |query| {
+                let mut filter = Condition::all().add(dependency::Column::ToEntityId.eq(entity_id));
+                if let Some(kind) = kind {
+                    let stored: StoredDependencyKind = kind.into();
+                    filter = filter.add(dependency::Column::Kind.eq(stored));
+                }
+                query
+                    .filter(filter)
+                    .select_only()
+                    .column(dependency::Column::FromEntityId)
+            })
+            .join_cte(
+                DIRECT_DEPENDENT_IDS,
+                Condition::all().add(
+                    Expr::col((
+                        Alias::new(DIRECT_DEPENDENT_IDS),
+                        Alias::new("from_entity_id"),
+                    ))
+                    .equals((entity::Entity, entity::Column::Id)),
+                ),
+            )
+            .filter(
+                Condition::all().add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active)),
+            )
+            .select_only()
+            .column(entity::Column::Id)
+            .distinct()
+            .order_by(entity::Column::Id, Order::Asc)
+            .limit(u64::try_from(limit).unwrap_or(u64::MAX))
+            .all_as::<DependentId>(runner)
+            .await?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
+    }
+
     /// Replace one entity's outgoing edges.
     ///
     /// Admission replaces only the admitted entity's outgoing rows, never anyone

@@ -10,10 +10,11 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote, quote_spanned};
 use syn::{Ident, TraitItem, Type};
 
+use crate::model::{MethodShape, StreamFraming, StreamOpen};
 use crate::projection::{
-    build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
+    Delegation, build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
     is_platform_security_context_type, is_security_context_type, rewrite_streaming_signature,
-    strip_method_attrs,
+    streaming_return_type, strip_method_attrs,
 };
 use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
 use crate::support::contract_support_path;
@@ -33,7 +34,7 @@ const HTTP_ATTRS: &[&str] = &[
 ];
 
 fn streaming_idents(method: &RestMethodModel) -> Option<(Type, Type)> {
-    if method.streaming {
+    if method.shape.is_streaming() {
         method.result_types.clone()
     } else {
         None
@@ -248,10 +249,16 @@ fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
     let mut item = model.item.clone();
     let base_trait = &model.base_trait;
 
-    let streaming_methods: std::collections::HashMap<String, (Type, Type)> = model
+    let streaming_methods: std::collections::HashMap<String, (Type, Type, StreamOpen)> = model
         .methods
         .iter()
-        .filter_map(|m| streaming_idents(m).map(|t| (m.ident.to_string(), t)))
+        .filter_map(|m| {
+            streaming_idents(m).and_then(|(ok, err)| {
+                m.shape
+                    .stream_open()
+                    .map(|open| (m.ident.to_string(), (ok, err, open)))
+            })
+        })
         .collect();
     let model_methods: std::collections::HashMap<String, &RestMethodModel> = model
         .methods
@@ -262,8 +269,8 @@ fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
     for trait_item in &mut item.items {
         if let TraitItem::Fn(method) = trait_item {
             strip_method_attrs(method, HTTP_ATTRS);
-            if let Some((ok, err)) = streaming_methods.get(&method.sig.ident.to_string()) {
-                rewrite_streaming_signature(method, ok, err);
+            if let Some((ok, err, open)) = streaming_methods.get(&method.sig.ident.to_string()) {
+                rewrite_streaming_signature(method, ok, err, *open);
             }
             // PRD #1536 D3: projection-trait methods become default fns
             // that delegate to the base trait via fully-qualified syntax.
@@ -280,7 +287,7 @@ fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
                     base_trait,
                     &model_method.ident,
                     arg_idents,
-                    model_method.streaming,
+                    Delegation::for_method(model_method.shape),
                 ));
             }
         }
@@ -322,7 +329,8 @@ fn build_method_binding(method: &RestMethodModel, support: &TokenStream) -> Toke
     let path = &method.path_template;
     let http_method = http_method_tokens(method.http_method, support);
     let retryable = method.retryable;
-    let streaming = method.streaming;
+    let streaming = method.shape.is_streaming();
+    let stream_framing = stream_framing_tokens(method.stream_framing, support);
     let optional = method.optional;
 
     let field_bindings = build_field_bindings(method, support);
@@ -335,9 +343,18 @@ fn build_method_binding(method: &RestMethodModel, support: &TokenStream) -> Toke
             field_bindings: vec![ #(#field_bindings),* ],
             retryable: #retryable,
             streaming: #streaming,
+            stream_framing: #stream_framing,
             optional: #optional,
         }
     }
+}
+
+/// A variant path of the runtime `StreamFraming`. A path (not a struct literal)
+/// is why that enum can be `#[non_exhaustive]` while the binding struct around
+/// it cannot.
+fn stream_framing_tokens(framing: StreamFraming, support: &TokenStream) -> TokenStream {
+    let variant = syn::Ident::new(framing.ir_variant(), proc_macro2::Span::call_site());
+    quote! { #support::ir::binding::StreamFraming::#variant }
 }
 
 fn http_method_tokens(verb: HttpVerb, support: &TokenStream) -> TokenStream {
@@ -610,7 +627,10 @@ fn generate_resolving_method(
         .map(|p| &p.ident)
         .collect();
 
-    if method.streaming {
+    // An `Awaited` stream falls through to the unary arm below: its signature
+    // is `async fn -> Result<Stream, E>`, so a resolve failure is a plain `?`
+    // rather than a one-item error stream.
+    if method.shape == MethodShape::Stream(StreamOpen::Immediate) {
         let item_ty = streaming_item_type(method);
         let err_ty = error_type(method);
         return quote! {
@@ -708,18 +728,18 @@ fn generate_client_method(
     // Per-method client span (baked-in telemetry) — see `client_span_ctor`.
     let span_ctor = client_span_ctor(&trait_ident.to_string(), &method_name_str, method, support);
 
-    if method.streaming {
-        return generate_streaming_method_body(
+    if method.shape.is_streaming() {
+        return generate_streaming_method_body(&StreamingBody {
             method,
-            &sig,
-            &binding_fn,
-            &method_name_str,
-            &fields_init,
-            &query_init,
-            &auth_capture,
-            &span_ctor,
+            sig: &sig,
+            binding_fn: &binding_fn,
+            method_name: &method_name_str,
+            fields_init: &fields_init,
+            query_init: &query_init,
+            auth_capture: &auth_capture,
+            span_ctor: &span_ctor,
             support,
-        );
+        });
     }
 
     let verb = method.http_method;
@@ -838,25 +858,186 @@ fn generate_client_method(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn generate_streaming_method_body(
-    method: &RestMethodModel,
-    sig: &TokenStream,
-    binding_fn: &syn::Ident,
-    method_name: &str,
-    fields_init: &TokenStream,
-    query_init: &TokenStream,
-    auth_capture: &TokenStream,
-    span_ctor: &TokenStream,
-    support: &TokenStream,
-) -> TokenStream {
-    let method_ident = &method.ident;
-    let item_ty = streaming_item_type(method);
+/// The inputs a generated streaming client method needs, bundled so the
+/// prelude builder and both open-shape arms can share one reference instead of
+/// threading nine positional arguments each.
+struct StreamingBody<'a> {
+    method: &'a RestMethodModel,
+    sig: &'a TokenStream,
+    binding_fn: &'a syn::Ident,
+    method_name: &'a str,
+    fields_init: &'a TokenStream,
+    query_init: &'a TokenStream,
+    auth_capture: &'a TokenStream,
+    span_ctor: &'a TokenStream,
+    support: &'a TokenStream,
+}
+
+fn generate_streaming_method_body(parts: &StreamingBody<'_>) -> TokenStream {
+    // Only reached for a streaming method, so `stream_open()` is always `Some`;
+    // the unreachable `None` takes the awaited path (its `Result`-wrapped shape).
+    match parts.method.shape.stream_open() {
+        Some(StreamOpen::Immediate) => generate_immediate_streaming_body(parts),
+        Some(StreamOpen::Awaited) | None => generate_awaited_streaming_body(parts),
+    }
+}
+
+/// The request-setup preamble shared by both open shapes: binding lookup, URL
+/// composition, auth capture, and the per-attempt request factory.
+///
+/// `bail` renders the early-return used by every pre-flight failure, given a
+/// converted error already bound to `__err`. The two open shapes differ only
+/// in what a failure *is*: an `Immediate` method has no way to report one
+/// except as a one-item error stream, whereas an `Awaited` method returns
+/// `Err` from the call itself. Everything between those returns is identical,
+/// so it lives here once.
+fn streaming_request_prelude(parts: &StreamingBody<'_>, bail: &TokenStream) -> TokenStream {
+    let StreamingBody {
+        method,
+        binding_fn,
+        method_name,
+        fields_init,
+        query_init,
+        auth_capture,
+        support,
+        ..
+    } = *parts;
     let err_ty = error_type(method);
     let verb_call = http_verb_call(method.http_method);
+    let accept = method.stream_framing.media_type();
     let convert_err = quote! {
         |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
     };
+
+    quote! {
+        let __binding = #binding_fn();
+        // The binding is generated from the same trait model, so this is
+        // unreachable in practice — but return a typed error rather than
+        // panicking inside generated library code (mirrors the unary path).
+        let __m = match __binding.find_method(#method_name) {
+            ::std::option::Option::Some(__m) => __m.clone(),
+            ::std::option::Option::None => {
+                let __err = (#convert_err)(
+                    #support::runtime::transport_error::TransportError::UrlBuild(
+                        concat!(
+                            "missing HTTP binding for method '",
+                            #method_name,
+                            "'",
+                        )
+                        .to_owned(),
+                    ),
+                );
+                #bail
+            }
+        };
+        let __base_path = __binding.base_path.clone();
+        let __base_url = self.config.base_url.clone();
+        let __http = self.http.clone();
+
+        #fields_init
+        #query_init
+        #auth_capture
+
+        // Bind the convert closure once so we can both call it
+        // imperatively (URL-build error path) and pass it to the map_err
+        // tail below. Boxed because closures don't impl `Copy`.
+        let __convert: ::std::boxed::Box<
+            dyn Fn(#support::runtime::transport_error::TransportError) -> #err_ty + Send,
+        > = ::std::boxed::Box::new(#convert_err);
+        let __fields = match __fields_result {
+            Ok(v) => v,
+            Err(e) => {
+                let __err = __convert(e);
+                #bail
+            }
+        };
+        // Compute the URL once; reconnect attempts re-use it.
+        let __query = match __query_result {
+            Ok(v) => v,
+            Err(e) => {
+                let __err = __convert(e);
+                #bail
+            }
+        };
+        let __url_result = #support::runtime::http::build_request_url(
+            &__base_url, &__base_path, &__m, &__fields, __query.as_deref(),
+        );
+        let __url = match __url_result {
+            Ok(u) => u,
+            Err(e) => {
+                let __err = __convert(e);
+                #bail
+            }
+        };
+        // Factory: invoked once per attempt with the latest seen
+        // `Last-Event-ID`. On the first attempt `last` is `None`.
+        let __factory = move |last: ::std::option::Option<&str>|
+            -> ::std::result::Result<
+                ::toolkit_http::RequestBuilder,
+                #support::runtime::transport_error::TransportError,
+            >
+        {
+            // A streaming client MUST advertise its framing's media type
+            // (PRD §5.6) so content-negotiating servers/gateways return the
+            // stream rather than JSON. This is the same `StreamFraming` the
+            // runtime parser is selected from, so the header and the parser
+            // cannot disagree.
+            let mut __builder = __http
+                .#verb_call(&__url)
+                .header("accept", #accept);
+            // Tenant bearer via a sensitive `Authorization` header, or the
+            // platform-plane runtime credential via a sensitive
+            // `X-ToolKit-Internal-Token` (never `Authorization`); at most one
+            // of the two is Some. The platform credential is resolved fresh
+            // on every reconnect attempt (not once before the stream
+            // started) so a rotated/refreshed token is used on reconnects.
+            if let Some(ref __t) = __bearer {
+                __builder = __builder.bearer_auth(__t);
+            }
+            // Platform-plane credential attach routed through the single
+            // audited runtime helper (shared with the unary path), which
+            // re-resolves per reconnect and warns on an unavailable source.
+            __builder = #support::runtime::http::attach_internal_token(
+                __builder,
+                __internal_token_provider.as_ref(),
+                #method_name,
+            );
+            // `Last-Event-ID` resume is an SSE mechanism. Under any other
+            // framing the runtime hands this factory a permanent `None`
+            // (`multipart/mixed` has no resume token), so this branch is
+            // unreachable there rather than conditionally compiled away — one
+            // factory shape for every framing, with the framing deciding what
+            // it is called with.
+            if let Some(__id) = last {
+                __builder = __builder.header("Last-Event-ID", __id);
+            }
+            ::std::result::Result::Ok(__builder)
+        };
+    }
+}
+
+/// `#[streaming] fn` — the historical shape. The stream is handed back
+/// synchronously, so every pre-flight failure can only be reported as the
+/// stream's first (and only) item.
+fn generate_immediate_streaming_body(parts: &StreamingBody<'_>) -> TokenStream {
+    let StreamingBody {
+        method,
+        sig,
+        span_ctor,
+        support,
+        ..
+    } = *parts;
+    let method_ident = &method.ident;
+    let item_ty = streaming_item_type(method);
+    let framing = stream_framing_tokens(method.stream_framing, support);
+    let prelude = streaming_request_prelude(
+        parts,
+        &quote! {
+            return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                ::std::result::Result::Err(__err)
+            }));
+        },
+    );
 
     quote! {
         fn #method_ident #sig {
@@ -867,116 +1048,21 @@ fn generate_streaming_method_body(
             // per-attempt HTTP send is traced by `toolkit-http`'s OtelLayer.
             let __span = #span_ctor;
 
-            let __binding = #binding_fn();
-            // The binding is generated from the same trait model, so this is
-            // unreachable in practice — but return a typed error rather than
-            // panicking inside generated library code (mirrors the unary path).
-            let __m = match __binding.find_method(#method_name) {
-                ::std::option::Option::Some(__m) => __m.clone(),
-                ::std::option::Option::None => {
-                    let __err = (#convert_err)(
-                        #support::runtime::transport_error::TransportError::UrlBuild(
-                            concat!(
-                                "missing HTTP binding for method '",
-                                #method_name,
-                                "'",
-                            )
-                            .to_owned(),
-                        ),
-                    );
-                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
-                        ::std::result::Result::Err(__err)
-                    }));
-                }
-            };
-            let __base_path = __binding.base_path.clone();
-            let __base_url = self.config.base_url.clone();
-            let __http = self.http.clone();
+            #prelude
 
-            #fields_init
-            #query_init
-            #auth_capture
-
-            // Bind the convert closure once so we can both call it
-            // imperatively (URL-build error path) and pass it to the map_err
-            // tail below. Boxed because closures don't impl `Copy`.
-            let __convert: ::std::boxed::Box<
-                dyn Fn(#support::runtime::transport_error::TransportError) -> #err_ty + Send,
-            > = ::std::boxed::Box::new(#convert_err);
-            let __fields = match __fields_result {
-                Ok(v) => v,
-                Err(e) => {
-                    let __err = __convert(e);
-                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
-                        ::std::result::Result::Err(__err)
-                    }));
-                }
-            };
-            // Compute the URL once; reconnect attempts re-use it.
-            let __query = match __query_result {
-                Ok(v) => v,
-                Err(e) => {
-                    let __err = __convert(e);
-                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
-                        ::std::result::Result::Err(__err)
-                    }));
-                }
-            };
-            let __url_result = #support::runtime::http::build_request_url(
-                &__base_url, &__base_path, &__m, &__fields, __query.as_deref(),
-            );
-            let __url = match __url_result {
-                Ok(u) => u,
-                Err(e) => {
-                    let __err = __convert(e);
-                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
-                        ::std::result::Result::Err(__err)
-                    }));
-                }
-            };
-            let __reconnect = self.config.sse_reconnect.clone();
-            // Factory: invoked once per attempt with the latest seen
-            // `Last-Event-ID`. On the first attempt `last` is `None`.
-            let __factory = move |last: ::std::option::Option<&str>|
-                -> ::std::result::Result<
-                    ::toolkit_http::RequestBuilder,
-                    #support::runtime::transport_error::TransportError,
-                >
-            {
-                // SSE clients MUST advertise the event-stream media type
-                // (PRD §5.6) so content-negotiating servers/gateways return the
-                // stream rather than JSON.
-                let mut __builder = __http
-                    .#verb_call(&__url)
-                    .header("accept", "text/event-stream");
-                // Tenant bearer via a sensitive `Authorization` header, or the
-                // platform-plane runtime credential via a sensitive
-                // `X-ToolKit-Internal-Token` (never `Authorization`); at most one
-                // of the two is Some. The platform credential is resolved fresh
-                // on every reconnect attempt (not once before the stream
-                // started) so a rotated/refreshed token is used on reconnects.
-                if let Some(ref __t) = __bearer {
-                    __builder = __builder.bearer_auth(__t);
-                }
-                // Platform-plane credential attach routed through the single
-                // audited runtime helper (shared with the unary path), which
-                // re-resolves per reconnect and warns on an unavailable source.
-                __builder = #support::runtime::http::attach_internal_token(
-                    __builder,
-                    __internal_token_provider.as_ref(),
-                    #method_name,
-                );
-                if let Some(__id) = last {
-                    __builder = __builder.header("Last-Event-ID", __id);
-                }
-                ::std::result::Result::Ok(__builder)
-            };
-
-            // SSE uses the per-event idle deadline (NOT the unary `timeout`),
-            // so a healthy slow stream is not killed between events.
-            let __timeout = ::std::option::Option::Some(self.config.sse_idle_timeout);
+            // A stream uses the per-item idle deadline (NOT the unary
+            // `timeout`), so a healthy slow stream is not killed between items.
+            //
+            // Per-client reconnect policy (D6: only the immediate form gets
+            // one — a fallible open carries domain semantics the client must
+            // not blindly repeat).
+            let __request = #support::runtime::client::StreamRequest::new(__factory)
+                .framing(#framing)
+                .reconnect(self.config.stream_reconnect.clone())
+                .open_timeout(self.config.timeout)
+                .idle_timeout(self.config.stream_idle_timeout);
             let __stream = #support::runtime::client::send_streaming::<_, #item_ty>(
-                __factory, __reconnect, __timeout,
+                __request,
             );
             ::std::boxed::Box::pin(__stream.map(move |r| {
                 let __enter = __span.enter();
@@ -987,6 +1073,85 @@ fn generate_streaming_method_body(
                 ::std::mem::drop(__enter);
                 __mapped
             }))
+        }
+    }
+}
+
+/// `#[streaming] async fn` — the fallible open (D2). Connect and status check
+/// run eagerly, so an open-time failure is an `Err` from the call itself and no
+/// stream is produced.
+fn generate_awaited_streaming_body(parts: &StreamingBody<'_>) -> TokenStream {
+    let StreamingBody {
+        method,
+        sig,
+        span_ctor,
+        support,
+        ..
+    } = *parts;
+    let method_ident = &method.ident;
+    let item_ty = streaming_item_type(method);
+    let err_ty = error_type(method);
+    let framing = stream_framing_tokens(method.stream_framing, support);
+    let prelude = streaming_request_prelude(
+        parts,
+        &quote! {
+            #support::__tracing::Span::current().record("error", true);
+            return ::std::result::Result::Err(__err);
+        },
+    );
+
+    quote! {
+        async fn #method_ident #sig {
+            use ::futures_util::StreamExt as _;
+
+            // Per-method client span (baked-in telemetry). Unlike the
+            // immediate form, the *open* runs inside this span too — it is a
+            // real awaited operation that can fail, so tracing only the
+            // yielded items would leave the failure that matters most
+            // untraced. `__item_span` re-enters it per item afterwards.
+            let __span = #span_ctor;
+            let __item_span = __span.clone();
+
+            #support::__tracing::Instrument::instrument(async move {
+                #prelude
+
+                // D6: a fallible open means the open carries domain semantics
+                // the client must not blindly repeat — the exclusion lease it
+                // may have acquired is owned by the returned stream, and a
+                // reconnect-time failure would land as a stream item, past the
+                // caller's open-time state machine. So reconnect is
+                // *disabled*, derived from the declared shape rather than
+                // authored (Q3).
+                let __request = #support::runtime::client::StreamRequest::new(__factory)
+                    .framing(#framing)
+                    .reconnect(#support::runtime::config::ReconnectConfig::disabled())
+                    .open_timeout(self.config.timeout)
+                    .idle_timeout(self.config.stream_idle_timeout);
+                let __stream = match #support::runtime::client::open_streaming::<_, #item_ty>(
+                    __request,
+                ).await {
+                    ::std::result::Result::Ok(__s) => __s,
+                    ::std::result::Result::Err(e) => {
+                        let __err = __convert(e);
+                        #support::__tracing::Span::current().record("error", true);
+                        return ::std::result::Result::Err(__err);
+                    }
+                };
+                let __boxed: ::std::pin::Pin<::std::boxed::Box<
+                    dyn ::futures_core::Stream<
+                        Item = ::std::result::Result<#item_ty, #err_ty>,
+                    > + ::std::marker::Send + 'static,
+                >> = ::std::boxed::Box::pin(__stream.map(move |r| {
+                    let __enter = __item_span.enter();
+                    let __mapped = r.map_err(|e| __convert(e));
+                    if __mapped.is_err() {
+                        #support::__tracing::Span::current().record("error", true);
+                    }
+                    ::std::mem::drop(__enter);
+                    __mapped
+                }));
+                ::std::result::Result::Ok(__boxed)
+            }, __span).await
         }
     }
 }
@@ -1002,7 +1167,9 @@ fn render_method_signature(method: &RestMethodModel) -> TokenStream {
     });
 
     let return_ty = match &method.result_types {
-        Some((ok, err)) if !method.streaming => quote! { -> ::std::result::Result<#ok, #err> },
+        Some((ok, err)) if !method.shape.is_streaming() => {
+            quote! { -> ::std::result::Result<#ok, #err> }
+        }
         _ => streaming_signature_return(method),
     };
 
@@ -1014,11 +1181,13 @@ fn render_method_signature(method: &RestMethodModel) -> TokenStream {
 fn streaming_signature_return(method: &RestMethodModel) -> TokenStream {
     // For streaming methods we mirror the original trait return type. The
     // parser recorded it as the function output; we re-emit the same tokens
-    // here by re-using the generic stream signature.
+    // here by re-using the shared projection helper, which also applies the
+    // `Result<..>` wrapper for a fallible (`Awaited`) open.
     if let Some((ok, err)) = &method.result_types {
-        return quote! {
-            -> ::std::pin::Pin<::std::boxed::Box<dyn ::futures_core::Stream<Item = ::std::result::Result<#ok, #err>> + ::std::marker::Send + 'static>>
-        };
+        // Reached only for a streaming method (the caller's unary arm handles the
+        // rest), so `stream_open()` is `Some`; default to `Immediate` otherwise.
+        let open = method.shape.stream_open().unwrap_or_default();
+        return streaming_return_type(ok, err, open);
     }
     quote! { -> ::std::pin::Pin<::std::boxed::Box<dyn ::futures_core::Stream<Item = ()> + ::std::marker::Send + 'static>> }
 }
@@ -1293,7 +1462,7 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
     // must opt out with `#[server_manual]` and be registered by hand via
     // `OperationBuilder`. (server_manual methods are filtered out before
     // reaching this function, so a streaming method here is an un-opted-out one.)
-    if method.streaming {
+    if method.shape.is_streaming() {
         let ident = &method.ident;
         let msg = format!(
             "rest_contract: streaming method `{ident}` cannot be auto-registered on the server yet. \

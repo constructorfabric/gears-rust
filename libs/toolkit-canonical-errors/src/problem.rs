@@ -52,6 +52,31 @@ pub enum ProblemCategory {
 }
 
 impl ProblemCategory {
+    /// Every [`ProblemCategory`] variant, in declaration order.
+    ///
+    /// Lets exhaustive checks — a category → gRPC/HTTP code table, a round-trip
+    /// test — be driven from the source of truth rather than a hand-maintained
+    /// list, so a variant added below can't be silently omitted. Kept complete
+    /// by the exhaustiveness guard just after this `impl`.
+    pub const ALL: &'static [Self] = &[
+        Self::Cancelled,
+        Self::Unknown,
+        Self::InvalidArgument,
+        Self::DeadlineExceeded,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::PermissionDenied,
+        Self::ResourceExhausted,
+        Self::FailedPrecondition,
+        Self::Aborted,
+        Self::OutOfRange,
+        Self::Unimplemented,
+        Self::Internal,
+        Self::ServiceUnavailable,
+        Self::DataLoss,
+        Self::Unauthenticated,
+    ];
+
     /// GTS URI fragment (without the `gts://` scheme). Identical to the
     /// fragment emitted by [`CanonicalError::gts_type`] for the matching
     /// variant.
@@ -146,6 +171,35 @@ impl ProblemCategory {
         }
     }
 }
+
+// Exhaustiveness guard for [`ProblemCategory::ALL`]. `#[non_exhaustive]` only
+// forces a wildcard on *downstream* crates; within this crate this match must
+// cover every variant, so adding one fails to compile here — the reminder to
+// append it to `ALL` above (and to `ALL.len()` below).
+const _: () = {
+    fn _assert_all_variants_listed(category: ProblemCategory) {
+        match category {
+            ProblemCategory::Cancelled
+            | ProblemCategory::Unknown
+            | ProblemCategory::InvalidArgument
+            | ProblemCategory::DeadlineExceeded
+            | ProblemCategory::NotFound
+            | ProblemCategory::AlreadyExists
+            | ProblemCategory::PermissionDenied
+            | ProblemCategory::ResourceExhausted
+            | ProblemCategory::FailedPrecondition
+            | ProblemCategory::Aborted
+            | ProblemCategory::OutOfRange
+            | ProblemCategory::Unimplemented
+            | ProblemCategory::Internal
+            | ProblemCategory::ServiceUnavailable
+            | ProblemCategory::DataLoss
+            | ProblemCategory::Unauthenticated => {}
+        }
+    }
+    // A variant added to the match but not to `ALL` (or vice versa) trips this.
+    assert!(ProblemCategory::ALL.len() == 16);
+};
 
 // ---------------------------------------------------------------------------
 // Problem (RFC 9457)

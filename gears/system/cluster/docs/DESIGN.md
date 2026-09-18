@@ -309,10 +309,10 @@ All three backend traits MUST be dyn-compatible. The SDK includes compile-time a
 | `LeaderElectionBackend` | Plugin-facing async trait. Methods: `features() -> LeaderElectionFeatures`, `elect`, `elect_with_config`. |
 | `DistributedLockBackend` | Plugin-facing async trait. Methods: `features() -> LockFeatures`, `try_lock`, `lock`. |
 | `ClusterProfile` | Marker trait: `pub trait ClusterProfile: 'static + Send + Sync + Copy { const NAME: &'static str; }`. Consumer crates impl this on a ZST struct once per profile; the `NAME` is the only place the profile string lives on the consumer side. |
-| `CacheCapability` | `#[non_exhaustive] enum { Linearizable, PrefixWatch }`. Per-primitive requirement enum used at resolver call sites. |
+| `CacheCapability` | `#[non_exhaustive] enum { Linearizable, Watch, PrefixWatch }`. Per-primitive requirement enum used at resolver call sites. `Watch` demands native exact-key watch; `PrefixWatch` demands native prefix watch. |
 | `LeaderElectionCapability` | `#[non_exhaustive] enum { Linearizable }`. |
 | `LockCapability` | `#[non_exhaustive] enum { Linearizable }`. |
-| `CacheFeatures` | `#[non_exhaustive] struct { prefix_watch: bool, ... }`. Backend declares native capability availability. |
+| `CacheFeatures` | `#[non_exhaustive] struct` with **private** `watch` / `prefix_watch` bools, read via `watch()` / `prefix_watch()` accessors and built only via `new(prefix_watch)` / `without_watch()`. Backend declares native capability availability. The fields are private (not `pub`) so the `!watch ⇒ !prefix_watch` invariant cannot be broken by field assignment on a held `Copy` value — the resolver's `Watch`/`PrefixWatch` gates and the wire decoder both rely on it. `watch() == false` means the backend serves no exact watch (`watch()` → `Unsupported { feature: "watch" }`) and forces `prefix_watch() == false` too — a backend that cannot watch one key cannot watch a family of them; see §3.12 for why watchless consumers degrade rather than polyfill. |
 | `LeaderElectionFeatures` | `#[non_exhaustive] struct { linearizable: bool, ... }`. |
 | `LockFeatures` | `#[non_exhaustive] struct { linearizable: bool, ... }`. |
 | `*ResolverBuilder<'a>` | Per-primitive fluent builder: `.profile<P: ClusterProfile>(_: P)`, `.require(cap: *Capability)`, `.resolve() -> Result<*V1, ClusterError>`. |
@@ -424,7 +424,7 @@ Each plugin (Postgres, K8s, Redis, NATS, etcd, standalone) exposes a builder/han
 | `contains` | `async fn contains(&self, key: &str) -> Result<bool, ClusterError>` | Existence check. MAY be `get(key).is_some()`. |
 | `put_if_absent` | `async fn put_if_absent(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Result<Option<CacheEntry>, ClusterError>` | Atomic. `Some(entry)` if created, `None` if key existed. Emits `Changed` on creation only. |
 | `compare_and_swap` | `async fn compare_and_swap(&self, key: &str, expected_version: u64, new_value: &[u8], ttl: Option<Duration>) -> Result<CacheEntry, ClusterError>` | Atomic version-based CAS. Emits `Changed` on success. `CasConflict { key, current }` on mismatch — `current` SHOULD contain the entry if cheaply obtainable. |
-| `watch` | `async fn watch(&self, key: &str) -> Result<CacheWatch, ClusterError>` | Yields `CacheWatchEvent` for exact key. Drop unsubscribes. |
+| `watch` | `async fn watch(&self, key: &str) -> Result<CacheWatch, ClusterError>` | Yields `CacheWatchEvent` for exact key. Drop unsubscribes. Backends declaring `features().watch == false` return `Err(Unsupported { feature: "watch" })`; CAS-default consumers degrade to timer/poll — no polyfill, see §3.12. |
 | `watch_prefix` | `async fn watch_prefix(&self, prefix: &str) -> Result<CacheWatch, ClusterError>` | Yields `CacheWatchEvent` for matching keys. Backends declaring `features().prefix_watch == false` return `Err(Unsupported { feature: "prefix_watch" })`. Callers may polyfill via `PollingPrefixWatch`. |
 | `CacheWatch::auto_restart` | `fn auto_restart(self, policy: RetryPolicy) -> RestartingWatch<CacheWatch>` | Wraps the watch with the SDK auto-restart combinator. See §3.9 for retryability classification and `RetryPolicy` defaults. `LeaderWatch::auto_restart` follows the same shape. |
 
@@ -705,7 +705,8 @@ Each primitive declares its own `*Capability` enum carrying the requirements a c
 | Capability | Descriptor field | Check |
 |---|---|---|
 | `CacheCapability::Linearizable` | `descriptor.consistency` | `CacheConsistency::from(...) == Linearizable` |
-| `CacheCapability::PrefixWatch` | `descriptor.features.prefix_watch` | `== true` |
+| `CacheCapability::Watch` | `CacheFeatures::from(descriptor.features).watch()` | `== true` (normalized: a `None` wire `watch` is an old peer that predates the field and *does* serve exact watch, so it decodes to `true`) |
+| `CacheCapability::PrefixWatch` | `CacheFeatures::from(descriptor.features).prefix_watch()` | `== true` |
 | `LeaderElectionCapability::Linearizable` | `descriptor.features.linearizable` | `== true` |
 | `LockCapability::Linearizable` | `descriptor.features.linearizable` | `== true` |
 
@@ -716,6 +717,14 @@ pub fn validate_cache_capabilities_from(
     descriptor: &CacheDescriptor,
     reqs: &[CacheCapability],
 ) -> Result<(), ClusterError> {
+    // Decode the wire mirror once so every watch-family arm reads the same
+    // normalized view: `CacheFeatures::from` applies the absent-is-supported
+    // default (`watch: None` → an old peer that serves exact watch) and the
+    // `!watch ⇒ !prefix_watch` invariant (equivalently `prefix_watch ⇒ watch`:
+    // native prefix watch implies exact watch, but not the reverse). Reading the raw wire bool in one arm and
+    // the decoded value in another would let a skewed descriptor satisfy one
+    // watch check yet fail the other.
+    let features = CacheFeatures::from(descriptor.features);
     for cap in reqs {
         match cap {
             CacheCapability::Linearizable => {
@@ -727,8 +736,17 @@ pub fn validate_cache_capabilities_from(
                     });
                 }
             }
+            CacheCapability::Watch => {
+                if !features.watch() {
+                    return Err(ClusterError::CapabilityNotMet {
+                        primitive: "ClusterCacheV1",
+                        capability: "Watch",
+                        provider: intern(&descriptor.provider),
+                    });
+                }
+            }
             CacheCapability::PrefixWatch => {
-                if !descriptor.features.prefix_watch {
+                if !features.prefix_watch() {
                     return Err(ClusterError::CapabilityNotMet {
                         primitive: "ClusterCacheV1",
                         capability: "PrefixWatch",
@@ -838,6 +856,10 @@ PollingPrefixWatch::spawn(
 Periodically lists keys under the prefix, diffs against the previous list, and emits `CacheWatchEvent::Event(CacheEvent::Changed | Deleted)` for observed changes. Cost: N `get` calls per interval, no millisecond-level precision. Doc comments explicitly warn about the cost and recommend routing to a backend with native prefix watch at scale. Drop on the watch stops the polling task.
 
 Enumeration is provided by `ClusterCacheBackend::scan_prefix(prefix) -> Vec<String>`, a defaulted (returns `Unsupported`) additive extension to the cache contract so existing backends keep compiling and opt in by override (see ADR-010). The polyfill lists keys via `scan_prefix`, then issues one `get` per key to read its version for change detection (the `N + 1` round-trips above); a `scan_prefix` error closes the synthesized watch with a terminal `Closed`. Because the polyfill emits full backend keys like a native `watch_prefix`, `ScopedCacheBackend` strips the scope prefix from them on the read path, so scoping composes with the polyfill.
+
+**No exact-watch polyfill — watchless backends degrade, they do not synthesize.** The polyfill above exists for `watch_prefix` because prefix-watch is a **membership feed**: value-less, and interesting only for "which keys under here exist," which a poll-and-diff of `scan_prefix` reproduces faithfully. Exact `watch` is the opposite — a **complete, edge-precise, per-key-ordered feed** (`cpt-cf-clst-nfr-watch-delivery`, ADR-003): every mutation yields an event, `Changed` before `Deleted` in order (SC-CACHE-012), at-most-once (SC-CACHE-015), with `Deleted` distinct from `Expired` (SC-CACHE-010). A polled exact-watch cannot meet that contract — a `put` then `delete` inside one poll interval collapses to a single observed `Deleted` (missing the `Changed`, so ordering is vacuous), and a `get` transition to absent cannot tell an explicit delete from a TTL reap. Such a feed would be a *weaker capability wearing the same type* — the softer sibling of the "channel that never fires" `watch_mode: disabled` avoids (§4.3, redis). So a backend that cannot serve exact watch declares `features().watch == false` and returns `Err(Unsupported { feature: "watch" })`, and its consumers **degrade** rather than receive a synthetic feed.
+
+This costs nothing real because the only exact-key watchers are the CAS default backends (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, §3.10–§3.11), and both already own a correctness-preserving fallback — timer-driven renewal and TTL-bounded polling of `try_acquire` — and use the watch purely as a latency optimization. On a watchless cache they fall back to that path (the lock's poll runs the same `try_acquire` retry a watch event would trigger — just on a bounded, geometrically backed-off cadence, capped near a second, rather than reactively on each event; the back-off keeps a lock held to its full TTL from turning a handful of waiters into thousands of CAS writes on one key, at the cost of up to ~1s of extra release-detection latency in the degraded mode), warned once at construction. A polyfill would wrap a background `get`-poll in a channel the lock then `select!`s on: strictly more machinery to deliver a signal the consumer's own poll already produces. **If** a future consumer ever wants best-effort exact-key reactivity and does *not* already poll, the move is a distinct best-effort contract (a `watch_best_effort()`, or `CacheCapability::Watch → {Native, Polled}`) plus a shared `PollingKeyWatch` helper — never overloading `watch()`, whose conformance is the complete flavor. `CacheFeatures.watch` and `CacheCapability::Watch` are both `#[non_exhaustive]`, which keeps that path open without a break.
 
 ### 3.13 Interactions & Sequences
 

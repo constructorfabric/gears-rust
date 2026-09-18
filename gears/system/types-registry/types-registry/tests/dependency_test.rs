@@ -128,6 +128,7 @@ async fn admit(
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         op,
         LATER,
@@ -161,6 +162,7 @@ async fn try_admit(
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         op,
         LATER,
@@ -270,13 +272,15 @@ async fn a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained() {
     let db = test_db().await;
     admit(&db, "shape", SHAPE, schema(SHAPE), None).await;
     admit(&db, "invoice", INVOICE, schema(INVOICE), None).await;
+    // Keep the property name and retarget it between structurally identical schemas.
+    // The edit stays compatible while testing dependency replacement.
     admit(
         &db,
         "first",
         BASE,
         schema_with(
             BASE,
-            &json!({ "shape": { "$ref": format!("gts://{SHAPE}") } }),
+            &json!({ "link": { "$ref": format!("gts://{SHAPE}") } }),
         ),
         None,
     )
@@ -292,7 +296,7 @@ async fn a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained() {
         BASE,
         schema_with(
             BASE,
-            &json!({ "invoice": { "$ref": format!("gts://{INVOICE}") } }),
+            &json!({ "link": { "$ref": format!("gts://{INVOICE}") } }),
         ),
         Some(1),
     )
@@ -412,6 +416,7 @@ async fn a_ref_naming_no_entity_fails_the_candidate() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         op,
         LATER,

@@ -7,7 +7,8 @@
 
 use async_trait::async_trait;
 use toolkit_contract::{
-    HttpFieldBinding, HttpMethod, contract, rest_contract, validate_contract, validate_http_binding,
+    HttpFieldBinding, HttpMethod, StreamFraming, contract, rest_contract, validate_contract,
+    validate_http_binding,
 };
 
 mod fakes {
@@ -164,11 +165,22 @@ fn generated_binding_passes_validation_against_contract_ir() {
 // Streaming projection — exercises the `#[streaming]` attribute path even
 // though the base trait wraps the return type in a Stream.
 
+// The base trait carries the bare `#[streaming]` marker for all three: a
+// framing selector names an HTTP media type and is rejected here (#4734 Q12),
+// because the base contract is transport-agnostic.
 #[contract(gear = "stream-svc", version = "v1")]
 pub trait StreamSvcBackend: Send + Sync {
     #[idempotency(SafeRead)]
     #[streaming]
     fn ticks(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
+
+    #[idempotency(SafeRead)]
+    #[streaming]
+    fn sse_ticks(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
+
+    #[idempotency(SafeRead)]
+    #[streaming]
+    fn parts(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
 }
 
 #[rest_contract(base_path = "/api/stream/v1")]
@@ -177,6 +189,16 @@ pub trait StreamSvcBackendRest: StreamSvcBackend {
     #[streaming]
     #[server_manual]
     fn ticks(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
+
+    #[get("/sse-ticks")]
+    #[streaming(sse)]
+    #[server_manual]
+    fn sse_ticks(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
+
+    #[get("/parts")]
+    #[streaming(multipart_mixed)]
+    #[server_manual]
+    fn parts(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
 }
 
 #[test]
@@ -185,6 +207,66 @@ fn streaming_method_marks_streaming_flag() {
     let ticks = binding.find_method("ticks").expect("present");
     assert!(ticks.streaming);
     assert_eq!(ticks.http_method, HttpMethod::Get);
+}
+
+/// A bare `#[streaming]` and an explicit `#[streaming(sse)]` are the same
+/// declaration, so every existing method keeps its framing without being
+/// touched.
+#[test]
+fn bare_streaming_and_explicit_sse_are_the_same_binding() {
+    let binding = stream_svc_backend_rest_http_binding();
+    let bare = binding.find_method("ticks").expect("present");
+    let explicit = binding.find_method("sse_ticks").expect("present");
+    assert_eq!(bare.stream_framing, StreamFraming::ServerSentEvents);
+    assert_eq!(explicit.stream_framing, bare.stream_framing);
+    assert_eq!(explicit.streaming, bare.streaming);
+}
+
+#[test]
+fn multipart_mixed_framing_reaches_the_binding_ir() {
+    let binding = stream_svc_backend_rest_http_binding();
+    let parts = binding.find_method("parts").expect("present");
+    assert!(parts.streaming);
+    assert_eq!(parts.stream_framing, StreamFraming::MultipartMixed);
+    assert_eq!(parts.stream_framing.media_type(), "multipart/mixed");
+}
+
+/// `stream_framing` round-trips, and IR serialized before the field existed
+/// still deserializes — to SSE, the historical behavior. `#[serde(default)]` is
+/// what buys that, and this is what makes it a promise rather than an accident.
+#[test]
+fn stream_framing_round_trips_and_defaults_for_legacy_ir() {
+    let binding = stream_svc_backend_rest_http_binding();
+    let json = serde_json::to_string(&binding).expect("binding serializes");
+    let back: toolkit_contract::HttpBindingIr =
+        serde_json::from_str(&json).expect("binding round-trips");
+    assert_eq!(
+        back.find_method("parts").expect("present").stream_framing,
+        StreamFraming::MultipartMixed
+    );
+    assert_eq!(
+        back.find_method("ticks").expect("present").stream_framing,
+        StreamFraming::ServerSentEvents
+    );
+
+    // Legacy document: a streaming binding written before the field existed.
+    let legacy = r#"{
+        "base_path": "/api/stream/v1",
+        "methods": [{
+            "method_name": "ticks",
+            "http_method": "Get",
+            "path_template": "/ticks",
+            "field_bindings": [],
+            "retryable": false,
+            "streaming": true,
+            "optional": false
+        }]
+    }"#;
+    let parsed: toolkit_contract::HttpBindingIr =
+        serde_json::from_str(legacy).expect("legacy binding IR still deserializes");
+    let ticks = parsed.find_method("ticks").expect("present");
+    assert!(ticks.streaming);
+    assert_eq!(ticks.stream_framing, StreamFraming::ServerSentEvents);
 }
 
 // `require_full_coverage` (ADR-0003): the projection covers every base method,

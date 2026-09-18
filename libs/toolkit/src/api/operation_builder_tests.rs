@@ -385,6 +385,54 @@ fn replacing_a_response_preserves_its_headers() {
     );
 }
 
+/// The additional-response `multipart_json` overload (`upsert_response`) had no
+/// caller and no test. A first `json_response` then `.multipart_json::<Item>()`
+/// must leave the `200` advertising BOTH media types, with the item `$ref` under
+/// `multipart/mixed` (#4740).
+#[test]
+fn json_then_multipart_json_keeps_both_media_types_on_one_status() {
+    let registry = MockRegistry::new();
+    let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/feed")
+        .anonymous()
+        .handler(test_handler)
+        // First response: application/json (the Missing -> Present overload).
+        .json_response(http::StatusCode::OK, "A JSON snapshot")
+        // Additional response on the SAME 200: the multipart/mixed overload
+        // under test (the `Present` `upsert_response` branch).
+        .multipart_json::<SampleDtoResponse>(&registry, "A live multipart feed");
+
+    // Two specs for the one status; the registry combines them into a single
+    // response object carrying both media-type keys.
+    let ok: Vec<_> = builder
+        .spec
+        .responses
+        .iter()
+        .filter(|r| r.status == 200)
+        .collect();
+    assert_eq!(ok.len(), 2, "both media types must be kept: {ok:?}");
+
+    let json = ok
+        .iter()
+        .find(|r| r.content_type == "application/json")
+        .expect("the application/json media type");
+    assert!(
+        json.schema_name().is_none(),
+        "a plain json_response carries no schema",
+    );
+
+    let multipart = ok
+        .iter()
+        .find(|r| r.content_type == "multipart/mixed")
+        .expect("the multipart/mixed media type");
+    let item = multipart
+        .schema_name()
+        .expect("multipart/mixed carries the item $ref");
+    assert!(
+        registry.schemas.lock().unwrap().contains(&item.to_owned()),
+        "the item schema `{item}` must be registered",
+    );
+}
+
 #[test]
 fn error_413_is_available_for_extractor_json_operations() {
     let registry = MockRegistry::new();

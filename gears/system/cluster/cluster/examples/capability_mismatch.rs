@@ -124,7 +124,7 @@ async fn show_resolution() -> Result<(), ClusterError> {
         .await?;
     println!(
         "[resolved] cache resolved; linearizable requirement met (prefix_watch={})",
-        cache.features().prefix_watch
+        cache.features().prefix_watch()
     );
 
     handle.stop().await;

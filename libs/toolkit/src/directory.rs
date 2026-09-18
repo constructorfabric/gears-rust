@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::runtime::{Endpoint, GearInstance, GearManager};
+use crate::runtime::{Endpoint, GearInstance, GearManager, GrpcServiceNameConflict};
 
 /// Compute a content token for an `OpenAPI` document, used to detect changes.
 ///
@@ -32,8 +32,9 @@ fn openapi_spec_hash(spec: &str) -> String {
 
 // Re-export all types from contracts - this is the single source of truth
 pub use cf_system_sdks::directory::{
-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, InstanceState,
-    LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
+    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector,
+    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
 
 /// Project the live runtime [`crate::runtime::InstanceState`] onto the domain
@@ -233,8 +234,24 @@ impl DirectoryClient for LocalDirectoryClient {
             instance = instance.with_labels(info.labels);
         }
 
-        // Register the instance with the manager
-        self.mgr.register_instance(Arc::new(instance));
+        // Register the instance, enforcing single-gear ownership of every gRPC
+        // service name it advertises atomically (check + insert under one lock)
+        // so two gears cannot race to claim the same name. A conflict is a typed
+        // sentinel the gRPC boundary maps to a status whose code reflects whether
+        // the conflict is recoverable (`recoverable` is carried across).
+        self.mgr.register_instance(Arc::new(instance)).map_err(
+            |GrpcServiceNameConflict {
+                 service_name,
+                 owner,
+                 recoverable,
+             }| {
+                anyhow::Error::from(DirectoryServiceNameConflict {
+                    service_name,
+                    owner,
+                    recoverable,
+                })
+            },
+        )?;
 
         Ok(())
     }
@@ -378,7 +395,7 @@ mod tests {
         let instance_id = Uuid::new_v4();
         // Register an instance first
         let inst = Arc::new(GearInstance::new("test_gear", instance_id));
-        dir.register_instance(inst);
+        dir.register_instance(inst).unwrap();
 
         // Verify it exists
         assert_eq!(dir.instances_of("test_gear").len(), 1);
@@ -402,7 +419,7 @@ mod tests {
         let instance_id = Uuid::new_v4();
         // Register an instance first
         let inst = Arc::new(GearInstance::new("test_gear", instance_id));
-        dir.register_instance(inst);
+        dir.register_instance(inst).unwrap();
 
         // Verify initial state is Registered
         let instances = dir.instances_of("test_gear");
@@ -457,9 +474,10 @@ mod tests {
             billing.rest_endpoint.as_ref().map(|e| e.uri.as_str()),
             Some("http://billing:8080")
         );
-        // The cross-gear snapshot never inlines the OpenAPI document; consumers
-        // fetch it per gear via `get_openapi_spec`.
-        assert!(billing.openapi_spec.is_none());
+        // The cross-gear snapshot never inlines the OpenAPI document; it carries
+        // only the hash, and consumers fetch the document per gear via
+        // `get_openapi_spec`.
+        assert!(billing.openapi_spec_hash.is_some());
         assert!(
             api.get_openapi_spec("billing")
                 .await
@@ -478,7 +496,7 @@ mod tests {
             Some("http://reporting:7000")
         );
         assert!(reporting.rest_endpoint.is_none());
-        assert!(reporting.openapi_spec.is_none());
+        assert!(reporting.openapi_spec_hash.is_none());
     }
 
     fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
@@ -636,20 +654,16 @@ mod tests {
             .unwrap();
         assert_eq!(matched.len(), 1);
         assert!(
-            matched[0].openapi_spec.is_none(),
-            "in-process resolve_by_labels must not attach the OpenAPI document"
+            matched[0].openapi_spec_hash.is_some(),
+            "in-process resolve_by_labels carries only the spec hash, never the document"
         );
 
         // The plain enumeration path is spec-free too: only the hash rides
         // along, the document is fetched via `get_openapi_spec`.
         let listed = api.list_instances("worker").await.unwrap();
         assert!(
-            listed[0].openapi_spec.is_none(),
-            "list_instances must not attach the OpenAPI document"
-        );
-        assert!(
             listed[0].openapi_spec_hash.is_some(),
-            "list_instances must still carry the spec hash"
+            "list_instances must carry the spec hash, never the document"
         );
     }
 

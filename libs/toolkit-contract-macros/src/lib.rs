@@ -16,6 +16,7 @@ mod provides;
 mod query_params;
 mod rest_contract;
 mod rest_contract_parse;
+mod stream_attr;
 mod support;
 
 #[proc_macro_attribute]
@@ -138,10 +139,25 @@ pub fn derive_query_params(input: TokenStream) -> TokenStream {
 ///
 /// Mark exactly one variant `#[contract_error(fallback)]` (unit, or a single
 /// named field receiving the original `Problem`) to additionally generate a
-/// **total** `From<TransportError> for MyError` (gated on the SDK `rest-client`
-/// feature). The generated REST client uses it to reconstruct typed variants
-/// from an RFC 9457 response and to route un-reconstructable transport/protocol
-/// failures into the fallback variant.
+/// **total** `From<TransportError> for MyError`, gated on the SDK having either
+/// the `rest-client` or the `grpc-client` feature. Both generated clients call
+/// that conversion on every failure, and they use it to reconstruct typed
+/// variants from an RFC 9457 envelope — the response body over HTTP, the
+/// `x-toolkit-problem-bin` trailer over gRPC — and to route
+/// un-reconstructable transport/protocol failures into the fallback variant.
+///
+/// **Declare a `ContractError` enum as a contract method's error type whenever
+/// the caller branches on a typed variant's payload.** `CanonicalError` cannot
+/// carry one: it has no field for `error_code`, `error_domain` or
+/// `context["data"]`, so converting through it strips the domain identity in
+/// both directions, and for the categories whose context type has required
+/// fields (`FailedPrecondition`, `ResourceExhausted`, `InvalidArgument`,
+/// `Aborted`) it also loses or corrupts the *category*.
+///
+/// The fallback field may be `Problem` **or** `Box<Problem>`. Prefer the boxed
+/// form: a `Problem` is ~208 bytes and the fallback variant sets the size of
+/// the whole enum, hence of every `Result<_, MyError>` the contract returns,
+/// which trips `clippy::result_large_err` on each generated method.
 #[proc_macro_derive(
     ContractError,
     attributes(error_code, error_domain, canonical, contract_error)
