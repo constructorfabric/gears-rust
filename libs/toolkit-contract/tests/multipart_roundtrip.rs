@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::http::multipart::MultipartJsonStream;
 use toolkit_contract::runtime::client::build_default_http_client;
+use toolkit_contract::runtime::config::ClientConfig;
 use toolkit_contract::runtime::http::body_to_byte_stream;
 use toolkit_contract::runtime::multipart::{
     MultipartStream, boundary_from_content_type, parse_multipart_stream,
@@ -249,7 +250,10 @@ type ByteStream = Pin<
 /// a hand-written client is expected to: read the boundary out of the
 /// advertised `Content-Type`, then hand the body's byte stream to the reader.
 async fn open(url: &str) -> MultipartStream<Frame, ByteStream> {
-    let client = build_default_http_client("multipart-roundtrip-test", false).unwrap();
+    let config = ClientConfig::new(url)
+        .with_pool_idle_timeout(None)
+        .with_max_concurrent_requests(usize::MAX);
+    let client = build_default_http_client("multipart-roundtrip-test", &config).unwrap();
     let response = client.get(url).send().await.unwrap();
     assert!(
         response.status().is_success(),
