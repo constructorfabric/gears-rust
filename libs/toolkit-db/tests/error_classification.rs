@@ -669,3 +669,79 @@ async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<(
 
     Ok(())
 }
+
+/// A connect-time failure must not look like a refused statement.
+///
+/// `driver_refusal` matches `DbErr::Exec | DbErr::Query` and deliberately not
+/// `DbErr::Conn`: a connect-time `28P01` is the server refusing a login, not a
+/// constraint speaking, and a caller reading `constraint()` on it would answer
+/// a transient or auth condition as though one had.
+///
+/// That exclusion is the part of the match a later change can get wrong, and
+/// the unit test next to it cannot hold it: `DbErr::Custom` and
+/// `DbErr::RecordNotFound` carry no driver error in the first place, so
+/// widening the pattern to `Conn` keeps them green. This case is a real
+/// `DbErr::Conn` from a real server, which does carry a SQLSTATE of its own.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_connect_time_refusal_carries_no_driver_refusal() -> Result<()> {
+    use toolkit_db::db_error::driver_refusal;
+
+    let dut = common::bring_up_postgres().await?;
+    let wrong_password = dut
+        .url
+        .replace("user:pass@", "user:definitely_not_the_password@");
+
+    let err = sea_orm::Database::connect(wrong_password)
+        .await
+        .expect_err("PostgreSQL must refuse a login with the wrong password");
+
+    assert!(
+        driver_refusal(&err).is_none(),
+        "a connect-time refusal must not arrive as a statement refusal: {err}"
+    );
+
+    Ok(())
+}
+
+/// The message text of a live error carries whatever value was rejected, and
+/// the classifiers must not read it when the server also gave a code.
+///
+/// `22P02` is `invalid_text_representation`: the input was not a uuid. The
+/// value is echoed into the message verbatim, so this is the caller writing
+/// our own search strings into the evidence.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_value_the_caller_chose_does_not_classify_the_error() -> Result<()> {
+    use sea_orm::ConnectionTrait as _;
+    use toolkit_db::secure::{is_foreign_key_violation, is_unique_violation};
+
+    let dut = common::bring_up_postgres().await?;
+    let conn = sea_orm::Database::connect(dut.url.clone()).await?;
+
+    for value in ["duplicate key", "violates foreign key constraint"] {
+        let err = conn
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT $1::uuid",
+                [value.into()],
+            ))
+            .await
+            .expect_err("PostgreSQL must refuse this as a malformed uuid");
+
+        assert!(
+            err.to_string().contains(value),
+            "the premise of this test is that the value reaches the message: {err}"
+        );
+        assert!(
+            !is_unique_violation(&err),
+            "a malformed input must not classify as a conflict because of its own text: {err}"
+        );
+        assert!(
+            !is_foreign_key_violation(&err),
+            "and the same for the foreign-key wording: {err}"
+        );
+    }
+
+    Ok(())
+}
