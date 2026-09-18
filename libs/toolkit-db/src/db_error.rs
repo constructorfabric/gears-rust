@@ -26,13 +26,14 @@
 //! fine-grained mapping to gears). So this module classifies conditions and
 //! stops there.
 //!
-//! Which leaves the question of where the line falls, since naming the five
-//! conditions below is itself a choice. The test is **whether a caller in this
+//! Which leaves the question of where the line falls, since naming any
+//! condition at all is itself a choice. The test is **whether a caller in this
 //! workspace branches on the distinction**:
 //!
 //! * A code earns a variant when some caller already acts differently on it.
-//!   [`ConstraintViolation`] is `#[non_exhaustive]` so that a sixth one can be
-//!   added the day a caller needs it, rather than in advance.
+//!   [`ConstraintViolation`] is `#[non_exhaustive]` so that the next one can
+//!   be added the day a caller needs it, rather than in advance. Class 23 has
+//!   more codes than the two named here, and they stay unnamed until then.
 //! * Two codes collapse into one variant when no caller would branch between
 //!   them. `23503` and `23001` differ in *when* the foreign key was checked,
 //!   not in what the caller must now do: rows still reference this one.
@@ -63,12 +64,6 @@ pub enum ConstraintViolation {
     /// first one under its own standard code. For a caller the condition is
     /// one and the same: rows still reference this one.
     ForeignKey,
-    /// A `CHECK` constraint rejected the row.
-    Check,
-    /// A `NOT NULL` column was given no value.
-    NotNull,
-    /// An `EXCLUDE` constraint rejected the row.
-    Exclusion,
 }
 
 /// The code the driver reported for a refusal, and the constraint name when it
@@ -131,9 +126,6 @@ pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
         "23505" => Some(ConstraintViolation::Unique),
         // One condition, two codes. See `ConstraintViolation::ForeignKey`.
         "23503" | "23001" => Some(ConstraintViolation::ForeignKey),
-        "23514" => Some(ConstraintViolation::Check),
-        "23502" => Some(ConstraintViolation::NotNull),
-        "23P01" => Some(ConstraintViolation::Exclusion),
         _ => None,
     }
 }
@@ -337,23 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn the_other_class_23_codes_are_named() {
+    fn a_duplicate_key_is_named() {
         assert_eq!(
             constraint_violation("23505"),
             Some(ConstraintViolation::Unique)
         );
-        assert_eq!(
-            constraint_violation("23514"),
-            Some(ConstraintViolation::Check)
-        );
-        assert_eq!(
-            constraint_violation("23502"),
-            Some(ConstraintViolation::NotNull)
-        );
-        assert_eq!(
-            constraint_violation("23P01"),
-            Some(ConstraintViolation::Exclusion)
-        );
+    }
+
+    /// The rest of class 23 is unnamed on purpose, by this module's own rule:
+    /// nothing in the workspace branches on a `CHECK`, `NOT NULL` or
+    /// `EXCLUDE` refusal. The code still reaches a caller through
+    /// [`DriverRefusal::code`], and the enum is `#[non_exhaustive]` so naming
+    /// one the day something does branch on it is not a breaking change.
+    #[test]
+    fn the_class_23_codes_no_caller_branches_on_stay_unnamed() {
+        for unnamed in ["23514", "23502", "23P01"] {
+            assert_eq!(constraint_violation(unnamed), None, "{unnamed}");
+        }
     }
 
     /// `23000` is `MySQL`'s answer for unique *and* foreign-key violations, so
