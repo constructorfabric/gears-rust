@@ -11,12 +11,28 @@
 //! holder stops renewing and the key evaporates on its own deadline with
 //! nothing having to notice.
 //!
-//! The token is a fresh v4 UUID per acquisition, and it is what makes `renew`
-//! and `release` safe against a successor: both are Lua scripts that compare
-//! `GET KEYS[1]` against the token before acting (DESIGN.md §5.2). A bare `DEL`
-//! on release is the classic bug in this pattern — a holder whose lease already
-//! lapsed deletes its successor's lock — and `RD-LOCK-006` is the regression
-//! test for it.
+//! The value stored under the key is the store-owned-lease token: `<owner>:<fence>`
+//! (DESIGN.md §5.1), and it is what makes `renew` and `release` safe against a
+//! successor: both are Lua scripts that compare `GET KEYS[1]` against it before
+//! acting (DESIGN.md §5.2). A bare `DEL` on release is the classic bug in this
+//! pattern — a holder whose lease already lapsed deletes its successor's lock —
+//! and `RD-LOCK-006` is the regression test for it. The `owner` half separates
+//! two holders; the `fence` half — a fresh random `u64` per acquisition, Redis's
+//! substitute for the monotonic column Postgres reads — separates two
+//! acquisitions of one name across a lapse, so a re-acquired name draws a fresh
+//! fence the previous holder's token will not match (a 2⁻⁶⁴ collision aside — a
+//! probabilistic bound, not the monotonic column's certainty, §5.8.1).
+//!
+//! ## Two halves, one lease
+//!
+//! `try_lock` / `lock` hand back a [`LockGuard`]; `acquire` / `acquire_waiting`
+//! hand back the [`LeaseToken`] the guard cannot carry, so a gear serving lock
+//! RPCs over the wire — where a `LockGuard` cannot cross the process boundary —
+//! can `renew` and `release` against the token from a task that never saw the
+//! acquire (the store-owned-leases half of `DistributedLockBackend`). Both halves
+//! are built over one `acquire_lease`: the guard path is `acquire_lease` plus a
+//! guard task, so there is one lease and one source of truth, never two
+//! mechanisms that could drift.
 //!
 //! ## A held lock consumes no connection
 //!
@@ -50,12 +66,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cluster_sdk::observability::{ResourceId, spans};
 use cluster_sdk::{
-    ClusterError, DistributedLockBackend, LockCommandReceiver, LockFeatures, LockGuard,
+    ClusterError, DistributedLockBackend, LeaseToken, LockCommandReceiver, LockFeatures, LockGuard,
     LockRequest, ProviderErrorKind,
 };
 use fred::clients::{Pool, SubscriberClient};
 use fred::interfaces::{KeysInterface, PubsubInterface};
 use fred::types::{ConnectHandle, Expiration, SetOptions, Value};
+use rand::RngExt as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -192,6 +209,52 @@ impl LockNames {
 }
 
 // ---------------------------------------------------------------------------
+// Holder identity (DESIGN.md §5.1, §5.8.1)
+// ---------------------------------------------------------------------------
+
+/// A fresh owner id for an acquisition the caller did not name — the guard-path
+/// `try_lock` / `lock`, which hold their own lease rather than one brokered for a
+/// remote `ClientId`.
+///
+/// A per-acquisition id, not one per process, so two guards held at once are
+/// distinct owners and neither can renew or release the other's lease — exactly
+/// how the CAS default (`cluster/src/defaults/lock.rs`) and the Postgres lock
+/// (`fresh_owner`) mint theirs. A *brokered* acquisition through
+/// [`DistributedLockBackend::acquire`] supplies its own owner (the caller's
+/// `ClientId`, §5.4) instead.
+fn fresh_owner() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// A fresh fence for one acquisition: Redis's substitute for the monotonic
+/// `fence` Postgres reads out of a column.
+///
+/// A single `SET NX PX` has no counter to increment, so the fence is a random
+/// `u64` drawn per acquisition. It approximates the guarantee the monotonic one
+/// gives where it actually matters (§5.8.1): a name that lapsed and was
+/// re-acquired draws a *fresh* fence, so a stale holder's token will not match the
+/// successor's lease — a probabilistic bound (a 2⁻⁶⁴ collision aside), not the
+/// monotonic column's certainty, which is more than enough for a coordination
+/// lock. It is **not** a globally monotonic third-party fencing token — ADR-002
+/// declines those (§5.4) and [`LockGuard`] exposes none — only the discriminator
+/// `renew` and `release` predicate on.
+fn fresh_fence() -> u64 {
+    rand::rng().random::<u64>()
+}
+
+/// The string a lease is stored under and every `renew` / `release` fences on:
+/// `<owner>:<fence>` (DESIGN.md §5.1, §5.2).
+///
+/// It is **composed, never parsed** — both halves reach it already, so an owner
+/// carrying a `:` is no hazard — and it is a pure function of a [`LeaseToken`]'s
+/// identity fields, which is what lets a remote caller holding only the token
+/// reconstruct the exact value the acquiring instance wrote and have any replica
+/// fence on it identically (§5.8.1, invariant I7).
+fn holder_value(owner: &str, fence: u64) -> String {
+    format!("{owner}:{fence}")
+}
+
+// ---------------------------------------------------------------------------
 // Pure decisions
 // ---------------------------------------------------------------------------
 
@@ -233,8 +296,9 @@ pub fn lease_remaining(pttl: i64) -> Option<Duration> {
 
 /// What one acquisition attempt left the blocking loop with.
 enum Attempt {
-    /// The `SET NX` took the lock.
-    Acquired(LockGuard),
+    /// The `SET NX` took the lock, returning the lease it minted. `lock()` wraps
+    /// it in a [`LockGuard`]; `acquire_waiting` hands the token straight back.
+    Acquired(LeaseToken),
     /// Redis answered, and the answer was that someone else holds the name.
     Contended,
     /// The attempt never reached a Redis that could answer. Retried inside the
@@ -387,31 +451,48 @@ impl RedisLock {
         }
     }
 
-    /// One `SET NX PX`, plus everything that has to be true before a guard is
-    /// handed out. `Ok(None)` is contention.
+    /// One `SET NX PX`, minting the store-owned lease. `Ok(None)` is contention.
+    ///
+    /// The single source of truth both halves of the lock are built over: the
+    /// token path ([`acquire`](DistributedLockBackend::acquire) /
+    /// [`acquire_waiting`](DistributedLockBackend::acquire_waiting)) hands the
+    /// returned [`LeaseToken`] straight to the caller, and the guard path
+    /// ([`try_lock`](DistributedLockBackend::try_lock) /
+    /// [`lock`](DistributedLockBackend::lock)) wraps it in a [`LockGuard`] via
+    /// [`guard_from`](Self::guard_from). One lease, one lease value, so the two
+    /// never fence on different things.
+    ///
+    /// Deliberately no post-`WAIT` shutdown re-check here: the token path must
+    /// **not** discard on a `stop()` race — it hands the token to a caller and
+    /// leaves the lease to lapse on its TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`,
+    /// §5.8.2). The guard path, which *did* take the lease but hands out no
+    /// consumer-visible token, does the re-check-and-discard in
+    /// [`guard_from`](Self::guard_from) instead.
     ///
     /// # Errors
-    /// [`ClusterError::Shutdown`] when `stop()` has run or races this, and
-    /// whatever [`map_redis_error`] makes of a failing `SET` or `WAIT`.
-    async fn try_acquire(
+    /// [`ClusterError::Shutdown`] when `stop()` has already run, and whatever
+    /// [`map_redis_error`] makes of a failing `SET` or `WAIT`.
+    async fn acquire_lease(
         &self,
         name: &str,
+        owner: &str,
         ttl: Duration,
-    ) -> Result<Option<LockGuard>, ClusterError> {
+    ) -> Result<Option<LeaseToken>, ClusterError> {
         // Checked before any lock work, so an acquisition arriving after
         // `stop()` answers immediately instead of writing a lease nothing will
-        // ever hold (DESIGN.md §5.3). `lock()` reaches this through the same
-        // path, which is what keeps the two in agreement.
+        // ever hold (DESIGN.md §5.3). Every acquisition path reaches this through
+        // the same check, which is what keeps them in agreement.
         if self.shutdown.is_cancelled() {
             return Err(ClusterError::Shutdown);
         }
 
-        let token = Uuid::new_v4().to_string();
+        let fence = fresh_fence();
+        let value = holder_value(owner, fence);
         let acquired: Value = self
             .pool
             .set(
                 self.names.lease_key(name),
-                token.clone(),
+                value.clone(),
                 Some(Expiration::PX(px_millis(ttl))),
                 Some(SetOptions::NX),
                 false,
@@ -431,22 +512,11 @@ impl RedisLock {
         // *release* only leaves a name unacquirable until its TTL. Neither can
         // produce two holders, so neither is worth a round trip on every call.
         if let Err(short) = wait_for_replicas(&self.pool, self.wait).await {
-            self.abandon(name, &token).await;
+            self.abandon(name, &value).await;
             return Err(short);
         }
 
-        // `stop()` may have run while that `SET` was in flight. Nobody holds
-        // this lease — no guard has been handed out — so releasing it is not the
-        // remote cleanup `cpt-cf-clst-fr-shutdown-ttl-cleanup` forbids: that
-        // rule is about leases a consumer *is* holding, which `stop()` leaves to
-        // expire (`RD-LOCK-013`). Wedging a name nobody took, for a full TTL,
-        // would be the worse answer.
-        if self.shutdown.is_cancelled() {
-            self.abandon(name, &token).await;
-            return Err(ClusterError::Shutdown);
-        }
-
-        // DEBUG and a *log line*, never a metric: a holder token is unbounded
+        // DEBUG and a *log line*, never a metric: a holder value is unbounded
         // and would explode the label cardinality of anything it touched
         // (ADR-004's cardinality rule). As a line it is what makes a token read
         // out of Redis by an operator traceable back to the instance holding it
@@ -455,18 +525,148 @@ impl RedisLock {
             name: logs::LOCK_ACQUIRED,
             provider = self.signals.provider(),
             lock = %name,
-            holder = %token,
+            holder = %value,
             "cluster.lock.acquired: this instance now holds the lease under this token"
         );
 
-        let (commands, guard) = LockGuard::channel(name.to_owned(), GUARD_COMMAND_BUFFER);
+        Ok(Some(LeaseToken::new(name, owner, fence)))
+    }
+
+    /// The non-blocking acquisition both [`try_lock`](DistributedLockBackend::try_lock)
+    /// and [`acquire`](DistributedLockBackend::acquire) run: one attempt, mapped
+    /// to `LockContended` on `nil`, instrumented as `try_lock`.
+    async fn acquire_once(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        let span = tracing::info_span!(
+            spans::LOCK_TRY_LOCK,
+            provider = %self.signals.provider(),
+            lock = %name
+        );
+        let started = std::time::Instant::now();
+        let out = async {
+            match self.acquire_lease(name, owner, ttl).await? {
+                Some(token) => Ok(token),
+                None => Err(ClusterError::LockContended {
+                    name: name.to_owned(),
+                }),
+            }
+        }
+        .instrument(span)
+        .await;
+        self.signals.record_lock("try_lock", name, started, &out);
+        out
+    }
+
+    /// The blocking acquisition both [`lock`](DistributedLockBackend::lock) and
+    /// [`acquire_waiting`](DistributedLockBackend::acquire_waiting) run:
+    /// [`wait_for_lease`](Self::wait_for_lease), instrumented once around the whole
+    /// wait as `lock`.
+    async fn acquire_waiting_for(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        // Instrumented once *around* the loop rather than inside it, following the
+        // postgres plugin's shape: a blocking acquisition is one operation however
+        // many `SET NX`s it takes, so one span covering the whole wait and one
+        // duration measuring it is what a consumer asked for. Recording per attempt
+        // would report a 30 s wait as a hundred fast operations.
+        let span = tracing::info_span!(
+            spans::LOCK_LOCK,
+            provider = %self.signals.provider(),
+            lock = %name
+        );
+        let op_started = std::time::Instant::now();
+        let out = self
+            .wait_for_lease(name, owner, ttl, timeout)
+            .instrument(span)
+            .await;
+        self.signals.record_lock("lock", name, op_started, &out);
+        out
+    }
+
+    /// The uninstrumented acquisition loop (DESIGN.md §5.3): re-attempt the
+    /// `SET NX` until the lease lands or `timeout` elapses, parking between
+    /// attempts on whichever comes first of the holder's release, the blocking
+    /// lease's own `PTTL`, and a jittered heartbeat.
+    async fn wait_for_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        // The last attempt that never reached Redis, cleared by every attempt
+        // that got a real answer. See [`lock_failure`] for why it survives at all.
+        let mut last: Option<ClusterError> = None;
+        let mut first = true;
+        loop {
+            // Registered before the attempt, not after — see [`park`].
+            let released = self.waiters.wait_for(name);
+            match self.attempt(name, owner, ttl, deadline, first).await {
+                Attempt::Acquired(token) => return Ok(token),
+                Attempt::Contended => last = None,
+                Attempt::Unreachable(err) => last = Some(err),
+                Attempt::Fatal(err) => return Err(err),
+                Attempt::BudgetSpent => {
+                    return Err(lock_failure(name, started.elapsed(), last));
+                }
+            }
+            first = false;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(lock_failure(name, started.elapsed(), last));
+            }
+            self.park(name, released, deadline).await?;
+        }
+    }
+
+    /// Wraps a freshly-minted `token` in the consumer-facing [`LockGuard`],
+    /// unwinding the acquisition if `stop()` won the race.
+    ///
+    /// The guard-path counterpart to the token path's "leave it to lapse": this
+    /// lease is provably ours and provably unheld (no consumer received the guard
+    /// yet), so discarding it on a shutdown race is this owner releasing its own
+    /// claim, not the remote cleanup `cpt-cf-clst-fr-shutdown-ttl-cleanup` forbids.
+    /// Contrast [`acquire`](DistributedLockBackend::acquire), which hands the token
+    /// to a caller and must therefore leave the lease to lapse instead.
+    async fn guard_from(&self, token: LeaseToken) -> Result<LockGuard, ClusterError> {
+        let value = holder_value(&token.owner, token.fence);
+        // `stop()` may have run while the `SET` was in flight. Nobody holds this
+        // lease — no guard has been handed out — so abandoning it here is safe and
+        // avoids wedging a name nobody took for a full TTL (`RD-LOCK-013` pins that
+        // *held* leases are the ones `stop()` must leave behind, not this one).
+        if self.shutdown.is_cancelled() {
+            // Balances the `cluster.lock.acquired` line `acquire_lease` already
+            // emitted for this lease: the `SET NX` won, but `stop()` raced in
+            // before a guard was handed out, so the lease is given back here rather
+            // than held. not-a-catalogued-event: a developer diagnostic, DEBUG, so
+            // a token read out of Redis that never became a guard is still
+            // traceable to its release.
+            tracing::debug!(
+                lock = %token.name,
+                holder = %value,
+                "cluster.lock.abandoned: a lease taken but not handed out is given back; stop() \
+                 raced the guard hand-off"
+            );
+            self.abandon(&token.name, &value).await;
+            return Err(ClusterError::Shutdown);
+        }
+        let (commands, guard) = LockGuard::channel(token.name.clone(), GUARD_COMMAND_BUFFER);
         self.guards.spawn(run_guard_task(
-            name.to_owned(),
-            token,
+            token.name,
+            value,
             self.guard_context(),
             commands,
         ));
-        Ok(Some(guard))
+        Ok(guard)
     }
 
     /// Gives back a lease this instance took but never handed to a consumer.
@@ -475,9 +675,10 @@ impl RedisLock {
     /// call unconditionally: if the lease has already lapsed and been re-taken,
     /// this matches nothing rather than deleting the successor's key. Failures
     /// are swallowed because the caller is already returning an error and the
-    /// TTL is the backstop either way.
-    async fn abandon(&self, name: &str, token: &str) {
-        if let Err(err) = release_lease(&self.guard_context(), name, token).await {
+    /// TTL is the backstop either way. `value` is the [`holder_value`] the lease
+    /// was written under.
+    async fn abandon(&self, name: &str, value: &str) {
+        if let Err(err) = release_lease(&self.guard_context(), name, value).await {
             tracing::debug!(
                 error = %err,
                 "could not give back a redis lease that was taken but never handed out; it will \
@@ -496,7 +697,7 @@ impl RedisLock {
     /// Runs one acquisition attempt inside whatever is left of the caller's
     /// budget.
     ///
-    /// The bound matters because `try_acquire`'s own bound is `fred`'s
+    /// The bound matters because `acquire_lease`'s own bound is `fred`'s
     /// `command_timeout_ms` (5 s by default), which can be far longer than a
     /// caller's `timeout`: without it a `lock(name, ttl, 1s)` against an
     /// unresponsive server returns after five seconds. An attempt cancelled
@@ -511,6 +712,7 @@ impl RedisLock {
     async fn attempt(
         &self,
         name: &str,
+        owner: &str,
         ttl: Duration,
         deadline: tokio::time::Instant,
         first: bool,
@@ -519,7 +721,7 @@ impl RedisLock {
         if remaining.is_zero() && !first {
             return Attempt::BudgetSpent;
         }
-        let acquire = self.try_acquire(name, ttl);
+        let acquire = self.acquire_lease(name, owner, ttl);
         let outcome = if remaining.is_zero() {
             acquire.await
         } else {
@@ -529,7 +731,7 @@ impl RedisLock {
             }
         };
         match outcome {
-            Ok(Some(guard)) => Attempt::Acquired(guard),
+            Ok(Some(token)) => Attempt::Acquired(token),
             Ok(None) => Attempt::Contended,
             Err(err) => classify_attempt(err),
         }
@@ -773,27 +975,11 @@ impl DistributedLockBackend for RedisLock {
     }
 
     async fn try_lock(&self, name: &str, ttl: Duration) -> Result<LockGuard, ClusterError> {
-        let span = tracing::info_span!(
-            spans::LOCK_TRY_LOCK,
-            provider = %self.signals.provider(),
-            lock = %name
-        );
-        let started = std::time::Instant::now();
-        let out = async {
-            match self.try_acquire(name, ttl).await? {
-                Some(guard) => Ok(guard),
-                None => Err(ClusterError::LockContended {
-                    name: name.to_owned(),
-                }),
-            }
-        }
-        .instrument(span)
-        .await;
-        // `LockContended` lands on the bounded `result` label as `contended` and
-        // *not* on the provider-error counter: someone else holding the name is
-        // this call's answer, not a fault (`result::label`).
-        self.signals.record_lock("try_lock", name, started, &out);
-        out
+        // A fresh owner because the caller did not name one: `try_lock` holds its
+        // own lease. Built *over* `acquire` — one lease, then a guard task — so the
+        // guard path and the token path fence on the same value (DESIGN.md §5.1).
+        let token = self.acquire_once(name, &fresh_owner(), ttl).await?;
+        self.guard_from(token).await
     }
 
     async fn lock(
@@ -802,47 +988,77 @@ impl DistributedLockBackend for RedisLock {
         ttl: Duration,
         timeout: Duration,
     ) -> Result<LockGuard, ClusterError> {
-        // Instrumented once *around* the loop rather than inside it, following
-        // the postgres plugin's shape: a blocking acquisition is one operation
-        // however many `SET NX`s it takes, so one span covering the whole wait
-        // and one duration measuring it is what a consumer asked for. Recording
-        // per attempt would report a 30 s wait as a hundred fast operations.
+        let token = self
+            .acquire_waiting_for(name, &fresh_owner(), ttl, timeout)
+            .await?;
+        self.guard_from(token).await
+    }
+
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        // The same lease `try_lock` takes, minus the guard task: this caller holds
+        // the token itself and renews or releases against it from wherever it likes
+        // — the store-owned-leases half a gear serving lock RPCs over the wire needs
+        // (§6.5, §12.6). No discard on a `stop()` race here; see `acquire_lease`.
+        self.acquire_once(name, owner, ttl).await
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.acquire_waiting_for(name, owner, ttl, timeout).await
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        // Predicated entirely on the lease value the store already holds, so this
+        // succeeds against a lease acquired through a *different* `RedisLock`
+        // handle — a different process, a different replica — which is the whole
+        // point of the token half (invariant I7). The guard path renews through the
+        // same `renew_lease` from its guard task; both fence on `holder_value`.
+        //
+        // Cross-checking that the transport caller is `token.owner` is the serving
+        // gear's authorization decision (§4.6), not this predicate's.
         let span = tracing::info_span!(
-            spans::LOCK_LOCK,
+            spans::LOCK_RENEW,
             provider = %self.signals.provider(),
-            lock = %name
+            lock = %token.name
         );
-        let op_started = std::time::Instant::now();
-        let out = async {
-            let started = tokio::time::Instant::now();
-            let deadline = started + timeout;
-            // The last attempt that never reached Redis, cleared by every
-            // attempt that got a real answer. See [`lock_failure`] for why it
-            // survives at all.
-            let mut last: Option<ClusterError> = None;
-            let mut first = true;
-            loop {
-                // Registered before the attempt, not after — see [`park`].
-                let released = self.waiters.wait_for(name);
-                match self.attempt(name, ttl, deadline, first).await {
-                    Attempt::Acquired(guard) => return Ok(guard),
-                    Attempt::Contended => last = None,
-                    Attempt::Unreachable(err) => last = Some(err),
-                    Attempt::Fatal(err) => return Err(err),
-                    Attempt::BudgetSpent => {
-                        return Err(lock_failure(name, started.elapsed(), last));
-                    }
-                }
-                first = false;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(lock_failure(name, started.elapsed(), last));
-                }
-                self.park(name, released, deadline).await?;
-            }
-        }
+        let started = std::time::Instant::now();
+        let ctx = self.guard_context();
+        let out = renew_lease(
+            &ctx,
+            &token.name,
+            &holder_value(&token.owner, token.fence),
+            ttl,
+        )
         .instrument(span)
         .await;
-        self.signals.record_lock("lock", name, op_started, &out);
+        self.signals
+            .record_lock("renew", &token.name, started, &out);
+        out
+    }
+
+    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        let span = tracing::info_span!(
+            spans::LOCK_RELEASE,
+            provider = %self.signals.provider(),
+            lock = %token.name
+        );
+        let started = std::time::Instant::now();
+        let ctx = self.guard_context();
+        let out = release_lease(&ctx, &token.name, &holder_value(&token.owner, token.fence))
+            .instrument(span)
+            .await;
+        self.signals
+            .record_lock("release", &token.name, started, &out);
         out
     }
 }

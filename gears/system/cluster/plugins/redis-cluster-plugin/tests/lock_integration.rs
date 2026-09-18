@@ -1,5 +1,7 @@
 //! Layer 3 — lock integration scenarios (docs/TESTING.md §4.3), `RD-LOCK-001`
-//! through `RD-LOCK-015`. `RD-LOCK-014` runs on the Sentinel fixture.
+//! through `RD-LOCK-018`. `RD-LOCK-014` runs on the Sentinel fixture;
+//! `RD-LOCK-016`/`017`/`018` cover the store-owned-leases token path
+//! (`acquire`/`acquire_waiting`/`renew`/`release`) the gRPC lock service serves.
 //!
 //! These run against the **standalone** `RedisLockPlugin` unless a scenario is
 //! specifically about the combined plugin or about wiring. That is the shape
@@ -51,6 +53,27 @@ const LONG_TTL: Duration = Duration::from_secs(30);
 /// derives the format from the code under test asserts nothing.
 fn lease_key(prefix: &str, name: &str) -> String {
     format!("{prefix}:l:{name}")
+}
+
+/// Asserts a raw lease value has the store-owned-lease shape `<owner>:<fence>`
+/// (DESIGN.md §5.1): a fence that parses as a `u64` after the final `:`, and — on
+/// the guard path, which mints a fresh v4 UUID owner — a UUID owner before it.
+///
+/// Spelled out here rather than read from the plugin for the reason `lease_key`
+/// gives: a wire-format assertion that derives the format from the code under
+/// test asserts nothing.
+fn assert_guard_holder_value(value: &str) {
+    let (owner, fence) = value
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("the lease value must be `<owner>:<fence>`, got {value:?}"));
+    assert!(
+        fence.parse::<u64>().is_ok(),
+        "the fence half must parse as a u64, got {value:?}"
+    );
+    assert!(
+        uuid::Uuid::parse_str(owner).is_ok(),
+        "the guard path mints a v4 UUID owner (DESIGN.md sec 5.1), got {value:?}"
+    );
 }
 
 /// Spawns a blocked `lock` on `name`, returning its outcome **and the instant it
@@ -192,10 +215,7 @@ async fn rd_lock_001_try_lock_writes_a_lease_and_release_frees_it() {
         .expect("try_lock on a free name succeeds");
 
     let token: String = raw.get(&key).await.expect("GET on the lease key succeeds");
-    assert!(
-        uuid::Uuid::parse_str(&token).is_ok(),
-        "the lease value must be the holder token - a v4 UUID (DESIGN.md sec 5.1) - got {token:?}"
-    );
+    assert_guard_holder_value(&token);
     let pttl: i64 = raw.pttl(&key).await.expect("PTTL succeeds");
     // Compared in `u128`, the type `as_millis` returns, rather than casting it
     // down to the `i64` Redis reports: the cast is the only lossy step in the
@@ -559,10 +579,7 @@ async fn rd_lock_008_end_to_end_yaml_routing_lock_redis_cache_standalone() {
         .get(lease_key(&key_prefix, "res"))
         .await
         .expect("the lease key must exist on the server");
-    assert!(
-        uuid::Uuid::parse_str(&token).is_ok(),
-        "the resolved facade must be backed by a real Redis lease, got {token:?}"
-    );
+    assert_guard_holder_value(&token);
 
     guard.release().await.expect("release succeeds");
     handle.stop().await;
@@ -1003,6 +1020,201 @@ async fn rd_lock_014_wait_is_applied_and_a_short_count_surfaces() {
          reporting success: the lease is on the primary but not replicated, so a failover now \
          could hand the same lock to a second holder. Got {short:?}"
     );
+
+    handle.stop().await;
+}
+
+/// `RD-LOCK-016` — the **store-owned-leases token path** works end to end:
+/// `acquire` writes a real lease, `renew` extends it, a second `acquire` contends,
+/// and `release` frees the name.
+///
+/// This is the exact path the cluster gear serves every remote lock RPC through
+/// (`api/grpc/lock.rs` calls `acquire`/`acquire_waiting`/`renew`/`release`), and
+/// the one the native `RedisLock` used to lack entirely — it fell through to the
+/// SDK's defaulted `Unsupported`, so every Profile-3 redis lock errored. The guard
+/// path (`RD-LOCK-001`) never exercised this, which is why the gap shipped. A
+/// `LockGuard` cannot cross a process boundary, so nothing here builds one: the
+/// token is the whole authority.
+#[tokio::test]
+async fn rd_lock_016_the_token_path_acquires_renews_contends_and_releases() {
+    let (_container, handle, lock, raw, prefix, _url) = fixture(json!({})).await;
+    let key = lease_key(&prefix, "res");
+
+    let token = lock
+        .acquire("res", "svc-a", LONG_TTL)
+        .await
+        .expect("acquire on a free name mints a lease - not the Unsupported the bug returned");
+    assert_eq!(token.owner, "svc-a", "the token carries the caller's owner");
+
+    // The stored value is the composed holder token, and it fences on `svc-a`.
+    let stored: String = raw.get(&key).await.expect("GET on the lease key succeeds");
+    assert_eq!(
+        stored,
+        format!("svc-a:{}", token.fence),
+        "the lease is stored under `<owner>:<fence>`, the value renew/release fence on"
+    );
+
+    lock.renew(&token, LONG_TTL)
+        .await
+        .expect("renew against a live token succeeds");
+    let pttl: i64 = raw.pttl(&key).await.expect("PTTL succeeds");
+    assert!(pttl > 0, "renew must leave a live deadline, got {pttl}");
+
+    // A second acquire — even a brokered one — contends while the lease is live.
+    let contended = lock.acquire("res", "svc-b", LONG_TTL).await;
+    assert!(
+        matches!(contended, Err(ClusterError::LockContended { .. })),
+        "a live lease must contend a second acquire, got {contended:?}"
+    );
+
+    lock.release(&token)
+        .await
+        .expect("release of a held token succeeds");
+    let exists: i64 = raw.exists(&key).await.expect("EXISTS succeeds");
+    assert_eq!(exists, 0, "release must remove the lease key");
+
+    // Absence is `Ok` (§6.10): releasing the same token again deletes nothing and
+    // succeeds rather than reporting a not-found.
+    lock.release(&token)
+        .await
+        .expect("a repeated release is idempotent by absence");
+
+    handle.stop().await;
+}
+
+/// `RD-LOCK-017` — the token path is fenced across a lapse: once a name is
+/// re-acquired, the previous holder's token can neither renew nor release the
+/// successor's lease.
+///
+/// The token-path analogue of `RD-LOCK-006` (which pins the same property on the
+/// guard path). The fence — a fresh random `u64` per acquisition — is what carries
+/// it: the re-acquire draws a new fence, so the stale token's composed value no
+/// longer matches what is under the key.
+#[tokio::test]
+async fn rd_lock_017_a_stale_token_cannot_touch_a_reacquired_lease() {
+    let (_container, handle, lock, raw, prefix, _url) = fixture(json!({})).await;
+    let key = lease_key(&prefix, "res");
+
+    let stale = lock
+        .acquire("res", "svc-a", Duration::from_millis(400))
+        .await
+        .expect("A acquires a short lease");
+    let lapsed = common::wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        async || raw.exists(&key).await.unwrap_or(1) == 0,
+    )
+    .await;
+    assert!(lapsed, "A's lease must lapse before B re-acquires");
+
+    let fresh = lock
+        .acquire("res", "svc-a", LONG_TTL)
+        .await
+        .expect("B re-acquires the freed name - even under the same owner");
+    assert_ne!(
+        stale.fence, fresh.fence,
+        "a re-acquisition must draw a fresh fence, or the stale token could still match"
+    );
+    let held: String = raw.get(&key).await.expect("GET succeeds");
+
+    // `stale` is still A's original token; its fence no longer matches what B wrote.
+    let renewed = lock.renew(&stale, LONG_TTL).await;
+    assert!(
+        matches!(renewed, Err(ClusterError::LockExpired { .. })),
+        "A's stale renew must report LockExpired rather than extending B's lease, got {renewed:?}"
+    );
+
+    lock.release(&stale)
+        .await
+        .expect("A's stale release is a no-op rather than an error");
+    let after: String = raw
+        .get(&key)
+        .await
+        .expect("B's lease must still be present after A's stale release");
+    assert_eq!(
+        after, held,
+        "A's stale release must leave B's key intact - a bare DEL would have handed the lock away \
+         while B was still inside its critical section"
+    );
+
+    lock.release(&fresh)
+        .await
+        .expect("B's own release succeeds");
+    handle.stop().await;
+}
+
+/// `RD-LOCK-018` — the **blocking token path** (`acquire_waiting`) waits out a
+/// contended name, times out with `LockTimeout` rather than a token, and once the
+/// holder releases yields a usable token that carries the *waiting* caller's owner.
+///
+/// This is the path the cluster gear serves every remote blocking `Lock` RPC
+/// through (`api/grpc/lock.rs` calls `acquire_waiting`). The guard-path `lock`
+/// tests (RD-LOCK-002/003) exercise the same wait loop, but not this wrapper's
+/// token return, so a blocked brokered acquire that wakes on release and hands
+/// back a token the caller can renew was otherwise unverified.
+#[tokio::test]
+async fn rd_lock_018_the_blocking_token_path_waits_then_acquires() {
+    let (_container, handle, lock, raw, prefix, _url) = fixture(json!({})).await;
+    let key = lease_key(&prefix, "res");
+
+    // A holds the name via the token path.
+    let held = lock
+        .acquire("res", "svc-a", LONG_TTL)
+        .await
+        .expect("A acquires the name on the token path");
+
+    // A contended blocking token-path acquire waits its budget and reports
+    // LockTimeout, not a token - the same contention-vs-outage distinction the
+    // guard-path lock makes (DESIGN.md sec 5.3).
+    let started = Instant::now();
+    let timed_out = lock
+        .acquire_waiting("res", "svc-b", LONG_TTL, Duration::from_millis(600))
+        .await;
+    assert!(
+        matches!(timed_out, Err(ClusterError::LockTimeout { .. })),
+        "a contended blocking token-path acquire must report LockTimeout, got {timed_out:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "it must actually have waited its budget, took {:?}",
+        started.elapsed()
+    );
+
+    // A blocked acquire_waiting wakes on A's release and yields a token carrying
+    // svc-b's own owner, not A's.
+    let waiter = {
+        let lock = Arc::clone(&lock);
+        tokio::spawn(async move {
+            lock.acquire_waiting("res", "svc-b", LONG_TTL, Duration::from_secs(10))
+                .await
+        })
+    };
+    // Let the waiter block on the held name before releasing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    lock.release(&held).await.expect("A releases the name");
+
+    let token = waiter
+        .await
+        .expect("the waiter task joins")
+        .expect("B acquires the freed name through the blocking token path");
+    assert_eq!(
+        token.owner, "svc-b",
+        "the woken token must carry the waiting caller's owner, not the previous holder's"
+    );
+
+    // The woken token is real: it is under the key and renew/release act on it.
+    let stored: String = raw.get(&key).await.expect("GET on the lease key succeeds");
+    assert_eq!(
+        stored,
+        format!("svc-b:{}", token.fence),
+        "B now holds the lease under its own composed token"
+    );
+    lock.renew(&token, LONG_TTL)
+        .await
+        .expect("renew the woken token succeeds");
+    lock.release(&token)
+        .await
+        .expect("release the woken token succeeds");
 
     handle.stop().await;
 }

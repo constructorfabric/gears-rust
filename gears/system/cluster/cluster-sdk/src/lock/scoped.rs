@@ -13,9 +13,12 @@ use crate::lock::types::LockFeatures;
 use crate::scope;
 
 /// A delegating [`DistributedLockBackend`] that prepends a validated scope prefix
-/// to every lock `name` on the write path. There is no read-path strip: a
-/// [`LockGuard`] is opaque to the consumer (DESIGN §3.8 table). Scoping composes
-/// by stacking wrappers.
+/// to every lock `name` on the write path, and — on the store-owned-leases path —
+/// strips it back off the [`LeaseToken::name`] it returns. A [`LockGuard`] is
+/// opaque and needs no read-path strip (DESIGN §3.8 table), but a `LeaseToken`
+/// exposes `name` as the *unprefixed* consumer name, so the token path strips on
+/// the way out and re-applies on the way back in, the way the cache primitive
+/// translates its keys. Scoping composes by stacking wrappers.
 pub struct ScopedDistributedLockBackend {
     inner: Arc<dyn DistributedLockBackend>,
     prefix: String,
@@ -56,17 +59,25 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
             .await
     }
 
+    /// Acquires under the scoped key, then strips the prefix from the returned
+    /// token so the caller sees the *unprefixed* name it asked for
+    /// ([`LeaseToken::name`] is the consumer name, not the backend's cache key).
+    /// `owner`, `fence` and `deadline` are preserved.
     async fn acquire(
         &self,
         name: &str,
         owner: &str,
         ttl: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        self.inner
+        let mut token = self
+            .inner
             .acquire(&scope::apply(&self.prefix, name), owner, ttl)
-            .await
+            .await?;
+        token.name = scope::strip(&self.prefix, &token.name).to_owned();
+        Ok(token)
     }
 
+    /// As [`acquire`](Self::acquire), stripping the prefix off the returned token.
     async fn acquire_waiting(
         &self,
         name: &str,
@@ -74,23 +85,28 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
         ttl: Duration,
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        self.inner
+        let mut token = self
+            .inner
             .acquire_waiting(&scope::apply(&self.prefix, name), owner, ttl, timeout)
-            .await
+            .await?;
+        token.name = scope::strip(&self.prefix, &token.name).to_owned();
+        Ok(token)
     }
 
-    /// Forwarded verbatim, prefix and all: the returned token names the *scoped*
-    /// lease, and it is presented back unchanged. Re-applying the prefix here would
-    /// double it, and stripping it on the way out would leave the inner backend
-    /// unable to find its own record — the same read-path rule the [`LockGuard`]
-    /// follows (DESIGN §3.8).
+    /// Re-applies the prefix to a clone of the caller's token before delegating, so
+    /// the scoped key the inner backend recorded on `acquire` is reconstructed. The
+    /// caller's token is left unchanged; only `name` is rewritten on the clone.
     async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
-        self.inner.renew(token, ttl).await
+        let mut scoped = token.clone();
+        scoped.name = scope::apply(&self.prefix, &token.name);
+        self.inner.renew(&scoped, ttl).await
     }
 
-    /// Forwarded verbatim, for the reason [`renew`](Self::renew) gives.
+    /// Re-applies the prefix on a clone, for the reason [`renew`](Self::renew) gives.
     async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
-        self.inner.release(token).await
+        let mut scoped = token.clone();
+        scoped.name = scope::apply(&self.prefix, &token.name);
+        self.inner.release(&scoped).await
     }
 
     /// Forwarded: a probe carries no name to scope, and a scoped view must not
@@ -109,6 +125,7 @@ mod tests {
 
     use super::ScopedDistributedLockBackend;
     use crate::error::ClusterError;
+    use crate::lease::LeaseToken;
     use crate::lock::backend::DistributedLockBackend;
     use crate::lock::guard::LockGuard;
     use crate::lock::types::LockFeatures;
@@ -138,6 +155,41 @@ mod tests {
             _timeout: Duration,
         ) -> Result<LockGuard, ClusterError> {
             self.try_lock(name, _ttl).await
+        }
+
+        // The token half records the scoped name it was handed, exactly as the
+        // guard half does, so `acquire_prepends_the_prefix` can assert scoping
+        // applies to the store-owned-leases path too.
+        async fn acquire(
+            &self,
+            name: &str,
+            owner: &str,
+            _ttl: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            self.seen.lock().expect("lock").push(name.to_owned());
+            Ok(LeaseToken::new(name, owner, 1))
+        }
+
+        async fn acquire_waiting(
+            &self,
+            name: &str,
+            owner: &str,
+            ttl: Duration,
+            _timeout: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            self.acquire(name, owner, ttl).await
+        }
+
+        // renew/release record the token name they were handed, so a test can
+        // assert the wrapper re-applied the prefix before delegating.
+        async fn renew(&self, token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+            self.seen.lock().expect("lock").push(token.name.clone());
+            Ok(())
+        }
+
+        async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+            self.seen.lock().expect("lock").push(token.name.clone());
+            Ok(())
         }
 
         async fn probe(&self) -> Result<(), ClusterError> {
@@ -170,6 +222,65 @@ mod tests {
         assert_eq!(
             backend.seen.lock().expect("lock").as_slice(),
             ["event-broker/ledger"]
+        );
+    }
+
+    /// The token path scopes the same way the guard path does on the *write* side —
+    /// the name the backend records is the `prefix/name` the wrapper composed — but,
+    /// unlike the opaque guard, the returned [`LeaseToken::name`] is stripped back to
+    /// the bare consumer name, because that field is contractually unprefixed.
+    #[tokio::test]
+    async fn acquire_prepends_the_prefix_and_strips_the_returned_name() {
+        let backend = Arc::new(RecordingBackend {
+            seen: Mutex::new(Vec::new()),
+        });
+        let wrapper = scoped(Arc::clone(&backend), "event-broker");
+        let token = wrapper
+            .acquire("ledger", "owner-a", Duration::from_secs(30))
+            .await
+            .expect("acquire");
+        // The inner backend keyed the lease under the scoped name...
+        assert_eq!(
+            backend.seen.lock().expect("lock").as_slice(),
+            ["event-broker/ledger"]
+        );
+        // ...but the caller gets the unprefixed name back, with owner/fence intact.
+        assert_eq!(token.name, "ledger");
+        assert_eq!(token.owner, "owner-a");
+        assert_eq!(token.fence, 1);
+    }
+
+    /// A token minted by the wrapper (bare name) must round-trip back to the inner
+    /// backend under the scoped key on `renew`/`release`, or the caller's token
+    /// would fail to resolve to the record `acquire` created.
+    #[tokio::test]
+    async fn renew_and_release_reapply_the_prefix() {
+        let backend = Arc::new(RecordingBackend {
+            seen: Mutex::new(Vec::new()),
+        });
+        let wrapper = scoped(Arc::clone(&backend), "event-broker");
+        let token = wrapper
+            .acquire("ledger", "owner-a", Duration::from_secs(30))
+            .await
+            .expect("acquire");
+        assert_eq!(token.name, "ledger");
+
+        wrapper
+            .renew(&token, Duration::from_secs(30))
+            .await
+            .expect("renew");
+        wrapper.release(&token).await.expect("release");
+
+        // The caller's token is untouched by the round-trip...
+        assert_eq!(token.name, "ledger");
+        // ...and both delegations reached the inner backend under the scoped key.
+        assert_eq!(
+            backend.seen.lock().expect("lock").as_slice(),
+            [
+                "event-broker/ledger",
+                "event-broker/ledger",
+                "event-broker/ledger"
+            ]
         );
     }
 

@@ -8,7 +8,7 @@ use cluster_sdk::{
     CacheCapability, CacheWatchEvent, ClusterCacheV1, ClusterError, ClusterProfile,
     DistributedLockBackend, DistributedLockV1, ElectionConfig, LeaderElectionBackend,
     LeaderElectionFeatures, LeaderElectionV1, LeaderStatus, LeaderWatch, LeaderWatchEvent,
-    LockFeatures, LockGuard,
+    LeaseToken, LockFeatures, LockGuard,
 };
 use standalone_cluster_plugin::StandaloneClusterPlugin;
 
@@ -215,6 +215,29 @@ impl LeaderElectionBackend for MarkerLeaderElectionBackend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.elect_with_config(name, config).await
     }
+
+    // The token half counts and delegates just like the `elect` half, so
+    // `explicit_backends_override_defaults` proves the explicit binding serves the
+    // over-the-wire `Join`/`Renew`/`Resign` methods too, not only `elect`.
+    async fn join(
+        &self,
+        name: &str,
+        owner: &str,
+        config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.join(name, owner, config).await
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.renew(token, ttl).await
+    }
+
+    async fn resign(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.resign(token).await
+    }
 }
 
 struct MarkerLockBackend {
@@ -241,6 +264,40 @@ impl DistributedLockBackend for MarkerLockBackend {
     ) -> Result<LockGuard, ClusterError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.lock(name, ttl, timeout).await
+    }
+
+    // The token half counts and delegates just like the guard half, so
+    // `explicit_backends_override_defaults` proves the explicit binding serves the
+    // over-the-wire methods too, not only `try_lock`/`lock`.
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire(name, owner, ttl).await
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire_waiting(name, owner, ttl, timeout).await
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.renew(token, ttl).await
+    }
+
+    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.release(token).await
     }
 }
 

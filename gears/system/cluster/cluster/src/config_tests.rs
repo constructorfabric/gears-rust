@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use cluster_sdk::lock::{DistributedLockBackend, LockFeatures, LockGuard};
 use cluster_sdk::{
     CacheCapability, ClusterCacheBackend, ClusterCacheProvider, ClusterCacheV1, ClusterError,
-    ClusterLockProvider, ClusterProfile, DistributedLockV1, LeaderElectionV1, ProfileHealth,
-    StopHook, WireCacheConsistency,
+    ClusterLockProvider, ClusterProfile, DistributedLockV1, LeaderElectionV1, LeaseToken,
+    ProfileHealth, StopHook, WireCacheConsistency,
 };
 use standalone_cluster_plugin::StandaloneCacheProvider;
 use toolkit::client_hub::ClientHub;
@@ -467,6 +467,44 @@ impl DistributedLockBackend for FakeNativeLock {
         Err(ClusterError::LockContended {
             name: name.to_owned(),
         })
+    }
+
+    // Every entry point bumps the counter (see the type doc), the token half
+    // included, so the mixed-profile test proves the *native* backend serves the
+    // over-the-wire lock methods and not the CAS default the omit path would fill.
+    async fn acquire(
+        &self,
+        name: &str,
+        _owner: &str,
+        _ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ClusterError::LockContended {
+            name: name.to_owned(),
+        })
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        _owner: &str,
+        _ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ClusterError::LockContended {
+            name: name.to_owned(),
+        })
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

@@ -83,12 +83,33 @@ fn the_release_pattern_covers_this_prefix_and_escapes_it() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_acquisition_mints_a_fresh_token() {
-    // The token is the entire fence behind `renew` and `release` (DESIGN.md
-    // §5.2). Two acquisitions sharing one would let a lapsed holder renew or
-    // release its successor's lease, which is the bug `RD-LOCK-006` exists for.
-    let tokens: HashSet<String> = (0..1_000).map(|_| Uuid::new_v4().to_string()).collect();
-    assert_eq!(tokens.len(), 1_000, "holder tokens must not repeat");
+fn every_acquisition_mints_a_fresh_fence() {
+    // The fence is the entire discriminator behind `renew` and `release`
+    // (DESIGN.md §5.2, §5.8.1): a single `SET NX PX` has no counter to increment,
+    // so it is drawn at random per acquisition. Two acquisitions sharing one would
+    // let a lapsed holder renew or release its successor's lease, which is the bug
+    // `RD-LOCK-006` exists for.
+    let fences: HashSet<u64> = (0..10_000).map(|_| fresh_fence()).collect();
+    assert_eq!(fences.len(), 10_000, "holder fences must not repeat");
+}
+
+#[test]
+fn the_holder_value_is_owner_and_fence_and_is_never_parsed() {
+    // The lease value every `renew` / `release` fences on is composed, never
+    // parsed back, so an owner carrying the `:` separator is no hazard — the two
+    // halves are already in hand. A remote caller holding only the token
+    // reconstructs the exact value the acquiring instance wrote.
+    assert_eq!(holder_value("owner-a", 42), "owner-a:42");
+    assert_eq!(
+        holder_value("a:b:c", 7),
+        "a:b:c:7",
+        "an owner with colons is composed verbatim, not re-parsed"
+    );
+    // A remote caller holding only the token reconstructs the exact value the
+    // acquiring instance wrote, from the token's identity fields alone (invariant
+    // I7), so any replica fences renew/release on the same string.
+    let token = LeaseToken::new("ledger", "owner-a", 99);
+    assert_eq!(holder_value(&token.owner, token.fence), "owner-a:99");
 }
 
 // ---------------------------------------------------------------------------
