@@ -155,6 +155,43 @@ pub trait ScopableEntity: EntityTrait {
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)];
 }
 
+/// `a == b` for two `&str`, in a `const` context.
+///
+/// `str`'s own `PartialEq` is not `const`, and the check below has to run at
+/// compile time to be worth anything.
+const fn property_names_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether a `SCOPE_PROPERTIES` table names every property at most once.
+///
+/// Quadratic, over a table of a handful of entries, at compile time.
+const fn properties_are_unique<C>(table: &[(&str, C)]) -> bool {
+    let mut i = 0;
+    while i < table.len() {
+        let mut j = i + 1;
+        while j < table.len() {
+            if property_names_equal(table[i].0, table[j].0) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Everything read out of [`ScopableEntity::SCOPE_PROPERTIES`]: look one
 /// property up, list the columns, or ask for one of the three well-known
 /// dimensions.
@@ -181,6 +218,29 @@ pub trait ScopableEntity: EntityTrait {
 /// }
 /// ```
 pub trait ScopeProperties: ScopableEntity {
+    /// Compile-time proof that the table names no property twice.
+    ///
+    /// `resolve_property` answers with the first matching entry, so a repeated
+    /// property name would make the later entries unreachable and silently
+    /// decide which column a scope constraint lands on. The `match` this lookup
+    /// replaced got an `unreachable_patterns` warning for that mistake; this
+    /// const puts the check back, and unlike the warning it covers hand-written
+    /// tables as well as derived ones.
+    ///
+    /// An associated const is only evaluated where it is used, so the two
+    /// readers below force it with a `const` block. An entity whose table is
+    /// never read is never checked — and never scopes anything either.
+    ///
+    /// `Self` is generic here, so the assertion is evaluated at monomorphization:
+    /// it fails a build (`cargo build`, `cargo test`, and every CI job that
+    /// compiles) but **not** a `cargo check`, which stops at metadata. That is
+    /// also why this cannot be a `trybuild` fixture — trybuild runs `cargo check`.
+    const PROPERTIES_ARE_UNIQUE: () = assert!(
+        properties_are_unique(Self::SCOPE_PROPERTIES),
+        "SCOPE_PROPERTIES names one property twice: resolve_property would answer \
+         with the first entry and quietly ignore the rest"
+    );
+
     /// Resolve an authorization property name to a database column.
     ///
     /// Maps PEP property names (e.g. `"owner_tenant_id"`) to `SeaORM` columns
@@ -193,6 +253,7 @@ pub trait ScopeProperties: ScopableEntity {
     /// dropping the constraint and falling to `WHERE false`.
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column> {
+        const { Self::PROPERTIES_ARE_UNIQUE }
         Self::SCOPE_PROPERTIES
             .iter()
             .find(|(name, _)| *name == property)
@@ -211,6 +272,7 @@ pub trait ScopeProperties: ScopableEntity {
     /// than compiling to a deny-all traversal (Policy 2).
     #[must_use]
     fn scope_columns() -> Vec<Self::Column> {
+        const { Self::PROPERTIES_ARE_UNIQUE }
         Self::SCOPE_PROPERTIES
             .iter()
             .map(|(_, column)| *column)
@@ -507,5 +569,51 @@ mod tests {
         assert!(Entity::SCOPE_PROPERTIES.is_empty());
         assert!(Entity::scope_columns().is_empty());
         assert!(Entity::resolve_property(pep_properties::OWNER_TENANT_ID).is_none());
+    }
+
+    /// The uniqueness rule `PROPERTIES_ARE_UNIQUE` asserts, tested directly.
+    ///
+    /// The assertion itself is evaluated at monomorphization, so a table that
+    /// breaks it fails a build rather than a test — there is no way to assert
+    /// on it from inside a test that has to compile. What a test can pin is the
+    /// rule the assertion applies, which is what these do.
+    mod uniqueness_rule {
+        use super::super::{properties_are_unique, property_names_equal};
+
+        #[test]
+        fn a_repeated_property_name_is_rejected() {
+            // Two entries under one name: `resolve_property` would answer with
+            // the first and the second would be dead, so which column the
+            // tenant predicate lands on would be decided by writing order.
+            assert!(!properties_are_unique(&[
+                ("owner_tenant_id", 1),
+                ("id", 2),
+                ("owner_tenant_id", 3),
+            ]));
+        }
+
+        #[test]
+        fn a_repeated_column_under_two_names_is_allowed() {
+            // The documented, intentional case: one column, two property names.
+            // Only the names have to be unique.
+            assert!(properties_are_unique(&[
+                ("owner_tenant_id", 1),
+                ("nickname", 1),
+            ]));
+        }
+
+        #[test]
+        fn an_empty_or_single_entry_table_is_unique() {
+            assert!(properties_are_unique::<u8>(&[]));
+            assert!(properties_are_unique(&[("id", 1)]));
+        }
+
+        #[test]
+        fn names_compare_by_content_not_by_pointer() {
+            assert!(property_names_equal("owner_tenant_id", "owner_tenant_id"));
+            assert!(!property_names_equal("owner_tenant_id", "owner_id"));
+            // A prefix is not a match: the length is checked first.
+            assert!(!property_names_equal("owner", "owner_id"));
+        }
     }
 }
