@@ -225,5 +225,29 @@ mod runtime_conversion {
         let cfg = tuning.apply_to(endpoint);
         assert_eq!(cfg.timeout, Duration::from_secs(30));
         assert_eq!(cfg.retry.max_attempts, 3);
+        assert_eq!(cfg.pool_max_idle_per_host, 256);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(cfg.max_concurrent_requests, 256);
+    }
+
+    #[test]
+    fn tuning_apply_overrides_pool_and_concurrency() {
+        let w = parse(
+            r#"{
+                "transport": "rest",
+                "endpoint": "https://x",
+                "pool_max_idle_per_host": 512,
+                "pool_idle_timeout": "5m",
+                "max_concurrent_requests": 1000
+            }"#,
+        )
+        .unwrap();
+        let ClientWiring::Rest { endpoint, tuning } = w else {
+            unreachable!()
+        };
+        let cfg: ClientConfig = tuning.apply_to(endpoint);
+        assert_eq!(cfg.pool_max_idle_per_host, 512);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_mins(5)));
+        assert_eq!(cfg.max_concurrent_requests, 1000);
     }
 }

@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::StreamFraming;
-use crate::runtime::config::ReconnectConfig;
+use crate::runtime::config::{ClientConfig, ReconnectConfig};
 use crate::runtime::http::{
     body_to_byte_stream, map_http_error, parse_retry_after, read_error_body_prefix,
 };
@@ -90,8 +90,12 @@ where
 /// Transport-layer retry is **disabled** — the SDK runs its own retry loop in
 /// [`retry_with_backoff`](crate::runtime::retry::retry_with_backoff).
 ///
-/// `require_tls` selects the transport security mode: `false` (the default
-/// via [`ClientConfig::new`](crate::runtime::config::ClientConfig::new))
+/// Only the *transport-construction* fields of `config` are read here — TLS
+/// enforcement plus the connection-pool / concurrency knobs. Everything else
+/// (`timeout`, `retry`, the streaming knobs, `internal_token_provider`) is
+/// applied per call by the generated client, not on the transport. In
+/// particular `config.require_tls` selects the transport security mode: `false`
+/// (the default via [`ClientConfig::new`](crate::runtime::config::ClientConfig::new))
 /// allows plaintext `http://`, preserving the platform's existing in-mesh
 /// service-to-service convention; `true`
 /// ([`ClientConfig::with_require_tls`](crate::runtime::config::ClientConfig::with_require_tls))
@@ -119,11 +123,21 @@ where
 #[cfg(feature = "otel")]
 pub fn build_default_http_client(
     client_type: &str,
-    require_tls: bool,
+    config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    // Only *transport-construction* fields belong here: transport security and
+    // the connection-pool / concurrency knobs. `config.timeout`, `config.retry`,
+    // the streaming knobs, and `internal_token_provider` are applied *per call*
+    // by the generated client — do NOT wire them onto the builder or they'll be
+    // double-applied (or override the SDK's own retry/timeout handling).
     toolkit_http::HttpClient::builder()
         .retry(None)
-        .transport(transport_security(require_tls))
+        .transport(transport_security(config.require_tls))
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .rate_limit(Some(toolkit_http::RateLimitConfig {
+            max_concurrent_requests: config.max_concurrent_requests,
+        }))
         .with_otel()
         .with_metrics(client_type)
         .build()
@@ -143,11 +157,19 @@ pub fn build_default_http_client(
 #[cfg(not(feature = "otel"))]
 pub fn build_default_http_client(
     _client_type: &str,
-    require_tls: bool,
+    config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    // See the `otel` sibling above: only transport-construction fields belong
+    // here; call-time fields (`timeout`, `retry`, streaming, credentials) are
+    // applied per call by the generated client, not on this builder.
     toolkit_http::HttpClient::builder()
         .retry(None)
-        .transport(transport_security(require_tls))
+        .transport(transport_security(config.require_tls))
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .rate_limit(Some(toolkit_http::RateLimitConfig {
+            max_concurrent_requests: config.max_concurrent_requests,
+        }))
         .with_otel()
         .build()
 }

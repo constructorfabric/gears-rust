@@ -494,7 +494,7 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             ) -> ::std::result::Result<Self, ::toolkit_http::HttpError> {
                 let http = #support::runtime::client::build_default_http_client(
                     #metrics_label,
-                    config.require_tls,
+                    &config,
                 )?;
                 Ok(Self { http, config })
             }

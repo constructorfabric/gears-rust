@@ -49,6 +49,29 @@ pub struct ClientTuning {
     #[serde(default)]
     pub require_tls: Option<bool>,
 
+    /// Max idle keep-alive connections per upstream host. Raise this to at least
+    /// the expected per-upstream request concurrency so HTTP/1.1 connections are
+    /// reused instead of churned under load. Missing keeps the SDK default
+    /// ([`ClientConfig::pool_max_idle_per_host`](crate::runtime::config::ClientConfig::pool_max_idle_per_host)).
+    #[serde(default)]
+    pub pool_max_idle_per_host: Option<usize>,
+
+    /// How long idle keep-alive connections are retained (e.g. `"90s"`, `"2m"`)
+    /// before being closed and reopened on the next request. Companion of
+    /// `pool_max_idle_per_host`; raise it above the gap between successive bursts
+    /// to a given upstream to keep connections warm. Missing keeps the SDK
+    /// default ([`ClientConfig::pool_idle_timeout`](crate::runtime::config::ClientConfig::pool_idle_timeout)).
+    #[serde(default, with = "toolkit_utils::humantime_serde::option")]
+    pub pool_idle_timeout: Option<Duration>,
+
+    /// Max concurrent in-flight requests through this client at once. Requests
+    /// beyond the cap are shed immediately (`HttpError::Overloaded`). Keep it at
+    /// or above `pool_max_idle_per_host` so the pool can be fully reused. Missing
+    /// keeps the SDK default
+    /// ([`ClientConfig::max_concurrent_requests`](crate::runtime::config::ClientConfig::max_concurrent_requests)).
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+
     /// Platform-plane credential source forwarded onto the built
     /// [`ClientConfig`](crate::runtime::config::ClientConfig). Injected by the
     /// runtime's proxy-wiring phase, never from config (`#[serde(skip)]`); gated
@@ -140,6 +163,15 @@ impl ClientTuning {
         }
         if let Some(require_tls) = self.require_tls {
             cfg = cfg.with_require_tls(require_tls);
+        }
+        if let Some(max) = self.pool_max_idle_per_host {
+            cfg = cfg.with_pool_max_idle_per_host(max);
+        }
+        if let Some(timeout) = self.pool_idle_timeout {
+            cfg = cfg.with_pool_idle_timeout(Some(timeout));
+        }
+        if let Some(max) = self.max_concurrent_requests {
+            cfg = cfg.with_max_concurrent_requests(max);
         }
         cfg = cfg.with_internal_token_provider(self.internal_token_provider.clone());
         cfg

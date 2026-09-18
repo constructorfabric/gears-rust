@@ -1,6 +1,6 @@
 use crate::config::{
-    ClientAuthConfig, HttpClientConfig, RedirectConfig, RetryConfig, TlsConfig, TlsRootConfig,
-    TlsVersion, TransportSecurity,
+    ClientAuthConfig, HttpClientConfig, RateLimitConfig, RedirectConfig, RetryConfig, TlsConfig,
+    TlsRootConfig, TlsVersion, TransportSecurity,
 };
 use crate::error::HttpError;
 use crate::layers::{OtelLayer, RetryLayer, SecureRedirectPolicy, UserAgentLayer};
@@ -94,6 +94,20 @@ impl HttpClientBuilder {
     #[must_use]
     pub fn max_body_size(mut self, size: usize) -> Self {
         self.config.max_body_size = size;
+        self
+    }
+
+    /// Set the rate-limit / concurrency configuration.
+    ///
+    /// `None` disables the concurrency limiter entirely. `Some(cfg)` installs a
+    /// load-shedding [`ConcurrencyLimitLayer`](tower::limit::ConcurrencyLimitLayer)
+    /// capped at `cfg.max_concurrent_requests`; requests beyond the cap fail
+    /// fast with [`HttpError::Overloaded`](crate::error::HttpError::Overloaded)
+    /// rather than queueing. A `max_concurrent_requests` of `usize::MAX` is also
+    /// treated as unlimited (the layer is skipped).
+    #[must_use]
+    pub fn rate_limit(mut self, rate_limit: Option<RateLimitConfig>) -> Self {
+        self.config.rate_limit = rate_limit;
         self
     }
 
