@@ -46,7 +46,9 @@ make e2e-local             # E2E — local: run every shared-server suite agains
 make e2e-local-smoke       # E2E — smoke subset only
 make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
-make e2e-usage-collector   # E2E — usage-collector lane (dedicated binary; needs Docker)
+make e2e-usage-collector   # E2E — usage-collector lane, both backends (aggregate of the two targets below)
+make e2e-usage-collector-timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
+make e2e-usage-collector-clickhouse   # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)
@@ -196,7 +198,13 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`timescaledb()`, `mariadb()`.
+`timescaledb()`, `mariadb()`, `clickhouse()`.
+
+`timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
+`ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
+still supplies the wait strategy and environment. ClickHouse in particular needs
+`WaitFor::Nothing` plus an HTTP readiness poll — that image writes its server log to files under
+`/var/log/clickhouse-server`, so a `message_on_stdout` wait can only ever time out.
 
 #### Version-matrix overrides
 
@@ -210,15 +218,23 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_MYSQL_TAG` | `MYSQL_TAG` |
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
+| `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 ```
 
-`GEARS_TEST_TIMESCALEDB_TAG` is read by both lanes: the Rust plugin fixtures via
-`test_containers::timescaledb()`, and the Python E2E sidecar via `timescaledb_tag()` in
+`GEARS_TEST_TIMESCALEDB_TAG` and `GEARS_TEST_CLICKHOUSE_TAG` are each read by *both* lanes: the
+Rust plugin fixtures via `test_containers::timescaledb()` / `clickhouse()`, and the Python E2E
+sidecars via `timescaledb_tag()` / `clickhouse_tag()` in
 [`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
 migrations and E2E on the same image instead of silently testing two different ones.
+
+Because those two pins are spelled once per language, each is duplicated across a Rust constant
+and a Python one. The unit tests `e2e_sidecar_pins_the_same_timescaledb_image` and
+`e2e_sidecar_pins_the_same_clickhouse_image` in `libs/test-containers` read `sidecars.py` and
+fail the build if either copy drifts — so a version bump is still a single reviewed decision even
+though it touches two files.
 
 `GEARS_TEST_PG_GRAPH_REQUIRED=1` turns an unavailable PostgreSQL 19 image into a failure rather
 than a graceful skip; it is off by default while that tag is pre-GA. Unset, empty, `0`, `false`,
@@ -281,10 +297,18 @@ e2e-launcher`) and therefore **skips these** — run them via their dedicated
 SUITE=<suite>`), which CI invokes as separate steps.
 
 The usage-collector lane additionally needs a reachable Docker daemon — its storage
-plugin connects and migrates a real TimescaleDB at gear init, which `lib/sidecars.py`
-supplies as a throwaway container on a dynamically mapped port. When Docker is
-unreachable the suite skips rather than fails, so verify the skip count before reading
-a green run as coverage.
+plugin connects and migrates a real TimescaleDB (or ClickHouse) at gear init, which
+`lib/sidecars.py` supplies as a throwaway container on a dynamically mapped port. When
+Docker is unreachable the suite skips rather than fails, so verify the skip count before
+reading a green run as coverage.
+
+Those containers are labelled per run, so two sessions can share one host without
+reaping each other's database: the label value ends in a per-process `RUN_ID`, and
+containers left behind by a crashed run (where `atexit` never fired) are swept on the
+next start by age rather than by label alone. Set `CF_GEARS_E2E_RUN_ID` to pin the run
+identity, and `CF_GEARS_E2E_REAP_MIN_AGE_SECS` (default 3600) to change how old a
+foreign container must be before it counts as leaked — lowering it below the length of
+a full session reintroduces the cross-session reap it exists to prevent.
 
 Other quality-related GitHub Actions under `.github/workflows` complement the E2E
 workflow:
