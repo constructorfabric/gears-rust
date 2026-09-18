@@ -551,7 +551,12 @@ async fn accept_inner(
         .await;
 
     match insert {
-        Ok(accepted) => Ok(accepted),
+        Ok(accepted) => {
+            // Enqueue can wake a sequencer before this transaction commits.
+            // Request a fresh scan now that the record is visible.
+            dispatch.committed(accepted.operation_id);
+            Ok(accepted)
+        }
         // The unique constraint on (idempotency_scope_hash, idempotency_key) is the
         // serialization point between two concurrent acceptances — this layer has no
         // row to lock, and the read above cannot close the window. The loser re-reads

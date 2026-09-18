@@ -8,14 +8,13 @@ use uuid::Uuid;
 
 use super::AdmissionFailureReason;
 use super::drift::VectorDrift;
+use crate::domain::dependency::DependencyEdge;
+use crate::domain::enums::DependencyKind;
 use crate::domain::gts_store::StoreBuildError;
 
-/// An infrastructure failure. Retryable by construction: nothing here is a
-/// statement about the candidate.
-///
-/// `#[non_exhaustive]` because this enum is still growing: T13, T15, T17, T19 and
-/// T20 each add a failure mode, and without the marker every one of them is a hard
-/// break for a downstream `match` on a published crate.
+/// Infrastructure failures; [`Self::transient`] classifies retryability.
+/// `#[non_exhaustive]` lets T13, T15, T17, T19 and T20 add failures without
+/// breaking downstream matches.
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -27,44 +26,25 @@ pub enum WorkerError {
     /// The dry-run overlay has no terminal item write after a successful admission.
     #[error("the commit path for operation item {item_id} recorded no terminal item write")]
     MissingItemWrite { item_id: i64 },
-    /// The dry-run pass left a prediction slot unfilled.
-    ///
-    /// `order_batch` partitions a batch into the ordered and the cyclic, so every
-    /// position is written exactly once. Reaching this means the partition no
-    /// longer holds, which is a worker bug rather than anything about the request.
+    /// Worker bug: `order_batch` partitions ordered/cyclic candidates so every
+    /// prediction slot must be written exactly once; one was left unfilled.
     #[error("the dry-run pass left operation item {item_id} without a prediction")]
     MissingPrediction { item_id: i64 },
-    /// Not a fault, and never reaches a caller: the worker catches it and reports
-    /// the outcome the other pass recorded. It exists as an error because rolling
-    /// the commit transaction back is the only way to *not* write an entity behind
-    /// an item that is already terminal.
+    /// Rolls back entity writes behind an already-terminal item. The worker
+    /// catches this and reports the other pass's outcome; callers never see it.
     #[error("operation item {item_id} was terminalized by another pass")]
     ItemAlreadyTerminal { item_id: i64 },
     #[error("building the transient store failed: {0}")]
     StoreBuild(#[source] StoreBuildError),
     #[error("the blocking evaluation task failed: {0}")]
     EvaluationTask(#[source] tokio::task::JoinError),
-    /// An Instance's conforming Type Schema has no committed current revision.
-    ///
-    /// **Retryable, not terminal**: the value is not wrong, its type has not landed
-    /// yet. A terminal failure would make the outcome depend on the order two
-    /// unrelated submissions reached the worker; a redelivery re-reads and succeeds.
-    /// Until T21 there is no outbox, so this condition surfaces inline as an
-    /// opaque `500`; write contention likewise surfaces as a storage error.
-    #[error("instance '{gts_id}' conforms to '{type_id}', which has no current revision")]
-    ConformingTypeAbsent { gts_id: String, type_id: String },
-    /// An entity row exists with no matching current-state row, or with one of the
-    /// other kind. Structurally impossible — entity, revision and current row are
-    /// written by one transaction (D3) — so this is a corrupt row rather than a
-    /// race, and it is infrastructure rather than a statement about the candidate.
+    /// Missing or wrong-kind current-state row. D3 writes entity, revision and
+    /// current state atomically, so this is corruption, not a race or candidate fault.
     #[error("entity '{gts_id}' (id {entity_id}) has no current-state row of its kind")]
     CurrentStateMissing { gts_id: String, entity_id: i64 },
-    /// The **entity** row itself disappeared between two reads in one transaction.
-    ///
-    /// Distinct from [`Self::CurrentStateMissing`] because the two send an operator
-    /// to different tables: this one says `entity` lost a row that nothing in the
-    /// admission protocol deletes, and that one says the `type_schema` / `instance`
-    /// projection is missing behind an entity that is still there.
+    /// An `entity` row vanished between reads in one transaction, though admission
+    /// never deletes it. Unlike [`Self::CurrentStateMissing`], the missing row is
+    /// in `entity`, not its `type_schema` / `instance` projection.
     #[error("entity '{gts_id}' (id {entity_id}) vanished mid-transaction")]
     EntityVanished { gts_id: String, entity_id: i64 },
     /// A stored `gts_id` no longer parses despite acceptance-time canonicalization.
@@ -106,6 +86,60 @@ pub enum WorkerError {
     Db(#[from] DbError),
 }
 
+impl WorkerError {
+    /// Retry only identified storage contention/transport failures or stale evaluation.
+    /// Missing dependencies are candidate refusals and never reach this type.
+    #[must_use]
+    pub fn transient(&self, backend: toolkit_db::DbBackend) -> bool {
+        match self {
+            Self::Storage(error) => toolkit_db::retry::scope(error, backend),
+            Self::Db(error) => toolkit_db::retry::database(error, backend),
+            Self::StoreBuild(error) => error.is_transient(backend),
+            Self::RevalidationRequired(_) => true,
+            // A cancelled task can be recovered on redelivery; a panic cannot.
+            Self::EvaluationTask(error) => error.is_cancelled(),
+            Self::OperationNotFound { .. }
+            | Self::MissingPayload { .. }
+            | Self::MissingItemWrite { .. }
+            | Self::MissingPrediction { .. }
+            | Self::ItemAlreadyTerminal { .. }
+            | Self::CurrentStateMissing { .. }
+            | Self::EntityVanished { .. }
+            | Self::StoredIdentifierUnparsable { .. }
+            | Self::BaselineUnparsable { .. }
+            | Self::DependencyTargetAbsent { .. }
+            | Self::ResourceVersionExhausted { .. }
+            | Self::RevisionNumberExhausted { .. }
+            | Self::RefusedAfterWrite(_) => false,
+        }
+    }
+
+    /// Safe, bounded diagnostic code. Never formats SQL, documents or credentials.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::OperationNotFound { .. } => "operation_not_found",
+            Self::MissingPayload { .. } => "missing_payload",
+            Self::MissingItemWrite { .. } => "missing_item_write",
+            Self::MissingPrediction { .. } => "missing_prediction",
+            Self::ItemAlreadyTerminal { .. } => "unexpected_terminal_item",
+            Self::StoreBuild(_) => "store_build_failed",
+            Self::EvaluationTask(_) => "evaluation_task_failed",
+            Self::CurrentStateMissing { .. } => "current_state_missing",
+            Self::EntityVanished { .. } => "entity_vanished",
+            Self::StoredIdentifierUnparsable { .. } => "stored_identifier_unparsable",
+            Self::BaselineUnparsable { .. } => "baseline_unparsable",
+            Self::DependencyTargetAbsent { .. } => "dependency_target_vanished",
+            Self::ResourceVersionExhausted { .. } => "resource_version_exhausted",
+            Self::RevisionNumberExhausted { .. } => "revision_number_exhausted",
+            Self::RefusedAfterWrite(_) => "unhandled_candidate_refusal",
+            Self::RevalidationRequired(_) => "revalidation_required",
+            Self::Storage(_) => "storage_failure",
+            Self::Db(_) => "database_failure",
+        }
+    }
+}
+
 /// A candidate-level failure: final, recorded, and never retried.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +147,8 @@ pub struct ItemFailure {
     /// A stable machine reason, preserving unknown codes read from storage.
     pub reason: AdmissionFailureReason,
     pub message: String,
+    /// Identifies a missing dependency without asking clients to parse the message.
+    pub dependency: Option<DependencyEdge>,
 }
 
 impl std::fmt::Display for ItemFailure {
@@ -125,26 +161,48 @@ impl std::fmt::Display for ItemFailure {
 impl ItemFailure {
     #[must_use]
     pub fn new(reason: AdmissionFailureReason, message: String) -> Self {
-        Self { reason, message }
+        Self {
+            reason,
+            message,
+            dependency: None,
+        }
+    }
+
+    /// A missing dependency is a final candidate refusal, not a delivery failure.
+    #[must_use]
+    pub fn missing_dependency(dependency: DependencyEdge) -> Self {
+        let role = match dependency.kind {
+            DependencyKind::Derivation => "base type",
+            DependencyKind::InstanceOf => "conforming type",
+            DependencyKind::SchemaRef => "$ref target",
+        };
+        Self {
+            reason: AdmissionFailureReason::DependencyNotFound,
+            message: format!("{role} '{}' is not registered", dependency.target),
+            dependency: Some(dependency),
+        }
     }
 
     /// The stored `error_payload`: structured, so the reason survives the round
     /// trip as a field rather than as a substring.
     #[must_use]
     pub fn to_payload(&self) -> String {
-        json!({ "reason": self.reason.as_str(), "message": self.message }).to_string()
+        let mut payload = json!({ "reason": self.reason.as_str(), "message": self.message });
+        if let Some(dependency) = &self.dependency {
+            payload["dependency_id"] = json!(dependency.target);
+            payload["dependency_kind"] = json!(match dependency.kind {
+                DependencyKind::Derivation => "base",
+                DependencyKind::InstanceOf => "conforming_type",
+                DependencyKind::SchemaRef => "ref",
+            });
+        }
+        payload.to_string()
     }
 
-    /// The inverse of [`Self::to_payload`], for an outcome read back off the row.
-    ///
-    /// Without it a redelivery and a first pass report *different shapes of the same
-    /// fact* — `{reason, message}` versus `reason: "recorded"` with the JSON stuffed
-    /// into `message`. Invisible on the wire today, since REST reads `error_payload`
-    /// from the row, but T16 counts refusals by `reason` and a metric reading
-    /// `recorded` for every redelivered item counts nothing.
-    ///
-    /// A payload that does not parse is kept verbatim under a reason that says so,
-    /// rather than being dropped or panicked on: a corrupt row should be visible.
+    /// Inverse of [`Self::to_payload`]: preserves `{reason, message}` on redelivery
+    /// for T16's per-reason metrics instead of reporting `recorded` with JSON in
+    /// `message`. REST reads the row's `error_payload` directly. Invalid payloads
+    /// remain verbatim with a diagnostic reason so corruption stays visible.
     #[must_use]
     pub fn from_payload(payload: &str) -> Self {
         match serde_json::from_str::<serde_json::Value>(payload) {
@@ -155,6 +213,25 @@ impl ItemFailure {
                     (Some(reason), Some(message)) => Self {
                         reason: AdmissionFailureReason::from_wire(reason),
                         message: message.to_owned(),
+                        dependency: value
+                            .get("dependency_id")
+                            .and_then(serde_json::Value::as_str)
+                            .zip(
+                                value
+                                    .get("dependency_kind")
+                                    .and_then(serde_json::Value::as_str),
+                            )
+                            .and_then(|(target, kind)| {
+                                Some(DependencyEdge {
+                                    kind: match kind {
+                                        "base" => DependencyKind::Derivation,
+                                        "conforming_type" => DependencyKind::InstanceOf,
+                                        "ref" => DependencyKind::SchemaRef,
+                                        _ => return None,
+                                    },
+                                    target: target.to_owned(),
+                                })
+                            }),
                     },
                     _ => Self::new(
                         AdmissionFailureReason::UnrecognizedPayload,
@@ -167,5 +244,79 @@ impl ItemFailure {
                 payload.to_owned(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_scope_is_not_a_temporary_database_failure() {
+        assert!(
+            !WorkerError::Storage(ScopeError::Invalid("invalid scope"))
+                .transient(sea_orm::DbBackend::Sqlite)
+        );
+        assert!(
+            !WorkerError::Storage(ScopeError::Denied("not allowed"))
+                .transient(sea_orm::DbBackend::Sqlite)
+        );
+        assert!(
+            !WorkerError::StoreBuild(StoreBuildError::Storage(ScopeError::Invalid(
+                "invalid scope"
+            )))
+            .transient(sea_orm::DbBackend::Sqlite)
+        );
+    }
+
+    #[test]
+    fn database_configuration_and_query_errors_are_permanent() {
+        assert!(
+            !WorkerError::Db(DbError::InvalidConfig("invalid configuration".into()))
+                .transient(sea_orm::DbBackend::Sqlite)
+        );
+        assert!(
+            !WorkerError::Storage(ScopeError::Db(sea_orm::DbErr::Query(
+                sea_orm::RuntimeErr::Internal("no such table: operation".into())
+            )))
+            .transient(sea_orm::DbBackend::Sqlite)
+        );
+    }
+
+    #[test]
+    fn a_target_disappearing_after_evaluation_is_an_invariant_failure() {
+        assert!(
+            !WorkerError::DependencyTargetAbsent {
+                gts_id: "missing".into()
+            }
+            .transient(sea_orm::DbBackend::Sqlite)
+        );
+    }
+
+    /// The split exists because `StoreBuildError` carries both a contention error
+    /// and statements about stored data. Treating the whole variant as permanent
+    /// dead-letters an operation a redelivery would have admitted.
+    #[test]
+    fn a_failed_closure_read_inside_store_build_is_retryable() {
+        let contention = WorkerError::StoreBuild(StoreBuildError::Storage(ScopeError::Db(
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+        )));
+
+        assert!(
+            contention.transient(sea_orm::DbBackend::Sqlite),
+            "a closure read that failed on contention must be retried, not dead-lettered",
+        );
+    }
+
+    #[test]
+    fn a_corrupt_document_inside_store_build_is_permanent() {
+        let corrupt = WorkerError::StoreBuild(StoreBuildError::MissingDocument {
+            gts_id: "cf.core.example.type.v1~".to_owned(),
+        });
+
+        assert!(
+            !corrupt.transient(sea_orm::DbBackend::Sqlite),
+            "no redelivery rewrites a missing stored document",
+        );
     }
 }

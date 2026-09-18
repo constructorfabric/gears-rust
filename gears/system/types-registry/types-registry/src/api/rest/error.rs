@@ -134,6 +134,12 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::CorruptDocument(detail) => {
                 opaque_internal(&detail, "stored document parse")
             }
+            // Match GET's unresolved-key response (DESIGN §3.3).
+            ServiceError::UnresolvedReference { gts_uuid } => TypeRegistryError::not_found(
+                format!("No entity with Registry Reference: {gts_uuid}"),
+            )
+            .with_resource(gts_uuid.to_string())
+            .create(),
         }
     }
 }
@@ -186,14 +192,6 @@ impl From<WorkerError> for CanonicalError {
             WorkerError::EvaluationTask(inner) => {
                 opaque_internal(&inner, "blocking evaluation task")
             }
-            // Deliberately not a `404` or `409`: a retryable condition dressed as a
-            // client error invites the caller to "fix" a request that is correct.
-            WorkerError::ConformingTypeAbsent { gts_id, type_id } => opaque_internal(
-                &format!(
-                    "instance '{gts_id}' conforms to '{type_id}', which has no current revision"
-                ),
-                "admission",
-            ),
             // Corruption, not input: an entity row without the current-state row its
             // own admission transaction wrote. Nothing the caller can act on.
             WorkerError::CurrentStateMissing { gts_id, entity_id } => opaque_internal(
@@ -212,7 +210,7 @@ impl From<WorkerError> for CanonicalError {
                 &format!("the stored baseline document for '{gts_id}' is not valid JSON: {source}"),
                 "admission",
             ),
-            // A retryable snapshot race, not a malformed candidate.
+            // A target disappearing after evaluation violates the persisted-identity invariant.
             WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
                 &format!("dependency target '{gts_id}' vanished before its edge was committed"),
                 "admission",
@@ -245,6 +243,7 @@ impl From<WorkerError> for CanonicalError {
 /// `field::` constants the SDK already publishes.
 mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
+    pub const IF_MATCH: &str = "If-Match";
     pub const ITEMS: &str = "items";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
@@ -269,6 +268,19 @@ pub fn idempotency_key_not_utf8() -> CanonicalError {
     invalid_field(
         violation_field::IDEMPOTENCY_KEY,
         "the Idempotency-Key header is not valid UTF-8".to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject `If-Match`: deletion uses `expected_resource_version`, checked
+/// asynchronously at admission, so it cannot provide HTTP `412` semantics (DESIGN §3.3).
+#[must_use]
+pub fn if_match_not_supported() -> CanonicalError {
+    invalid_field(
+        violation_field::IF_MATCH,
+        "If-Match is not supported on this route; name the precondition in \
+         expected_resource_version, whose failure is reported on the operation item"
+            .to_owned(),
         field::VALIDATION_FAILED,
     )
 }
@@ -713,10 +725,6 @@ mod tests {
             worker_problem(WorkerError::StoreBuild(StoreBuildError::Storage(
                 ScopeError::Invalid("store-secret"),
             ))),
-            worker_problem(WorkerError::ConformingTypeAbsent {
-                gts_id: "instance-secret".to_owned(),
-                type_id: "type-secret".to_owned(),
-            }),
             worker_problem(WorkerError::CurrentStateMissing {
                 gts_id: "state-secret".to_owned(),
                 entity_id: 7,

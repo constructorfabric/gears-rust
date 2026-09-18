@@ -6,6 +6,39 @@ use super::{ItemFailure, reason_label};
 use crate::domain::admission::AdmissionFailureReason;
 
 #[test]
+fn missing_dependency_details_survive_outcome_redelivery() {
+    use crate::domain::dependency::DependencyEdge;
+    use crate::domain::enums::DependencyKind;
+    for kind in [
+        DependencyKind::Derivation,
+        DependencyKind::InstanceOf,
+        DependencyKind::SchemaRef,
+    ] {
+        let failure = ItemFailure::missing_dependency(DependencyEdge {
+            kind,
+            target: "cf.core.absent.type.v1~".into(),
+        });
+        assert_eq!(ItemFailure::from_payload(&failure.to_payload()), failure);
+    }
+}
+
+#[tokio::test]
+async fn evaluation_panics_are_permanent_but_cancelled_tasks_can_be_recovered() {
+    use super::WorkerError;
+    let panicked = tokio::spawn(async {
+        std::panic::resume_unwind(Box::new("injected evaluation panic"));
+    })
+    .await
+    .expect_err("task panicked");
+    assert!(!WorkerError::EvaluationTask(panicked).transient(sea_orm::DbBackend::Sqlite));
+
+    let task = tokio::spawn(std::future::pending::<()>());
+    task.abort();
+    let cancelled = task.await.expect_err("task cancelled");
+    assert!(WorkerError::EvaluationTask(cancelled).transient(sea_orm::DbBackend::Sqlite));
+}
+
+#[test]
 fn known_reasons_keep_their_wire_codes_and_metric_labels_after_storage() {
     for (reason, code) in [
         (

@@ -1,34 +1,20 @@
-//! The persistence ports the domain calls, and the row and input types that cross
-//! them.
-//!
-//! SPEC §8 makes acceptance and admission each one transaction, so the transaction
-//! boundary is a business rule and the domain orchestrates it: the transaction
-//! crosses the boundary as `&DbTx<'_>`. What the ports hide is every `SeaORM` type
-//! — entities, active models, column enums — so the domain names `toolkit_db` and
-//! nothing below it. The row and input types below are what the repositories in
-//! `infra::storage::repo` themselves take and return, which is why `store.rs`
-//! forwards without translating.
+//! Persistence ports and shared row/input types. The domain orchestrates SPEC §8
+//! acceptance/admission transactions via `&DbTx<'_>`; ports hide `SeaORM` entities,
+//! active models and column enums. `infra::storage::repo` uses these same types,
+//! so `store.rs` forwards without translation and the domain names only `toolkit_db`.
 //!
 //! # Why every port takes `&DbTx<'_>` and not a runner
 //!
-//! Three candidates, and the first two are unavailable rather than unattractive:
+//! - `&impl DBRunner` makes trait methods non-dyn-safe, preventing `Arc<dyn Stores>`
+//!   and propagating generics through the domain to gear wiring.
+//! - Sealing permits coercion to `&dyn DBRunner`, but secure queries require
+//!   `&impl DBRunner` with implicit `Sized` (`toolkit-db/src/secure/select.rs`).
+//!   Only `toolkit_db::outbox` accepts `&(impl DBRunner + Sync + ?Sized)`.
+//! - Concrete `&DbTx<'_>` preserves dyn safety. Every call, including reads, uses
+//!   a transaction so multi-table reads cannot straddle commits ([`snapshot_read`]).
 //!
-//! - `&impl DBRunner` on a trait method makes the trait non-dyn-safe, which would
-//!   push a type parameter through every domain function into the gear's wiring.
-//!   `Arc<dyn Stores>` would be impossible.
-//! - `&dyn DBRunner` *can be built* — sealing prevents implementing the trait, not
-//!   coercing to it — but cannot be *executed on*: the secure query API spells its
-//!   parameter `&impl DBRunner` (`toolkit-db/src/secure/select.rs`), whose implicit
-//!   `Sized` bound an unsized `dyn` runner fails. `toolkit_db::outbox` opted out
-//!   with `&(impl DBRunner + Sync + ?Sized)`; the secure API has not.
-//! - `&DbTx<'_>` is concrete, so the traits stay dyn-safe. Its cost is that
-//!   **every** port call runs inside a transaction, reads included — the
-//!   deliberate choice, because a read that consults two tables must not straddle
-//!   a concurrent commit (see [`snapshot_read`]).
-//!
-//! The repositories underneath keep `runner: &impl DBRunner` as
-//! `11_database_patterns.md` prescribes, so they stay usable outside a
-//! transaction. That is the whole difference between a repository and a port here.
+//! Repositories retain `runner: &impl DBRunner` per `11_database_patterns.md`
+//! and remain usable outside transactions.
 //!
 //! # Rows mirror their tables
 //!
@@ -58,25 +44,15 @@ pub mod metrics;
 // Read transactions
 // ---------------------------------------------------------------------------
 
-/// The configuration a **multi-statement read** must run under.
+/// Multi-statement read snapshot. `PostgreSQL`'s default `READ COMMITTED` takes
+/// per-statement snapshots that can straddle a commit. Request `RepeatableRead`
+/// explicitly on it and `MySQL`/`InnoDB` (where it is the default); `ReadOnly`
+/// makes both engines reject writes.
 ///
-/// A transaction alone is not enough on every backend. `PostgreSQL` defaults to
-/// `READ COMMITTED`, where every statement takes a fresh snapshot — so two reads
-/// inside one such transaction can still straddle a concurrent commit and compose a
-/// state that never existed. `RepeatableRead` is snapshot isolation there;
-/// `MySQL`/`InnoDB` is already at that level, and asking makes the requirement
-/// explicit rather than inherited from a server default. `ReadOnly` is an
-/// assertion, not an optimisation: both engines reject a write inside such a
-/// transaction.
-///
-/// **`SQLite` is asked for nothing, deliberately.** Its transactions are
-/// serializable by construction — a reader holds a WAL snapshot or a shared lock
-/// for the duration — and `SeaORM` does not translate the request anyway:
-/// `sqlx_sqlite`'s `set_transaction_config` logs one `WARN` per unsupported setting
-/// (observed: two lines per read on the backend `quickstart.yaml` binds).
-///
-/// A **single**-statement read needs none of this — one statement is atomic on its
-/// own — so those paths use a plain transaction, which the ports still require.
+/// `SQLite` already holds a serializable WAL snapshot/shared lock. Request no
+/// settings: `SeaORM` does not translate them, and `sqlx_sqlite`'s
+/// `set_transaction_config` emits a `WARN` per unsupported setting (two per read
+/// with `quickstart.yaml`). Atomic single-statement reads use plain transactions.
 #[must_use]
 pub fn snapshot_read(db: &Db) -> TxConfig {
     snapshot_read_for(db.db_engine())
@@ -94,19 +70,11 @@ fn snapshot_read_for(engine: &str) -> TxConfig {
     }
 }
 
-/// The configuration a **commit transaction** must run under: the mirror image of
-/// [`snapshot_read`], and for the same reason — a server default is not a contract.
-///
-/// A commit transaction rechecks and writes, so it wants the *latest* committed
-/// state: every recheck in SPEC §8.1 step 4 exists to see what another admission
-/// just did. `PostgreSQL` gives that by default; `MySQL`/`InnoDB` defaults to
-/// `REPEATABLE READ`, where the re-read that recovers from an absorbed unique
-/// conflict (`repo::conflict_do_nothing`) would still see the transaction's opening
-/// snapshot and miss the winner's row. `READ COMMITTED` makes the two backends
-/// agree.
-///
-/// No `access_mode`: this transaction writes. `SQLite` is asked for nothing, as in
-/// [`snapshot_read`].
+/// Commit rechecks need the latest state (SPEC §8.1 step 4): request `READ COMMITTED`
+/// on `PostgreSQL` (its default) and `MySQL`/`InnoDB`. The latter's default
+/// `REPEATABLE READ` would hide the winner after an absorbed unique conflict
+/// (`repo::conflict_do_nothing`). No `access_mode` because commits write;
+/// no `SQLite` settings, as in [`snapshot_read`].
 #[must_use]
 pub fn commit_write(db: &Db) -> TxConfig {
     commit_write_for(db.db_engine())
@@ -682,6 +650,17 @@ pub trait EntityStore: Send + Sync {
         gts_uuid: Uuid,
     ) -> Result<Option<EntityRow>, ScopeError>;
 
+    /// Batch exact read by Registry Reference, for a caller resolving a whole
+    /// batch of deletion targets. References with no row are absent from the
+    /// result rather than reported, so the caller keeps request order when it
+    /// names the first unresolved one.
+    async fn find_by_gts_uuids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError>;
+
     /// The kind of one member of a family, or `None` when the family is empty.
     /// The input to T10's one-kind-per-family rule.
     async fn kind_in_family(
@@ -844,6 +823,15 @@ pub trait InstanceStore: Send + Sync {
     ) -> Result<bool, ScopeError>;
 }
 
+/// Recovery ordering key and operation id. Client-allocated UUIDs carry no time
+/// component, so `created_at` supplies chronological order.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryCursor {
+    pub created_at: OffsetDateTime,
+    pub id: Uuid,
+}
+
 /// Operations and their per-candidate items.
 #[async_trait]
 pub trait OperationStore: Send + Sync {
@@ -861,6 +849,17 @@ pub trait OperationStore: Send + Sync {
         scope: &AccessScope,
         id: Uuid,
     ) -> Result<Option<OperationRow>, ScopeError>;
+
+    /// Page non-terminal operations after interruption or outbox rollout without
+    /// reading the entire boot backlog. Keyset paging advances while prior rows
+    /// await admission. Start with `None`, then use the last cursor; a short page ends the scan.
+    async fn find_nonterminal_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ScopeError>;
 
     async fn insert_operation(
         &self,
@@ -896,6 +895,17 @@ pub trait OperationStore: Send + Sync {
     ) -> Result<bool, ScopeError>;
 
     async fn mark_completed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError>;
+
+    /// Terminalize an operation that delivery abandoned, from either non-terminal
+    /// status. Unlike [`Self::mark_completed`] this also moves a `pending` row: an
+    /// operation can be abandoned before its pass ever marked it running.
+    async fn mark_abandoned(
         &self,
         tx: &DbTx<'_>,
         scope: &AccessScope,

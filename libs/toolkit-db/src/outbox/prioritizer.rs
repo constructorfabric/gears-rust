@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -309,6 +310,9 @@ pub struct SharedPrioritizer {
     /// Sequencer wakeup signal. Owned by the prioritizer, exposed via
     /// [`notifier()`](Self::notifier) for worker subscription.
     notify: Arc<Notify>,
+    /// A post-commit flush requires a fresh database snapshot, even when the
+    /// enqueue hint was already consumed. Independent of the dirty inbox.
+    reconciliation_requested: AtomicBool,
 }
 
 impl SharedPrioritizer {
@@ -319,6 +323,7 @@ impl SharedPrioritizer {
             inbox: std::sync::Mutex::new(Inbox::new()),
             scheduler: std::sync::Mutex::new(PartitionScheduler::new()),
             notify: Arc::new(Notify::new()),
+            reconciliation_requested: AtomicBool::new(false),
         }
     }
 
@@ -328,9 +333,17 @@ impl SharedPrioritizer {
         Arc::clone(&self.notify)
     }
 
-    /// Fire-and-forget sequencer wakeup. Used by `Outbox::flush()`.
-    pub(crate) fn wake_sequencers(&self) {
+    /// Request a fresh scan of committed incoming rows. Repeated requests
+    /// coalesce until a sequencer starts the scan.
+    pub(crate) fn request_reconciliation(&self) {
+        self.reconciliation_requested.store(true, Ordering::Release);
         self.notify.notify_one();
+    }
+
+    /// Consume BEFORE querying the database: a flush during that query must
+    /// survive for another scan, since it can commit after the query snapshot.
+    pub(crate) fn take_reconciliation_request(&self) -> bool {
+        self.reconciliation_requested.swap(false, Ordering::AcqRel)
     }
 
     /// Signal that a partition has pending work. Called by producers

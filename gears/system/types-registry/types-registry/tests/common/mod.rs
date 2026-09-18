@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use test_stores::{
-    CasMissHooks, ClaimHooks, DeletionMissHooks, PauseHooks, PausePoint, StoreHooks, TestStores,
+    CasMissHooks, ClaimHooks, DeletionMissHooks, OperationReadFailureHooks, PauseHooks, PausePoint,
+    SlowAdmissionThenStalledAbandonHooks, StaleFirstFindItemsHooks, StallHooks, StoreHooks,
+    TestStores,
 };
 
 use gts::GtsConfig;
@@ -116,6 +118,77 @@ pub async fn provider_for(dsn: &str, max_conns: u32) -> Arc<DBProvider<DbError>>
 fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
     use sea_orm_migration::MigratorTrait;
     types_registry::infra::storage::Migrator::migrations()
+}
+
+/// Isolated in-memory `SQLite` pool with managed-state and outbox migrations.
+/// A UUID-named shared cache lets background connections see the same tables;
+/// multiple connections let acceptance and outbox tasks run concurrently.
+pub async fn test_db_with_outbox() -> Arc<DBProvider<DbError>> {
+    let name = format!("tr-outbox-{}", uuid::Uuid::new_v4());
+    provider_for_with_outbox(&format!("sqlite:file:{name}?mode=memory&cache=shared"), 4).await
+}
+
+/// Apply managed-state and outbox migrations using the production table prefix.
+pub async fn provider_for_with_outbox(dsn: &str, max_conns: u32) -> Arc<DBProvider<DbError>> {
+    let opts = ConnectOpts {
+        max_conns: Some(max_conns),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let dsn_scheme = dsn.split(':').next().unwrap_or("database");
+    let db = connect_db(dsn, opts)
+        .await
+        .unwrap_or_else(|e| panic!("connect {dsn_scheme} test database: {e}"));
+    let mut all = migrations();
+    all.extend(
+        toolkit_db::outbox::outbox_migrations_with_prefix(
+            types_registry::infra::outbox::TABLE_PREFIX,
+        )
+        .expect("outbox migration prefix"),
+    );
+    run_migrations_for_testing(&db, all)
+        .await
+        .expect("run migrations");
+    Arc::new(DBProvider::new(db))
+}
+
+// ---------------------------------------------------------------------------
+// The outbox-delivery wait (SPEC §13's scoped exception)
+// ---------------------------------------------------------------------------
+
+/// Wait for real outbox delivery only (SPEC §13). Other tests call the worker directly.
+///
+/// `read` returns `Some` when terminal, `None` only for `pending`/`running`, and
+/// asserts on other responses. Observe immediately, then back off 10–100 ms under
+/// one deadline covering reads and waits. Never retry submissions or assertions.
+///
+/// # Panics
+/// If the deadline expires before `read` returns `Some`.
+pub async fn await_delivery<T, F, Fut>(what: &str, read: F) -> T
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    use std::time::Duration;
+
+    /// Failure deadline; the passing suite must still meet SPEC §13's 5 s budget.
+    const DEADLINE: Duration = Duration::from_secs(2);
+    const FIRST_BACKOFF: Duration = Duration::from_millis(10);
+    const MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        if let Some(value) = read().await {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() + backoff < deadline,
+            "{what}: the outbox did not deliver within {DEADLINE:?}"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 /// The database-backed persistence ports, as the gear wires them. Tests that

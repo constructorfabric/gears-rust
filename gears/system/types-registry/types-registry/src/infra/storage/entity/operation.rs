@@ -14,7 +14,7 @@
 //! mismatch rather than a replay of the dry-run result.
 //!
 //! Worker leases, attempts, retries and dead letters are **not** here — they live
-//! in the `toolkit-db` outbox tables under the `types_registry_outbox` prefix.
+//! in the `toolkit-db` outbox tables under the `types_registry__outbox` prefix.
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

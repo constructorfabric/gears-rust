@@ -25,3 +25,12 @@ are provided as definitions and executed by the runtime with a privileged connec
 ## License
 
 Licensed under Apache-2.0.
+
+### Classifying delivery failures
+
+With a database backend enabled, `toolkit_db::retry::{scope, database}` classify
+recognized temporary storage failures for **idempotent** callers such as leased outbox
+handlers. Pass the actual `Db::backend()`. Contention, temporary transport failures and
+pool-acquisition timeout can be retried; scope/access/configuration errors, invalid SQL,
+closed pools, corrupt data and unknown errors cannot. This does not change the narrower
+`transaction_with_retry` contention policy and does not itself schedule or bound retries.

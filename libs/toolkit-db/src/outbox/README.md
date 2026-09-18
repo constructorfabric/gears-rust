@@ -150,6 +150,21 @@ outbox.enqueue_batch(&txn, Records::to("orders")
 A batch is all-or-nothing: one entity that breaks a rule rejects the whole
 submission, and nothing is written.
 
+After a successful transaction commit, call `outbox.flush()` once, regardless of
+how many queues or partitions the transaction wrote. `Outbox::transaction()` does
+this automatically. Do not call it after rollback.
+
+`flush()` requests an immediate database scan by a sequencer and wakes it. This
+recovers work even if enqueue's early notification was consumed before commit.
+Concurrent requests coalesce; a request arriving during a scan requires another
+scan so that the earlier database snapshot cannot hide the new commit. Only
+partitions with pending incoming rows are scheduled.
+
+The call performs no database I/O itself and does not wait for delivery. Use a
+trace subscription or operation status to observe completion. A failed scan is
+retried by the sequencer with its normal backoff. The periodic database scan
+remains the recovery path if a producer exits between commit and `flush()`.
+
 ### Multi-queue with tuning
 
 ```rust
@@ -183,16 +198,19 @@ batch is the unit: you are told once, not per message.
 // Subscribe before the transaction commits. A completion cannot precede that
 // commit, so registering first means nothing can be missed.
 let waiting = outbox.subscribe("import-2026-09-08")?;
+let tx_outbox = outbox.clone();
 
 db.in_transaction(|txn| async move {
     orders_repo.insert(txn, &orders).await?;
-    outbox.enqueue_batch(txn, Records::to("orders")
+    tx_outbox.enqueue_batch(txn, Records::to("orders")
         .payload_type("application/json")
         .trace("import-2026-09-08")
         .push(0, first)
         .push(1, second)
         .build()?).await
 }).await?;
+
+outbox.flush();
 
 match waiting.completion().await {
     Some(outcome) if outcome.is_clean() => info!(entities = outcome.entities, "all delivered"),

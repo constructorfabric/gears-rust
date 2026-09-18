@@ -1,4 +1,4 @@
-//! T17/T18 admission behavior on PostgreSQL and MySQL.
+//! T17/T18 admission behavior on `PostgreSQL` and `MySQL`.
 
 #![cfg(feature = "integration")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]

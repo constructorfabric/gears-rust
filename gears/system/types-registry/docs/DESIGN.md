@@ -422,6 +422,8 @@ The pipeline is the sole writer of entity state. It owns request identity, opera
 
 The endpoint has one successful acceptance shape: `202 Accepted` with an operation UUID, never an inline result. Admission is asynchronous because dependent revalidation is intentionally unbounded; P2 hooks may add further long-running work. For registration, the caller first batch-reads its identifiers, omits equal authored content, and submits missing entities without `expected_resource_version` and updates with the version it observed. Deletion always supplies the positive version observed for the existing entity. Tenant ownership comes from `SecurityContext`; global registration uses `PlatformSecurityContext`.
 
+Separate operations, including requests accepted in sequence, have no execution or completion ordering guarantee. Dependency ordering applies within one batch. Callers needing a dependency across requests must await and inspect the prerequisite operation's results before submitting the dependent request.
+
 Acceptance reads no registry entity state. It decides only from the request, plane, and startup configuration, so the following failures are synchronous:
 
 1. **Envelope and batch size** — refuses more than 100 candidates.
@@ -452,7 +454,26 @@ Authored-content equality is established once by the worker per candidate. The h
 
 The leased ToolKit outbox owns multi-pod claiming, lease expiry, retry, and dead letters. Delivery is at least once, so admission-unit commits are idempotent and guarded by operation-item identity, authored equality, unique revisions, and compare-and-swap; outbox lease state is not duplicated in `operation`. The operation status index only terminalizes work abandoned after outbox retries and is not a second dispatcher.
 
-Candidate rejection is a successful dispatch outcome. Transient database or infrastructure failure returns `Retry`; `Reject` is reserved for a permanently invalid internal message. Long-running P2 hooks split into bounded durable stages rather than retaining one lease. P1 use of the `toolkit-db/preview-outbox` feature requires the §4 sign-off.
+Candidate rejection is a successful dispatch outcome (`Ack`), including an absent base,
+conforming Type Schema or `$ref` target. The item fails on its first evaluation with
+`dependency_not_found`, `dependency_id` and `dependency_kind` (`base`, `conforming_type`,
+`ref`). There is no dependency-wait window. Dependencies submitted together are ordered
+within the batch; across submissions, the caller waits for successful prerequisite admission.
+
+Only recognized temporary database contention, transport failures or connection-acquisition
+timeouts permit delivery retry. Invalid scope, access denial, configuration/query errors,
+corrupt stored data, invariant failures and evaluation panics are permanent system failures.
+Evaluation cancellation leaves work recoverable; lease-timeout recovery remains bounded by
+`worker.max_delivery_attempts`. Stale evaluation uses the separate revalidation budget.
+
+`Reject`/dead-letter is reserved for unusable internal messages, permanent system failures
+and exhausted delivery recovery. Unfinished items receive `admission_abandoned`; already
+terminal outcomes remain intact. Operation diagnostics and dead-letter reasons carry a safe
+`error_code` and the `operation_id` used in logs, never raw SQL, credentials or candidate
+content. If terminalization fails, startup recovery can re-enqueue the still-active operation.
+Dead letters are operator diagnostics, not client results; replaying an already-completed
+operation does not restart admission. Long-running P2 hooks split into bounded durable stages
+rather than retaining one lease.
 
 The end-to-end flow this pipeline drives — read, reconcile, submit, dispatch, admit, poll — is `cpt-cf-types-registry-seq-batch-admission` in §3.6.
 
@@ -1902,7 +1923,7 @@ Registry Source Plugins are registered as well-known GTS Instances and resolved 
 
 #### Platform database
 
-The single authoritative store of §3.7, served by many pods, on SQLite, PostgreSQL, or MySQL. Durable dispatch uses the `toolkit-db` outbox with the `types_registry_outbox` table prefix, currently gated by the experimental `toolkit-db/preview-outbox` feature. `cpt-cf-types-registry-constraint-multi-backend` governs how portability is preserved across the three backends.
+The single authoritative store of §3.7, served by many pods, on SQLite, PostgreSQL, or MySQL. Durable dispatch uses the `toolkit-db` outbox with the `types_registry__outbox` table prefix, unconditionally supported and behind no feature gate (SPEC §4). `cpt-cf-types-registry-constraint-multi-backend` governs how portability is preserved across the three backends.
 
 #### External Registry Sources
 
@@ -2212,7 +2233,7 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 ### Implementation prerequisites
 
-Six prerequisites block implementation: the benchmark profile above, two external confirmations, and three protocol/contract/schema alignments below.
+Five prerequisites block implementation: the benchmark profile above, one external confirmation, and three protocol/contract/schema alignments below.
 
 No ADR-0015 quarantine preflight is needed because the release introducing the check is also the first to persist Managed Entities. The rule must not be enabled over data admitted by a build that had storage but lacked the check.
 
@@ -2233,7 +2254,7 @@ No ADR-0015 quarantine preflight is needed because the release introducing the c
 7. **Registration-policy matching properties**: trailing wildcard includes its root; a prefixed wildcard requires a suffix; trailing wildcard ignores the type marker; major-only pattern includes its minors. These are pinned in `gts-id` `GtsIdPattern::matches_views` tests `test_trailing_chain_wildcard_matches_empty_suffix`, `test_prefixed_chain_wildcard_requires_a_suffix`, and `test_trailing_wildcard_ignores_type_marker`.
 8. **Pattern containment** for Source Claim overlap. Rooted grammar provides anchoring, and ADR-0011 prevents claims slicing into a chain.
 
-**Approve reliance on `toolkit-db/preview-outbox`.** P1 will reuse its leased outbox rather than implement another. `ledger`, `file-storage`, and `chat-engine` already use it; Types Registry needs the same sign-off.
+**`toolkit-db` outbox reliance — no longer a prerequisite.** P1 reuses `toolkit-db`'s leased outbox rather than implementing another, as `ledger`, `file-storage`, and `chat-engine` do. This needed a sign-off while the outbox was an experimental feature; `toolkit-db` 0.12.0 made it unconditional, so no approval is outstanding (SPEC §4).
 
 ## 5. Traceability
 

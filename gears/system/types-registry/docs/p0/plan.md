@@ -13,8 +13,9 @@ Task list: [`todo.md`](./todo.md)
 
 Make Types Registry durable: entities move from a process-local `gts-rust` store into the
 platform database, admission becomes an asynchronous operation-based protocol, effective
-artifacts are materialized, registration moves from a registry-side inventory pull to a
-per-gear push, and a new SDK trait replaces the old one outright.
+artifacts are materialized, and a new SDK trait replaces the old one outright. P0 retains
+registry-side inventory pull; per-gear inventory push moves to P1 alongside platform-plane
+authentication and client integration (P18).
 
 Global entities only — no tenant ownership, no `PlatformSecurityContext`, no PDP, no
 federation.
@@ -32,15 +33,17 @@ and dependent refresh. Both must be positive. Closure accounting is per document
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-33 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a added
-out of the Checkpoint 1 review (P12/P13), and T27 split into T20a and T22a (P17). Thirty are
+32 P0 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a
+added out of the Checkpoint 1 review (P12/P13), T27 split into T20a and T22a (P17), and T22
+deferred to P1 (P18). Existing task IDs are retained; T22 is a transfer note, not an open P0
+task. Twenty-nine are
 S or M; three are **L** and say why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
 (e2e migration across seven files), each split by gear or by file rather than landing as one
 commit. Two tasks exceed the ~5 file guideline, flagged with the reason where they occur.
 
 ## Decisions taken during planning
 
-Sixteen decisions were made here rather than in the spec, because all of them are consequences
+Seventeen decisions were made here rather than in the spec, because all of them are consequences
 of task ordering or of facts about the runtime that only surface once the work is sliced.
 P1–P5 were taken before implementation started; P6–P10 came out of reviewing Phase 1 on its way
 in, and the spec has been updated to match all five. P12 is a correction: it reverses a change T9
@@ -52,7 +55,8 @@ claimed first by every commit — that orders commits, joined by every writer of
 admission here, deletion at T20, purge under ADR-0013. P16 came out of reviewing Phase 3:
 observability is a per-task obligation from T17 onward. P17, revised after T20, splits REST
 completion into T20a (mutations, Phase 5) and T22a (reads, Phase 6), and moves T21 outbox
-dispatch into Phase 5. (P11 was a housekeeping close-out and is retired; the number is not reused.)
+dispatch into Phase 5. P18 supersedes P4’s P0 scope: inventory push moves to P1, while
+explicit-document reconciliation remains in P0. (P11 was a housekeeping close-out and is retired; the number is not reused.)
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -68,7 +72,7 @@ Later phases widen that path without reshaping it.
 
 No decision from SPEC §3 changes. Only the order does.
 
-### P2. Types-registry seeds itself by invoking the admission worker directly
+### P2. Types-registry seeds by invoking the admission worker directly
 
 types-registry owns the `toolkit-gts` base types and its own control-plane types (DESIGN:
 *"`toolkit-gts` base types default to `types-registry` ownership"*). It cannot register
@@ -80,7 +84,8 @@ outbox and no barrier. This is not a privileged second path; it is the same func
 outbox handler calls. Seeding is deterministic and complete before the client is published.
 
 This is also what makes the §13 no-polling rule satisfiable, so it is the same property
-being exploited twice.
+being exploited twice. At T24, P18 extends this inline seed set to all process-linked
+inventory plus `cfg.entities`; per-gear selection is deferred to P1.
 
 ### P3. The outbox worker starts at the end of types-registry's `init()`
 
@@ -104,7 +109,7 @@ topological and types-registry is a declared dependency of its consumers, so its
 live before any consumer's `init()` body runs.
 
 **Order inside types-registry's `init()`:** repositories → inline seeding of
-its own types (P2) → start the outbox worker → publish the client. Seeding precedes the
+the seed set (P2/P18) → start the outbox worker → publish the client. Seeding precedes the
 worker start and enqueues nothing, so seed operations cannot be leased concurrently. There is
 no snapshot-load step: per P6 seeding builds its own transient store like any other
 admission, and reads go to the database.
@@ -118,15 +123,18 @@ executors:
 
 | Moment | Accepts | Admits |
 |---|---|---|
-| types-registry `init()` — its own types | types-registry | itself, inline, no outbox (P2) |
-| A gear reconciles its inventory | registry code in the **caller's** task (local client in-process; a gRPC client out-of-process) | the outbox worker |
+| types-registry `init()` — linked inventory + `cfg.entities` (P18) | types-registry | itself, inline, no outbox (P2) |
+| A gear reconciles explicitly supplied documents | registry code in the **caller's** task (local client in P0; platform client in P1) | the outbox worker |
 | REST at runtime | types-registry's Axum handler | the outbox worker |
 
 Acceptance is always synchronous, in the caller's task. Admission is performed by exactly
 one outbox worker owned by types-registry — one in the system for a single-binary
 deployment.
 
-### P4. Registration moves from pull to push, in P0
+### P4. Registration moves from pull to push — P0 scheduling superseded by P18
+
+**Historical decision.** The rationale below describes the original plan. P18 moves this
+inventory migration to P1; its P0 task boundaries and C3 disposition supersede this section.
 
 A gear does not know whether it runs in-process or out of process, and its code must not
 depend on that. The registry-side **pull** violates this in the worst way: a gear's code is
@@ -179,7 +187,8 @@ success. Keeping the old trait means keeping a blocking submit-then-await adapte
 signature that no longer describes what happens. Second, the old models cannot cross a wire
 at all — `GtsTypeSchema.parent: Option<Arc<GtsTypeSchema>>` and
 `GtsInstance.type_schema: Arc<GtsTypeSchema>` are in-process object graphs — so retaining
-them retains an out-of-process blocker that P4 exists to remove.
+them retains an out-of-process blocker. P0 removes that model blocker; inventory push
+from P4 is now deferred to P1 by P18.
 
 So the old trait goes, and every consumer migrates inside P0. The real surface is larger
 than the thirteen register sites: reads dominate (`list_instances` ~59 references,
@@ -697,14 +706,15 @@ T28–T30 keep their IDs.
 - **Phase 5: T19 → T20 → T20a → T21 → Checkpoint 5.** T20a exposes single/batch
   deletion with dry run on all mutations (body for registration/batch deletion, query for
   single deletion). T21 adds outbox submission; seeding remains inline (P3).
-- **Phase 6: T22 → T22a → T23 → Checkpoint 6.** T22a adds `:batchGet` and bounded,
+- **Phase 6: T22a → T23 → Checkpoint 6.** (T22 deferred by P18.) T22a adds `:batchGet` and bounded,
   content-free discovery with cursors and `$select` refusal. REST and SDK follow SPEC
   §10.1/§10.2 (`items`, `key`, `EntityPage`).
 
 T20a works with inline admission. T21 depends on T20; scheduling it after T20a enables
 REST-to-outbox tests before Checkpoint 5. T22a needs database reads, v2 routes and T20a's
-mutation docs for the seven-route completeness check. T22's `owning_gear` is independent
-of reads; T23 depends on T22 and follows T22a by execution order. T29 needs T22a and T23.
+mutation docs for the seven-route completeness check. T23 needs T4 reads and T21 dispatch
+for explicit-document reconciliation, and follows T22a by execution order. T22 is no longer
+a P0 dependency (P18). T29 needs T22a and T23.
 
 Checkpoint 5 proves submit → poll → terminal outcome through the router and outbox for
 all mutations in both modes, without direct worker calls. Dry runs persist outcomes but
@@ -717,6 +727,48 @@ P12 keeps e2e files unchanged and `make e2e-local` green until T24.
 
 Cutover remains **T24 → T24a → T28**, alongside T25 → T26. T24a promotes all seven
 routes and owns both v1-breaking changelog entries; T28 migrates the Python suites.
+
+### P18. Defer per-gear inventory push to P1; retain explicit-document reconciliation
+
+**Accepted scope revision (2026-09-15).** Supersedes P4's P0 scheduling and rewrites SPEC
+D11. T22 moves to [#4827](https://github.com/constructorfabric/gears-rust/issues/4827)
+under [P1 #4628](https://github.com/constructorfabric/gears-rust/issues/4628)
+alongside platform-plane authentication and client integration. `owning_gear` is attribution
+and a local inventory selector, never authentication or authorization. The reason to group
+this work is to verify the complete cross-process startup path together; metadata itself
+has no authN dependency.
+
+**Task boundaries and numbering.** Keep all existing IDs so issue links and recorded evidence
+remain valid. There are 32 active P0 tasks; T22 remains a transfer note. Phase 6 is now
+T22a → T23. T23 keeps the new trait/models and a helper accepting explicit desired documents:
+batch-read → compare → submit changes → poll, with bounded dependency retry. It neither
+collects inventory nor deletes records omitted from the desired set. T25/T26 migrate existing
+registration and read callers; they add no inventory registration call merely because a gear
+has GTS declarations. T24 still deletes ready mode and the in-memory repository.
+
+**P0 bootstrap.** T24 collects all linked Type Schema and Instance inventory, including other
+gears, plus operator `cfg.entities`, and admits that combined set inline before starting the
+outbox and publishing the client. Keep one bounded seed batch: the combined set must fit
+`limits.batch_candidates` and all other admission limits. Fail startup explicitly if it does
+not; do not truncate or silently split dependency-related candidates. Admission already orders
+the candidate graph. Verify real deployment inventories, cross-crate dependencies, the
+combined-set limit, and unchanged repeat startup. This costs startup work proportional to
+linked declarations, not a whole-table warm-up, and preserves C1/C4's closure.
+
+**C3 remains open.** P0 persists `owning_gear = "types-registry"` as a documented compatibility
+placeholder for admissions; it does not claim to identify their declaring gear. The field
+and global NOT NULL constraint stay. Automatic inventory registration from another process
+is unsupported until P1. This limitation does not widen C8's internal-only mutation surface.
+
+**P1 acceptance boundary.** Add inventory metadata/filtering (former T22); compose it with the
+platform client/security context and P0's reconciliation helper; migrate declaring gears to
+push their own inventory, with dependency retry and readiness tests in both process layouts.
+Reduce registry bootstrap to its own/base declarations plus `cfg.entities`. Correct existing
+P0 attribution through the supported revision/provenance path even when authored content is
+unchanged; a content-only `UpToDate` shortcut must not retain the placeholder. Preserve
+operator/bootstrap attribution for `cfg.entities` and never infer owners from GTS namespaces.
+Only then close C3. Metadata acceptance and verification are tracked in #4827; integration
+and migration remain epic obligations in #4628 for the P1 task breakdown.
 
 ## Dependency graph
 
@@ -759,14 +811,14 @@ T6 config ───────────────────────�
                                                         │
                    ┌────────────────────────────────────┘
                    │
-        ┌──────────┴──────────────────────┐
-        ▼                                 ▼
-        T22 toolkit-gts owning_gear       T22a REST batchGet + discovery
-        (needs T1)                        (needs T4, T9a, T20a)
-        └──────────┬──────────────────────┘
                    ▼
-        T23 new SDK trait + reconciliation helper
-        (needs T22; scheduled after T22a)
+        T22a REST batchGet + discovery
+        (needs T4, T9a, T20a)
+                   │
+                   ▼
+        T23 new SDK trait + explicit-document reconciliation
+        (needs T4, T21; scheduled after T22a)
+        T22 deferred to P1 (#4628); no P0 dependency
                    │
         ─── Checkpoint 6: SDK + all seven v2 routes ───
                    │
@@ -837,14 +889,14 @@ exists. From T7 onward the graph is vertical.
 **Checkpoint 5**
 
 ### Phase 6 — Read API and the new contract
-- T22: `toolkit-gts` — `owning_gear` on inventory records
+- **Deferred to P1:** T22 — inventory `owning_gear` metadata/filtering (#4628, P18)
 - T22a: REST batchGet and discovery — complete OpenAPI and quickstart (P17)
-- T23: New SDK trait and the reconciliation helper
+- T23: New SDK trait and explicit-document reconciliation helper
 
 **Checkpoint 6**
 
 ### Phase 7 — Cutover and migration
-- T24: **Cutover** — registry seeds only what it owns; ready mode and in-memory repository out
+- T24: **Cutover** — registry seeds linked inventory into the database; ready mode and in-memory repository out
 - T24a: Retire v1; promote v2 → v1 (P12) — lands right after T24, promoting all seven routes (P17)
 - T25: Migrate system gears and plugins onto the new trait
 - T26: Migrate domain gears; delete the old trait
@@ -899,14 +951,15 @@ in committed and dry-run mode, reach terminal outcomes through the outbox withou
 worker call (T21): operation/outcome records persist, while a dry run changes no entity state,
 revision or resource version. `make e2e-local` stays green with no e2e file edited.
 
-**Checkpoint 6** — inventory records carry `owning_gear`; the new trait and its reconciliation
-helper work against a mock consumer. **All seven v2 routes are complete** (T20a, T22a, P17):
+**Checkpoint 6** — the new trait and explicit-document reconciliation helper work against
+a mock consumer without inventory metadata or filtering. **All seven v2 routes are complete** (T20a, T22a, P17):
 `batchGet` returns explicit per-key results; discovery is bounded and content-free, its cursor
 traverses a stable set exactly once, and `$select` is refused. OpenAPI covers every route and
 `QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged
 `make e2e-local` pass; nothing has been cut over yet.
 
-**Checkpoint 7** — every gear reconciles its own declarations and gates its own readiness;
+**Checkpoint 7** — linked inventory and `cfg.entities` seed into the database; existing
+explicit registration callers reconcile their documents and await terminal outcomes;
 the platform boots; the old trait is gone and no consumer references it. The SDK client cache
 is in place on the new models, with its window, byte bound and `fresh` bypass (P7) — P0 does
 not finish with an uncached read path. **One REST version: no `/v2/` path survives, and the
@@ -919,9 +972,9 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
 | Risk | Impact | Mitigation |
 |---|---|---|
 | 0.12.0 semantics reject a currently-admitted schema in another gear | **High** — breaks unrelated gears | T1 is first and is its own commit; full re-validation sweep before any registry code |
-| Pull→push cutover regresses platform boot | **High** — every gear now gates on its own registration | T24 lands after the helper is proven against a mock (Checkpoint 6); migration split across T25/T26 by gear group; each verified by booting the example server |
+| Database bootstrap regresses platform boot or exceeds admission limits | **High** — all linked declarations seed before consumers initialize | T24 tests the combined inventory + configuration set, dependency ordering, repeat startup and limit refusal; keep one bounded batch and verify quickstart/e2e configurations (P18) |
 | Removing the old trait breaks ~50 call sites in 20+ gears | **High** | Split by gear group; new trait exists and is tested (T23) before the first consumer moves; `cargo test --workspace` gates each migration task |
-| A gear's registration fails at startup and it gates readiness on it | Medium | This is DESIGN-intended (*"Each gear gates only its own readiness"*), but it is a real behavioural change; the SDK helper retries, and failures name the gear and identifier |
+| An existing explicit registrant fails during startup | Medium | T23 provides bounded dependency retry and a polling deadline; T25/T26 preserve startup failure diagnostics. Per-gear inventory readiness migration is deferred to P1 (P18) |
 | Dual path (in-memory + DB) live through phases 1–6 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository. **This was breached by T9 and repaired by T9a (P12):** repointing the v1 routes made the DB path consumer-visible ~19 tasks early, and `oagw` / `account-management` were then registering into the database while resolving from memory. The mitigation is now structural — v1 and v2 are separate routes over separate stores, and the criterion "no route straddles the two stores" is grep-checkable |
 | DB revisions land before reverse-impact refresh and compatibility | Medium | T11 documents the staging window; minor-bearing Type Schema revisions and effective `force` are refused, and the DB path has no consumer until T24. Checkpoints 3 and 4 must close T14/T17 before cutover |
 | Read latency regresses at T24, when reads move from memory to the database | Medium | Correctness first, then the cache: D3 already materializes what a read returns, so a read is one keyed `SELECT`, and T30 restores caching with DESIGN's contract (P7). The exposure is the T24–T28 window, which is why Checkpoint 7 gates on T30 |
@@ -939,13 +992,12 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
 
 ## Parallelization
 
-- **Parallel:** T16 with T14/T15. T22 and T22a are independent after Checkpoint 5; the
-  default execution order is T22 then T22a. T25 and T26 split per gear, but T26 deletes the
+- **Parallel:** T16 with T14/T15. T25 and T26 split per gear, but T26 deletes the
   shared trait and so lands after T25 — the split is within each, not between them. T30 with T28 — it needs the new models (T26) and the database read path (T24), and
   nothing in the e2e task touches the client cache.
 - **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T19→T20→T20a→T21 in Phase 5
-  (P17). Phase 6 executes T22→T22a→T23; T22→T23 is the SDK dependency, while T22a uses the
-  existing read primitives. In Phase 7 T24→T24a→T28: the
+  (P17/P18). Phase 6 executes T22a→T23; T23 uses T4 reads and T21 dispatch, with no
+  inventory metadata dependency. In Phase 7 T24→T24a→T28: the
   promotion now sits directly after the cutover, because every route it promotes already exists.
 - **Contract first:** T23's trait shape is fixed by SPEC §10.1 rather than by the REST DTOs.
   Keep SDK integration after T22a in the chosen execution order; T29 then uses both the

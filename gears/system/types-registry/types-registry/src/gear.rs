@@ -3,25 +3,26 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::contracts::{DatabaseCapability, SystemCapability};
+use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, GearCtx, RestApiCapability};
+use toolkit_db::outbox::OutboxHandle;
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info, warn};
 use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::config::TypesRegistryConfig;
-use crate::domain::admission::{NullDispatch, OperationDispatch};
+use crate::domain::admission::OperationDispatch;
 use crate::domain::local_client::TypesRegistryLocalClient;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 use crate::infra::InMemoryGtsRepository;
+use crate::infra::outbox::{OutboxDispatch, TABLE_PREFIX as OUTBOX_TABLE_PREFIX};
 use crate::infra::storage::Repos;
-
-/// Table prefix for the gear's `toolkit-db` outbox (SPEC §5).
-const OUTBOX_TABLE_PREFIX: &str = "types_registry_outbox";
 
 /// Types Registry gear.
 ///
@@ -32,31 +33,50 @@ const OUTBOX_TABLE_PREFIX: &str = "types_registry_outbox";
 /// - `system` — Core infrastructure gear, initialized early in startup
 /// - `db` — Owns the managed-state schema (`docs/database.sql`, P0 subset)
 /// - `rest` — Exposes REST API endpoints
+/// - `stateful` — Owns the admission outbox worker's lifetime (T21)
+///
+/// ## Worker lifecycle
+///
+/// Start in `init()` so consumers can await registration during their own `init()`;
+/// all gears initialize before any stateful `start` runs (plan P3).
+/// `serve` awaits runtime cancellation and calls `OutboxHandle::stop()` to cancel
+/// the outbox's internal token and join its workers.
 ///
 /// ## Link-time inventory seeding
 ///
-/// At startup, this gear seeds its own registry with every GTS Type Schema
-/// and well-known Instance submitted to the process-wide `toolkit-gts`
-/// inventory — the `InventoryTypeSchema` / `InventoryInstance` collectors
-/// populated by `#[gts_type_schema]` / `gts_instance!` from any linked crate.
-/// The seeding happens via the internal `TypesRegistryService::register`
-/// (no `ClientHub` round-trip) before the client is published, so
-/// downstream consumers always see the base types at first access.
+/// Seed all `toolkit-gts` inventory entries: `InventoryTypeSchema` / `InventoryInstance`
+/// populated by linked crates' `#[gts_type_schema]` / `gts_instance!`. Call internal
+/// `TypesRegistryService::register` before publishing the client (no `ClientHub`
+/// round-trip), so consumers see base types on first access.
 ///
-/// `toolkit-gts` is a content-agnostic aggregator: types-registry code
-/// never references specific type names — it simply calls
-/// `all_inventory_type_schemas()` / `all_inventory_instances()`. New entries
-/// are picked up automatically as soon as a contributing crate is in
-/// the dependency graph.
+/// `all_inventory_type_schemas()` / `all_inventory_instances()` discover entries
+/// from the dependency graph without naming specific types in types-registry.
 #[toolkit::gear(
     name = "types-registry",
-    capabilities = [system, db, rest]
+    capabilities = [system, db, rest, stateful],
+    // 30s, matching `HostRuntime::DEFAULT_SHUTDOWN_DEADLINE`'s assumption that a
+    // gear's lifecycle timeout fires 5s before the runtime's 35s hard backstop.
+    // This does NOT cover the worst-case outbox lease (`worker.operation_timeout`
+    // + 2s, 5 minutes by default): the processor ignores cancellation while a
+    // leased handler runs, so a long admission outlives the drain and `serve` is
+    // aborted. Declaring a larger value would not help — the host hard-stops at 35s
+    // whatever the gear asks for.
+    //
+    // Aborting `serve` destroys the future awaiting the drain, not the spawned
+    // outbox tasks, so a pass in flight keeps running with no bound on when it ends.
+    // What that costs is bounded, not what it takes: an interrupted pass is
+    // resumable (see the cancel-safety note on `AdmissionHandler::admit_payload`)
+    // and recovery re-enqueues whatever stayed non-terminal on the next boot. Task
+    // lifetime itself is a lifecycle guarantee this gear does not provide.
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct TypesRegistryGear {
     service: OnceLock<Arc<TypesRegistryService>>,
     /// The database-backed path. Absent when no database is bound to this gear.
     registry: OnceLock<Arc<RegistryService>>,
     local_client: OnceLock<Arc<TypesRegistryLocalClient>>,
+    /// Pipeline retained from `init()` for shutdown; absent without a DB or after draining.
+    outbox: tokio::sync::Mutex<Option<OutboxHandle>>,
 }
 
 impl Default for TypesRegistryGear {
@@ -65,7 +85,28 @@ impl Default for TypesRegistryGear {
             service: OnceLock::new(),
             registry: OnceLock::new(),
             local_client: OnceLock::new(),
+            outbox: tokio::sync::Mutex::new(None),
         }
+    }
+}
+
+impl TypesRegistryGear {
+    /// Await runtime cancellation, then stop and join the pipeline started in `init()`.
+    pub(crate) async fn serve(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        ready: ReadySignal,
+    ) -> anyhow::Result<()> {
+        ready.notify();
+        cancel.cancelled().await;
+
+        // Taking the handle makes repeated shutdown a no-op.
+        if let Some(handle) = self.outbox.lock().await.take() {
+            info!("types_registry draining the admission outbox");
+            handle.stop().await;
+            info!("types_registry admission outbox stopped");
+        }
+        Ok(())
     }
 }
 
@@ -79,12 +120,8 @@ impl Gear for TypesRegistryGear {
         let metrics: Arc<dyn AdmissionMetrics> =
             crate::infra::metrics::default_adapter(&metrics_prefix);
 
-        // Startup validation. An unparsable registration-policy region reads
-        // exactly like a closed one at admission time, so the boot fails here
-        // rather than leaving an operator with refusals that name no cause
-        // (SPEC §10.3). The compiled policy is returned rather than recomputed
-        // so the boot path and the acceptance path cannot disagree; T7 is its
-        // first consumer and takes ownership of it there.
+        // Fail boot on invalid policy regions (SPEC §10.3); reuse the compiled
+        // policy for T7 acceptance so validation and enforcement agree.
         let registration_policy = cfg.validate()?;
         debug!(
             regions = registration_policy.len(),
@@ -93,10 +130,7 @@ impl Gear for TypesRegistryGear {
             "Validated types_registry registration policy and limits"
         );
 
-        // A key P0 parses but does not act on is said out loud once, at the only
-        // moment an operator is watching. Silence is what turns
-        // `activation_write_set: 1024` into "the operator believes the bound is 1024"
-        // — the enforcement is scheduled, the false impression is the defect.
+        // Warn once at boot so operators do not mistake accepted settings for enforced bounds.
         let inert = cfg.inert_limit_keys();
         if !inert.is_empty() {
             warn!(
@@ -127,11 +161,6 @@ impl Gear for TypesRegistryGear {
         let repo = Arc::new(InMemoryGtsRepository::new(gts_config));
         let service = Arc::new(TypesRegistryService::new(repo, cfg));
 
-        // Seed the process-wide toolkit-gts inventory (auto-discovered via
-        // `inventory` at link time). Content-agnostic: types-registry never
-        // names specific types — it calls aggregators. Runs before the
-        // client is published so downstream consumers always see the base
-        // types on first access.
         let inventory_type_schemas = all_inventory_type_schemas()
             .map_err(|e| anyhow::anyhow!("Failed to collect GTS Type Schemas: {e}"))?;
         let inventory_instances = all_inventory_instances()
@@ -181,18 +210,11 @@ impl Gear for TypesRegistryGear {
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // The database-backed platform-plane path (T7–T9). Optional rather than
-        // required: `no-db.yaml` and `--mock` deployments bind no database to this
-        // gear, and failing their boot for a path they do not use would be a
-        // regression. Where no database is bound the new routes answer
-        // `503 Service Unavailable` through the ordinary canonical-error ladder,
-        // and this warning names the cause.
+        // T7–T9's database path is optional for `no-db.yaml` / `--mock` deployments.
+        // Without a DB, routes return canonical `503 Service Unavailable`; warn why.
         if let Some(db) = ctx.db() {
-            // Admission runs inline until T21 starts the outbox worker in
-            // `init()`. `NullDispatch` therefore enqueues nothing — the
-            // dispatch is still written inside the acceptance transaction, so
-            // the shape T21 needs is already in place.
-            let dispatch: Arc<dyn OperationDispatch> = Arc::new(NullDispatch);
+            // Bind after pipeline creation; the weak link breaks the ownership cycle.
+            let dispatch = Arc::new(OutboxDispatch::new());
             // The domain names its persistence ports and never the repositories;
             // this is the one place the database-backed adapter is chosen.
             let stores: Arc<dyn Stores> = Arc::new(Repos);
@@ -201,14 +223,24 @@ impl Gear for TypesRegistryGear {
                 stores,
                 registration_policy,
                 cfg_for_registry,
-                dispatch,
-                crate::domain::registry_service::AdmissionMode::Inline,
+                Arc::clone(&dispatch) as Arc<dyn OperationDispatch>,
+                // Dispatch production admissions; seeding uses a separate inline service (SPEC §8.1).
+                crate::domain::registry_service::AdmissionMode::Outbox,
                 Arc::clone(&metrics),
             ));
+
+            // Start after inline seeding to avoid concurrent seed admission (plan P3).
+            let handle = crate::infra::outbox::start(db.db(), &registry, &dispatch).await?;
+            *self.outbox.lock().await = Some(handle);
+
             self.registry
                 .set(registry)
                 .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-            info!("types_registry database-backed admission path wired");
+            info!(
+                queue = crate::infra::outbox::QUEUE,
+                table_prefix = OUTBOX_TABLE_PREFIX,
+                "types_registry database-backed admission path wired; outbox worker running"
+            );
         } else {
             tracing::warn!(
                 "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \
@@ -235,11 +267,7 @@ impl Gear for TypesRegistryGear {
 
 #[async_trait]
 impl SystemCapability for TypesRegistryGear {
-    /// Post-init hook: switches the registry to ready mode.
-    ///
-    /// This runs AFTER `init()` has completed for ALL gears.
-    /// At this point, all gears have had a chance to register their types,
-    /// so we can safely validate and switch to ready mode.
+    /// Validate and enter ready mode after all gears finish `init()` and register types.
     async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
         info!("types_registry post_init: switching to ready mode");
 
@@ -270,10 +298,8 @@ impl SystemCapability for TypesRegistryGear {
             anyhow::anyhow!("Failed to switch to ready mode: {e}")
         })?;
 
-        // Drop any cached entries built before the ready transition (e.g.
-        // best-effort builds that may have had unresolved parents). After
-        // switch_to_ready, the persistent store has the final picture and
-        // subsequent get_*/list_* calls rebuild against it.
+        // Drop pre-ready builds with possibly unresolved parents; subsequent
+        // get_*/list_* calls rebuild against the final persistent store.
         if let Some(client) = self.local_client.get() {
             client.clear_caches();
         }
@@ -284,25 +310,17 @@ impl SystemCapability for TypesRegistryGear {
 }
 
 impl DatabaseCapability for TypesRegistryGear {
-    /// The managed-state schema plus the outbox tables the admission worker
-    /// dispatches through.
-    ///
-    /// The outbox tables are `ToolKit`-owned and are deliberately *not* part of
-    /// the initial migration: they come from
-    /// `outbox_migrations_with_prefix("types_registry_outbox")`, so a `ToolKit`
-    /// change to the outbox schema arrives as a `ToolKit` migration rather than
-    /// as a hand-copied DDL drift in this gear.
+    /// Managed-state schema plus `ToolKit`-owned outbox migrations from
+    /// `outbox_migrations_with_prefix("types_registry__outbox")`. Keeping outbox DDL
+    /// out of the initial migration lets `ToolKit` evolve it without local drift.
     fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
         use sea_orm_migration::MigratorTrait;
         info!("Providing types-registry database migrations");
         let mut migrations = crate::infra::storage::Migrator::migrations();
         let outbox = match toolkit_db::outbox::outbox_migrations_with_prefix(OUTBOX_TABLE_PREFIX) {
             Ok(outbox) => outbox,
-            // `migrations()` cannot fail in its signature. The prefix is a
-            // compile-time constant that the helper only rejects for an invalid
-            // shape (e.g. a schema-qualified name), so this arm is unreachable
-            // in practice; fail the process rather than booting a gear whose
-            // outbox tables are missing.
+            // `migrations()` cannot return errors. Only an invalid constant prefix
+            // (e.g. schema-qualified) reaches here; abort rather than boot without outbox tables.
             Err(e) => panic!(
                 "types-registry outbox migration prefix '{OUTBOX_TABLE_PREFIX}' is invalid: {e}"
             ),

@@ -3,7 +3,8 @@
 //! Integration tests for the transactional outbox subsystem.
 //!
 //! Organized as narrative chapters that trace complete lifecycle paths.
-//! Uses `SQLite` in-memory databases for fast, hermetic testing.
+//! Uses `SQLite` in-memory databases for fast, hermetic testing, with temporary
+//! WAL databases where concurrent transaction visibility is under test.
 //!
 //! Chapter ordering mirrors the pipeline:
 //!   1. Registration  →  2. Record  →  3. Sequencer
@@ -2040,6 +2041,209 @@ async fn enqueue_transaction_helper_auto_flushes() {
     tokio::time::timeout(Duration::from_millis(100), notified)
         .await
         .expect("sequencer should be notified on successful transaction");
+}
+
+/// A file-backed WAL database lets the sequencer read the committed snapshot
+/// while the enqueue transaction holds the writer connection. Shared-cache
+/// in-memory `SQLite` would lock the table instead of reproducing this race.
+async fn setup_commit_race_db() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc&wal=true",
+        dir.path().join("outbox.db").display()
+    );
+    let db = connect_db(
+        &url,
+        ConnectOpts {
+            max_conns: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    run_migrations_for_testing(&db, super::outbox_migrations())
+        .await
+        .unwrap();
+    (dir, db)
+}
+
+async fn enqueue_and_consume_hint_before_commit(
+    tx: &crate::DbTx<'_>,
+    outbox: &Outbox,
+    sequencer: &mut Sequencer,
+    partition_id: i64,
+) -> anyhow::Result<()> {
+    outbox
+        .enqueue(
+            tx,
+            Record::to("q", 0)
+                .payload(b"committed work".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await?;
+
+    // Execute the real sequencer before commit, not just its scheduler: it
+    // queries this partition through another connection and sees no rows.
+    let before_commit = sequencer.execute(&CancellationToken::new()).await?;
+    assert!(matches!(before_commit, Directive::Idle(_)));
+    assert_eq!(before_commit.payload().partition_id, partition_id);
+    assert_eq!(before_commit.payload().rows_claimed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn flush_sequences_committed_rows_after_early_hint_was_consumed() {
+    let (_dir, db) = setup_commit_race_db().await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let partition_id = t.outbox.all_partition_ids()[0];
+    let mut sequencer = make_sequencer(&t, SequencerConfig::default(), &db);
+    let outbox = Arc::clone(&t.outbox);
+
+    let (db, result) = db
+        .transaction(move |tx| {
+            Box::pin(async move {
+                enqueue_and_consume_hint_before_commit(tx, &outbox, &mut sequencer, partition_id)
+                    .await
+            })
+        })
+        .await;
+    result.unwrap();
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+
+    t.outbox.flush();
+    run_sequencer_once(&t, &db).await;
+
+    assert_eq!(
+        read_outgoing(&db, partition_id).await.len(),
+        1,
+        "post-commit flush must restore work after the early hint was consumed"
+    );
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
+}
+
+#[tokio::test]
+async fn transaction_flush_sequences_committed_rows_after_early_hint_was_consumed() {
+    let (_dir, db) = setup_commit_race_db().await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let partition_id = t.outbox.all_partition_ids()[0];
+    let mut sequencer = make_sequencer(&t, SequencerConfig::default(), &db);
+    let outbox = Arc::clone(&t.outbox);
+
+    let (db, result) = t
+        .outbox
+        .transaction(db, move |tx| {
+            Box::pin(async move {
+                enqueue_and_consume_hint_before_commit(tx, &outbox, &mut sequencer, partition_id)
+                    .await
+            })
+        })
+        .await;
+    result.unwrap();
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+
+    // No explicit flush: the transaction helper must provide the same
+    // post-commit guarantee, without a periodic recovery scan.
+    run_sequencer_once(&t, &db).await;
+
+    assert_eq!(
+        read_outgoing(&db, partition_id).await.len(),
+        1,
+        "automatic flush must restore work after the early hint was consumed"
+    );
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
+}
+
+#[tokio::test]
+async fn flush_retries_failed_discovery_without_another_flush() {
+    let (_dir, db) = setup_commit_race_db().await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let partition_id = t.outbox.all_partition_ids()[0];
+    let mut early_sequencer = make_sequencer(&t, SequencerConfig::default(), &db);
+    let outbox = Arc::clone(&t.outbox);
+
+    let (db, result) = db
+        .transaction(move |tx| {
+            Box::pin(async move {
+                enqueue_and_consume_hint_before_commit(
+                    tx,
+                    &outbox,
+                    &mut early_sequencer,
+                    partition_id,
+                )
+                .await
+            })
+        })
+        .await;
+    result.unwrap();
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+
+    // Make the discovery SELECT fail while keeping the committed data intact.
+    let conn = db.sea_internal();
+    conn.execute_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "ALTER TABLE toolkit_outbox_incoming RENAME TO unavailable_incoming",
+    ))
+    .await
+    .unwrap();
+    let mut sequencer = make_sequencer(&t, SequencerConfig::default(), &db);
+    t.outbox.flush();
+    let error = sequencer
+        .execute(&CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::Database(_)), "{error:?}");
+
+    conn.execute_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "ALTER TABLE unavailable_incoming RENAME TO toolkit_outbox_incoming",
+    ))
+    .await
+    .unwrap();
+
+    // The worker's next attempt must retain the failed request; no new flush
+    // or periodic recovery scan supplies another discovery opportunity.
+    let retried = sequencer.execute(&CancellationToken::new()).await.unwrap();
+    assert_eq!(retried.payload().partition_id, partition_id);
+    assert_eq!(retried.payload().rows_claimed, 1);
+    assert_eq!(read_outgoing(&db, partition_id).await.len(), 1);
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
+}
+
+#[tokio::test]
+async fn flush_discovers_multiple_queues_and_partitions_after_hints_were_consumed() {
+    let db = setup_db("ch2_flush_multiple_partitions").await;
+    let t = make_default_test_outbox().await;
+    for queue in ["orders", "notifications"] {
+        t.outbox.register_queue(&db, queue, 2).await.unwrap();
+        for partition in 0..2 {
+            enqueue_msgs(&t.outbox, &db, queue, partition, &["committed work"]).await;
+        }
+    }
+
+    // Model all enqueue hints having already been consumed. The single
+    // partition regressions above exercise the actual pre-commit DB reads.
+    let mut consumed = 0;
+    while let Some(guard) = t.prioritizer.take() {
+        guard.processed();
+        consumed += 1;
+    }
+    assert_eq!(consumed, 4);
+
+    t.outbox.flush();
+    run_sequencer_once(&t, &db).await;
+
+    for partition_id in t.outbox.all_partition_ids() {
+        assert_eq!(
+            read_outgoing(&db, partition_id).await.len(),
+            1,
+            "one flush must discover pending partition {partition_id}"
+        );
+    }
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
 }
 
 #[tokio::test]
@@ -5165,7 +5369,9 @@ async fn poker_discovers_pending_from_incoming_table() {
     assert!(t.prioritizer.take().is_none());
 
     // Run cold reconciler
-    super::workers::reconciler::reconcile_dirty(&t.outbox, &db, &t.prioritizer).await;
+    super::workers::reconciler::reconcile_dirty(&t.outbox, &db, &t.prioritizer)
+        .await
+        .unwrap();
 
     // Prioritizer should now contain both partitions
     let g1 = t
@@ -5193,7 +5399,9 @@ async fn startup_reconciliation_finds_preexisting_incoming() {
     insert_raw_incoming(&db, pid, 3).await;
 
     // Simulate startup reconciliation
-    super::workers::reconciler::reconcile_dirty(&t.outbox, &db, &t.prioritizer).await;
+    super::workers::reconciler::reconcile_dirty(&t.outbox, &db, &t.prioritizer)
+        .await
+        .unwrap();
 
     // Now sequencer should pick them up
     run_sequencer_once(&t, &db).await;

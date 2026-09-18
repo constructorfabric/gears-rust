@@ -117,6 +117,7 @@ impl Outbox {
     ///     orders_repo.insert(txn, &orders).await?;
     ///     outbox.enqueue_batch(txn, batch).await
     /// }).await?;
+    /// outbox.flush();
     /// let outcome = sub.await;
     /// ```
     ///
@@ -434,6 +435,7 @@ impl Outbox {
 
     /// Record one entity. Accepts `&impl DBRunner` - use within a transaction
     /// for atomicity with business data, or with a standalone connection.
+    /// When using an external transaction, call [`Self::flush`] after commit.
     ///
     /// Every rule that can be checked without the database was checked when the
     /// [`Record`] was built, so the only rejections left are an unregistered
@@ -471,6 +473,7 @@ impl Outbox {
     }
 
     /// Enqueue a batch of entities for a single queue.
+    /// When using an external transaction, call [`Self::flush`] after commit.
     ///
     /// All partitions are resolved before any DB write - one unresolvable
     /// entity rejects the whole batch, matching the validation the
@@ -757,19 +760,26 @@ impl Outbox {
         }
     }
 
-    /// Notify the sequencer that new items are available.
-    /// Multiple flushes coalesce into a single wakeup.
+    /// Request a fresh scan of committed incoming rows and wake a sequencer.
+    /// Call once after a successful enqueue transaction commits, regardless of
+    /// how many queues or partitions it wrote. [`Self::transaction`] does this
+    /// automatically. An enqueue's earlier hint may have been consumed before
+    /// its rows became visible; this scan restores that work.
+    ///
+    /// Requests coalesce until a scan starts. A flush during a scan requests
+    /// another pass, so a newer commit is not hidden by an older snapshot.
+    /// This call performs no database I/O and does not wait for delivery.
     /// No-op before `set_prioritizer()` (during startup).
     pub fn flush(&self) {
         if let Ok(guard) = self.prioritizer.try_read()
             && let Some(p) = guard.as_ref()
         {
-            p.wake_sequencers();
+            p.request_reconciliation();
         }
     }
 
-    /// Execute a closure inside a database transaction, then auto-flush
-    /// the sequencer notification channel on success.
+    /// Execute a closure inside a database transaction, then call [`Self::flush`]
+    /// after a successful commit to schedule discovery of the committed rows.
     pub async fn transaction<F, T>(&self, db: Db, f: F) -> (Db, anyhow::Result<T>)
     where
         F: for<'a> FnOnce(
@@ -1014,6 +1024,42 @@ mod tests {
     }
 
     // -- flush tests --
+
+    #[tokio::test]
+    async fn flush_requests_a_scan_after_the_enqueue_hint_is_drained() {
+        let prioritizer = Arc::new(SharedPrioritizer::new());
+        let outbox = make_default_outbox();
+        outbox.set_prioritizer(Arc::clone(&prioritizer)).await;
+
+        outbox.push_dirty(10);
+        prioritizer.take().expect("early enqueue hint").processed();
+        assert!(prioritizer.take().is_none());
+        assert!(!prioritizer.take_reconciliation_request());
+
+        outbox.flush();
+        outbox.flush();
+        assert!(prioritizer.take_reconciliation_request());
+        assert!(
+            !prioritizer.take_reconciliation_request(),
+            "flushes coalesce"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_during_a_scan_requests_another_scan() {
+        let prioritizer = Arc::new(SharedPrioritizer::new());
+        let outbox = make_default_outbox();
+        outbox.set_prioritizer(Arc::clone(&prioritizer)).await;
+
+        outbox.flush();
+        // A sequencer consumes the request before opening its read snapshot.
+        assert!(prioritizer.take_reconciliation_request());
+        // Another transaction commits while that scan is in flight. Its rows
+        // may not be visible to the first scan, so another pass is required.
+        outbox.flush();
+        assert!(prioritizer.take_reconciliation_request());
+        assert!(!prioritizer.take_reconciliation_request());
+    }
 
     #[tokio::test]
     async fn flush_triggers_notify() {

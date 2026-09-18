@@ -658,7 +658,12 @@ impl OutboxBuilder {
             .await;
 
         // 6. Eager reconciliation at startup
-        super::workers::reconciler::reconcile_dirty(&outbox, &self.db, &shared_prioritizer).await;
+        if let Err(error) =
+            super::workers::reconciler::reconcile_dirty(&outbox, &self.db, &shared_prioritizer)
+                .await
+        {
+            tracing::warn!(%error, "startup: failed to discover dirty partitions");
+        }
 
         let mut ctx = StartContext {
             db: &self.db,

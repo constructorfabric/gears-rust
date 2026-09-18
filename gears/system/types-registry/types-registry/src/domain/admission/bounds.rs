@@ -9,6 +9,7 @@ use crate::config::Limits;
 use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::artifacts::{MaterializedArtifacts, materialize};
 use crate::domain::dependency::extract_edges;
+use crate::domain::enums::DependencyKind;
 
 /// Count the candidate and the distinct documents it consumes before resolving.
 ///
@@ -29,16 +30,23 @@ pub fn check_closure(store: &mut GtsStore, root: &str, bound: usize) -> Result<(
             ));
         }
         let Some(document) = store.get(&id) else {
-            // Validation owns missing-reference errors; no reader is installed.
+            // Validation diagnoses an absent root; dependency targets are checked below.
             continue;
         };
         let parsed = GtsId::try_new(&id).map_err(|error| {
             ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
         })?;
-        let edges = extract_edges(&parsed, &document.content).map_err(|error| {
+        let mut edges = extract_edges(&parsed, &document.content).map_err(|error| {
             ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
         })?;
-        pending.extend(edges.into_iter().map(|edge| edge.target));
+        // A base can also occur in allOf/$ref; report its semantic role first.
+        edges.sort_by_key(|edge| edge.kind == DependencyKind::SchemaRef);
+        for edge in edges {
+            if store.get(&edge.target).is_none() {
+                return Err(ItemFailure::missing_dependency(edge));
+            }
+            pending.push(edge.target);
+        }
     }
     Ok(())
 }

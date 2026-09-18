@@ -1,29 +1,17 @@
-//! The database-backed registry service: the domain surface every transport
-//! adapter calls.
+//! Database-backed domain service for all transports (SPEC §8.4). REST only maps
+//! domain values, allowing a future `api/grpc` adapter without new domain methods.
+//! `Idempotency-Key` is a field; no `StatusCode`, `HeaderMap` or `Json` crosses here.
 //!
-//! SPEC §8.4 requires that the REST layer be a mapping step only, and that this
-//! surface *already* be sufficient for a future `api/grpc` adapter without adding
-//! domain methods. That is why the three methods here take and return domain
-//! values — no `StatusCode`, no `HeaderMap`, no `Json` — and why the
-//! `Idempotency-Key` arrives as an ordinary field rather than being read from a
-//! header somewhere inside.
+//! API traffic uses [`AdmissionMode::Outbox`]: T21 starts the worker in `init()`
+//! and enqueues in the acceptance transaction. Seeding permanently uses
+//! [`AdmissionMode::Inline`], accepting and admitting in one call (SPEC §8.1).
 //!
-//! # Two interim shapes, both marked
-//!
-//! **Admission runs inline.** T21 starts the outbox worker in `init()` and makes
-//! the dispatcher enqueue; until then `submit` accepts and then admits in the same
-//! call, which is what makes a registration observable end to end at Checkpoint 1.
-//! Seeding does this permanently (SPEC §8.1: *"types-registry accepts and admits it
-//! itself, inline, with no outbox"*), so the code path is not a throwaway — only
-//! its use for API traffic is.
-//!
-//! **The scope is `allow_all`.** ponytail: ceiling C6 — there is no PDP, the
-//! managed entities are `#[secure(unrestricted)]`, and no `SecurityContext` reaches
-//! this layer yet. `allow_all` is a legitimate authorization outcome with no
-//! row-level filtering, not a bypass; `AccessScope::default()` is deny-all. The P1
-//! upgrade is a request-scoped `AccessScope` derived from the `SecurityContext`,
-//! which is why every repository method already takes one.
+//! ponytail C6: no PDP or `SecurityContext` here; managed entities are
+//! `#[secure(unrestricted)]`. `allow_all` authorizes without row filtering;
+//! `AccessScope::default()` denies all. Every repository already takes a scope
+//! for P1's request-scoped `AccessScope` derived from `SecurityContext`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -36,21 +24,21 @@ use uuid::Uuid;
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use crate::domain::admission::worker::{Tuning, WorkerError, run_operation};
-use crate::domain::admission::{Accepted, OperationDispatch, SubmitRequest};
+use crate::domain::admission::{
+    Accepted, AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
+};
 use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
 use crate::domain::policy::RegistrationPolicy;
-use crate::domain::ports::metrics::AdmissionMetrics;
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
 use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceValue, CurrentTypeSchemaRow, Stores, snapshot_read,
+    CurrentDocument, CurrentInstanceValue, CurrentTypeSchemaRow, RecoveryCursor, Stores,
+    snapshot_read,
 };
 
-/// Either key an entity can be read by.
-///
-/// Both name the same row: the Registry Reference is `GtsId::to_uuid()`, a
-/// deterministic derivation of the identifier. Parsing which one the caller meant
-/// is a domain decision, not a transport one, so it lives in [`EntityKey::parse`].
+/// Identifier or deterministic Registry Reference (`GtsId::to_uuid()`) for the
+/// same row. [`EntityKey::parse`] keeps classification in the domain.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntityKey {
@@ -59,12 +47,8 @@ pub enum EntityKey {
 }
 
 impl EntityKey {
-    /// Classify a path segment. A value that parses as a UUID is a Registry
-    /// Reference; anything else is treated as an identifier and validated by the
-    /// read.
-    ///
-    /// The order matters and is not arbitrary: a GTS identifier can never be a
-    /// bare UUID, because every segment carries dots and a version.
+    /// Parse UUIDs as Registry References; otherwise validate identifiers on read.
+    /// Unambiguous: GTS identifier segments contain dots and a version, never a bare UUID.
     #[must_use]
     pub fn parse(key: &str) -> Self {
         match Uuid::parse_str(key) {
@@ -72,6 +56,25 @@ impl EntityKey {
             Err(_) => Self::GtsId(key.to_owned()),
         }
     }
+}
+
+/// Deletion target shared by single and batch requests.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct DeleteTarget {
+    pub key: EntityKey,
+    /// Acceptance rejects missing, zero and negative versions with
+    /// `deletion_requires_version`, `zero_precondition` and `negative_precondition`.
+    pub expected_resource_version: Option<i64>,
+}
+
+/// A submitted deletion, before its keys are resolved to identifiers.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct DeleteRequest {
+    pub idempotency_key: String,
+    pub dry_run: bool,
+    pub targets: Vec<DeleteTarget>,
 }
 
 /// One operation and its per-candidate outcomes, as a caller polls it.
@@ -120,12 +123,8 @@ pub struct EntityRecord {
     pub effective_traits_schema: Option<Value>,
 }
 
-/// One entity's current state as its own kind stores it.
-///
-/// An enum rather than four `Option`s beside a kind discriminant, for the reason
-/// `EvaluatedOutcome` is one on the write side: the pairing of a kind with the state
-/// that kind actually has is then a compile-time fact, and "an Instance carrying a
-/// resolved schema" is not a representable value.
+/// Kind-specific current state. Like `EvaluatedOutcome` on writes, the enum
+/// prevents invalid combinations such as an Instance carrying a resolved schema.
 enum CurrentState {
     /// The authored document and D3's materialized artifacts.
     TypeSchema {
@@ -151,6 +150,10 @@ pub enum ServiceError {
     Db(#[from] DbError),
     #[error("a stored document could not be read as JSON: {0}")]
     CorruptDocument(String),
+    /// Unresolvable Registry Reference: no identifier exists to record an item outcome.
+    /// An absent GTS identifier instead fails asynchronously during admission.
+    #[error("no entity has Registry Reference {gts_uuid}")]
+    UnresolvedReference { gts_uuid: Uuid },
 }
 
 /// How accepted operations are driven after their acceptance transaction commits.
@@ -167,9 +170,7 @@ pub enum AdmissionMode {
 #[domain_model]
 pub struct RegistryService {
     db: Db,
-    /// The persistence ports. Injected rather than named concretely, which is what
-    /// keeps this layer free of every `SeaORM` type; the gear passes
-    /// `infra::storage::Repos`.
+    /// Injected persistence ports keep `SeaORM` out; the gear supplies `infra::storage::Repos`.
     stores: Arc<dyn Stores>,
     policy: RegistrationPolicy,
     config: TypesRegistryConfig,
@@ -180,9 +181,7 @@ pub struct RegistryService {
 }
 
 impl RegistryService {
-    /// `admission_mode` drives the interim behaviour described in the module
-    /// header: [`AdmissionMode::Inline`] until T21 starts the outbox worker, and
-    /// permanently inline for the seeding path.
+    /// `admission_mode` selects the inline/outbox driver described in the module docs.
     #[must_use]
     pub fn new(
         db: Db,
@@ -204,22 +203,108 @@ impl RegistryService {
         }
     }
 
-    /// See the module header for why this is `allow_all` and why that is honest
-    /// rather than a bypass.
+    /// Admission budget, also used by the outbox leased handler.
+    pub(crate) fn operation_timeout(&self) -> std::time::Duration {
+        self.config.worker.operation_timeout
+    }
+
+    /// Classify admission failures against the database engine that produced them.
+    pub(crate) fn retryable(&self, error: &WorkerError) -> bool {
+        error.transient(self.db.backend())
+    }
+
+    /// Delivery attempts the outbox handler may spend on one operation.
+    pub(crate) fn max_delivery_attempts(&self) -> u32 {
+        self.config.worker.max_delivery_attempts
+    }
+
+    /// Instruments for outcomes outside the service, such as outbox delivery.
+    pub(crate) fn metrics(&self) -> &dyn AdmissionMetrics {
+        self.metrics.as_ref()
+    }
+
+    /// Page the startup recovery backlog without reading it all at once.
+    /// Start with `None`, then use the last cursor; fewer than `limit` rows means EOF.
+    pub async fn nonterminal_operation_page(
+        &self,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ServiceError> {
+        let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+        let stores = Arc::clone(&self.stores);
+        let scope = Self::scope();
+        provider
+            .transaction_with_config(snapshot_read(&self.db), move |tx| {
+                Box::pin(async move {
+                    Ok(stores
+                        .find_nonterminal_ids(tx, &scope, after, limit)
+                        .await?)
+                })
+            })
+            .await
+    }
+
+    /// Terminalize abandoned delivery, recording `reason` only on undecided items;
+    /// terminal items retain their outcomes. This exposes abandonment through
+    /// `GET /operations/{id}` and removes the operation from boot recovery.
+    ///
+    /// # Errors
+    /// [`ServiceError::Storage`] or [`ServiceError::Db`] if the write fails.
+    pub(crate) async fn abandon(
+        &self,
+        operation_id: Uuid,
+        now: OffsetDateTime,
+        error_code: &'static str,
+    ) -> Result<(), ServiceError> {
+        let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+        let stores = Arc::clone(&self.stores);
+        let scope = Self::scope();
+        // Safe diagnostic codes correlate the operation and dead letter with logs.
+        // Never expose an infrastructure error's Display (SQL/credentials/content).
+        let payload = serde_json::json!({
+            "reason": AdmissionFailureReason::AdmissionAbandoned.as_str(),
+            "message": "admission could not complete because of a system failure",
+            "error_code": error_code,
+            "operation_id": operation_id,
+        })
+        .to_string();
+        provider
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let items = stores.find_items(tx, &scope, operation_id).await?;
+                    for item in items {
+                        if item.status == OperationItemStatus::Pending
+                            || item.status == OperationItemStatus::Running
+                        {
+                            stores
+                                .mark_item_failed(tx, &scope, item.id, payload.clone(), now)
+                                .await?;
+                        }
+                    }
+                    // One statement from either non-terminal status: an
+                    // operation abandoned before its pass reached `mark_running`
+                    // is still `pending`, and `mark_completed` would not move it —
+                    // leaving a non-terminal operation with terminal items that
+                    // every boot's recovery scan picks up again. `false` means
+                    // another writer terminalized it first, which is fine.
+                    stores.mark_abandoned(tx, &scope, operation_id, now).await?;
+                    Ok(())
+                })
+            })
+            .await
+    }
+
+    /// See the module docs for the P0 `allow_all` scope.
     fn scope() -> AccessScope {
         AccessScope::allow_all()
     }
 
     /// Accept a submission, and — while admission is inline — admit it.
     ///
-    /// NOT cancel-safe, and cannot be: the acceptance transaction commits before
-    /// inline admission starts, so a future dropped in between — the caller's
-    /// connection closed, a `timeout` fired — leaves the operation `pending` with
-    /// its work undone. Nothing here can undo the commit, and nothing should: the
-    /// operation and its idempotency key are the record that the submission was
-    /// accepted. Recovery is a replay under the same key, which re-enters the
-    /// non-terminal branch below and drives the operation to completion; that is
-    /// the only recovery path until T21's outbox exists.
+    /// **NOT cancel-safe.** A disconnect/timeout after acceptance commits but
+    /// before inline admission leaves durable `pending` work and its idempotency
+    /// key. Replay under that key resumes non-terminal work; before T21's outbox,
+    /// this was the only recovery path. The acceptance record must not be undone.
     ///
     /// # Errors
     /// [`ServiceError::Acceptance`] for every synchronous refusal, including the
@@ -247,39 +332,150 @@ impl RegistryService {
         )
         .await?;
 
-        // `!terminal`, not `!replayed`. A replay of a *non-terminal* operation is
-        // the only recovery path there is until T21's outbox exists: if the process
-        // died — or `run_operation` returned an infrastructure error — between the
-        // acceptance commit and the inline admission, nothing else will ever drive
-        // that operation, and gating on `replayed` left it `pending` with the client
-        // polling forever. `run_operation` is idempotent: it returns early on
-        // `completed` and skips items that are already terminal.
+        // Gate on `!terminal`, not `!replayed`, to resume interrupted inline work.
+        // `run_operation` is idempotent: completed operations and terminal items are skipped.
         let mut accepted = accepted;
         if self.admission_mode == AdmissionMode::Inline && !accepted.terminal() {
             // After the acceptance transaction committed, never inside it: the
             // worker reads the operation it is admitting.
-            let worker: DBProvider<WorkerError> = DBProvider::new(self.db.clone());
-            run_operation(
-                &self.stores,
-                &worker,
-                &Self::scope(),
-                Tuning {
-                    limits: &self.config.limits,
-                    worker: &self.config.worker,
-                    metrics: &self.metrics,
-                    allow_compatibility_force: self.config.allow_compatibility_force,
-                },
-                accepted.operation_id,
-                now,
-            )
-            .await?;
-            // A pass that returns `Ok` leaves the operation `completed`, whether it
-            // did the work or found it already terminal — `run_operation` ends with
-            // `mark_completed` on the first path and returns early on the second. So
-            // the receipt can carry the real status without reading the row back.
+            self.admit(accepted.operation_id, now).await?;
+            // `Ok` means completed or already terminal; no receipt status reread is needed.
             accepted.status = OperationStatus::Completed;
         }
         Ok(accepted)
+    }
+
+    /// Admit an accepted operation with shared inline/outbox tuning.
+    /// Completed operations and terminal items are skipped, making redelivery safe.
+    ///
+    /// # Errors
+    /// [`ServiceError::Worker`] for infrastructure failures. Candidate refusals are
+    /// recorded on items and return `Ok`.
+    pub async fn admit(&self, operation_id: Uuid, now: OffsetDateTime) -> Result<(), ServiceError> {
+        let worker: DBProvider<WorkerError> = DBProvider::new(self.db.clone());
+        run_operation(
+            &self.stores,
+            &worker,
+            &Self::scope(),
+            Tuning {
+                limits: &self.config.limits,
+                worker: &self.config.worker,
+                metrics: &self.metrics,
+                allow_compatibility_force: self.config.allow_compatibility_force,
+            },
+            operation_id,
+            now,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Submit a single or batch deletion through the shared admission path (SPEC §8.4).
+    ///
+    /// # Errors
+    /// [`ServiceError::UnresolvedReference`] for an unknown Registry Reference,
+    /// plus errors from [`Self::submit`].
+    pub async fn delete(
+        &self,
+        request: &DeleteRequest,
+        now: OffsetDateTime,
+    ) -> Result<Accepted, ServiceError> {
+        // Enforce `limits.batch_candidates` before `resolve_targets` can perform
+        // unbounded reads; acceptance's own check runs after resolution.
+        let limit = self.config.limits.batch_candidates;
+        if request.targets.len() > limit {
+            let error = AcceptanceError::BatchTooLarge {
+                count: request.targets.len(),
+                limit,
+            };
+            // Counted here because `accept` counts at its own exit and this refusal
+            // never reaches it; the series must not depend on which check fired.
+            self.metrics.refused(
+                RefusalStage::Acceptance,
+                error.reason(),
+                PassLabels::new(OperationKind::Deletion, request.dry_run),
+            );
+            return Err(ServiceError::Acceptance(error));
+        }
+        let candidates = self.resolve_targets(&request.targets).await?;
+        self.submit(
+            &SubmitRequest {
+                idempotency_key: request.idempotency_key.clone(),
+                kind: OperationKind::Deletion,
+                dry_run: request.dry_run,
+                candidates,
+            },
+            now,
+        )
+        .await
+    }
+
+    /// Resolve deletion keys to candidate identifiers before acceptance, which reads
+    /// no entity state (SPEC §8.1). UUID-to-identifier mappings are immutable;
+    /// admission rechecks lifecycle and preconditions under its locks.
+    async fn resolve_targets(
+        &self,
+        targets: &[DeleteTarget],
+    ) -> Result<Vec<Candidate>, ServiceError> {
+        let references: Vec<Uuid> = targets
+            .iter()
+            .filter_map(|target| match &target.key {
+                EntityKey::Uuid(gts_uuid) => Some(*gts_uuid),
+                EntityKey::GtsId(_) => None,
+            })
+            .collect();
+        // Identifier-only batches need no lookup.
+        let resolved = if references.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.reverse_resolve(references).await?
+        };
+
+        targets
+            .iter()
+            .map(|target| {
+                let gts_id = match &target.key {
+                    EntityKey::GtsId(gts_id) => gts_id.clone(),
+                    EntityKey::Uuid(gts_uuid) => resolved.get(gts_uuid).cloned().ok_or(
+                        ServiceError::UnresolvedReference {
+                            gts_uuid: *gts_uuid,
+                        },
+                    )?,
+                };
+                Ok(Candidate {
+                    gts_id,
+                    // Deletion has no content or compatibility check to waive (ADR-0004).
+                    content: None,
+                    expected_resource_version: target.expected_resource_version,
+                    force: false,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve Registry References under one snapshot, in chunked batch reads
+    /// rather than one query per reference. The caller has already bounded the
+    /// batch by `limits.batch_candidates`. Omit missing rows so the caller reports
+    /// the first unresolved target in request order.
+    async fn reverse_resolve(
+        &self,
+        references: Vec<Uuid>,
+    ) -> Result<BTreeMap<Uuid, String>, ServiceError> {
+        let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+        let scope = Self::scope();
+        let stores = Arc::clone(&self.stores);
+        provider
+            .transaction_with_config(snapshot_read(&self.db), move |tx| {
+                Box::pin(async move {
+                    // Resolve tombstones too, preserving the identifier path's `not_active` outcome.
+                    let rows = stores.find_by_gts_uuids(tx, &scope, &references).await?;
+                    Ok(rows
+                        .into_iter()
+                        .map(|row| (row.gts_uuid, row.gts_id))
+                        .collect())
+                })
+            })
+            .await
     }
 
     /// Read one operation and its per-candidate outcomes.
@@ -291,10 +487,8 @@ impl RegistryService {
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let scope = Self::scope();
         let stores = Arc::clone(&self.stores);
-        // One snapshot for both reads. The operation's status and its items'
-        // outcomes are written by two different transactions (`worker`), so two
-        // independently-snapshotted reads could compose a pair that no single
-        // committed state ever had.
+        // Worker transactions write status and item outcomes separately; one
+        // snapshot prevents combining states that never coexisted.
         let Some((operation, items)) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
@@ -332,15 +526,10 @@ impl RegistryService {
     /// Read one entity by identifier or Registry Reference, with its authored
     /// content and D3's materialized artifacts.
     ///
-    /// **Both kinds, and the branch is on the row rather than on the key.** A Type
-    /// Schema's current state is its document plus D3's three artifacts; an
-    /// Instance's is its authored value and nothing derived. Asking the Type Schema
-    /// store for both is what made an admitted Instance read back with a null
-    /// `content` while its operation said `succeeded` — the read path was built at
-    /// T9, when only Type Schemas existed, and T10 extended admission past it.
-    ///
-    /// A tombstone is returned: a DELETED entity stays exact-readable as deleted
-    /// and only leaves discovery.
+    /// Branch on row kind, not key: Type Schemas have a document and three D3
+    /// artifacts; Instances only an authored value. T9's schema-only read path
+    /// would return null `content` for Instances admitted since T10.
+    /// DELETED tombstones remain exact-readable but leave discovery.
     ///
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure, or
@@ -351,13 +540,9 @@ impl RegistryService {
         let stores = Arc::clone(&self.stores);
         let key = key.clone();
 
-        // One snapshot for all three reads. `entity.resource_version`, the
-        // current-state artifacts and the authored document are written by one
-        // transaction, so reading them under three independent snapshots is what
-        // would let a concurrent revision compose version N with the artifacts of
-        // N + 1. Today only creations exist, so the window is closed by there being
-        // no second revision; T11 opens it, and T29's conditional reads make
-        // `resource_version` a wire promise about the body beside it.
+        // One snapshot keeps atomically written `entity.resource_version`, artifacts
+        // and authored document together. T11 revisions could otherwise pair N with
+        // N + 1 artifacts, breaking T29's version/body promise for conditional reads.
         let Some((row, current)) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
@@ -375,10 +560,7 @@ impl RegistryService {
                             current: stores.find_current_schema(tx, &scope, row.id).await?,
                             document: stores.current_documents(tx, &scope, &[row.id]).await?.pop(),
                         },
-                        // One read, not two: `current_values` returns the pointer's
-                        // revision number with the value it points at, so the
-                        // separate pointer read `find_current_instance` offers would
-                        // buy a second statement and nothing else.
+                        // `current_values` includes the revision; no `find_current_instance` read needed.
                         EntityKind::Instance => CurrentState::Instance {
                             value: stores.current_values(tx, &scope, &[row.id]).await?.pop(),
                         },
@@ -412,9 +594,7 @@ impl RegistryService {
                     Some(parse_stored(&current.effective_traits_schema, &row.gts_id)?),
                 )
             }
-            // The three artifacts are `None` by construction rather than by
-            // omission: an Instance has no derived state, so there is nothing a
-            // later task could materialize into them.
+            // Instances have no derived artifacts; all three are intentionally `None`.
             CurrentState::Instance { value } => {
                 let value = value.ok_or_else(|| {
                     ServiceError::CorruptDocument(format!(

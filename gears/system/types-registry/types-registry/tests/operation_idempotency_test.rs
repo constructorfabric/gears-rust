@@ -46,6 +46,7 @@ const KEY: &str = "idem-key-1";
 #[derive(Default)]
 struct RecordingDispatch {
     calls: Mutex<Vec<Uuid>>,
+    committed: Mutex<Vec<Uuid>>,
     fail: bool,
 }
 
@@ -53,12 +54,17 @@ impl RecordingDispatch {
     fn failing() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            committed: Mutex::new(Vec::new()),
             fail: true,
         }
     }
 
     fn calls(&self) -> Vec<Uuid> {
         self.calls.lock().expect("dispatch lock").clone()
+    }
+
+    fn committed_calls(&self) -> Vec<Uuid> {
+        self.committed.lock().expect("commit lock").clone()
     }
 }
 
@@ -70,6 +76,17 @@ impl OperationDispatch for RecordingDispatch {
             anyhow::bail!("the transport refused this message");
         }
         Ok(())
+    }
+
+    fn committed(&self, operation_id: Uuid) {
+        assert!(
+            !toolkit_db::secure::in_transaction_for_testing(),
+            "the consumer must be notified after the acceptance transaction commits",
+        );
+        self.committed
+            .lock()
+            .expect("commit lock")
+            .push(operation_id);
     }
 }
 
@@ -186,6 +203,7 @@ async fn an_accepted_request_writes_one_operation_its_items_and_one_dispatch() {
 
     // The dispatch happened once, inside the same transaction.
     assert_eq!(recorder.calls(), vec![accepted.operation_id]);
+    assert_eq!(recorder.committed_calls(), vec![accepted.operation_id]);
 }
 
 /// The configured maximum batch crosses the 66-row SQLite-safe insert chunk.
@@ -243,7 +261,8 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
     let provider = provider(&db);
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
-    let dispatch: Arc<dyn OperationDispatch> = Arc::new(RecordingDispatch::failing());
+    let recorder = Arc::new(RecordingDispatch::failing());
+    let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
 
     let err = accept(
         &stores(),
@@ -257,6 +276,10 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
     .await
     .expect_err("a dispatch failure must fail the acceptance");
     assert!(matches!(err, AcceptanceError::Dispatch(_)), "got {err}");
+    assert!(
+        recorder.committed_calls().is_empty(),
+        "rollback must not wake a consumer"
+    );
 
     let conn = provider.conn().expect("conn");
     assert!(
@@ -317,6 +340,7 @@ async fn a_synchronous_refusal_writes_no_operation() {
         .expect("read operations");
     assert!(all.is_empty(), "a refusal must not write an operation");
     assert!(recorder.calls().is_empty(), "and must not dispatch");
+    assert!(recorder.committed_calls().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +405,11 @@ async fn a_replay_with_a_matching_fingerprint_returns_the_stored_operation() {
         .expect("read operations");
     assert_eq!(all.len(), 1, "a replay creates no second operation");
     assert_eq!(recorder.calls().len(), 1, "a replay dispatches nothing");
+    assert_eq!(
+        recorder.committed_calls().len(),
+        1,
+        "a replay adds no new work"
+    );
 }
 
 /// A replay of a *terminal* operation is reported as terminal, which is what makes

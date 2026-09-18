@@ -693,7 +693,7 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().expect("failure").reason,
-        AdmissionFailureReason::InvalidSchema,
+        AdmissionFailureReason::DependencyNotFound,
     );
 
     let provider = worker_provider(&db);

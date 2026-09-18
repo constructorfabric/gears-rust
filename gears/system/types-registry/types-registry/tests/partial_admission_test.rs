@@ -351,7 +351,11 @@ async fn an_independent_branch_commits_while_another_candidate_fails() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     succeeded(&outcome, STANDALONE);
     no_entity(&db, BROKEN).await;
 }
@@ -369,7 +373,11 @@ async fn a_dependent_of_a_failed_candidate_is_blocked_by_dependency() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     failed_with(
         &outcome,
         REFERRER,
@@ -394,7 +402,11 @@ async fn blocking_reaches_the_whole_downstream_of_one_failure() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     failed_with(
         &outcome,
         MIDDLE,
@@ -421,7 +433,7 @@ async fn a_later_minor_whose_predecessor_failed_is_blocked_by_predecessor() {
     )
     .await;
 
-    failed_with(&outcome, V1_0, &AdmissionFailureReason::InvalidSchema);
+    failed_with(&outcome, V1_0, &AdmissionFailureReason::DependencyNotFound);
     failed_with(
         &outcome,
         V1_1,

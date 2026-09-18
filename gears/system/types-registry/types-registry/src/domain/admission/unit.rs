@@ -551,8 +551,8 @@ async fn finish_evaluation(
         )
     })
     .await
-    .map_err(WorkerError::EvaluationTask)?
     .map(|result| result.map(|unit| PreparedUnit::Evaluated(Arc::new(unit))))
+    .map_err(WorkerError::EvaluationTask)
 }
 
 /// Probe once when requested, then evaluate a miss from the same snapshot.
@@ -646,24 +646,16 @@ fn evaluate_loaded(
     edges: Vec<DependencyEdge>,
     vector: RevisionVector,
     limits: &Limits,
-) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
-    if let Err(failure) = check_closure(store.store_mut(), id.id(), limits.resolution_closure) {
-        return Ok(Err(failure));
-    }
+) -> Result<EvaluatedUnit, ItemFailure> {
+    check_closure(store.store_mut(), id.id(), limits.resolution_closure)?;
     let outcome = if id.is_type() {
-        let resolved = match store.store_mut().validate_schema(id.id()) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                return Ok(Err(ItemFailure::new(
-                    AdmissionFailureReason::InvalidSchema,
-                    e.to_string(),
-                )));
-            }
-        };
-        let artifacts = match materialize_bounded(&resolved, limits) {
-            Ok(artifacts) => artifacts,
-            Err(failure) => return Ok(Err(failure)),
-        };
+        let resolved = store
+            .store_mut()
+            .validate_schema(id.id())
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+            })?;
+        let artifacts = materialize_bounded(&resolved, limits)?;
         EvaluatedOutcome::TypeSchema {
             artifacts,
             is_abstract: resolved.is_abstract,
@@ -672,39 +664,34 @@ fn evaluate_loaded(
         // `Some` for every parsed Instance identifier: `get_type_id()` is `None` only
         // for a single segment, which `try_new` above already refused.
         let Some(type_id) = conforming_type else {
-            return Ok(Err(ItemFailure::new(
+            return Err(ItemFailure::new(
                 AdmissionFailureReason::InvalidIdentifier,
                 format!("instance '{}' has no conforming type", id.id()),
-            )));
+            ));
         };
         // Checked before validation, so the failure names the cause:
         // `validate_instance` would report a missing schema as a content fault.
         let Some((type_schema_entity_id, type_schema_revision_no)) = schema_pair else {
-            return Err(WorkerError::ConformingTypeAbsent {
-                gts_id: id.id().to_owned(),
-                type_id,
-            });
+            return Err(ItemFailure::missing_dependency(DependencyEdge {
+                kind: DependencyKind::InstanceOf,
+                target: type_id,
+            }));
         };
         // A type admitted under an older, larger budget must not bypass the
         // current resolution budget when it is used to validate an Instance.
-        let resolved = match store.store_mut().validate_schema(&type_id) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                return Ok(Err(ItemFailure::new(
-                    AdmissionFailureReason::InvalidSchema,
-                    error.to_string(),
-                )));
-            }
-        };
-        if let Err(failure) = materialize_bounded(&resolved, limits) {
-            return Ok(Err(failure));
-        }
-        if let Err(e) = store.store_mut().validate_instance(id.id()) {
-            return Ok(Err(ItemFailure::new(
-                AdmissionFailureReason::InvalidValue,
-                e.to_string(),
-            )));
-        }
+        let resolved = store
+            .store_mut()
+            .validate_schema(&type_id)
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+            })?;
+        materialize_bounded(&resolved, limits)?;
+        store
+            .store_mut()
+            .validate_instance(id.id())
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidValue, error.to_string())
+            })?;
         EvaluatedOutcome::Instance {
             type_schema_entity_id,
             type_schema_revision_no,
@@ -712,12 +699,10 @@ fn evaluate_loaded(
     };
 
     // Validate the candidate before judging its compatibility with another document.
-    if let Err(failure) = check_compatibility(&mut store, id, content, baseline, reporting) {
-        return Ok(Err(failure));
-    }
+    check_compatibility(&mut store, id, content, baseline, reporting)?;
 
     let content_hash = content_hash(&canonical_body);
-    Ok(Ok(EvaluatedUnit {
+    Ok(EvaluatedUnit {
         gts_id: id.id().to_owned(),
         // Derived by `gts-rust`, never locally: the Registry Reference is a
         // deterministic UUIDv5 over the identifier and its namespace, and
@@ -733,7 +718,7 @@ fn evaluate_loaded(
         edges,
         vector,
         labels: reporting.labels,
-    }))
+    })
 }
 
 /// Report compatibility to both the unit span and verdict counter.

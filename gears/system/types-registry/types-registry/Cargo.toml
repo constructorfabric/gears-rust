@@ -29,6 +29,8 @@ gts = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# The stateful entry point takes the runtime's cancellation token (T21).
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 # Admission metrics use ToolKit's global meter provider.
 opentelemetry = { workspace = true }
@@ -76,9 +78,17 @@ heck = { workspace = true }
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
-# In-memory SQLite for the schema-level migration tests.
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# `test-util` (not part of `full`) enables `tokio::time::pause`, so the outbox
+# handler's lease arithmetic is asserted against the timer it actually uses
+# rather than against how loaded the machine running the suite happens to be.
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "test-util",
+] }
+# SQLite plus transaction-boundary observation for dispatch regression tests.
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --
 # `[dev-dependencies]` cannot be -- but every reference is behind
 # `#![cfg(feature = "integration")]`, so a default `cargo test` needs no Docker.
@@ -97,3 +107,6 @@ tracing-test = { workspace = true }
 # Captures admission spans in integration tests.
 tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
+# `OutboxMessage::created_at` is a `chrono` timestamp, and the envelope-guard test
+# builds one directly. Test-only: the gear's own timestamps are all `time`.
+chrono = { workspace = true }

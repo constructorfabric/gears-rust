@@ -333,6 +333,8 @@ fn class_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -351,6 +353,8 @@ fn value_param() -> ParamSpec {
         ),
         param_type: "string".to_owned(),
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -374,6 +378,8 @@ fn if_match_value_param() -> ParamSpec {
         ),
         param_type: "string".to_owned(),
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 

@@ -5,6 +5,7 @@ use sea_orm::{FromQueryResult, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::super::OutboxError;
 use super::super::core::Outbox;
 use super::super::prioritizer::SharedPrioritizer;
 use super::super::store::OutboxStore;
@@ -17,27 +18,24 @@ struct DirtyPartitionRow {
 }
 
 /// Discover pending partitions from the incoming table and populate
-/// the in-memory dirty set. Used at startup for eager reconciliation
-/// and by the cold reconciler (poker) loop.
-pub async fn reconcile_dirty(outbox: &Outbox, db: &Db, prioritizer: &SharedPrioritizer) {
+/// the in-memory dirty set. Used at startup for eager reconciliation,
+/// by sequencers after a post-commit flush, and by the cold reconciler (poker).
+pub async fn reconcile_dirty(
+    outbox: &Outbox,
+    db: &Db,
+    prioritizer: &SharedPrioritizer,
+) -> Result<(), OutboxError> {
     let conn = db.sea_internal();
     debug_assert_eq!(conn.get_database_backend(), outbox.statements().backend());
     let store = OutboxStore::new(outbox.statements());
 
-    let rows = match DirtyPartitionRow::find_by_statement(Statement::from_sql_and_values(
+    let rows = DirtyPartitionRow::find_by_statement(Statement::from_sql_and_values(
         store.backend(),
         store.discover_dirty_partitions(),
         [],
     ))
     .all(&conn)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!(error = %e, "cold reconciler: failed to discover dirty partitions");
-            return;
-        }
-    };
+    .await?;
 
     let mut found = 0u64;
     for row in rows {
@@ -46,9 +44,9 @@ pub async fn reconcile_dirty(outbox: &Outbox, db: &Db, prioritizer: &SharedPrior
     }
 
     if found > 0 {
-        tracing::debug!(found, "cold reconciler: discovered dirty partitions");
-        outbox.flush();
+        tracing::debug!(found, "outbox: discovered dirty partitions");
     }
+    Ok(())
 }
 
 /// Cold reconciler as a `WorkerAction` — periodically discovers pending
@@ -66,10 +64,9 @@ impl WorkerAction for ColdReconciler {
     ///
     /// They report failures so the worker loop escalates its backoff, because
     /// theirs delay something auxiliary. This one is the pipeline's liveness
-    /// net: it is the only path by which work enqueued by *another* instance
-    /// becomes visible here, since that instance's notification never reaches
-    /// this process. Delaying its retry delays discovery of work nothing else
-    /// will find.
+    /// net: it discovers work enqueued by *another* instance even when there
+    /// are no local flushes, since that instance's notification never reaches
+    /// this process. Delaying its retry delays that discovery.
     ///
     /// And escalating would buy nothing measurable anyway - its `retry_max` is
     /// one minute and its `idle_interval` is one minute, so the backoff caps at
@@ -77,7 +74,9 @@ impl WorkerAction for ColdReconciler {
     type Error = Infallible;
 
     async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, Self::Error> {
-        reconcile_dirty(&self.outbox, &self.db, &self.prioritizer).await;
+        if let Err(e) = reconcile_dirty(&self.outbox, &self.db, &self.prioritizer).await {
+            warn!(error = %e, "cold reconciler: failed to discover dirty partitions");
+        }
         Ok(Directive::idle())
     }
 }

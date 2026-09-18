@@ -8,7 +8,9 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{InstrumentationScope, KeyValue};
 
 use crate::domain::admission::vector::VectorDrift;
-use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage, TerminalStatus};
+use crate::domain::ports::metrics::{
+    AdmissionMetrics, DeliveryOutcome, PassLabels, RefusalStage, TerminalStatus,
+};
 
 /// Instrumentation scope shared by this gear's metrics.
 pub const SCOPE: &str = "cf-gears-types-registry";
@@ -54,6 +56,8 @@ pub struct AdmissionMetricsMeter {
     compat_verdicts: Counter<u64>,
     /// Revalidation retries, by drift.
     revalidations: Counter<u64>,
+    /// `types_registry_admission_deliveries_total{outcome}`.
+    admission_deliveries: Counter<u64>,
     /// Dependents rewritten by one revision (SPEC §8.1 step 4.6).
     activation_write_set: Histogram<f64>,
     /// `types_registry_operation_duration_seconds` — one admission pass, wall-clock.
@@ -97,6 +101,13 @@ impl AdmissionMetricsMeter {
                 .with_description(
                     "Revalidation retries taken after the commit-time revision-vector guard \
                      or an artifact write's compare-and-swap fired, by drift shape",
+                )
+                .build(),
+            admission_deliveries: meter
+                .u64_counter(format!("{prefix}_admission_deliveries_total"))
+                .with_description(
+                    "Outbox deliveries of an admission message that did not succeed, by \
+                     outcome (retried / dead_lettered)",
                 )
                 .build(),
             activation_write_set: meter
@@ -174,6 +185,12 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
 
     fn observe_operation_duration(&self, elapsed: Duration) {
         self.operation_duration.record(elapsed.as_secs_f64(), &[]);
+    }
+
+    fn admission_delivery(&self, outcome: DeliveryOutcome) {
+        self.admission_deliveries
+            // The static type enforces a closed label vocabulary.
+            .add(1, &[KeyValue::new("outcome", outcome.label())]);
     }
 }
 

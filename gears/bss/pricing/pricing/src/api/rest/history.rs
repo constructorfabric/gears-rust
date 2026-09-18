@@ -208,6 +208,8 @@ pub(crate) fn limit_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -228,6 +230,8 @@ pub(crate) fn cursor_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 

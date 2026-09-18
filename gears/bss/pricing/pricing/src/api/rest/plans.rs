@@ -142,6 +142,8 @@ pub(crate) fn if_none_match_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -170,6 +172,8 @@ pub(crate) fn if_match_param(subject: &str) -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -193,6 +197,8 @@ pub(crate) fn idempotency_key_param() -> ParamSpec {
         // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
         // here has.
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 

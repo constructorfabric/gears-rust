@@ -1,9 +1,10 @@
 //! The `operation` / `operation_item` repository: acceptance, idempotency
 //! resolution, and the state moves the worker makes on the way to terminality.
 
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -15,7 +16,7 @@ use uuid::Uuid;
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
 use crate::domain::ports::{
-    ItemSuccess, NewOperation, NewOperationItem, OperationItemRow, OperationRow,
+    ItemSuccess, NewOperation, NewOperationItem, OperationItemRow, OperationRow, RecoveryCursor,
 };
 use crate::infra::storage::entity::enums::{OperationItemStatus, OperationStatus};
 use crate::infra::storage::entity::{operation, operation_item};
@@ -123,18 +124,60 @@ impl OperationRepo {
             .transpose()
     }
 
-    /// Insert an accepted operation.
+    /// Find pending and running operations for startup recovery.
+    pub async fn find_nonterminal_ids(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        after: Option<RecoveryCursor>,
+        limit: u64,
+    ) -> Result<Vec<RecoveryCursor>, ScopeError> {
+        let mut filter = Condition::all().add(
+            Condition::any()
+                .add(operation::Column::Status.eq(OperationStatus::Pending))
+                .add(operation::Column::Status.eq(OperationStatus::Running)),
+        );
+        // Keyset rather than offset: the rows this scan returns stay non-terminal
+        // until their admission lands, so an offset would re-read the same page.
+        if let Some(cursor) = after {
+            filter = filter.add(
+                Condition::any()
+                    .add(operation::Column::CreatedAt.gt(cursor.created_at))
+                    .add(
+                        Condition::all()
+                            .add(operation::Column::CreatedAt.eq(cursor.created_at))
+                            .add(operation::Column::Id.gt(cursor.id)),
+                    ),
+            );
+        }
+        operation::Entity::find()
+            .filter(filter)
+            // Creation order, so recovery re-enqueues in the order the operations
+            // were accepted. `id` only breaks ties: it is a client-allocated UUID
+            // and carries no time component.
+            .order_by(operation::Column::CreatedAt, Order::Asc)
+            .order_by(operation::Column::Id, Order::Asc)
+            .limit(limit)
+            .secure()
+            .scope_with(scope)
+            .all(runner)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| RecoveryCursor {
+                        created_at: row.created_at,
+                        id: row.id,
+                    })
+                    .collect()
+            })
+    }
+
+    /// Insert acceptance; a duplicate `(idempotency_scope_hash, idempotency_key)`
+    /// unique violation serializes concurrent acceptances, as in
+    /// [`VersionFamilyRepo::create_or_get`].
     ///
-    /// A duplicate `(idempotency_scope_hash, idempotency_key)` surfaces as a unique
-    /// violation, which the caller reads as the serialization point between two
-    /// concurrent acceptances rather than as a fault — the same protocol
-    /// [`VersionFamilyRepo::create_or_get`] uses, and for the same reason.
-    ///
-    /// ponytail: ceiling C5 — no operation-retention sweep in P0, so terminal
-    /// operations accumulate here; rows are small and bounded by request volume.
-    /// Upgrade path: the DESIGN §3.2 sweep, which deletes a completed operation only
-    /// when no revision pins any of its items — `idx_tr_operation_status` exists for
-    /// exactly that query.
+    /// ponytail C5: P0 retains terminal operations (small rows, bounded by request
+    /// volume). DESIGN §3.2 adds a sweep using `idx_tr_operation_status`, deleting
+    /// completed operations only when no revision pins any item.
     ///
     /// # Errors
     /// Propagates the insert's failure, including the unique violation above.
@@ -230,12 +273,8 @@ impl OperationRepo {
             .collect()
     }
 
-    /// Move an operation from `pending` to `running`.
-    ///
-    /// `ck_tr_operation_state` requires `started_at` at `running`, so both move in
-    /// one statement. The `pending` precondition is in the `WHERE`, so a
-    /// redelivered message that finds the operation already running affects no row
-    /// and is reported as such rather than resetting the clock.
+    /// Move `pending` to `running` with `started_at` atomically (`ck_tr_operation_state`).
+    /// The `WHERE` guard reports no change on redelivery without resetting the clock.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -268,6 +307,56 @@ impl OperationRepo {
     ///
     /// # Errors
     /// Propagates the update's failure.
+    /// Terminalize an operation delivery abandoned, from **either** non-terminal
+    /// status.
+    ///
+    /// Separate from [`Self::mark_completed`], which only moves a `running` row:
+    /// an operation can be abandoned before its pass ever reached `mark_running`,
+    /// and widening `mark_completed` instead would let an ordinary pass complete an
+    /// operation it never started. One statement rather than a promote-then-complete
+    /// pair, so there is no intermediate state and no second failure point.
+    ///
+    /// `false` means the row was already terminal — an ordinary concurrent outcome.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database update failures.
+    pub async fn mark_abandoned(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        let result = operation::Entity::update_many()
+            .secure()
+            .col_expr(
+                operation::Column::Status,
+                Expr::value(OperationStatus::Completed),
+            )
+            .col_expr(operation::Column::CompletedAt, Expr::value(now))
+            // `ck_tr_operation_state` requires a completed row to carry both
+            // timestamps, and a `pending` operation has no `started_at`: delivery
+            // gave up before its pass ever moved the row. Coalesce rather than
+            // overwrite, so an operation that did run keeps the instant it started.
+            .col_expr(
+                operation::Column::StartedAt,
+                Expr::expr(Func::coalesce([
+                    Expr::col(operation::Column::StartedAt),
+                    Expr::value(now),
+                ])),
+            )
+            .filter(
+                Condition::all().add(operation::Column::Id.eq(id)).add(
+                    Condition::any()
+                        .add(operation::Column::Status.eq(OperationStatus::Pending))
+                        .add(operation::Column::Status.eq(OperationStatus::Running)),
+                ),
+            )
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     pub async fn mark_completed(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -292,12 +381,8 @@ impl OperationRepo {
         Ok(result.rows_affected == 1)
     }
 
-    /// Record a committed, changed registration on one item.
-    ///
-    /// Every column `ck_tr_operation_item_state` couples to `succeeded` moves in
-    /// one statement: the payload is dropped, both timestamps are set, and the
-    /// revision and resource version are recorded. Splitting them would leave a
-    /// row the CHECK rejects halfway.
+    /// Record changed registration atomically to satisfy `ck_tr_operation_item_state`:
+    /// set `succeeded`, drop payload, set both timestamps, revision and resource version.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -336,13 +421,9 @@ impl OperationRepo {
         Ok(result.rows_affected == 1)
     }
 
-    /// Record a committed registration that changed **nothing**.
-    ///
-    /// No `result_revision_no`, and that is the whole difference from
-    /// [`Self::mark_item_succeeded`]: an `unchanged` candidate allocates no revision
-    /// number (ADR-0005), and `ck_tr_operation_item_state` enforces that pairing.
-    /// The same CHECK requires `expected_resource_version >= 1`, so a creation
-    /// cannot reach this state.
+    /// Record `unchanged`: unlike [`Self::mark_item_succeeded`], no `result_revision_no`
+    /// is allocated (ADR-0005). `ck_tr_operation_item_state` enforces this and
+    /// `expected_resource_version >= 1`, excluding creations.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -411,13 +492,9 @@ impl OperationRepo {
     }
 }
 
-/// One item, and only while it is still non-terminal.
-///
-/// The status half is the guard: an item's outcome is written once and stands
-/// (`database.sql`). Two passes over one operation can overlap — at-least-once
-/// delivery (T21), or a retry under the same `Idempotency-Key` arriving mid-flight —
-/// and filtering on `id` alone would let the loser overwrite a `succeeded` item with
-/// `failed`. Both writers report `false` instead.
+/// Guard non-terminal status so outcomes remain write-once (`database.sql`).
+/// Overlapping T21 deliveries or same-`Idempotency-Key` retries must report `false`
+/// on losing the guard, never overwrite `succeeded` with `failed` by filtering only on `id`.
 fn non_terminal(item_id: i64) -> Condition {
     Condition::all()
         .add(operation_item::Column::Id.eq(item_id))

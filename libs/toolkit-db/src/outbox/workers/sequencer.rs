@@ -187,6 +187,17 @@ impl WorkerAction for Sequencer {
         &mut self,
         _cancel: &CancellationToken,
     ) -> Result<Directive<SequencerReport>, OutboxError> {
+        if self.shared_prioritizer.take_reconciliation_request()
+            && let Err(error) =
+                super::reconciler::reconcile_dirty(&self.outbox, &self.db, &self.shared_prioritizer)
+                    .await
+        {
+            // Preserve the request on database failure. WorkerAction's error
+            // path applies the normal backoff before retrying the scan.
+            self.shared_prioritizer.request_reconciliation();
+            return Err(error);
+        }
+
         let Some(guard) = self.shared_prioritizer.take() else {
             return Ok(Directive::Idle(SequencerReport {
                 partition_id: -1,

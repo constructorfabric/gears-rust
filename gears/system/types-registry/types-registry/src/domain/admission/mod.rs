@@ -17,20 +17,19 @@ mod batch;
 mod bounds;
 mod deletion;
 mod drift;
+pub mod dry_run;
 mod errors;
 mod reasons;
 mod unchanged;
 
 pub mod fingerprint;
 mod graph;
-mod publish;
+mod outcome;
 pub mod refresh;
 pub mod revision;
-pub mod simulate;
 mod tuning;
 pub mod unit;
 pub mod vector;
-pub mod view;
 pub mod worker;
 
 pub use reasons::AdmissionFailureReason;
@@ -167,6 +166,11 @@ pub trait OperationDispatch: Send + Sync {
     /// Whatever the transport fails with; acceptance turns it into a refusal and
     /// the transaction rolls back, so nothing is half-accepted.
     async fn enqueue(&self, tx: &DbTx<'_>, operation_id: Uuid) -> anyhow::Result<()>;
+
+    /// Wake the consumer after acceptance commits. This is only a latency hint:
+    /// durable delivery still comes from the enqueued record and recovery.
+    /// Inline dispatchers need no wakeup. Must not perform blocking work.
+    fn committed(&self, _operation_id: Uuid) {}
 }
 
 /// A dispatcher that enqueues nothing.

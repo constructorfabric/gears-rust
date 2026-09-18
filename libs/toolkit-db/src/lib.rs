@@ -86,11 +86,15 @@ pub use sea_orm_migration;
 pub mod advisory_locks;
 pub mod config;
 pub mod contention;
+/// Database backend used to classify engine-specific storage errors.
+pub use sea_orm::DbBackend;
 pub mod manager;
 pub mod migration_runner;
 pub mod odata;
 pub mod options;
 pub mod outbox;
+#[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+pub mod retry;
 pub mod secure;
 /// Test-only helpers for DB-behavior audits (SQL query recorder). Gated behind
 /// the `test-support` feature; never part of a production build.

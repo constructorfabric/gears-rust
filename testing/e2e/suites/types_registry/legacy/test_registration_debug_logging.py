@@ -20,7 +20,9 @@ _counter = int(time.time() * 1000) % 1000000
 
 # Path to the server error log file (where debug logs are written)
 # The server writes to logs/types-registry.log based on config/e2e-local.yaml
-LOG_FILE_PATH = Path(__file__).parent.parent.parent.parent.parent / "logs" / "types-registry.log"
+# parents[5] walks legacy -> types_registry -> suites -> e2e -> testing -> repo root,
+# so keep it in step with this file's depth under the suite.
+LOG_FILE_PATH = Path(__file__).parents[5] / "logs" / "types-registry.log"
 
 
 def get_log_content() -> str:

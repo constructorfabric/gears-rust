@@ -159,6 +159,19 @@ fn operation_vendor_extensions(
     ext
 }
 
+/// Build a scalar parameter schema, preserving its format and minimum.
+fn param_schema_object(
+    schema_type: SchemaType,
+    format: Option<SchemaFormat>,
+    minimum: Option<f64>,
+) -> utoipa::openapi::schema::Object {
+    ObjectBuilder::new()
+        .schema_type(schema_type)
+        .format(format)
+        .minimum(minimum)
+        .build()
+}
+
 /// Implementation of `OpenAPI` registry with lock-free data structures
 pub struct OpenApiRegistryImpl {
     /// Store operation specs keyed by "METHOD:path"
@@ -232,7 +245,7 @@ impl OpenApiRegistryImpl {
                     "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
                     _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
                 };
-                let item_object = ObjectBuilder::new().schema_type(schema_type).build();
+                let item_object = param_schema_object(schema_type, p.format.clone(), p.minimum);
 
                 let mut builder = ParameterBuilder::new()
                     .name(&p.name)
@@ -752,6 +765,51 @@ mod tests {
     }
 
     #[test]
+    fn parameter_formats_are_preserved_in_scalar_and_array_schemas() {
+        use serde_json::json;
+        use utoipa::openapi::schema::KnownFormat;
+
+        for (format, param_type, expected) in [
+            (
+                Some(SchemaFormat::KnownFormat(KnownFormat::Int64)),
+                "integer",
+                json!({"type": "integer", "format": "int64", "minimum": 1}),
+            ),
+            (
+                Some(SchemaFormat::Custom("resource-version".to_owned())),
+                "integer",
+                json!({"type": "integer", "format": "resource-version", "minimum": 1}),
+            ),
+            (None, "integer", json!({"type": "integer", "minimum": 1})),
+        ] {
+            for array in [false, true] {
+                let registry = OpenApiRegistryImpl::new();
+                let mut spec = spec_with_response("/test", "get_test", None);
+                spec.params.push(ParamSpec {
+                    name: "version".to_owned(),
+                    location: ParamLocation::Query,
+                    required: true,
+                    description: None,
+                    param_type: param_type.to_owned(),
+                    array,
+                    format: format.clone(),
+                    minimum: Some(1.0),
+                });
+                registry.register_operation(&spec);
+                let doc = registry.build_openapi(&test_info()).expect("build OpenAPI");
+                let json = serde_json::to_value(doc).expect("serialize OpenAPI");
+                let schema = &json["paths"]["/test"]["get"]["parameters"][0]["schema"];
+                let expected_schema = if array {
+                    json!({"type": "array", "items": expected})
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(schema, &expected_schema, "format={format:?}, array={array}");
+            }
+        }
+    }
+
+    #[test]
     fn test_register_operation() {
         let registry = OpenApiRegistryImpl::new();
         let spec = OperationSpec {
@@ -934,6 +992,8 @@ mod tests {
                 description: Some("User ID".to_owned()),
                 param_type: "string".to_owned(),
                 array: false,
+                format: None,
+                minimum: None,
             }],
             request_body: None,
             responses: vec![ResponseSpec {

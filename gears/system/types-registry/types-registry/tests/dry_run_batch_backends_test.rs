@@ -1,5 +1,5 @@
 //! Whole-batch parity, snapshot coherence and atomic publication on all backends.
-//! Use `SQLite` WAL and PostgreSQL/MySQL `REPEATABLE READ` to commit a concurrent
+//! Use `SQLite` WAL and `PostgreSQL`/`MySQL` `REPEATABLE READ` to commit a concurrent
 //! writer while prediction retains its original snapshot.
 //!
 //! Run dry run before commit on the same database, checking unchanged entity

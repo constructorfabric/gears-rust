@@ -32,6 +32,8 @@ fn if_match_param() -> ParamSpec {
         ),
         param_type: "string".to_owned(),
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
