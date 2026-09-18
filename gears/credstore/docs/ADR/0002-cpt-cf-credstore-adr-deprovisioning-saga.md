@@ -27,7 +27,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-credstore-adr-deprovisioning-saga`
 
-**Superseded by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md).** The deprovisioning saga and its name retention existed because a successor's value shared the deleted value's backend key; with immutable per-version keys the race it guarded against cannot occur, and deletion becomes one row transaction plus garbage collection.
+**Superseded by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md).** The saga and its name retention existed because a successor's value shared the deleted value's backend key. With immutable per-version keys that race cannot occur; deletion becomes one row transaction plus garbage collection.
 
 ## Context and Problem Statement
 
