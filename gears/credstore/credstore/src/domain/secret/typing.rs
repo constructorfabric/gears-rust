@@ -22,6 +22,30 @@ pub mod reasons {
     pub const EXPIRY_NOT_SUPPORTED_FOR_TYPE: &str = "EXPIRY_NOT_SUPPORTED_FOR_TYPE";
     pub const EXPIRY_IN_THE_PAST: &str = "EXPIRY_IN_THE_PAST";
     pub const TYPE_IMMUTABLE: &str = "TYPE_IMMUTABLE";
+    /// ADR-0004: a `PUT` creating a record over a reference that currently
+    /// resolves to an ancestor's `shared` record of a *different* type
+    /// (`cpt-cf-credstore-fr-override-type-consistency`). Canonical `Aborted`
+    /// (409), like `TYPE_IMMUTABLE`.
+    pub const TYPE_MISMATCH_WITH_INHERITED: &str = "TYPE_MISMATCH_WITH_INHERITED";
+    /// ADR-0004: `PUT` creation requires an explicit `secret_type`; there is
+    /// no default-to-generic on create as there was pre-ADR-0004. Canonical
+    /// `InvalidArgument` (400), like the other `*_REQUIRED`/`*_ALLOWED`
+    /// request-shape reasons below.
+    pub const TYPE_REQUIRED: &str = "TYPE_REQUIRED";
+    /// ADR-0004: `PUT` without a `secret` key, or `CredentialWrite::secret`
+    /// otherwise unset. Canonical `InvalidArgument` (400).
+    pub const SECRET_REQUIRED: &str = "SECRET_REQUIRED";
+    /// ADR-0004: `PATCH` whose body touches nothing at all
+    /// (`CredentialPatch::is_empty`). Canonical `InvalidArgument` (400).
+    pub const EMPTY_PATCH: &str = "EMPTY_PATCH";
+    /// ADR-0004: a merge-patch `null` on `sharing`/`fallback`/`secret_type` —
+    /// none is a nullable column. Canonical `InvalidArgument` (400).
+    pub const NULL_NOT_ALLOWED: &str = "NULL_NOT_ALLOWED";
+    /// ADR-0004: `PUT` with neither `If-None-Match` nor `If-Match` (or both).
+    /// Distinct from the plain `IF_MATCH_REQUIRED` `PATCH`/`DELETE` use,
+    /// since `PUT` accepts either precondition header. Canonical
+    /// `InvalidArgument` (400).
+    pub const PRECONDITION_REQUIRED: &str = "PRECONDITION_REQUIRED";
 }
 
 fn violation(field: &'static str, reason: &'static str, detail: String) -> DomainError {
@@ -38,6 +62,10 @@ fn violation(field: &'static str, reason: &'static str, detail: String) -> Domai
 /// `expires_at` semantics: permitted only for `expirable` types; a value in
 /// the past is rejected (it would create a secret that never resolves).
 ///
+/// A `PUT` always carries a `secret`, so every check applies (ADR-0004
+/// §5.4.2); a `PATCH` calls [`validate_metadata`] and/or [`validate_value`]
+/// individually, whichever the body's keys actually require.
+///
 /// # Errors
 ///
 /// Returns [`DomainError::TypeViolation`] with a stable reason on the first
@@ -51,36 +79,31 @@ pub fn validate_write(
     value: &SecretValue,
     expires_at: Option<OffsetDateTime>,
 ) -> Result<(), DomainError> {
+    validate_metadata(type_id, traits, sharing, expires_at)?;
+    validate_value(type_id, traits, value)
+}
+
+/// Validate the metadata half of a write: `sharing` against `allow_sharing`,
+/// `expires_at` against the `expirable`/in-the-past gates. Used for a
+/// `PATCH` whose body carries no `secret` key (§4.4 body-derived actions), and
+/// as half of [`validate_write`].
+///
+/// # Errors
+///
+/// Returns [`DomainError::TypeViolation`] with a stable reason on the first
+/// violated trait.
+pub fn validate_metadata(
+    type_id: &str,
+    traits: &SecretTypeTraits,
+    sharing: SharingMode,
+    expires_at: Option<OffsetDateTime>,
+) -> Result<(), DomainError> {
     if !traits.allows_sharing(sharing) {
         return Err(violation(
             "sharing",
             reasons::SHARING_NOT_ALLOWED_FOR_TYPE,
             format!("sharing mode {sharing:?} is not permitted for secret type '{type_id}'"),
         ));
-    }
-
-    // A value too large for u64 is definitely over any declared limit.
-    let len = u64::try_from(value.as_bytes().len()).unwrap_or(u64::MAX);
-    if let Some(max) = traits.max_size_bytes
-        && len > max
-    {
-        return Err(violation(
-            "value",
-            reasons::VALUE_TOO_LARGE,
-            format!("value of {len} bytes exceeds the {max}-byte limit of secret type '{type_id}'"),
-        ));
-    }
-
-    if traits.utf8_only && std::str::from_utf8(value.as_bytes()).is_err() {
-        return Err(violation(
-            "value",
-            reasons::VALUE_NOT_UTF8,
-            format!("secret type '{type_id}' requires a valid UTF-8 value"),
-        ));
-    }
-
-    if let Some(schema) = traits.value_schema.as_ref() {
-        validate_value_schema(type_id, schema, value)?;
     }
 
     match expires_at {
@@ -104,6 +127,48 @@ pub fn validate_write(
     Ok(())
 }
 
+/// Validate the value half of a write: size, UTF-8, and `value_schema`. Used
+/// for a `PATCH` whose body carries a `secret` key (`Set`, never `Null` — a
+/// removal validates nothing), and as half of [`validate_write`].
+///
+/// # Errors
+///
+/// Returns [`DomainError::TypeViolation`] with a stable reason on the first
+/// violated trait, or [`DomainError::ServiceUnavailable`] when the type's
+/// registered `value_schema` trait fails to compile (a broken registration,
+/// not a caller error — fail closed).
+pub fn validate_value(
+    type_id: &str,
+    traits: &SecretTypeTraits,
+    value: &SecretValue,
+) -> Result<(), DomainError> {
+    // A value too large for u64 is definitely over any declared limit.
+    let len = u64::try_from(value.as_bytes().len()).unwrap_or(u64::MAX);
+    if let Some(max) = traits.max_size_bytes
+        && len > max
+    {
+        return Err(violation(
+            "secret",
+            reasons::VALUE_TOO_LARGE,
+            format!("value of {len} bytes exceeds the {max}-byte limit of secret type '{type_id}'"),
+        ));
+    }
+
+    if traits.utf8_only && std::str::from_utf8(value.as_bytes()).is_err() {
+        return Err(violation(
+            "secret",
+            reasons::VALUE_NOT_UTF8,
+            format!("secret type '{type_id}' requires a valid UTF-8 value"),
+        ));
+    }
+
+    if let Some(schema) = traits.value_schema.as_ref() {
+        validate_value_schema(type_id, schema, value)?;
+    }
+
+    Ok(())
+}
+
 /// Validate the value against the type's `value_schema` trait. The value
 /// must parse as JSON; violation details never echo the value itself (only
 /// schema paths), preserving the no-secret-logging posture.
@@ -118,7 +183,7 @@ fn validate_value_schema(
 ) -> Result<(), DomainError> {
     let parsed: serde_json::Value = serde_json::from_slice(value.as_bytes()).map_err(|_| {
         violation(
-            "value",
+            "secret",
             reasons::VALUE_SCHEMA_VIOLATION,
             format!("secret type '{type_id}' requires a JSON value matching its schema"),
         )
@@ -138,7 +203,7 @@ fn validate_value_schema(
     if let Err(first) = validator.validate(&parsed) {
         // instance_path only — never the offending value.
         return Err(violation(
-            "value",
+            "secret",
             reasons::VALUE_SCHEMA_VIOLATION,
             format!(
                 "value does not match the '{type_id}' schema at '{}': {}",

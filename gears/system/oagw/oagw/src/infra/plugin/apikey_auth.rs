@@ -48,12 +48,12 @@ impl AuthPlugin for ApiKeyAuthPlugin {
 
         let response = self
             .credstore
-            .get(&ctx.security_context, &key)
+            .get_secret(&ctx.security_context, &key)
             .await
             .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
             .ok_or_else(|| PluginError::SecretNotFound(config.secret_ref.clone()))?;
 
-        let secret_str = std::str::from_utf8(response.value.as_bytes())
+        let secret_str = std::str::from_utf8(response.secret.as_bytes())
             .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?
             .to_string();
 
