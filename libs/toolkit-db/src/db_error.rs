@@ -441,7 +441,7 @@ pub(crate) mod driver_shaped {
 
     #[derive(Debug)]
     struct Refusal {
-        code: &'static str,
+        code: Option<&'static str>,
         message: String,
     }
 
@@ -458,7 +458,7 @@ pub(crate) mod driver_shaped {
             &self.message
         }
         fn code(&self) -> Option<Cow<'_, str>> {
-            Some(Cow::Borrowed(self.code))
+            self.code.map(Cow::Borrowed)
         }
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
             self
@@ -469,12 +469,25 @@ pub(crate) mod driver_shaped {
         fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
             self
         }
+        /// `SeaORM`'s `sql_err()` classifies by downcasting to a concrete
+        /// driver type, not by this, so the kind is never the deciding factor
+        /// for anything a test double can reach.
         fn kind(&self) -> sqlx::error::ErrorKind {
             sqlx::error::ErrorKind::Other
         }
     }
 
     pub fn refused(code: &'static str, message: &str) -> sea_orm::DbErr {
+        build(Some(code), message)
+    }
+
+    /// A refusal the driver reported without any code -- the fourth `None`
+    /// case `driver_refusal` documents, which no supported backend produces.
+    pub fn refused_without_a_code(message: &str) -> sea_orm::DbErr {
+        build(None, message)
+    }
+
+    fn build(code: Option<&'static str>, message: &str) -> sea_orm::DbErr {
         sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
             sqlx::Error::Database(Box::new(Refusal {
                 code,
@@ -482,12 +495,73 @@ pub(crate) mod driver_shaped {
             })),
         )))
     }
+
+    /// A driver error that is not a database refusal at all.
+    pub fn not_a_refusal() -> sea_orm::DbErr {
+        sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sqlx::Error::RowNotFound,
+        )))
+    }
+
+    /// The double is load-bearing for every test that uses it, so it is checked
+    /// like anything else: a double that reports the wrong thing would weaken
+    /// its callers silently.
+    #[cfg(test)]
+    mod self_check {
+        use sqlx::error::DatabaseError as _;
+
+        fn database_error_of(err: &sea_orm::DbErr) -> &(dyn sqlx::error::DatabaseError + 'static) {
+            let (sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(e))
+            | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(e))) = err
+            else {
+                panic!("the double must build a driver error");
+            };
+            let sqlx::Error::Database(db) = &**e else {
+                panic!("the double must build a database error");
+            };
+            &**db
+        }
+
+        #[test]
+        fn it_reports_what_it_was_built_with() {
+            let err = super::refused("23505", "duplicate key");
+            let db = database_error_of(&err);
+            assert_eq!(db.message(), "duplicate key");
+            assert_eq!(db.code().as_deref(), Some("23505"));
+            assert_eq!(db.kind(), sqlx::error::ErrorKind::Other);
+            assert!(db.as_error().to_string().contains("duplicate key"));
+
+            let err = super::refused_without_a_code("no code here");
+            assert!(database_error_of(&err).code().is_none());
+        }
+
+        #[test]
+        fn it_can_be_taken_apart_the_way_sqlx_takes_errors_apart() {
+            let mut refusal = super::Refusal {
+                code: Some("23505"),
+                message: "duplicate key".to_owned(),
+            };
+            assert!(refusal.as_error_mut().to_string().contains("duplicate key"));
+            assert!(
+                Box::new(refusal)
+                    .into_error()
+                    .to_string()
+                    .contains("duplicate key")
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{ConstraintViolation, DriverRefusal, constraint_violation, driver_refusal};
+    use super::{
+        ConstraintViolation, DriverRefusal, constraint_violation, driver_refusal,
+        is_foreign_key_violation, is_unique_violation,
+    };
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    use super::{driver_code, driver_shaped, violation_of};
+    use sea_orm::DbErr;
 
     /// The point of the table: one condition, both codes. A `RESTRICT` refusal
     /// on `PostgreSQL` 18 and a `NO ACTION` refusal on any major must classify
@@ -501,6 +575,71 @@ mod tests {
         assert_eq!(
             constraint_violation("23503"),
             Some(ConstraintViolation::ForeignKey)
+        );
+    }
+
+    /// `driver_refusal` on the shape it is written for: a refused statement.
+    ///
+    /// The owned accessor, unlike `driver_code`, also carries the constraint
+    /// name, and most refusals name none.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_refused_statement_reaches_the_owned_accessor() {
+        let err = driver_shaped::refused("23505", "duplicate key value violates unique constraint");
+        let refusal = driver_refusal(&err).expect("a refused statement carries a refusal");
+        assert_eq!(refusal.code(), "23505");
+        assert_eq!(refusal.constraint(), None);
+        assert_eq!(refusal.violation(), Some(ConstraintViolation::Unique));
+    }
+
+    /// A driver error that is not a database refusal reads as no refusal, which
+    /// is the other early return in `database_error`.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_driver_error_that_is_not_a_refusal_carries_none() {
+        let err = driver_shaped::not_a_refusal();
+        assert!(driver_refusal(&err).is_none());
+        assert!(driver_code(&err).is_none());
+        assert!(violation_of(&err).is_none());
+    }
+
+    /// The fourth documented `None`: the driver refused but named no code.
+    ///
+    /// No backend the workspace supports does it, which is why the code is a
+    /// `String` rather than an `Option<String>` -- but the contract says this
+    /// is indistinguishable from the other three, and that is asserted here
+    /// rather than only described.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_refusal_without_a_code_reads_as_no_refusal() {
+        let err = driver_shaped::refused_without_a_code("refused, but said nothing");
+        assert!(driver_refusal(&err).is_none());
+        assert!(driver_code(&err).is_none());
+        assert!(violation_of(&err).is_none());
+    }
+
+    /// A code this table names no condition for does not reach the text, even
+    /// when the text would have matched.
+    ///
+    /// The tier below is `sql_err()`, and it cannot be reached from here:
+    /// `SeaORM` classifies by `try_downcast_ref` to a concrete driver type
+    /// (`SqliteError`, `PgDatabaseError`, `MySqlDatabaseError`), which a test
+    /// double is not. So this asserts the part that is testable without a
+    /// driver -- that the message is not consulted -- and the real `SQLite`
+    /// path, where `sql_err()` does answer for `2067`, is covered by the
+    /// sqlite lane in `tests/error_classification.rs`.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_code_that_names_nothing_does_not_fall_through_to_the_text() {
+        let err = driver_shaped::refused("2067", "UNIQUE constraint failed: users.email");
+        assert_eq!(
+            violation_of(&err),
+            None,
+            "the table names no condition for it"
+        );
+        assert!(
+            !is_unique_violation(&err),
+            "and with a driver code in hand the message is not evidence"
         );
     }
 
@@ -609,9 +748,6 @@ mod tests {
         assert!(driver_refusal(&sea_orm::DbErr::Custom("not from a driver".into())).is_none());
         assert!(driver_refusal(&sea_orm::DbErr::RecordNotFound("nope".into())).is_none());
     }
-
-    use super::{is_foreign_key_violation, is_unique_violation};
-    use sea_orm::DbErr;
 
     // The classifiers are reached through two shapes: the typed `SqlErr` the
     // driver produces, and the `DbErr::Custom` left by a caller that

@@ -261,6 +261,43 @@ mod tests {
         );
     }
 
+    /// The code path is per backend, and each backend spells contention
+    /// differently: a SQLSTATE on `MySQL`, an extended result code on `SQLite`.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn every_backend_recognises_its_own_contention_code() {
+        let mysql = refused("40001", "Deadlock found when trying to get lock");
+        assert!(is_retryable_contention(DbBackend::MySql, &mysql));
+
+        // SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, as the driver reports them
+        // rather than as `(code: 5)` in a rendered message.
+        for code in ["5", "517"] {
+            let sqlite = refused(code, "database is locked");
+            assert!(
+                is_retryable_contention(DbBackend::Sqlite, &sqlite),
+                "SQLite code {code} must be retryable"
+            );
+        }
+
+        // A refusal is not contention, on any of them.
+        let refusal = refused("23505", "duplicate key value violates unique constraint");
+        for backend in [DbBackend::MySql, DbBackend::Postgres, DbBackend::Sqlite] {
+            assert!(!is_retryable_contention(backend, &refusal), "{backend:?}");
+        }
+    }
+
+    /// Galera says it in words. The code path keeps those, and they are the
+    /// reason the wording tier survives a driver error with a code.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_wsrep_conflict_is_retryable_on_a_code_we_do_not_name() {
+        let err = refused(
+            "HY000",
+            "WSREP detected deadlock/conflict and aborted the transaction",
+        );
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
     /// And the structured path recognises a real one, on a code sea-orm's own
     /// table has nothing to say about.
     #[test]
