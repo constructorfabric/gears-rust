@@ -41,6 +41,8 @@
 //!   does need to tell immediate `RESTRICT` from deferrable `NO ACTION` can,
 //!   without this module having to guess on its behalf.
 
+use std::borrow::Cow;
+
 use sea_orm::DbErr;
 
 /// The condition a SQLSTATE names, for the codes this platform acts on.
@@ -181,23 +183,9 @@ pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
 /// ```
 #[must_use]
 pub fn driver_refusal(err: &DbErr) -> Option<DriverRefusal> {
-    // The body needs a driver; the signature does not, so callers never have to
-    // gate on a backend feature to name this function. A build with no driver
-    // cannot produce a driver error either, so `None` is the truth there rather
-    // than a silent degradation.
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     {
-        // Exactly the shape `DbErr::sql_err` reads, and for the same reason:
-        // these two are a statement that ran and was refused. `DbErr::Conn` is
-        // not one -- see this function's documentation.
-        let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
-        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
-        else {
-            return None;
-        };
-        let sqlx::Error::Database(db_err) = &**sqlx_err else {
-            return None;
-        };
+        let db_err = database_error(err)?;
         Some(DriverRefusal {
             code: db_err.code()?.into_owned(),
             constraint: db_err.constraint().map(ToOwned::to_owned),
@@ -208,6 +196,65 @@ pub fn driver_refusal(err: &DbErr) -> Option<DriverRefusal> {
         let _ = err;
         None
     }
+}
+
+/// The driver error behind a refused statement, if this error is one.
+///
+/// The shape every reader in this module agrees on, written once. Exactly what
+/// [`sea_orm::DbErr::sql_err`] reads, and for the same reason: `Exec` and
+/// `Query` are a statement that ran and was refused. `DbErr::Conn` is not one
+/// -- see [`driver_refusal`] for why a connect-time code must not surface here.
+#[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+fn database_error(err: &DbErr) -> Option<&(dyn sqlx::error::DatabaseError + 'static)> {
+    let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
+    | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
+    else {
+        return None;
+    };
+    let sqlx::Error::Database(db_err) = &**sqlx_err else {
+        return None;
+    };
+    Some(&**db_err)
+}
+
+/// The code the driver reported, borrowed rather than copied.
+///
+/// The primitive [`driver_refusal`] and [`violation_of`] are both built on, and
+/// the one to reach for when the constraint name is not wanted: it allocates
+/// nothing, where [`driver_refusal`] copies the code and the constraint name
+/// into owned `String`s whether the caller reads them or not.
+///
+/// `Cow` keeps the signature free of `sqlx` exactly as the owned `String` did
+/// -- it is a `std` type, and a gear that calls this still never links the
+/// driver.
+///
+/// `None` means the same four things it means for [`driver_refusal`]; see there.
+#[must_use]
+pub fn driver_code(err: &DbErr) -> Option<Cow<'_, str>> {
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    {
+        database_error(err)?.code()
+    }
+    #[cfg(not(any(feature = "pg", feature = "mysql", feature = "sqlite")))]
+    {
+        let _ = err;
+        None
+    }
+}
+
+/// The condition the driver named for this error, if it named one.
+///
+/// [`driver_refusal`] then [`DriverRefusal::violation`] in one step, without
+/// building the `DriverRefusal`. This is the whole question for a caller that
+/// only wants to know *what kind* of refusal it was.
+///
+/// `None` covers two different situations, which
+/// [`driver_code`] tells apart when that matters: there was no driver refusal
+/// to read, or the driver reported a code this table names no condition for (a
+/// `SQLite` extended code, or any SQLSTATE outside class 23).
+#[must_use]
+pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
+    constraint_violation(&driver_code(err)?)
 }
 
 #[cfg(test)]
