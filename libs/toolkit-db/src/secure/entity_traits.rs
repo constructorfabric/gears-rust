@@ -471,7 +471,10 @@ mod tests {
 
         check::<derived::Entity>("derived");
         check::<manual::Entity>("manual");
-        check::<unrestricted::Entity>("unrestricted");
+        // `unrestricted::Entity` is deliberately not walked here: its table is
+        // empty, so the loop runs zero times and the only surviving assertion
+        // is `0 == 0`, which nothing can make fail.
+        // `an_unrestricted_entity_declares_an_empty_table` covers that case.
     }
 
     /// A column two properties both name is reported once per entry, and the
