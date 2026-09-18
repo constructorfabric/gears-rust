@@ -151,6 +151,22 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # cargo-semver-checks (via release-plz/action >= 0.5.136) rustdocs toolkit
+      # with extra features, including contract-grpc-client and fips. That pulls
+      # prost-build (needs protoc) and aws-lc-fips-sys (needs Go). The publish
+      # job already installs both; this job did not, and started failing on
+      # every push to main after #4831.
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
       - name: Install Rust toolchain from rust-toolchain.toml
         run: |
           rustup show active-toolchain || rustup toolchain install

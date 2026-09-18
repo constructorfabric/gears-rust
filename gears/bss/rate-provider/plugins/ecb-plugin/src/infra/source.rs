@@ -63,7 +63,7 @@ pub fn parse_ecb_xml(bytes: &[u8]) -> Result<EcbTable, RateProviderError> {
             // The date lives on the outer `<Cube time="...">` and each inner
             // `<Cube currency="X" rate="Y"/>` is one EUR-based pair — both are
             // `Cube` elements, so inspect every `Cube`'s attributes.
-            Event::Start(e) if e.local_name().as_ref() == b"Cube" => {
+            Event::Start(e) if e.local_name().as_ref() == "Cube" => {
                 depth += 1;
                 let (time, currency, rate) = read_cube_attributes(&e);
                 if let Some(value) = time {
@@ -83,7 +83,7 @@ pub fn parse_ecb_xml(bytes: &[u8]) -> Result<EcbTable, RateProviderError> {
                 );
             }
             // Self-closing: encloses nothing, so it never changes depth.
-            Event::Empty(e) if e.local_name().as_ref() == b"Cube" => {
+            Event::Empty(e) if e.local_name().as_ref() == "Cube" => {
                 let (time, currency, rate) = read_cube_attributes(&e);
                 if let Some(value) = time {
                     current_date = update_publication_date(&mut date, &value)?;
@@ -96,7 +96,7 @@ pub fn parse_ecb_xml(bytes: &[u8]) -> Result<EcbTable, RateProviderError> {
                     rate,
                 );
             }
-            Event::End(e) if e.local_name().as_ref() == b"Cube" => {
+            Event::End(e) if e.local_name().as_ref() == "Cube" => {
                 if retained_depth == Some(depth) {
                     retained_depth = None;
                 }
@@ -189,11 +189,11 @@ fn read_cube_attributes(e: &BytesStart<'_>) -> (Option<String>, Option<String>, 
     let mut currency = None;
     let mut rate = None;
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+        let value = attr.value.as_ref().to_owned();
         match attr.key.as_ref() {
-            b"time" => time = Some(value),
-            b"currency" => currency = Some(value),
-            b"rate" => rate = Some(value),
+            "time" => time = Some(value),
+            "currency" => currency = Some(value),
+            "rate" => rate = Some(value),
             _ => {}
         }
     }

@@ -122,7 +122,7 @@ impl K8sTokenReviewAuthenticator {
 
         let review = TokenReview {
             spec: TokenReviewSpec {
-                token: Some(token.to_owned()),
+                token: token.to_owned(),
                 audiences,
             },
             ..Default::default()
