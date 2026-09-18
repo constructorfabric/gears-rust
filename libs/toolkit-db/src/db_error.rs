@@ -227,6 +227,9 @@ pub fn driver_refusal(err: &DbErr) -> Option<DriverRefusal> {
 /// [`sea_orm::DbErr::sql_err`] reads, and for the same reason: `Exec` and
 /// `Query` are a statement that ran and was refused. `DbErr::Conn` is not one
 /// -- see [`driver_refusal`] for why a connect-time code must not surface here.
+/// `a_connect_time_refusal_carries_no_driver_refusal` in
+/// `tests/error_classification.rs` holds that exclusion against a live server,
+/// which does answer a bad password with a SQLSTATE of its own.
 #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
 fn database_error(err: &DbErr) -> Option<&(dyn sqlx::error::DatabaseError + 'static)> {
     let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))

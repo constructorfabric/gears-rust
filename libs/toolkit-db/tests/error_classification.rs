@@ -79,6 +79,92 @@ impl mig::MigrationTrait for CreateClassifyTable {
     }
 }
 
+#[derive(Iden)]
+enum RestrictParent {
+    #[iden = "restrict_parent"]
+    Table,
+    Id,
+}
+
+#[derive(Iden)]
+enum RestrictChild {
+    #[iden = "restrict_child"]
+    Table,
+    Id,
+    ParentId,
+}
+
+/// A parent and a child joined by `ON DELETE RESTRICT`.
+///
+/// Built through `sea_query` like every other schema in this file, rather than
+/// as raw DDL: the referential action is the subject of the test below, and
+/// `mig::ForeignKeyAction::Restrict` is the statement of it that the migration
+/// layer can also check.
+struct CreateRestrictTables;
+
+impl mig::MigrationName for CreateRestrictTables {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "m002_create_restrict_pair"
+    }
+}
+
+#[async_trait::async_trait]
+impl mig::MigrationTrait for CreateRestrictTables {
+    async fn up(&self, manager: &mig::SchemaManager) -> Result<(), mig::DbErr> {
+        manager
+            .create_table(
+                mig::Table::create()
+                    .table(RestrictParent::Table)
+                    .if_not_exists()
+                    .col(
+                        mig::ColumnDef::new(RestrictParent::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                mig::Table::create()
+                    .table(RestrictChild::Table)
+                    .if_not_exists()
+                    .col(
+                        mig::ColumnDef::new(RestrictChild::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        mig::ColumnDef::new(RestrictChild::ParentId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        mig::ForeignKey::create()
+                            .name("restrict_child_parent_fk")
+                            .from(RestrictChild::Table, RestrictChild::ParentId)
+                            .to(RestrictParent::Table, RestrictParent::Id)
+                            .on_delete(mig::ForeignKeyAction::Restrict),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &mig::SchemaManager) -> Result<(), mig::DbErr> {
+        manager
+            .drop_table(mig::Table::drop().table(RestrictChild::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(mig::Table::drop().table(RestrictParent::Table).to_owned())
+            .await
+    }
+}
+
 mod ent {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
@@ -516,33 +602,39 @@ async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<(
     use toolkit_db::secure::is_foreign_key_violation;
 
     let dut = common::bring_up_postgres().await?;
-    // A plain connection: the subject is how a driver refusal classifies, not
-    // how toolkit-db wraps a pool, and raw DDL is what sets the FK up.
-    let conn = sea_orm::Database::connect(dut.url.clone()).await?;
-
-    conn.execute_unprepared(
-        "CREATE TABLE restrict_parent (id uuid PRIMARY KEY); \
-         CREATE TABLE restrict_child ( \
-             id uuid PRIMARY KEY, \
-             parent_id uuid NOT NULL, \
-             CONSTRAINT restrict_child_parent_fk \
-                 FOREIGN KEY (parent_id) REFERENCES restrict_parent (id) \
-                 ON DELETE RESTRICT \
-         );",
-    )
-    .await?;
+    let url = dut.url.clone();
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateRestrictTables)])
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // A plain connection for the statements: the subject is how a driver
+    // refusal classifies, not how toolkit-db wraps a pool.
+    let conn = sea_orm::Database::connect(url).await?;
 
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();
-    conn.execute_unprepared(&format!(
-        "INSERT INTO restrict_parent (id) VALUES ('{parent}'); \
-         INSERT INTO restrict_child (id, parent_id) VALUES ('{child}', '{parent}');"
+    conn.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO restrict_parent (id) VALUES ($1)",
+        [parent.into()],
+    ))
+    .await?;
+    conn.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO restrict_child (id, parent_id) VALUES ($1, $2)",
+        [child.into(), parent.into()],
     ))
     .await?;
 
     let err = conn
-        .execute_unprepared(&format!(
-            "DELETE FROM restrict_parent WHERE id = '{parent}'"
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM restrict_parent WHERE id = $1",
+            [parent.into()],
         ))
         .await
         .expect_err("a RESTRICT foreign key must refuse this delete");
