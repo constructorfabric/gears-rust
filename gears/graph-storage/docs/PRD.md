@@ -235,6 +235,20 @@ Several platform initiatives need to persist and query relationships between het
 
 The system **MUST** accept runtime registration of GTS types with kind `node`, `edge`, or `attribute`, each carrying a GTS identifier and a draft-07 JSON Schema. Registration **MUST** be idempotent for byte-identical schemas, **MUST** reject re-registration of an existing identifier with a different schema (directing the caller to publish a new GTS version), and **MUST** apply each registration batch atomically. The system **MUST** derive and store the deterministic UUIDv5 for every registered GTS identifier using the platform GTS derivation so identifiers are interoperable with other gears.
 
+> **Amended 2026-09-10 by [ADR-0006](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md).**
+> The rejection above is now the **default** rather than the only behaviour.
+> `POST /types` takes `options.on_existing: reject | update`; `reject` is the
+> default and is this requirement unchanged. With `update`, a candidate whose
+> backward verdict is `Compatible` (types-registry ADR-0003's strategy, computed
+> by GTS **OP#8**) replaces the stored definition under the same identifier —
+> because that is precisely the class of change that cannot invalidate a stored
+> instance or a derived type, which is this requirement's own rationale. An
+> incompatible or undecidable change is still refused, and still directed to a
+> new major, unless the caller offers the type's rows for re-validation
+> (`options.revalidate`), which is a weaker and separately reported claim. The
+> rest of this requirement — idempotence on identical bytes, batch atomicity,
+> UUIDv5 derivation — is untouched.
+
 - **Rationale**: Producers evolve independently; the type registry is the contract boundary that keeps one shared graph consistent across them.
 - **Actors**: `cpt-cf-graph-storage-actor-ontology-author`, `cpt-cf-graph-storage-actor-producer-gear`
 
@@ -278,6 +292,18 @@ Convergence **MUST** hold under retries with unknown commit outcomes: every inge
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
+> **Found while building the prototype.** One clause is not met as written:
+> writes are one statement per node and per edge rather than batched
+> statements. The measured § 6.1 ingest budget is met regardless (10k nodes +
+> 20k edges in ~20 s on developer hardware), so batching is a cost question
+> rather than a correctness one. The producer scope *is* met: the writing
+> principal is carried into the store, the idempotency receipt's key is
+> `(tenant, producer, idempotency_key)`, and a scope records its owning
+> producer and refuses a replacement from any other. Both columns existed from
+> the first migration and both were written empty, so every check around them
+> passed vacuously until this was found; rows written before the fix carry an
+> empty owner and are adopted by the producer that next replaces the scope.
+
 #### Stable Identity and Parallel Edges
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-fr-stable-identity`
@@ -309,6 +335,14 @@ When an ingested edge references a node key that does not exist, the system **MU
 - **Rationale**: Producers ingest incrementally and out of order; silently dropped edges are much harder to diagnose than visible phantoms.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
+> **Found while building the prototype.** The phantom type's payload is empty
+> by schema (`maxProperties: 0`, DESIGN § 3.1), so a phantom does not record
+> the referencing edge type in its payload; the edge that brought it into
+> being is visible through the phantom's adjacency, which is where a consumer
+> reads it. Concurrent creation of one phantom resolves as a unique-key
+> conflict (`aborted` / `CAS_CONFLICT`) for the later writer rather than as a
+> retry inside the gear.
+
 #### Edge Provenance and Analysis Preservation
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-fr-edge-provenance`
@@ -328,6 +362,16 @@ A scope **MUST** have a canonical identity (tenant, owning producer, scope attri
 
 - **Rationale**: Producers re-sync whole sources; replacement semantics keep the graph consistent with upstream without full wipes or tombstone bookkeeping.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
+
+> **Found while building the prototype.** Three clauses are narrower than
+> written. A replacement removes the scope's static *edges* only where they are
+> incident to a node the batch stopped naming — an edge between two re-supplied
+> nodes that the batch no longer asserts survives. Ordinary ingests do not
+> participate in the scope lock: with no `replace_scope` the registry is never
+> touched, so a plain write can interleave with a replacement. And the lock
+> itself is the fence row's own write (`ON CONFLICT DO UPDATE`, which takes the
+> row lock to commit), because the platform's secure ORM exposes no
+> row-locking surface a gear could use.
 
 #### Node Read with Adjacency
 
@@ -409,6 +453,15 @@ The system **MUST** persist a canonical hash of each embedding input, and the ve
 The system **MUST** verify at readiness that the configured embedding dimension matches the database vector column definition, and **MUST** reject ingest batches whose produced vectors do not match the configured dimension. The system **MUST** also record the embedding-space identity (model artifact, tokenizer, preprocessing and pooling configuration) under which stored vectors were produced, verify the active provider against that record at readiness, and on mismatch **MUST** fail readiness and block vector search until re-embedding completes. Readiness reporting **MUST** state the active provider identity and dimension.
 
 - **Rationale**: A silent dimension mismatch corrupts similarity ranking, and a same-dimension model swap corrupts it invisibly; the prototype documented the dimension case as a real failure mode, and identity verification closes the remaining gap.
+
+> **Found while building the prototype.** Vectors are computed by the gear, not
+> sent by producers, so "reject ingest batches whose produced vectors do not
+> match" is a check on what the provider returns, per batch, and a provider
+> whose declared width differs from the migrated column fails the boot. On an
+> identity mismatch the gear blocks vector and hybrid search and *stays
+> ready* — the readiness matrix's own row (DESIGN § Readiness Matrix) — rather
+> than failing readiness as written here. Readiness does not yet state the
+> active provider identity and dimension.
 - **Actors**: `cpt-cf-graph-storage-actor-platform-admin`, `cpt-cf-graph-storage-actor-embedding-provider`
 
 ### 5.5 Search
@@ -599,6 +652,8 @@ The system **MUST** expose all capabilities over a versioned REST API following 
 
 Every node and edge returned by any read surface **MUST** carry a gear-assigned envelope: tenant, key, creation and last-update timestamps, the soft-delete tombstone, and the subject behind each of those three verbs. The acting party **MUST** be expressed as a platform subject (`subject_id` plus optional `subject_type`) rather than as a user identifier, so an automation, a service integration and a person are all representable. The envelope **MUST** be read-only on every write surface and **MUST NOT** be declared by the GTS types producers register or derive from, which describe only producer-authored fields. Per-element change history is out of scope: the current state is stored, and history is reconstructed from emitted change events and `ingest_audit`.
 
+> **Found while building the prototype.** The edge half of this had no way to be met: no read surface returned an edge as an element. `DELETE /edges/{edge_key}` existed, `GET` did not, and an edge appeared in a response only as a topology reference — a key, a type and two endpoints by design. The columns were written correctly by every ingest path and read by nothing, so a path that forgot one would have broken no test. `GET /edges/{edge_key}` (DESIGN § 3.3) closes it, keyed by the same derived key the topology references carry, and the conformance suite now asserts the envelope on an edge against both store implementations. The general form is worth stating once: a requirement that cannot be observed is a requirement nothing checks.
+
 - **Rationale**: Who wrote an element and when is the first question asked of any stored record, and the answer has to exist before it is needed rather than be added after. Keeping it out of the GTS type keeps a type usable as a static registry instance, where runtime timestamps have no value to carry.
 - **Actors**: `cpt-cf-graph-storage-actor-platform-admin`, `cpt-cf-graph-storage-actor-consumer-gear`, `cpt-cf-graph-storage-actor-data-analyst`
 
@@ -749,7 +804,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 
 - **Type**: Rust trait (ClientHub client) in the SDK crate
 - **Stability**: unstable (v1 during incubation)
-- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer.
+- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer. *Found while building the prototype:* parity holds for every operation the trait carries; the `V1` trait is narrower than REST (no edge read, no compatibility dry run, no registration options or migrations, no source-namespace operations), and widening it is a `ClientV2` change under the policy below.
 - **Breaking Change Policy**: Versioned trait names (`...ClientV1`); breaking changes introduce a new trait version.
 
 ### 7.2 External Integration Contracts
@@ -930,7 +985,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 | Community detection and sampled betweenness differ from prototype outputs | Consumers expecting NetworkX-identical numbers are surprised | PRD explicitly waives numeric parity; determinism and ordering guarantees are documented per algorithm |
 | A single tenant's ingest load starves others | Platform-wide latency degradation | Batch size limits, per-tenant concurrency gates, operation-level permissions, observability of per-tenant load |
 | Analytics load starves the interactive path | Ingest and search miss latency targets | Analytics runs as its own gear with its own CPU, memory and connection budget (graph-analytics ADR-0002), so the two cannot share a pool |
-| Shared ontologies evolve incompatibly across producers | Ingest failures or semantic drift between producers | Immutable schemas per GTS version, conflict-rejecting registration, family patterns that keep older derived types valid |
+| Shared ontologies evolve incompatibly across producers | Ingest failures or semantic drift between producers | Conflict-rejecting registration by default; an in-place update only for a change proved backward compatible, which is the property that actually keeps older derived types valid (ADR-0006); family patterns; a new major for anything else |
 | PostgreSQL 19 GA slips, or a PG19 beta regression hits the pinned stack | The gear ships on a beta database longer than planned | The stack is pinned (beta image + pgvector revision) and validated by the PG19 spike and the prototype's full test suite; the iterative-CTE backend can serve the whole fixed-depth API if a PGQ-specific regression appears; re-pin to stock at GA |
 | SQL/PGQ variable-length paths arrive later than PG20 | The CTE backend carries variable-depth expansion longer | The traversal port isolates the split; consumers see no API difference; a dedicated traversal mirror remains the measured-bottleneck contingency (ADR-0001) |
 | The `toolkit-db` scoped single-statement API is not delivered | Single-statement traversal and single-statement hybrid composition stay unavailable; each hop costs an extra database round trip | Bounded traversal is implemented and verified without it (two scoped queries per hop, p95 0.37 ms per hop at reference scale), so delivery affects performance and expressiveness rather than viability. Measured against the candidate implementation, the single statement buys tail latency on wide frontiers — depth-3 p95 30.0 ms against 50.5 ms end to end — not correctness. Largely retired: the CTE half is merged (PR #4584) and the SQL/PGQ half is in review (PR #4639). What remains of the risk is the SQL/PGQ half not landing, which leaves the CTE backend serving traversal in full |

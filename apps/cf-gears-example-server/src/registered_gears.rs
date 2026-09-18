@@ -18,6 +18,8 @@ use file_storage as _;
 use gear_orchestrator as _;
 #[cfg(feature = "github-mirror")]
 use github_mirror as _;
+#[cfg(feature = "graph-storage")]
+use graph_storage as _;
 #[cfg(feature = "grpc-hub")]
 use grpc_hub as _;
 use license_resolver as _;
