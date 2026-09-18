@@ -85,29 +85,31 @@ Response: **204 No Content** (`If-Match` is mandatory here too: an `ETag` for a 
 
 For additional endpoints, see <http://127.0.0.1:8087/cf/docs>.
 
-## Planned surface (ADR-0004 / ADR-0005)
+## Planned surface (ADR-0004 / ADR-0005 / ADR-0007 / ADR-0008)
 
-The examples in this section describe a **proposed** direction — [ADR-0004](docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)
-and [ADR-0005](docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) —
+The examples in this section describe a **proposed** direction — [ADR-0004](docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md),
+[ADR-0005](docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md),
+[ADR-0007](docs/ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md) and
+[ADR-0008](docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) —
 and are **not implemented**. Nothing below will work against the server today;
 the current surface is `/credstore/v1/secrets…`, shown above. Under the
-proposed model a credential and its optional value share one item shape,
-addressed under `/credstore/v1/credentials…`; the value is a `$select`able
+proposed model a credential and its optional secret share one item shape,
+addressed under `/credstore/v1/credentials…`; the secret is a `$select`able
 field of that same item, not a separate resource.
 
 > **Creating a credential is one request:** `PUT .../credentials/{ref}` with
-> `If-None-Match: *` carries the record and its value together, written
+> `If-None-Match: *` carries the record and its secret together, written
 > atomically. A merge-`PATCH` on the same address —
 > `Content-Type: application/merge-patch+json` — edits metadata, rotates the
-> value, or removes it (`{"value": null}`) without recreating the record; it
+> secret, or removes it (`{"secret": null}`) without recreating the record; it
 > never creates, so a `PATCH` against a reference with no own record is a
 > 404. Both verbs are checked against the same `ETag` — there is one
-> resource and one validator, not a record and a separate value
+> resource and one validator, not a record and a separate secret
 > sub-resource.
 
 **List credential records** — demonstrates the new metadata listing, bounded
 with `limit` and filtered with the platform `$filter` syntax; the response
-never carries a value. Requires the `list` PDP action.
+never carries a secret. Requires the `list` PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0005
@@ -116,7 +118,7 @@ curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=20&\$filter=typ
 ```
 
 **Get one credential record** — demonstrates the point metadata read; the
-response carries no value but does carry the `ETag`, which a value-blind
+response carries no secret but does carry the `ETag`, which a secret-blind
 caller uses as the CAS validator for a later write. Requires the `read`
 PDP action.
 
@@ -124,63 +126,63 @@ PDP action.
 # NOT IMPLEMENTED — planned, ADR-0004
 curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN"
-# → 200, body has no "value" field; response carries an ETag header
+# → 200, body has no "secret" field; response carries an ETag header
 ```
 
-**Read the secret value** — demonstrates reading the value by naming it in
+**Read the secret** — demonstrates reading the secret by naming it in
 `$select` on the point read; there is no separate sub-resource address. The
-body carries only the fields selected — here the value with its type and
+body carries only the fields selected — here the secret with its type and
 expiry — and the record's `ETag` in the header. Requires the `read_secret`
 PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key?\$select=reference,type,expires_at,value" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key?\$select=reference,type,expires_at,secret" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **Create a credential** — demonstrates atomic creation: the record and its
-value are written together, under the create-only precondition. Requires
+secret are written together, under the create-only precondition. Requires
 both the `write` and `write_secret` PDP actions.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
+# NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H 'If-None-Match: *' \
   -i \
-  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "value": "sk-abc123"}'
+  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "secret": "sk-abc123"}'
 
 # 201 Created
 # Location: /cf/credstore/v1/credentials/partner-openai-key
 # ETag: "7f3a…-…-…c1.1"     <- the validator later writes need
 ```
 
-**Rotate the value** — demonstrates a guarded partial update carrying only
-`value`, keyed off the record's `ETag` (from the record read above, or from
+**Rotate the secret** — demonstrates a guarded partial update carrying only
+`secret`, keyed off the record's `ETag` (from the record read above, or from
 the `201` of creation above). `PATCH` follows RFC 7396 merge-patch
 semantics — fields absent from the body are untouched — so this call
-changes nothing but the value; it always writes and bumps `version`, even on
+changes nothing but the secret; it always writes and bumps `version`, even on
 identical bytes. Requires the `write_secret` PDP action, and notably not
-`read_secret` — this is the write a value-blind configurator performs.
+`read_secret` — this is the write a secret-blind configurator performs.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
+# NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
   -H 'If-Match: "<etag-of-the-record>"' \
-  -d '{"value": "sk-def456"}'
+  -d '{"secret": "sk-def456"}'
 ```
 
-**Edit metadata without touching the value** — demonstrates a partial update
-that carries no `value` key at all: the value is left exactly as it was, so
+**Edit metadata without touching the secret** — demonstrates a partial update
+that carries no `secret` key at all: the secret is left exactly as it was, so
 this call can be made by a caller holding `write` but not `write_secret`.
 Requires the `write` PDP action.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
+# NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
@@ -188,59 +190,59 @@ curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-open
   -d '{"sharing": "tenant"}'
 ```
 
-**Remove the value, keep the record** — demonstrates the only way to reach
-the value-less `declared` state: a partial update whose `value` is `null`.
+**Remove the secret, keep the record** — demonstrates the only way to reach
+the secret-less `declared` state: a partial update whose `secret` is `null`.
 The record's metadata and `fallback` are untouched; what the
 reference then resolves to is decided by `fallback`, not by this call.
 Requires the `write_secret` PDP action.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
+# NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
   -H 'If-Match: "<etag-of-the-record>"' \
-  -d '{"value": null}'
+  -d '{"secret": null}'
 ```
 
-**Bulk read secret values, explicit selector** — demonstrates the bounded,
-non-paginated bulk value read: naming `value` in `$select` on the collection
-switches it into value mode, scoped here by an explicit `reference in (...)`
+**Bulk read secrets, explicit selector** — demonstrates the bounded,
+non-paginated bulk secret read: naming `secret` in `$select` on the collection
+switches it into secret mode, scoped here by an explicit `reference in (...)`
 list. Requires `read_secret`, evaluated per item; `limit`/`cursor` are
 rejected; cap 25.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key','webhook-signing')&\$select=reference,type,value" \
+# NOT IMPLEMENTED — planned, ADR-0005
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key','webhook-signing')&\$select=reference,type,secret" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-**Bulk read secret values, scoped selector** — demonstrates the same value
+**Bulk read secrets, scoped selector** — demonstrates the same secret
 mode scoped by `type` instead of an explicit reference list; still capped,
 still per-item authorized. Requires `read_secret`, evaluated per item;
 `limit`/`cursor` are rejected; cap 25.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=type+eq+'<gts id>'&\$select=reference,type,value" \
+# NOT IMPLEMENTED — planned, ADR-0005
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=type+eq+'<gts id>'&\$select=reference,type,secret" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 **Suppress an inherited credential you do not own** — demonstrates blocking
-a partner's shared credential in one request, without ever holding a value
-of your own: a create-only `PUT` whose `value` is an explicit `null`
-creates the record directly in the value-less `declared` state with
-`fallback: none` — no backend call is made, since there is no value to
+a partner's shared credential in one request, without ever holding a secret
+of your own: a create-only `PUT` whose `secret` is an explicit `null`
+creates the record directly in the secret-less `declared` state with
+`fallback: none` — no backend call is made, since there is no secret to
 write. Requires only the `write` PDP action.
 
 ```text
-# NOT IMPLEMENTED — planned, ADR-0004
+# NOT IMPLEMENTED — planned, ADR-0008
 curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H 'If-None-Match: *' \
   -i \
-  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "fallback": "none", "value": null}'
+  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~", "fallback": "none", "secret": null}'
 
 # 201 Created
 # { "reference": "partner-openai-key", "status": "declared", "inheritance": "suppressed", … }
