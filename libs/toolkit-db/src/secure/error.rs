@@ -78,12 +78,8 @@ impl ScopeError {
     }
 }
 
-/// Whether the SQLSTATE the driver reported names `violation`.
-///
-/// The first thing both classifiers below ask, because it is the only one of
-/// the three paths that neither guesses nor depends on wording: the code comes
-/// from the server. See [`crate::db_error`] for why the other two are not
-/// enough on their own.
+/// The shared shape of both classifiers below: three tiers, and which of them
+/// is allowed to answer.
 ///
 /// # Why three tiers, and what would retire each
 ///
@@ -93,16 +89,58 @@ impl ScopeError {
 ///
 /// * `sql_err()` reads `MySQL`'s vendor error number. `MySQL` reports both a
 ///   duplicate key and a failed foreign key as `23000`, so the SQLSTATE alone
-///   cannot tell the two conditions apart — only the vendor number can. This
-///   tier retires when [`crate::db_error`] reads that number itself.
+///   cannot tell the two conditions apart — only the vendor number can. It also
+///   carries `SQLite`, whose extended result codes are not SQLSTATEs and which
+///   [`crate::db_error`] therefore names no condition for. This tier retires
+///   when [`crate::db_error`] reads both itself.
 /// * The message match catches errors re-wrapped as [`DbErr::Custom`] on the
 ///   way here, which have no driver error left to read at all. It retires when
 ///   no call site can hand these classifiers a re-wrapped error — a property of
 ///   the callers, not of this module.
 ///
+/// # Why the driver gets the last word, not just the first
+///
+/// The tiers are ordered by how much they assume, and a tier may only speak
+/// when the ones above it had nothing to say — *including when what they had to
+/// say was "no"*.
+///
+/// The message tier is the reason this matters. `PostgreSQL` echoes the
+/// offending value into its message text, so a caller can put our own search
+/// strings there: `invalid input syntax for type uuid: "duplicate key"` is a
+/// `22P02`, a malformed input, and it used to classify as a unique violation
+/// because `22P02` names no condition and the fall-through reached the text.
+/// A gear answers `409 Conflict` to what is a `400`, and one that treats a
+/// conflict as "it already exists, return that one" takes a branch the caller
+/// chose for it.
+///
+/// So: a code that names a condition is the final answer, yes or no. A code
+/// that names none (a `SQLite` extended code, a SQLSTATE outside class 23)
+/// still leaves `sql_err()` its turn. And the text is read only when no driver
+/// spoke at all, which is exactly the re-wrapped case it documents.
+///
 /// [`DbErr::Custom`]: sea_orm::DbErr::Custom
-fn driver_says(err: &sea_orm::DbErr, violation: crate::db_error::ConstraintViolation) -> bool {
-    crate::db_error::driver_refusal(err).and_then(|refusal| refusal.violation()) == Some(violation)
+fn classifies_as(
+    err: &sea_orm::DbErr,
+    violation: crate::db_error::ConstraintViolation,
+    sea_orm_says: impl FnOnce() -> bool,
+    message_says: impl FnOnce(&str) -> bool,
+) -> bool {
+    // The driver named a condition: that is the answer, either way.
+    if let Some(named) = crate::db_error::violation_of(err) {
+        return named == violation;
+    }
+
+    if sea_orm_says() {
+        return true;
+    }
+
+    // A driver spoke and neither tier above recognised what it said. Guessing
+    // from text here is what let caller-supplied content decide the answer.
+    if crate::db_error::driver_code(err).is_some() {
+        return false;
+    }
+
+    message_says(&err.to_string().to_lowercase())
 }
 
 /// Check whether a `sea_orm::DbErr` represents a unique-constraint violation.
@@ -110,7 +148,8 @@ fn driver_says(err: &sea_orm::DbErr, violation: crate::db_error::ConstraintViola
 /// Three paths, in order of how much they assume: the SQLSTATE the driver
 /// reported ([`crate::db_error`]), then `SeaORM`'s own `sql_err()`
 /// classification, then a match on the message text for errors that were
-/// re-wrapped on the way here and lost their typed shape.
+/// re-wrapped on the way here and lost their typed shape. See
+/// [`classifies_as`] for which of them is allowed to answer when.
 ///
 /// Recognized patterns across backends:
 /// - **Postgres** SQLSTATE `23505` — "`unique_violation`" / "duplicate key"
@@ -118,26 +157,23 @@ fn driver_says(err: &sea_orm::DbErr, violation: crate::db_error::ConstraintViola
 /// - **`MySQL`** error `1062` — "Duplicate entry"
 #[must_use]
 pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
-    if driver_says(err, crate::db_error::ConstraintViolation::Unique) {
-        return true;
-    }
-
-    // SeaORM parsed the SQLSTATE / vendor code itself. Still needed: it reads
-    // MySQL's vendor error number, which no SQLSTATE distinguishes.
-    if matches!(
-        err.sql_err(),
-        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
-    ) {
-        return true;
-    }
-
-    // Fallback: string-based detection for wrapped / proxied errors.
-    let msg = err.to_string().to_lowercase();
-    msg.contains("unique constraint")
-        || msg.contains("duplicate key")
-        || msg.contains("unique_violation")
-        || msg.contains("duplicate entry")
-        || msg.contains("unique constraint failed")
+    classifies_as(
+        err,
+        crate::db_error::ConstraintViolation::Unique,
+        || {
+            matches!(
+                err.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            )
+        },
+        |msg| {
+            msg.contains("unique constraint")
+                || msg.contains("duplicate key")
+                || msg.contains("unique_violation")
+                || msg.contains("duplicate entry")
+                || msg.contains("unique constraint failed")
+        },
+    )
 }
 
 /// Check whether a `sea_orm::DbErr` represents a foreign-key violation.
@@ -164,24 +200,24 @@ pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
 /// - **`MySQL`** errors `1451`/`1452` — "a foreign key constraint fails"
 #[must_use]
 pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
-    if driver_says(err, crate::db_error::ConstraintViolation::ForeignKey) {
-        return true;
-    }
-
-    if matches!(
-        err.sql_err(),
-        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
-    ) {
-        return true;
-    }
-
-    let msg = err.to_string().to_lowercase();
-    msg.contains("foreign key constraint")
-        || msg.contains("foreign_key_violation")
-        || msg.contains("violates foreign key")
-        // PostgreSQL 18's RESTRICT wording, for an error that reached here
-        // stripped of its SQLSTATE.
-        || msg.contains("violates restrict setting")
+    classifies_as(
+        err,
+        crate::db_error::ConstraintViolation::ForeignKey,
+        || {
+            matches!(
+                err.sql_err(),
+                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+            )
+        },
+        |msg| {
+            msg.contains("foreign key constraint")
+                || msg.contains("foreign_key_violation")
+                || msg.contains("violates foreign key")
+                // PostgreSQL 18's RESTRICT wording, for an error that reached
+                // here stripped of its SQLSTATE.
+                || msg.contains("violates restrict setting")
+        },
+    )
 }
 
 #[cfg(test)]
@@ -277,5 +313,120 @@ mod tests {
         let err = DbErr::Custom("connection reset by peer".to_owned());
         assert!(!is_unique_violation(&err));
         assert!(!is_foreign_key_violation(&err));
+    }
+
+    /// A `DbErr` shaped exactly like one a driver produces, with a code and a
+    /// message of our choosing.
+    ///
+    /// The tier rules cannot be exercised through `DbErr::Custom`, which by
+    /// definition carries no driver error: what has to be tested is a *live*
+    /// shape whose code says one thing and whose text says another. A live
+    /// server can produce it (and does, in `tests/error_classification.rs`),
+    /// but the rule itself deserves a test that runs without one.
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    mod driver_shaped {
+        use std::borrow::Cow;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Refusal {
+            code: &'static str,
+            message: String,
+        }
+
+        impl std::fmt::Display for Refusal {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.message)
+            }
+        }
+
+        impl std::error::Error for Refusal {}
+
+        impl sqlx::error::DatabaseError for Refusal {
+            fn message(&self) -> &str {
+                &self.message
+            }
+            fn code(&self) -> Option<Cow<'_, str>> {
+                Some(Cow::Borrowed(self.code))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+
+        pub fn refused(code: &'static str, message: &str) -> sea_orm::DbErr {
+            sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
+                sqlx::Error::Database(Box::new(Refusal {
+                    code,
+                    message: message.to_owned(),
+                })),
+            )))
+        }
+    }
+
+    /// The finding this rule exists for: `PostgreSQL` echoes the offending
+    /// value into the message, so a caller can put our own search strings
+    /// there. `22P02` is a malformed input, not a conflict, and the value is
+    /// whatever was submitted.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_value_in_the_message_cannot_decide_the_condition() {
+        let err = driver_shaped::refused(
+            "22P02",
+            r#"invalid input syntax for type uuid: "duplicate key""#,
+        );
+        assert!(
+            !is_unique_violation(&err),
+            "a caller-supplied 'duplicate key' must not classify a 22P02 as a conflict"
+        );
+
+        let err = driver_shaped::refused(
+            "22P02",
+            r#"invalid input syntax for type uuid: "violates foreign key constraint""#,
+        );
+        assert!(
+            !is_foreign_key_violation(&err),
+            "and the same for the foreign-key wording"
+        );
+    }
+
+    /// The other half of the rule: when the code does name a condition, it is
+    /// the whole answer, for both classifiers.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_code_that_names_a_condition_is_the_whole_answer() {
+        let unique = driver_shaped::refused(
+            "23505",
+            "duplicate key value violates unique constraint \"users_email_key\"",
+        );
+        assert!(is_unique_violation(&unique));
+        assert!(!is_foreign_key_violation(&unique));
+
+        // PostgreSQL 18's RESTRICT code, which sea-orm's own table does not map.
+        let restrict = driver_shaped::refused(
+            "23001",
+            "update or delete on table \"parent\" violates RESTRICT setting",
+        );
+        assert!(is_foreign_key_violation(&restrict));
+        assert!(!is_unique_violation(&restrict));
+    }
+
+    /// And the message tier is still there for what it documents: an error
+    /// re-wrapped on the way here, with no driver error left to read.
+    #[test]
+    fn a_rewrapped_error_is_still_read_from_its_text() {
+        let err = DbErr::Custom(
+            "duplicate key value violates unique constraint \"users_email_key\"".to_owned(),
+        );
+        assert!(is_unique_violation(&err));
     }
 }
