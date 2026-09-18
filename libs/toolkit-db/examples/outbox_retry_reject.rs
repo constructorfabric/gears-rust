@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let conn = db.conn()?;
-    handle
+    let pending = handle
         .outbox()
         .enqueue(
             &conn,
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
                 .build()?,
         )
         .await?;
-    handle.outbox().flush();
+    pending.flush();
     println!("Enqueued 1 message, watching retries:");
 
     // wait for retries + final reject

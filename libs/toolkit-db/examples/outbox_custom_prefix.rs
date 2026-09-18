@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    handle
+    let pending = handle
         .outbox()
         .enqueue(
             &db.conn()?,
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
                 .build()?,
         )
         .await?;
-    handle.outbox().flush();
+    pending.flush();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while processed.load(Ordering::Relaxed) == 0 {

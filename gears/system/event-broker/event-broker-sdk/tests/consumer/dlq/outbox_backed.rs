@@ -170,11 +170,11 @@ async fn if_i_want_a_single_queue_dlq_i_enqueue_to_the_consumer_dlq_outbox() {
     let record = dead_letter(&event, group);
     let conn = fixture.db.conn().expect("db conn");
 
-    helper
+    let flush = helper
         .enqueue(&conn, record)
         .await
         .expect("dead-letter record enqueued");
-    fixture.handle.outbox().flush();
+    flush.flush();
 
     let envelope = wait_for_envelope(&fixture.envelopes).await;
     assert_eq!(envelope.group_id, Some(group));
@@ -201,11 +201,11 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
     let record = dead_letter(&event, group);
     let tx_manager = Arc::clone(&manager);
 
-    fixture
+    let flush = fixture
         .db
         .transaction_ref(|tx| {
             Box::pin(async move {
-                helper
+                let flush = helper
                     .enqueue(tx, record)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
@@ -213,12 +213,12 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
                     .commit_in_tx(tx, &group, &topic, event.partition, event.offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
-                Ok(())
+                Ok(flush)
             })
         })
         .await
         .expect("transaction commits");
-    fixture.handle.outbox().flush();
+    flush.flush();
 
     let envelope = wait_for_envelope(&fixture.envelopes).await;
     assert_eq!(envelope.offset, event.offset);
@@ -247,7 +247,7 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
         .db
         .transaction_ref(|tx| {
             Box::pin(async move {
-                helper
+                let _ = helper
                     .enqueue(tx, record)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
@@ -263,7 +263,6 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
         .await;
 
     assert!(result.is_err());
-    fixture.handle.outbox().flush();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(fixture.envelopes.lock().unwrap().is_empty());
     assert_eq!(
@@ -299,11 +298,11 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
     assert!(business_result.is_err());
 
     let tx_manager = Arc::clone(&manager);
-    fixture
+    let flush = fixture
         .db
         .transaction_ref(|tx| {
             Box::pin(async move {
-                helper
+                let flush = helper
                     .enqueue(tx, record)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
@@ -311,12 +310,12 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
                     .commit_in_tx(tx, &group, &topic, event.partition, event.offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
-                Ok(())
+                Ok(flush)
             })
         })
         .await
         .expect("dlq transaction commits");
-    fixture.handle.outbox().flush();
+    flush.flush();
 
     let envelope = wait_for_envelope(&fixture.envelopes).await;
     assert_eq!(envelope.offset, event.offset);
@@ -348,7 +347,7 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
         .db
         .transaction_ref(|tx| {
             Box::pin(async move {
-                broken_helper
+                let _ = broken_helper
                     .enqueue(tx, record)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;

@@ -596,7 +596,7 @@ impl<
         let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
         let scope_tx = scope.clone();
 
-        let affected = self
+        let (affected, pending) = self
             .db
             .transaction(move |tx| {
                 Box::pin(async move {
@@ -606,19 +606,24 @@ impl<
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
+                    let mut pending = toolkit_db::outbox::FlushHandle::default();
                     if affected > 0 {
                         // Enqueue cleanup event in the same TX
-                        outbox_enqueuer
+                        pending += outbox_enqueuer
                             .enqueue_attachment_cleanup(tx, event)
                             .await
                             .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
                     }
 
-                    Ok(affected)
+                    Ok((affected, pending))
                 })
             })
             .await
             .map_err(|e: toolkit_db::DbError| DomainError::database(e.to_string()))?;
+
+        // Post-commit: wake the sequencer for the cleanup event (no-op when
+        // nothing was enqueued).
+        pending.flush();
 
         if affected == 0 {
             // Ambiguity: rows_affected=0 could mean concurrent delete OR message reference.

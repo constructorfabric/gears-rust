@@ -128,7 +128,8 @@ async fn consumer_dlq_outbox_enqueues_dead_letter_envelope() {
     let message_id = helper
         .enqueue(&conn, dead_letter_record(11))
         .await
-        .expect("enqueue succeeds");
+        .expect("enqueue succeeds")
+        .id();
 
     assert!(message_id.0 > 0);
     handle.stop().await;

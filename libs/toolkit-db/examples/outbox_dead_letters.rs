@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use toolkit_db::outbox::{
-    DeadLetterFilter, DeadLetterScope, LeasedMessageHandler, MessageResult, Outbox, OutboxMessage,
-    Partitions, Record, WorkerTuning, outbox_migrations,
+    DeadLetterFilter, DeadLetterScope, FlushHandle, LeasedMessageHandler, MessageResult, Outbox,
+    OutboxMessage, Partitions, Record, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -48,8 +48,10 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
     let conn = db.conn()?;
+    let mut pending = FlushHandle::default();
     for i in 0..3 {
-        h1.outbox()
+        pending += h1
+            .outbox()
             .enqueue(
                 &conn,
                 Record::to("events", 0)
@@ -61,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
     }
-    h1.outbox().flush();
+    pending.flush();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let outbox = std::sync::Arc::clone(h1.outbox());
     h1.stop().await;

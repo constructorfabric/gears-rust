@@ -204,6 +204,7 @@ mod builder;
 mod core;
 mod dead_letter;
 mod dialect;
+mod flush_handle;
 mod handler;
 mod manager;
 mod migrations;
@@ -231,6 +232,7 @@ pub use batch::Batch;
 pub use builder::{LeasedQueueBuilder, QueueBuilder};
 pub use core::Outbox;
 pub use dead_letter::{DeadLetterFilter, DeadLetterMessage, DeadLetterScope, DeadLetterStatus};
+pub use flush_handle::FlushHandle;
 pub use handler::{
     HandlerResult, LeasedHandler, LeasedMessageHandler, MessageResult, OutboxMessage,
     PerMessageAdapter, TransactionalHandler, TransactionalMessageHandler,

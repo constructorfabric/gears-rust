@@ -42,7 +42,7 @@ impl ConsumerDlqOutbox {
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         record: DeadLetterRecord,
-    ) -> Result<toolkit_db::outbox::OutboxMessageId, ConsumerError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, ConsumerError> {
         let partition = self.partition_for_record(&record);
         let envelope = DeadLetterEnvelope::from_record(record);
         let payload = envelope.to_vec()?;

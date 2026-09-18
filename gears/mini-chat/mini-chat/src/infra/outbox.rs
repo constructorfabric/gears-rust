@@ -121,10 +121,11 @@ impl InfraOutboxEnqueuer {
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         chat_id: uuid::Uuid,
         payload: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         let partition = Self::compute_partition(chat_id, self.num_partitions);
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.thread_summary_queue_name, partition, payload)?,
@@ -139,7 +140,7 @@ impl InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
+        Ok(handle)
     }
 }
 
@@ -149,12 +150,13 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: UsageEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         let partition = self.partition_for(event.tenant_id);
         let payload = serde_json::to_vec(&event)
             .map_err(|e| DomainError::internal(format!("serialize UsageEvent: {e}")))?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.usage_queue_name, partition, payload)?,
@@ -170,19 +172,20 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "usage event enqueued"
         );
 
-        Ok(())
+        Ok(handle)
     }
 
     async fn enqueue_attachment_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         let partition = self.partition_for(event.tenant_id);
         let payload = serde_json::to_vec(&event)
             .map_err(|e| DomainError::internal(format!("serialize AttachmentCleanupEvent: {e}")))?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.cleanup_queue_name, partition, payload)?,
@@ -198,21 +201,22 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "attachment cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(handle)
     }
 
     async fn enqueue_chat_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         // Partition by chat_id so all cleanup messages for the same chat
         // are serialized within one partition.
         let partition = Self::compute_partition(event.chat_id, self.num_partitions);
         let payload = serde_json::to_vec(&event)
             .map_err(|e| DomainError::internal(format!("serialize ChatCleanupEvent: {e}")))?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.chat_cleanup_queue_name, partition, payload)?,
@@ -228,14 +232,14 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "chat cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(handle)
     }
 
     async fn enqueue_audit_event(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         let tenant_id = match &event {
             AuditEnvelope::Turn(e) => e.tenant_id,
             AuditEnvelope::Mutation(e) => e.tenant_id,
@@ -245,7 +249,8 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         let payload = serde_json::to_vec(&event)
             .map_err(|e| DomainError::internal(format!("serialize AuditEnvelope: {e}")))?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.audit_queue_name, partition, payload)?,
@@ -260,20 +265,21 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         "audit event enqueued"
         );
 
-        Ok(())
+        Ok(handle)
     }
 
     async fn enqueue_thread_summary(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
         let partition = Self::compute_partition(payload.chat_id, self.num_partitions);
         let serialized = serde_json::to_vec(&payload).map_err(|e| {
             DomainError::internal(format!("serialize ThreadSummaryTaskPayload: {e}"))
         })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.thread_summary_queue_name, partition, serialized)?,
@@ -289,14 +295,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
-    }
-
-    fn flush(&self) {
-        // flush is a no-op if outbox isn't set yet (before start).
-        if let Some(outbox) = self.outbox.get() {
-            outbox.flush();
-        }
+        Ok(handle)
     }
 }
 
@@ -1067,11 +1066,11 @@ mod tests {
         let payload = make_audit_envelope_payload();
         let envelope: AuditEnvelope = serde_json::from_slice(&payload).unwrap();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let flush_handle = enqueuer
             .enqueue_audit_event(&conn, envelope)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        flush_handle.flush();
 
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())
             .await
@@ -1136,11 +1135,11 @@ mod tests {
         enqueuer.set_outbox(Arc::clone(handle.outbox()));
         let event = make_usage_event();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let flush_handle = enqueuer
             .enqueue_usage_event(&conn, event)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        flush_handle.flush();
 
         // Wait for the handler to process (notification-based, no fixed sleep).
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())
