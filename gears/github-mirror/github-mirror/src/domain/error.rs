@@ -37,6 +37,33 @@ impl DomainError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
+
+    #[must_use]
+    pub fn public_text(&self) -> String {
+        match self {
+            Self::NotFound | Self::Validation { .. } | Self::Conflict(_) => self.to_string(),
+            Self::Forbidden(_) => "access forbidden".to_owned(),
+            Self::AccessLost(_) => {
+                "GitHub refused the mirror's credentials for this repository".to_owned()
+            }
+            Self::Internal(msg) => crate::redact::redacted(msg),
+            Self::Database(_) => "a storage error stopped the work".to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Database(toolkit_db::DbError::Sea(e)) => [
+                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
+                sea_orm::DbBackend::MySql,
+            ]
+            .into_iter()
+            .any(|backend| toolkit_db::contention::is_retryable_contention(backend, e)),
+            _ => false,
+        }
+    }
 }
 
 #[allow(unknown_lints, de1302_error_from_to_string)]

@@ -40,6 +40,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_issue_reactions",
         "gm_check_runs",
         "gm_issue_timeline",
+        "gm_sync_sessions",
+        "gm_sync_watermarks",
+        "gm_entity_fingerprints",
+        "gm_repo_sync_status",
+        "gm_http_cache",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -97,6 +102,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         ("gm_pull_requests", "author_json"),
         ("gm_issues", "labels_json"),
         ("gm_pull_requests", "requested_reviewers_json"),
+        ("gm_sync_sessions", "updated_at"),
     ] {
         assert!(
             manager.has_column(table, column).await.unwrap(),
@@ -142,6 +148,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_issue_reactions",
         "gm_check_runs",
         "gm_issue_timeline",
+        "gm_sync_sessions",
+        "gm_sync_watermarks",
+        "gm_entity_fingerprints",
+        "gm_repo_sync_status",
+        "gm_http_cache",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),
@@ -153,9 +164,9 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
     // so there is nothing further to assert for the individual columns.
 }
 
-/// The nine `z_`-prefixed migrations only add columns, and the runner applies
-/// migrations in name order, so they are the last nine to run and the first
-/// nine to roll back. Undoing exactly those leaves every table in place, which
+/// The ten `z_`-prefixed migrations only add columns, and the runner applies
+/// migrations in name order, so they are the last ten to run and the first
+/// ten to roll back. Undoing exactly those leaves every table in place, which
 /// is what makes their `down()` bodies observable: replace one with `Ok(())`
 /// and its column survives here.
 #[tokio::test]
@@ -165,7 +176,7 @@ async fn the_additive_migrations_drop_their_columns_on_rollback() {
         .expect("in-memory database must connect");
 
     Migrator::up(&conn, None).await.expect("up must succeed");
-    Migrator::down(&conn, Some(9))
+    Migrator::down(&conn, Some(10))
         .await
         .expect("rolling back the additive migrations must succeed");
 

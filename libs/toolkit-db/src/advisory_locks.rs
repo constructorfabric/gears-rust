@@ -1633,6 +1633,36 @@ impl LockManager {
         }
     }
 
+    /// Remove the marker a dead holder left behind for `key`, so the key can be
+    /// acquired again. Only the file backend keeps markers; `PostgreSQL` and
+    /// `MySQL` drop a dead session's locks themselves, so this is a no-op there.
+    /// Returns whether a marker was removed.
+    ///
+    /// No liveness check is made, deliberately: this is for a service's own
+    /// start-up path, where the caller knows no holder of `key` is running
+    /// (module docs, "Recovering a stale marker"). The name carries that
+    /// contract: called from a request path, this would delete the marker of
+    /// a holder that is still running.
+    ///
+    /// # Errors
+    /// `DbLockError::Io` when a marker exists but cannot be removed.
+    pub async fn remove_marker_at_startup(
+        &self,
+        gear: &str,
+        key: &str,
+    ) -> Result<bool, DbLockError> {
+        if !matches!(self.backend, LockBackend::File) {
+            return Ok(false);
+        }
+        let canonical = canonical_lock_input(self.database_scope, gear, key);
+        let path = self.get_lock_file_path(&canonical);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Try to acquire an advisory lock with retry/backoff policy.
     ///
     /// Returns:
