@@ -1,0 +1,88 @@
+# Created: 2026-08-12 by Constructor Tech
+[package]
+name = "cf-gears-settings-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Settings Service gear: declaration registry, scoped value resolution, and validate-then-set writes"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "settings-service"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
+toolkit-canonical-errors = { workspace = true }
+settings-service-sdk = { workspace = true }
+# `rest-client`: `#[toolkit::consumes]` needs the directory-resolving client to
+# exist, even though R1 binds the co-located provider (DESIGN.md §4.9).
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
+types-registry-sdk = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
+types-registry = { workspace = true }
+# The Credential Store behind the Secret Manager: plaintext lives there, the
+# settings row holds the reference (DESIGN.md §4.2 *Secret Manager*).
+credstore-sdk = { workspace = true }
+credstore = { workspace = true }
+uuid = { workspace = true }
+# Type Validator: structural + `format` assertions, and the regex trait check.
+jsonschema = { workspace = true }
+regex = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+thiserror = { workspace = true }
+
+sea-orm = { workspace = true }
+toolkit-db-macros = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+time = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+axum = { workspace = true }
+http = { workspace = true }
+toolkit = { workspace = true }
+toolkit-db = { workspace = true }
+# The pending-secret sweep runs on the gear's managed lifecycle tick.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+tokio-util = { workspace = true }
+# Step-up: the presented token is validated by the platform's AuthN resolver,
+# fetched from the hub at first use; the freshness claims are read from it.
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.32", path = "../../system/authn-resolver/authn-resolver-sdk" }
+# Write-path counters.
+opentelemetry = { workspace = true }
+# Reading the session token's `sub` (unverified, for subject binding only).
+base64 = { workspace = true }
+secrecy = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+# Drives a request through the real router in the REST tests: the routes are
+# registered exactly as the gear registers them, and `oneshot` answers.
+tower = { workspace = true }
+# `MockTypesRegistryClient`, the SDK's own double for the registry the
+# declaration reads ask for a type's traits.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# `MockCredStoreClient`, for the gear-init test: `init` resolves the credstore
+# client out of the hub, so the hub has to hold one.
+credstore-sdk = { workspace = true, features = ["test-util"] }
+# The SQLite driver the repository tests run against. Only the driver: the
+# runtime and TLS come from the workspace, which pins `runtime-tokio` and
+# routes TLS through `sqlx/tls-rustls-aws-lc-rs` for the reason its own
+# comment records -- `runtime-tokio-rustls` would add the `ring` provider
+# beside `aws-lc-rs`, and rustls 0.23 panics process-wide when it cannot
+# choose between two.
+sea-orm = { workspace = true, features = ["sqlx-sqlite"] }
