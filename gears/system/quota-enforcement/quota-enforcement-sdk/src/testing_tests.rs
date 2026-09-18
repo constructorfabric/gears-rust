@@ -1,5 +1,6 @@
 //! The doubles must hold the contract semantics the gear's tests rely on.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -12,17 +13,29 @@ use super::{
 };
 use crate::engine::{EvaluationContext, EvaluationLimits, PolicySchemaSnapshot};
 use crate::models::{
-    ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults, DecisionResult,
-    EventId, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, LeaseToken,
-    NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash, PolicyDraft,
-    PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaStatus,
+    ApplicableQuotas, AttributionDigest, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults,
+    DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState,
+    LeaseToken, NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash,
+    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaStatus,
 };
-use crate::models::{EvaluatedDebit, EvaluatedLease, TransitionOutcome};
+use crate::models::{
+    EvaluatedDebit, EvaluatedLease, PartialIdempotencyWrite, PeriodType, Retention, RollbackTarget,
+    TransitionOutcome,
+};
 use crate::storage_plugin::{
     CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
     StorageError,
 };
+
+/// The scripted evaluator as the owned callback the contract now takes.
+///
+/// The double and the real plugin both move it into their transaction, so it
+/// cannot be a borrow of a local.
+fn scripted(evaluator: &Arc<ScriptedEvaluator>) -> Arc<crate::engine::TransactionEvaluator> {
+    let evaluator = Arc::clone(evaluator);
+    Arc::new(move |context: &EvaluationContext<'_>| evaluator.evaluate(context))
+}
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()
@@ -90,8 +103,8 @@ impl EvaluatedMutations for InMemoryStorage {
         write: &IdempotencyWrite,
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         let storage = self;
-        let evaluator = ScriptedEvaluator::new();
-        let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+        let evaluator = Arc::new(ScriptedEvaluator::new());
+        let call = scripted(&evaluator);
         let applicable = applicable();
         storage
             .apply_debit_plan(
@@ -105,7 +118,8 @@ impl EvaluatedMutations for InMemoryStorage {
                     user_projection: None,
                     limits: limits(),
                     idempotency: write,
-                    evaluate: &call,
+                    authorized: authorized(),
+                    evaluate: Arc::clone(&call),
                 },
                 &[],
             )
@@ -119,8 +133,8 @@ impl EvaluatedMutations for InMemoryStorage {
         write: &IdempotencyWrite,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
         let storage = self;
-        let evaluator = ScriptedEvaluator::new();
-        let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+        let evaluator = Arc::new(ScriptedEvaluator::new());
+        let call = scripted(&evaluator);
         let applicable = applicable();
         storage
             .acquire_lease(
@@ -134,7 +148,8 @@ impl EvaluatedMutations for InMemoryStorage {
                     user_projection: None,
                     limits: limits(),
                     idempotency: write,
-                    evaluate: &call,
+                    authorized: authorized(),
+                    evaluate: Arc::clone(&call),
                 },
                 ttl,
             )
@@ -145,6 +160,16 @@ impl EvaluatedMutations for InMemoryStorage {
 /// The token of an acquisition the evaluator allowed.
 fn token_of(outcome: &TransitionOutcome<EvaluatedLease>) -> LeaseToken {
     outcome.get().token.expect("an allowed acquisition holds")
+}
+
+/// The attribution digest a debit is authorized under. One value throughout,
+/// so a rollback in these tests presents the same one the debit recorded.
+fn authorized() -> AttributionDigest {
+    AttributionDigest::of_canonical(&serde_json::json!({
+        "metric": "gts.cf.qe.metric.type.v1~cf.qe.metric.tokens.v1",
+        "subjects": [{"kind": "user", "id": "u1"}],
+    }))
+    .expect("a constant document serializes")
 }
 
 fn applicable() -> ApplicableQuotas {
@@ -271,7 +296,15 @@ async fn storage_debit_plan_mutates_counters_once_and_replays_verbatim() {
         matches!(replay, TransitionOutcome::NoOp(_)),
         "a replay is typed as one"
     );
-    assert_eq!(replay.get().mutation.counters[0].value, 40);
+    assert!(
+        replay.get().mutation.counters.is_empty(),
+        "a replay moved nothing, so it reports no counter movement"
+    );
+    assert_eq!(
+        replay.get().decision,
+        first.get().decision,
+        "the stored decision is what a replay returns"
+    );
 
     let mismatch = idem(OperationType::Debit, "k1", 8);
     let err = storage
@@ -1338,8 +1371,8 @@ async fn a_transaction_that_needs_a_prepared_artifact_rolls_back_and_writes_noth
     let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     let write = idem(OperationType::Debit, "miss", 4);
-    let evaluator = ScriptedEvaluator::with_preparation_misses(1);
-    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = Arc::new(ScriptedEvaluator::with_preparation_misses(1));
+    let call = scripted(&evaluator);
     let applicable = applicable();
     let err = storage
         .apply_debit_plan(
@@ -1353,7 +1386,8 @@ async fn a_transaction_that_needs_a_prepared_artifact_rolls_back_and_writes_noth
                 user_projection: None,
                 limits: limits(),
                 idempotency: &write,
-                evaluate: &call,
+                authorized: authorized(),
+                evaluate: Arc::clone(&call),
             },
             &[],
         )
@@ -1383,14 +1417,15 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
     let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     let envelope = idem(OperationType::Debit, "batch", 5);
-    let evaluator = ScriptedEvaluator::new();
-    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
     let items = vec![
         BatchDebitItem {
             applicable: applicable(),
             amount: 7,
             request: serde_json::Value::Null,
             resource: serde_json::Value::Null,
+            authorized: authorized(),
             item_scope: None,
         },
         BatchDebitItem {
@@ -1398,6 +1433,7 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
             amount: 3,
             request: serde_json::Value::Null,
             resource: serde_json::Value::Null,
+            authorized: authorized(),
             item_scope: None,
         },
     ];
@@ -1406,7 +1442,7 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
         items: &items,
         user_projection: None,
         limits: limits(),
-        evaluate: &call,
+        evaluate: Arc::clone(&call),
     };
     let applied = storage
         .apply_batch_debit(&ctx(), &scope(), &batch, &[])
@@ -1486,6 +1522,7 @@ fn batch_item(amount: u64) -> BatchDebitItem {
         amount,
         request: serde_json::Value::Null,
         resource: serde_json::Value::Null,
+        authorized: authorized(),
         item_scope: None,
     }
 }
@@ -1497,8 +1534,8 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
     let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(800)).await;
     let envelope = idem(OperationType::Debit, "atomic", 6);
-    let evaluator = ScriptedEvaluator::new();
-    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
     let items = vec![batch_item(500), batch_item(500)];
     let outcome = storage
         .apply_batch_debit(
@@ -1509,7 +1546,7 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
                 items: &items,
                 user_projection: None,
                 limits: limits(),
-                evaluate: &call,
+                evaluate: Arc::clone(&call),
             },
             &[],
         )
@@ -1550,7 +1587,7 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
                 items: &fits,
                 user_projection: None,
                 limits: limits(),
-                evaluate: &call,
+                evaluate: Arc::clone(&call),
             },
             &[],
         )
@@ -1624,8 +1661,8 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
     }
     storage.bootstrap(&bundle).await.expect("bootstrap");
     let _quota = seeded_quota(&storage, Some(100)).await;
-    let evaluator = ScriptedEvaluator::new();
-    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
     let write = idem(OperationType::Debit, "budget", 8);
     let applicable = applicable();
     storage
@@ -1640,7 +1677,8 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
                 user_projection: None,
                 limits: limits(),
                 idempotency: &write,
-                evaluate: &call,
+                authorized: authorized(),
+                evaluate: Arc::clone(&call),
             },
             &[],
         )
@@ -1690,7 +1728,8 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
                 user_projection: None,
                 limits: limits(),
                 idempotency: &clamped,
-                evaluate: &call,
+                authorized: authorized(),
+                evaluate: Arc::clone(&call),
             },
             &[],
         )
@@ -1701,5 +1740,657 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
         vec![Duration::from_millis(3), Duration::from_millis(5)],
         "the new version's request is re-clamped per evaluation, with no \
          artifact republished"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Consumption periods, thresholds, credit and rollback
+// ---------------------------------------------------------------------------
+
+/// 2026-03-17T10:00:00Z, a Tuesday inside an ordinary day period.
+fn day_one() -> OffsetDateTime {
+    OffsetDateTime::parse(
+        "2026-03-17T10:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("valid timestamp")
+}
+
+fn at(text: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .expect("valid timestamp")
+}
+
+async fn consumption_storage(cap: Option<u64>, thresholds: Vec<u8>) -> (InMemoryStorage, QuotaId) {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            super::consumption_quota_draft(test_subject("u1"), cap, PeriodType::Day, thresholds),
+            &[],
+        )
+        .await
+        .expect("create consumption quota");
+    (storage, id)
+}
+
+fn partial(key: &str, payload: u8) -> PartialIdempotencyWrite {
+    PartialIdempotencyWrite {
+        tenant_id: test_tenant(),
+        key: key.to_owned(),
+        payload_hash: PayloadHash::from_bytes([payload; 32]),
+    }
+}
+
+fn target(original: &IdempotencyWrite) -> RollbackTarget {
+    RollbackTarget {
+        original: original.scope.clone(),
+        authorized: authorized(),
+    }
+}
+
+fn kinds(storage: &InMemoryStorage) -> Vec<NotificationEventKind> {
+    storage.events().into_iter().map(|e| e.kind).collect()
+}
+
+#[tokio::test]
+async fn a_first_debit_materializes_the_current_period_with_no_threshold_marker() {
+    let (storage, id) = consumption_storage(Some(100), vec![50, 80]).await;
+
+    storage
+        .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+
+    let rows = storage.period_rows(id);
+    assert_eq!(rows.len(), 1, "exactly one period row was materialized");
+    assert_eq!(rows[0].window.start, at("2026-03-17T00:00:00Z"));
+    assert_eq!(rows[0].consumed, 10);
+    assert_eq!(rows[0].marker, None, "no threshold was crossed (I13)");
+    assert!(!rows[0].settled);
+    assert!(!kinds(&storage).contains(&NotificationEventKind::PeriodRollover));
+}
+
+#[tokio::test]
+async fn a_debit_at_exactly_the_boundary_opens_the_successor_and_settles_the_closing_row() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    storage
+        .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("first debit");
+
+    // Exactly at period_end: half-open windows put this in the next period.
+    storage.set_now(Some(at("2026-03-18T00:00:00Z")));
+    storage
+        .apply_debit_plan_for(4, &idem(OperationType::Debit, "k2", 2))
+        .await
+        .expect("debit after the boundary");
+
+    let rows = storage.period_rows(id);
+    assert_eq!(rows.len(), 2, "the successor row was materialized");
+    assert!(rows[0].settled, "the closing row settled");
+    assert_eq!(rows[0].consumed, 10, "the closing counter is final");
+    assert_eq!(rows[1].consumed, 4, "the new period starts from this debit");
+    assert_eq!(
+        kinds(&storage)
+            .iter()
+            .filter(|kind| **kind == NotificationEventKind::PeriodRollover)
+            .count(),
+        1,
+        "exactly one rollover event per closing row"
+    );
+}
+
+#[tokio::test]
+async fn thresholds_fire_upward_once_and_reset_when_the_period_rolls_over() {
+    let (storage, id) = consumption_storage(Some(100), vec![50, 80, 100]).await;
+
+    storage
+        .apply_debit_plan_for(85, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit past two thresholds");
+    let crossed: Vec<NotificationEvent> = storage
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == NotificationEventKind::ThresholdCrossed)
+        .collect();
+    assert_eq!(
+        crossed.len(),
+        1,
+        "one event carries every threshold crossed"
+    );
+    assert_eq!(
+        crossed[0].payload["crossed_thresholds"],
+        serde_json::json!([50, 80])
+    );
+    assert_eq!(storage.period_rows(id)[0].marker, Some(80));
+
+    // A credit below 80 does not re-arm it.
+    storage
+        .apply_credit(&ctx(), &scope(), id, 40, &partial("c1", 9), &[])
+        .await
+        .expect("credit");
+    storage
+        .apply_debit_plan_for(40, &idem(OperationType::Debit, "k2", 2))
+        .await
+        .expect("debit back across 80");
+    assert_eq!(
+        storage
+            .events()
+            .iter()
+            .filter(|e| e.kind == NotificationEventKind::ThresholdCrossed)
+            .count(),
+        1,
+        "a threshold crossed once stays crossed for the period"
+    );
+
+    // The next period starts with a clean marker.
+    storage.set_now(Some(at("2026-03-18T00:00:00Z")));
+    storage
+        .apply_debit_plan_for(60, &idem(OperationType::Debit, "k3", 3))
+        .await
+        .expect("debit in the new period");
+    let rows = storage.period_rows(id);
+    assert_eq!(rows[1].marker, Some(50), "the successor row armed afresh");
+}
+
+#[tokio::test]
+async fn a_no_applicable_quota_denial_records_nothing_and_is_reevaluated_later() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let write = idem(OperationType::Debit, "k1", 1);
+
+    let denied = storage
+        .apply_debit_plan_for(5, &write)
+        .await
+        .expect("a denial is a successful call");
+    assert_eq!(
+        denied.get().decision.denied_reason(),
+        Some(crate::models::NO_APPLICABLE_QUOTA)
+    );
+    assert_eq!(
+        denied.get().retention,
+        Retention::Unrecorded,
+        "nothing was persisted, so nothing may replay or be cached"
+    );
+    assert!(
+        storage
+            .lookup_idempotency(&write.scope)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+
+    // Provisioning a Quota must change the answer for the very same request.
+    let id = seeded_quota(&storage, Some(100)).await;
+    let allowed = storage
+        .apply_debit_plan_for(5, &write)
+        .await
+        .expect("re-evaluated");
+    assert_eq!(allowed.get().decision.result, DecisionResult::Allowed);
+    assert_eq!(storage.consumed(id), 5);
+}
+
+#[tokio::test]
+async fn a_credit_derives_its_scope_from_the_locked_row_and_floors_at_zero() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    storage
+        .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+
+    let applied = storage
+        .apply_credit(&ctx(), &scope(), id, 40, &partial("c1", 9), &[])
+        .await
+        .expect("credit");
+    assert!(matches!(applied, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0, "a credit floors at zero");
+    assert!(kinds(&storage).contains(&NotificationEventKind::QuotaCounterAdjusted));
+
+    // The scope the plugin derived is the Quota's own subject pair.
+    let derived = IdempotencySubjectKey::of(&[test_subject("u1")]);
+    let record = storage
+        .lookup_idempotency(&IdempotencyScope {
+            tenant_id: test_tenant(),
+            subject_key: derived,
+            operation_type: OperationType::Credit,
+            key: "c1".to_owned(),
+        })
+        .await
+        .expect("lookup")
+        .expect("the credit recorded under the derived scope");
+    assert_eq!(record.attribution_hash, None, "a credit reverses nothing");
+}
+
+#[tokio::test]
+async fn a_credit_replays_even_after_its_quota_was_deactivated() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    storage
+        .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+    storage
+        .apply_credit(&ctx(), &scope(), id, 4, &partial("c1", 9), &[])
+        .await
+        .expect("credit");
+    storage
+        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .await
+        .expect("deactivate");
+
+    let replay = storage
+        .apply_credit(&ctx(), &scope(), id, 4, &partial("c1", 9), &[])
+        .await
+        .expect("a replay answers from the record, not from the guards");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(storage.consumed(id), 6, "the replay moved nothing");
+
+    let fresh = storage
+        .apply_credit(&ctx(), &scope(), id, 1, &partial("c2", 8), &[])
+        .await
+        .expect_err("a fresh credit is refused");
+    assert_eq!(fresh, StorageError::QuotaDeactivated { id });
+}
+
+#[tokio::test]
+async fn a_credit_refuses_a_closed_period_but_materializes_one_that_was_never_opened() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+
+    // Never evaluated: the current window is open, so the row is materialized.
+    storage
+        .apply_credit(&ctx(), &scope(), id, 5, &partial("c1", 9), &[])
+        .await
+        .expect("a Quota with no row has an open current window");
+    assert_eq!(storage.period_rows(id).len(), 1);
+
+    storage.set_now(Some(at("2026-03-19T00:00:00Z")));
+    let err = storage
+        .apply_credit(&ctx(), &scope(), id, 5, &partial("c2", 8), &[])
+        .await
+        .expect_err("the latest period has ended");
+    assert_eq!(err, StorageError::PeriodClosed);
+}
+
+#[tokio::test]
+async fn a_rollback_reverses_against_the_acquisition_period_after_the_boundary() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+
+    // Cross into the next period, then reverse: the closing row is the one
+    // that must lose the amount (I5), not the row now current.
+    storage.set_now(Some(at("2026-03-18T00:00:00Z")));
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &target(&original),
+            &idem(OperationType::Rollback, "r1", 2),
+            &[],
+        )
+        .await
+        .expect("rollback into the settlement window");
+
+    let rows = storage.period_rows(id);
+    assert_eq!(rows[0].consumed, 0, "the acquisition period was reversed");
+    assert!(kinds(&storage).contains(&NotificationEventKind::QuotaRollbackApplied));
+}
+
+#[tokio::test]
+async fn a_rollback_is_refused_once_the_attribution_period_has_settled() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+
+    // A debit in the next period settles the closing row and emits its event.
+    storage.set_now(Some(at("2026-03-18T00:00:00Z")));
+    storage
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "k2", 2))
+        .await
+        .expect("debit in the new period");
+
+    let err = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &target(&original),
+            &idem(OperationType::Rollback, "r1", 3),
+            &[],
+        )
+        .await
+        .expect_err("a settled period is final");
+    assert_eq!(err, StorageError::PeriodClosed);
+    assert_eq!(storage.period_rows(id)[0].consumed, 30, "nothing moved");
+}
+
+#[tokio::test]
+async fn a_rollback_authorized_under_another_attribution_finds_nothing() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = seeded_quota(&storage, Some(100)).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+
+    let foreign = RollbackTarget {
+        original: original.scope.clone(),
+        authorized: AttributionDigest::from_bytes([9; 32]),
+    };
+    let err = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &foreign,
+            &idem(OperationType::Rollback, "r1", 2),
+            &[],
+        )
+        .await
+        .expect_err("the caller was admitted for something else");
+
+    assert_eq!(
+        err,
+        StorageError::OperationNotFound {
+            key: "k1".to_owned()
+        },
+        "the record is reported absent rather than revealed"
+    );
+    assert_eq!(storage.consumed(id), 30, "no counter was touched");
+}
+
+#[tokio::test]
+async fn a_rollback_of_a_credit_a_denial_or_an_unknown_key_finds_nothing() {
+    let (storage, id) = consumption_storage(Some(10), Vec::new()).await;
+    let credit_key = partial("c1", 9);
+    storage
+        .apply_credit(&ctx(), &scope(), id, 1, &credit_key, &[])
+        .await
+        .expect("credit");
+    let denied = idem(OperationType::Debit, "denied", 4);
+    storage
+        .apply_debit_plan_for(999, &denied)
+        .await
+        .expect("a denial is a successful call");
+
+    for (label, scope_of) in [
+        (
+            "an unknown key",
+            idem(OperationType::Debit, "nope", 1).scope,
+        ),
+        ("a denied debit", denied.scope.clone()),
+        (
+            "a credit",
+            IdempotencyScope {
+                tenant_id: test_tenant(),
+                subject_key: IdempotencySubjectKey::of(&[test_subject("u1")]),
+                operation_type: OperationType::Credit,
+                key: "c1".to_owned(),
+            },
+        ),
+    ] {
+        let err = storage
+            .apply_rollback(
+                &ctx(),
+                &scope(),
+                &RollbackTarget {
+                    original: scope_of,
+                    authorized: authorized(),
+                },
+                &idem(OperationType::Rollback, label, 2),
+                &[],
+            )
+            .await
+            .expect_err("only a committed debit is reversible");
+        assert!(
+            matches!(err, StorageError::OperationNotFound { .. }),
+            "{label} should not be reversible, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_same_original_key_under_another_subject_set_is_a_different_operation() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    seeded_quota(&storage, Some(100)).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+
+    let other_subject = IdempotencyScope {
+        subject_key: IdempotencySubjectKey::from_bytes([2; 32]),
+        ..original.scope.clone()
+    };
+    let err = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &RollbackTarget {
+                original: other_subject,
+                authorized: authorized(),
+            },
+            &idem(OperationType::Rollback, "r1", 2),
+            &[],
+        )
+        .await
+        .expect_err("the scope includes the subject set");
+
+    assert!(matches!(err, StorageError::OperationNotFound { .. }));
+}
+
+#[tokio::test]
+async fn a_second_rollback_under_another_key_is_an_idempotent_no_op() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = seeded_quota(&storage, Some(100)).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &target(&original),
+            &idem(OperationType::Rollback, "r1", 2),
+            &[],
+        )
+        .await
+        .expect("first rollback");
+    assert_eq!(storage.consumed(id), 0);
+
+    let again = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &target(&original),
+            &idem(OperationType::Rollback, "r2", 3),
+            &[],
+        )
+        .await
+        .expect("a second rollback is accepted");
+
+    assert!(
+        again.get().decision.debit_plan.is_empty(),
+        "reversal happens once, so the second plan is empty"
+    );
+    assert_eq!(storage.consumed(id), 0, "the counter did not go negative");
+}
+
+#[tokio::test]
+async fn a_rollback_replay_returns_the_stored_outcome() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = seeded_quota(&storage, Some(100)).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+    let rollback = idem(OperationType::Rollback, "r1", 2);
+    storage
+        .apply_rollback(&ctx(), &scope(), &target(&original), &rollback, &[])
+        .await
+        .expect("first rollback");
+
+    let replay = storage
+        .apply_rollback(&ctx(), &scope(), &target(&original), &rollback, &[])
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(storage.consumed(id), 0);
+
+    let mismatch = IdempotencyWrite {
+        payload_hash: PayloadHash::from_bytes([7; 32]),
+        ..rollback.clone()
+    };
+    let err = storage
+        .apply_rollback(&ctx(), &scope(), &target(&original), &mismatch, &[])
+        .await
+        .expect_err("a different payload under the same key");
+    assert_eq!(err, StorageError::IdempotencyPayloadMismatch);
+}
+
+#[tokio::test]
+async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    storage
+        .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+    let events_before = storage.events().len();
+
+    storage.set_now(Some(at("2026-03-19T00:00:00Z")));
+    let snapshots = storage
+        .read_quota_snapshot(&ctx(), &scope(), &applicable())
+        .await
+        .expect("read");
+
+    assert_eq!(snapshots[0].consumed, 0, "the new period starts empty");
+    let rows = storage.period_rows(id);
+    assert_eq!(rows.len(), 2, "the successor row was materialized");
+    assert!(!rows[0].settled, "a read settles nothing");
+    assert_eq!(
+        storage.events().len(),
+        events_before,
+        "a read enqueues nothing, so a preview never writes an outbox row"
+    );
+
+    // Repeating the read writes nothing further.
+    storage
+        .read_quota_snapshot(&ctx(), &scope(), &applicable())
+        .await
+        .expect("read again");
+    assert_eq!(storage.period_rows(id).len(), 2);
+
+    // The next mutation is what settles and emits.
+    storage
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "k2", 2))
+        .await
+        .expect("debit");
+    assert!(storage.period_rows(id)[0].settled);
+    assert!(kinds(&storage).contains(&NotificationEventKind::PeriodRollover));
+}
+
+#[tokio::test]
+async fn a_replay_after_the_retention_window_is_a_new_operation() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = seeded_quota(&storage, Some(100)).await;
+    let write = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(10, &write)
+        .await
+        .expect("debit");
+
+    let reclaimed = storage
+        .reclaim_expired_idempotency(10, at("2999-01-01T00:00:00Z"))
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed, 1);
+
+    storage
+        .apply_debit_plan_for(10, &write)
+        .await
+        .expect("re-evaluated as a new operation");
+    assert_eq!(storage.consumed(id), 20, "the counter moved a second time");
+}
+
+#[tokio::test]
+async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            super::consumption_quota_draft(
+                test_subject("u1"),
+                Some(100),
+                PeriodType::Day,
+                vec![50],
+            ),
+            &[],
+        )
+        .await
+        .expect("create quota");
+    let events_before = storage.events().len();
+    let log_before = storage.operation_log_len();
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
+
+    // The first item crosses 50 and produces a threshold event; the second
+    // exceeds the cap and denies the envelope.
+    let items = vec![batch_item(60), batch_item(90)];
+    let envelope = idem(OperationType::Debit, "batch", 5);
+    let outcome = storage
+        .apply_batch_debit(
+            &ctx(),
+            &scope(),
+            &EvaluatedBatch {
+                envelope: &envelope,
+                items: &items,
+                user_projection: None,
+                limits: limits(),
+                evaluate: Arc::clone(&call),
+            },
+            &[],
+        )
+        .await
+        .expect("a denied envelope is a successful call");
+
+    assert!(
+        outcome
+            .get()
+            .iter()
+            .any(|item| matches!(item.decision.result, DecisionResult::Denied { .. })),
+        "the envelope was denied"
+    );
+    assert_eq!(storage.consumed(id), 0, "no counter survived the refusal");
+    assert_eq!(
+        storage.events().len(),
+        events_before,
+        "the threshold event the first item produced was discarded too"
+    );
+    assert_eq!(
+        storage.operation_log_len(),
+        log_before,
+        "an uncommitted envelope writes no operation-log row"
+    );
+    assert!(
+        storage.period_rows(id).iter().all(|row| row.consumed == 0),
+        "the period row the first item filled was rolled back"
     );
 }

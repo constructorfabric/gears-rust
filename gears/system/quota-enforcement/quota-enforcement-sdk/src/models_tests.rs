@@ -6,12 +6,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ActiveQuotaCounts, CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode,
-    EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId, MetricKind,
-    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
-    PolicyScope, ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch,
-    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, ScopeError,
-    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow,
+    ActiveQuotaCounts, AttributionDigest, CapPatch, ContractRef, DECISION_BLOB_VERSION,
+    DebitRequest, Decision, DecisionPreview, DecisionResult, EnforcementMode,
+    EvaluationAttribution, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey, LeaseState,
+    MetricId, MetricKind, NO_APPLICABLE_QUOTA, NotificationEventKind, OperationType, PageRequest,
+    PageResult, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyId, PolicyScope,
+    ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch, QuotaSource,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, Retention, ScopeError,
+    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow, positive_amount,
 };
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
@@ -693,4 +695,288 @@ fn public_policy_inputs_reject_server_owned_fields() {
         spoofed[field] = json!("caller controlled");
         assert!(serde_json::from_value::<super::PolicyPatch>(spoofed).is_err());
     }
+}
+
+// --- digests ---------------------------------------------------------------
+
+fn subject(projection: &str, id: &str) -> SubjectRef {
+    SubjectRef {
+        projection_type: GtsTypeId::new(projection),
+        subject_id: id.to_owned(),
+    }
+}
+
+#[test]
+fn a_subject_key_ignores_the_order_and_multiplicity_of_its_pairs() {
+    let tenant = subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1");
+    let user = subject("gts.cf.core.qe.subj.v1~acme.user.v1", "u-9");
+
+    let one = IdempotencySubjectKey::of(&[tenant.clone(), user.clone()]);
+    let other = IdempotencySubjectKey::of(&[user, tenant.clone(), tenant]);
+
+    assert_eq!(one, other);
+}
+
+#[test]
+fn a_subject_key_separates_fields_that_would_otherwise_concatenate_alike() {
+    let split_one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.xy.v1", "z")]);
+    let split_other = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.x.v1", "yz")]);
+
+    assert_ne!(
+        split_one, split_other,
+        "length prefixes keep the encoding injective"
+    );
+}
+
+#[test]
+fn different_subject_sets_fingerprint_differently() {
+    let one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
+    let other =
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-2")]);
+
+    assert_ne!(one, other);
+}
+
+#[test]
+fn the_empty_subject_set_still_fingerprints_deterministically() {
+    assert_eq!(
+        IdempotencySubjectKey::of(&[]),
+        IdempotencySubjectKey::of(&[])
+    );
+}
+
+#[test]
+fn a_subject_key_is_pinned_to_its_byte_form() {
+    // Golden vector: one pair, each field length-prefixed big-endian.
+    let expected = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for field in ["gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1"] {
+            hasher.update(
+                u32::try_from(field.len())
+                    .expect("short field")
+                    .to_be_bytes(),
+            );
+            hasher.update(field.as_bytes());
+        }
+        IdempotencySubjectKey::from_bytes(hasher.finalize().into())
+    };
+
+    assert_eq!(
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]),
+        expected
+    );
+}
+
+#[test]
+fn a_payload_hash_ignores_key_insertion_order_at_every_depth() {
+    let one = json!({"b": 1, "a": {"y": 2, "x": 3}});
+    let other = json!({"a": {"x": 3, "y": 2}, "b": 1});
+
+    assert_eq!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn a_payload_hash_respects_array_order_which_carries_meaning() {
+    let one = json!({"subjects": ["a", "b"]});
+    let other = json!({"subjects": ["b", "a"]});
+
+    assert_ne!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn a_payload_hash_distinguishes_the_amount_it_covers() {
+    let one = json!({"amount": 1});
+    let other = json!({"amount": 2});
+
+    assert_ne!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn an_attribution_digest_is_canonical_in_the_same_way() {
+    let one = json!({"metric": "m", "subjects": [{"kind": "tenant", "id": "t-1"}]});
+    let other = json!({"subjects": [{"id": "t-1", "kind": "tenant"}], "metric": "m"});
+
+    assert_eq!(
+        AttributionDigest::of_canonical(&one).expect("serializable"),
+        AttributionDigest::of_canonical(&other).expect("serializable")
+    );
+    assert_ne!(
+        AttributionDigest::of_canonical(&one)
+            .expect("serializable")
+            .to_hex(),
+        AttributionDigest::of_canonical(&json!({"metric": "other"}))
+            .expect("serializable")
+            .to_hex()
+    );
+}
+
+// --- consumer requests -----------------------------------------------------
+
+#[test]
+fn a_debit_request_ignores_decision_shaped_fields_a_caller_echoed_back() {
+    let request: DebitRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "subjects": [{"kind": "gts.cf.core.qe.scope.v1~cf.qe.scope.tenant.v1", "id": "t-1"}],
+            "metadata": {}
+        },
+        "amount": 5,
+        "idempotency_key": "k-1",
+        "result": {"outcome": "allowed"},
+        "debit_plan": {},
+        "diagnostics": {"engine": "noise"}
+    }))
+    .expect("server-derived fields are ignored, never rejected");
+
+    assert_eq!(request.amount, 5);
+    assert_eq!(request.idempotency_key, "k-1");
+}
+
+#[test]
+fn an_attribution_inside_a_request_keeps_rejecting_its_own_unknown_fields() {
+    let error = serde_json::from_value::<DebitRequest>(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {},
+            "tenant": "typo"
+        },
+        "amount": 5,
+        "idempotency_key": "k-1"
+    }))
+    .expect_err("a misspelled attribution field is still an error");
+
+    assert!(error.to_string().contains("tenant"), "{error}");
+}
+
+#[test]
+fn a_signed_amount_reaches_the_domain_instead_of_failing_deserialization() {
+    let request: DebitRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {}
+        },
+        "amount": -3,
+        "idempotency_key": "k-1"
+    }))
+    .expect("a negative amount parses so the domain can answer INVALID_AMOUNT");
+
+    assert_eq!(request.amount, -3);
+    assert_eq!(positive_amount(request.amount), None);
+    assert_eq!(positive_amount(0), None);
+    assert_eq!(positive_amount(7), Some(7));
+    assert_eq!(positive_amount(i64::MAX), Some(9_223_372_036_854_775_807));
+}
+
+#[test]
+fn a_preview_flattens_the_decision_next_to_its_marker() {
+    let preview = DecisionPreview::of(Decision::allowed_with_plan(BTreeMap::new()));
+
+    let value = serde_json::to_value(&preview).expect("serializable");
+    let keys: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    assert_eq!(
+        keys,
+        vec!["debit_plan", "diagnostics", "preview", "result"],
+        "the decision is flattened next to the marker, adding no envelope"
+    );
+    assert_eq!(value["preview"], json!(true));
+}
+
+// --- idempotency records ---------------------------------------------------
+
+#[test]
+fn a_partial_write_completes_into_the_scope_the_transaction_derived() {
+    let partial = PartialIdempotencyWrite {
+        tenant_id: TenantId::new(Uuid::from_u128(1)),
+        key: "k-1".to_owned(),
+        payload_hash: PayloadHash::of_canonical(&json!({"amount": 5})).expect("serializable"),
+    };
+    let subject_key =
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
+
+    let write = partial.clone().complete(subject_key, OperationType::Credit);
+
+    assert_eq!(write.scope.tenant_id, TenantId::new(Uuid::from_u128(1)));
+    assert_eq!(write.scope.subject_key, subject_key);
+    assert_eq!(write.scope.operation_type, OperationType::Credit);
+    assert_eq!(write.scope.key, "k-1");
+    assert_eq!(write.payload_hash, partial.payload_hash);
+}
+
+#[test]
+fn a_versioned_blob_decodes_into_the_decision_it_recorded() {
+    let record = IdempotencyRecord {
+        scope: IdempotencyScope {
+            tenant_id: TenantId::new(Uuid::from_u128(1)),
+            subject_key: IdempotencySubjectKey::of(&[]),
+            operation_type: OperationType::Debit,
+            key: "k-1".to_owned(),
+        },
+        payload_hash: PayloadHash::of_canonical(&json!({})).expect("serializable"),
+        decision_blob: json!({
+            "__version": DECISION_BLOB_VERSION,
+            "result": {"outcome": "allowed"},
+            "debit_plan": {},
+            "diagnostics": {}
+        }),
+        engine_id: None,
+        policy_id: None,
+        policy_version: None,
+        attribution_hash: None,
+        created_at: ts(0),
+        expires_at: ts(86_400),
+    };
+
+    let decision = record.decision().expect("the blob decodes");
+
+    assert_eq!(decision.result, DecisionResult::Allowed);
+    assert_eq!(decision.denied_reason(), None);
+}
+
+#[test]
+fn a_denial_reports_its_reason_and_whether_it_records_anything() {
+    let denied = Decision {
+        result: DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: NO_APPLICABLE_QUOTA.to_owned(),
+        },
+        debit_plan: BTreeMap::new(),
+        diagnostics: BTreeMap::new(),
+    };
+
+    assert_eq!(denied.denied_reason(), Some(NO_APPLICABLE_QUOTA));
+    assert!(denied.is_no_applicable_quota());
+    assert!(!Decision::allowed_with_plan(BTreeMap::new()).is_no_applicable_quota());
+}
+
+#[test]
+fn retention_reports_the_deadline_only_when_something_was_recorded() {
+    assert_eq!(
+        Retention::Recorded {
+            expires_at: ts(86_400)
+        }
+        .expires_at(),
+        Some(ts(86_400))
+    );
+    assert_eq!(Retention::Unrecorded.expires_at(), None);
 }

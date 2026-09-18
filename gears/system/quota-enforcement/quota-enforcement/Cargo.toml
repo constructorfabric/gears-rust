@@ -79,6 +79,7 @@ opentelemetry = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+criterion.workspace = true
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # A real cluster over the standalone backend for the adapter and gear tests.
@@ -88,3 +89,7 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
+
+[[bench]]
+name = "debit"
+harness = false

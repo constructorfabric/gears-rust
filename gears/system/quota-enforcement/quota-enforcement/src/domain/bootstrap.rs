@@ -33,6 +33,7 @@ use super::ports::metrics::EngineLabel;
 use super::ports::metrics::QeMetrics;
 use super::ports::pdp::PdpProbe;
 use super::readiness::Readiness;
+use quota_enforcement_sdk::MetricId;
 
 const LOG_TARGET: &str = "qe.bootstrap";
 
@@ -53,8 +54,12 @@ pub struct Bound {
     pub catalog: Arc<ProjectionContractCatalog>,
     /// The contract registry the write path snapshots projections from.
     pub registry: Arc<dyn ContractRegistry>,
-    /// The metric identity and classification registry.
+    /// The metric identity and classification registry. The Quota and Policy
+    /// write paths read it; the evaluation path never does.
     pub metric_registry: Arc<dyn MetricRegistry>,
+    /// Classification of every admitted metric, frozen here so the evaluation
+    /// path answers from process memory.
+    pub classifications: Arc<super::catalog::MetricClassifications>,
 }
 
 /// The registry the catalogue is built from and the projections to build it
@@ -220,27 +225,23 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Catalog, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
 
-        // A persisted Quota whose metric was later removed from the registry is
-        // flagged, never deactivated: every distinct bound metric is looked up
-        // once, a registry that does not answer fails readiness.
-        let mut seen = std::collections::HashSet::new();
-        for metric in bindings.iter().map(|b| &b.metric) {
-            if !seen.insert(metric.clone()) {
-                continue;
-            }
-            let described = self
-                .metric_registry
-                .describe(metric)
+        // One pass over the registry for every metric this deployment can see:
+        // those the catalogue admits, so the evaluation path never has to call
+        // it, and those active Quotas are bound to, so a Quota stranded on a
+        // removed metric is flagged. Each distinct metric is looked up once, and
+        // a registry that does not answer fails readiness.
+        // Collected first: the lookup awaits, and holding a borrow of the
+        // catalogue across it would tie this future to their lifetimes.
+        let to_classify: Vec<MetricId> = catalog
+            .admitted_metrics()
+            .cloned()
+            .chain(bindings.iter().map(|binding| binding.metric.clone()))
+            .collect();
+        let classifications = Arc::new(
+            super::catalog::MetricClassifications::load(to_classify, self.metric_registry.as_ref())
                 .await
-                .map_err(|e| (Dependency::TypesRegistry, e))?;
-            if described.is_none() {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    metric = %metric,
-                    "active Quotas reference a metric the types registry no longer knows"
-                );
-            }
-        }
+                .map_err(|e| (Dependency::TypesRegistry, e))?,
+        );
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
         // The cluster resolver validates the operator's binding of the
@@ -273,6 +274,7 @@ impl Bootstrap {
             catalog,
             registry: self.catalog.registry.clone(),
             metric_registry: self.metric_registry.clone(),
+            classifications,
         })
     }
 

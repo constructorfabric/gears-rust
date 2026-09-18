@@ -17,6 +17,9 @@ pub struct Model {
     pub tenant_id: Uuid,
     /// Capacity currently held.
     pub in_flight: i64,
+    /// Highest notification threshold already emitted for this Quota.
+    /// Allocation Quotas have no period rows, so the marker lives here.
+    pub highest_crossed_threshold_pct: Option<i16>,
     /// Increments once per accepted mutation.
     pub record_version: i32,
     /// Last write.

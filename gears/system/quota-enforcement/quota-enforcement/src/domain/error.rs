@@ -434,6 +434,7 @@ impl DomainError {
 }
 
 /// 1:1 lift of the storage contract errors (DESIGN section 3.3).
+// @cpt-algo:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1
 impl From<StorageError> for DomainError {
     fn from(err: StorageError) -> Self {
         match err {
@@ -466,6 +467,13 @@ impl From<StorageError> for DomainError {
                 id: id.to_string(),
             },
             StorageError::QuotaDeactivated { id } => Self::QuotaDeactivated { id: id.to_string() },
+            // No committed debit answers the rollback target, whether because
+            // no record exists, because it moved no counter, or because it was
+            // authorized under another attribution. The three are one answer.
+            StorageError::OperationNotFound { key } => Self::NotFound {
+                kind: ResourceKind::Operation,
+                id: key,
+            },
             StorageError::PeriodClosed => Self::PeriodClosed,
             StorageError::MetricNotRegistered { metric } => Self::MetricNotRegistered { metric },
             StorageError::MetricNotQuotaGated { metric } => Self::MetricNotQuotaGated { metric },
@@ -481,10 +489,14 @@ impl From<StorageError> for DomainError {
                 reason: tokens::CURSOR_INVALID,
             },
             // The transaction evaluated and refused; the same closed failures the
-            // gear lifts when it evaluates outside one.
+            // gear lifts when it evaluates outside one. The transaction has
+            // already rolled back, so no counter moved and no record was
+            // written: the canonical error is the whole outcome.
+            // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
             StorageError::EvaluationFailed { engine_id, failure } => {
                 super::engines::lift_evaluation(&engine_id, failure)
             }
+            // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
             // The caller prepares the artifact and retries. Reaching this lift
             // means the bounded retry budget was spent: an internal condition.
             StorageError::PreparationRequired { policy_id, version } => Self::Internal(format!(

@@ -179,3 +179,35 @@ pub async fn read_default_idempotency_retention(
     .await?;
     Ok(row.map(|r| r.retention_seconds))
 }
+
+/// The idempotency retention that applies to `(tenant, metric)`: the most
+/// specific configured row of `(t, m)`, `(t, *)`, `(*, m)`, `(*, *)`.
+///
+/// # Errors
+///
+/// Returns the database error of the read.
+pub async fn read_idempotency_retention(
+    runner: &impl DBRunner,
+    tenant_id: &str,
+    metric: &str,
+) -> Result<Option<i64>, ScopeError> {
+    for (tenant_key, metric_key) in [
+        (tenant_id, metric),
+        (tenant_id, DEFAULT_KEY),
+        (DEFAULT_KEY, metric),
+        (DEFAULT_KEY, DEFAULT_KEY),
+    ] {
+        let row = idempotency_retention_config::Entity::find_by_id((
+            tenant_key.to_owned(),
+            metric_key.to_owned(),
+        ))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .one(runner)
+        .await?;
+        if let Some(row) = row {
+            return Ok(Some(row.retention_seconds));
+        }
+    }
+    Ok(None)
+}

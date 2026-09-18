@@ -154,7 +154,7 @@ per-sink timeout
 
 ### Threshold-Crossed Emission Semantics
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-threshold-emission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-threshold-emission`
 
 **Input**: Pre/post consumed values of a successful counter mutation, the Quota's `notification_thresholds`, the
 per-`(Quota, period)` highest-crossed marker. This feature owns the shared emission routine; the mutating call sites
@@ -163,19 +163,16 @@ that invoke it land with consumption-operations and lease-operations.
 **Output**: Zero or one `threshold-crossed` outbox event for the mutation
 
 **Steps**:
-1. [ ] - `p1` - **IF** the operation outcome is `Denied` or a canonical error - `inst-thr-denied-if`
-   1. [ ] - `p1` - Emit nothing: counters did not move, so no transition occurred - `inst-thr-none`
-2. [ ] - `p1` - **IF** the mutation settles into a closing period during the settlement window (cross-period lease
-   commit/release/rollback per ADR-0004) - `inst-thr-settle-if`
-   1. [ ] - `p1` - Emit nothing: the settlement-window emit policy is silence; closing-period state rides the
-      `period-rollover` payload alone - `inst-thr-settle-skip`
-3. [ ] - `p1` - Compute the crossed set: thresholds `t` with `pre% < t ≤ post%` that are also strictly above the
-   stored marker (the marker guards against re-emission after credits lower `consumed`) - `inst-thr-compute`
-4. [ ] - `p1` - **IF** the crossed set is empty - `inst-thr-empty-if`
-   1. [ ] - `p1` - Emit nothing - `inst-thr-skip`
-5. [ ] - `p1` - Enqueue exactly one `threshold-crossed` event carrying `crossed_thresholds` ascending and `highest_crossed_threshold`, same-tx with the mutation - `inst-thr-emit`
-6. [ ] - `p1` - DB: advance the stored marker to the highest crossed value; the marker resets at period rollover (I13, owned by consumption-operations) - `inst-thr-marker`
-7. [ ] - `p1` - **RETURN** one event per upward transition, never per threshold and never on repeat readings - `inst-thr-return`
+1. [x] - `p1` - **IF** the operation outcome is `Denied` or a canonical error - `inst-thr-denied-if`
+   1. [x] - `p1` - Emit nothing: counters did not move, so no transition occurred - `inst-thr-none`
+2. [x] - `p1` - **IF** the mutation settles into a closing period during the settlement window (cross-period lease commit/release/rollback per ADR-0004) - `inst-thr-settle-if`
+   1. [x] - `p1` - Emit nothing: the settlement-window emit policy is silence; closing-period state rides the `period-rollover` payload alone - `inst-thr-settle-skip`
+3. [x] - `p1` - Compute the crossed set: thresholds `t` with `pre% < t ≤ post%` that are also strictly above the stored marker (the marker guards against re-emission after credits lower `consumed`) - `inst-thr-compute`
+4. [x] - `p1` - **IF** the crossed set is empty - `inst-thr-empty-if`
+   1. [x] - `p1` - Emit nothing - `inst-thr-skip`
+5. [x] - `p1` - Enqueue exactly one `threshold-crossed` event carrying `crossed_thresholds` ascending and `highest_crossed_threshold`, same-tx with the mutation - `inst-thr-emit`
+6. [x] - `p1` - DB: advance the stored marker to the highest crossed value; the marker resets at period rollover (I13, owned by consumption-operations) - `inst-thr-marker`
+7. [x] - `p1` - **RETURN** one event per upward transition, never per threshold and never on repeat readings - `inst-thr-return`
 
 ## 4. States (CDSL)
 

@@ -2,8 +2,9 @@
 //! forwards, and the store ports the SQL adapters implement.
 
 pub mod bootstrap;
+pub mod consumption;
 pub mod ports;
 pub mod quotas;
 
 pub use bootstrap::StoragePlugin;
-pub use ports::{Actor, FoundationStore, QuotaStore, SeedReport, StoreError};
+pub use ports::{Actor, ConsumptionStore, FoundationStore, QuotaStore, SeedReport, StoreError};

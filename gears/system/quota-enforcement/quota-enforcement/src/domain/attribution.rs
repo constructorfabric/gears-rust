@@ -13,7 +13,8 @@
 use authz_resolver_sdk::pep::ResourceType;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    EvaluationAttribution, MetricId, ResourceProjection, SubjectRef, SubjectScope, TenantId,
+    AttributionDigest, EvaluationAttribution, MetricId, ResourceProjection, SubjectRef,
+    SubjectScope, TenantId,
 };
 use serde_json::{Map, Value, json};
 use toolkit_macros::domain_model;
@@ -63,6 +64,12 @@ pub struct AdmittedEvaluation {
     pub metric: MetricId,
     /// The Policy-visible input.
     pub input: PolicyInput,
+    /// Digest of exactly what the PDP authorized: metric, mapped subjects, and
+    /// the resource document. A debit records it so that a later rollback can
+    /// prove it reverses an operation it was itself admitted for; the
+    /// idempotency scope covers tenant and subjects, but neither the metric nor
+    /// the resource.
+    pub authorized: AttributionDigest,
 }
 
 /// The ingress step over the PEP boundary and the published catalogue.
@@ -138,6 +145,7 @@ impl<'a> Attribution<'a> {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
+        let pdp_properties = shaped.pdp_properties();
         let admitted = self
             .admission
             .admit_with_properties(
@@ -145,7 +153,7 @@ impl<'a> Attribution<'a> {
                 resource_type,
                 action,
                 AdmissionTarget::tenant(shaped.tenant_id),
-                shaped.pdp_properties(),
+                pdp_properties.clone(),
             )
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
@@ -224,6 +232,11 @@ impl<'a> Attribution<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
         // Any authorized caller reached the owner's projections through the
         // catalogue; none of them chose a projection.
+        // Digested before the shaped request is consumed, and from the very
+        // document the PDP saw, so a policy that keyed on resource metadata is
+        // honoured by the rollback check too.
+        let authorized = AttributionDigest::of_canonical(&pdp_properties)
+            .map_err(|error| DomainError::Internal(error.to_string()))?;
         Ok(AdmittedEvaluation {
             attribution: MappedAttribution {
                 tenant_id: shaped.tenant_id,
@@ -235,6 +248,7 @@ impl<'a> Attribution<'a> {
                 request: shaped.metadata,
                 resource,
             },
+            authorized,
         })
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-return

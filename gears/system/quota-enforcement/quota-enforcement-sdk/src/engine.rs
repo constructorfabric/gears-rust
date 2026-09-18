@@ -453,7 +453,10 @@ pub enum EvaluationFailure {
 /// The plugin supplies transaction-selected state, owns all database handles,
 /// and rolls back on error. The callback performs no I/O or externally visible
 /// side effects and may be retried after preparation outside the transaction.
-pub type TransactionEvaluator<'a> = dyn for<'ctx> Fn(&EvaluationContext<'ctx>) -> Result<EvaluationOutcome, EvaluationFailure>
+///
+/// It is passed as an [`Arc`](std::sync::Arc) rather than a borrow because a
+/// plugin has to move it into the future that runs inside its transaction, and
+/// such a future may not name any lifetime of its caller.
+pub type TransactionEvaluator = dyn for<'ctx> Fn(&EvaluationContext<'ctx>) -> Result<EvaluationOutcome, EvaluationFailure>
     + Send
-    + Sync
-    + 'a;
+    + Sync;

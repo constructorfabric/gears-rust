@@ -354,9 +354,9 @@ async fn a_missing_artifact_is_prepared_outside_the_transaction_and_the_mutation
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         std::num::NonZeroU32::new(2).expect("attempts"),
     );
@@ -399,9 +399,9 @@ async fn a_version_that_never_becomes_available_exhausts_the_bounded_retry_budge
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         std::num::NonZeroU32::new(2).expect("attempts"),
     );
@@ -488,9 +488,9 @@ async fn concurrent_misses_of_one_version_compile_it_once() {
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         NonZeroU32::new(2).expect("attempts"),
     );
@@ -555,9 +555,9 @@ async fn compiling_distinct_versions_stays_within_the_configured_bound() {
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         NonZeroU32::new(2).expect("attempts"),
     );
@@ -649,9 +649,9 @@ async fn a_finished_preparation_leaves_no_gate_behind() {
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         NonZeroU32::new(2).expect("attempts"),
     );
@@ -703,9 +703,9 @@ async fn an_abandoned_caller_keeps_its_permit_until_the_compilation_publishes() 
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         NonZeroU32::new(2).expect("attempts"),
     );
@@ -775,9 +775,9 @@ async fn a_waiter_cancelled_before_it_acquires_the_gate_still_releases_it() {
     ));
     let metrics = RecordingMetrics::default();
     let driver = super::PreparedEvaluation::new(
-        &engines,
-        &artifacts,
-        &metrics,
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(metrics),
         &storage,
         NonZeroU32::new(2).expect("attempts"),
     );

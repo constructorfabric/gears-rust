@@ -16,7 +16,7 @@ use super::InProcessQuotaManager;
 use crate::domain::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig};
+use crate::domain::catalog::{CatalogBuilder, CatalogConfig, MetricClassifications};
 use crate::domain::quotas::QuotaLimits;
 use crate::domain::readiness::Readiness;
 use crate::test_support::{
@@ -63,6 +63,11 @@ fn unbound_service() -> Arc<Service> {
             list_max_ids: 100,
         },
         crate::test_support::policy_limits(),
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+        },
     ))
 }
 
@@ -89,6 +94,7 @@ async fn bound_service() -> Arc<Service> {
             catalog: Arc::new(catalog),
             registry,
             metric_registry: Arc::new(FakeMetricRegistry::classified()),
+            classifications: Arc::new(MetricClassifications::default()),
         })
         .expect("bind");
     service

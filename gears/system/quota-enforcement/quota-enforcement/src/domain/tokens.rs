@@ -72,3 +72,14 @@ pub const CAP_OUT_OF_RANGE: &str = "CAP_OUT_OF_RANGE";
 pub const CURSOR_INVALID: &str = "CURSOR_INVALID";
 /// A client set `constraint_contract` on a patch; the gear alone fills it.
 pub const CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED: &str = "CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED";
+
+// --- consumption operations ---
+
+/// The requested amount is zero or negative.
+pub const INVALID_AMOUNT: &str = "INVALID_AMOUNT";
+/// A write operation carried no idempotency key.
+pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
+/// No committed operation is registered under the key the caller named.
+pub const UNKNOWN_OPERATION: &str = "UNKNOWN_OPERATION";
+/// No Quota exists under the identifier the caller named.
+pub const UNKNOWN_QUOTA: &str = "UNKNOWN_QUOTA";

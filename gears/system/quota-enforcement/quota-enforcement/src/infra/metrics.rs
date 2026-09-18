@@ -18,8 +18,8 @@ use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::LifecycleCounts;
 use crate::domain::ports::metrics::{
-    DenialReason, EngineLabel, PolicyTransition, QeMetrics, REASON_LABEL, SURFACE_LABEL,
-    ValidationReason, ValidationSurface,
+    DenialReason, EngineLabel, OperationKind, PolicyTransition, QeMetrics, REASON_LABEL,
+    RetentionTable, SURFACE_LABEL, ValidationReason, ValidationSurface,
 };
 use crate::infra::lifecycle_gauges::{
     LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
@@ -35,6 +35,24 @@ pub const CONTRACT_VALIDATION_FAILURES_TOTAL: &str = "contract_validation_failur
 /// Catalogue name of the projection/metric incompatibility counter.
 pub const ADMITTED_METRIC_VIOLATIONS_TOTAL: &str = "admitted_metric_violations_total";
 
+/// Catalogue name of the hot-path latency histogram.
+pub const EVALUATION_SECONDS: &str = "evaluation_seconds";
+
+/// Catalogue name of the replay counter.
+pub const IDEMPOTENCY_REPLAYS_TOTAL: &str = "idempotency_replays_total";
+
+/// Catalogue name of the reclamation counter.
+pub const RETENTION_RECLAIMED_TOTAL: &str = "retention_reclaimed_total";
+
+/// Catalogue name of the reclamation-failure counter.
+pub const RETENTION_SWEEP_FAILURES_TOTAL: &str = "retention_sweep_failures_total";
+
+/// Label carrying a closed operation kind.
+pub const OPERATION_LABEL: &str = "operation";
+
+/// Label carrying a closed retention table.
+pub const TABLE_LABEL: &str = "table";
+
 /// The gear's instruments.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-telemetry-conventions:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-contract-validation-telemetry:p1
@@ -47,6 +65,10 @@ pub struct QeMetricsMeter {
     denials: Counter<u64>,
     contract_validation_failures: Counter<u64>,
     admitted_metric_violations: Counter<u64>,
+    evaluation_seconds: Histogram<f64>,
+    idempotency_replays: Counter<u64>,
+    retention_reclaimed: Counter<u64>,
+    retention_failures: Counter<u64>,
     /// Held so the observable gauges stay registered for the meter's life.
     _lifecycle_gauges: [ObservableGauge<u64>; 3],
 }
@@ -70,6 +92,23 @@ impl QeMetricsMeter {
         let admitted_metric_violations = meter
             .u64_counter(config.instrument_name(ADMITTED_METRIC_VIOLATIONS_TOTAL))
             .with_description("Projection/metric incompatibilities by closed validation surface")
+            .build();
+        let evaluation_seconds = meter
+            .f64_histogram(config.instrument_name(EVALUATION_SECONDS))
+            .with_description("Hot-path evaluation latency by closed operation kind")
+            .with_unit("s")
+            .build();
+        let idempotency_replays = meter
+            .u64_counter(config.instrument_name(IDEMPOTENCY_REPLAYS_TOTAL))
+            .with_description("Replays answered from a stored record, by operation kind")
+            .build();
+        let retention_reclaimed = meter
+            .u64_counter(config.instrument_name(RETENTION_RECLAIMED_TOTAL))
+            .with_description("Rows the retention sweeper deleted, by table")
+            .build();
+        let retention_failures = meter
+            .u64_counter(config.instrument_name(RETENTION_SWEEP_FAILURES_TOTAL))
+            .with_description("Retention sweeps that failed, by table")
             .build();
         // Label-free gauges over the published sample. Each callback reads the
         // cell and observes only when a sample is published: a withdrawn
@@ -118,6 +157,10 @@ impl QeMetricsMeter {
             denials,
             contract_validation_failures,
             admitted_metric_violations,
+            evaluation_seconds,
+            idempotency_replays,
+            retention_reclaimed,
+            retention_failures,
             _lifecycle_gauges: lifecycle_gauges,
         }
     }
@@ -203,6 +246,28 @@ impl QeMetrics for QeMetricsMeter {
     fn record_admitted_metric_violation(&self, surface: ValidationSurface) {
         self.admitted_metric_violations
             .add(1, &[KeyValue::new(SURFACE_LABEL, surface.as_label())]);
+    }
+
+    fn record_evaluation(&self, operation: OperationKind, elapsed: std::time::Duration) {
+        self.evaluation_seconds.record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new(OPERATION_LABEL, operation.as_label())],
+        );
+    }
+
+    fn record_idempotency_replay(&self, operation: OperationKind) {
+        self.idempotency_replays
+            .add(1, &[KeyValue::new(OPERATION_LABEL, operation.as_label())]);
+    }
+
+    fn record_retention_reclaimed(&self, table: RetentionTable, rows: u64) {
+        self.retention_reclaimed
+            .add(rows, &[KeyValue::new(TABLE_LABEL, table.as_str())]);
+    }
+
+    fn record_retention_failure(&self, table: RetentionTable) {
+        self.retention_failures
+            .add(1, &[KeyValue::new(TABLE_LABEL, table.as_str())]);
     }
 }
 

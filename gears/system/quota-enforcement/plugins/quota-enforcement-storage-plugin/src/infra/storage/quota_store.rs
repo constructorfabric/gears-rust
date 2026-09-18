@@ -36,7 +36,7 @@ use crate::infra::storage::quota_mapping::{
 use crate::infra::storage::repo::operation_log_repo::{
     self, Entry, OP_QUOTA_CREATE, OP_QUOTA_DEACTIVATE, OP_QUOTA_UPDATE,
 };
-use crate::infra::storage::repo::{allocation_counter_repo, quota_repo};
+use crate::infra::storage::repo::{allocation_counter_repo, consumption_counter_repo, quota_repo};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -45,6 +45,7 @@ const LOG_TARGET: &str = "qe.storage";
 pub struct SqlQuotaStore {
     db: Db,
     enqueuer: Arc<dyn NotificationEnqueuer>,
+    clock: crate::infra::storage::consumption_store::Clock,
 }
 
 /// Every way a transaction body can fail, before the lift to [`StoreError`].
@@ -138,7 +139,31 @@ impl SqlQuotaStore {
     /// Bind the store to the plugin's database and its notification outbox.
     #[must_use]
     pub fn new(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>) -> Self {
-        Self { db, enqueuer }
+        Self {
+            db,
+            enqueuer,
+            clock: Arc::new(OffsetDateTime::now_utc),
+        }
+    }
+
+    /// The same store on a caller-driven clock. The cap guard compares the
+    /// current period against it, so a test that drives period boundaries has
+    /// to drive this store's clock too.
+    #[must_use]
+    pub fn with_clock(
+        db: Db,
+        enqueuer: Arc<dyn NotificationEnqueuer>,
+        clock: crate::infra::storage::consumption_store::Clock,
+    ) -> Self {
+        Self {
+            db,
+            enqueuer,
+            clock,
+        }
+    }
+
+    fn now(&self) -> OffsetDateTime {
+        (self.clock)()
     }
 
     fn conn(&self, operation: &'static str) -> Result<toolkit_db::DbConn<'_>, StoreError> {
@@ -161,26 +186,41 @@ impl SqlQuotaStore {
     }
 
     /// What the merged row would over-commit: the counters under the row lock.
-    /// Allocation Quotas read their in-flight counter; consumption Quotas read
-    /// nothing until consumption-operations (2.5) adds their period counters.
+    ///
+    /// An allocation Quota reads its in-flight counter. A consumption Quota
+    /// reads the period it is accumulating into, and only that one: a lowered
+    /// cap governs the period the Quota is in, so an elapsed row's total is
+    /// history and a Quota whose current period has not been materialized has
+    /// consumed nothing yet.
     async fn consumed_under_lock(
         runner: &impl DBRunner,
         scope: &AccessScope,
         row: &quota::Model,
+        now: OffsetDateTime,
     ) -> Result<u64, TxError> {
-        if row.quota_type != QuotaType::Allocation.as_gts_id() {
-            return Ok(0);
-        }
-        let in_flight = allocation_counter_repo::read_in_flight_for_update(runner, scope, row.id)
-            .await?
-            .unwrap_or(0);
-        u64::try_from(in_flight).map_err(|_| {
+        let negative = |column: &'static str, value: i64| -> TxError {
             MappingError::Column {
-                column: "in_flight",
-                detail: format!("negative in-flight amount {in_flight}"),
+                column,
+                detail: format!("negative counter amount {value}"),
             }
             .into()
-        })
+        };
+        if row.quota_type == QuotaType::Allocation.as_gts_id() {
+            let in_flight =
+                allocation_counter_repo::read_in_flight_for_update(runner, scope, row.id)
+                    .await?
+                    .unwrap_or(0);
+            return u64::try_from(in_flight).map_err(|_| negative("in_flight", in_flight));
+        }
+        let current = consumption_counter_repo::find_latest_for_update(runner, scope, row.id)
+            .await?
+            .filter(|period| period.period_start <= now && now < period.period_end);
+        match current {
+            None => Ok(0),
+            Some(period) => {
+                u64::try_from(period.consumed).map_err(|_| negative("consumed", period.consumed))
+            }
+        }
     }
 
     /// Invariants I6 and I14 on the merged row.
@@ -217,7 +257,7 @@ impl QuotaStore for SqlQuotaStore {
         validate_tenant_in_scope(draft.tenant_id.as_uuid(), scope)
             .map_err(|_| StoreError::SubjectOutOfScope)?;
         let id = QuotaId::generate();
-        let now = OffsetDateTime::now_utc();
+        let now = self.now();
         let row =
             quota_mapping::draft_to_row(id, &draft, now).map_err(|e| lift(OPERATION, e.into()))?;
         let events = with_quota_id(events, id);
@@ -273,16 +313,21 @@ impl QuotaStore for SqlQuotaStore {
         const OPERATION: &str = "update quota";
         let update =
             quota_mapping::patch_to_update(&patch).map_err(|e| lift(OPERATION, e.into()))?;
-        let now = OffsetDateTime::now_utc();
         let scope = scope.clone();
         let actor = actor.clone();
         let events = events.to_vec();
         let enqueuer = Arc::clone(&self.enqueuer);
+        let clock = Arc::clone(&self.clock);
         self.db
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
-                    let consumed = Self::consumed_under_lock(tx, &scope, &row).await?;
+                    // Read under the lock, never before it. An update that
+                    // waited here may have waited out a period boundary, and a
+                    // debit that crossed it first has already opened the row
+                    // this cap has to respect.
+                    let now = clock();
+                    let consumed = Self::consumed_under_lock(tx, &scope, &row, now).await?;
                     Self::check_merged(&row, &update, consumed)?;
                     let applied = quota_repo::apply_update(
                         tx,
@@ -336,7 +381,7 @@ impl QuotaStore for SqlQuotaStore {
         events: &[NotificationEvent],
     ) -> Result<DeactivateOutcome, StoreError> {
         const OPERATION: &str = "deactivate quota";
-        let now = OffsetDateTime::now_utc();
+        let now = self.now();
         let scope = scope.clone();
         let actor = actor.clone();
         let events = events.to_vec();

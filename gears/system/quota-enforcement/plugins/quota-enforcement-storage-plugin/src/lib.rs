@@ -15,9 +15,13 @@ pub mod infra;
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod test_support;
 
-pub use domain::{Actor, FoundationStore, QuotaStore, SeedReport, StoragePlugin, StoreError};
+pub use domain::{
+    Actor, ConsumptionStore, FoundationStore, QuotaStore, SeedReport, StoragePlugin, StoreError,
+};
 pub use gear::StoragePluginGear;
 pub use infra::outbox::{
     NOTIFICATION_PARTITIONS, NOTIFICATION_QUEUE, NotificationEnqueuer, QeOutbox, start_outbox,
 };
-pub use infra::storage::{OUTBOX_TABLE_PREFIX, SqlFoundationStore, SqlPolicyStore, SqlQuotaStore};
+pub use infra::storage::{
+    OUTBOX_TABLE_PREFIX, SqlConsumptionStore, SqlFoundationStore, SqlPolicyStore, SqlQuotaStore,
+};

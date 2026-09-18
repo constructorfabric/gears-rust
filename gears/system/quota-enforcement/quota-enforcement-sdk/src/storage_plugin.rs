@@ -15,11 +15,14 @@
 //!   [`StorageError::IdempotencyPayloadMismatch`].
 //! - **I3 Read-only.** `read_*`, `list_*`, and `lookup_idempotency` write no
 //!   persistent state. Lazy period-row creation in `read_quota_snapshot` is
-//!   the single exception.
+//!   the single exception: it materializes the current period row and nothing
+//!   else. Settling an elapsed period and emitting its `period-rollover` event
+//!   belong to a mutating primitive, so that a dry run enqueues no event.
 //! - **I4 Lease lazy expiry.** Every read and write path treats a lease with
 //!   `expiry_at <= now()` as released, whether or not its row still exists.
-//! - **I5 Period attribution.** Lease commit, release, and auto-release
-//!   mutate the acquisition period's counter, not the current period's.
+//! - **I5 Period attribution.** Lease commit, release, auto-release, and
+//!   rollback mutate the acquisition period's counter, not the current
+//!   period's.
 //! - **I6 Cap versus consumed.** `update_quota` with a lower cap returns
 //!   [`StorageError::CapBelowConsumed`] when any active period exceeds it,
 //!   checked in the transaction under a row lock.
@@ -39,6 +42,32 @@
 //!   [`StorageError::SchemaVersionMismatch`].
 //! - **I13 Threshold-marker reset.** A newly materialized period row has a
 //!   `NULL` highest-crossed-threshold marker.
+//! # In-transaction key derivation
+//!
+//! Credit's idempotency scope is completed inside the transaction: its subject
+//! key fingerprints the locked Quota row's own subject pair, which the caller
+//! neither knows nor may supply (PRD section 5.8). Every other primitive
+//! receives a complete scope.
+//!
+//! # Denials and records
+//!
+//! Every denial except [`NO_APPLICABLE_QUOTA`] persists its idempotency record
+//! with an empty plan and writes no operation-log row, so a retry replays the
+//! denial. A [`NO_APPLICABLE_QUOTA`] denial persists nothing at all. Caller
+//! events are enqueued only when a counter actually moved.
+//!
+//! # Racing writers under one scope
+//!
+//! Two concurrent operations can share an idempotency scope and still lock
+//! disjoint rows, so the row locks alone do not serialize them. The
+//! idempotency record's primary key is the arbiter: an insert that loses the
+//! race rolls its whole transaction back, counters, period rows, and events
+//! included, and then resolves by re-reading the record under the same scope.
+//! An equal payload hash becomes a replay; a different one becomes
+//! [`StorageError::IdempotencyPayloadMismatch`]. A partial write is never
+//! observable, and each attempt is one complete transaction, so a caller that
+//! cancels between attempts leaves nothing half-applied.
+//!
 //! - **I14 Thresholds need a bounded cap.** `update_quota` returns
 //!   [`StorageError::ThresholdsRequireBoundedCap`] when the merged row would
 //!   carry notification thresholds with an unbounded cap, checked in the
@@ -62,6 +91,7 @@
 //! and binds it through `SecureConn`. No scoped operation runs without it.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -70,12 +100,13 @@ use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::engine::{EvaluationFailure, EvaluationLimits, TransactionEvaluator};
 use crate::models::{
-    ActiveQuotaCounts, ApplicableQuotas, BatchDebitItem, BootstrapBundle, ConfigDefaults,
-    DeactivateOutcome, EvaluatedDebit, EvaluatedLease, ExpiredLease, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, LeaseToken, MutationResult, NotificationEvent, PageRequest,
-    PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
+    BootstrapBundle, ConfigDefaults, DeactivateOutcome, EvaluatedDebit, EvaluatedLease,
+    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken,
+    MutationResult, NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite,
+    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
     ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
-    TransitionOutcome,
+    RollbackTarget, TransitionOutcome,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -104,7 +135,14 @@ impl BootstrapBundle {
 /// `SchemaVersionMismatch` never surfaces at runtime; `bootstrap()` fails fast.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StorageError {
-    // --- lease state ---
+    // --- operations ---
+    /// No committed debit answers the rollback target: absent record, a record
+    /// that moved no counter, or one authorized under another attribution.
+    #[error("no committed debit is registered under the requested key")]
+    OperationNotFound {
+        /// The original idempotency key the caller named.
+        key: String,
+    },
     /// Commit or release against a lease that is not active.
     #[error("lease {token} is not active")]
     LeaseNotActive {
@@ -302,9 +340,14 @@ pub struct EvaluatedMutation<'a> {
     /// Idempotency key and payload digest. The record written under it carries
     /// the decision this transaction produced.
     pub idempotency: &'a IdempotencyWrite,
+    /// Digest of the authorized, catalogue-mapped attribution. Recorded with
+    /// the outcome so that a rollback can prove it reverses an operation it was
+    /// itself authorized for: the idempotency scope covers tenant and subjects,
+    /// but not the metric or the resource.
+    pub authorized: AttributionDigest,
     /// Synchronous, side-effect-free evaluation callback. It performs no I/O,
     /// holds no database handle, and may be retried after preparation.
-    pub evaluate: &'a TransactionEvaluator<'a>,
+    pub evaluate: Arc<TransactionEvaluator>,
 }
 
 /// An atomic batch under one envelope key. Every item is evaluated and applied
@@ -320,7 +363,7 @@ pub struct EvaluatedBatch<'a> {
     /// policy that item's evaluation selects.
     pub limits: EvaluationLimits,
     /// Synchronous, side-effect-free evaluation callback.
-    pub evaluate: &'a TransactionEvaluator<'a>,
+    pub evaluate: Arc<TransactionEvaluator>,
 }
 
 /// Pluggable persistence for Quotas, counters, leases, policies, idempotency
@@ -479,6 +522,19 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///   different payload (I2).
     /// - [`StorageError::QuotaDeactivated`] when a planned Quota is inactive.
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    ///
+    /// # Replay and retention
+    ///
+    /// A replay reports `NoOp` carrying the stored [`Decision`], the record's
+    /// [`Retention::Recorded`] deadline, and an **empty**
+    /// [`MutationResult`]: nothing moved and no event was enqueued, and the
+    /// recorded decision is the whole of what a replay promises (I2).
+    ///
+    /// A fresh outcome reports `Applied`. Its retention is `Recorded` except
+    /// for a denial with reason [`NO_APPLICABLE_QUOTA`], which persists no
+    /// record and no audit row and is therefore
+    /// [`Retention::Unrecorded`]: provisioning a Quota must change the answer,
+    /// so that denial may not be replayed or cached.
     async fn apply_debit_plan(
         &self,
         ctx: &SecurityContext,
@@ -502,26 +558,63 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError>;
 
-    /// Credit one named Quota.
+    /// Credit one named Quota, returning consumption to it.
+    ///
+    /// The idempotency input is partial because the scope is not knowable
+    /// before the transaction: the subject key fingerprints the Quota's own
+    /// `(projection_type, subject_id)` pair, which is only readable under the
+    /// row lock, and a caller may not supply one. The order inside the
+    /// transaction is therefore fixed: lock the row, derive the scope, check
+    /// for a replay, and only then apply the guards that reject a *fresh*
+    /// credit. A credit that succeeded before the Quota was deactivated
+    /// replays its stored outcome instead of failing.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::QuotaNotFound`] when no such Quota exists, and
+    ///   [`StorageError::SubjectOutOfScope`] when it belongs to another tenant.
+    /// - [`StorageError::QuotaDeactivated`] for a fresh credit to an inactive
+    ///   Quota, and [`StorageError::PeriodClosed`] when the Quota's latest
+    ///   period has ended. Neither is raised for a replay.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay with a
+    ///   different payload (I2).
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn apply_credit(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
-        idempotency: &IdempotencyWrite,
+        idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError>;
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Reverse the debit registered under `original`.
+    /// Reverse the committed debit `target` names.
+    ///
+    /// Each reversal is applied against the acquisition period of the original
+    /// mutation, never the current one (I5), and the original is reversed at
+    /// most once however many rollback keys target it.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::OperationNotFound`] when no committed debit answers
+    ///   `target`: no record under the scope, a record that committed no
+    ///   counter change (a denial, or a credit), or one whose stored
+    ///   authorized attribution differs from `target.authorized`. The three
+    ///   are deliberately indistinguishable to the caller.
+    /// - [`StorageError::PeriodClosed`] when the attribution period was
+    ///   already settled, checked before any write.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay of this
+    ///   rollback with a different payload (I2).
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn apply_rollback(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
-        original: &IdempotencyScope,
+        target: &RollbackTarget,
         idempotency: &IdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError>;
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
     // --- leases ---
 

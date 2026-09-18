@@ -32,6 +32,10 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 time = { workspace = true }
 
+# Canonical digests: the idempotency subject key and the request payload hash
+# (PRD section 5.8) are SHA-256 over a byte form this crate defines.
+sha2 = { workspace = true }
+
 # GTS types. `inventory` carries the QE-owned GTS definitions into the
 # process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
 gts = { workspace = true }

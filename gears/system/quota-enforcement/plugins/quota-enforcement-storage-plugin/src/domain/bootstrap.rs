@@ -17,7 +17,9 @@ use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, PolicyScope, Storag
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
-use super::ports::{FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError};
+use super::ports::{
+    ConsumptionStore, FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -28,6 +30,7 @@ pub struct StoragePlugin {
     store: Arc<dyn FoundationStore>,
     pub(super) quotas: Arc<dyn QuotaStore>,
     pub(super) policies: Arc<dyn PolicyStore>,
+    pub(super) consumption: Arc<dyn ConsumptionStore>,
 }
 
 impl StoragePlugin {
@@ -37,11 +40,13 @@ impl StoragePlugin {
         store: Arc<dyn FoundationStore>,
         quotas: Arc<dyn QuotaStore>,
         policies: Arc<dyn PolicyStore>,
+        consumption: Arc<dyn ConsumptionStore>,
     ) -> Self {
         Self {
             store,
             quotas,
             policies,
+            consumption,
         }
     }
 

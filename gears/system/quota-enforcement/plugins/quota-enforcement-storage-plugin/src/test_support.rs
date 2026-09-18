@@ -433,3 +433,91 @@ pub fn global_policy_draft() -> PolicyDraft {
         schema_snapshot: PolicySchemaSnapshot::default(),
     }
 }
+
+/// A consumption store that refuses every call.
+///
+/// The bootstrap and Quota-lifecycle tests never reach a consumption
+/// primitive; they need a fourth store only because the plugin binds one.
+#[derive(Default)]
+pub struct FakeConsumptionStore;
+
+#[async_trait]
+impl crate::domain::ConsumptionStore for FakeConsumptionStore {
+    async fn apply_debit_plan(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _mutation: &quota_enforcement_sdk::EvaluatedMutation<'_>,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::EvaluatedDebit>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
+    async fn apply_credit(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _quota_id: quota_enforcement_sdk::QuotaId,
+        _amount: u64,
+        _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::AppliedMutation>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
+    async fn apply_rollback(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _target: &quota_enforcement_sdk::RollbackTarget,
+        _idempotency: &quota_enforcement_sdk::IdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::AppliedMutation>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
+    async fn read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _applicable: &quota_enforcement_sdk::ApplicableQuotas,
+    ) -> Result<Vec<quota_enforcement_sdk::QuotaSnapshot>, StorageError> {
+        Err(unreached())
+    }
+
+    async fn lookup_idempotency(
+        &self,
+        _scope_of: &quota_enforcement_sdk::IdempotencyScope,
+    ) -> Result<Option<quota_enforcement_sdk::IdempotencyRecord>, StorageError> {
+        Err(unreached())
+    }
+
+    async fn reclaim_expired_idempotency(
+        &self,
+        _batch_size: u32,
+        _before: time::OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        Err(unreached())
+    }
+
+    async fn reclaim_operation_log(
+        &self,
+        _batch_size: u32,
+        _before: time::OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        Err(unreached())
+    }
+}
+
+fn unreached() -> StorageError {
+    StorageError::Internal("the consumption store is not part of this test".to_owned())
+}

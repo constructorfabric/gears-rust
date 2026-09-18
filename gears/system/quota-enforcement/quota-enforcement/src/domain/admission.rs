@@ -100,6 +100,12 @@ impl Admission {
         self.metrics.as_ref()
     }
 
+    /// The same port as a handle, for a component that outlives the borrow.
+    #[must_use]
+    pub fn metrics_handle(&self) -> Arc<dyn QeMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
     /// Admit a platform policy operation through the PDP without row properties.
     ///
     /// # Errors

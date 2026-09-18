@@ -33,6 +33,10 @@ pub struct QuotaEnforcementConfig {
     pub policies: PoliciesSection,
     /// Timing of the lifecycle-gauge refresh.
     pub gauges: GaugesSection,
+    /// Bounds of the consumption hot path.
+    pub operations: OperationsSection,
+    /// Timing of the retention sweeper.
+    pub retention: RetentionSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -46,6 +50,8 @@ impl Default for QuotaEnforcementConfig {
             quotas: QuotasSection::default(),
             policies: PoliciesSection::default(),
             gauges: GaugesSection::default(),
+            operations: OperationsSection::default(),
+            retention: RetentionSection::default(),
         }
     }
 }
@@ -71,7 +77,9 @@ impl QuotaEnforcementConfig {
         self.catalog.validate()?;
         self.quotas.validate()?;
         self.policies.validate()?;
-        self.gauges.validate()
+        self.gauges.validate()?;
+        self.operations.validate()?;
+        self.retention.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -562,3 +570,114 @@ impl GaugesSection {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "config_tests.rs"]
 mod config_tests;
+
+/// Bounds of the consumption hot path (`[quota-enforcement.operations]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OperationsSection {
+    /// Replay records the in-process cache holds before evicting the least
+    /// recently used one.
+    pub idempotency_cache_entries: usize,
+    /// How long a cached record may answer a replay, in milliseconds. An entry
+    /// never outlives the record's own retention whatever this says.
+    pub idempotency_cache_ttl_ms: u64,
+}
+
+impl Default for OperationsSection {
+    fn default() -> Self {
+        Self {
+            idempotency_cache_entries: 4096,
+            // The P1 reference default of the idempotency-replay algorithm.
+            idempotency_cache_ttl_ms: 5_000,
+        }
+    }
+}
+
+impl OperationsSection {
+    /// Reject bounds the hot path cannot serve with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.idempotency_cache_entries == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_entries must be at least 1"
+            );
+        }
+        if self.idempotency_cache_ttl_ms == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// How long a cached record may answer.
+    #[must_use]
+    pub const fn idempotency_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.idempotency_cache_ttl_ms)
+    }
+}
+
+/// Timing of the retention sweeper (`[quota-enforcement.retention]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionSection {
+    /// Seconds between sweeps.
+    pub interval_secs: u64,
+    /// Rows one delete statement reclaims.
+    pub batch_size: u32,
+    /// Days operation-log rows are kept. Idempotency retention is
+    /// per-`(tenant, metric)` configuration the storage plugin reads itself.
+    pub operation_log_retention_days: u32,
+}
+
+impl Default for RetentionSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: 300,
+            batch_size: 1_000,
+            operation_log_retention_days: 30,
+        }
+    }
+}
+
+impl RetentionSection {
+    /// Reject timings the sweeper cannot run with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_secs == 0 {
+            anyhow::bail!("[quota-enforcement.retention].interval_secs must be at least 1");
+        }
+        if self.batch_size == 0 {
+            anyhow::bail!("[quota-enforcement.retention].batch_size must be at least 1");
+        }
+        if self.operation_log_retention_days == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.retention].operation_log_retention_days must be at least 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// The domain view of the sweeper timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound is zero, which [`Self::validate`] has
+    /// already rejected at startup.
+    pub fn to_timing(&self) -> anyhow::Result<crate::domain::operations::RetentionTiming> {
+        Ok(crate::domain::operations::RetentionTiming {
+            interval: Duration::from_secs(self.interval_secs),
+            batch_size: std::num::NonZeroU32::new(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("retention batch size must be at least 1"))?,
+            operation_log_retention: time::Duration::days(i64::from(
+                self.operation_log_retention_days,
+            )),
+        })
+    }
+}
