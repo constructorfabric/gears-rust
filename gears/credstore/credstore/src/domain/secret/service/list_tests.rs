@@ -643,3 +643,67 @@ async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
         "list denied must drop the type entirely when a record field rides with value"
     );
 }
+
+#[test]
+fn odata_errors_map_onto_the_domain_rejection_the_rest_boundary_renders() {
+    use toolkit_odata::Error as ODataError;
+
+    use super::map_odata_err;
+
+    let invalid_request = |err: &ODataError| match map_odata_err(err) {
+        DomainError::InvalidRequest { field, reason, .. } => (field, reason),
+        other => panic!("expected InvalidRequest for {err:?}, got {other:?}"),
+    };
+
+    assert_eq!(
+        invalid_request(&ODataError::OrderMismatch),
+        ("$orderby", "ORDER_MISMATCH")
+    );
+    assert_eq!(
+        invalid_request(&ODataError::FilterMismatch),
+        ("$filter", "FILTER_MISMATCH")
+    );
+    for cursor_err in [
+        ODataError::InvalidCursor,
+        ODataError::CursorInvalidBase64,
+        ODataError::CursorInvalidJson,
+        ODataError::CursorInvalidVersion,
+        ODataError::CursorInvalidKeys,
+        ODataError::CursorInvalidFields,
+        ODataError::CursorInvalidDirection,
+    ] {
+        assert_eq!(
+            invalid_request(&cursor_err),
+            ("cursor", "INVALID_CURSOR"),
+            "{cursor_err:?}"
+        );
+    }
+    assert_eq!(
+        invalid_request(&ODataError::InvalidOrderByField("updated_at".to_owned())),
+        ("$orderby", "INVALID_ORDERBY_FIELD")
+    );
+    assert_eq!(
+        invalid_request(&ODataError::InvalidFilter("bad".to_owned())),
+        ("$filter", "INVALID_FILTER")
+    );
+    assert_eq!(
+        invalid_request(&ODataError::InvalidLimit),
+        ("limit", "INVALID_LIMIT")
+    );
+    assert_eq!(
+        invalid_request(&ODataError::OrderWithCursor),
+        ("$orderby", "ORDER_WITH_CURSOR")
+    );
+
+    // The two the toolkit raises for its own failures, not the caller's:
+    // internal, not a 400.
+    for internal in [
+        ODataError::Db("connection reset".to_owned()),
+        ODataError::ParsingUnavailable("parser feature disabled"),
+    ] {
+        assert!(
+            matches!(map_odata_err(&internal), DomainError::Internal { .. }),
+            "{internal:?} must map to Internal"
+        );
+    }
+}

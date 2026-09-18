@@ -130,11 +130,122 @@ pub(super) fn map_scope_err(err: ScopeError) -> DomainError {
 #[cfg(test)]
 mod tests {
     use sea_orm::DbErr;
+    use time::OffsetDateTime;
     use toolkit_db::secure::ScopeError;
     use uuid::Uuid;
 
-    use super::map_scope_err;
+    use super::{
+        entity_to_model, gc_entity_to_model, map_scope_err, sharing_from_i16, sharing_to_i16,
+    };
     use crate::domain::error::DomainError;
+    use crate::domain::secret::model::{Fallback, GcReason, SecretStatus};
+    use crate::infra::storage::entity;
+    use credstore_sdk::SharingMode;
+
+    /// An `Active`, `Tenant`-shared row with every column in domain.
+    fn row() -> entity::secrets::Model {
+        entity::secrets::Model {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            reference: "openai-key".to_owned(),
+            sharing: 2,
+            owner_id: Uuid::nil(),
+            status: 2,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            version: 1,
+            secret_type_uuid: Uuid::new_v4(),
+            expires_at: None,
+            value_id: Some(Uuid::new_v4()),
+            value_fp: Some(vec![1, 2, 3]),
+            fp_key_id: Some(1),
+            fallback: 1,
+        }
+    }
+
+    fn gc_row() -> entity::value_gc::Model {
+        entity::value_gc::Model {
+            value_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            reason: 1,
+            enqueued_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn sharing_round_trips_through_its_smallint_encoding() {
+        for mode in [
+            SharingMode::Private,
+            SharingMode::Tenant,
+            SharingMode::Shared,
+        ] {
+            assert_eq!(sharing_from_i16(sharing_to_i16(mode)), Some(mode));
+        }
+        // Codes outside the stored domain have no mode.
+        assert_eq!(sharing_from_i16(0), None);
+        assert_eq!(sharing_from_i16(4), None);
+    }
+
+    #[test]
+    fn entity_to_model_maps_every_column_onto_the_domain_row() {
+        let m = row();
+        let (id, tenant_id, value_id) = (m.id, m.tenant_id, m.value_id);
+        let mapped = entity_to_model(m).expect("in-domain row maps");
+        assert_eq!(mapped.id, id);
+        assert_eq!(mapped.tenant_id.0, tenant_id);
+        assert_eq!(mapped.reference, "openai-key");
+        assert_eq!(mapped.sharing, SharingMode::Tenant);
+        assert_eq!(mapped.status, SecretStatus::Active);
+        assert_eq!(mapped.fallback, Fallback::Inherit);
+        assert_eq!(mapped.value_id.map(|v| v.0), value_id);
+    }
+
+    #[test]
+    fn entity_to_model_reports_each_out_of_domain_column_as_internal() {
+        for (column, m) in [
+            (
+                "sharing",
+                entity::secrets::Model {
+                    sharing: 9,
+                    ..row()
+                },
+            ),
+            ("status", entity::secrets::Model { status: 9, ..row() }),
+            (
+                "fallback",
+                entity::secrets::Model {
+                    fallback: 9,
+                    ..row()
+                },
+            ),
+        ] {
+            let err = entity_to_model(m).expect_err("out-of-domain column must be rejected");
+            let DomainError::Internal { diagnostic, .. } = err else {
+                panic!("{column}: expected Internal");
+            };
+            assert!(
+                diagnostic.contains(column),
+                "{column}: diagnostic must name the column, got {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_entity_to_model_maps_the_queue_row_and_rejects_an_unknown_reason() {
+        let m = gc_row();
+        let (value_id, tenant_id) = (m.value_id, m.tenant_id);
+        let mapped = gc_entity_to_model(&m).expect("in-domain row maps");
+        assert_eq!(mapped.value_id.0, value_id);
+        assert_eq!(mapped.tenant_id.0, tenant_id);
+        assert_eq!(mapped.reason, GcReason::Pending);
+
+        let err = gc_entity_to_model(&entity::value_gc::Model {
+            reason: 9,
+            ..gc_row()
+        })
+        .expect_err("out-of-domain reason must be rejected");
+        assert!(matches!(err, DomainError::Internal { .. }));
+    }
 
     #[test]
     fn maps_each_scope_error_variant() {
