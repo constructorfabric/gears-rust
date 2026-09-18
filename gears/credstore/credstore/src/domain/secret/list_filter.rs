@@ -28,17 +28,17 @@ use crate::domain::secret::model::Fallback;
 /// Stable machine-readable reason codes this module's validation failures
 /// carry. `INVALID_FILTER`/`INVALID_ORDERBY_FIELD`/`INVALID_SELECT` mirror
 /// the platform's standard `OData` reason codes (`guidelines/DNA/REST/
-/// PAGINATION.md`, DESIGN §10); `VALUE_MODE_NO_PAGINATION`/
-/// `VALUE_MODE_NO_ORDER`/`VALUE_MODE_SELECTOR`/`TOO_MANY_MATCHES` are the
-/// value-mode-specific codes ADR-0004/0005 describe only in prose ("rejected
+/// PAGINATION.md`, DESIGN §10); `SECRET_MODE_NO_PAGINATION`/
+/// `SECRET_MODE_NO_ORDER`/`SECRET_MODE_SELECTOR`/`TOO_MANY_MATCHES` are the
+/// secret-mode-specific codes ADR-0004/0005 describe only in prose ("rejected
 /// (400)") without naming — named here for Phase 3.
 pub(crate) mod reasons {
     pub const INVALID_FILTER: &str = "INVALID_FILTER";
     pub const INVALID_ORDERBY_FIELD: &str = "INVALID_ORDERBY_FIELD";
     pub const INVALID_SELECT: &str = "INVALID_SELECT";
-    pub const VALUE_MODE_NO_PAGINATION: &str = "VALUE_MODE_NO_PAGINATION";
-    pub const VALUE_MODE_NO_ORDER: &str = "VALUE_MODE_NO_ORDER";
-    pub const VALUE_MODE_SELECTOR: &str = "VALUE_MODE_SELECTOR";
+    pub const SECRET_MODE_NO_PAGINATION: &str = "SECRET_MODE_NO_PAGINATION";
+    pub const SECRET_MODE_NO_ORDER: &str = "SECRET_MODE_NO_ORDER";
+    pub const SECRET_MODE_SELECTOR: &str = "SECRET_MODE_SELECTOR";
     pub const TOO_MANY_MATCHES: &str = "TOO_MANY_MATCHES";
 }
 
@@ -102,7 +102,7 @@ impl FilterField for CredentialFilterField {
 }
 
 /// `$select` allowlist (ADR-0004): the `Credential` field names plus
-/// `value`. Selecting `value` switches the request to value mode.
+/// `secret`. Selecting `secret` switches the request to secret mode.
 const SELECT_ALLOWLIST: &[&str] = &[
     "reference",
     "type",
@@ -114,7 +114,7 @@ const SELECT_ALLOWLIST: &[&str] = &[
     "version",
     "updated_at",
     "owner_id",
-    "value",
+    "secret",
 ];
 
 /// The administrative record fields (ADR-0004 Amendment A): naming any of
@@ -149,13 +149,13 @@ pub(crate) fn validate_select(fields: &[String]) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// `true` iff `fields` names `value` — the value-mode switch (ADR-0004).
-pub(crate) fn is_value_mode(fields: Option<&[String]>) -> bool {
-    fields.is_some_and(|fields| fields.iter().any(|f| f == "value"))
+/// `true` iff `fields` names `secret` — the secret-mode switch (ADR-0004).
+pub(crate) fn is_secret_mode(fields: Option<&[String]>) -> bool {
+    fields.is_some_and(|fields| fields.iter().any(|f| f == "secret"))
 }
 
 /// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's and
-/// the collection value mode's shared trigger for requiring `read`/`list` on
+/// the collection secret mode's shared trigger for requiring `read`/`list` on
 /// top of (or instead of) `read_secret` (ADR-0004 Amendment A).
 pub(crate) fn admin_field_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| ADMIN_FIELDS.contains(&f.as_str())))
@@ -266,15 +266,15 @@ impl ParsedFilter {
         true
     }
 
-    /// Value mode's selector shape (ADR-0005 "Value mode has no cursor at
+    /// Secret mode's selector shape (ADR-0005 "Secret mode has no cursor at
     /// all"; ADR-0004 "Bulk secret read"): the filter must be **exactly**
     /// one of `reference` (`eq`/`in`) or `type` (`eq`/`in`) — nothing else,
     /// and not both together.
-    pub(crate) fn require_value_mode_selector(&self) -> Result<(), DomainError> {
+    pub(crate) fn require_secret_mode_selector(&self) -> Result<(), DomainError> {
         let selector_error = || DomainError::InvalidRequest {
             field: "$filter",
-            reason: reasons::VALUE_MODE_SELECTOR,
-            detail: "value mode requires $filter to be exactly `reference eq/in (...)` or \
+            reason: reasons::SECRET_MODE_SELECTOR,
+            detail: "secret mode requires $filter to be exactly `reference eq/in (...)` or \
                      `type eq/in (...)`"
                 .to_owned(),
         };

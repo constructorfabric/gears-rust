@@ -180,7 +180,7 @@ def _provision_credstore_secrets(_check_oagw_reachable):
                 json={
                     "type": _GENERIC_TYPE,
                     "sharing": "tenant",
-                    "value": _CREDSTORE_SECRETS[ref],
+                    "secret": _CREDSTORE_SECRETS[ref],
                 },
                 timeout=5.0,
             )
@@ -189,7 +189,7 @@ def _provision_credstore_secrets(_check_oagw_reachable):
                 resp = httpx.put(
                     f"{base_url}/credstore/v1/credentials/{ref}",
                     headers={**headers, "If-Match": "*"},
-                    json={"sharing": "tenant", "value": _CREDSTORE_SECRETS[ref]},
+                    json={"sharing": "tenant", "secret": _CREDSTORE_SECRETS[ref]},
                     timeout=5.0,
                 )
         except httpx.RequestError:

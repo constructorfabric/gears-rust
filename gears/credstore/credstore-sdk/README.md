@@ -4,49 +4,63 @@ SDK crate for the `CredStore` gear, providing public API contracts for credentia
 
 ## Overview
 
-Transport-agnostic interface for the `CredStore` gear:
+This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 - **`CredStoreClientV1`** — consumer-facing trait (`get`/`put`/`create`/`delete`);
   `get` returns the value plus metadata (`owner_tenant_id`, `sharing`,
   `is_inherited`, `id`, `version`, `secret_type`, `expires_at`)
 - **`CredStorePluginClientV1`** — backend trait: a pure per-tenant value store
-  (`get`/`put`/`delete` keyed by `tenant_id` + `key` + optional `owner_id`); no
-  sharing/hierarchy/policy — that stays in the gear. Planned (ADR-0006): the
-  key becomes `tenant_id`/`value_id` only, since backend entries become
-  immutable and version-addressed; the plugin then knows nothing about
+  (`get`/`put`/`delete` keyed by `tenant_id` + `key` + optional `owner_id`); it
+  holds no sharing/hierarchy/policy — that lives in the gear. Planned,
+  ADR-0006, not yet implemented: the key becomes `tenant_id`/`value_id` — no
+  `key`, no `owner_id` — since backend entries become immutable, addressed
+  only by version, and unique store-wide; the plugin learns nothing about
   references, owners, or sharing
-- **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — domain models
-- **`CredStoreError`** — error types for all operations
+- **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — Domain models
+- **`CredStoreError`** — Error types for all operations
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
-- **Planned (ADR-0004)**: `CredStoreClientV1` reshaped around one item shared
-  by the record and its optional secret — `get`, `get_secret`, `put`, `patch`,
-  `list`, `delete`:
-  - `get` — metadata only (`Credential`, `read`), never the secret; always
-    carries the validator a secret-blind writer needs
-  - `get_secret` — the secret plus its usage fields (`Secret`: reference,
-    type, expiry, secret; `read_secret`). Over REST both live at one address,
-    `/credentials/{ref}`, selected by `$select=secret`; the trait keeps two
-    typed methods since a caller already knows which half it needs
-  - `put` — guarded create-or-replace of the record with a tri-state `secret`
-    (ADR-0007): a string writes it, an explicit `null` creates or leaves the
-    record without one; this is the only way to create a credential
-  - `patch` — guarded partial update, RFC 7396 merge-patch semantics
-    (ADR-0007): present fields replace, absent fields untouched; covers
-    metadata edits, secret rotation and secret removal (`null`); never
-    creates
-  - `list` — OData query (`filter`, `select`, `orderby`, `limit`, `cursor`)
-    over records; `secret` appears only when selected. Selecting it switches
-    to **secret mode** (ADR-0005): `limit`/`cursor` rejected, results capped
-    and non-paginated, filterable only by `reference in (...)` or
-    `type eq`/`in`. Otherwise `list` is the plain paginated listing and never
-    carries secrets
-  - `delete` — guarded delete of the record and its secret
+- Planned (ADR-0004), not yet implemented — `CredStoreClientV1` reshaped
+  around one item shape shared by the record and its optional secret:
+  `get`, `get_secret`, `put`, `patch`, `list`, `delete`.
+  - `get` — point read of one credential's metadata (`Credential`, never
+    the secret; `read`); always the source of the validator a secret-blind
+    writer needs
+  - `get_secret` — the secret with its usage envelope (`Secret`: reference,
+    type, expiry, secret; `read_secret`). Over REST these are one item shape
+    at one address, `/credentials/{ref}`, where `$select=secret` decides
+    whether the secret is included; the in-process trait keeps two typed
+    methods instead of a field selector because a caller inside the platform
+    already knows which half it needs
+  - `put` — precondition-guarded create-or-replace of the record together
+    with a **tri-state** `secret`, in one call (ADR-0007): a string writes it, an
+    explicit `null` creates or leaves the record without one; the
+    create-only precondition is how a credential is created, with or
+    without a secret
+  - `patch` — precondition-guarded partial update following RFC 7396
+    merge-patch semantics (ADR-0007): present fields replace, absent fields are
+    untouched; metadata edit, secret rotate, or secret remove (a `null` secret)
+    all go through it; never creates
+  - `list` — takes an `OData` query (`filter`, `select`, `orderby`, `limit`,
+    `cursor`) over credential records; an item's `secret` field is present
+    only when `select` names it. Selecting `secret` switches the call into
+    **secret mode** (ADR-0005 "Secret mode"), matching the REST contract one-for-one: `limit` and
+    `cursor` are rejected, results are capped and non-paginated, and only
+    `reference in (...)` or `type eq`/`in` may filter — no prefix or ordered
+    operator over `reference` — see ADR-0005 for why that one is withheld
+    rather than pending. Without `secret` selected, `list` behaves exactly as
+    the plain listing: paginated, never carrying secrets regardless of the
+    caller's grants
+  - `delete` — precondition-guarded delete of the record and its secret
 
-  `get`'s return type changes: `Credential.secret` becomes optional, so code
-  that read the old response as a bare value fails to compile instead of
-  silently reading metadata; secret readers use `get_secret` or select
-  `secret` on `get`. `create` is removed (ADR-0007) — `put` under the
-  create-only precondition replaces it.
+  **`get` changes meaning**: `Credential.secret` is optional and present only
+  when selected, so an existing caller that read the old combined response's
+  value as a bare value fails to compile against the changed type rather
+  than silently reading metadata; secret readers use `get_secret`, or select
+  `secret` on `get` directly. **`create` is removed** (ADR-0007): `put` under the
+  create-only precondition is create, and its `secret` may be a string or an
+  explicit `null` — creating with `put` (record and, optionally, a secret
+  together, guarded by the create-only precondition), then editing or
+  rotating with `patch`; a `patch` `secret` of `null` removes the secret.
 
 ## Usage
 
@@ -62,9 +76,9 @@ async fn secret_length(
     security: &SecurityContext,
 ) -> Result<Option<usize>, CredStoreError> {
     let key = SecretRef::new("my-api-key")?;
-    let response = credstore.get(security, &key).await?;
+    let response = credstore.get_secret(security, &key).await?;
 
-    Ok(response.map(|secret| secret.value.as_bytes().len()))
+    Ok(response.map(|secret| secret.secret.as_bytes().len()))
 }
 ```
 

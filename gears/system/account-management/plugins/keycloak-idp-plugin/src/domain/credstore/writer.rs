@@ -63,7 +63,7 @@ impl CredStoreWriter {
             sharing,
             fallback: Fallback::Inherit,
             expires_at: None,
-            value: Some(value),
+            secret: Some(value),
         };
         match self
             .inner
@@ -78,7 +78,7 @@ impl CredStoreWriter {
                     sharing,
                     fallback: Fallback::Inherit,
                     expires_at: None,
-                    value: Some(SecretValue::new(bytes)),
+                    secret: Some(SecretValue::new(bytes)),
                 };
                 self.inner
                     .put(&self.system_ctx, key, replace, PutPrecondition::Exists)

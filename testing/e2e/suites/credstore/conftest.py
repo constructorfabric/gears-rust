@@ -131,7 +131,7 @@ def create_credential(credentials_url, cleanup):
         expires_at: str | None = None,
         fallback: str | None = None,
     ) -> httpx.Response:
-        body: dict = {"sharing": sharing, "value": value}
+        body: dict = {"sharing": sharing, "secret": value}
         if type_id is not None:
             body["type"] = type_id
         if expires_at is not None:

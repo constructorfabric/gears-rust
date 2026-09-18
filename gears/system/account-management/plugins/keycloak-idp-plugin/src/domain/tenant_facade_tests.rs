@@ -109,7 +109,7 @@ impl ConfigurableStubOpenBao {
                 reference: SecretRef::new(key).expect("valid SecretRef"),
                 secret_type: String::new(),
                 expires_at: None,
-                value: SecretValue::from(value),
+                secret: SecretValue::from(value),
                 validator: Validator {
                     id: uuid::Uuid::nil(),
                     version: 1,
@@ -147,7 +147,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         self.put_calls.lock().push((
             key.as_ref().to_owned(),
             write
-                .value
+                .secret
                 .as_ref()
                 .map(|v| v.as_bytes().to_vec())
                 .unwrap_or_default(),

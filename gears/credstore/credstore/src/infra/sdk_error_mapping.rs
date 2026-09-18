@@ -186,7 +186,7 @@ mod tests {
     fn invalid_request_reasons_are_400() {
         use crate::domain::secret::typing::reasons;
         for reason in [
-            reasons::VALUE_REQUIRED,
+            reasons::SECRET_REQUIRED,
             reasons::EMPTY_PATCH,
             reasons::NULL_NOT_ALLOWED,
             reasons::PRECONDITION_REQUIRED,
@@ -194,7 +194,7 @@ mod tests {
         ] {
             assert_eq!(
                 status_of(DomainError::InvalidRequest {
-                    field: "value",
+                    field: "secret",
                     reason,
                     detail: "x".to_owned(),
                 }),

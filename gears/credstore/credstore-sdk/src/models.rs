@@ -326,7 +326,7 @@ pub enum CredentialStatus {
     /// The caller's tenant holds no row under the reference at all.
     None,
     /// The caller's own row exists but carries no value
-    /// (`PATCH {"value": null}` was the last write to touch it).
+    /// (`PATCH {"secret": null}` was the last write to touch it).
     Declared,
     /// The caller's own row exists and carries a value.
     Active,
@@ -400,7 +400,7 @@ pub struct Credential {
 /// representations"): nothing administrative rides along — `sharing`,
 /// `inheritance`, `status` stay on [`Credential`]. The SDK-side convenience
 /// envelope [`CredStoreClientV1::get_secret`](crate::CredStoreClientV1::get_secret)
-/// wraps, projecting `GET /credentials/{ref}?$select=reference,type,expires_at,value`
+/// wraps, projecting `GET /credentials/{ref}?$select=reference,type,expires_at,secret`
 /// to exactly these four fields (ADR-0004 Amendment A) — the shape the
 /// withdrawn `GET /credentials/{ref}/secret` used to return.
 #[derive(Debug)]
@@ -417,7 +417,7 @@ pub struct Secret {
     /// Expiry instant, when the type is expirable and one was set.
     pub expires_at: Option<OffsetDateTime>,
     /// The decrypted value.
-    pub value: SecretValue,
+    pub secret: SecretValue,
     /// The winning row's validator — travels with the value so a caller that
     /// reads and rotates its own credential never needs the record address.
     pub validator: Validator,
@@ -425,14 +425,14 @@ pub struct Secret {
 
 /// Body of [`CredStoreClientV1::put`](crate::CredStoreClientV1::put) — a
 /// whole-credential replace: fields absent reset to their defaults (ADR-0004,
-/// "Two write verbs"). `value` is required at the REST boundary (its
-/// *absence* on the wire is 400 `VALUE_REQUIRED`, before this type is even
+/// "Two write verbs"). `secret` is required at the REST boundary (its
+/// *absence* on the wire is 400 `SECRET_REQUIRED`, before this type is even
 /// built), but once past that gate it is tri-state (ADR-0004 Amendment B,
 /// "The value-less record: reached only on purpose"): `Some(_)` writes a
 /// value (create, or replace/rotate), `None` is an explicit `null` — no value
 /// is written: on create the row is inserted `declared`; on replace of an
 /// `active` row the value is removed in the same one transaction
-/// `PATCH {"value": null}` uses; on replace of an already-`declared` row
+/// `PATCH {"secret": null}` uses; on replace of an already-`declared` row
 /// nothing about the value changes.
 #[derive(Debug)]
 pub struct CredentialWrite {
@@ -452,10 +452,10 @@ pub struct CredentialWrite {
     /// The value to write, or `None` for an explicit `null` (no value on
     /// either side of the request — a value-less create, or a value removal/
     /// no-op on replace, per the type's own doc above). The REST layer maps
-    /// the wire's *absent* `value` key to 400 (`VALUE_REQUIRED`) before this
+    /// the wire's *absent* `secret` key to 400 (`SECRET_REQUIRED`) before this
     /// type is ever constructed, so `None` here is unambiguously "explicit
     /// null", never "the caller forgot the field".
-    pub value: Option<SecretValue>,
+    pub secret: Option<SecretValue>,
 }
 
 /// Tri-state field for an RFC 7396 JSON Merge Patch: absent (untouched),
@@ -483,8 +483,8 @@ impl<T> PatchField<T> {
 
 /// Body of [`CredStoreClientV1::patch`](crate::CredStoreClientV1::patch) — an
 /// RFC 7396 JSON Merge Patch over the mutable fields of [`Credential`] plus
-/// `value` (ADR-0004). A field absent from every one of these is untouched; a
-/// `PatchField::Null` on `expires_at`/`value` clears/removes it. `sharing`,
+/// `secret` (ADR-0004). A field absent from every one of these is untouched; a
+/// `PatchField::Null` on `expires_at`/`secret` clears/removes it. `sharing`,
 /// `fallback` and `secret_type` have no `Null` state on the wire — a
 /// merge-patch `null` for any of them is a REST-layer 400
 /// (`NULL_NOT_ALLOWED`), since none is a nullable column.
@@ -501,7 +501,7 @@ pub struct CredentialPatch {
     pub expires_at: PatchField<OffsetDateTime>,
     /// Value change: absent (untouched), `Null` (remove — the record becomes
     /// `declared`), or `Set` (rotate/create the value).
-    pub value: PatchField<SecretValue>,
+    pub secret: PatchField<SecretValue>,
 }
 
 impl CredentialPatch {
@@ -515,16 +515,16 @@ impl CredentialPatch {
             && self.sharing.is_none()
             && self.fallback.is_none()
             && self.expires_at.is_absent()
-            && self.value.is_absent()
+            && self.secret.is_absent()
     }
 }
 
 /// One item of the collection read (`CredStoreClientV1::list`, ADR-0005): the
 /// reduced [`Credential`] a reference resolves to, plus its decrypted value
-/// (`value`) when the request ran in **value mode**
-/// (`$select` containing `value`, ADR-0004 "Bulk secret read: the collection
-/// in value mode"). `value` is `None` in ordinary (metadata-mode) listing —
-/// the collection never carries a value unless the caller opted into value
+/// (`secret`) when the request ran in **secret mode**
+/// (`$select` containing `secret`, ADR-0004 "Bulk secret read: the collection
+/// in secret mode"). `secret` is `None` in ordinary (metadata-mode) listing —
+/// the collection never carries a value unless the caller opted into secret
 /// mode, and even then only for the items whose value the caller may read.
 #[derive(Debug)]
 pub struct CredentialListItem {
@@ -532,11 +532,11 @@ pub struct CredentialListItem {
     /// item"): one item per reference, matching what a point read
     /// (`CredStoreClientV1::get`) of that reference would resolve to.
     pub credential: Credential,
-    /// The decrypted value, present only in value mode and only for an item
+    /// The decrypted value, present only in secret mode and only for an item
     /// the caller may read (`read_secret`); a refused, missing, or
     /// fingerprint-mismatched item is omitted from the page entirely rather
     /// than carrying `None` here.
-    pub value: Option<SecretValue>,
+    pub secret: Option<SecretValue>,
 }
 
 /// Outcome of one [`CredStoreMaintenanceV1::run_gc`](crate::CredStoreMaintenanceV1::run_gc)
@@ -704,7 +704,7 @@ mod models_tests {
 
         assert!(
             !CredentialPatch {
-                value: PatchField::Set(SecretValue::from("x")),
+                secret: PatchField::Set(SecretValue::from("x")),
                 ..CredentialPatch::default()
             }
             .is_empty()
@@ -737,9 +737,9 @@ mod models_tests {
         };
         let item = CredentialListItem {
             credential,
-            value: None,
+            secret: None,
         };
-        assert!(item.value.is_none());
+        assert!(item.secret.is_none());
     }
 
     #[test]

@@ -107,15 +107,15 @@ fn build_credential(key: &SecretRef, secret_type: String, reduced: &Reduced<'_>)
 impl Service {
     /// The collection read (ADR-0005): one reduced item per reference,
     /// rooted at the caller's tenant and walking upward through its
-    /// ancestor chain only. Selecting `value` in `query`'s `$select`
-    /// switches to value mode (ADR-0004, "Bulk secret read").
+    /// ancestor chain only. Selecting `secret` in `query`'s `$select`
+    /// switches to secret mode (ADR-0004, "Bulk secret read").
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::InvalidRequest`] for every validation failure
     /// this endpoint defines (see [`crate::domain::secret::list_filter`]):
     /// an unsupported `$filter`/`$orderby`/`$select` field or shape, an
-    /// out-of-range `limit`, a malformed or inconsistent cursor, or (value
+    /// out-of-range `limit`, a malformed or inconsistent cursor, or (secret
     /// mode) pagination present, a missing/invalid selector, or a
     /// match-set over the configured cap.
     pub async fn list(
@@ -131,8 +131,8 @@ impl Service {
             None => ParsedFilter::default(),
         };
 
-        if list_filter::is_value_mode(query.selected_fields()) {
-            self.list_value_mode(ctx, query, &parsed_filter).await
+        if list_filter::is_secret_mode(query.selected_fields()) {
+            self.list_secret_mode(ctx, query, &parsed_filter).await
         } else {
             self.list_metadata_mode(ctx, query, &parsed_filter).await
         }
@@ -264,7 +264,7 @@ impl Service {
         })
     }
 
-    async fn list_value_mode(
+    async fn list_secret_mode(
         &self,
         ctx: &SecurityContext,
         query: &ODataQuery,
@@ -277,27 +277,27 @@ impl Service {
                 } else {
                     "cursor"
                 },
-                reason: list_filter::reasons::VALUE_MODE_NO_PAGINATION,
-                detail: "value mode does not paginate; remove limit/cursor".to_owned(),
+                reason: list_filter::reasons::SECRET_MODE_NO_PAGINATION,
+                detail: "secret mode does not paginate; remove limit/cursor".to_owned(),
             });
         }
         if !query.order.is_empty() {
             return Err(DomainError::InvalidRequest {
                 field: "$orderby",
-                reason: list_filter::reasons::VALUE_MODE_NO_ORDER,
-                detail: "value mode has no $orderby".to_owned(),
+                reason: list_filter::reasons::SECRET_MODE_NO_ORDER,
+                detail: "secret mode has no $orderby".to_owned(),
             });
         }
-        parsed_filter.require_value_mode_selector()?;
+        parsed_filter.require_secret_mode_selector()?;
 
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        let cap = self.list.value_mode_cap;
+        let cap = self.list.secret_mode_cap;
         let cap_plus_one = cap
             .checked_add(1)
-            .ok_or_else(|| DomainError::internal("value_mode_cap + 1 overflowed u64"))?;
+            .ok_or_else(|| DomainError::internal("secret_mode_cap + 1 overflowed u64"))?;
         let refs = self
             .repo
             .list_candidate_references(
@@ -320,8 +320,8 @@ impl Service {
             });
         }
 
-        // Value mode always requires `read_secret`; a record-only field
-        // named alongside `value` additionally requires `list` (ADR-0004
+        // Secret mode always requires `read_secret`; a record-only field
+        // named alongside `secret` additionally requires `list` (ADR-0004
         // Amendment A) — disclosing `sharing`/`inheritance`/... is `list`'s
         // privilege, not `read_secret`'s, exactly as the point read's
         // `get_item` splits the two.
@@ -355,14 +355,14 @@ impl Service {
     /// Shared tail of both modes (ADR-0005 steps 6-9): authorize each
     /// distinct type found among `references`, fetch those references'
     /// rows whole (unclamped by type), reduce each to one item, drop what
-    /// the caller may not see, apply the in-memory filters, and — in value
+    /// the caller may not see, apply the in-memory filters, and — in secret
     /// mode — read each winner's value.
     ///
     /// `required_actions` are evaluated per distinct type, each one gating
     /// the type's inclusion in `allowed_types` (all must permit and include
-    /// the caller's tenant) — metadata mode always names `[list]`; value
+    /// the caller's tenant) — metadata mode always names `[list]`; secret
     /// mode names `[read_secret]`, plus `list` too when a record-only field
-    /// is selected alongside `value` (ADR-0004 Amendment A).
+    /// is selected alongside `secret` (ADR-0004 Amendment A).
     #[allow(
         clippy::too_many_arguments,
         reason = "every input the shared reduction+authorization tail needs; splitting it into \
@@ -377,7 +377,7 @@ impl Service {
         references: &[String],
         parsed_filter: &ParsedFilter,
         required_actions: &[&str],
-        value_mode: bool,
+        secret_mode: bool,
     ) -> Result<Vec<CredentialListItem>, DomainError> {
         if references.is_empty() {
             return Ok(Vec::new());
@@ -450,7 +450,7 @@ impl Service {
                 .push(row);
         }
 
-        let plugin: Option<Arc<dyn CredStorePluginClientV1>> = if value_mode {
+        let plugin: Option<Arc<dyn CredStorePluginClientV1>> = if secret_mode {
             Some(self.plugins.resolve().await?)
         } else {
             None
@@ -494,10 +494,10 @@ impl Service {
             })?;
             let credential = build_credential(&key, resolved.gts_id.clone(), &reduced);
 
-            if !value_mode {
+            if !secret_mode {
                 items.push(CredentialListItem {
                     credential,
-                    value: None,
+                    secret: None,
                 });
                 continue;
             }
@@ -508,11 +508,11 @@ impl Service {
             if winner.value_id.is_none() {
                 continue;
             }
-            // Set whenever `value_mode` is true, which is the only path
+            // Set whenever `secret_mode` is true, which is the only path
             // that reaches here (see the early `continue` above).
             let Some(plugin) = plugin.as_ref() else {
                 return Err(DomainError::internal(
-                    "value mode reached the read step without a resolved plugin",
+                    "secret mode reached the read step without a resolved plugin",
                 ));
             };
             let secret = self
@@ -530,12 +530,12 @@ impl Service {
             if let Some(secret) = secret {
                 items.push(CredentialListItem {
                     credential,
-                    value: Some(secret.value),
+                    secret: Some(secret.secret),
                 });
             }
             // A refused/missing/fingerprint-mismatched value is omitted,
             // not reported (ADR-0004 "Bulk secret read: the collection in
-            // value mode") — `read_value_for_row` already recorded the
+            // secret mode") — `read_value_for_row` already recorded the
             // relevant metric.
         }
 

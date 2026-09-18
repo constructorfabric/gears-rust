@@ -32,9 +32,9 @@ pub mod reasons {
     /// `InvalidArgument` (400), like the other `*_REQUIRED`/`*_ALLOWED`
     /// request-shape reasons below.
     pub const TYPE_REQUIRED: &str = "TYPE_REQUIRED";
-    /// ADR-0004: `PUT` without a `value` key, or `CredentialWrite::value`
+    /// ADR-0004: `PUT` without a `secret` key, or `CredentialWrite::secret`
     /// otherwise unset. Canonical `InvalidArgument` (400).
-    pub const VALUE_REQUIRED: &str = "VALUE_REQUIRED";
+    pub const SECRET_REQUIRED: &str = "SECRET_REQUIRED";
     /// ADR-0004: `PATCH` whose body touches nothing at all
     /// (`CredentialPatch::is_empty`). Canonical `InvalidArgument` (400).
     pub const EMPTY_PATCH: &str = "EMPTY_PATCH";
@@ -62,7 +62,7 @@ fn violation(field: &'static str, reason: &'static str, detail: String) -> Domai
 /// `expires_at` semantics: permitted only for `expirable` types; a value in
 /// the past is rejected (it would create a secret that never resolves).
 ///
-/// A `PUT` always carries a `value`, so every check applies (ADR-0004
+/// A `PUT` always carries a `secret`, so every check applies (ADR-0004
 /// §5.4.2); a `PATCH` calls [`validate_metadata`] and/or [`validate_value`]
 /// individually, whichever the body's keys actually require.
 ///
@@ -85,7 +85,7 @@ pub fn validate_write(
 
 /// Validate the metadata half of a write: `sharing` against `allow_sharing`,
 /// `expires_at` against the `expirable`/in-the-past gates. Used for a
-/// `PATCH` whose body carries no `value` key (§4.4 body-derived actions), and
+/// `PATCH` whose body carries no `secret` key (§4.4 body-derived actions), and
 /// as half of [`validate_write`].
 ///
 /// # Errors
@@ -128,7 +128,7 @@ pub fn validate_metadata(
 }
 
 /// Validate the value half of a write: size, UTF-8, and `value_schema`. Used
-/// for a `PATCH` whose body carries a `value` key (`Set`, never `Null` — a
+/// for a `PATCH` whose body carries a `secret` key (`Set`, never `Null` — a
 /// removal validates nothing), and as half of [`validate_write`].
 ///
 /// # Errors
@@ -148,7 +148,7 @@ pub fn validate_value(
         && len > max
     {
         return Err(violation(
-            "value",
+            "secret",
             reasons::VALUE_TOO_LARGE,
             format!("value of {len} bytes exceeds the {max}-byte limit of secret type '{type_id}'"),
         ));
@@ -156,7 +156,7 @@ pub fn validate_value(
 
     if traits.utf8_only && std::str::from_utf8(value.as_bytes()).is_err() {
         return Err(violation(
-            "value",
+            "secret",
             reasons::VALUE_NOT_UTF8,
             format!("secret type '{type_id}' requires a valid UTF-8 value"),
         ));
@@ -183,7 +183,7 @@ fn validate_value_schema(
 ) -> Result<(), DomainError> {
     let parsed: serde_json::Value = serde_json::from_slice(value.as_bytes()).map_err(|_| {
         violation(
-            "value",
+            "secret",
             reasons::VALUE_SCHEMA_VIOLATION,
             format!("secret type '{type_id}' requires a JSON value matching its schema"),
         )
@@ -203,7 +203,7 @@ fn validate_value_schema(
     if let Err(first) = validator.validate(&parsed) {
         // instance_path only — never the offending value.
         return Err(violation(
-            "value",
+            "secret",
             reasons::VALUE_SCHEMA_VIOLATION,
             format!(
                 "value does not match the '{type_id}' schema at '{}': {}",

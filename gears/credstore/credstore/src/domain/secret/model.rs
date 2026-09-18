@@ -26,7 +26,7 @@ pub enum SecretStatus {
     /// The row resolves and points at a value (`value_id IS NOT NULL`).
     Active,
     /// The row holds its reference but carries no value (`value_id IS
-    /// NULL`), reached only via a value-removal write (`PATCH {"value":
+    /// NULL`), reached only via a value-removal write (`PATCH {"secret":
     /// null}`, or a `PATCH` that suppresses an active row in the same
     /// transaction). A resolution candidate only when its `fallback` is
     /// `None` (ADR-0004, Suppression): `status = 2 OR (status = 4 AND

@@ -111,24 +111,24 @@ fn matches_post_reduction_applies_sharing_fallback_expires_at() {
 }
 
 #[test]
-fn value_mode_selector_accepts_exactly_reference_or_type() {
+fn secret_mode_selector_accepts_exactly_reference_or_type() {
     let f = parse("reference eq 'r'").expect("valid");
-    assert!(f.require_value_mode_selector().is_ok());
+    assert!(f.require_secret_mode_selector().is_ok());
 
     let f = parse("type eq 'gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~'")
         .expect("valid");
-    assert!(f.require_value_mode_selector().is_ok());
+    assert!(f.require_secret_mode_selector().is_ok());
 
     let f = parse("sharing eq 'shared'").expect("valid");
-    let err = f.require_value_mode_selector().expect_err("must reject");
-    assert_eq!(reason_of(&err), reasons::VALUE_MODE_SELECTOR);
+    let err = f.require_secret_mode_selector().expect_err("must reject");
+    assert_eq!(reason_of(&err), reasons::SECRET_MODE_SELECTOR);
 
     let neither = ParsedFilter::default();
-    assert!(neither.require_value_mode_selector().is_err());
+    assert!(neither.require_secret_mode_selector().is_err());
 }
 
 #[test]
-fn select_allowlist_accepts_credential_fields_and_value() {
+fn select_allowlist_accepts_credential_fields_and_secret() {
     for field in [
         "reference",
         "type",
@@ -140,7 +140,7 @@ fn select_allowlist_accepts_credential_fields_and_value() {
         "version",
         "updated_at",
         "owner_id",
-        "value",
+        "secret",
     ] {
         assert!(validate_select(&[field.to_owned()]).is_ok(), "{field}");
     }
@@ -149,13 +149,13 @@ fn select_allowlist_accepts_credential_fields_and_value() {
 }
 
 #[test]
-fn is_value_mode_detects_value_in_select() {
-    assert!(is_value_mode(Some(&[
+fn is_secret_mode_detects_secret_in_select() {
+    assert!(is_secret_mode(Some(&[
         "reference".to_owned(),
-        "value".to_owned()
+        "secret".to_owned()
     ])));
-    assert!(!is_value_mode(Some(&["reference".to_owned()])));
-    assert!(!is_value_mode(None));
+    assert!(!is_secret_mode(Some(&["reference".to_owned()])));
+    assert!(!is_secret_mode(None));
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn admin_field_selected_detects_each_administrative_field_but_not_envelope_field
             "{field} must be detected as an administrative field"
         );
     }
-    for field in ["reference", "type", "expires_at", "value"] {
+    for field in ["reference", "type", "expires_at", "secret"] {
         assert!(
             !admin_field_selected(Some(&[field.to_owned()])),
             "{field} must not be treated as administrative"

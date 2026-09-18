@@ -88,7 +88,7 @@ fn make_response(value: &str) -> Secret {
         reference: SecretRef::new("k").expect("valid SecretRef"),
         secret_type: String::new(),
         expires_at: None,
-        value: SecretValue::from(value),
+        secret: SecretValue::from(value),
         validator: Validator {
             id: Uuid::nil(),
             version: 1,
@@ -130,7 +130,7 @@ async fn non_utf8_value_surfaces_as_internal_error() {
             reference: SecretRef::new("k").expect("valid SecretRef"),
             secret_type: String::new(),
             expires_at: None,
-            value: SecretValue::new(vec![0xFF, 0xFE, 0xFD]),
+            secret: SecretValue::new(vec![0xFF, 0xFE, 0xFD]),
             validator: Validator {
                 id: Uuid::nil(),
                 version: 1,

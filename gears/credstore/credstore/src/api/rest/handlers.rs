@@ -165,7 +165,7 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
 ///
 /// Metadata-mode responses carry every reduced item as the same shape
 /// `GET .../{ref}` returns (`value` absent); selecting `value` in
-/// `$select` switches to value mode (ADR-0004, "Bulk secret read"), whose
+/// `$select` switches to secret mode (ADR-0004, "Bulk secret read"), whose
 /// items additionally carry the decrypted value — audited per item exactly
 /// like the point read's `$select=…,value`, since both paths share
 /// `Service::read_value_for_row`'s retry/fence-verification/metrics.
@@ -174,7 +174,7 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
 ///
 /// Returns a canonical `Problem` envelope on an unsupported `$filter`/
 /// `$orderby`/`$select` field or shape (400), an out-of-range `limit` or a
-/// malformed/inconsistent cursor (400), or — in value mode — pagination
+/// malformed/inconsistent cursor (400), or — in secret mode — pagination
 /// present, an invalid selector, or a match-set over the configured cap
 /// (400).
 pub async fn list_credentials(
@@ -205,7 +205,7 @@ pub async fn list_credentials(
 
 /// `GET /credstore/v1/credentials/{ref}` (ADR-0004 Amendment A): the point
 /// read, sharing its item shape and `$select` mechanism with the collection.
-/// Without `$select`, the full record (never `value`); selecting `value`
+/// Without `$select`, the full record (never `secret`); selecting `secret`
 /// includes it, for a caller the projection's action(s) admit — the same
 /// projection-to-action rule `Service::get_item` documents.
 ///
@@ -286,13 +286,13 @@ pub async fn put_credential(
         })
     })?;
     // Tri-state (ADR-0004 Amendment B): absent (`None`) is 400
-    // `VALUE_REQUIRED`; `Some(None)` (explicit JSON `null`) writes no value;
+    // `SECRET_REQUIRED`; `Some(None)` (explicit JSON `null`) writes no value;
     // `Some(Some(s))` writes `s`.
-    let Some(raw_value) = body.value else {
+    let Some(raw_value) = body.secret else {
         return Err(CanonicalError::from(DomainError::InvalidRequest {
-            field: "value",
-            reason: reasons::VALUE_REQUIRED,
-            detail: "value is required".to_owned(),
+            field: "secret",
+            reason: reasons::SECRET_REQUIRED,
+            detail: "secret is required".to_owned(),
         }));
     };
     let secret_type = body
@@ -311,7 +311,7 @@ pub async fn put_credential(
         sharing: body.sharing.into(),
         fallback: Fallback::from(body.fallback),
         expires_at,
-        value: raw_value.map(SecretValue::from),
+        secret: raw_value.map(SecretValue::from),
     };
     let outcome = svc.put(&ctx, &key, write, precondition).await?;
     let etag = format!("\"{}.{}\"", outcome.validator.id, outcome.validator.version);
@@ -441,7 +441,7 @@ pub async fn patch_credential(
         Some(None) => PatchField::Null,
         Some(Some(raw)) => PatchField::Set(parse_rfc3339("expires_at", &raw)?),
     };
-    let value = match dto.value {
+    let secret = match dto.secret {
         None => PatchField::Absent,
         Some(None) => PatchField::Null,
         Some(Some(raw)) => PatchField::Set(SecretValue::from(raw)),
@@ -452,7 +452,7 @@ pub async fn patch_credential(
         sharing,
         fallback,
         expires_at,
-        value,
+        secret,
     };
     let validator = svc.patch(&ctx, &key, patch, precondition).await?;
     let etag = format!("\"{}.{}\"", validator.id, validator.version);

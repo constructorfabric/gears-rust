@@ -180,7 +180,7 @@ impl ConfigurableStubCS {
                 reference: SecretRef::new(key).expect("valid SecretRef"),
                 secret_type: String::new(),
                 expires_at: None,
-                value: SecretValue::from(value),
+                secret: SecretValue::from(value),
                 validator: Validator {
                     id: Uuid::nil(),
                     version: 1,

@@ -135,12 +135,12 @@ pub struct GcSettings {
 
 /// Collection-read settings (`Service::list`, ADR-0005/ADR-0004), from
 /// `ListCfg`: the metadata-mode page-size cap (`limit`/`$top`) and the
-/// value-mode (`$select` containing `secret`) match-set cap.
+/// secret-mode (`$select` containing `secret`) match-set cap.
 #[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ListSettings {
     pub max_limit: u64,
-    pub value_mode_cap: u64,
+    pub secret_mode_cap: u64,
 }
 
 /// Outcome of one [`Service::run_gc`] invocation.
@@ -225,7 +225,7 @@ pub struct Service {
 
 /// Selection-aware answer to the point read (`Service::get_item`, ADR-0004
 /// Amendment A): the resolved [`Credential`], its decrypted value when the
-/// projection named `value` and the winner had one to serve, that value's
+/// projection named `secret` and the winner had one to serve, that value's
 /// own validator (the row it was actually served from — a concurrent switch
 /// can make this momentarily different from `credential.validator`), and the
 /// weak-`ETag` source the REST layer needs whenever the caller holds no own
@@ -592,24 +592,24 @@ impl Service {
     /// the action(s) `fields` requires once each on the effective concrete
     /// type — `read` when `fields` is `None` or names any administrative
     /// record field (`sharing`/`status`/`fallback`/`inheritance`/`version`/
-    /// `updated_at`/`owner_id`), `read_secret` when `fields` names `value`,
+    /// `updated_at`/`owner_id`), `read_secret` when `fields` names `secret`,
     /// both when both — and reads the value via the fence-checked
-    /// [`Self::read_value_for_row`] only when `value` is selected and the
+    /// [`Self::read_value_for_row`] only when `secret` is selected and the
     /// winner has one. A denial on either required action is the canonical
     /// 404 (`Ok(None)`), before either representation is assembled. A
-    /// `value`-only projection (no administrative field alongside it — the
+    /// `secret`-only projection (no administrative field alongside it — the
     /// shape [`Self::get_secret`] uses) against a winner with no value to
     /// serve is the canonical miss too, exactly as the withdrawn
     /// `GET …/secret` was; the same value-less winner, projected together
     /// with an administrative field, is returned as a record with no
-    /// `value` instead.
+    /// `secret` instead.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
     /// Returns [`DomainError::NotFound`] or [`DomainError::ServiceUnavailable`]
     /// from the value read, exactly as [`Self::get_secret`] documents, when
-    /// `value` is selected and the winner has one.
+    /// `secret` is selected and the winner has one.
     #[allow(
         clippy::cognitive_complexity,
         reason = "resolve -> reduce -> authorize(s) -> assemble -> conditionally read is \
@@ -627,11 +627,11 @@ impl Service {
         }
 
         // Amendment A's projection-to-action rule: `read` is required unless
-        // this is a pure value request (`value` named, no administrative
+        // this is a pure value request (`secret` named, no administrative
         // field alongside it) — the shape `get_secret` uses; `read_secret`
-        // is required whenever `value` is named. At least one is always
+        // is required whenever `secret` is named. At least one is always
         // `true`.
-        let need_value = list_filter::is_value_mode(fields);
+        let need_value = list_filter::is_secret_mode(fields);
         let need_admin = list_filter::admin_field_selected(fields);
         let need_read = !need_value || need_admin;
         let need_read_secret = need_value;
@@ -852,7 +852,7 @@ impl Service {
         }
 
         let value_validator = secret.as_ref().map(|s| s.validator);
-        let value = secret.map(|s| s.value);
+        let value = secret.map(|s| s.secret);
         Ok(Some(CredentialItem {
             credential,
             value,
@@ -865,7 +865,7 @@ impl Service {
     /// hierarchy. A winning record with no value (`declared`, including the
     /// suppression case) is the canonical miss. Thin wrapper over
     /// [`Self::get_item`], projected to exactly `reference`, `type`,
-    /// `expires_at` and `value` — the shape the SDK's `Secret` envelope
+    /// `expires_at` and `secret` — the shape the SDK's `Secret` envelope
     /// wraps, and the same projection `CredStoreLocalClient::get_secret`
     /// sends over the in-process trait (ADR-0004, "One item, one shape").
     ///
@@ -888,7 +888,7 @@ impl Service {
             "reference".to_owned(),
             "type".to_owned(),
             "expires_at".to_owned(),
-            "value".to_owned(),
+            "secret".to_owned(),
         ];
         let Some(item) = self.get_item(ctx, key, Some(&fields)).await? else {
             return Ok(None);
@@ -904,7 +904,7 @@ impl Service {
             reference: key.clone(),
             secret_type: item.credential.secret_type,
             expires_at: item.credential.expires_at,
-            value,
+            secret: value,
             validator,
         }))
     }
@@ -913,7 +913,7 @@ impl Service {
     /// (ADR-0003, narrowed by ADR-0006), retrying once against a freshly
     /// re-resolved row if the backend reports the pointer missing — the
     /// shared tail of [`Self::get_secret`] and, per reduced winner, the
-    /// collection read's value mode (ADR-0005 "Bulk secret read"), so both
+    /// collection read's secret mode (ADR-0005 "Bulk secret read"), so both
     /// apply the identical retry-once-and-verify-fingerprint protocol.
     ///
     /// Callers MUST have already checked `row.value_id.is_some()` (a
@@ -1011,7 +1011,7 @@ impl Service {
             reference: key.clone(),
             secret_type: resolved_gts_id.to_owned(),
             expires_at: served_row.expires_at,
-            value,
+            secret: value,
             validator: Validator {
                 id: served_row.id,
                 version: served_row.version,
@@ -1152,7 +1152,7 @@ impl Service {
     /// `update_metadata`, itself skipped when nothing would change — ADR-0004
     /// "A metadata-only write that changes nothing bumps nothing"); on
     /// replace of an `active` row it removes the value in the same one
-    /// transaction `PATCH {"value": null}` uses (`remove_value`), and the
+    /// transaction `PATCH {"secret": null}` uses (`remove_value`), and the
     /// plugin is then resolved for the old version's best-effort cleanup.
     ///
     /// `write` is always required; `write_secret` is additionally required
@@ -1190,7 +1190,7 @@ impl Service {
             sharing,
             fallback,
             expires_at,
-            value,
+            secret: value,
         } = write;
         let fallback = Fallback::from(fallback);
         let tenant = TenantId(ctx.subject_tenant_id());
@@ -1258,7 +1258,7 @@ impl Service {
                 None if existing.status == SecretStatus::Active => {
                     // Replace of an active row with an explicit `null`:
                     // remove the value in the same one transaction
-                    // `PATCH {"value": null}` uses, then best-effort clean up
+                    // `PATCH {"secret": null}` uses, then best-effort clean up
                     // the version it superseded.
                     let plugin = self.plugins.resolve().await?;
                     let (row, old_value_id) = self
@@ -1460,7 +1460,7 @@ impl Service {
             || patch.fallback.is_some()
             || !patch.expires_at.is_absent()
             || patch.secret_type.is_some();
-        let value_present = !patch.value.is_absent();
+        let value_present = !patch.secret.is_absent();
 
         // Both required actions are evaluated — and must both allow — before
         // any side effect AND before any response that would reveal a detail
@@ -1513,7 +1513,7 @@ impl Service {
             )?;
         }
 
-        match patch.value {
+        match patch.secret {
             PatchField::Absent => {
                 if merged_sharing == existing.sharing
                     && merged_fallback == existing.fallback
@@ -1767,7 +1767,7 @@ impl Service {
     /// (version mismatch, or the row vanished) aborts the just-written
     /// version (best-effort) and returns `VersionConflict`; a won CAS
     /// best-effort cleans up the version it just superseded. Shared by
-    /// `put`'s replace leg and `patch {"value": …}` (ADR-0004: the
+    /// `put`'s replace leg and `patch {"secret": …}` (ADR-0004: the
     /// value-write half of `PATCH` is the same protocol as `PUT`'s) —
     /// accepts a `declared` row too, switching it back to `active`.
     #[allow(

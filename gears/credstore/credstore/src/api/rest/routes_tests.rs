@@ -70,7 +70,7 @@ fn build_harness_with_enforcer(enforcer: authz_resolver_sdk::PolicyEnforcer) -> 
         },
         ListSettings {
             max_limit: 200,
-            value_mode_cap: 25,
+            secret_mode_cap: 25,
         },
     ));
     let openapi = OpenApiRegistryImpl::new();
@@ -162,7 +162,7 @@ async fn seed_credential(harness: &TestHarness, reference: &str, value: &str) ->
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     };
     let outcome = harness
         .svc
@@ -204,7 +204,7 @@ async fn get_credential_existing_returns_200_with_body_and_strong_etag() {
     assert_eq!(body["status"], "active");
     assert_eq!(body["inheritance"], "own");
     assert!(
-        body.get("value").is_none(),
+        body.get("secret").is_none(),
         "credential must never carry a value"
     );
 }
@@ -261,7 +261,7 @@ async fn put_create_only_returns_201_with_location_and_etag() {
         Some(serde_json::json!({
             "type": SecretType::generic().gts_id(),
             "sharing": "tenant",
-            "value": "mysecret"
+            "secret": "mysecret"
         })),
         Some("*"),
         None,
@@ -284,7 +284,7 @@ async fn put_type_is_full_gts_id_only() {
         Some(serde_json::json!({
             "type": api_key.gts_id(),
             "sharing": "tenant",
-            "value": "v"
+            "secret": "v"
         })),
         Some("*"),
         None,
@@ -304,7 +304,7 @@ async fn put_type_is_full_gts_id_only() {
         let req = json_request_preconditioned(
             "PUT",
             "/credstore/v1/credentials/badtype",
-            Some(serde_json::json!({"type": bad, "sharing": "tenant", "value": "v"})),
+            Some(serde_json::json!({"type": bad, "sharing": "tenant", "secret": "v"})),
             Some("*"),
             None,
             test_ctx(),
@@ -323,7 +323,7 @@ async fn put_unknown_custom_type_returns_400_unknown_secret_type() {
         Some(serde_json::json!({
             "type": gts_id!("cf.core.credstore.credential.v1~acme.connectors.creds.db_password.v1~"),
             "sharing": "tenant",
-            "value": "v"
+            "secret": "v"
         })),
         Some("*"),
         None,
@@ -349,7 +349,7 @@ async fn put_duplicate_create_only_returns_409() {
         Some(serde_json::json!({
             "type": SecretType::generic().gts_id(),
             "sharing": "tenant",
-            "value": "v2"
+            "secret": "v2"
         })),
         Some("*"),
         None,
@@ -360,7 +360,7 @@ async fn put_duplicate_create_only_returns_409() {
 }
 
 #[tokio::test]
-async fn put_without_value_returns_400_value_required() {
+async fn put_without_secret_returns_400_secret_required() {
     let h = build_harness();
     let req = json_request_preconditioned(
         "PUT",
@@ -378,7 +378,7 @@ async fn put_without_value_returns_400_value_required() {
     let body = body_json(resp).await;
     assert_eq!(
         body["context"]["field_violations"][0]["reason"],
-        "VALUE_REQUIRED"
+        "SECRET_REQUIRED"
     );
 }
 
@@ -391,7 +391,7 @@ async fn put_neither_precondition_returns_400_precondition_required() {
         Some(serde_json::json!({
             "type": SecretType::generic().gts_id(),
             "sharing": "tenant",
-            "value": "v"
+            "secret": "v"
         })),
         None,
         None,
@@ -415,7 +415,7 @@ async fn put_both_preconditions_returns_400() {
         Some(serde_json::json!({
             "type": SecretType::generic().gts_id(),
             "sharing": "tenant",
-            "value": "v"
+            "secret": "v"
         })),
         Some("*"),
         Some("*"),
@@ -433,7 +433,7 @@ async fn put_if_match_matching_version_replaces_returns_204() {
     let req = json_request_preconditioned(
         "PUT",
         "/credstore/v1/credentials/ocp",
-        Some(serde_json::json!({"sharing": "tenant", "value": "new"})),
+        Some(serde_json::json!({"sharing": "tenant", "secret": "new"})),
         None,
         Some(&format!("\"{id}.{version}\"")),
         test_ctx(),
@@ -451,7 +451,7 @@ async fn put_if_match_stale_version_returns_409() {
     let req = json_request_preconditioned(
         "PUT",
         "/credstore/v1/credentials/ocp",
-        Some(serde_json::json!({"sharing": "tenant", "value": "new"})),
+        Some(serde_json::json!({"sharing": "tenant", "secret": "new"})),
         None,
         Some(&format!("\"{id}.999\"")),
         test_ctx(),
@@ -468,7 +468,7 @@ async fn put_if_match_star_replaces_returns_204() {
     let req = json_request_preconditioned(
         "PUT",
         "/credstore/v1/credentials/putkey",
-        Some(serde_json::json!({"sharing": "tenant", "value": "new-value"})),
+        Some(serde_json::json!({"sharing": "tenant", "secret": "new-value"})),
         None,
         Some("*"),
         test_ctx(),
@@ -483,7 +483,7 @@ async fn put_missing_target_with_if_match_never_creates_returns_409() {
     let req = json_request_preconditioned(
         "PUT",
         "/credstore/v1/credentials/absent",
-        Some(serde_json::json!({"sharing": "tenant", "value": "v"})),
+        Some(serde_json::json!({"sharing": "tenant", "secret": "v"})),
         None,
         Some("*"),
         test_ctx(),
@@ -493,7 +493,7 @@ async fn put_missing_target_with_if_match_never_creates_returns_409() {
 }
 
 #[tokio::test]
-async fn put_create_with_explicit_null_value_returns_201_declared() {
+async fn put_create_with_explicit_null_secret_returns_201_declared() {
     let h = build_harness();
     let req = json_request_preconditioned(
         "PUT",
@@ -501,7 +501,7 @@ async fn put_create_with_explicit_null_value_returns_201_declared() {
         Some(serde_json::json!({
             "type": SecretType::generic().gts_id(),
             "sharing": "tenant",
-            "value": null
+            "secret": null
         })),
         Some("*"),
         None,
@@ -522,19 +522,19 @@ async fn put_create_with_explicit_null_value_returns_201_declared() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["status"], "declared");
-    assert!(body.get("value").is_none());
+    assert!(body.get("secret").is_none());
 }
 
 // ── PATCH /credstore/v1/credentials/{ref} ───────────────────────────────────
 
 #[tokio::test]
-async fn patch_rotates_value_returns_204_with_new_etag() {
+async fn patch_rotates_secret_returns_204_with_new_etag() {
     let h = build_harness();
     let (id, version) = seed_credential(&h, "rot", "old").await;
 
     let req = merge_patch_request(
         "/credstore/v1/credentials/rot",
-        &serde_json::json!({"value": "new"}),
+        &serde_json::json!({"secret": "new"}),
         &format!("\"{id}.{version}\""),
         test_ctx(),
     );
@@ -551,13 +551,13 @@ async fn patch_rotates_value_returns_204_with_new_etag() {
 
     let get = json_request(
         "GET",
-        "/credstore/v1/credentials/rot?%24select=reference%2Ctype%2Cexpires_at%2Cvalue",
+        "/credstore/v1/credentials/rot?%24select=reference%2Ctype%2Cexpires_at%2Csecret",
         None,
         test_ctx(),
     );
     let resp = h.router.oneshot(get).await.expect("router");
     let body = body_json(resp).await;
-    assert_eq!(body["value"], "new");
+    assert_eq!(body["secret"], "new");
 }
 
 #[tokio::test]
@@ -571,7 +571,7 @@ async fn patch_wrong_content_type_returns_415() {
         .header("content-type", "application/json")
         .header(axum::http::header::IF_MATCH, format!("\"{id}.{version}\""))
         .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({"value": "x"})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"secret": "x"})).unwrap(),
         ))
         .unwrap();
     req.extensions_mut().insert(test_ctx());
@@ -589,7 +589,7 @@ async fn patch_missing_content_type_returns_415() {
         .uri("/credstore/v1/credentials/ct2")
         .header(axum::http::header::IF_MATCH, format!("\"{id}.{version}\""))
         .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({"value": "x"})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"secret": "x"})).unwrap(),
         ))
         .unwrap();
     req.extensions_mut().insert(test_ctx());
@@ -609,7 +609,7 @@ async fn patch_if_none_match_present_returns_400() {
         .header(axum::http::header::IF_MATCH, format!("\"{id}.{version}\""))
         .header(axum::http::header::IF_NONE_MATCH, "*")
         .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({"value": "x"})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"secret": "x"})).unwrap(),
         ))
         .unwrap();
     req.extensions_mut().insert(test_ctx());
@@ -627,7 +627,7 @@ async fn patch_without_if_match_returns_400() {
         .uri("/credstore/v1/credentials/noif")
         .header("content-type", MERGE_PATCH)
         .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({"value": "x"})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"secret": "x"})).unwrap(),
         ))
         .unwrap();
     req.extensions_mut().insert(test_ctx());
@@ -716,13 +716,13 @@ async fn patch_null_type_returns_400_null_not_allowed() {
 }
 
 #[tokio::test]
-async fn patch_value_null_suppresses_and_secret_read_becomes_404() {
+async fn patch_secret_null_suppresses_and_secret_read_becomes_404() {
     let h = build_harness();
     let (id, version) = seed_credential(&h, "suppress", "v").await;
 
     let req = merge_patch_request(
         "/credstore/v1/credentials/suppress",
-        &serde_json::json!({"fallback": "none", "value": null}),
+        &serde_json::json!({"fallback": "none", "secret": null}),
         &format!("\"{id}.{version}\""),
         test_ctx(),
     );
@@ -731,7 +731,7 @@ async fn patch_value_null_suppresses_and_secret_read_becomes_404() {
 
     let get_secret = json_request(
         "GET",
-        "/credstore/v1/credentials/suppress?%24select=value",
+        "/credstore/v1/credentials/suppress?%24select=secret",
         None,
         test_ctx(),
     );
@@ -800,16 +800,16 @@ async fn delete_missing_returns_404() {
 
 // ── GET /credentials/{ref}?$select=... (ADR-0004 Amendment A) ───────────────
 // The withdrawn `GET /credentials/{ref}/secret` is superseded by
-// `$select=reference,type,expires_at,value` on the point read.
+// `$select=reference,type,expires_at,secret` on the point read.
 
 #[tokio::test]
-async fn get_credential_select_value_returns_the_value() {
+async fn get_credential_select_secret_returns_the_secret() {
     let h = build_harness();
     seed_credential(&h, "sec", "topsecret").await;
 
     let req = json_request(
         "GET",
-        "/credstore/v1/credentials/sec?%24select=reference%2Ctype%2Cexpires_at%2Cvalue",
+        "/credstore/v1/credentials/sec?%24select=reference%2Ctype%2Cexpires_at%2Csecret",
         None,
         test_ctx(),
     );
@@ -823,20 +823,20 @@ async fn get_credential_select_value_returns_the_value() {
         .unwrap();
     assert!(cc.contains("no-store"));
     let body = body_json(resp).await;
-    assert_eq!(body["value"], "topsecret");
+    assert_eq!(body["secret"], "topsecret");
     assert_eq!(body["reference"], "sec");
     assert!(
         body.get("sharing").is_none(),
-        "an administrative field must not ride along with a value-only projection: {body}"
+        "an administrative field must not ride along with a secret-only projection: {body}"
     );
 }
 
 #[tokio::test]
-async fn get_credential_select_value_missing_returns_404() {
+async fn get_credential_select_secret_missing_returns_404() {
     let h = build_harness();
     let req = json_request(
         "GET",
-        "/credstore/v1/credentials/nosec?%24select=value",
+        "/credstore/v1/credentials/nosec?%24select=secret",
         None,
         test_ctx(),
     );
@@ -889,9 +889,9 @@ async fn get_credential_select_unknown_field_returns_400() {
 }
 
 #[tokio::test]
-async fn get_credential_select_value_without_read_secret_grant_returns_404() {
+async fn get_credential_select_secret_without_read_secret_grant_returns_404() {
     // A caller holding `read` but not `read_secret`: the unselected point
-    // read (metadata only) still succeeds, but naming `value` in `$select`
+    // read (metadata only) still succeeds, but naming `secret` in `$select`
     // is the canonical 404 -- not a 403, and not a 200 missing the field.
     let denied_type = SecretType::generic().gts_id().to_owned();
     let (enforcer, _resolver) = action_deny_enforcer(denied_type, actions::READ_SECRET);
@@ -907,13 +907,13 @@ async fn get_credential_select_value_without_read_secret_grant_returns_404() {
     let resp = h.router.clone().oneshot(plain).await.expect("router");
     assert_eq!(resp.status(), StatusCode::OK, "read alone must still work");
 
-    let with_value = json_request(
+    let with_secret = json_request(
         "GET",
-        "/credstore/v1/credentials/noreadsecret?%24select=value",
+        "/credstore/v1/credentials/noreadsecret?%24select=secret",
         None,
         test_ctx(),
     );
-    let resp = h.router.oneshot(with_value).await.expect("router");
+    let resp = h.router.oneshot(with_secret).await.expect("router");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1032,7 +1032,7 @@ async fn list_credentials_without_select_returns_the_full_credential_shape() {
             "updated_at",
             "version",
         ],
-        "no `value` key outside value mode (no expiry set on this fixture, so `expires_at` is \
+        "no `secret` key outside secret mode (no expiry set on this fixture, so `expires_at` is \
          skipped too)"
     );
     assert_eq!(item["status"], "active");
@@ -1069,13 +1069,13 @@ async fn list_credentials_select_projects_only_the_requested_fields() {
 }
 
 #[tokio::test]
-async fn list_credentials_value_mode_returns_the_value() {
+async fn list_credentials_secret_mode_returns_the_secret() {
     let h = build_harness();
     seed_credential(&h, "list-value", "top-secret").await;
 
     let req = json_request(
         "GET",
-        &list_uri("%24select=reference%2Cvalue&%24filter=reference%20eq%20%27list-value%27"),
+        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27list-value%27"),
         None,
         test_ctx(),
     );
@@ -1085,16 +1085,16 @@ async fn list_credentials_value_mode_returns_the_value() {
     let items = body["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["reference"], "list-value");
-    assert_eq!(items[0]["value"], "top-secret");
+    assert_eq!(items[0]["secret"], "top-secret");
     assert!(body["page_info"]["next_cursor"].is_null());
 }
 
 #[tokio::test]
-async fn list_credentials_value_mode_rejects_limit() {
+async fn list_credentials_secret_mode_rejects_limit() {
     let h = build_harness();
     let req = json_request(
         "GET",
-        &list_uri("%24select=reference%2Cvalue&%24filter=reference%20eq%20%27x%27&limit=5"),
+        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27x%27&limit=5"),
         None,
         test_ctx(),
     );
@@ -1103,7 +1103,7 @@ async fn list_credentials_value_mode_rejects_limit() {
     let body = body_json(resp).await;
     assert_eq!(
         body["context"]["field_violations"][0]["reason"],
-        "VALUE_MODE_NO_PAGINATION"
+        "SECRET_MODE_NO_PAGINATION"
     );
 }
 

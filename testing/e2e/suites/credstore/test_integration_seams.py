@@ -56,7 +56,7 @@ async def test_route_smoke_list_credentials(base_url, l1a_headers):
     assert "page_info" in body
 
 
-# ── S2: Create -> read -> read secret -> rotate -> list (metadata + value
+# ── S2: Create -> read -> read secret -> rotate -> list (metadata + secret
 #       mode) -> suppress -> delete: one credential's full lifecycle ────────
 
 
@@ -64,7 +64,7 @@ async def test_credential_lifecycle_and_listing_seam(
     base_url, l1a_headers, unique_ref, create_credential,
 ):
     """Seam: PUT create-only -> GET record -> GET secret -> PATCH rotate ->
-    collection read (metadata and value mode) -> PATCH suppress -> DELETE.
+    collection read (metadata and secret mode) -> PATCH suppress -> DELETE.
 
     One reference walks every write/read address the credential surface
     has, plus both collection-read modes, so each is exercised exactly once
@@ -103,21 +103,21 @@ async def test_credential_lifecycle_and_listing_seam(
     assert body["expires_at"] == "2099-01-01T00:00:00Z"
     assert body["owner_id"] is not None
 
-    # --- GET point read, $select=value: 200, value round-trips, type,
+    # --- GET point read, $select=secret: 200, value round-trips, type,
     #     expires_at (ADR-0004 Amendment A supersedes the withdrawn
     #     GET .../secret) ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         secret_resp = await c.get(
             f"{base_url}{_credential(ref)}",
             headers=l1a_headers,
-            params={"$select": "reference,type,expires_at,value"},
+            params={"$select": "reference,type,expires_at,secret"},
         )
     assert secret_resp.status_code == 200
     secret_body = secret_resp.json()
-    assert secret_body["value"] == "initial-value"
+    assert secret_body["secret"] == "initial-value"
     assert secret_body["type"] == PERSONAL_TOKEN_TYPE
     assert secret_body["expires_at"] == "2099-01-01T00:00:00Z"
-    assert "sharing" not in secret_body, "a value-only projection carries no administrative field"
+    assert "sharing" not in secret_body, "a secret-only projection carries no administrative field"
 
     # --- PATCH: rotate the value (merge-patch, If-Match) -> 204, new ETag ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -128,13 +128,13 @@ async def test_credential_lifecycle_and_listing_seam(
                 "Content-Type": "application/merge-patch+json",
                 "If-Match": create_etag,
             },
-            json={"value": "rotated-value"},
+            json={"secret": "rotated-value"},
         )
     assert patch_resp.status_code == 204
     rotated_etag = patch_resp.headers["etag"]
     assert rotated_etag != create_etag
 
-    # --- Collection read, metadata mode: item present, no `value` key ---
+    # --- Collection read, metadata mode: item present, no `secret` key ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         list_resp = await c.get(
             f"{base_url}/credstore/v1/credentials",
@@ -145,25 +145,25 @@ async def test_credential_lifecycle_and_listing_seam(
     items = list_resp.json()["items"]
     assert len(items) == 1, items
     assert items[0]["reference"] == ref
-    assert "value" not in items[0]
+    assert "secret" not in items[0]
 
-    # --- Collection read, value mode: item carries the rotated value ---
+    # --- Collection read, secret mode: item carries the rotated value ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        value_mode_resp = await c.get(
+        secret_mode_resp = await c.get(
             f"{base_url}/credstore/v1/credentials",
             headers=l1a_headers,
             params={
-                "$select": "reference,value",
+                "$select": "reference,secret",
                 "$filter": f"reference eq '{ref}'",
             },
         )
-    assert value_mode_resp.status_code == 200
-    value_items = value_mode_resp.json()["items"]
-    assert len(value_items) == 1, value_items
-    assert value_items[0]["reference"] == ref
-    assert value_items[0]["value"] == "rotated-value"
+    assert secret_mode_resp.status_code == 200
+    secret_items = secret_mode_resp.json()["items"]
+    assert len(secret_items) == 1, secret_items
+    assert secret_items[0]["reference"] == ref
+    assert secret_items[0]["secret"] == "rotated-value"
 
-    # --- PATCH: suppress (fallback: none, value: null) -> 204 ---
+    # --- PATCH: suppress (fallback: none, secret: null) -> 204 ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         suppress_resp = await c.patch(
             f"{base_url}{_credential(ref)}",
@@ -172,16 +172,16 @@ async def test_credential_lifecycle_and_listing_seam(
                 "Content-Type": "application/merge-patch+json",
                 "If-Match": rotated_etag,
             },
-            json={"fallback": "none", "value": None},
+            json={"fallback": "none", "secret": None},
         )
     assert suppress_resp.status_code == 204
 
-    # --- GET $select=value now 404 (no value); GET record: declared/suppressed ---
+    # --- GET $select=secret now 404 (no value); GET record: declared/suppressed ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         secret_after_suppress = await c.get(
             f"{base_url}{_credential(ref)}",
             headers=l1a_headers,
-            params={"$select": "value"},
+            params={"$select": "secret"},
         )
         record_after_suppress = await c.get(
             f"{base_url}{_credential(ref)}", headers=l1a_headers
@@ -255,22 +255,22 @@ async def test_tenant_isolation_seam(
                 "type": GENERIC_TYPE,
                 "sharing": "tenant",
                 "fallback": "none",
-                "value": None,
+                "secret": None,
             },
         )
     assert suppress_resp.status_code == 201, suppress_resp.text
     cleanup(l1a_headers, ref)
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        value_after_suppress = await c.get(
+        secret_after_suppress = await c.get(
             f"{base_url}{_credential(ref)}",
             headers=l1a_headers,
-            params={"$select": "value"},
+            params={"$select": "secret"},
         )
         record_after_suppress = await c.get(
             f"{base_url}{_credential(ref)}", headers=l1a_headers
         )
-    assert value_after_suppress.status_code == 404
+    assert secret_after_suppress.status_code == 404
     suppressed_body = record_after_suppress.json()
     assert suppressed_body["status"] == "declared"
     assert suppressed_body["inheritance"] == "suppressed"
@@ -280,7 +280,7 @@ async def test_tenant_isolation_seam(
 
 
 async def test_error_response_is_problem_json(base_url, l1a_headers, unique_ref):
-    """Seam: a domain validation failure (PUT without `value`) renders as
+    """Seam: a domain validation failure (PUT without `secret`) renders as
     `application/problem+json`, not a generic framework error."""
     ref = unique_ref("badput")
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
