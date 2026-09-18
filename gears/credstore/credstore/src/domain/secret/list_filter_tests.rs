@@ -231,3 +231,108 @@ fn orderby_rejects_any_other_field_or_multiple_keys() {
     ]);
     assert!(validate_metadata_orderby(&multiple).is_err());
 }
+
+#[test]
+fn expires_at_predicate_applies_every_comparator_post_reduction() {
+    let at = datetime!(2030-01-01 0:00 UTC);
+    let earlier = datetime!(2029-01-01 0:00 UTC);
+    let later = datetime!(2031-01-01 0:00 UTC);
+    let with = |op| ParsedFilter {
+        expires_at: Some((op, at)),
+        ..ParsedFilter::default()
+    };
+    let matches = |f: &ParsedFilter, actual| {
+        f.matches_post_reduction(SharingMode::Tenant, None, Some(actual))
+    };
+
+    assert!(matches(&with(FilterOp::Eq), at));
+    assert!(!matches(&with(FilterOp::Eq), later));
+    assert!(matches(&with(FilterOp::Ne), later));
+    assert!(!matches(&with(FilterOp::Ne), at));
+    assert!(matches(&with(FilterOp::Gt), later));
+    assert!(!matches(&with(FilterOp::Gt), at));
+    assert!(matches(&with(FilterOp::Ge), at));
+    assert!(!matches(&with(FilterOp::Ge), earlier));
+    assert!(matches(&with(FilterOp::Lt), earlier));
+    assert!(!matches(&with(FilterOp::Lt), at));
+    assert!(matches(&with(FilterOp::Le), at));
+    assert!(!matches(&with(FilterOp::Le), later));
+}
+
+#[test]
+fn a_row_without_an_expiry_never_matches_an_expires_at_predicate() {
+    let f = parse("expires_at lt 2030-01-01T00:00:00Z").expect("valid");
+    assert!(!f.matches_post_reduction(SharingMode::Tenant, None, None));
+}
+
+#[test]
+fn type_in_list_parses_every_member_into_a_uuid() {
+    let a = "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~";
+    let b = "gts.cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~";
+    let f = parse(&format!("type in ('{a}', '{b}')")).expect("valid");
+    let expected: Vec<_> = [a, b]
+        .iter()
+        .map(|id| credstore_sdk::GtsId::try_new(id).expect("valid").to_uuid())
+        .collect();
+    assert_eq!(f.type_uuid_in, Some(expected));
+}
+
+#[test]
+fn every_field_is_rejected_when_named_twice() {
+    for raw in [
+        "reference in ('a') and reference in ('b')",
+        "type eq 'gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~' and \
+         type eq 'gts.cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~'",
+        "sharing eq 'shared' and sharing eq 'tenant'",
+        "fallback eq 'none' and fallback eq 'inherit'",
+        "expires_at gt 2029-01-01T00:00:00Z and expires_at lt 2031-01-01T00:00:00Z",
+    ] {
+        let err = parse(raw).expect_err("duplicate field must be rejected");
+        assert_eq!(reason_of(&err), reasons::INVALID_FILTER, "{raw}");
+    }
+}
+
+#[test]
+fn only_eq_and_in_are_accepted_on_the_string_fields() {
+    for raw in [
+        "reference ne 'a'",
+        "type ne 'gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~'",
+        "sharing ne 'shared'",
+        "fallback ne 'none'",
+    ] {
+        let err = parse(raw).expect_err("`ne` must be rejected");
+        assert_eq!(reason_of(&err), reasons::INVALID_FILTER, "{raw}");
+    }
+}
+
+#[test]
+fn in_lists_are_rejected_on_the_in_memory_fields() {
+    for raw in [
+        "sharing in ('shared', 'tenant')",
+        "fallback in ('none', 'inherit')",
+        "expires_at in (2030-01-01T00:00:00Z)",
+    ] {
+        let err = parse(raw).expect_err("`in` must be rejected");
+        assert_eq!(reason_of(&err), reasons::INVALID_FILTER, "{raw}");
+    }
+}
+
+#[test]
+fn fallback_rejects_an_unknown_wire_value() {
+    let err = parse("fallback eq 'bogus'").expect_err("must reject");
+    assert_eq!(reason_of(&err), reasons::INVALID_FILTER);
+}
+
+#[test]
+fn value_converters_reject_a_value_of_the_wrong_shape() {
+    // Defensive arms: the generic parser type-checks a field's value against
+    // its `FieldKind` before these are reached, so they are only reachable
+    // by calling the converter directly.
+    let err = string_value(CredentialFilterField::Sharing, &ODataValue::Bool(true))
+        .expect_err("a non-string value must be rejected");
+    assert_eq!(reason_of(&err), reasons::INVALID_FILTER);
+
+    let err = expires_at_value(&ODataValue::String("2030-01-01".to_owned()))
+        .expect_err("a non-datetime value must be rejected");
+    assert_eq!(reason_of(&err), reasons::INVALID_FILTER);
+}

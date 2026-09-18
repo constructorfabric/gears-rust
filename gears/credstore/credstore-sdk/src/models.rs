@@ -741,4 +741,26 @@ mod models_tests {
         };
         assert!(item.value.is_none());
     }
+
+    #[test]
+    fn owner_id_nil_is_the_sentinel_for_no_owner() {
+        let nil = OwnerId::nil();
+        assert!(nil.is_nil());
+        assert_eq!(nil.to_string(), Uuid::nil().to_string());
+        assert!(!OwnerId(Uuid::new_v4()).is_nil());
+    }
+
+    #[test]
+    fn secret_ref_debug_shows_the_reference_it_wraps() {
+        let key = SecretRef::new("openai-key").expect("valid");
+        assert_eq!(format!("{key:?}"), "SecretRef(\"openai-key\")");
+    }
+
+    #[test]
+    fn secret_value_carries_raw_bytes_from_either_constructor() {
+        let from_new = SecretValue::new(b"s3cr3t".to_vec());
+        assert_eq!(from_new.as_bytes(), b"s3cr3t");
+        let from_vec: SecretValue = b"s3cr3t".to_vec().into();
+        assert_eq!(from_vec.as_bytes(), from_new.as_bytes());
+    }
 }
