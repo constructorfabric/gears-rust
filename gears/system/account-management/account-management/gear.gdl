@@ -1,0 +1,34 @@
+# Gearbox product metadata for the account-management gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver, types-registry, resource-group,
+# tenant-resolver) and the lifecycle clause. Four `deps` is the widest
+# co-location closure in the platform, and it is why this gear is part of
+# `platform-host` rather than a pod of its own.
+
+gear(
+    name = "Account Management",
+    description = "Reference multi-tenant account management with user and tenant lifecycle operations.",
+    category = "oss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-account-management",
+        lib = "account_management",
+        path = ".",
+    ),
+
+    # A locator: the SDK declares the identity-provider plugin trait this gear
+    # selects an implementation of at runtime, and nothing in the gear's own
+    # crate says where that SDK is.
+    sdk = cargo(
+        crate_name = "cf-gears-account-management-sdk",
+        lib = "account_management_sdk",
+        path = "../account-management-sdk",
+    ),
+
+    # Deliberately empty rather than absent: the crate's only feature is
+    # `integration`, which spins up Postgres in Docker per test. "Nothing here
+    # for you" is an answer; saying nothing is not.
+    cargo_features = [],
+)

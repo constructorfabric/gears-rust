@@ -1897,11 +1897,43 @@ These services have no trust-coupling and can run as separate pods in K8s (Profi
 
 | Component | REST surface needed | Persistence | Notes |
 |-----------|-------------------|-------------|-------|
-| gear-orchestrator (DirectoryService) | Yes — REST extension for service discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Already has gRPC via grpc-hub; REST surface enables k8s-native discovery. |
+| gear-orchestrator (DirectoryService) | Yes — REST extension for service discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Already has gRPC via grpc-hub; REST surface enables k8s-native discovery. **One per installation** — see below. |
 | types-registry | Yes — REST write (registration) and read (query) endpoints | Needs persistence or re-registration. Currently in-memory (link-time inventory). As a separate pod, gears register over REST at startup; heartbeat re-registration handles pod restarts. DB persistence is a future optimization. | Critical path: `post_init` graph validation must work across distributed registrations. |
 | credstore | Yes — REST endpoint for secret retrieval | No DB; stateless plugin-based lookups. | Alternative: embed per-pod (like authn-resolver) to avoid secrets-in-transit. If separate, mTLS protects the wire. |
 | api-gateway | Already HTTP; GatewayProvider registers routes via API | No DB; route table is in-memory, populated by GatewayProvider registrations. | Separate pod in Mode A; absent in Mode B (external gateway). |
 | authn-resolver | None (embeds in each OoP pod) | No DB; JWKS cache only. | Stateless; zero network latency for JWT validation. |
+
+##### One directory per installation
+
+The row above answers *restart* and not *duplication*, and the two are different
+questions. The registry is this process's own instance map — a `DashMap` in
+`GearManager`, with no store, no replication, no gossip and no quorum — and
+every worker is handed exactly one endpoint: `TOOLKIT_DIRECTORY_ENDPOINT` is a
+string, not a list, and there is no failover path.
+
+So two `gear-orchestrator` instances in one installation are two disjoint maps
+that never meet, and every consequence is silent rather than loud:
+
+* **The edge withdraws the other half's public routes.** api-gateway's
+  `compute_removals` treats an *empty* snapshot as a transient directory hiccup
+  and skips the prune. A second directory produces a **partial** snapshot, which
+  takes the ordinary filter path — so the routes belonging to gears registered
+  with the other directory are deregistered and the public API returns 404, with
+  no warning, because from the edge's point of view those gears legitimately
+  went away.
+* **Readiness never arrives.** A gear whose dependency registered with the other
+  directory stays at `503 {"state":"starting"}`. The re-registration loop is
+  idempotent and unbounded, so it neither succeeds nor fails.
+* **Instance targeting answers wrongly rather than emptily.** A half-view yields
+  a complete-looking ownership map over half the shards, and a non-match is
+  specified as `Ok(empty)` — so a caller cannot tell "no such shard" from "that
+  shard is registered with the other directory".
+
+This cannot be enforced the way `MultipleRestHosts` and `MultipleGrpcHubs` are.
+Those work because a process can enumerate its own gears; no process can
+enumerate another, so an installation-wide claim has no runtime vantage point.
+The gear therefore states it — `#[toolkit::gear(one_per_installation = true)]` —
+and composition tooling refuses a topology that would deploy it twice.
 
 #### Trust-coupled core (must remain co-located)
 

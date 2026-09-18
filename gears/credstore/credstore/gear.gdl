@@ -1,0 +1,30 @@
+# Gearbox product metadata for the credstore gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system, db, rest,
+# stateful), colocated_deps (authz-resolver, tenant-resolver, types-registry)
+# and the lifecycle clause.
+
+gear(
+    name = "Credentials Store",
+    description = "Secure per-tenant secret storage with pluggable backends and hierarchical sharing.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-credstore",
+        lib = "credstore",
+        path = ".",
+    ),
+
+    # A locator for the backend plugin trait this gear selects an
+    # implementation of; which plugins fill it is read from source.
+    sdk = cargo(
+        crate_name = "cf-gears-credstore-sdk",
+        lib = "credstore_sdk",
+        path = "../credstore-sdk",
+    ),
+
+    # Deliberately empty rather than absent: `test-support` pulls an
+    # OpenTelemetry SDK for the crate's own tests and is not a product choice.
+    cargo_features = [],
+)

@@ -1,0 +1,95 @@
+# Gearbox product metadata for the cluster gear.
+#
+# Projected from #[toolkit::gear]: id and runtime_caps. The attribute declares
+# `capabilities = [stateful, system, grpc, rest]`, and all four are read -- not
+# just `stateful`. `system` is why this gear starts before any application
+# consumer; `grpc` and `rest` are the surfaces the deployable model added, and
+# they are the reason a consumer is no longer pinned to this gear's process.
+#
+# `cluster_providers` is projected too -- from the with_*_provider calls in
+# ClusterGear::provider_registry(), and from each plugin crate's own
+# PROVIDER_NAME and backend impl. What that function registers today:
+#
+#   .with_cache_provider(StandaloneCacheProvider)
+#   .with_cache_provider(PostgresCacheProvider)
+#   .with_lock_provider(PostgresLockProvider)
+#   .with_cache_provider(RedisCacheProvider)
+#   .with_lock_provider(RedisLockProvider)
+#
+# Five registrations across three crates. A registration whose crate has no
+# `cluster_plugin` locator below is GBX0509 -- Gearbox can see the name in
+# `provider_registry()` and cannot find the crate to read its capabilities out
+# of, which is exactly what happened when the redis plugin landed here before
+# its locator did.
+#
+# Note there is still NO leader-election provider -- redis registers a cache and
+# a lock, like postgres -- so leader election always falls through to the SDK's
+# compare-and-swap default over the scope's cache.
+#
+# `cluster_plugins` below is a locator, not a restatement. The registry names a
+# library identifier (`standalone_cluster_plugin`) and nothing in that
+# expression says which directory the crate is in, so `package` supplies the one
+# hop Rust cannot -- the same role `sdk` plays for a contract. Names and
+# capabilities are then read out of those crates.
+#
+# `process_local` and `needs_credentials` are the two facts with no Rust
+# representation at all: the nearest signal is that one plugin's options carry a
+# connection string and the other's do not, and reading deployment semantics out
+# of that would be an inference rather than a fact. Declared deliberately.
+
+gear(
+    name = "Cluster Coordination",
+    description = "Cache, leader-election and distributed-lock primitives over pluggable backends.",
+    # "serverless" is the platform's own answer, from gears/system/cluster/gear.toml.
+    # It reads oddly for a coordination gear, but taking the team's taxonomy beats
+    # inventing a better-sounding one.
+    category = "serverless",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-cluster",
+        lib = "cluster",
+        path = ".",
+    ),
+
+    cluster_plugins = [
+        # An in-process store: every replica gets its own, coordinating none of
+        # the others. That is what makes it unusable in a multi-process topology
+        # (GBX0503) and perfect for dev and test.
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-gears-standalone-cluster-plugin",
+                lib = "standalone_cluster_plugin",
+                path = "../plugins/standalone-cluster-plugin",
+            ),
+            process_local = True,
+            needs_credentials = False,
+        ),
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-postgres-cluster-plugin",
+                lib = "postgres_cluster_plugin",
+                path = "../plugins/postgres-cluster-plugin",
+            ),
+            process_local = False,
+            needs_credentials = True,
+        ),
+        # A network service like postgres, and declared the same way for the
+        # same reasons: its state is not in any one process, and it is reached
+        # through an operator-supplied connection URL
+        # (`redis_cluster_plugin::connect`), which is where the credential is.
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-redis-cluster-plugin",
+                lib = "redis_cluster_plugin",
+                path = "../plugins/redis-cluster-plugin",
+            ),
+            process_local = False,
+            needs_credentials = True,
+        ),
+    ],
+
+    # `integration` gates tests that want a running backend, so it is not offered.
+    # `k8s-auth` belongs to a Kubernetes deployment and to no other.
+    cargo_features = [feature("k8s-auth", kinds = ["kubernetes"])],
+)

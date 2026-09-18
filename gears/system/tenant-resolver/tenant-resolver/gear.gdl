@@ -1,0 +1,35 @@
+# Gearbox product metadata for the tenant resolver.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
+# (types-registry). Mirrors authn-resolver exactly, including the `vendor`
+# selector defaulting to `constructorfabric`.
+
+gear(
+    name = "Tenant Resolver",
+    description = "Resolves tenant identity and hierarchy through a selected plugin.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-tenant-resolver",
+        lib = "tenant_resolver",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-tenant-resolver-sdk",
+        lib = "tenant_resolver_sdk",
+        path = "../tenant-resolver-sdk",
+    ),
+
+    # A locator plus a curation, and neither half restates the other. The field's
+    # name, type, whether it is required and its `constructorfabric` default are
+    # all read from `TenantResolverConfig` -- declaring them here would be the
+    # drift GBX0210 exists to refuse. What is declared is the one judgement Rust
+    # cannot hold: that `vendor` is worth putting in front of an integrator.
+    #
+    # `rust` is omitted: the struct is found from the single `ctx.config*()` call
+    # in `impl Gear::init`, which is the only machine-readable link between a
+    # gear and its config type.
+    config_schema = config(exposes = ["vendor"]),
+)

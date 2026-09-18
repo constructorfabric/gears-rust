@@ -9,6 +9,9 @@ description = "api-contracts example — consumer gear that resolves PaymentApi 
 rust-version.workspace = true
 publish = false
 
+[lib]
+name = "cf_api_contracts_consumer"
+
 [features]
 default = []
 # OpenTelemetry in the resolved REST client: W3C traceparent propagation + RED
@@ -23,6 +26,9 @@ workspace = true
 # `PaymentApiRestResolvingClient` unconditionally, so the SDK must always
 # generate it.
 api-contracts-sdk = { workspace = true, features = ["rest-client"] }
+# The cluster profile marker in `src/cluster.rs`. Not `deps = [cluster]`: see the
+# module comment for why a hard topo-sort edge would refuse to start.
+cluster-sdk.workspace = true
 toolkit.workspace = true
 toolkit-canonical-errors.workspace = true
 toolkit-security.workspace = true

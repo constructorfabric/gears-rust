@@ -212,6 +212,7 @@ impl Parse for GearConfig {
         let mut seen_ctor = false;
         let mut seen_client = false;
         let mut seen_lifecycle = false;
+        let mut seen_one_per_installation = false;
 
         let punctuated: Punctuated<Meta, Token![,]> =
             input.parse_terminated(Meta::parse, Token![,])?;
@@ -290,6 +291,40 @@ impl Parse for GearConfig {
                                 "client must be a trait path, e.g. client = crate::api::MyClient",
                             ));
                         }
+                    }
+                }
+                // `one_per_installation = <bool>`: this gear may exist only once in
+                // a running installation.
+                //
+                // Validated here and deliberately not stored. There is nothing
+                // for the runtime to do with it: a process can refuse a second
+                // `rest_host` because it can see its own gears, and no process
+                // can see another, so an installation-wide claim has no runtime
+                // vantage point. What acts on it is composition tooling, which
+                // reads this attribute's source rather than this macro's output.
+                //
+                // So the macro's job here is to make a typo a compile error
+                // instead of a silently ignored argument -- which is what the
+                // fallthrough below would otherwise make it.
+                Meta::NameValue(nv) if nv.path.is_ident("one_per_installation") => {
+                    if seen_one_per_installation {
+                        return Err(syn::Error::new_spanned(
+                            nv.path,
+                            "duplicate `one_per_installation` parameter",
+                        ));
+                    }
+                    seen_one_per_installation = true;
+                    if !matches!(
+                        nv.value,
+                        Expr::Lit(syn::ExprLit {
+                            lit: Lit::Bool(_),
+                            ..
+                        })
+                    ) {
+                        return Err(syn::Error::new_spanned(
+                            nv.value,
+                            "one_per_installation must be a bool, e.g. one_per_installation = true",
+                        ));
                     }
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("deps") => {
