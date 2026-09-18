@@ -1,0 +1,11 @@
+error: pep_prop: column name '2fa_col' does not form a valid column variant ('2faCol'); use a snake_case identifier
+  --> tests/ui/err_pep_column_not_an_identifier.rs:15:14
+   |
+15 |     pep_prop(second_factor = "2fa_col")
+   |              ^^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/err_pep_column_not_an_identifier.rs:17:14
+   |
+17 | struct Model;
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/err_pep_column_not_an_identifier.rs`

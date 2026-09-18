@@ -36,6 +36,7 @@ fn ui() {
     t.compile_fail("tests/ui/err_pep_reserved_id.rs");
     t.compile_fail("tests/ui/err_pep_reserved_owner_id.rs");
     t.compile_fail("tests/ui/err_pep_duplicate_property.rs");
+    t.compile_fail("tests/ui/err_pep_column_not_an_identifier.rs");
     t.compile_fail("tests/ui/err_unrestricted_with_pep.rs");
     t.compile_fail("tests/ui/err_pep_before_unrestricted.rs");
 

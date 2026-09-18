@@ -265,6 +265,24 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
             ));
         }
 
+        // Check the column name forms a usable column variant.
+        //
+        // `syn::Ident::new` panics on anything that is not a valid Rust
+        // identifier, which aborts expansion with a bare `proc macro panicked`
+        // and no span at all. Every other bad input here gets a spanned error;
+        // the column name was the last one that could still crash the macro
+        // instead of reporting.
+        let variant = snake_to_upper_camel(column);
+        if !is_ident(&variant) {
+            return Err(syn::Error::new(
+                *span,
+                format!(
+                    "pep_prop: column name '{column}' does not form a valid column variant \
+                     ('{variant}'); use a snake_case identifier"
+                ),
+            ));
+        }
+
         // Check for duplicate property names
         if !seen.insert(property.clone()) {
             return Err(syn::Error::new(
@@ -275,6 +293,19 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `s` is a valid Rust identifier.
+///
+/// ASCII only: the workspace sets `non_ascii_idents = "forbid"`, so an
+/// identifier this crate generates could not use anything else anyway.
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Validate a single dimension has exactly one specification
