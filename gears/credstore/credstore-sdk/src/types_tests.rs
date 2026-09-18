@@ -138,3 +138,10 @@ fn serde_round_trip_uses_short_name() {
     assert_eq!(back, t);
     assert!(serde_json::from_str::<SecretType>("\"bogus\"").is_err());
 }
+
+#[test]
+fn secret_type_debug_and_display_name_the_catalog_entry() {
+    let t = SecretType::from_name("api-key").expect("known");
+    assert_eq!(t.to_string(), "api-key");
+    assert_eq!(format!("{t:?}"), "SecretType(\"api-key\")");
+}
