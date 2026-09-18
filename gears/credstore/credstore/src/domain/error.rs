@@ -44,7 +44,7 @@ pub enum DomainError {
         detail: String,
     },
     /// A request is malformed independently of any secret type (ADR-0004):
-    /// `VALUE_REQUIRED`, `EMPTY_PATCH`, `NULL_NOT_ALLOWED`,
+    /// `SECRET_REQUIRED`, `EMPTY_PATCH`, `NULL_NOT_ALLOWED`,
     /// `PRECONDITION_REQUIRED`, `TYPE_REQUIRED`. `reason` is the stable
     /// machine-readable code; `field` names the offending request field.
     #[error("invalid request ({reason}): {detail}")]

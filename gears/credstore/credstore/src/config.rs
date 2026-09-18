@@ -70,7 +70,7 @@ impl Default for GcCfg {
 }
 
 /// Settings for the collection read (`GET /credstore/v1/credentials`,
-/// ADR-0005/ADR-0004): the metadata-mode page-size cap and the value-mode
+/// ADR-0005/ADR-0004): the metadata-mode page-size cap and the secret-mode
 /// (`$select` containing `secret`) match-set cap. Neither is specified by a
 /// config key in the design docs; both are introduced here as the
 /// implementation's own knobs, named after the ADRs' proposed defaults.
@@ -81,18 +81,18 @@ pub struct ListCfg {
     /// value above this is rejected (400 `INVALID_LIMIT`) rather than
     /// silently clamped.
     pub max_limit: u64,
-    /// Cap on how many references a value-mode (`$select=…,secret`) request
+    /// Cap on how many references a secret-mode (`$select=…,secret`) request
     /// may match. Enforced by fetching `cap + 1` candidate references and
     /// failing closed with `400 TOO_MANY_MATCHES` if the `(cap + 1)`th
     /// appears — never by a `COUNT` query.
-    pub value_mode_cap: u64,
+    pub secret_mode_cap: u64,
 }
 
 impl Default for ListCfg {
     fn default() -> Self {
         Self {
             max_limit: 200,
-            value_mode_cap: 25,
+            secret_mode_cap: 25,
         }
     }
 }
@@ -116,8 +116,8 @@ impl CredStoreConfig {
         if self.list.max_limit == 0 {
             return Err("list.max_limit must be > 0".to_owned());
         }
-        if self.list.value_mode_cap == 0 {
-            return Err("list.value_mode_cap must be > 0".to_owned());
+        if self.list.secret_mode_cap == 0 {
+            return Err("list.secret_mode_cap must be > 0".to_owned());
         }
         Ok(())
     }
@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(cfg.gc.pending_max_age_secs, 3600);
         assert_eq!(cfg.gc.batch_size, 256);
         assert_eq!(cfg.list.max_limit, 200);
-        assert_eq!(cfg.list.value_mode_cap, 25);
+        assert_eq!(cfg.list.secret_mode_cap, 25);
         assert!(cfg.validate().is_ok());
     }
 
@@ -160,7 +160,7 @@ mod tests {
             serde_json::from_str(r#"{"list":{"max_limit":50}}"#).expect("deserialize");
         assert_eq!(cfg.list.max_limit, 50);
         // Unspecified fields fall back to defaults.
-        assert_eq!(cfg.list.value_mode_cap, 25);
+        assert_eq!(cfg.list.secret_mode_cap, 25);
     }
 
     #[test]
@@ -208,14 +208,14 @@ mod tests {
         };
         assert!(zero_max_limit.validate().is_err());
 
-        let zero_value_mode_cap = CredStoreConfig {
+        let zero_secret_mode_cap = CredStoreConfig {
             list: ListCfg {
-                value_mode_cap: 0,
+                secret_mode_cap: 0,
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert!(zero_value_mode_cap.validate().is_err());
+        assert!(zero_secret_mode_cap.validate().is_err());
     }
 
     #[test]

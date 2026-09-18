@@ -53,7 +53,7 @@ fn test_gc_settings_zero_age() -> GcSettings {
 fn test_list_settings() -> ListSettings {
     ListSettings {
         max_limit: 200,
-        value_mode_cap: 25,
+        secret_mode_cap: 25,
     }
 }
 
@@ -137,7 +137,7 @@ fn write_create_typed(sharing: SharingMode, value: &str, type_name: &str) -> Cre
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     }
 }
 
@@ -149,7 +149,7 @@ fn write_replace(sharing: SharingMode, value: &str) -> CredentialWrite {
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     }
 }
 
@@ -161,7 +161,7 @@ fn write_create_null(sharing: SharingMode, fallback: SdkFallback) -> CredentialW
         sharing,
         fallback,
         expires_at: None,
-        value: None,
+        secret: None,
     }
 }
 
@@ -175,7 +175,7 @@ fn write_replace_null(sharing: SharingMode, fallback: SdkFallback) -> Credential
         sharing,
         fallback,
         expires_at: None,
-        value: None,
+        secret: None,
     }
 }
 
@@ -185,13 +185,13 @@ fn empty_patch() -> CredentialPatch {
         sharing: None,
         fallback: None,
         expires_at: PatchField::Absent,
-        value: PatchField::Absent,
+        secret: PatchField::Absent,
     }
 }
 
 fn patch_value(value: &str) -> CredentialPatch {
     CredentialPatch {
-        value: PatchField::Set(SecretValue::from(value)),
+        secret: PatchField::Set(SecretValue::from(value)),
         ..empty_patch()
     }
 }
@@ -206,7 +206,7 @@ fn patch_sharing(sharing: SharingMode) -> CredentialPatch {
 fn patch_suppress() -> CredentialPatch {
     CredentialPatch {
         fallback: Some(SdkFallback::None),
-        value: PatchField::Null,
+        secret: PatchField::Null,
         ..empty_patch()
     }
 }
@@ -244,7 +244,7 @@ async fn get_own_tenant_secret_returns_hit_own() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"v1");
+    assert_eq!(got.secret.as_bytes(), b"v1");
     assert_eq!(metrics.last_read_outcome(), Some(ReadOutcome::HitOwn));
 
     let cred = svc.get(&ctx, &key("k")).await.expect("get").expect("some");
@@ -278,7 +278,7 @@ async fn get_inherited_shared_from_parent_sets_inherited_status() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"shared-v");
+    assert_eq!(got.secret.as_bytes(), b"shared-v");
 
     let cred = svc
         .get(&child_ctx, &key("shared-k"))
@@ -390,7 +390,7 @@ async fn get_shadowing_private_beats_inherited() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"private");
+    assert_eq!(got.secret.as_bytes(), b"private");
     let cred = svc
         .get(&child_ctx, &key("k"))
         .await
@@ -530,7 +530,7 @@ async fn create_starts_at_version_one_then_overwrite_bumps() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"v2");
+    assert_eq!(got.secret.as_bytes(), b"v2");
 }
 
 #[tokio::test]
@@ -576,7 +576,7 @@ async fn put_create_without_type_is_rejected() {
         sharing: SharingMode::Tenant,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from("v")),
+        secret: Some(SecretValue::from("v")),
     };
     let err = svc
         .put(&ctx, &key("k"), write, create_only())
@@ -755,7 +755,7 @@ async fn torn_write_leaves_old_value_serving_and_run_gc_reclaims_the_orphan() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"old");
+    assert_eq!(got.secret.as_bytes(), b"old");
     assert_eq!(repo.rows()[0].value_id, Some(old_value_id));
 
     // A pending gc row exists for the orphaned new value_id.
@@ -821,7 +821,7 @@ async fn cas_lost_marks_uploaded_version_aborted_and_deletes_it_winner_serves() 
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"winner");
+    assert_eq!(got.secret.as_bytes(), b"winner");
 }
 
 #[tokio::test]
@@ -871,7 +871,7 @@ async fn two_exists_writers_sequentially_last_pointer_wins_earlier_collected() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"v3", "last writer wins");
+    assert_eq!(got.secret.as_bytes(), b"v3", "last writer wins");
 
     // Both superseded versions were collected by each write's own step-5
     // cleanup (the default FakePlugin never fails delete).
@@ -983,7 +983,7 @@ async fn read_races_a_switch_retry_returns_the_current_version() {
         .expect("get_secret")
         .expect("some");
     assert_eq!(
-        got.value.as_bytes(),
+        got.secret.as_bytes(),
         b"new",
         "the retry must serve the current (post-switch) version"
     );
@@ -1027,7 +1027,7 @@ async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
         .await
         .expect("get_secret")
         .expect("some");
-    assert_eq!(got.value.as_bytes(), b"new");
+    assert_eq!(got.secret.as_bytes(), b"new");
     // The predecessor's version was collected by delete's own step-3 cleanup.
     assert!(!plugin.contains(&TenantId(tenant), old_value_id));
 }
@@ -1935,7 +1935,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t2 get_secret")
             .expect("v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -1945,7 +1945,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t3 get_secret")
             .expect("v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -1984,7 +1984,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t3 get_secret")
             .expect("v2")
-            .value
+            .secret
             .as_bytes(),
         b"V2"
     );
@@ -2021,7 +2021,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t3 get_secret")
             .expect("v3")
-            .value
+            .secret
             .as_bytes(),
         b"V3"
     );
@@ -2032,7 +2032,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         "a value-only PATCH must not evaluate `write`: {seen:?}"
     );
 
-    // Step 3: T2 suppresses {"fallback": "none", "value": null} — one
+    // Step 3: T2 suppresses {"fallback": "none", "secret": null} — one
     // transaction. T2's row becomes declared/none; T2 and T3 now get None;
     // T2's record reads suppressed/declared; T1 untouched.
     let t2_after_rotate = svc_t2
@@ -2079,7 +2079,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t1 get_secret")
             .expect("still v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1",
         "T1's own record and value are untouched"
@@ -2103,7 +2103,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t2 get_secret")
             .expect("inherits v1 again")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -2113,7 +2113,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .await
             .expect("t3 get_secret")
             .expect("inherits v1 again")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -2507,7 +2507,7 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
             .await
             .expect("get_secret")
             .expect("v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -2515,7 +2515,7 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
 
 fn patch_value_null_keep_inherit() -> CredentialPatch {
     CredentialPatch {
-        value: PatchField::Null,
+        secret: PatchField::Null,
         ..empty_patch()
     }
 }
@@ -2563,7 +2563,7 @@ async fn patch_value_on_declared_row_switches_it_to_active() {
             .await
             .expect("get_secret")
             .expect("v2")
-            .value
+            .secret
             .as_bytes(),
         b"v2"
     );
@@ -2760,7 +2760,7 @@ async fn get_item_without_select_evaluates_read_only_and_carries_no_value() {
 }
 
 #[tokio::test]
-async fn get_item_select_value_evaluates_read_secret_only_and_carries_the_value() {
+async fn get_item_select_secret_evaluates_read_secret_only_and_carries_the_value() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -2777,7 +2777,7 @@ async fn get_item_select_value_evaluates_read_secret_only_and_carries_the_value(
     .await
     .expect("create");
 
-    let fields = ["value".to_owned()];
+    let fields = ["secret".to_owned()];
     let item = svc
         .get_item(&ctx, &key("k"), Some(&fields))
         .await
@@ -2798,7 +2798,7 @@ async fn get_item_select_value_evaluates_read_secret_only_and_carries_the_value(
 }
 
 #[tokio::test]
-async fn get_item_select_sharing_and_value_evaluates_both_actions() {
+async fn get_item_select_sharing_and_secret_evaluates_both_actions() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -2815,7 +2815,7 @@ async fn get_item_select_sharing_and_value_evaluates_both_actions() {
     .await
     .expect("create");
 
-    let fields = ["sharing".to_owned(), "value".to_owned()];
+    let fields = ["sharing".to_owned(), "secret".to_owned()];
     let item = svc
         .get_item(&ctx, &key("k"), Some(&fields))
         .await
@@ -2828,7 +2828,7 @@ async fn get_item_select_sharing_and_value_evaluates_both_actions() {
 }
 
 #[tokio::test]
-async fn get_item_denial_of_read_secret_with_value_selected_returns_none() {
+async fn get_item_denial_of_read_secret_with_secret_selected_returns_none() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -2850,7 +2850,7 @@ async fn get_item_denial_of_read_secret_with_value_selected_returns_none() {
         action_deny_enforcer(denied_type, crate::domain::authz::actions::READ_SECRET);
     let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
 
-    let fields = ["value".to_owned()];
+    let fields = ["secret".to_owned()];
     let item = svc
         .get_item(&ctx, &key("k"), Some(&fields))
         .await
@@ -2859,8 +2859,8 @@ async fn get_item_denial_of_read_secret_with_value_selected_returns_none() {
 }
 
 #[tokio::test]
-async fn get_item_suppressed_winner_with_value_only_selected_returns_none_but_record_still_visible()
-{
+async fn get_item_suppressed_winner_with_secret_only_selected_returns_none_but_record_still_visible()
+ {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -2887,7 +2887,7 @@ async fn get_item_suppressed_winner_with_value_only_selected_returns_none_but_re
 
     // A pure value-only projection of a value-less (declared) row is the
     // canonical miss, exactly as the withdrawn `GET …/secret` was.
-    let value_only = ["value".to_owned()];
+    let value_only = ["secret".to_owned()];
     let item = svc
         .get_item(&ctx, &key("k"), Some(&value_only))
         .await
@@ -2896,7 +2896,7 @@ async fn get_item_suppressed_winner_with_value_only_selected_returns_none_but_re
 
     // The same value-less row, projected together with an administrative
     // field, is a record with no `value` instead of a miss.
-    let with_admin = ["sharing".to_owned(), "value".to_owned()];
+    let with_admin = ["sharing".to_owned(), "secret".to_owned()];
     let item = svc
         .get_item(&ctx, &key("k"), Some(&with_admin))
         .await
@@ -3016,7 +3016,7 @@ async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
             .await
             .expect("t3 get_secret")
             .expect("v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1"
     );
@@ -3080,7 +3080,7 @@ async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
             .await
             .expect("t1 get_secret")
             .expect("still v1")
-            .value
+            .secret
             .as_bytes(),
         b"V1",
         "T1's own record and value are untouched"

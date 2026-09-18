@@ -49,8 +49,8 @@ pub fn register_routes(
             "Upward-rooted collection read (ADR-0005): one reduced item per reference, from \
              the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ \
              `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after \
-             reduction); `$orderby` accepts only `reference`. Selecting `value` in `$select` \
-             switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or \
+             reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` \
+             switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or \
              `type` selector only, capped and unpaginated.",
         )
         .tag(TAG)
@@ -69,7 +69,7 @@ pub fn register_routes(
         .json_response_with_schema::<toolkit_odata::Page<CredentialDto>>(
             openapi,
             StatusCode::OK,
-            "A page of reduced credential items (value-mode items additionally carry `value`)",
+            "A page of reduced credential items (secret-mode items additionally carry `secret`)",
         )
         .standard_errors(openapi)
         .error_503(openapi)
@@ -81,12 +81,12 @@ pub fn register_routes(
         .description(
             "Retrieve the credential for the authenticated tenant, with walk-up resolution: \
              the same item shape the collection returns. Without `$select`, the record fields \
-             only (never `value`); selecting `value` includes it, for a caller the projection's \
+             only (never `secret`); selecting `secret` includes it, for a caller the projection's \
              action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ \
              `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` \
-             when `value` is named, both when both. Supersedes the withdrawn \
-             `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,value` is its \
-             equivalent, and a value-only projection resolving to a value-less winner is the \
+             when `secret` is named, both when both. Supersedes the withdrawn \
+             `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,secret` is its \
+             equivalent, and a secret-only projection resolving to a value-less winner is the \
              same canonical 404 that address gave.",
         )
         .tag(TAG)
@@ -101,7 +101,7 @@ pub fn register_routes(
         .json_response_with_schema::<CredentialDto>(
             openapi,
             StatusCode::OK,
-            "The resolved credential, carrying `value` only when `$select` names it",
+            "The resolved credential, carrying `secret` only when `$select` names it",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -115,13 +115,13 @@ pub fn register_routes(
         .operation_id("credstore.put_credential")
         .summary("Create or replace a credential by reference")
         .description(
-            "Whole-credential replace: record and, unless `value` is an explicit `null`, its \
+            "Whole-credential replace: record and, unless `secret` is an explicit `null`, its \
              value together, in one call. Exactly one of `If-None-Match: *` (create-only) or \
-             `If-Match` (guarded/unconditional replace) is required. `value` is required in the \
-             body (its absence is 400 VALUE_REQUIRED) but is tri-state: a string writes a \
+             `If-Match` (guarded/unconditional replace) is required. `secret` is required in the \
+             body (its absence is 400 SECRET_REQUIRED) but is tri-state: a string writes a \
              value; an explicit `null` writes none -- on create the row is inserted `declared`; \
              on replace of an active row the value is removed in the same transaction \
-             `PATCH {\"value\": null}` uses; on replace of an already-declared row nothing about \
+             `PATCH {\"secret\": null}` uses; on replace of an already-declared row nothing about \
              the value changes.",
         )
         .tag(TAG)
@@ -163,7 +163,7 @@ pub fn register_routes(
         .description(
             "RFC 7396 JSON Merge Patch over the record, the value, or both. Requires \
              `Content-Type: application/merge-patch+json` (415 otherwise) and a mandatory \
-             `If-Match`. Never creates. A body carrying no `value` key whose metadata already \
+             `If-Match`. Never creates. A body carrying no `secret` key whose metadata already \
              matches the current record is a no-op (204, unchanged ETag).",
         )
         .tag(TAG)

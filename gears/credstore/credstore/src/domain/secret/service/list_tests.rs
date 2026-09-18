@@ -31,7 +31,7 @@ fn write_typed(sharing: SharingMode, value: &str, type_name: &str) -> Credential
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     }
 }
 
@@ -45,7 +45,7 @@ fn patch_suppress() -> CredentialPatch {
         sharing: None,
         fallback: Some(SdkFallback::None),
         expires_at: PatchField::Absent,
-        value: PatchField::Null,
+        secret: PatchField::Null,
     }
 }
 
@@ -59,7 +59,7 @@ fn service_with(
     dir: Arc<dyn TenantDirectory>,
     enforcer: authz_resolver_sdk::PolicyEnforcer,
     max_limit: u64,
-    value_mode_cap: u64,
+    secret_mode_cap: u64,
 ) -> Service {
     Service::new(
         repo,
@@ -74,7 +74,7 @@ fn service_with(
         },
         ListSettings {
             max_limit,
-            value_mode_cap,
+            secret_mode_cap,
         },
     )
 }
@@ -242,7 +242,7 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
     assert_eq!(d.credential.status, CredentialStatus::Declared);
 
     // Metadata mode never carries a value.
-    assert!(page.items.iter().all(|i| i.value.is_none()));
+    assert!(page.items.iter().all(|i| i.secret.is_none()));
 }
 
 // ── type clamp / authorization ───────────────────────────────────────────────
@@ -416,32 +416,32 @@ async fn orderby_other_than_reference_is_rejected() {
     assert_eq!(reason_of(&err), "INVALID_ORDERBY_FIELD");
 }
 
-// ── value mode ───────────────────────────────────────────────────────────────
+// ── secret mode ───────────────────────────────────────────────────────────────
 
-fn value_mode_query(filter_raw: &str) -> ODataQuery {
+fn secret_mode_query(filter_raw: &str) -> ODataQuery {
     ODataQuery::new()
-        .with_select(vec!["reference".to_owned(), "value".to_owned()])
+        .with_select(vec!["reference".to_owned(), "secret".to_owned()])
         .with_filter(filter_expr(filter_raw))
 }
 
 #[tokio::test]
-async fn value_mode_rejects_limit_and_cursor() {
+async fn secret_mode_rejects_limit_and_cursor() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
     let svc = default_service(repo, dir);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
-    let with_limit = value_mode_query("reference eq 'r'").with_limit(10);
+    let with_limit = secret_mode_query("reference eq 'r'").with_limit(10);
     let err = svc
         .list(&ctx, &with_limit)
         .await
-        .expect_err("limit must be rejected in value mode");
-    assert_eq!(reason_of(&err), "VALUE_MODE_NO_PAGINATION");
+        .expect_err("limit must be rejected in secret mode");
+    assert_eq!(reason_of(&err), "SECRET_MODE_NO_PAGINATION");
 }
 
 #[tokio::test]
-async fn value_mode_over_cap_fails_closed() {
+async fn secret_mode_over_cap_fails_closed() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -460,13 +460,13 @@ async fn value_mode_over_cap_fails_closed() {
         .expect("create");
     }
 
-    let query = value_mode_query("reference in ('r1', 'r2', 'r3')");
+    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
     let err = svc.list(&ctx, &query).await.expect_err("must fail closed");
     assert_eq!(reason_of(&err), "TOO_MANY_MATCHES");
 }
 
 #[tokio::test]
-async fn value_mode_items_carry_values_and_evaluate_read_secret_once_per_type() {
+async fn secret_mode_items_carry_values_and_evaluate_read_secret_once_per_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -492,13 +492,13 @@ async fn value_mode_items_carry_values_and_evaluate_read_secret_once_per_type() 
     .await
     .expect("create r2");
 
-    let query = value_mode_query("reference in ('r1', 'r2')");
+    let query = secret_mode_query("reference in ('r1', 'r2')");
     let page = svc.list(&ctx, &query).await.expect("list");
 
     assert_eq!(page.page_info.next_cursor, None);
     assert_eq!(page.items.len(), 2);
     for item in &page.items {
-        let value = item.value.as_ref().expect("value present");
+        let value = item.secret.as_ref().expect("value present");
         let expected = if item.credential.reference.as_ref() == "r1" {
             "value-one"
         } else {
@@ -518,7 +518,7 @@ async fn value_mode_items_carry_values_and_evaluate_read_secret_once_per_type() 
 }
 
 #[tokio::test]
-async fn value_mode_omits_items_of_a_refused_type() {
+async fn secret_mode_omits_items_of_a_refused_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -558,17 +558,17 @@ async fn value_mode_omits_items_of_a_refused_type() {
 
     let (enforcer, _resolver) = type_deny_enforcer(vec![denied_gts]);
     let svc = service_with(repo, plugin, dir, enforcer, 200, 25);
-    let query = value_mode_query("reference in ('allowed', 'denied')");
+    let query = secret_mode_query("reference in ('allowed', 'denied')");
     let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(references_of(&page), vec!["allowed"]);
     assert_eq!(
-        page.items[0].value.as_ref().expect("value").as_bytes(),
+        page.items[0].secret.as_ref().expect("value").as_bytes(),
         b"v-ok"
     );
 }
 
 #[tokio::test]
-async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
+async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -593,20 +593,20 @@ async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
         .await
         .expect("create r1");
 
-    // A pure value-only selector evaluates `read_secret` alone.
+    // A pure secret-only selector evaluates `read_secret` alone.
     let (enforcer, resolver) = type_recording_enforcer();
     let svc = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer, 200, 25);
-    let value_only = value_mode_query("reference eq 'r1'");
-    let page = svc.list(&ctx, &value_only).await.expect("list");
+    let secret_only = secret_mode_query("reference eq 'r1'");
+    let page = svc.list(&ctx, &secret_only).await.expect("list");
     assert_eq!(references_of(&page), vec!["r1"]);
     let seen = resolver.seen_actions();
     assert!(seen.contains(&"read_secret".to_owned()));
     assert!(
         !seen.contains(&"list".to_owned()),
-        "a value-only selector must not evaluate list: {seen:?}"
+        "a secret-only selector must not evaluate list: {seen:?}"
     );
 
-    // Selecting a record-only field alongside `value` needs `list` too.
+    // Selecting a record-only field alongside `secret` needs `list` too.
     let (enforcer2, resolver2) = type_recording_enforcer();
     let svc2 = service_with(
         repo.clone(),
@@ -620,7 +620,7 @@ async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
         .with_select(vec![
             "reference".to_owned(),
             "sharing".to_owned(),
-            "value".to_owned(),
+            "secret".to_owned(),
         ])
         .with_filter(filter_expr("reference eq 'r1'"));
     let page2 = svc2.list(&ctx, &combined).await.expect("list");
@@ -630,7 +630,7 @@ async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
     assert!(seen2.contains(&"list".to_owned()));
 
     // And a caller denied `list` (but holding `read_secret`) loses the item
-    // entirely once a record field rides with `value` — dropped, not
+    // entirely once a record field rides with `secret` — dropped, not
     // returned without its record fields (ADR-0004 Amendment A).
     let (enforcer3, _resolver3) = action_deny_enforcer(
         SecretType::generic().gts_id().to_owned(),
@@ -640,7 +640,7 @@ async fn value_mode_with_record_field_selected_also_requires_list_per_type() {
     let page3 = svc3.list(&ctx, &combined).await.expect("list");
     assert!(
         page3.items.is_empty(),
-        "list denied must drop the type entirely when a record field rides with value"
+        "list denied must drop the type entirely when a record field rides with secret"
     );
 }
 

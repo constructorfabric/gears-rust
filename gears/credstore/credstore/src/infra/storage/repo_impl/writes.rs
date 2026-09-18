@@ -546,7 +546,7 @@ async fn update_metadata_tx(
     Some(entity_to_model(row)).transpose()
 }
 
-/// Value-removal write (ADR-0004 `PATCH {"value": null}`, "How a record
+/// Value-removal write (ADR-0004 `PATCH {"secret": null}`, "How a record
 /// reaches it"): one transaction — nulls the pointer/fingerprint, moves the
 /// row to `declared`, applies the merged metadata, and enqueues the old
 /// version (if any) for garbage collection.

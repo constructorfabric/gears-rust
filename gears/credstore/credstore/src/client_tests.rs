@@ -25,7 +25,7 @@ fn generic_write(value: &str) -> credstore_sdk::CredentialWrite {
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     }
 }
 
@@ -35,7 +35,7 @@ fn replace_write(value: &str) -> credstore_sdk::CredentialWrite {
         sharing: SharingMode::Tenant,
         fallback: Fallback::Inherit,
         expires_at: None,
-        value: Some(SecretValue::from(value)),
+        secret: Some(SecretValue::from(value)),
     }
 }
 
@@ -54,7 +54,7 @@ fn build_client(repo: Arc<FakeSecretRepo>, dir: Arc<FakeDir>) -> CredStoreLocalC
         },
         ListSettings {
             max_limit: 200,
-            value_mode_cap: 25,
+            secret_mode_cap: 25,
         },
     ));
     CredStoreLocalClient::new(svc)
@@ -234,7 +234,7 @@ async fn precondition_guards_in_process_write_and_delete() {
                 sharing: None,
                 fallback: None,
                 expires_at: PatchField::Absent,
-                value: PatchField::Set(SecretValue::from("v2")),
+                secret: PatchField::Set(SecretValue::from("v2")),
             },
             stale,
         )
@@ -251,7 +251,7 @@ async fn precondition_guards_in_process_write_and_delete() {
                 sharing: None,
                 fallback: None,
                 expires_at: PatchField::Absent,
-                value: PatchField::Set(SecretValue::from("v3")),
+                secret: PatchField::Set(SecretValue::from("v3")),
             },
             stale,
         )

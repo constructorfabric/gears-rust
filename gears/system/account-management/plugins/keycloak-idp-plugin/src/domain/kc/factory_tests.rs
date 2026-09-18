@@ -161,7 +161,7 @@ async fn factory_with_tls_ca_bundle_ref_loads_bundle() {
             reference: SecretRef::new("platform-ca-bundle").expect("valid SecretRef"),
             secret_type: String::new(),
             expires_at: None,
-            value: SecretValue::from(pem.as_str()),
+            secret: SecretValue::from(pem.as_str()),
             validator: Validator {
                 id: Uuid::nil(),
                 version: 1,
@@ -214,7 +214,7 @@ async fn factory_with_invalid_tls_ca_bundle_fails_init() {
             reference: SecretRef::new("platform-ca-bundle").expect("valid SecretRef"),
             secret_type: String::new(),
             expires_at: None,
-            value: SecretValue::from(bad_pem),
+            secret: SecretValue::from(bad_pem),
             validator: Validator {
                 id: Uuid::nil(),
                 version: 1,

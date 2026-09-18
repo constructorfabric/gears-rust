@@ -129,14 +129,14 @@ where
 }
 
 /// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state
-/// `value` per Amendment B): a whole-credential replace. `value` is tri-state
-/// (`Option<Option<String>>`, like [`CredentialPatchDto::value`]) so its
-/// *absence* — rejected with the typed `VALUE_REQUIRED` reason rather than a
-/// generic deserialization error — can be told apart from an explicit JSON
-/// `null` (no value is written: a value-less create, or a value
+/// `secret` per Amendment B): a whole-credential replace. `secret` is
+/// tri-state (`Option<Option<String>>`, like [`CredentialPatchDto::secret`])
+/// so its *absence* — rejected with the typed `SECRET_REQUIRED` reason rather
+/// than a generic deserialization error — can be told apart from an explicit
+/// JSON `null` (no value is written: a value-less create, or a value
 /// removal/no-op on replace) and from a string (the value is written).
 ///
-/// `Debug` is hand-written to redact `value`.
+/// `Debug` is hand-written to redact `secret`.
 #[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -156,12 +156,12 @@ pub struct PutCredentialRequestDto {
     #[serde(default)]
     #[schema(format = DateTime)]
     pub expires_at: Option<String>,
-    /// The value to write. Required at the wire — absent is `400
-    /// VALUE_REQUIRED` — but once present it is tri-state: a string writes a
+    /// The secret to write. Required at the wire — absent is `400
+    /// SECRET_REQUIRED` — but once present it is tri-state: a string writes a
     /// value, an explicit `null` writes none (ADR-0004 Amendment B).
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
-    pub value: Option<Option<String>>,
+    pub secret: Option<Option<String>>,
 }
 
 impl std::fmt::Debug for PutCredentialRequestDto {
@@ -172,8 +172,8 @@ impl std::fmt::Debug for PutCredentialRequestDto {
             .field("fallback", &self.fallback)
             .field("expires_at", &self.expires_at)
             .field(
-                "value",
-                &match &self.value {
+                "secret",
+                &match &self.secret {
                     None => "<absent>",
                     Some(None) => "<null>",
                     Some(Some(_)) => "[REDACTED]",
@@ -188,9 +188,9 @@ impl std::fmt::Debug for PutCredentialRequestDto {
 /// absent (untouched), explicit `null`, or a value. `secret_type`/`sharing`/
 /// `fallback` have no valid `null` state on the wire (rejected as
 /// `NULL_NOT_ALLOWED` by the handler, since none is a nullable column);
-/// `expires_at`/`value` do — `null` clears/removes them.
+/// `expires_at`/`secret` do — `null` clears/removes them.
 ///
-/// `Debug` is hand-written to redact `value`.
+/// `Debug` is hand-written to redact `secret`.
 #[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -214,7 +214,7 @@ pub struct CredentialPatchDto {
     pub expires_at: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
-    pub value: Option<Option<String>>,
+    pub secret: Option<Option<String>>,
 }
 
 impl std::fmt::Debug for CredentialPatchDto {
@@ -225,8 +225,8 @@ impl std::fmt::Debug for CredentialPatchDto {
             .field("fallback", &self.fallback)
             .field("expires_at", &self.expires_at)
             .field(
-                "value",
-                &match &self.value {
+                "secret",
+                &match &self.secret {
                     None => "<absent>",
                     Some(None) => "<null>",
                     Some(Some(_)) => "[REDACTED]",
@@ -239,13 +239,14 @@ impl std::fmt::Debug for CredentialPatchDto {
 /// Response body for both `GET /credstore/v1/credentials/{ref}` and each item
 /// of `GET /credstore/v1/credentials` (ADR-0004 Amendment A, "Why one item
 /// shape, and why writes do not follow `$select`"): one shape for both
-/// addresses. `value` is populated only when `$select` names it (point read)
-/// or in value mode (collection) and only for an item the caller may read;
-/// absent from the wire entirely otherwise — including when the item's value
-/// could not be served (refused, missing, fingerprint mismatch — omitted by
-/// the domain layer already, never reported as an error for one item).
+/// addresses. `secret` is populated only when `$select` names it (point
+/// read) or in secret mode (collection) and only for an item the caller may
+/// read; absent from the wire entirely otherwise — including when the item's
+/// value could not be served (refused, missing, fingerprint mismatch —
+/// omitted by the domain layer already, never reported as an error for one
+/// item).
 ///
-/// `Debug` is hand-written to redact `value`.
+/// `Debug` is hand-written to redact `secret`.
 #[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub struct CredentialDto {
@@ -277,11 +278,11 @@ pub struct CredentialDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(format = DateTime)]
     pub expires_at: Option<String>,
-    /// The decrypted value — present only when `$select` names it (point
-    /// read) or in value mode (collection), and only for an item the caller
+    /// The decrypted secret — present only when `$select` names it (point
+    /// read) or in secret mode (collection), and only for an item the caller
     /// may read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    pub secret: Option<String>,
 }
 
 impl std::fmt::Debug for CredentialDto {
@@ -297,14 +298,15 @@ impl std::fmt::Debug for CredentialDto {
             .field("updated_at", &self.updated_at)
             .field("owner_id", &self.owner_id)
             .field("expires_at", &self.expires_at)
-            .field("value", &self.value.as_ref().map(|_| "[REDACTED]"))
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
 
 impl CredentialDto {
     /// Convert the domain [`Credential`] into the REST DTO shape, with no
-    /// value (the unselected point read, or a metadata-mode collection item).
+    /// secret (the unselected point read, or a metadata-mode collection
+    /// item).
     ///
     /// # Errors
     ///
@@ -315,8 +317,8 @@ impl CredentialDto {
     }
 
     /// Convert one domain [`CredentialListItem`] into the REST DTO shape,
-    /// carrying its value when the collection read ran in value mode and the
-    /// item's value was served.
+    /// carrying its secret when the collection read ran in secret mode and
+    /// the item's value was served.
     ///
     /// # Errors
     ///
@@ -324,7 +326,7 @@ impl CredentialDto {
     /// format as RFC 3339, or the value is not valid UTF-8 (never expected
     /// in practice).
     pub fn try_from_list_item(item: &CredentialListItem) -> Result<Self, DomainError> {
-        Self::build(&item.credential, item.value.as_ref())
+        Self::build(&item.credential, item.secret.as_ref())
     }
 
     /// Convert a resolved [`Credential`] plus an optional decrypted value
@@ -334,7 +336,7 @@ impl CredentialDto {
     /// # Errors
     ///
     /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
-    /// format as RFC 3339, or `value` is not valid UTF-8.
+    /// format as RFC 3339, or `secret` is not valid UTF-8.
     pub fn try_from_parts(
         c: &Credential,
         value: Option<&SecretValue>,
@@ -357,7 +359,7 @@ impl CredentialDto {
                     .map_err(|e| DomainError::internal(format!("expires_at failed to format: {e}")))
             })
             .transpose()?;
-        let value = value
+        let secret = value
             .map(|v| {
                 String::from_utf8(v.as_bytes().to_vec()).map_err(|_| {
                     DomainError::internal(
@@ -378,7 +380,7 @@ impl CredentialDto {
             updated_at,
             owner_id: c.owner_id.map(|o| o.0.to_string()),
             expires_at,
-            value,
+            secret,
         })
     }
 }

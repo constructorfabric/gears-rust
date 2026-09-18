@@ -34,8 +34,8 @@ pub enum CredStoreError {
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
     /// A request is malformed independently of any secret type — an empty
-    /// merge patch (`EMPTY_PATCH`), a required `value` missing from a `PUT`
-    /// (`VALUE_REQUIRED`), a merge-patch `null` on a non-nullable field
+    /// merge patch (`EMPTY_PATCH`), a required `secret` missing from a `PUT`
+    /// (`SECRET_REQUIRED`), a merge-patch `null` on a non-nullable field
     /// (`NULL_NOT_ALLOWED`), or a missing/conflicting write precondition
     /// (`PRECONDITION_REQUIRED`). `reason` is a stable machine-readable code.
     #[error("invalid request ({reason}): {detail}")]

@@ -204,7 +204,7 @@ pub trait SecretRepo: Send + Sync {
     /// status = active WHERE id = ? AND status IN (active, declared) [AND
     /// version = ?]`; 0 rows affected → `Ok(None)` (the caller maps this to
     /// `Conflict`/`VersionConflict`). Accepts a **`declared`** current row —
-    /// `PUT`'s replace leg and `PATCH {"value": …}` both switch a `declared`
+    /// `PUT`'s replace leg and `PATCH {"secret": …}` both switch a `declared`
     /// row to `active` this way (ADR-0004, "Writing a value to a suppressed
     /// record is not a conflict"). On success, in the same transaction:
     /// `DELETE` the `pending` entry for `new_value_id`, and — reading the
@@ -245,7 +245,7 @@ pub trait SecretRepo: Send + Sync {
         expires_at: Option<OffsetDateTime>,
     ) -> Result<Option<SecretRow>, DomainError>;
 
-    /// Value-removal write (ADR-0004 `PATCH {"value": null}`, "How a record
+    /// Value-removal write (ADR-0004 `PATCH {"secret": null}`, "How a record
     /// reaches it"): ONE transaction — `UPDATE … SET value_id = NULL, status
     /// = declared, value_fp = NULL, fp_key_id = NULL, sharing, fallback,
     /// expires_at, version = version + 1, updated_at = now() WHERE id = ?

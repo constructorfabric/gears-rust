@@ -233,7 +233,7 @@ fn apply_reference_and_type_clamps(
 /// `cursor` (exclusive: `reference > cursor` ascending, `reference < cursor`
 /// descending). Fetches at most `limit` references — the caller passes
 /// `page_limit + 1` in metadata mode to detect a next page, or
-/// `value_mode_cap + 1` in value mode (no cursor, always ascending).
+/// `secret_mode_cap + 1` in secret mode (no cursor, always ascending).
 #[allow(
     clippy::too_many_arguments,
     reason = "every clamp the collection read's step 1 query supports, named rather than \
