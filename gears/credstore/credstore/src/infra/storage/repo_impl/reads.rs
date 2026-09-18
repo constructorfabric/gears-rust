@@ -1,7 +1,7 @@
 //! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
-//! `scope_includes_tenant`, and the collection read's two-step candidate
-//! queries (`list_candidate_references`, `list_candidate_types`,
-//! `list_candidates_for_references` — ADR-0005).
+//! `scope_includes_tenant`, and the collection read's candidate queries
+//! (`list_visible_types`, `list_candidate_references`,
+//! `list_candidates_for_references` — ADR-0005, ADR-0010).
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
 use sea_orm::{
@@ -207,9 +207,10 @@ struct SecretTypeUuidRow {
 }
 
 /// Applies the caller's `reference`/`secret_type_uuid` clamps to `filter`
-/// when given — shared by [`list_candidate_references`] and
-/// [`list_candidate_types`], which clamp identically (ADR-0005 §"Filter in
-/// SQL first…": "a second small DISTINCT query over the same predicate").
+/// when given — shared by [`list_candidate_references`] (both clamps) and
+/// [`list_visible_types`] (type clamp only, called with `reference_in =
+/// None`); both clamps are invariant across a reference's chain (ADR-0005
+/// §"Filter in SQL first…").
 fn apply_reference_and_type_clamps(
     mut filter: Condition,
     reference_in: Option<&[String]>,
@@ -226,14 +227,20 @@ fn apply_reference_and_type_clamps(
 
 /// Collection read, step 1 (ADR-0005): candidate **references** visible
 /// across `chain`, under [`chain_visibility_condition`], clamped by an exact
-/// `reference` or `secret_type_uuid` set when the caller's `$filter` named
-/// one (both invariant across a reference's chain, so both are sound SQL
-/// clamps — ADR-0005 §"What stays out of the filter"). `DISTINCT reference`,
-/// ordered by `reference` (`desc` when `desc`), keyset-paginated by
-/// `cursor` (exclusive: `reference > cursor` ascending, `reference < cursor`
+/// `reference` set when the caller's `$filter` named one, and by
+/// `type_uuid_in` — by the time this runs, the service layer
+/// (`Service::permitted_types`, ADR-0010) has already narrowed that clamp to
+/// the PDP-permitted types intersected with the caller's own `$filter type
+/// in (…)`, so what reaches here is the type clamp this query actually
+/// enforces in SQL, not merely the caller's raw filter (both clamps are
+/// invariant across a reference's chain, so both are sound SQL clamps —
+/// ADR-0005 §"What stays out of the filter"). `DISTINCT reference`, ordered
+/// by `reference` (`desc` when `desc`), keyset-paginated by `cursor`
+/// (exclusive: `reference > cursor` ascending, `reference < cursor`
 /// descending). Fetches at most `limit` references — the caller passes
 /// `page_limit + 1` in metadata mode to detect a next page, or
-/// `secret_mode_cap + 1` in secret mode (no cursor, always ascending).
+/// `secret_mode_cap + 1` in secret mode (no cursor, always ascending); both
+/// counts now reflect only references admitted by the permitted-type clamp.
 #[allow(
     clippy::too_many_arguments,
     reason = "every clamp the collection read's step 1 query supports, named rather than \
@@ -289,35 +296,29 @@ pub(super) async fn list_candidate_references(
     Ok(rows.into_iter().map(|r| r.reference).collect())
 }
 
-/// Collection read, the authorization side's small second query (ADR-0005
-/// §"Filter in SQL first, reduce the hierarchy in memory": "a second small
-/// `DISTINCT` query over the same predicate"): the distinct
-/// `secret_type_uuid`s among the candidate rows of `references` — the same
-/// visibility predicate and the same `type_uuid_in` clamp step 1 applied,
-/// restricted to the references step 1 actually found. Deliberately clamped
-/// (not a scan of every row of `references` regardless of type): this is
-/// what lets a reduced winner whose type step 1's clamp never selected for
-/// (an override-type-consistency violation) be told apart in memory from an
-/// ordinary PDP denial — see
-/// [`crate::domain::secret::service`]'s collection-read authorization.
-pub(super) async fn list_candidate_types(
+/// Collection read, the authorization side's query (ADR-0005/ADR-0010,
+/// **before** step 1 runs): the distinct `secret_type_uuid`s among every row
+/// visible to the caller across `chain` — the same
+/// [`chain_visibility_condition`] step 1 applies, clamped by
+/// `secret_type_uuid IN (…)` when the caller's `$filter` named a type set.
+/// Not restricted to any reference set: this feeds the per-type PDP
+/// evaluation (`Service::permitted_types`) whose permitted result becomes
+/// step 1's own `type_uuid_in` clamp, so step 1 never even sees a row of a
+/// type the caller may not see. Backed by `idx_credstore_type`; never a
+/// `COUNT`.
+pub(super) async fn list_visible_types(
     repo: &SecretRepoImpl,
     req_tenant: TenantId,
     subject: OwnerId,
     chain: &[Uuid],
-    references: &[String],
     type_uuid_in: Option<&[Uuid]>,
 ) -> Result<Vec<Uuid>, DomainError> {
-    if references.is_empty() {
-        return Ok(Vec::new());
-    }
     let conn = repo.db.conn()?;
     let req = req_tenant.0;
     let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
     let visibility = chain_visibility_condition(req, subject.0, &ancestors);
 
     let filter = Condition::all()
-        .add(entity::secrets::Column::Reference.is_in(references.to_vec()))
         .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
         .add(visibility);
     let filter = apply_reference_and_type_clamps(filter, None, type_uuid_in);

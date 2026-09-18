@@ -1642,8 +1642,8 @@ async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
     );
 }
 
-// ── collection read: list_candidate_references / list_candidate_types /
-//    list_candidates_for_references (ADR-0005) ─────────────────────────────
+// ── collection read: list_visible_types / list_candidate_references /
+//    list_candidates_for_references (ADR-0005, ADR-0010) ──────────────────
 
 #[tokio::test]
 async fn list_candidate_references_is_distinct_and_keyset_paginated() {
@@ -1791,65 +1791,180 @@ async fn list_candidate_references_spans_the_ancestor_chain_shared_only() {
 }
 
 #[tokio::test]
-async fn list_candidate_types_is_clamped_like_step_1_and_restricted_to_the_given_references() {
+async fn list_visible_types_matches_the_collection_reads_visibility_predicate() {
     let repo = setup().await;
-    let tenant = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
     let owner = Uuid::new_v4();
+    let other_owner = Uuid::new_v4();
+
     let generic_uuid = SecretType::generic().uuid();
     let api_key_uuid = SecretType::from_name("api-key").expect("known").uuid();
+    let personal_token_uuid = SecretType::from_name("personal-token")
+        .expect("known")
+        .uuid();
+    let oauth2_uuid = SecretType::from_name("oauth2-client")
+        .expect("known")
+        .uuid();
+    let basic_auth_uuid = SecretType::from_name("basic-auth").expect("known").uuid();
+    let bearer_uuid = SecretType::from_name("bearer-token").expect("known").uuid();
+    let cert_uuid = SecretType::from_name("certificate").expect("known").uuid();
+    let ssh_key_uuid = SecretType::from_name("ssh-key").expect("known").uuid();
 
-    seed_active(&repo, tenant, owner, "r1", SharingMode::Tenant).await;
+    // Own tenant, private-for-subject: visible.
     seed_active_typed(
         &repo,
-        tenant,
+        child,
         owner,
-        "r2",
+        "own-private",
+        SharingMode::Private,
+        generic_uuid,
+    )
+    .await;
+    // A second own-tenant row of the SAME type: must not duplicate the type
+    // in the result.
+    seed_active_typed(
+        &repo,
+        child,
+        owner,
+        "own-private-dup",
+        SharingMode::Private,
+        generic_uuid,
+    )
+    .await;
+
+    // Own tenant, tenant-sharing row: visible.
+    seed_active_typed(
+        &repo,
+        child,
+        owner,
+        "own-tenant",
         SharingMode::Tenant,
         api_key_uuid,
     )
     .await;
-    // r3 exists but is excluded from the `references` slice below.
+
+    // Own tenant, declared row: visible (any status counts for the caller's
+    // own tenant, exactly like `list_candidate_references`'s predicate).
+    let (own_declared_id, _) = seed_active_typed(
+        &repo,
+        child,
+        owner,
+        "own-declared",
+        SharingMode::Tenant,
+        personal_token_uuid,
+    )
+    .await;
+    repo.remove_value(
+        &AccessScope::for_tenant(child),
+        own_declared_id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("own declared row");
+
+    // Another subject's private row in the SAME (own) tenant: excluded.
     seed_active_typed(
         &repo,
-        tenant,
-        owner,
-        "r3",
-        SharingMode::Tenant,
-        api_key_uuid,
+        child,
+        other_owner,
+        "other-private",
+        SharingMode::Private,
+        oauth2_uuid,
     )
     .await;
 
-    let types = repo
-        .list_candidate_types(
-            TenantId(tenant),
-            OwnerId(owner),
-            &[tenant],
-            &["r1".to_owned(), "r2".to_owned()],
-            None,
-        )
+    // Ancestor, shared and resolution-eligible: visible.
+    seed_active_typed(
+        &repo,
+        parent,
+        owner,
+        "parent-shared",
+        SharingMode::Shared,
+        basic_auth_uuid,
+    )
+    .await;
+
+    // Ancestor, tenant-sharing (never inherited): excluded.
+    seed_active_typed(
+        &repo,
+        parent,
+        owner,
+        "parent-tenant",
+        SharingMode::Tenant,
+        bearer_uuid,
+    )
+    .await;
+
+    // Ancestor, private (never inherited): excluded.
+    seed_active_typed(
+        &repo,
+        parent,
+        owner,
+        "parent-private",
+        SharingMode::Private,
+        cert_uuid,
+    )
+    .await;
+
+    // Ancestor, shared but declared/inherit (not resolution-eligible):
+    // excluded.
+    let (parent_declared_id, _) = seed_active_typed(
+        &repo,
+        parent,
+        owner,
+        "parent-declared",
+        SharingMode::Shared,
+        ssh_key_uuid,
+    )
+    .await;
+    repo.remove_value(
+        &AccessScope::for_tenant(parent),
+        parent_declared_id,
+        Some(1),
+        SharingMode::Shared,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("ancestor declared/inherit row");
+
+    let mut types = repo
+        .list_visible_types(TenantId(child), OwnerId(owner), &[child, parent], None)
         .await
-        .expect("types");
-    let mut types = types;
+        .expect("visible types");
     types.sort();
-    let mut expected = vec![generic_uuid, api_key_uuid];
+    let mut expected = vec![
+        generic_uuid,
+        api_key_uuid,
+        personal_token_uuid,
+        basic_auth_uuid,
+    ];
     expected.sort();
-    assert_eq!(types, expected, "r3 must not contribute its type");
+    assert_eq!(
+        types, expected,
+        "own rows of any status, other subjects' private rows and ancestor \
+         non-shared/non-eligible rows excluded, no duplicates"
+    );
 
-    let clamped = repo
-        .list_candidate_types(
-            TenantId(tenant),
+    let mut clamped = repo
+        .list_visible_types(
+            TenantId(child),
             OwnerId(owner),
-            &[tenant],
-            &["r1".to_owned(), "r2".to_owned()],
-            Some(&[api_key_uuid]),
+            &[child, parent],
+            Some(&[api_key_uuid, basic_auth_uuid]),
         )
         .await
-        .expect("type-clamped types");
-    assert_eq!(
-        clamped,
-        vec![api_key_uuid],
-        "clamped to the same type_uuid_in step 1 would have applied"
-    );
+        .expect("clamped visible types");
+    clamped.sort();
+    let mut expected_clamped = vec![api_key_uuid, basic_auth_uuid];
+    expected_clamped.sort();
+    assert_eq!(clamped, expected_clamped, "type_uuid_in clamp applies");
 }
 
 #[tokio::test]
