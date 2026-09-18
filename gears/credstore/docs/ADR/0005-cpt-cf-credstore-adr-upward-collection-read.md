@@ -61,9 +61,9 @@ The chain needs all ancestors, so this is the one place the gear looks past an i
 
 1. Fetch the ancestor chain, barriers ignored.
 2. SQL is not tenant-clamped; visibility follows the point read (own tenant: private/tenant/shared; ancestors: `shared`). Candidates: `active` rows and `declared` rows with `fallback: none` ([ADR-0008](0008-cpt-cf-credstore-adr-suppression-fallback.md)).
-3. The PDP gate targets the request (does the scope admit the caller's tenant), not rows. A gated-out caller gets an empty page, not a refusal: the PDP resource is the concrete type, which exists only once rows are typed (see Revisit Triggers).
+3. A `DISTINCT secret_type_uuid` query over the visible set, clamped by `$filter type in (…)` if given, drives the PDP gate per type — `list` in metadata mode, `read_secret` plus `list` when a record field rides with `secret`; a type whose scope does not admit the caller's tenant is not permitted. Result: the **permitted set**. An empty permitted set is an empty page, not a refusal, with no further query.
 4. An attribute predicate goes into SQL only if it is **invariant across a reference's chain**; otherwise the clamp could change which row wins (a caller granted only `smtp` would see an ancestor's `smtp` row win over a nearer, ungranted `basic_auth` row). `secret_type_uuid` is invariant by `cpt-cf-credstore-fr-override-type-consistency`; `sharing`, `updated_at`, `expires_at`, `owner_tenant_id` are not.
-5. **Filter in SQL, reduce in memory, authorize per type.** Query one: candidate references and their distinct types, clamped by `reference`/`secret_type_uuid`, index `(tenant_id, secret_type_uuid)`. Query two: those references' rows, whole and unclamped. The winner is authorized afterwards — `list` in metadata mode, `read_secret` per type in secret mode, plus `list` when a record field rides with `secret`. A denied type never reaches query two. A row that violates the invariant drops its reference and raises a metric: a missing entry, never a false one. Short pages are contractual.
+5. **Filter in SQL, reduce in memory.** Query one: candidate references, clamped by `secret_type_uuid IN (permitted set)` and `reference IN (…)`, index `(tenant_id, secret_type_uuid)`; a reference with no permitted-type row never enters the page or consumes the cursor. Query two: those references' rows, whole and unclamped by type — `cpt-cf-credstore-fr-override-type-consistency` is enforced only upward on write, so reduction must see every row a point read sees. A winner outside the permitted set is an invariant violation (`list_type_invariant_violation`), dropped and counted, never a false entry. Short pages are contractual.
 6. A structured `InTenantSubtree` predicate or an undeclared attribute fails closed (D5).
 
 **Reducing a reference to one item.** Only resolvable rows compete. A `declared`/`inherit` row never wins while a resolvable inherited row exists. A `declared`/`none` row competes and, when nearest, wins as `suppressed`; the point read 404s ([ADR-0008](0008-cpt-cf-credstore-adr-suppression-fallback.md)). A reference whose only row is `declared` still appears. Among resolvable rows the nearest wins, `private` before non-`private` at the same depth (D3).
@@ -74,7 +74,7 @@ Canonical sort `reference ASC, id ASC` keeps one reference's rows contiguous, so
 
 ### Secret mode
 
-`$select=…,secret` (`cpt-cf-credstore-fr-bulk-read-secrets`) is the bounded bulk read of [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md): the same pipeline, authorizing `read_secret` per distinct type (plus `list` when a record field rides along). No `cursor`, `limit` or `$orderby`: a secret read is never paginated. At most `cap + 1` candidates are fetched; above the cap the whole request fails closed. Selectors: `reference in (...)` and `type eq/in (...)` only. An item the caller may not read is omitted, never reported. Reason codes and envelope: DESIGN §4.3.2.
+`$select=…,secret` (`cpt-cf-credstore-fr-bulk-read-secrets`) is the bounded bulk read of [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md): the same pipeline, authorizing `read_secret` per distinct type (plus `list` when a record field rides along). No `cursor`, `limit` or `$orderby`: a secret read is never paginated. At most `cap + 1` permitted candidates are fetched; above the cap the whole request fails closed. Selectors: `reference in (...)` and `type eq/in (...)` only. An item the caller may not read is omitted, never reported; values are read with bounded concurrency (8 in flight). Reason codes and envelope: DESIGN §4.3.2.
 
 ### What stays out of the filter
 
@@ -102,6 +102,7 @@ Canonical sort `reference ASC, id ASC` keeps one reference's rows contiguous, so
 - E2E: a reference spanning three tenants yields one item, also across a page boundary; a `declared`+`fallback:none` winner yields `suppressed` and the point read 404s.
 - E2E: `$filter` on `inheritance`, `owner_tenant_id`, `updated_at` is rejected; `secret_type_uuid` narrows in SQL, `sharing` after reduction; secret mode rejects `limit`/`cursor`/`$orderby` and fails closed above the cap.
 - Unit: the winner over a `secret_type_uuid`-clamped set equals the winner over the unclamped set.
+- E2E/unit: a reference with no row of a permitted type never appears and never consumes the page; a caller with no permitted type gets an empty page without a candidate query.
 
 ## Pros and Cons of the Options
 
@@ -119,5 +120,5 @@ Canonical sort `reference ASC, id ASC` keeps one reference's rows contiguous, so
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.2, §4.4
-- `cpt-cf-credstore-fr-list-credentials`, `cpt-cf-credstore-fr-get-credential`, `cpt-cf-credstore-fr-inheritance-status`, `cpt-cf-credstore-fr-authz-action-split`, `cpt-cf-credstore-fr-hierarchical-resolve`, `cpt-cf-credstore-fr-secret-shadowing`, `cpt-cf-credstore-fr-bulk-read-secrets`, `cpt-cf-credstore-nfr-tenant-isolation`; `cpt-cf-credstore-fr-override-type-consistency` for the type clamp's selectivity (not for correctness — the winner is authorized after reduction).
+- `cpt-cf-credstore-fr-list-credentials`, `cpt-cf-credstore-fr-get-credential`, `cpt-cf-credstore-fr-inheritance-status`, `cpt-cf-credstore-fr-authz-action-split`, `cpt-cf-credstore-fr-hierarchical-resolve`, `cpt-cf-credstore-fr-secret-shadowing`, `cpt-cf-credstore-fr-bulk-read-secrets`, `cpt-cf-credstore-nfr-tenant-isolation`; `cpt-cf-credstore-fr-override-type-consistency` for the type clamp's soundness (a winner outside the permitted set is still dropped after reduction).
 - Builds on [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md), [ADR-0008](0008-cpt-cf-credstore-adr-suppression-fallback.md), [ADR-0009](0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md), [ADR-0010](0010-cpt-cf-credstore-adr-type-scoped-authorization.md). Pagination follows `guidelines/DNA/REST/PAGINATION.md`; the reference-boundary cursor rule is new here.
