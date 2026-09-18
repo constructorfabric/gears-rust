@@ -110,6 +110,7 @@ impl GearOpenApiDoc {
                     .to_owned(),
             ),
             servers: Vec::new(),
+            tags: Vec::new(),
         };
 
         match registry

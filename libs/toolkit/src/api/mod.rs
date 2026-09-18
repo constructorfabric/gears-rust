@@ -22,7 +22,10 @@ pub use canonical_error_layer::canonical_error_middleware;
 pub use error_layer::{
     IntoCanonical, error_mapping_middleware, extract_trace_id, map_error_to_canonical,
 };
-pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, ensure_schema};
+pub use openapi_registry::{
+    OpenApiExternalDocs, OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, OpenApiTag,
+    ensure_schema, validate_document_text, validate_tags,
+};
 pub use operation_builder::{
     Missing, OperationBuilder, OperationSpec, ParamLocation, ParamSpec, Present,
     ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, ThrottlingSpec, state,

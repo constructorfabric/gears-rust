@@ -4,10 +4,10 @@
 //! This gear provides a standalone `OpenAPI` registry that collects operation specs
 //! and schemas, and builds a complete `OpenAPI` document from them.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use utoipa::openapi::{
     OpenApi, OpenApiBuilder, Ref, RefOr, Required,
@@ -32,6 +32,229 @@ use toolkit_contract::StreamFraming;
 /// Type alias for schema collections used in API operations.
 type SchemaCollection = Vec<(String, RefOr<Schema>)>;
 
+/// Longest a declared group name may be.
+const MAX_TAG_NAME_LEN: usize = 100;
+/// Longest a declared group description may be.
+const MAX_TAG_DESCRIPTION_LEN: usize = 1_000;
+/// Most groups one document may declare.
+const MAX_DECLARED_TAGS: usize = 200;
+
+/// One entry of the document-level `tags` list.
+///
+/// An operation declares the tag it belongs to; this declares the *group* that
+/// tag names — the order it appears in, and what it is for. Documentation
+/// browsers read the document-level list to order and describe the groups in
+/// their sidebar, and fall back to first-appearance order when it is absent.
+///
+/// `name` is matched against an operation's tag by exact string equality: no
+/// trimming, no case folding. `Orders` and `orders` are two different groups,
+/// and one of them will be empty.
+///
+/// The fields are public because this type is deserialised straight from
+/// configuration. [`OpenApiTag::new`] is the checked way to build one in Rust,
+/// and [`validate_tags`] is what a config loader calls to reject a list that
+/// arrived some other way.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiTag {
+    /// Exact-match name of the group. Must equal the tag an operation declares.
+    pub name: String,
+    /// Shown under the group heading. Optional, and worth writing: it is the
+    /// only place a whole domain can be explained rather than an endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Where a reader goes for more than a description can hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_docs: Option<OpenApiExternalDocs>,
+    /// `x-*` members to emit on the group, for whatever reads the document.
+    ///
+    /// A named field rather than a flattened catch-all: serde cannot combine
+    /// `flatten` with `deny_unknown_fields`, and the deny is what turns a
+    /// mistyped `descrption:` into a startup error instead of a group that
+    /// silently lost its description. So an extension copied from an existing
+    /// spec is nested under this key rather than written beside `name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+/// The `externalDocs` of a tag group: somewhere to send a reader.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiExternalDocs {
+    /// Target of the link. Required, and the only reason the object exists.
+    pub url: String,
+    /// What the reader will find there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl OpenApiTag {
+    /// A group with the given name and no description.
+    ///
+    /// # Errors
+    /// Returns an error if `name` is blank or longer than 100 characters.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let tag = Self {
+            name: name.into(),
+            description: None,
+            external_docs: None,
+            extensions: BTreeMap::new(),
+        };
+        tag.validate()?;
+        Ok(tag)
+    }
+
+    /// The same group, carrying a description.
+    ///
+    /// # Errors
+    /// Returns an error if the description is longer than 1000 characters.
+    pub fn with_description(mut self, description: impl Into<String>) -> Result<Self> {
+        self.description = Some(description.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// One group on its own: a usable name, a description within bounds.
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            anyhow::bail!("the name is empty");
+        }
+        // Not `trim().is_empty()`: a name is matched against an operation's tag
+        // by exact equality, so ` Orders` is not `Orders`. Accepting it would
+        // silently produce an empty group beside the real one — and the real
+        // one would then be appended as undeclared, which is precisely the
+        // placement this feature exists to control.
+        if self.name.trim() != self.name {
+            anyhow::bail!(
+                "the name `{}` has leading or trailing whitespace; names are matched exactly",
+                self.name.escape_debug()
+            );
+        }
+        if self.name.chars().count() > MAX_TAG_NAME_LEN {
+            anyhow::bail!(
+                "the name `{}` is longer than {MAX_TAG_NAME_LEN} characters",
+                self.name.escape_debug()
+            );
+        }
+        validate_document_text("name", &self.name, false)?;
+
+        if let Some(description) = &self.description {
+            if description.chars().count() > MAX_TAG_DESCRIPTION_LEN {
+                anyhow::bail!(
+                    "the description is longer than {MAX_TAG_DESCRIPTION_LEN} characters"
+                );
+            }
+            validate_document_text("description", description, true)?;
+        }
+
+        if let Some(docs) = &self.external_docs {
+            if docs.url.trim().is_empty() {
+                anyhow::bail!("the external documentation has no url");
+            }
+            if docs.url.chars().count() > MAX_TAG_DESCRIPTION_LEN {
+                anyhow::bail!(
+                    "the external documentation url is longer than \
+                     {MAX_TAG_DESCRIPTION_LEN} characters"
+                );
+            }
+            validate_document_text("external documentation url", &docs.url, false)?;
+            if let Some(description) = &docs.description {
+                validate_document_text("external documentation description", description, true)?;
+            }
+        }
+
+        for key in self.extensions.keys() {
+            // `OpenAPI` reserves every non-`x-` member of an object for the
+            // specification, so a key without the prefix is not an extension —
+            // it is a member this document is not allowed to invent.
+            if !key.starts_with("x-") {
+                anyhow::bail!(
+                    "the extension `{}` does not start with `x-`",
+                    key.escape_debug()
+                );
+            }
+            validate_document_text("extension name", key, false)?;
+        }
+        Ok(())
+    }
+}
+
+/// Characters that reorder what a reader sees rather than adding to it.
+const BIDI_OVERRIDES: &[char] = &[
+    // U+061C is the one that hides: it is a formatting character, so
+    // `char::is_control()` says nothing about it, and it reorders text all the
+    // same.
+    '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+];
+
+/// Refuse operator text that must not reach a served document or a log line.
+///
+/// These strings are copied verbatim into `/openapi.json`, which the gateway
+/// serves on an anonymous route, and rendered by a documentation browser on the
+/// unauthenticated `/docs` page. So a control character here is not a
+/// formatting nuisance: a newline in a tag name forges a line in the startup
+/// log, and a bidi override reorders what a reader is shown without changing
+/// what is stored. `ApiGateway::normalize_prefix_path` allow-lists another
+/// operator string that reaches HTML for the same reason.
+///
+/// `allow_line_breaks` is for prose fields — an `OpenAPI` description is
+/// `CommonMark`, where newlines and tabs are content rather than smuggling.
+///
+/// # Errors
+/// Returns an error naming the first offending character and its code point.
+pub fn validate_document_text(label: &str, value: &str, allow_line_breaks: bool) -> Result<()> {
+    let offending = value.chars().find(|c| {
+        let break_ok = allow_line_breaks && matches!(c, '\n' | '\r' | '\t');
+        (c.is_control() && !break_ok) || BIDI_OVERRIDES.contains(c)
+    });
+
+    if let Some(c) = offending {
+        anyhow::bail!(
+            "the {label} contains U+{:04X}, a control or direction-override character",
+            c as u32
+        );
+    }
+    Ok(())
+}
+
+/// Check a declared group list before it reaches a document.
+///
+/// Every entry has to stand on its own, and the names have to be unique:
+/// `OpenAPI` requires document-level `tags` names to be distinct, so two
+/// entries with one name produce a document that is invalid rather than merely
+/// odd. A config loader calls this, so the failure is a startup error naming
+/// the offending group instead of a served document nobody validates.
+///
+/// # Errors
+/// Returns an error on a blank or over-long name, an over-long description, a
+/// duplicate name, or more than 200 groups.
+pub fn validate_tags(tags: &[OpenApiTag]) -> Result<()> {
+    if tags.len() > MAX_DECLARED_TAGS {
+        anyhow::bail!(
+            "{} OpenAPI tag groups declared, more than the {MAX_DECLARED_TAGS} allowed",
+            tags.len()
+        );
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (position, tag) in tags.iter().enumerate() {
+        // The position is the only handle an operator has on the offending
+        // entry when the problem is the name itself — there is nothing else to
+        // call it by, and a list of twenty in YAML is not searchable by eye.
+        tag.validate()
+            .with_context(|| format!("OpenAPI tag group #{position}"))?;
+        if !seen.insert(tag.name.as_str()) {
+            anyhow::bail!(
+                "OpenAPI tag group #{position} repeats the name `{}`; \
+                 document-level tag names must be unique",
+                tag.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `OpenAPI` document metadata (title, version, description)
 #[derive(Debug, Clone)]
 pub struct OpenApiInfo {
@@ -39,6 +262,12 @@ pub struct OpenApiInfo {
     pub version: String,
     pub description: Option<String>,
     pub servers: Vec<String>,
+    /// Document-level tag groups, in the order a reader should meet them.
+    ///
+    /// Empty — as [`Default`] leaves it — means the document carries no `tags`
+    /// key at all, which is the document every caller had before this field
+    /// existed.
+    pub tags: Vec<OpenApiTag>,
 }
 
 impl Default for OpenApiInfo {
@@ -48,8 +277,71 @@ impl Default for OpenApiInfo {
             version: "0.1.0".to_owned(),
             description: None,
             servers: Vec::new(),
+            tags: Vec::new(),
         }
     }
+}
+
+/// The document-level `tags` list, or `None` when the caller declared no groups.
+///
+/// `None` rather than an empty vector on purpose: an empty list serialises as
+/// `tags: []`, which is not the same document as one with no `tags` key.
+/// [`OpenApiRegistryImpl::build_openapi`] passes an empty slice, so every
+/// caller that predates groups keeps the document it already had — an added
+/// empty array would surface as a diff in every committed `OpenAPI` snapshot
+/// downstream.
+///
+/// Once anything is declared, every tag an operation actually uses is listed:
+/// the declared ones first, in the order given, then the rest in name order.
+/// Leaving the others out would leave their placement to whatever a browser
+/// decides on its own, which is the thing this list exists to stop.
+///
+/// A declared group no operation uses is still emitted — an empty group is
+/// occasionally deliberate, and dropping it silently would be its own surprise
+/// — but it is logged, because the overwhelmingly likely cause is a typo in a
+/// name that is matched by exact string equality.
+fn document_tags(
+    declared: &[OpenApiTag],
+    in_use: &BTreeSet<String>,
+) -> Option<Vec<utoipa::openapi::Tag>> {
+    if declared.is_empty() {
+        return None;
+    }
+
+    let mut tags: Vec<utoipa::openapi::Tag> = Vec::with_capacity(declared.len() + in_use.len());
+    for tag in declared {
+        if !in_use.contains(&tag.name) {
+            tracing::warn!(
+                tag = %tag.name,
+                "declared OpenAPI tag group matches no operation; names are matched exactly, so check spelling and case"
+            );
+        }
+        let mut built = utoipa::openapi::Tag::new(&tag.name);
+        built.description.clone_from(&tag.description);
+        if let Some(docs) = &tag.external_docs {
+            let mut emitted = utoipa::openapi::external_docs::ExternalDocs::new(&docs.url);
+            emitted.description.clone_from(&docs.description);
+            built.external_docs = Some(emitted);
+        }
+        if !tag.extensions.is_empty() {
+            let mut emitted = utoipa::openapi::extensions::Extensions::default();
+            for (key, value) in &tag.extensions {
+                emitted.insert(key.clone(), value.clone());
+            }
+            built.extensions = Some(emitted);
+        }
+        tags.push(built);
+    }
+
+    let declared_names: BTreeSet<&str> = declared.iter().map(|tag| tag.name.as_str()).collect();
+    tags.extend(
+        in_use
+            .iter()
+            .filter(|name| !declared_names.contains(name.as_str()))
+            .map(utoipa::openapi::Tag::new),
+    );
+
+    Some(tags)
 }
 
 /// `OpenAPI` registry trait for operation and schema registration
@@ -178,16 +470,79 @@ impl OpenApiRegistryImpl {
         }
     }
 
+    /// Every tag some registered operation carries, de-duplicated and ordered.
+    fn tags_in_use(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for entry in &self.operation_specs {
+            names.extend(entry.value().tags.iter().cloned());
+        }
+        names
+    }
+
+    /// Registered schemas, plus the one security scheme every document declares.
+    fn document_components(&self) -> ComponentsBuilder {
+        let reg = self.components_registry.load();
+        let mut components = ComponentsBuilder::new();
+        for (name, schema) in reg.iter() {
+            components = components.schema(name.clone(), schema.clone());
+        }
+
+        components.security_scheme(
+            "bearerAuth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        )
+    }
+
     /// Build `OpenAPI` specification from registered operations and components.
     ///
+    /// An operation declares the tag it belongs to; [`OpenApiInfo::tags`]
+    /// declares the groups those tags name — the order a reader meets them in,
+    /// and what each is for. Documentation browsers read that list to order and
+    /// describe the groups, and fall back to the order the tags first appear in
+    /// when it is absent.
+    ///
+    /// The list is a preference, not a whitelist: a tag an operation uses but
+    /// the list omits is still emitted, after the declared ones, so its
+    /// placement stays ours rather than the browser's. Leave it empty — as
+    /// [`OpenApiInfo::default`] does — and the document carries no `tags` key at
+    /// all.
+    ///
     /// # Arguments
-    /// * `info` - `OpenAPI` document metadata (title, version, description)
+    /// * `info` - `OpenAPI` document metadata (title, version, description, tag groups)
     ///
     /// # Errors
-    /// Returns an error if the `OpenAPI` specification cannot be built.
-    #[allow(unknown_lints, de0205_operation_builder)]
+    /// Returns an error if the tag groups do not pass [`validate_tags`], or if
+    /// the `OpenAPI` specification cannot be built.
+    // This is the registry that turns registered `OperationSpec`s into utoipa
+    // operations, so it necessarily constructs them here rather than through
+    // `OperationBuilder` — which is the very thing that feeds it. The lint is
+    // spelled with `unknown_lints` because it only exists under
+    // `cargo gears lint --dylint`.
+    #[allow(
+        unknown_lints,
+        de0205_operation_builder,
+        reason = "this function implements the registry OperationBuilder registers into"
+    )]
     pub fn build_openapi(&self, info: &OpenApiInfo) -> Result<OpenApi> {
         use http::Method;
+
+        let tags = info.tags.as_slice();
+        validate_tags(tags)?;
+
+        // Only walked when it will be read: `document_tags` returns early on an
+        // empty declaration, and every caller that declares nothing — plain
+        // `build_openapi` and the OoP runtime among them — would otherwise pay
+        // for a full pass over the specs whose result is thrown away.
+        let in_use = if tags.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.tags_in_use()
+        };
 
         // Log operation count for visibility
         let op_count = self.operation_specs.len();
@@ -367,22 +722,7 @@ impl OpenApiRegistryImpl {
         }
 
         // 2) Components (from our registry)
-        let reg = self.components_registry.load();
-        let mut components = ComponentsBuilder::new();
-        for (name, schema) in reg.iter() {
-            components = components.schema(name.clone(), schema.clone());
-        }
-
-        // Add bearer auth security scheme
-        components = components.security_scheme(
-            "bearerAuth",
-            SecurityScheme::Http(
-                HttpBuilder::new()
-                    .scheme(HttpAuthScheme::Bearer)
-                    .bearer_format("JWT")
-                    .build(),
-            ),
-        );
+        let components = self.document_components();
 
         // 3) Info & final OpenAPI doc
         let openapi_info = InfoBuilder::new()
@@ -404,6 +744,7 @@ impl OpenApiRegistryImpl {
             .servers(servers)
             .paths(paths.build())
             .components(Some(components.build()))
+            .tags(document_tags(tags, &in_use))
             .build();
 
         // Document-level vendor extension: this spec is generated from Rust
@@ -707,6 +1048,7 @@ mod tests {
             version: "1".to_owned(),
             description: None,
             servers: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -898,6 +1240,7 @@ mod tests {
             version: "1.0.0".to_owned(),
             description: Some("Test API Description".to_owned()),
             servers: Vec::new(),
+            tags: Vec::new(),
         };
         let doc = registry.build_openapi(&info).unwrap();
         let json = serde_json::to_value(&doc).unwrap();
@@ -914,6 +1257,360 @@ mod tests {
         assert_eq!(
             openapi_info.get("description").unwrap(),
             "Test API Description"
+        );
+    }
+
+    /// A document nobody gave groups to carries no `tags` key at all.
+    ///
+    /// Not `tags: []`. `build_openapi` is unchanged for every caller that had
+    /// it before groups existed, and "unchanged" has to mean the bytes too —
+    /// an added empty array is a diff in every committed snapshot downstream.
+    #[test]
+    fn no_declared_groups_means_no_tags_key() {
+        let registry = OpenApiRegistryImpl::new();
+        let doc = registry.build_openapi(&OpenApiInfo::default()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        assert!(
+            json.get("tags").is_none(),
+            "an undeclared tag list must not appear in the document: {json}"
+        );
+    }
+
+    /// An operation carrying `tag`, enough of one to register.
+    fn tagged_operation(path: &str, tag: &str) -> OperationSpec {
+        OperationSpec {
+            method: Method::GET,
+            path: path.to_owned(),
+            operation_id: Some(format!("get_{tag}")),
+            summary: Some("Something".to_owned()),
+            description: Some("Something worth a sentence.".to_owned()),
+            tags: vec![tag.to_owned()],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema: None,
+                headers: vec![],
+            }],
+            handler_id: format!("handler_{tag}"),
+            authenticated: false,
+            exposed: false,
+            throttling: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        }
+    }
+
+    /// Declared groups reach the document in the order they were declared, and
+    /// a tag nobody declared lands after them rather than wherever.
+    ///
+    /// The order is the whole point: a browser presents the groups in document
+    /// order and falls back to first-appearance order when the list is absent,
+    /// which in an assembly means whatever the path alphabet produced. That
+    /// fallback is also why the undeclared tag has to be emitted rather than
+    /// left out — left out, its placement would be the browser's to choose.
+    #[test]
+    fn declared_groups_keep_their_order_and_undeclared_ones_follow() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/zulu", "Zulu"));
+        registry.register_operation(&tagged_operation("/alpha", "Alpha"));
+        // Registered in an order that is not their name order, so the tail
+        // being sorted is what the assertion below proves, not a coincidence.
+        registry.register_operation(&tagged_operation("/stray", "Yankee"));
+        registry.register_operation(&tagged_operation("/other", "Charlie"));
+        registry.register_operation(&tagged_operation("/third", "Mike"));
+
+        let groups = [
+            OpenApiTag::new("Zulu")
+                .unwrap()
+                .with_description("Last alphabetically, first on purpose.")
+                .unwrap(),
+            OpenApiTag::new("Alpha").unwrap(),
+        ];
+
+        let info = OpenApiInfo {
+            tags: groups.to_vec(),
+            ..OpenApiInfo::default()
+        };
+        let doc = registry.build_openapi(&info).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let tags = json
+            .get("tags")
+            .expect("declared groups reach the document");
+
+        let names: Vec<&str> = tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Zulu", "Alpha", "Charlie", "Mike", "Yankee"],
+            "declared order first, then the rest in name order"
+        );
+
+        // The feature must not touch an operation's own tag attribution: the
+        // top-level list says how groups are ordered, never which group an
+        // operation is in.
+        let stray_tags = json
+            .get("paths")
+            .and_then(|paths| paths.get("/stray"))
+            .and_then(|item| item.get("get"))
+            .and_then(|op| op.get("tags"))
+            .expect("the undeclared operation still carries its own tag");
+        assert_eq!(
+            stray_tags.as_array().map(Vec::as_slice),
+            Some([serde_json::json!("Yankee")].as_slice()),
+            "an omitted group is not hidden from its own operation: {stray_tags}"
+        );
+
+        assert_eq!(
+            tags[0].get("description").unwrap(),
+            "Last alphabetically, first on purpose."
+        );
+        assert!(
+            tags[1].get("description").is_none(),
+            "a group with nothing to say carries no description key: {tags}"
+        );
+    }
+
+    /// Two groups with one name make an invalid document, so it is not built.
+    #[test]
+    fn duplicate_group_names_are_rejected() {
+        let registry = OpenApiRegistryImpl::new();
+        let groups = [
+            OpenApiTag::new("Orders").unwrap(),
+            OpenApiTag::new("Orders").unwrap(),
+        ];
+
+        let info = OpenApiInfo {
+            tags: groups.to_vec(),
+            ..OpenApiInfo::default()
+        };
+        let Err(error) = registry.build_openapi(&info) else {
+            panic!("a duplicate group name must not reach a document");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Orders") && message.contains("#1"),
+            "the error names the offending group and where it is: {message}"
+        );
+    }
+
+    /// Matching is exact, which is the headline promise of the whole feature.
+    ///
+    /// Without this, a later switch to trimmed or case-folded matching would
+    /// pass every other test while quietly changing what an operator's config
+    /// means. It is also the only test that exercises the unmatched-group
+    /// warning.
+    #[test]
+    fn group_names_match_operation_tags_exactly() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/orders", "orders"));
+
+        let info = OpenApiInfo {
+            tags: vec![OpenApiTag::new("Orders").unwrap()],
+            ..OpenApiInfo::default()
+        };
+        let doc = registry.build_openapi(&info).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        let names: Vec<&str> = json
+            .get("tags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Orders", "orders"],
+            "case differs, so these are two groups: the declared one is empty \
+             and the real one is appended as undeclared"
+        );
+    }
+
+    /// A name that only looks like the operation's tag is refused, not accepted
+    /// as a second, empty group.
+    #[test]
+    fn a_padded_group_name_is_rejected() {
+        assert!(
+            OpenApiTag::new(" Orders").is_err(),
+            "leading whitespace survives exact matching and would make a ghost group"
+        );
+        assert!(OpenApiTag::new("Orders ").is_err());
+        assert!(OpenApiTag::new("Orders").is_ok());
+    }
+
+    /// The name cap holds at the boundary rather than somewhere near it.
+    #[test]
+    fn the_group_name_length_cap_is_enforced_at_the_boundary() {
+        let longest = "n".repeat(MAX_TAG_NAME_LEN);
+        assert!(OpenApiTag::new(longest).is_ok(), "the cap is inclusive");
+
+        let over = "n".repeat(MAX_TAG_NAME_LEN + 1);
+        assert!(OpenApiTag::new(over).is_err());
+    }
+
+    /// So does the description cap, and `with_description` reports it.
+    #[test]
+    fn the_description_length_cap_is_enforced_at_the_boundary() {
+        let longest = "d".repeat(MAX_TAG_DESCRIPTION_LEN);
+        assert!(
+            OpenApiTag::new("Orders")
+                .unwrap()
+                .with_description(longest)
+                .is_ok()
+        );
+
+        let over = "d".repeat(MAX_TAG_DESCRIPTION_LEN + 1);
+        let failed = OpenApiTag::new("Orders").unwrap().with_description(over);
+        assert!(
+            failed.is_err(),
+            "with_description has a documented error path"
+        );
+    }
+
+    /// More groups than a document may declare is refused.
+    #[test]
+    fn too_many_declared_groups_are_rejected() {
+        let at_cap: Vec<OpenApiTag> = (0..MAX_DECLARED_TAGS)
+            .map(|i| OpenApiTag::new(format!("Group{i}")).unwrap())
+            .collect();
+        assert!(validate_tags(&at_cap).is_ok(), "the cap is inclusive");
+
+        let over: Vec<OpenApiTag> = (0..=MAX_DECLARED_TAGS)
+            .map(|i| OpenApiTag::new(format!("Group{i}")).unwrap())
+            .collect();
+        assert!(validate_tags(&over).is_err());
+    }
+
+    /// Control characters never reach the served document or the startup log.
+    ///
+    /// Both strings are copied verbatim into `/openapi.json`, which is served
+    /// anonymously, and rendered on the unauthenticated `/docs` page. A newline
+    /// in a name also forges a line in the log that reports an unmatched group.
+    #[test]
+    fn control_and_direction_override_characters_are_rejected() {
+        assert!(OpenApiTag::new("Orders\nWARN: forged").is_err());
+        assert!(OpenApiTag::new("Orders\u{202E}sredrO").is_err());
+        assert!(OpenApiTag::new("Orders\u{1B}[31m").is_err());
+
+        let tag = OpenApiTag::new("Orders").unwrap();
+        assert!(
+            tag.clone()
+                .with_description("Two\nlines, and a\ttab.")
+                .is_ok(),
+            "a description is CommonMark, so line breaks are content"
+        );
+        assert!(tag.with_description("Bell\u{7}here").is_err());
+    }
+
+    /// U+061C reorders text and is not a control character, so it needs naming.
+    #[test]
+    fn the_arabic_letter_mark_is_rejected_like_the_other_overrides() {
+        assert!(
+            !'\u{061C}'.is_control(),
+            "if this ever becomes a control character the explicit entry is redundant"
+        );
+        assert!(OpenApiTag::new("Orders\u{061C}").is_err());
+        assert!(
+            OpenApiTag::new("Orders")
+                .unwrap()
+                .with_description("Fine\u{061C}print")
+                .is_err()
+        );
+    }
+
+    /// A group can carry `externalDocs` and `x-*`, and they reach the document.
+    #[test]
+    fn external_docs_and_extensions_reach_the_document() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/orders", "Orders"));
+
+        let mut declared = OpenApiTag::new("Orders").unwrap();
+        declared.external_docs = Some(OpenApiExternalDocs {
+            url: "https://example.test/orders".to_owned(),
+            description: Some("The long version.".to_owned()),
+        });
+        declared
+            .extensions
+            .insert("x-displayName".to_owned(), serde_json::json!("Orders"));
+
+        let info = OpenApiInfo {
+            tags: vec![declared],
+            ..OpenApiInfo::default()
+        };
+        let json = serde_json::to_value(registry.build_openapi(&info).unwrap()).unwrap();
+        let tag = &json.get("tags").unwrap()[0];
+
+        assert_eq!(
+            tag.get("externalDocs").unwrap().get("url").unwrap(),
+            "https://example.test/orders"
+        );
+        assert_eq!(
+            tag.get("externalDocs").unwrap().get("description").unwrap(),
+            "The long version."
+        );
+        assert_eq!(
+            tag.get("x-displayName").unwrap(),
+            "Orders",
+            "an extension is emitted as a member of the tag: {tag}"
+        );
+    }
+
+    /// A member that is not an extension is refused rather than invented.
+    #[test]
+    fn an_extension_without_the_x_prefix_is_rejected() {
+        let mut tag = OpenApiTag::new("Orders").unwrap();
+        tag.extensions
+            .insert("displayName".to_owned(), serde_json::json!("Orders"));
+
+        assert!(
+            validate_tags(&[tag]).is_err(),
+            "every non-`x-` member of an OpenAPI object belongs to the specification"
+        );
+    }
+
+    /// The error points at the entry, since a bad name has nothing to call it by.
+    #[test]
+    fn a_rejected_group_is_identified_by_position() {
+        let tags = [
+            OpenApiTag::new("Fine").unwrap(),
+            OpenApiTag {
+                name: String::new(),
+                ..OpenApiTag::default()
+            },
+        ];
+
+        let Err(error) = validate_tags(&tags) else {
+            panic!("an empty name is not a group");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("#1"),
+            "an operator with twenty groups needs the index: {message}"
+        );
+    }
+
+    /// A blank name groups nothing and matches nothing; it is a typo, not a group.
+    #[test]
+    fn a_blank_group_name_is_rejected() {
+        assert!(OpenApiTag::new("   ").is_err());
+        assert!(
+            validate_tags(&[OpenApiTag {
+                name: String::new(),
+                ..OpenApiTag::default()
+            }])
+            .is_err(),
+            "a list that arrived from config is checked too, not just the constructor"
         );
     }
 

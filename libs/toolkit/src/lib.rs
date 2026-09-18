@@ -123,7 +123,7 @@ pub mod contracts;
 // Type-safe API operation builder
 pub mod api;
 pub use api::{
-    IntoCanonical, OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, OperationBuilder,
+    IntoCanonical, OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, OpenApiTag, OperationBuilder,
     error_mapping_middleware,
 };
 pub use toolkit_odata::{Page, PageInfo};

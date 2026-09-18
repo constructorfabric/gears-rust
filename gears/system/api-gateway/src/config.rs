@@ -349,6 +349,91 @@ pub struct OpenApiConfig {
     /// API description (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Document-level tag groups, in the order a reader should meet them.
+    ///
+    /// An assembly links gears it does not own, so the tags in its document
+    /// come from several authors and no single one of them can decide the
+    /// order. The deployment can, and this is where it says so. Omit it and
+    /// the document carries no `tags` key, exactly as before.
+    ///
+    /// ```yaml
+    /// openapi:
+    ///   title: "Constructor Studio Backend"
+    ///   version: "0.1.0"
+    ///   tags:
+    ///     - name: StudioDocuments
+    ///       description: "Documents, their bindings and the types they carry."
+    ///     - name: StudioTasks
+    ///       description: "Background runs: state, attempts, cancel and retry."
+    /// ```
+    ///
+    /// A tag an operation uses but this list omits is not hidden — it is
+    /// grouped as it always was, after the ones named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<toolkit::api::OpenApiTag>,
+}
+
+/// Longest an `OpenAPI` document title or version may be.
+const MAX_OPENAPI_TITLE_LEN: usize = 200;
+/// Longest an `OpenAPI` document description may be.
+const MAX_OPENAPI_DESCRIPTION_LEN: usize = 4_000;
+
+impl OpenApiConfig {
+    /// Reject document metadata that cannot make a valid served document.
+    ///
+    /// Called from `Gear::init`, beside the other config checks, so a blank or
+    /// duplicated group name is a startup error naming the offending entry
+    /// rather than an invalid `openapi.json` served to every reader.
+    ///
+    /// Every field here is operator text that reaches `/openapi.json` on an
+    /// anonymous route and the `/docs` page in a browser, so all four are
+    /// checked, not only `tags`: `title` and `version` land in the document's
+    /// `info` block and are read by every generated client.
+    ///
+    /// # Errors
+    /// Returns an error on a blank, over-long or control-character-bearing
+    /// title, version or description, and on a tag list that
+    /// [`toolkit::api::validate_tags`] rejects.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use toolkit::api::validate_document_text;
+
+        if self.title.trim().is_empty() {
+            anyhow::bail!("invalid openapi configuration: `title` is blank");
+        }
+        if self.version.trim().is_empty() {
+            anyhow::bail!("invalid openapi configuration: `version` is blank");
+        }
+        if self.title.chars().count() > MAX_OPENAPI_TITLE_LEN {
+            anyhow::bail!(
+                "invalid openapi configuration: `title` is longer than \
+                 {MAX_OPENAPI_TITLE_LEN} characters"
+            );
+        }
+        if self.version.chars().count() > MAX_OPENAPI_TITLE_LEN {
+            anyhow::bail!(
+                "invalid openapi configuration: `version` is longer than \
+                 {MAX_OPENAPI_TITLE_LEN} characters"
+            );
+        }
+        validate_document_text("title", &self.title, false)
+            .context("invalid openapi configuration")?;
+        validate_document_text("version", &self.version, false)
+            .context("invalid openapi configuration")?;
+
+        if let Some(description) = &self.description {
+            if description.chars().count() > MAX_OPENAPI_DESCRIPTION_LEN {
+                anyhow::bail!(
+                    "invalid openapi configuration: `description` is longer than \
+                     {MAX_OPENAPI_DESCRIPTION_LEN} characters"
+                );
+            }
+            validate_document_text("description", description, true)
+                .context("invalid openapi configuration")?;
+        }
+
+        toolkit::api::validate_tags(&self.tags).context("invalid openapi configuration")
+    }
 }
 
 impl Default for OpenApiConfig {
@@ -357,6 +442,7 @@ impl Default for OpenApiConfig {
             title: "API Documentation".to_owned(),
             version: "0.1.0".to_owned(),
             description: None,
+            tags: Vec::new(),
         }
     }
 }
@@ -637,7 +723,87 @@ fn validate_status(zone: &str, status: u16) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::GatewayProxyConfig;
+    use super::{GatewayProxyConfig, OpenApiConfig};
+
+    /// The operator-facing shape actually deserialises into the field.
+    ///
+    /// The registry tests build `OpenApiTag` as a Rust literal, which says
+    /// nothing about whether serde agrees with the key names an operator
+    /// types. Driven through JSON rather than YAML because that is the
+    /// deserialiser this crate carries; it is the same `Deserialize` impl.
+    #[test]
+    fn openapi_tags_deserialise_from_config() {
+        let cfg: OpenApiConfig = serde_json::from_value(serde_json::json!({
+            "title": "Example Assembly",
+            "version": "0.1.0",
+            "tags": [
+                { "name": "Orders", "description": "Placing an order, and what happens after." },
+                { "name": "Tenants" },
+            ],
+        }))
+        .expect("the documented config shape parses");
+
+        assert_eq!(cfg.tags.len(), 2);
+        assert_eq!(cfg.tags[0].name, "Orders");
+        assert_eq!(
+            cfg.tags[0].description.as_deref(),
+            Some("Placing an order, and what happens after.")
+        );
+        assert_eq!(cfg.tags[1].name, "Tenants");
+        assert!(
+            cfg.tags[1].description.is_none(),
+            "description is optional, and absent means absent"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Config written before groups existed still parses, and declares none.
+    #[test]
+    fn openapi_config_without_tags_is_still_valid() {
+        let cfg: OpenApiConfig = serde_json::from_value(serde_json::json!({
+            "title": "Example Assembly",
+            "version": "0.1.0",
+        }))
+        .expect("a config predating the key keeps parsing");
+
+        assert!(cfg.tags.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// `Gear::init` refuses a list that cannot make a valid document.
+    #[test]
+    fn duplicate_openapi_tag_names_fail_validation() {
+        let cfg: OpenApiConfig = serde_json::from_value(serde_json::json!({
+            "title": "Example Assembly",
+            "version": "0.1.0",
+            "tags": [{ "name": "Orders" }, { "name": "Orders" }],
+        }))
+        .expect("it parses; it is validation that rejects it");
+
+        let error = cfg
+            .validate()
+            .expect_err("two groups with one name are not a document");
+        // `{:#}` so the assertion reads the whole chain, not just the outermost
+        // context — the position comes from `validate_tags` underneath.
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("#1"),
+            "the error points at the offending entry: {error}"
+        );
+    }
+
+    /// A blank name is rejected at load rather than served as an empty group.
+    #[test]
+    fn blank_openapi_tag_name_fails_validation() {
+        let cfg: OpenApiConfig = serde_json::from_value(serde_json::json!({
+            "title": "Example Assembly",
+            "version": "0.1.0",
+            "tags": [{ "name": "  " }],
+        }))
+        .expect("it parses; it is validation that rejects it");
+
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn disabled_proxy_needs_no_endpoint() {

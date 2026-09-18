@@ -706,6 +706,7 @@ impl ApiGateway {
             version: config.openapi.version.clone(),
             description: config.openapi.description.clone(),
             servers: (!prefix.is_empty()).then_some(prefix).into_iter().collect(),
+            tags: config.openapi.tags.clone(),
         };
         let mut openapi = self.openapi_registry.build_openapi(&info)?;
         enrich_openapi_with_zone_limits(&mut openapi, &config);
@@ -1214,6 +1215,10 @@ impl toolkit::Gear for ApiGateway {
         cfg.gateway_proxy
             .validate()
             .map_err(|e| anyhow::anyhow!(e))?;
+        // Same reason for the documentation groups: a blank or duplicated tag name
+        // makes an invalid OpenAPI document, and the only place anyone would notice
+        // is a docs browser that quietly renders it wrong.
+        cfg.openapi.validate()?;
         self.config.store(Arc::new(cfg.clone()));
 
         debug!(
@@ -1619,6 +1624,61 @@ mod tests {
         assert_eq!(info.get("title").unwrap(), "Test API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
         assert_eq!(info.get("description").unwrap(), "Test Description");
+    }
+
+    /// A gateway told about no groups serves the document it always did.
+    ///
+    /// The registry test for this passes an empty slice by hand. This one goes
+    /// through the config field and `ApiGateway::build_openapi`, which is the
+    /// path an actual deployment takes, so a wiring change that started
+    /// sending a non-empty list would be caught here.
+    #[test]
+    fn no_configured_groups_means_no_tags_key() {
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+
+        let doc = api.build_openapi().unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        assert!(json.get("openapi").is_some(), "still a document: {json:?}");
+        assert!(
+            json.get("tags").is_none(),
+            "an unconfigured tag list must not appear in the served document"
+        );
+    }
+
+    /// Configured groups reach the served document, in configured order.
+    ///
+    /// Without this, `build_openapi` could pass `&[]` instead of
+    /// `&config.openapi.tags` and every other test would still be green.
+    #[test]
+    fn configured_groups_reach_the_served_document() {
+        let mut config = ApiGatewayConfig::default();
+        config.openapi.tags = vec![
+            toolkit::api::OpenApiTag::new("Zulu")
+                .unwrap()
+                .with_description("Declared first on purpose.")
+                .unwrap(),
+            toolkit::api::OpenApiTag::new("Alpha").unwrap(),
+        ];
+        let api = ApiGateway::new(config);
+
+        let doc = api.build_openapi().unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let tags = json
+            .get("tags")
+            .expect("configured groups reach the served document");
+
+        let names: Vec<&str> = tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Zulu", "Alpha"], "configuration order is kept");
+        assert_eq!(
+            tags[0].get("description").unwrap(),
+            "Declared first on purpose."
+        );
     }
 
     #[test]
