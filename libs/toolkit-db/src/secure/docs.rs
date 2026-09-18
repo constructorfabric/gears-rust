@@ -35,37 +35,34 @@
 //! ### 2. `ScopableEntity`
 //!
 //! Entities must implement [`ScopableEntity`](crate::secure::ScopableEntity) to declare
-//! which columns are used for scoping:
+//! which columns are used for scoping. The declaration is one table: every
+//! authorization property the entity understands, paired with the column it
+//! means. [`ScopeProperties`](crate::secure::ScopeProperties) reads the lookup,
+//! the column list and the tenant/resource/owner accessors back out of it, so
+//! none of them can disagree with it.
 //!
 //! ```rust,ignore
 //! use toolkit_db::secure::ScopableEntity;
+//! use toolkit_security::access_scope::pep_properties;
 //!
 //! impl ScopableEntity for user::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         Some(user::Column::TenantId)  // Multi-tenant entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(user::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
+//!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+//!         (pep_properties::OWNER_TENANT_ID, user::Column::TenantId),
+//!         (pep_properties::RESOURCE_ID, user::Column::Id),
+//!     ];
+//!
+//!     // Tenant- and resource-scoped, not owner-scoped: all three follow from
+//!     // the table. Only `type_col` is written out, because no property name
+//!     // addresses it.
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }
 //! }
 //!
-//! // Global entity (no tenant scoping)
+//! // Global entity (no scoping at all): an empty table.
 //! impl ScopableEntity for system_config::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         None  // Global entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(system_config::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
+//!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+//!
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }

@@ -8,8 +8,8 @@ use std::marker::PhantomData;
 use crate::secure::cond::build_scope_condition;
 use crate::secure::error::ScopeError;
 use crate::secure::{
-    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, Scoped, SeaOrmRunner, SecureEntityExt,
-    Unscoped,
+    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeProperties, Scoped, SeaOrmRunner,
+    SecureEntityExt, Unscoped,
 };
 
 /// Convert a `sea_orm::Value` to a [`ScopeValue`] for comparison with scope filter values.
@@ -78,7 +78,7 @@ where
     'next_constraint: for constraint in scope.constraints() {
         // AND over filters within this constraint.
         for filter in constraint.filters() {
-            let Some(col) = <A::Entity as ScopableEntity>::resolve_property(filter.property())
+            let Some(col) = <A::Entity as ScopeProperties>::resolve_property(filter.property())
             else {
                 // Unknown property → this constraint fails (fail-closed).
                 continue 'next_constraint;
@@ -121,7 +121,7 @@ where
 ///
 /// Validates **all** scope constraints against the `ActiveModel`'s column values,
 /// not just `tenant_id`. For each constraint in the scope, every filter's property
-/// is resolved to a column via `ScopableEntity::resolve_property`, and the
+/// is resolved to a column via `ScopeProperties::resolve_property`, and the
 /// `ActiveModel`'s value for that column is checked against the filter's values.
 /// At least one constraint must match entirely (OR semantics) for the insert to
 /// proceed.
@@ -933,7 +933,7 @@ where
 
 /// A secure builder for `ON CONFLICT DO UPDATE` clauses that enforces tenant immutability.
 ///
-/// For tenant-scoped entities (`ScopableEntity::tenant_col() != None`), this builder
+/// For tenant-scoped entities (`ScopeProperties::tenant_col() != None`), this builder
 /// ensures that `tenant_id` is never included in the update columns. Attempting to
 /// update `tenant_id` via `update_columns()` or `value()` returns an error.
 ///
@@ -1331,27 +1331,13 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+                (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+                (pep_properties::RESOURCE_ID, Column::Id),
+            ];
+
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-                    pep_properties::RESOURCE_ID => Self::resource_col(),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id]
             }
         }
     }
@@ -1400,23 +1386,10 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                None
-            }
-            fn resource_col() -> Option<Column> {
-                None
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(_property: &str) -> Option<Column> {
-                None
-            }
-            fn scope_columns() -> Vec<Column> {
-                Vec::new()
             }
         }
     }
@@ -1440,26 +1413,10 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                None // Global entity - no tenant column
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[("id", Column::Id)];
+
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    "id" => Self::resource_col(),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::Id]
             }
         }
     }
@@ -1654,29 +1611,15 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                Some(Column::UserId)
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+                (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+                (pep_properties::RESOURCE_ID, Column::Id),
+                (pep_properties::OWNER_ID, Column::UserId),
+                ("city_id", Column::CityId),
+            ];
+
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                    pep_properties::RESOURCE_ID => Some(Column::Id),
-                    pep_properties::OWNER_ID => Some(Column::UserId),
-                    "city_id" => Some(Column::CityId),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::UserId, Column::CityId]
             }
         }
     }
@@ -1939,27 +1882,13 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+                (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+                ("score", Column::Score),
+            ];
+
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-                    "score" => Some(Column::Score),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::Score]
             }
         }
     }

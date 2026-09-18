@@ -1,0 +1,11 @@
+error: When using 'unrestricted', no other column attributes are allowed
+  --> tests/ui/err_pep_before_unrestricted.rs:11:43
+   |
+11 | #[secure(pep_prop(custom = "custom_col"), unrestricted)]
+   |                                           ^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/err_pep_before_unrestricted.rs:12:14
+   |
+12 | struct Model;
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/err_pep_before_unrestricted.rs`
