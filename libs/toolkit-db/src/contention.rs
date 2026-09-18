@@ -78,6 +78,9 @@ const SQLITE_BUSY_SNAPSHOT_CODE: &str = "(code: 517)";
 /// them.
 const SQLITE_BUSY: &str = "5";
 const SQLITE_BUSY_SNAPSHOT: &str = "517";
+/// `SQLITE_CONSTRAINT`. Every extended constraint code carries it in its low
+/// byte, so one comparison covers `787`, `1555`, `2067` and the others.
+const SQLITE_CONSTRAINT: u32 = 19;
 const SQLITE_LOCKED_MSG: &str = "database is locked";
 
 /// Returns `true` if the error is a transient lock-contention error that is
@@ -115,6 +118,16 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
     // exists to replace, and `PostgreSQL` 18 already showed the server can
     // renumber and reword what this module reads.
     if let Some(code) = crate::db_error::driver_code(err) {
+        // A code that names a deterministic refusal ends the question. The
+        // rendered message must not be able to reopen it: `PostgreSQL` prints
+        // the rejected value into a unique violation's detail, so a row whose
+        // key is the text `deadlock detected` would otherwise be retried
+        // forever instead of reported as the conflict it is. This is the same
+        // rule `db_error::classifies_as` applies, and it belongs here for the
+        // same reason.
+        if names_a_refusal(backend, &code) {
+            return false;
+        }
         return is_contention_code(backend, &code)
             || is_contention_wording(backend, &err.to_string());
     }
@@ -127,6 +140,27 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
             is_contention_message(backend, &msg)
         }
         DbErr::Custom(msg) => is_contention_message(backend, msg),
+        _ => false,
+    }
+}
+
+/// Whether `code` names a deterministic refusal -- something the statement did
+/// wrong, which retrying cannot fix.
+///
+/// Class 23 (`integrity_constraint_violation`) on the SQLSTATE backends, and
+/// `SQLITE_CONSTRAINT` with its extended codes on `SQLite`, where the extended
+/// code is the primary code in the low byte (`19` for `SQLITE_CONSTRAINT`), so
+/// `787`, `1555`, `2067` and the rest all answer here without listing them.
+///
+/// Wider than [`crate::db_error::constraint_violation`] on purpose: that table
+/// names only the conditions a caller in this workspace branches on, while this
+/// question is the cruder one of whether retrying could possibly help.
+fn names_a_refusal(backend: DbBackend, code: &str) -> bool {
+    match backend {
+        DbBackend::MySql | DbBackend::Postgres => code.starts_with("23"),
+        DbBackend::Sqlite => code
+            .parse::<u32>()
+            .is_ok_and(|extended| extended & 0xff == SQLITE_CONSTRAINT),
         _ => false,
     }
 }
@@ -283,6 +317,40 @@ mod tests {
         let refusal = refused("23505", "duplicate key value violates unique constraint");
         for backend in [DbBackend::MySql, DbBackend::Postgres, DbBackend::Sqlite] {
             assert!(!is_retryable_contention(backend, &refusal), "{backend:?}");
+        }
+    }
+
+    /// A refusal stays a refusal, whatever its message happens to say.
+    ///
+    /// `PostgreSQL` prints the rejected value into a unique violation's detail,
+    /// so the text of a `23505` is partly written by whoever supplied the row.
+    /// Retrying a constraint violation cannot help, and a transaction that
+    /// retries one spins until it gives up.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_refusal_is_not_contention_however_its_message_reads() {
+        let err = refused("23505", "duplicate key: deadlock detected");
+        assert!(
+            !is_retryable_contention(DbBackend::Postgres, &err),
+            "a unique violation must not be retried because its value spells contention"
+        );
+
+        // Class 23 entire, not only the two codes `constraint_violation` names.
+        for code in ["23505", "23503", "23001", "23514", "23502", "23P01"] {
+            let err = refused(code, "could not serialize access due to concurrent update");
+            assert!(
+                !is_retryable_contention(DbBackend::Postgres, &err),
+                "{code} is a refusal"
+            );
+        }
+
+        // SQLite carries the primary code in the low byte of the extended one.
+        for code in ["787", "1555", "2067"] {
+            let err = refused(code, "database is locked");
+            assert!(
+                !is_retryable_contention(DbBackend::Sqlite, &err),
+                "SQLite {code} is a constraint refusal"
+            );
         }
     }
 
