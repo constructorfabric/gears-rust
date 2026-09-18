@@ -180,17 +180,19 @@ async fn the_managed_lifecycle_sweeps_abandoned_stages_and_stops_when_cancelled(
     ));
 
     rx.await.expect("the sweep announces readiness");
+    // The sweep's database work runs on the blocking pool, so the release
+    // lands on another thread at a time this task cannot observe directly.
+    // The wait is therefore on the clock and not on scheduler turns: a
+    // fixed number of `yield_now`s is a race, and a slow machine loses it.
     // The store release is the pass's last step, so waiting for it waits for
     // the whole of it.
-    let mut released = false;
-    for _ in 0..1000u32 {
-        if secrets.held().is_empty() {
-            released = true;
-            break;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !secrets.held().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        tokio::task::yield_now().await;
-    }
-    assert!(released, "the first tick releases what has expired");
+    })
+    .await
+    .expect("the first tick releases what has expired");
 
     let conn = inner.db.conn().expect("connection");
     let scope = toolkit_security::AccessScope::allow_all();
