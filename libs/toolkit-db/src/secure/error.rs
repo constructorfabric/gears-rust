@@ -315,64 +315,6 @@ mod tests {
         assert!(!is_foreign_key_violation(&err));
     }
 
-    /// A `DbErr` shaped exactly like one a driver produces, with a code and a
-    /// message of our choosing.
-    ///
-    /// The tier rules cannot be exercised through `DbErr::Custom`, which by
-    /// definition carries no driver error: what has to be tested is a *live*
-    /// shape whose code says one thing and whose text says another. A live
-    /// server can produce it (and does, in `tests/error_classification.rs`),
-    /// but the rule itself deserves a test that runs without one.
-    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
-    mod driver_shaped {
-        use std::borrow::Cow;
-        use std::sync::Arc;
-
-        #[derive(Debug)]
-        struct Refusal {
-            code: &'static str,
-            message: String,
-        }
-
-        impl std::fmt::Display for Refusal {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.message)
-            }
-        }
-
-        impl std::error::Error for Refusal {}
-
-        impl sqlx::error::DatabaseError for Refusal {
-            fn message(&self) -> &str {
-                &self.message
-            }
-            fn code(&self) -> Option<Cow<'_, str>> {
-                Some(Cow::Borrowed(self.code))
-            }
-            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-                self
-            }
-            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-                self
-            }
-            fn kind(&self) -> sqlx::error::ErrorKind {
-                sqlx::error::ErrorKind::Other
-            }
-        }
-
-        pub fn refused(code: &'static str, message: &str) -> sea_orm::DbErr {
-            sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
-                sqlx::Error::Database(Box::new(Refusal {
-                    code,
-                    message: message.to_owned(),
-                })),
-            )))
-        }
-    }
-
     /// The finding this rule exists for: `PostgreSQL` echoes the offending
     /// value into the message, so a caller can put our own search strings
     /// there. `22P02` is a malformed input, not a conflict, and the value is
@@ -380,7 +322,7 @@ mod tests {
     #[test]
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     fn a_value_in_the_message_cannot_decide_the_condition() {
-        let err = driver_shaped::refused(
+        let err = crate::db_error::driver_shaped::refused(
             "22P02",
             r#"invalid input syntax for type uuid: "duplicate key""#,
         );
@@ -389,7 +331,7 @@ mod tests {
             "a caller-supplied 'duplicate key' must not classify a 22P02 as a conflict"
         );
 
-        let err = driver_shaped::refused(
+        let err = crate::db_error::driver_shaped::refused(
             "22P02",
             r#"invalid input syntax for type uuid: "violates foreign key constraint""#,
         );
@@ -404,7 +346,7 @@ mod tests {
     #[test]
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     fn a_code_that_names_a_condition_is_the_whole_answer() {
-        let unique = driver_shaped::refused(
+        let unique = crate::db_error::driver_shaped::refused(
             "23505",
             "duplicate key value violates unique constraint \"users_email_key\"",
         );
@@ -412,7 +354,7 @@ mod tests {
         assert!(!is_foreign_key_violation(&unique));
 
         // PostgreSQL 18's RESTRICT code, which sea-orm's own table does not map.
-        let restrict = driver_shaped::refused(
+        let restrict = crate::db_error::driver_shaped::refused(
             "23001",
             "update or delete on table \"parent\" violates RESTRICT setting",
         );

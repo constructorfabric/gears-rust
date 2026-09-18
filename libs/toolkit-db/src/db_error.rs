@@ -258,6 +258,65 @@ pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
 }
 
 #[cfg(test)]
+/// A `DbErr` shaped exactly like one a driver produces, with a code and a
+/// message of our choosing.
+///
+/// The tier rules cannot be exercised through `DbErr::Custom`, which by
+/// definition carries no driver error: what has to be tested is a *live*
+/// shape whose code says one thing and whose text says another. A live
+/// server can produce it (and does, in `tests/error_classification.rs`),
+/// but the rule itself deserves a test that runs without one.
+#[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+pub(crate) mod driver_shaped {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Refusal {
+        code: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for Refusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Refusal {}
+
+    impl sqlx::error::DatabaseError for Refusal {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    pub fn refused(code: &'static str, message: &str) -> sea_orm::DbErr {
+        sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sqlx::Error::Database(Box::new(Refusal {
+                code,
+                message: message.to_owned(),
+            })),
+        )))
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{ConstraintViolation, constraint_violation, driver_refusal};

@@ -74,6 +74,10 @@ const PG_DEADLOCK_MSG: &str = "deadlock detected";
 /// sqlx surfaces these as `"error returned from database: (code: N) database is locked"`.
 const SQLITE_BUSY_CODE: &str = "(code: 5)";
 const SQLITE_BUSY_SNAPSHOT_CODE: &str = "(code: 517)";
+/// The same two, as the driver reports them rather than as a message renders
+/// them.
+const SQLITE_BUSY: &str = "5";
+const SQLITE_BUSY_SNAPSHOT: &str = "517";
 const SQLITE_LOCKED_MSG: &str = "database is locked";
 
 /// Returns `true` if the error is a transient lock-contention error that is
@@ -85,8 +89,9 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 /// * `SQLite` `SQLITE_BUSY` (code 5) — `busy_timeout` expired
 /// * `SQLite` `SQLITE_BUSY_SNAPSHOT` (code 517) — WAL snapshot conflict
 ///
-/// Detection is based on the error's string representation, which avoids a
-/// direct dependency on `sqlx` types.
+/// Detection prefers the code the driver reported ([`crate::db_error`]), and
+/// falls back to the error's string representation when there is none. Neither
+/// puts a `sqlx` type in this signature.
 ///
 /// # Why `DbErr::Custom` is also checked
 ///
@@ -104,12 +109,63 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 /// match.
 #[must_use]
 pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
+    // The server's own code, when it gave one: no locale, no rendering, and no
+    // interpolated identifier that happens to contain `40001`. Pulling the
+    // SQLSTATE back out of the rendered message is the path `crate::db_error`
+    // exists to replace, and `PostgreSQL` 18 already showed the server can
+    // renumber and reword what this module reads.
+    if let Some(code) = crate::db_error::driver_code(err) {
+        return is_contention_code(backend, &code)
+            || is_contention_wording(backend, &err.to_string());
+    }
+
+    // No code to read: a `DbErr::Custom` a caller composed, or a driver error
+    // that carried none. The message is all there is, numeric shapes included.
     match err {
         DbErr::Exec(runtime_err) | DbErr::Query(runtime_err) => {
             let msg = runtime_err.to_string();
             is_contention_message(backend, &msg)
         }
         DbErr::Custom(msg) => is_contention_message(backend, msg),
+        _ => false,
+    }
+}
+
+/// Whether `code`, as the driver reported it, is a contention condition.
+///
+/// `PostgreSQL` and `MySQL` report a SQLSTATE; `SQLite` reports its extended
+/// result code, which is what `(code: 5)` renders in a message.
+fn is_contention_code(backend: DbBackend, code: &str) -> bool {
+    match backend {
+        DbBackend::MySql => code == MYSQL_DEADLOCK_SQLSTATE,
+        DbBackend::Postgres => code == PG_SERIALIZATION_FAILURE || code == PG_DEADLOCK_DETECTED,
+        DbBackend::Sqlite => code == SQLITE_BUSY || code == SQLITE_BUSY_SNAPSHOT,
+        _ => false,
+    }
+}
+
+/// The message signals that are *words*, not codes.
+///
+/// Kept for an error that carried a code we do not recognise: Galera surfaces
+/// certification conflicts in wording, and a serialization failure says so in
+/// its text. What is deliberately absent is the numeric matching in
+/// `contains_sqlstate` -- when the driver handed us a code, digging a different
+/// one out of the rendered text can only be a coincidence, and a UUID in an
+/// interpolated message supplies those.
+fn is_contention_wording(backend: DbBackend, msg: &str) -> bool {
+    match backend {
+        DbBackend::MySql => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains(MYSQL_DEADLOCK_MSG)
+                || msg.contains(MYSQL_WSREP_DEADLOCK_MSG)
+                || msg.contains(MYSQL_WSREP_CERTIFICATION_ERROR_MSG)
+                || msg.contains(MYSQL_WSREP_CANNOT_CERTIFY_MSG)
+                || msg.contains(MYSQL_WSREP_WRITE_SET_CONFLICT_MSG)
+                || msg.contains(MYSQL_WSREP_CERTIFICATION_FAILURE_MSG)
+                || msg.contains(MYSQL_RESTART_MSG)
+        }
+        DbBackend::Postgres => msg.contains(PG_SERIALIZATION_MSG) || msg.contains(PG_DEADLOCK_MSG),
+        DbBackend::Sqlite => is_sqlite_busy(msg),
         _ => false,
     }
 }
@@ -178,6 +234,45 @@ mod tests {
     use sea_orm::RuntimeErr;
 
     use super::*;
+
+    /// A driver error whose code says one thing and whose rendered message
+    /// carries another, which is the shape the code path exists to get right.
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    use crate::db_error::driver_shaped::refused;
+
+    /// The hazard `contains_sqlstate` was narrowed for, closed at the source.
+    ///
+    /// A `DbErr` a caller composed can interpolate an id, and `40001` is a run
+    /// of digits a UUID produces by chance -- the existing doc says so. When
+    /// the driver gave us a code, that guesswork is not needed at all: this
+    /// refusal is a unique violation whose message happens to render `(40001)`,
+    /// and it is not retryable.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_code_the_driver_gave_beats_a_sqlstate_shape_in_the_text() {
+        let err = refused(
+            "23505",
+            "duplicate key value violates unique constraint \"orders_pkey\" \
+             for group 8f3c40001a2b4d5e9f00040001bbccdd (40001)",
+        );
+        assert!(
+            !is_retryable_contention(DbBackend::Postgres, &err),
+            "a unique violation must not be retried because its text renders a SQLSTATE shape"
+        );
+    }
+
+    /// And the structured path recognises a real one, on a code sea-orm's own
+    /// table has nothing to say about.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_serialization_failure_is_recognised_by_its_code() {
+        let err = refused("40001", "could not serialize access due to concurrent update");
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+
+        // Wording gone, code intact: still retryable.
+        let terse = refused("40P01", "deadlock");
+        assert!(is_retryable_contention(DbBackend::Postgres, &terse));
+    }
 
     fn exec_err(msg: &str) -> DbErr {
         DbErr::Exec(RuntimeErr::Internal(msg.to_owned()))
