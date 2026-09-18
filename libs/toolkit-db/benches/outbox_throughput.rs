@@ -1156,8 +1156,9 @@ async fn produce_range(
                 state.watch_trace(t, outbox.subscribe(t).expect("valid trace"));
             }
             let o = Arc::clone(outbox);
-            let (_, result) = o
-                .transaction(db.clone(), |tx| {
+            let (_, result) = db
+                .clone()
+                .transaction(|tx| {
                     let o2 = Arc::clone(&o);
                     let trace = trace.clone();
                     Box::pin(async move {
@@ -1167,14 +1168,15 @@ async fn produce_range(
                             record = record.trace(trace);
                         }
                         let msg = record.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-                        o2.enqueue(tx, msg)
+                        let handle = o2
+                            .enqueue(tx, msg)
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        Ok(())
+                        Ok(handle)
                     })
                 })
                 .await;
-            result.unwrap();
+            result.unwrap().flush();
         }
     } else {
         // Batched path — bucket messages by queue, then enqueue_batch per queue.
@@ -1203,8 +1205,9 @@ async fn produce_range(
                     trace
                 });
                 let o = Arc::clone(outbox);
-                let (_, result) = o
-                    .transaction(db.clone(), |tx| {
+                let (_, result) = db
+                    .clone()
+                    .transaction(|tx| {
                         let o2 = Arc::clone(&o);
                         let trace = trace.clone();
                         Box::pin(async move {
@@ -1227,14 +1230,15 @@ async fn produce_range(
                                 records = records.trace(trace);
                             }
                             let batch = records.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-                            o2.enqueue_batch(tx, batch)
+                            let handle = o2
+                                .enqueue_batch(tx, batch)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            Ok(())
+                            Ok(handle)
                         })
                     })
                     .await;
-                result.unwrap();
+                result.unwrap().flush();
             }
         }
     }

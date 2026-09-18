@@ -877,38 +877,37 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_chat_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
-    fn flush(&self) {}
 }
 
 /// Recording outbox enqueuer that captures events for test assertions.
@@ -919,7 +918,7 @@ pub struct RecordingOutboxEnqueuer {
     pub chat_cleanup_events: Mutex<Vec<ChatCleanupEvent>>,
     pub thread_summary_payloads: Mutex<Vec<crate::domain::repos::ThreadSummaryTaskPayload>>,
     recorded_audit_events: Mutex<Vec<AuditEnvelope>>,
-    recorded_flush_count: AtomicU32,
+    recorded_enqueue_count: AtomicU32,
 }
 
 impl RecordingOutboxEnqueuer {
@@ -930,7 +929,7 @@ impl RecordingOutboxEnqueuer {
             chat_cleanup_events: Mutex::new(Vec::new()),
             thread_summary_payloads: Mutex::new(Vec::new()),
             recorded_audit_events: Mutex::new(Vec::new()),
-            recorded_flush_count: AtomicU32::new(0),
+            recorded_enqueue_count: AtomicU32::new(0),
         }
     }
 
@@ -942,8 +941,12 @@ impl RecordingOutboxEnqueuer {
         self.recorded_audit_events.lock().unwrap().clear();
     }
 
-    pub fn flush_count(&self) -> u32 {
-        self.recorded_flush_count.load(Ordering::SeqCst)
+    /// Total number of `enqueue_*` calls seen. Flush now happens on the
+    /// returned `FlushHandle` (which this mock returns as `default()` and so
+    /// cannot observe), so tests assert on enqueue activity instead: a CAS
+    /// winner enqueues, a CAS loser enqueues nothing.
+    pub fn enqueue_count(&self) -> u32 {
+        self.recorded_enqueue_count.load(Ordering::SeqCst)
     }
 }
 
@@ -953,44 +956,46 @@ impl OutboxEnqueuer for RecordingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         self.usage_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         self.cleanup_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_chat_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         self.chat_cleanup_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         self.recorded_audit_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         self.thread_summary_payloads.lock().unwrap().push(payload);
-        Ok(())
-    }
-    fn flush(&self) {
-        self.recorded_flush_count.fetch_add(1, Ordering::SeqCst);
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
 }
 
@@ -1004,14 +1009,14 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         Err(crate::domain::error::DomainError::database(
             "simulated outbox enqueue failure".to_owned(),
         ))
@@ -1020,7 +1025,7 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
         Err(crate::domain::error::DomainError::database(
             "simulated outbox enqueue failure".to_owned(),
         ))
@@ -1029,17 +1034,16 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<toolkit_db::outbox::FlushHandle, crate::domain::error::DomainError> {
+        Ok(toolkit_db::outbox::FlushHandle::default())
     }
-    fn flush(&self) {}
 }
 
 // ── Mock OAGW Gateway ──

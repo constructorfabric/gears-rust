@@ -154,7 +154,7 @@ impl ProducerOutbox {
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         event: E,
-    ) -> Result<toolkit_db::outbox::OutboxMessageId, EventBrokerError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, EventBrokerError> {
         let (partition, envelope) = self
             .producer
             .outbox_envelope(event, self.partitions)
@@ -176,7 +176,7 @@ impl ProducerOutbox {
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         events: impl IntoIterator<Item = E>,
-    ) -> Result<Vec<toolkit_db::outbox::OutboxMessageId>, EventBrokerError> {
+    ) -> Result<toolkit_db::outbox::FlushHandle, EventBrokerError> {
         // Every event in the batch shares the queue and the payload type, so
         // the batch states them once. No trace is attached: a produced event
         // is already identified by its own id and `trace_parent`, and giving

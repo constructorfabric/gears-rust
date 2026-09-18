@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use sea_orm::DatabaseExecutor;
 use toolkit_db::outbox::{
-    HandlerResult, Outbox, OutboxMessage, Partitions, Record, TransactionalMessageHandler,
-    WorkerTuning, outbox_migrations,
+    FlushHandle, HandlerResult, Outbox, OutboxMessage, Partitions, Record,
+    TransactionalMessageHandler, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -64,15 +64,18 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    // transaction() auto-flushes the sequencer on commit — no manual flush() needed
+    // Enqueue inside the DB transaction, accumulate the FlushHandle, and flush
+    // it only after the transaction commits — so the sequencer is woken against
+    // durable rows.
     let outbox = Arc::clone(handle.outbox());
-    let (db, result) = outbox
-        .transaction(db, |tx| {
+    let (db, result) = db
+        .transaction(|tx| {
             let outbox = Arc::clone(&outbox);
             Box::pin(async move {
+                let mut pending = FlushHandle::default();
                 for i in 0..5u32 {
                     let payload = format!(r#"{{"order_id": {i}}}"#);
-                    outbox
+                    pending += outbox
                         // payload_type is user-defined — convention: mime base + vendor domain type
                         .enqueue(
                             tx,
@@ -83,11 +86,11 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
-                Ok(())
+                Ok(pending)
             })
         })
         .await;
-    result?;
+    result?.flush();
     println!("Enqueued 5 messages across 2 partitions");
 
     // Poll until all messages are processed (processor runs in background)

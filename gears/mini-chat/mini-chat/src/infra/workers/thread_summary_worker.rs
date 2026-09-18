@@ -341,7 +341,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
                     if rows == 0 {
-                        return Ok(false);
+                        return Ok((false, toolkit_db::outbox::FlushHandle::default()));
                     }
 
                     // 5b. Mark messages as compressed
@@ -398,19 +398,20 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         )),
                         system_task_type: Some("thread_summary_update".to_owned()),
                     };
-                    deps.outbox_enqueuer
+                    let pending = deps
+                        .outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
-                    Ok(true)
+                    Ok((true, pending))
                 })
             })
             .await;
 
         match cas_result {
-            Ok(true) => {
-                self.deps.outbox_enqueuer.flush();
+            Ok((true, pending)) => {
+                pending.flush();
                 self.deps.metrics.record_thread_summary_execution("success");
                 info!(
                     chat_id = %payload.chat_id,
@@ -419,7 +420,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                 );
                 MessageResult::Ok
             }
-            Ok(false) => {
+            Ok((false, _)) => {
                 self.deps.metrics.record_thread_summary_cas_conflict();
                 info!(
                     chat_id = %payload.chat_id,

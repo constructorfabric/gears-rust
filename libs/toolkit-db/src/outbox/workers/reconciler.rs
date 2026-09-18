@@ -47,7 +47,7 @@ pub async fn reconcile_dirty(outbox: &Outbox, db: &Db, prioritizer: &SharedPrior
 
     if found > 0 {
         tracing::debug!(found, "cold reconciler: discovered dirty partitions");
-        outbox.flush();
+        prioritizer.wake_sequencers();
     }
 }
 

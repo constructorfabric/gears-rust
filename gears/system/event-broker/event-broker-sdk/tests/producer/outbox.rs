@@ -480,7 +480,11 @@ async fn service_owned_lifecycle_registers_extra_queue_and_binds_producer_outbox
     let producer_outbox = event_outbox.bind(&handle);
     let conn = db.conn().unwrap();
 
-    let id = producer_outbox.enqueue(&conn, order(None)).await.unwrap();
+    let id = producer_outbox
+        .enqueue(&conn, order(None))
+        .await
+        .unwrap()
+        .id();
 
     assert!(id.0 > 0);
     handle.stop().await;
@@ -503,7 +507,8 @@ async fn convenience_start_drains_enqueued_event_to_broker() {
         .outbox()
         .enqueue(&conn, order(None))
         .await
-        .unwrap();
+        .unwrap()
+        .flush();
     wait_for_stored(&handle, TOPIC, TENANT_PARTITION, 1).await;
 
     producer_handle.stop().await;
@@ -612,7 +617,8 @@ async fn outbox_processor_rotates_future_registration_when_broker_forgot_produce
         .outbox()
         .enqueue(&conn, order(None))
         .await
-        .unwrap();
+        .unwrap()
+        .flush();
     let after =
         wait_for_rotated_registration(&producer, before["producer_id"].as_str().unwrap()).await;
 

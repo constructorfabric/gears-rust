@@ -130,8 +130,11 @@ pub struct ThreadSummaryTaskPayload {
 ///
 /// The infra implementation (`InfraOutboxEnqueuer`) holds an
 /// `Arc<toolkit_db::outbox::Outbox>` and calls `outbox.enqueue(runner, ...)`
-/// within the finalization transaction. The `Outbox::flush()` notification
-/// is sent after the transaction commits (by the finalization service).
+/// within the finalization transaction. Each enqueue returns a
+/// [`toolkit_db::outbox::FlushHandle`]; the caller accumulates the handles of a
+/// unit of work (with `+=`) and calls `.flush()` on the combined handle *after*
+/// the transaction commits, which marks the written partitions dirty and wakes
+/// the sequencers.
 #[async_trait::async_trait]
 pub trait OutboxEnqueuer: Send + Sync {
     /// Enqueue a usage event within the caller's transaction.
@@ -145,12 +148,13 @@ pub trait OutboxEnqueuer: Send + Sync {
     /// Duplicate prevention is handled by the CAS guard in the finalization
     /// transaction — the outbox enqueue is only reached by the CAS winner.
     ///
-    /// Returns `Ok(())` on success. Returns `Err` on database error.
+    /// Returns a [`toolkit_db::outbox::FlushHandle`] the caller flushes after
+    /// the transaction commits. Returns `Err` on database error.
     async fn enqueue_usage_event(
         &self,
         runner: &(dyn DBRunner + Sync),
         event: UsageEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError>;
 
     /// Enqueue an attachment cleanup event within the caller's transaction.
     ///
@@ -160,7 +164,7 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError>;
 
     /// Enqueue a chat-deletion cleanup event within the caller's transaction.
     ///
@@ -171,7 +175,7 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError>;
 
     /// Enqueue an audit event within the caller's transaction.
     ///
@@ -181,12 +185,13 @@ pub trait OutboxEnqueuer: Send + Sync {
     /// - Use `queue = "mini-chat.audit"`
     /// - Derive the partition from the envelope's `tenant_id`
     ///
-    /// Returns `Ok(())` on success. Returns `Err` on database error.
+    /// Returns a [`toolkit_db::outbox::FlushHandle`] the caller flushes after
+    /// the transaction commits. Returns `Err` on database error.
     async fn enqueue_audit_event(
         &self,
         runner: &(dyn DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), DomainError>;
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError>;
 
     /// Enqueue a thread summary task within the caller's transaction.
     ///
@@ -196,15 +201,5 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         payload: ThreadSummaryTaskPayload,
-    ) -> Result<(), DomainError>;
-
-    /// Notify the outbox sequencer that new events are available.
-    ///
-    /// Called after the transaction that contains enqueue calls commits.
-    /// Multiple flush calls coalesce — calling flush 10 times results in at most
-    /// one sequencer wakeup.
-    ///
-    /// This is outbox-wide: it wakes the sequencer for ALL registered queues,
-    /// so a single flush call suffices regardless of which queue was written to.
-    fn flush(&self);
+    ) -> Result<toolkit_db::outbox::FlushHandle, DomainError>;
 }

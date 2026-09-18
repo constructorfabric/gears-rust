@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::current_otel_trace_id;
+use toolkit_db::outbox::FlushHandle;
 use toolkit_macros::domain_model;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -139,10 +140,10 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         let result = self.try_finalize(&input, trace_id.clone()).await;
 
         match result {
-            Ok(outcome) => {
+            Ok((outcome, pending)) => {
                 // Post-commit side effects (outside transaction).
                 if outcome.won_cas {
-                    self.outbox_enqueuer.flush();
+                    pending.flush();
                 }
                 if let Some(billing) = outcome.billing_outcome {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -163,7 +164,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     let mut retry_input = input;
                     retry_input.terminal_state = TurnState::Failed;
                     retry_input.error_code = Some("message_persistence_failed".to_owned());
-                    let retry_outcome = self
+                    let (retry_outcome, retry_pending) = self
                         .try_finalize(&retry_input, trace_id.clone())
                         .await
                         .map_err(|fe| match fe {
@@ -173,7 +174,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             }
                         })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_pending.flush();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -197,7 +198,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     );
                     let mut retry_input = input;
                     retry_input.accumulated_text = String::new();
-                    let retry_outcome =
+                    let (retry_outcome, retry_pending) =
                         self.try_finalize(&retry_input, trace_id)
                             .await
                             .map_err(|fe| match fe {
@@ -209,7 +210,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                                 }
                             })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_pending.flush();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -233,7 +234,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         &self,
         input: &FinalizationInput,
         trace_id: Option<String>,
-    ) -> Result<FinalizationOutcome, FinalizationError> {
+    ) -> Result<(FinalizationOutcome, FlushHandle), FinalizationError> {
         let turn_repo = Arc::clone(&self.turn_repo);
         let message_repo = Arc::clone(&self.message_repo);
         let quota_settler = Arc::clone(&self.quota_settler);
@@ -270,12 +271,19 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     if rows == 0 {
                         debug!(turn_id = %input.turn_id, "CAS loser: another finalizer won");
-                        return Ok(FinalizationOutcome {
-                            won_cas: false,
-                            billing_outcome: None,
-                            settlement_outcome: None,
-                        });
+                        return Ok((
+                            FinalizationOutcome {
+                                won_cas: false,
+                                billing_outcome: None,
+                                settlement_outcome: None,
+                            },
+                            FlushHandle::default(),
+                        ));
                     }
+
+                    // Accumulate the flush handles of every enqueue in this unit
+                    // of work; flushed post-commit by the caller.
+                    let mut pending = FlushHandle::default();
 
                     // 2. Derive billing outcome (pure function, no DB)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -357,14 +365,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     // 5. Enqueue usage outbox event
                     let usage_event = build_usage_event(&input, billing, &settlement_outcome);
-                    outbox_enqueuer
+                    pending += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
 
                     // 6. Enqueue audit outbox event
                     let audit_event = build_turn_audit_envelope(&input, trace_id);
-                    outbox_enqueuer
+                    pending += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
@@ -450,7 +458,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                                     frozen_target_created_at: target.created_at,
                                     frozen_target_message_id: target.message_id,
                                 };
-                                outbox_enqueuer
+                                pending += outbox_enqueuer
                                     .enqueue_thread_summary(tx, payload)
                                     .await
                                     .map_err(to_db)?;
@@ -461,11 +469,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         }
                     }
 
-                    Ok(FinalizationOutcome {
-                        won_cas: true,
-                        billing_outcome: Some(billing),
-                        settlement_outcome: Some(settlement_outcome),
-                    })
+                    Ok((
+                        FinalizationOutcome {
+                            won_cas: true,
+                            billing_outcome: Some(billing),
+                            settlement_outcome: Some(settlement_outcome),
+                        },
+                        pending,
+                    ))
                 })
             })
             .await;
@@ -608,8 +619,12 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             turn_id = %input.turn_id,
                             "orphan CAS loser: turn already finalized or progress renewed"
                         );
-                        return Ok(false);
+                        return Ok((false, FlushHandle::default()));
                     }
+
+                    // Accumulate the flush handles of every enqueue in this unit
+                    // of work; flushed post-commit once the transaction lands.
+                    let mut pending = FlushHandle::default();
 
                     // 2. Derive billing outcome (pure function)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -717,7 +732,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         dedupe_key: None,
                         system_task_type: None,
                     };
-                    outbox_enqueuer
+                    pending += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
@@ -765,20 +780,21 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         attachments: Vec::new(),
                         tool_calls: None,
                     });
-                    outbox_enqueuer
+                    pending += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
 
-                    Ok(true)
+                    Ok((true, pending))
                 })
             })
             .await
             .map_err(DomainError::from)?;
 
         // Post-commit side effects (outside transaction).
+        let (tx_result, pending) = tx_result;
         if tx_result {
-            self.outbox_enqueuer.flush();
+            pending.flush();
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             self.metrics.record_audit_emit(result_label::OK);
             self.metrics.record_finalization_latency_ms(ms);
@@ -983,19 +999,22 @@ mod tests {
 
     #[domain_model]
     struct NoopOutboxEnqueuer {
-        flush_count: std::sync::atomic::AtomicU32,
+        enqueue_count: std::sync::atomic::AtomicU32,
     }
 
     impl NoopOutboxEnqueuer {
         fn new() -> Self {
             Self {
-                flush_count: std::sync::atomic::AtomicU32::new(0),
+                enqueue_count: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
+        // Flush now happens on the returned FlushHandle, which this mock
+        // returns as `default()` and cannot observe; the counter tracks
+        // enqueue activity instead.
         #[allow(dead_code)]
-        fn flush_count(&self) -> u32 {
-            self.flush_count.load(std::sync::atomic::Ordering::Relaxed)
+        fn enqueue_count(&self) -> u32 {
+            self.enqueue_count.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1005,45 +1024,50 @@ mod tests {
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: mini_chat_sdk::UsageEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(toolkit_db::outbox::FlushHandle::default())
         }
 
         async fn enqueue_attachment_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(toolkit_db::outbox::FlushHandle::default())
         }
 
         async fn enqueue_chat_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::ChatCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(toolkit_db::outbox::FlushHandle::default())
         }
 
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::model::audit_envelope::AuditEnvelope,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(toolkit_db::outbox::FlushHandle::default())
         }
 
         async fn enqueue_thread_summary(
             &self,
             _: &(dyn toolkit_db::secure::DBRunner + Sync),
             _: crate::domain::repos::ThreadSummaryTaskPayload,
-        ) -> Result<(), DomainError> {
-            Ok(())
-        }
-
-        fn flush(&self) {
-            self.flush_count
+        ) -> Result<toolkit_db::outbox::FlushHandle, DomainError> {
+            self.enqueue_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(toolkit_db::outbox::FlushHandle::default())
         }
     }
 
@@ -1260,9 +1284,9 @@ mod tests {
         assert!(outcome.billing_outcome.is_some());
         assert!(outcome.settlement_outcome.is_some());
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called once after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "CAS winner enqueues the usage + audit events"
         );
 
         // Verify turn is now in completed state
@@ -1324,11 +1348,12 @@ mod tests {
         assert!(!outcome2.won_cas, "second finalizer should lose CAS");
         assert!(outcome2.billing_outcome.is_none());
         assert!(outcome2.settlement_outcome.is_none());
-        // First call won CAS → 1 flush. Second lost CAS → no additional flush.
+        // First call won CAS → 2 enqueues (usage + audit). Second lost CAS →
+        // no enqueues.
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should only be called for CAS winner"
+            outbox.enqueue_count(),
+            2,
+            "only the CAS winner enqueues; the loser enqueues nothing"
         );
     }
 
@@ -1998,11 +2023,11 @@ mod tests {
             other => panic!("expected Turn event, got: {other:?}"),
         }
 
-        // Verify flush was called
+        // Verify events were enqueued
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "orphan CAS winner enqueues the usage + audit events"
         );
     }
 
@@ -2126,7 +2151,7 @@ mod tests {
         let audit_events = outbox.audit_events();
         assert!(audit_events.is_empty(), "no audit events for CAS loser");
 
-        assert_eq!(outbox.flush_count(), 0, "no flush for CAS loser");
+        assert_eq!(outbox.enqueue_count(), 0, "CAS loser enqueues nothing");
     }
 
     #[tokio::test]
