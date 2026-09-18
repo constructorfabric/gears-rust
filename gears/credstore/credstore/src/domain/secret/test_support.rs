@@ -348,6 +348,22 @@ impl TenantDirectory for FakeDir {
 /// Key: `(tenant_id, value_id)` (ADR-0006).
 type PluginKey = (Uuid, Uuid);
 
+/// Injected `get` fault for one `(tenant, value_id)` key — see
+/// [`FakePlugin::deny_get_for`] / [`FakePlugin::fail_get_for`]. Used by the
+/// secret-mode-list concurrency tests, which need a *specific* winner's read
+/// (not just "the next `get` call", nondeterministic once reads run
+/// concurrently) to fail.
+#[derive(Clone, Copy)]
+enum FakeGetFault {
+    /// Backend ACL refusal (`CredStoreError::AccessDenied`) — a legitimate
+    /// per-item miss (`fetch_with_retry` maps it to `Ok(None)`), not a
+    /// request failure.
+    Denied,
+    /// A generic backend outage (`CredStoreError::ServiceUnavailable`) — a
+    /// non-`NotFound` error that fails the whole request.
+    Error,
+}
+
 /// In-memory plugin store keyed by `(tenant_id, value_id)`, with the same
 /// immutability guard the static plugin enforces (`put` on an existing key
 /// is `Conflict`) and fault-injection hooks for the write-protocol tests.
@@ -371,6 +387,18 @@ pub struct FakePlugin {
     /// assert the mismatch-triggered refresh does not re-read the key on every
     /// poisoned get (the cache-thrash guard).
     fence_key_gets: AtomicUsize,
+    /// Per-key injected `get` faults (secret-mode-list concurrency tests) —
+    /// see [`FakeGetFault`].
+    get_faults: Mutex<HashMap<PluginKey, FakeGetFault>>,
+    /// Per-key injected read latency in milliseconds (secret-mode-list
+    /// concurrency tests): `get` sleeps this long for a key present here,
+    /// tracked by `in_flight`/`max_in_flight` so a test can observe how many
+    /// reads were in flight at once.
+    delays: Mutex<HashMap<PluginKey, u64>>,
+    /// Number of delayed `get` calls currently sleeping.
+    in_flight: AtomicUsize,
+    /// The largest `in_flight` value observed — see [`Self::max_in_flight`].
+    max_in_flight: AtomicUsize,
 }
 
 impl FakePlugin {
@@ -383,6 +411,10 @@ impl FakePlugin {
             not_found_gets: Mutex::new(0),
             get_denied: false,
             fence_key_gets: AtomicUsize::new(0),
+            get_faults: Mutex::new(HashMap::new()),
+            delays: Mutex::new(HashMap::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -421,6 +453,10 @@ impl FakePlugin {
             not_found_gets: Mutex::new(0),
             get_denied: true,
             fence_key_gets: AtomicUsize::new(0),
+            get_faults: Mutex::new(HashMap::new()),
+            delays: Mutex::new(HashMap::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -484,6 +520,65 @@ impl FakePlugin {
     fn key(tenant_id: &TenantId, value_id: &ValueId) -> PluginKey {
         (tenant_id.0, value_id.0)
     }
+
+    /// Always fail `get` for `(tenant_id, value_id)` with
+    /// `CredStoreError::AccessDenied` — a backend ACL refusing a read the
+    /// gear's PDP already allowed, which `fetch_with_retry` treats as a
+    /// legitimate per-item miss (`Ok(None)`), not a request failure. For the
+    /// secret-mode-list "refused item omitted" test: unlike
+    /// [`Self::fail_next_gets_with_not_found`] (a global counter over the
+    /// *next* call, nondeterministic once reads run concurrently), this
+    /// targets one specific winner.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn deny_get_for(&self, tenant_id: &TenantId, value_id: ValueId) {
+        self.get_faults
+            .lock()
+            .expect("lock")
+            .insert(Self::key(tenant_id, &value_id), FakeGetFault::Denied);
+    }
+
+    /// Always fail `get` for `(tenant_id, value_id)` with a simulated backend
+    /// outage (`CredStoreError::ServiceUnavailable`) — a non-`NotFound` error
+    /// that fails the whole request, targeted at one specific winner (see
+    /// [`Self::deny_get_for`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_get_for(&self, tenant_id: &TenantId, value_id: ValueId) {
+        self.get_faults
+            .lock()
+            .expect("lock")
+            .insert(Self::key(tenant_id, &value_id), FakeGetFault::Error);
+    }
+
+    /// Make every future `get` for `(tenant_id, value_id)` sleep `ms`
+    /// milliseconds, with the sleep tracked by [`Self::max_in_flight`] — for
+    /// asserting the secret-mode list's bounded-concurrency fan-out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_delay_ms(&self, tenant_id: &TenantId, value_id: ValueId, ms: u64) {
+        self.delays
+            .lock()
+            .expect("lock")
+            .insert(Self::key(tenant_id, &value_id), ms);
+    }
+
+    /// The largest number of [`Self::set_delay_ms`]-delayed `get` calls this
+    /// plugin ever had sleeping at the same time.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    #[must_use]
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for FakePlugin {
@@ -495,6 +590,10 @@ impl Default for FakePlugin {
             not_found_gets: Mutex::new(0),
             get_denied: false,
             fence_key_gets: AtomicUsize::new(0),
+            get_faults: Mutex::new(HashMap::new()),
+            delays: Mutex::new(HashMap::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 }
@@ -513,6 +612,16 @@ impl CredStorePluginClientV1 for FakePlugin {
         if self.get_denied {
             return Err(CredStoreError::AccessDenied);
         }
+        let k = Self::key(tenant_id, value_id);
+        if let Some(fault) = self.get_faults.lock().expect("lock").get(&k).copied() {
+            return match fault {
+                FakeGetFault::Denied => Err(CredStoreError::AccessDenied),
+                FakeGetFault::Error => Err(CredStoreError::ServiceUnavailable {
+                    detail: "simulated backend get failure".to_owned(),
+                    retry_after: None,
+                }),
+            };
+        }
         {
             let mut remaining = self.not_found_gets.lock().expect("lock");
             if *remaining > 0 {
@@ -520,7 +629,19 @@ impl CredStorePluginClientV1 for FakePlugin {
                 return Ok(None);
             }
         }
-        let k = Self::key(tenant_id, value_id);
+        let delay_ms = self
+            .delays
+            .lock()
+            .expect("lock")
+            .get(&k)
+            .copied()
+            .unwrap_or(0);
+        if delay_ms > 0 {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
         let guard = self.store.lock().expect("lock");
         Ok(guard.get(&k).map(|v| SecretValue::new(v.clone())))
     }
@@ -649,6 +770,13 @@ pub struct FakeSecretRepo {
     /// regardless of actual row state — models a row vanishing concurrently
     /// between the caller's precheck and this call.
     force_delete_by_id_not_found: Mutex<usize>,
+    /// Every `type_uuid_in` clamp `list_candidate_references` (step 1) was
+    /// called with, in call order (`None` when that call carried no type
+    /// clamp) — lets tests assert the PDP-permitted set
+    /// `Service::permitted_types` computed actually reached step 1's SQL
+    /// clamp, and that step 1 was skipped entirely (an empty vec here) when
+    /// nothing was permitted.
+    list_candidate_references_calls: Mutex<Vec<Option<Vec<Uuid>>>>,
 }
 
 impl FakeSecretRepo {
@@ -664,6 +792,7 @@ impl FakeSecretRepo {
             pending_switch: Mutex::new(None),
             fail_delete: false,
             force_delete_by_id_not_found: Mutex::new(0),
+            list_candidate_references_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -784,6 +913,22 @@ impl FakeSecretRepo {
     #[must_use]
     pub fn gc_entries(&self) -> Vec<GcEntry> {
         self.gc.lock().expect("lock").clone()
+    }
+
+    /// Every `type_uuid_in` clamp `list_candidate_references` (step 1) was
+    /// called with, in call order — an empty vec means step 1 was never
+    /// called at all (e.g. the PDP-permitted set was empty and the service
+    /// returned before running it).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn list_candidate_references_type_clamps(&self) -> Vec<Option<Vec<Uuid>>> {
+        self.list_candidate_references_calls
+            .lock()
+            .expect("lock")
+            .clone()
     }
 
     /// Resolution-eligible (ADR-0004, Suppression): `active` and not expired,
@@ -974,6 +1119,10 @@ impl SecretRepo for FakeSecretRepo {
         desc: bool,
         limit: u64,
     ) -> Result<Vec<String>, DomainError> {
+        self.list_candidate_references_calls
+            .lock()
+            .expect("lock")
+            .push(type_uuid_in.map(<[Uuid]>::to_vec));
         let rows = self.rows.lock().expect("lock");
         let mut refs: Vec<String> = rows
             .iter()
@@ -1000,18 +1149,16 @@ impl SecretRepo for FakeSecretRepo {
         Ok(refs)
     }
 
-    async fn list_candidate_types(
+    async fn list_visible_types(
         &self,
         req_tenant: TenantId,
         subject: OwnerId,
         chain: &[Uuid],
-        references: &[String],
         type_uuid_in: Option<&[Uuid]>,
     ) -> Result<Vec<Uuid>, DomainError> {
         let rows = self.rows.lock().expect("lock");
         let types: std::collections::BTreeSet<Uuid> = rows
             .iter()
-            .filter(|r| references.contains(&r.reference))
             .filter(|r| Self::is_candidate_visible(r, req_tenant, subject, chain))
             .filter(|r| type_uuid_in.is_none_or(|types| types.contains(&r.secret_type_uuid)))
             .map(|r| r.secret_type_uuid)

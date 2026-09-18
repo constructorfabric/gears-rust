@@ -97,16 +97,14 @@ impl SecretRepo for SecretRepoImpl {
         .await
     }
 
-    async fn list_candidate_types(
+    async fn list_visible_types(
         &self,
         req_tenant: TenantId,
         subject: OwnerId,
         chain: &[Uuid],
-        references: &[String],
         type_uuid_in: Option<&[Uuid]>,
     ) -> Result<Vec<Uuid>, DomainError> {
-        reads::list_candidate_types(self, req_tenant, subject, chain, references, type_uuid_in)
-            .await
+        reads::list_visible_types(self, req_tenant, subject, chain, type_uuid_in).await
     }
 
     async fn list_candidates_for_references(

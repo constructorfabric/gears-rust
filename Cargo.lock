@@ -2432,6 +2432,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "futures",
  "gts",
  "inventory",
  "jsonschema",

@@ -35,6 +35,9 @@ types-registry = { workspace = true }
 
 async-trait = { workspace = true }
 axum = { workspace = true }
+# Bounded-concurrency value reads in secret-mode list (ADR-0005 §4.6):
+# `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
+futures = { workspace = true }
 # Value-fingerprint fence (docs/features/001-value-fingerprint-fence.md):
 # HMAC-SHA256 over the backend value + fence-key generation via AWS-LC
 # (aws-lc-rs) — the workspace's FIPS-capable crypto backend, so the fence runs

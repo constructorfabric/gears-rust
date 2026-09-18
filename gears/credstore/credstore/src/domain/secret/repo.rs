@@ -94,10 +94,14 @@ pub trait SecretRepo: Send + Sync {
     /// same predicate [`Self::resolve_candidates`] applies per reference —
     /// own tenant: every sharing-visible row of any status; ancestors:
     /// resolution-eligible `shared` rows only — clamped by an exact
-    /// `reference` or `secret_type_uuid` set when given (both invariant
-    /// across a reference's chain). `DISTINCT reference`, ordered by
-    /// `reference` (`desc` when `desc`), keyset-paginated by `cursor`
-    /// (exclusive); fetches at most `limit` references. Never a `COUNT`.
+    /// `reference` set when the caller's `$filter` named one, and by
+    /// `type_uuid_in`, which the caller (the collection-read service) has
+    /// already narrowed to the PDP-permitted types intersected with the
+    /// caller's own `$filter type in (…)` before calling this (ADR-0005,
+    /// ADR-0010) — both invariant across a reference's chain. `DISTINCT
+    /// reference`, ordered by `reference` (`desc` when `desc`),
+    /// keyset-paginated by `cursor` (exclusive); fetches at most `limit`
+    /// references. Never a `COUNT`.
     #[allow(
         clippy::too_many_arguments,
         reason = "every clamp the collection read's step 1 query supports"
@@ -114,21 +118,17 @@ pub trait SecretRepo: Send + Sync {
         limit: u64,
     ) -> Result<Vec<String>, DomainError>;
 
-    /// The small second query of step 1 (ADR-0005): distinct
-    /// `secret_type_uuid`s among the candidate rows of `references` — the
-    /// same visibility predicate and `type_uuid_in` clamp
-    /// [`Self::list_candidate_references`] applied, restricted to the
-    /// references it found. This is what the collection read authorizes per
-    /// type; a reduced winner whose type is outside this set (an
-    /// override-type-consistency violation, since step 2 fetches whole rows
-    /// unclamped by type) is dropped and counted, distinct from an ordinary
-    /// PDP denial.
-    async fn list_candidate_types(
+    /// Distinct `secret_type_uuid`s among every row visible to the caller
+    /// across `chain` (the collection read's visibility predicate), clamped
+    /// by `type_uuid_in` when the caller's `$filter` named types. Feeds the
+    /// per-type PDP evaluation whose permitted set becomes step 1's type
+    /// clamp (ADR-0005, ADR-0010). Backed by `idx_credstore_type`; never a
+    /// `COUNT`.
+    async fn list_visible_types(
         &self,
         req_tenant: TenantId,
         subject: OwnerId,
         chain: &[Uuid],
-        references: &[String],
         type_uuid_in: Option<&[Uuid]>,
     ) -> Result<Vec<Uuid>, DomainError>;
 
