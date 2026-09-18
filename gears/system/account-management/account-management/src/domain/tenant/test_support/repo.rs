@@ -647,6 +647,22 @@ impl TenantRepo for FakeTenantRepo {
         Ok(state.tenants.get(&id).cloned())
     }
 
+    async fn find_platform_root(
+        &self,
+        scope: &AccessScope,
+    ) -> Result<Option<TenantModel>, DomainError> {
+        let state = self.state.lock().expect("lock");
+        let visible = visible_ids_for(&state, scope);
+        Ok(state
+            .tenants
+            .values()
+            .find(|tenant| {
+                tenant.parent_id.is_none()
+                    && visible.as_ref().is_none_or(|ids| ids.contains(&tenant.id))
+            })
+            .cloned())
+    }
+
     async fn find_many(
         &self,
         scope: &AccessScope,

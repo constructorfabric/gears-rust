@@ -19,6 +19,7 @@ use account_management_sdk::IdpPluginClient;
 
 use crate::config::{AccountManagementConfig, ReaperConfig, RetentionConfig};
 use crate::domain::bootstrap::BootstrapConfig;
+use crate::domain::root_type::RootTypeConfig;
 use crate::domain::tenant::model::TenantStatus;
 use crate::domain::tenant::resource_checker::InertResourceOwnershipChecker;
 use crate::domain::tenant::service::TenantService;
@@ -28,6 +29,7 @@ use crate::domain::tenant::test_support::{
 
 use crate::domain::bootstrap::BootstrapService;
 use crate::domain::tenant::TenantRepo;
+use crate::gear::{handle_bootstrap_failure, validate_existing_root_binding};
 
 const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
 const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
@@ -63,7 +65,7 @@ async fn run_bootstrap_phase<R: TenantRepo + 'static>(
         return Ok(());
     }
     let strict = boot_cfg.strict;
-    let mut bootstrap_svc = BootstrapService::new(repo, idp, boot_cfg);
+    let mut bootstrap_svc = BootstrapService::new(repo, idp, boot_cfg, root_type_cfg());
     bootstrap_svc = bootstrap_svc
         .with_types_registry(types_registry)
         .with_idp_required(idp_required);
@@ -72,16 +74,7 @@ async fn run_bootstrap_phase<R: TenantRepo + 'static>(
             tracing::info!(root_id = %root.id, "platform bootstrap saga completed");
             Ok(())
         }
-        Err(err) if strict => Err(anyhow::anyhow!(
-            "platform bootstrap saga failed (strict mode): {err}"
-        )),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "platform bootstrap saga failed (non-strict); proceeding without root"
-            );
-            Ok(())
-        }
+        Err(err) => handle_bootstrap_failure(err, strict),
     }
 }
 
@@ -198,15 +191,50 @@ async fn stateful_task_shuts_down_on_cancel() {
 
 const ROOT_TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
 
+fn root_type_cfg() -> RootTypeConfig {
+    RootTypeConfig {
+        gts_id: gts::GtsTypeId::new(ROOT_TENANT_TYPE),
+        idp_provisioning: false,
+    }
+}
+
 fn root_id() -> Uuid {
     Uuid::from_u128(0x100)
+}
+
+#[test]
+fn existing_root_type_binding_must_match_configured_gts_id() {
+    let cfg = root_type_cfg();
+    let expected = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    validate_existing_root_binding(root_id(), expected, None, &cfg)
+        .expect("matching durable binding");
+
+    let error = validate_existing_root_binding(root_id(), Uuid::nil(), None, &cfg)
+        .expect_err("type drift must be lifecycle-fatal");
+    assert!(error.to_string().contains("explicit root/schema migration"));
+}
+
+#[test]
+fn existing_root_id_must_match_bootstrap_config() {
+    let cfg = root_type_cfg();
+    let expected = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    let bootstrap = valid_bootstrap_cfg(false);
+
+    let error = validate_existing_root_binding(Uuid::nil(), expected, Some(&bootstrap), &cfg)
+        .expect_err("root id drift must be lifecycle-fatal");
+    assert!(error.to_string().contains("explicit root migration"));
 }
 
 fn valid_bootstrap_cfg(strict: bool) -> BootstrapConfig {
     BootstrapConfig {
         root_id: root_id(),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(ROOT_TENANT_TYPE),
+        root_tenant_type: Some(gts::GtsTypeId::new(ROOT_TENANT_TYPE)),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         idp_wait_timeout: std::time::Duration::from_secs(1),
         idp_retry_backoff_initial: std::time::Duration::from_secs(1),
@@ -355,20 +383,80 @@ async fn run_bootstrap_phase_nonstrict_run_failure_proceeds() {
         registry,
     )
     .await
-    .expect("non-strict + saga failure must proceed (logged)");
+    .expect("non-strict + ordinary saga failure must proceed (logged)");
+}
+
+#[tokio::test]
+async fn run_bootstrap_phase_nonstrict_root_id_drift_is_fatal() {
+    let repo = Arc::new(FakeTenantRepo::new());
+    let expected_type = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    seed_root_with_binding(
+        &repo,
+        Uuid::from_u128(0xDEAD),
+        expected_type,
+        TenantStatus::Active,
+    );
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+
+    let error = run_bootstrap_phase(
+        Some(valid_bootstrap_cfg(false)),
+        false,
+        repo,
+        idp.clone() as Arc<dyn IdpPluginClient>,
+        stub_types_registry(),
+    )
+    .await
+    .expect_err("root id drift must bypass bootstrap.strict=false");
+
+    assert!(error.to_string().contains("root binding mismatch"));
+    assert_eq!(idp.provision_call_count(), 0);
+}
+
+#[tokio::test]
+async fn run_bootstrap_phase_nonstrict_root_type_drift_is_fatal() {
+    let repo = Arc::new(FakeTenantRepo::new());
+    seed_root_with_binding(&repo, root_id(), Uuid::nil(), TenantStatus::Active);
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+
+    let error = run_bootstrap_phase(
+        Some(valid_bootstrap_cfg(false)),
+        false,
+        repo,
+        idp.clone() as Arc<dyn IdpPluginClient>,
+        stub_types_registry(),
+    )
+    .await
+    .expect_err("root type drift must bypass bootstrap.strict=false");
+
+    assert!(error.to_string().contains("root binding mismatch"));
+    assert_eq!(idp.provision_call_count(), 0);
 }
 
 fn seed_root_at_status(repo: &FakeTenantRepo, status: TenantStatus) {
+    let tenant_type_uuid = gts::GtsId::try_new(ROOT_TENANT_TYPE)
+        .expect("valid root type")
+        .to_uuid();
+    seed_root_with_binding(repo, root_id(), tenant_type_uuid, status);
+}
+
+fn seed_root_with_binding(
+    repo: &FakeTenantRepo,
+    id: Uuid,
+    tenant_type_uuid: Uuid,
+    status: TenantStatus,
+) {
     use crate::domain::tenant::model::TenantModel;
     use time::OffsetDateTime;
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
     repo.insert_tenant_raw(TenantModel {
-        id: root_id(),
+        id,
         parent_id: None,
         name: "platform-root".into(),
         status,
         self_managed: false,
-        tenant_type_uuid: Uuid::from_u128(0xAA),
+        tenant_type_uuid,
         depth: 0,
         created_at: now,
         updated_at: now,
@@ -487,4 +575,200 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
     }
 
     Arc::new(Stub)
+}
+
+mod no_seed_startup_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use authz_resolver_sdk::{
+        AuthZResolverApi,
+        models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
+    };
+    use sea_orm_migration::{MigrationTrait, MigratorTrait};
+    use serde_json::{Value, json};
+    use toolkit::contracts::SystemCapability;
+    use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
+    use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_db::migration_runner::run_migrations_for_testing;
+    use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
+    use toolkit_security::PlatformSecurityContext;
+    use types_registry_sdk::TypesRegistryClient;
+
+    use crate::gear::AccountManagementGear;
+
+    use super::ROOT_TENANT_TYPE;
+
+    struct StartupConfig {
+        account_management: Value,
+    }
+
+    impl ConfigProvider for StartupConfig {
+        fn get_gear_config(&self, gear_name: &str) -> Option<&Value> {
+            (gear_name == "account-management").then_some(&self.account_management)
+        }
+    }
+
+    struct PermitAllAuthz;
+
+    #[async_trait]
+    impl AuthZResolverApi for PermitAllAuthz {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            _request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext::default(),
+            })
+        }
+    }
+
+    async fn migrated_sqlite(migrations: Vec<Box<dyn MigrationTrait>>) -> Db {
+        let db = connect_db(
+            "sqlite::memory:",
+            ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect in-memory SQLite");
+        run_migrations_for_testing(&db, migrations)
+            .await
+            .expect("apply gear migrations");
+        db
+    }
+
+    fn context(
+        gear_name: &'static str,
+        config: Arc<dyn ConfigProvider>,
+        hub: Arc<ClientHub>,
+        db: Db,
+    ) -> GearCtx {
+        GearCtx::new(
+            gear_name,
+            uuid::Uuid::new_v4(),
+            config,
+            hub,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_db(DBProvider::new(db))
+    }
+
+    #[tokio::test]
+    async fn full_init_registers_and_validates_root_without_a_yaml_seed() {
+        let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
+            account_management: json!({
+                "config": {
+                    "root_tenant_type": {
+                        "gts_id": ROOT_TENANT_TYPE,
+                        "idp_provisioning": false
+                    },
+                    "bootstrap": {
+                        "root_id": "00000000-df51-5b42-9538-d2b56b7ee953",
+                        "root_name": "platform-root",
+                        "strict": true
+                    }
+                }
+            }),
+        });
+        let hub = Arc::new(ClientHub::new());
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        hub.register::<dyn AuthZResolverApi>(authz);
+
+        // Initialize the actual Types Registry gear with its default, seedless
+        // configuration. This publishes the process-local client in
+        // configuration mode, before its ready transition.
+        let types_registry_gear = types_registry::gear::TypesRegistryGear::default();
+        let types_registry_ctx = context(
+            "types-registry",
+            Arc::clone(&config),
+            Arc::clone(&hub),
+            migrated_sqlite(types_registry::infra::storage::Migrator::migrations()).await,
+        );
+        types_registry_gear
+            .init(&types_registry_ctx)
+            .await
+            .expect("Types Registry init");
+
+        let registry = hub
+            .get::<dyn TypesRegistryClient>()
+            .expect("Types Registry client");
+        assert!(
+            registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err(),
+            "the test must not accidentally provide a YAML root seed"
+        );
+
+        // Initialize the actual Resource Group gear so AM resolves its normal
+        // production dependencies and performs user-group type registration.
+        let resource_group_gear = resource_group::gear::ResourceGroup::default();
+        let resource_group_ctx = context(
+            "resource-group",
+            Arc::clone(&config),
+            Arc::clone(&hub),
+            migrated_sqlite(resource_group::infra::storage::migrations::Migrator::migrations())
+                .await,
+        );
+        resource_group_gear
+            .init(&resource_group_ctx)
+            .await
+            .expect("Resource Group init");
+
+        let account_management_gear = AccountManagementGear::default();
+        let account_management_ctx = context(
+            "account-management",
+            config,
+            Arc::clone(&hub),
+            migrated_sqlite(crate::Migrator::migrations()).await,
+        );
+        let loaded: crate::config::AccountManagementConfig = account_management_ctx
+            .config_or_default()
+            .expect("load AM startup config");
+        assert_eq!(
+            loaded
+                .root_tenant_type
+                .as_ref()
+                .map(|cfg| cfg.gts_id.as_ref()),
+            Some(ROOT_TENANT_TYPE)
+        );
+        account_management_gear
+            .init(&account_management_ctx)
+            .await
+            .expect("AM init without a YAML root seed");
+
+        // AM registration happens while the registry is in configuration mode,
+        // so the staged definition is intentionally not readable yet.
+        assert!(registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err());
+
+        let sys = SystemContext::new(
+            uuid::Uuid::new_v4(),
+            Arc::new(GearManager::new()),
+            Arc::new(GrpcInstallerStore::new()),
+        );
+        types_registry_gear
+            .post_init(&sys)
+            .await
+            .expect("Types Registry semantic validation and ready transition");
+
+        let runtime_root = registry
+            .get_type_schema(ROOT_TENANT_TYPE)
+            .await
+            .expect("validated in-memory root type");
+        assert_eq!(runtime_root.type_id.as_ref(), ROOT_TENANT_TYPE);
+        assert_eq!(
+            runtime_root.effective_traits(),
+            json!({"allowed_parent_types": [], "idp_provisioning": false})
+        );
+        assert_eq!(
+            runtime_root
+                .parent
+                .as_ref()
+                .map(|parent| parent.type_id.as_ref()),
+            Some("gts.cf.core.am.tenant_type.v1~")
+        );
+    }
 }
