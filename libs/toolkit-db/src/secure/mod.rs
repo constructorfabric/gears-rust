@@ -134,7 +134,11 @@ mod tx_error;
 
 // Core types
 pub use entity_traits::ScopableEntity;
-pub use error::{ScopeError, is_foreign_key_violation, is_unique_violation};
+pub use error::ScopeError;
+// The two classifiers live in `crate::db_error` -- they answer "what kind of
+// database error is this", which has nothing to do with scoping. Re-exported
+// here so the paths gears already import keep working.
+pub use crate::db_error::{is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security
 pub use toolkit_security::{
