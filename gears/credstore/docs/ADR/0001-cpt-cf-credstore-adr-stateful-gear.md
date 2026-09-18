@@ -27,7 +27,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-credstore-adr-stateful-gear`
 
-**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses described below is replaced by immutable value versions with a pointer in the row and a gc table; the stateful-gear decision itself — metadata in the gear's table, values in a plugin — is unchanged and is what makes the pointer possible.
+**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses below is replaced by immutable value versions with a pointer in the row and a gc table. The stateful-gear decision itself — metadata in the gear's table, values in a plugin — is unchanged; it is what makes the pointer possible.
 
 ## Context and Problem Statement
 
