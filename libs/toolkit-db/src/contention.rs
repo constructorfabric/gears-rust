@@ -266,7 +266,10 @@ mod tests {
     #[test]
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     fn a_serialization_failure_is_recognised_by_its_code() {
-        let err = refused("40001", "could not serialize access due to concurrent update");
+        let err = refused(
+            "40001",
+            "could not serialize access due to concurrent update",
+        );
         assert!(is_retryable_contention(DbBackend::Postgres, &err));
 
         // Wording gone, code intact: still retryable.

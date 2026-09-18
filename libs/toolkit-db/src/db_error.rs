@@ -149,8 +149,8 @@ impl DriverRefusal {
 ///   `MySQL` caller needs the vendor error number, which is what
 ///   [`sea_orm::DbErr::sql_err`] already reads.
 /// * `SQLite` extended codes are not SQLSTATEs and are not in this table;
-///   [`crate::secure::is_unique_violation`] and
-///   [`crate::secure::is_foreign_key_violation`] remain the portable path.
+///   [`is_unique_violation`] and [`is_foreign_key_violation`] below remain the
+///   portable path, because `SeaORM`'s own `sql_err()` does read them.
 #[must_use]
 pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
     match sqlstate {
@@ -278,6 +278,148 @@ pub fn driver_code(err: &DbErr) -> Option<Cow<'_, str>> {
 #[must_use]
 pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
     constraint_violation(&driver_code(err)?)
+}
+
+/// The shared shape of both classifiers below: three tiers, and which of them
+/// is allowed to answer.
+///
+/// # Why three tiers, and what would retire each
+///
+/// The two older tiers are not a transitional shim waiting on more coverage in
+/// [this module](self); each answers a case the SQLSTATE cannot, and each has a
+/// condition under which it goes away:
+///
+/// * `sql_err()` reads `MySQL`'s vendor error number. `MySQL` reports both a
+///   duplicate key and a failed foreign key as `23000`, so the SQLSTATE alone
+///   cannot tell the two conditions apart — only the vendor number can. It also
+///   carries `SQLite`, whose extended result codes are not SQLSTATEs and which
+///   [this module](self) therefore names no condition for. This tier retires
+///   when [this module](self) reads both itself.
+/// * The message match catches errors re-wrapped as [`DbErr::Custom`] on the
+///   way here, which have no driver error left to read at all. It retires when
+///   no call site can hand these classifiers a re-wrapped error — a property of
+///   the callers, not of this module.
+///
+/// # Why the driver gets the last word, not just the first
+///
+/// The tiers are ordered by how much they assume, and a tier may only speak
+/// when the ones above it had nothing to say — *including when what they had to
+/// say was "no"*.
+///
+/// The message tier is the reason this matters. `PostgreSQL` echoes the
+/// offending value into its message text, so a caller can put our own search
+/// strings there: `invalid input syntax for type uuid: "duplicate key"` is a
+/// `22P02`, a malformed input, and it used to classify as a unique violation
+/// because `22P02` names no condition and the fall-through reached the text.
+/// A gear answers `409 Conflict` to what is a `400`, and one that treats a
+/// conflict as "it already exists, return that one" takes a branch the caller
+/// chose for it.
+///
+/// So: a code that names a condition is the final answer, yes or no. A code
+/// that names none (a `SQLite` extended code, a SQLSTATE outside class 23)
+/// still leaves `sql_err()` its turn. And the text is read only when no driver
+/// spoke at all, which is exactly the re-wrapped case it documents.
+///
+/// [`DbErr::Custom`]: sea_orm::DbErr::Custom
+fn classifies_as(
+    err: &sea_orm::DbErr,
+    violation: ConstraintViolation,
+    sea_orm_says: impl FnOnce() -> bool,
+    message_says: impl FnOnce(&str) -> bool,
+) -> bool {
+    // The driver named a condition: that is the answer, either way.
+    if let Some(named) = violation_of(err) {
+        return named == violation;
+    }
+
+    if sea_orm_says() {
+        return true;
+    }
+
+    // A driver spoke and neither tier above recognised what it said. Guessing
+    // from text here is what let caller-supplied content decide the answer.
+    if driver_code(err).is_some() {
+        return false;
+    }
+
+    message_says(&err.to_string().to_lowercase())
+}
+
+/// Check whether a `sea_orm::DbErr` represents a unique-constraint violation.
+///
+/// Three paths, in order of how much they assume: the SQLSTATE the driver
+/// reported ([this module](self)), then `SeaORM`'s own `sql_err()`
+/// classification, then a match on the message text for errors that were
+/// re-wrapped on the way here and lost their typed shape. See
+/// [`classifies_as`] for which of them is allowed to answer when.
+///
+/// Recognized patterns across backends:
+/// - **Postgres** SQLSTATE `23505` — "`unique_violation`" / "duplicate key"
+/// - **`SQLite`** extended code `2067` — "UNIQUE constraint failed"
+/// - **`MySQL`** error `1062` — "Duplicate entry"
+#[must_use]
+pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    classifies_as(
+        err,
+        ConstraintViolation::Unique,
+        || {
+            matches!(
+                err.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            )
+        },
+        |msg| {
+            msg.contains("unique constraint")
+                || msg.contains("duplicate key")
+                || msg.contains("unique_violation")
+                || msg.contains("duplicate entry")
+                || msg.contains("unique constraint failed")
+        },
+    )
+}
+
+/// Check whether a `sea_orm::DbErr` represents a foreign-key violation.
+///
+/// The counterpart of [`is_unique_violation`], detected the same three ways.
+///
+/// Useful where a referencing row is the invariant and the `RESTRICT` on the
+/// foreign key is what actually enforces it -- a preceding count is a nicer
+/// message, not the guard, and under concurrency the constraint is what
+/// answers.
+///
+/// `RESTRICT` is why the structured path leads. `PostgreSQL` 18 reports such a
+/// refusal as `23001` (`restrict_violation`) where 17 and earlier reported
+/// `23503`, and `sea-orm` 2.0 maps only the latter — so `sql_err()` returns
+/// `None` for it, and what recognised it here was the *message* still
+/// containing "foreign key constraint" after 18 reworded it (issue #4645).
+/// Both codes name one condition in [this module](self).
+///
+/// Recognized patterns across backends:
+/// - **Postgres** SQLSTATE `23503` / `23001` — "`foreign_key_violation`" /
+///   "violates foreign key constraint" / "violates RESTRICT setting of"
+/// - **`SQLite`** extended code `787` (`SQLITE_CONSTRAINT_FOREIGNKEY`) —
+///   "FOREIGN KEY constraint failed"
+/// - **`MySQL`** errors `1451`/`1452` — "a foreign key constraint fails"
+#[must_use]
+pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
+    classifies_as(
+        err,
+        ConstraintViolation::ForeignKey,
+        || {
+            matches!(
+                err.sql_err(),
+                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+            )
+        },
+        |msg| {
+            msg.contains("foreign key constraint")
+                || msg.contains("foreign_key_violation")
+                || msg.contains("violates foreign key")
+                // PostgreSQL 18's RESTRICT wording, for an error that reached
+                // here stripped of its SQLSTATE.
+                || msg.contains("violates restrict setting")
+        },
+    )
 }
 
 #[cfg(test)]
@@ -410,7 +552,7 @@ mod tests {
     /// the driver reports an extended result code (`2067`), not a SQLSTATE, and
     /// names no constraint — so the table names no condition for it and a
     /// `SQLite` caller keeps using
-    /// [`crate::secure::is_unique_violation`]. The `PostgreSQL` half, where the
+    /// [`is_unique_violation`]. The `PostgreSQL` half, where the
     /// code *is* a SQLSTATE, is covered by
     /// `tests/error_classification.rs::pg_restrict_delete_is_classified_as_foreign_key_violation`
     /// against a real server.
@@ -453,7 +595,7 @@ mod tests {
         );
         // The portable classifier still recognises it, which is the path a
         // SQLite caller is meant to use.
-        assert!(crate::secure::is_unique_violation(&err));
+        assert!(is_unique_violation(&err));
     }
 
     /// An error `SeaORM` produced itself carries no driver refusal. Asserted
@@ -463,5 +605,155 @@ mod tests {
     fn an_internal_error_carries_no_driver_refusal() {
         assert!(driver_refusal(&sea_orm::DbErr::Custom("not from a driver".into())).is_none());
         assert!(driver_refusal(&sea_orm::DbErr::RecordNotFound("nope".into())).is_none());
+    }
+
+    use super::{is_foreign_key_violation, is_unique_violation};
+    use sea_orm::DbErr;
+
+    // The classifiers are reached through two shapes: the typed `SqlErr` the
+    // driver produces, and the `DbErr::Custom` left by a caller that
+    // re-wrapped the error through `to_string()`.
+    //
+    // In this workspace the *typed* shape is the production one for these two
+    // functions: every call site classifies the raw `ScopeError::Db` straight
+    // out of `secure_insert`/`secure_delete`, and only stringifies what the
+    // classifier already rejected. (`is_retryable_contention` is the opposite
+    // case, and the one RG-15 was about -- do not carry that conclusion
+    // across.)
+    //
+    // The typed path cannot be exercised from here: it needs a `DbErr` whose
+    // `sql_err()` resolves, and that requires a real `PgDatabaseError` or
+    // `SqliteError`, both of which have crate-private constructors. It is
+    // covered end-to-end instead, by tests that provoke a genuine violation
+    // against live SQLite. What is left for a unit test is the message
+    // matching below, per backend.
+
+    #[test]
+    fn foreign_key_violation_detected_per_backend_message() {
+        for msg in [
+            "error returned from database: update or delete on table \"gts_type\" violates \
+             foreign key constraint \"resource_group_gts_type_id_fkey\" on table \
+             \"resource_group\"",
+            "error returned from database: (code: 787) FOREIGN KEY constraint failed",
+            "Cannot delete or update a parent row: a foreign key constraint fails",
+        ] {
+            assert!(
+                is_foreign_key_violation(&DbErr::Custom(msg.to_owned())),
+                "should classify as a foreign-key violation: {msg}"
+            );
+        }
+    }
+
+    /// The wording `PostgreSQL` 18 introduced for a `RESTRICT` refusal, on the
+    /// text path.
+    ///
+    /// The structured path is what recognises this in production (the SQLSTATE
+    /// is `23001`, and `crate::db_error` names both codes one condition). This
+    /// branch is the last resort, for an error that reached a classifier
+    /// stripped of its code — and it exists because 18 reworded the message
+    /// as well as renumbering it, so the pre-18 substrings no longer match
+    /// (issue #4645).
+    #[test]
+    fn the_postgres_18_restrict_wording_is_recognised_without_a_code() {
+        let restrict = DbErr::Custom(
+            "error returned from database: update or delete on table \"usage_type\" violates \
+             RESTRICT setting of foreign key constraint \"usage_records_gts_id_fk\" on table \
+             \"usage_records\""
+                .to_owned(),
+        );
+        assert!(
+            is_foreign_key_violation(&restrict),
+            "PostgreSQL 18's RESTRICT wording must classify as a foreign-key violation"
+        );
+        assert!(
+            !is_unique_violation(&restrict),
+            "and must not be confused with a duplicate key"
+        );
+    }
+
+    #[test]
+    fn foreign_key_and_unique_are_not_confused() {
+        // They map to different domain answers -- "still referenced" versus
+        // "already exists" -- so a classifier that matched both would report
+        // the wrong conflict.
+        let unique = DbErr::Custom("UNIQUE constraint failed: gts_type.schema_id".to_owned());
+        let unique_pg = DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \
+             \"gts_type_schema_id_key\""
+                .to_owned(),
+        );
+        assert!(is_unique_violation(&unique_pg));
+        assert!(!is_foreign_key_violation(&unique_pg));
+        let fk = DbErr::Custom("FOREIGN KEY constraint failed".to_owned());
+
+        assert!(is_unique_violation(&unique));
+        assert!(!is_foreign_key_violation(&unique));
+
+        assert!(is_foreign_key_violation(&fk));
+        assert!(!is_unique_violation(&fk));
+    }
+
+    #[test]
+    fn an_unrelated_error_is_neither() {
+        let err = DbErr::Custom("connection reset by peer".to_owned());
+        assert!(!is_unique_violation(&err));
+        assert!(!is_foreign_key_violation(&err));
+    }
+
+    /// The finding this rule exists for: `PostgreSQL` echoes the offending
+    /// value into the message, so a caller can put our own search strings
+    /// there. `22P02` is a malformed input, not a conflict, and the value is
+    /// whatever was submitted.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_value_in_the_message_cannot_decide_the_condition() {
+        let err = super::driver_shaped::refused(
+            "22P02",
+            r#"invalid input syntax for type uuid: "duplicate key""#,
+        );
+        assert!(
+            !is_unique_violation(&err),
+            "a caller-supplied 'duplicate key' must not classify a 22P02 as a conflict"
+        );
+
+        let err = super::driver_shaped::refused(
+            "22P02",
+            r#"invalid input syntax for type uuid: "violates foreign key constraint""#,
+        );
+        assert!(
+            !is_foreign_key_violation(&err),
+            "and the same for the foreign-key wording"
+        );
+    }
+
+    /// The other half of the rule: when the code does name a condition, it is
+    /// the whole answer, for both classifiers.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_code_that_names_a_condition_is_the_whole_answer() {
+        let unique = super::driver_shaped::refused(
+            "23505",
+            "duplicate key value violates unique constraint \"users_email_key\"",
+        );
+        assert!(is_unique_violation(&unique));
+        assert!(!is_foreign_key_violation(&unique));
+
+        // PostgreSQL 18's RESTRICT code, which sea-orm's own table does not map.
+        let restrict = super::driver_shaped::refused(
+            "23001",
+            "update or delete on table \"parent\" violates RESTRICT setting",
+        );
+        assert!(is_foreign_key_violation(&restrict));
+        assert!(!is_unique_violation(&restrict));
+    }
+
+    /// And the message tier is still there for what it documents: an error
+    /// re-wrapped on the way here, with no driver error left to read.
+    #[test]
+    fn a_rewrapped_error_is_still_read_from_its_text() {
+        let err = DbErr::Custom(
+            "duplicate key value violates unique constraint \"users_email_key\"".to_owned(),
+        );
+        assert!(is_unique_violation(&err));
     }
 }
