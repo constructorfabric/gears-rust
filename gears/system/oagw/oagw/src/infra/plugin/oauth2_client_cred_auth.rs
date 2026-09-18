@@ -165,7 +165,7 @@ impl OAuth2ClientCredAuthPlugin {
             .await
             .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
             .ok_or_else(|| PluginError::SecretNotFound(cred_ref.to_owned()))?;
-        std::str::from_utf8(response.value.as_bytes())
+        std::str::from_utf8(response.secret.as_bytes())
             .map(str::to_owned)
             .map_err(|_| PluginError::Internal(format!("secret '{cred_ref}' is not valid UTF-8")))
     }

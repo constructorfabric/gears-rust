@@ -18,8 +18,8 @@ use crate::models::{
 /// Consumer-facing API trait for credential storage operations. Seven
 /// methods, none named `create` or `read_secrets`: `put` under
 /// [`PutPrecondition::CreateOnly`] **is** create, and [`Self::list`] is the
-/// collection read (metadata by default; `$select` containing `value`
-/// switches it to bulk value mode, ADR-0005/ADR-0004).
+/// collection read (metadata by default; `$select` containing `secret`
+/// switches it to bulk secret mode, ADR-0005/ADR-0004).
 #[async_trait]
 pub trait CredStoreClientV1: Send + Sync {
     /// Retrieves the credential **record** by reference, applying
@@ -51,7 +51,7 @@ pub trait CredStoreClientV1: Send + Sync {
     ) -> Result<Option<Secret>, CredStoreError>;
 
     /// Creates or replaces the whole credential — record and, unless
-    /// `write.value` is an explicit `None`, its value together, in one call.
+    /// `write.secret` is an explicit `None`, its value together, in one call.
     /// `precondition` carries the intent: [`PutPrecondition::CreateOnly`]
     /// fails with [`CredStoreError::Conflict`] if the caller's own tenant
     /// already holds a record under the reference;
@@ -59,14 +59,14 @@ pub trait CredStoreClientV1: Send + Sync {
     /// same way if it does not (a `put` under either never creates).
     ///
     /// `write` is the whole-credential replace: an explicit `None` in
-    /// `write.value` writes no value — on create the row is inserted
+    /// `write.secret` writes no value — on create the row is inserted
     /// `declared`; on replace of an `active` row the value is removed in the
     /// same transaction; on replace of an already-`declared` row nothing
     /// about the value changes (ADR-0004 Amendment B, "The value-less
     /// record: reached only on purpose").
     ///
     /// `write` always requires `write`; `write_secret` is additionally
-    /// required when `write.value` is `Some(_)`, or when a `None` removes an
+    /// required when `write.secret` is `Some(_)`, or when a `None` removes an
     /// existing value (replace of an `active` row) — never when `None`
     /// creates or replaces an already value-less row. Both required actions
     /// are evaluated before any side effect — a caller missing either fails
@@ -92,19 +92,19 @@ pub trait CredStoreClientV1: Send + Sync {
     /// Applies a partial change to the record, the value, or both — RFC 7396
     /// JSON Merge Patch semantics: a field present is applied exactly as
     /// [`Self::put`] would apply it, a field absent is left untouched.
-    /// `patch.value` present as [`crate::models::PatchField::Null`] removes
+    /// `patch.secret` present as [`crate::models::PatchField::Null`] removes
     /// the value (the record becomes `declared`); as
     /// [`crate::models::PatchField::Set`] it rotates/creates it.
     ///
     /// The action set is derived from the body: any metadata field present
     /// (`sharing`/`fallback`/`secret_type`/`expires_at`) requires `write`;
-    /// `value` present (`Set` or `Null`) requires `write_secret`; both
+    /// `secret` present (`Set` or `Null`) requires `write_secret`; both
     /// present require both — all required actions are evaluated before any
     /// side effect. Never creates: no own record under the reference is
     /// [`CredStoreError::NotFound`].
     ///
     /// A patch whose metadata equals the current record and carries no
-    /// `value` key is a no-op: it returns the current validator unchanged,
+    /// `secret` key is a no-op: it returns the current validator unchanged,
     /// without bumping the version.
     ///
     /// # Errors
@@ -153,17 +153,17 @@ pub trait CredStoreClientV1: Send + Sync {
     /// `inheritance`, `owner_tenant_id` and `updated_at` are never
     /// filterable or orderable. `query.order` accepts only `reference`
     /// (ascending by default). `query.selected_fields()` accepts the
-    /// `Credential` field names plus `value`.
+    /// `Credential` field names plus `secret`.
     ///
-    /// Selecting `value` switches the request to **value mode**: `limit`
+    /// Selecting `secret` switches the request to **secret mode**: `limit`
     /// and `query.cursor` are rejected, `query.order` must be empty, the
     /// selector in `query.filter()` must be exactly `reference` or `type`
     /// (`eq`/`in`), the match set is capped, and each returned item's
-    /// [`CredentialListItem::value`] carries the decrypted value for the
+    /// [`CredentialListItem::secret`] carries the decrypted value for the
     /// items the caller may read — a refused, missing, or
     /// fingerprint-mismatched item is omitted rather than reported.
     /// `Page::page_info.next_cursor` is always `None` in this mode; there is
-    /// no pagination over a value-mode match set.
+    /// no pagination over a secret-mode match set.
     ///
     /// A caller whose scope does not admit its own tenant gets an empty page,
     /// never [`CredStoreError::AccessDenied`] (ADR-0005: the PDP resource is
@@ -171,7 +171,7 @@ pub trait CredStoreClientV1: Send + Sync {
     /// therefore nothing to deny — until rows exist).
     ///
     /// Requires the `list` action per distinct type present among candidates
-    /// (metadata mode) or `read_secret` (value mode); a type the caller may
+    /// (metadata mode) or `read_secret` (secret mode); a type the caller may
     /// not read is dropped from the page rather than failing the request.
     ///
     /// # Errors
@@ -179,7 +179,7 @@ pub trait CredStoreClientV1: Send + Sync {
     /// Returns [`CredStoreError::InvalidRequest`] if `query` names an
     /// unsupported filter/order field, an out-of-range `limit`, a malformed
     /// cursor, a cursor minted under a different filter/order, or a
-    /// value-mode request that also carries pagination — or, in value mode,
+    /// secret-mode request that also carries pagination — or, in secret mode,
     /// if the selector is not `reference`/`type` `eq`/`in`, or the selector
     /// matches more than the configured cap.
     async fn list(

@@ -149,7 +149,7 @@ impl Gear for CredStoreGear {
             },
             ListSettings {
                 max_limit: cfg.list.max_limit,
-                value_mode_cap: cfg.list.value_mode_cap,
+                secret_mode_cap: cfg.list.secret_mode_cap,
             },
         ));
 

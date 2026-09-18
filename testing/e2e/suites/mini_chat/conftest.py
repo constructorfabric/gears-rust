@@ -512,7 +512,7 @@ def _provision_credstore_secrets(request, server):
             resp = httpx.put(
                 f"{server}/cf/credstore/v1/credentials/{ref}",
                 headers={**headers, "If-None-Match": "*"},
-                json={"type": _GENERIC_TYPE, "sharing": "tenant", "value": value},
+                json={"type": _GENERIC_TYPE, "sharing": "tenant", "secret": value},
                 timeout=5.0,
             )
             if resp.status_code == 409:
@@ -520,7 +520,7 @@ def _provision_credstore_secrets(request, server):
                 resp = httpx.put(
                     f"{server}/cf/credstore/v1/credentials/{ref}",
                     headers={**headers, "If-Match": "*"},
-                    json={"sharing": "tenant", "value": value},
+                    json={"sharing": "tenant", "secret": value},
                     timeout=5.0,
                 )
         except httpx.RequestError:

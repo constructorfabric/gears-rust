@@ -135,7 +135,7 @@ impl MockCredStoreClient {
             reference: reference.clone(),
             secret_type: SecretType::generic().gts_id().to_owned(),
             expires_at: None,
-            value: SecretValue::new(value),
+            secret: SecretValue::new(value),
             validator: Self::validator(),
         }
     }
@@ -223,17 +223,17 @@ impl CredStoreClientV1 for MockCredStoreClient {
     /// Minimal double: every stored reference is returned as one item
     /// (unfiltered, unpaginated — this test double is read-oriented and does
     /// not model the `OData` allowlist, reduction, or cursor semantics a real
-    /// server enforces). `value` is populated only when `query`'s `$select`
-    /// names it, mirroring the real value-mode switch.
+    /// server enforces). `secret` is populated only when `query`'s `$select`
+    /// names it, mirroring the real secret-mode switch.
     async fn list(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<CredentialListItem>, CredStoreError> {
         let limit = query.limit.unwrap_or(50);
-        let value_mode = query
+        let secret_mode = query
             .selected_fields()
-            .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("value")));
+            .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
         match &self.behavior {
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
             Behavior::NotFound | Behavior::AnyValue(_) => Ok(Page::empty(limit)),
@@ -244,7 +244,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
                         let key = SecretRef::new(k.clone()).ok()?;
                         Some(CredentialListItem {
                             credential: Self::credential(&key),
-                            value: value_mode.then(|| SecretValue::new(v.clone())),
+                            secret: secret_mode.then(|| SecretValue::new(v.clone())),
                         })
                     })
                     .collect();

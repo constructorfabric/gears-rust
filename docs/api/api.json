@@ -3892,7 +3892,7 @@
         "type": "object"
       },
       "CredentialDto": {
-        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `value` is populated only when `$select` names it (point read)\nor in value mode (collection) and only for an item the caller may read;\nabsent from the wire entirely otherwise — including when the item's value\ncould not be served (refused, missing, fingerprint mismatch — omitted by\nthe domain layer already, never reported as an error for one item).\n\n`Debug` is hand-written to redact `value`.",
+        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `secret` is populated only when `$select` names it (point\nread) or in secret mode (collection) and only for an item the caller may\nread; absent from the wire entirely otherwise — including when the item's\nvalue could not be served (refused, missing, fingerprint mismatch —\nomitted by the domain layer already, never reported as an error for one\nitem).\n\n`Debug` is hand-written to redact `secret`.",
         "properties": {
           "expires_at": {
             "format": "date-time",
@@ -3925,6 +3925,13 @@
           "reference": {
             "type": "string"
           },
+          "secret": {
+            "description": "The decrypted secret — present only when `$select` names it (point\nread) or in secret mode (collection), and only for an item the caller\nmay read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sharing": {
             "$ref": "#/components/schemas/SharingModeDto"
           },
@@ -3937,13 +3944,6 @@
           "updated_at": {
             "description": "The caller's own row's last-write instant; absent iff `status` is\n`none`.",
             "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "value": {
-            "description": "The decrypted value — present only when `$select` names it (point\nread) or in value mode (collection), and only for an item the caller\nmay read.",
             "type": [
               "string",
               "null"
@@ -3969,7 +3969,7 @@
       },
       "CredentialPatchDto": {
         "additionalProperties": false,
-        "description": "Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0004): an\nRFC 7396 JSON Merge Patch. Every field is tri-state (`Option<Option<T>>`):\nabsent (untouched), explicit `null`, or a value. `secret_type`/`sharing`/\n`fallback` have no valid `null` state on the wire (rejected as\n`NULL_NOT_ALLOWED` by the handler, since none is a nullable column);\n`expires_at`/`value` do — `null` clears/removes them.\n\n`Debug` is hand-written to redact `value`.",
+        "description": "Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0004): an\nRFC 7396 JSON Merge Patch. Every field is tri-state (`Option<Option<T>>`):\nabsent (untouched), explicit `null`, or a value. `secret_type`/`sharing`/\n`fallback` have no valid `null` state on the wire (rejected as\n`NULL_NOT_ALLOWED` by the handler, since none is a nullable column);\n`expires_at`/`secret` do — `null` clears/removes them.\n\n`Debug` is hand-written to redact `secret`.",
         "properties": {
           "expires_at": {
             "type": [
@@ -3987,6 +3987,12 @@
               }
             ]
           },
+          "secret": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sharing": {
             "oneOf": [
               {
@@ -3998,12 +4004,6 @@
             ]
           },
           "type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "value": {
             "type": [
               "string",
               "null"
@@ -13718,7 +13718,7 @@
       },
       "PutCredentialRequestDto": {
         "additionalProperties": false,
-        "description": "Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state\n`value` per Amendment B): a whole-credential replace. `value` is tri-state\n(`Option<Option<String>>`, like [`CredentialPatchDto::value`]) so its\n*absence* — rejected with the typed `VALUE_REQUIRED` reason rather than a\ngeneric deserialization error — can be told apart from an explicit JSON\n`null` (no value is written: a value-less create, or a value\nremoval/no-op on replace) and from a string (the value is written).\n\n`Debug` is hand-written to redact `value`.",
+        "description": "Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state\n`secret` per Amendment B): a whole-credential replace. `secret` is\ntri-state (`Option<Option<String>>`, like [`CredentialPatchDto::secret`])\nso its *absence* — rejected with the typed `SECRET_REQUIRED` reason rather\nthan a generic deserialization error — can be told apart from an explicit\nJSON `null` (no value is written: a value-less create, or a value\nremoval/no-op on replace) and from a string (the value is written).\n\n`Debug` is hand-written to redact `secret`.",
         "properties": {
           "expires_at": {
             "description": "Expiry instant (RFC 3339); only for expirable types. A `PUT` is a\nwhole-value replace: omitting `expires_at` clears a stored expiry.",
@@ -13732,19 +13732,19 @@
             "$ref": "#/components/schemas/FallbackDto",
             "description": "Suppression policy; defaults to `inherit`."
           },
+          "secret": {
+            "description": "The secret to write. Required at the wire — absent is `400\nSECRET_REQUIRED` — but once present it is tri-state: a string writes a\nvalue, an explicit `null` writes none (ADR-0004 Amendment B).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sharing": {
             "$ref": "#/components/schemas/SharingModeDto",
             "description": "Sharing mode — required (ADR-0004)."
           },
           "type": {
             "description": "Full GTS type id. Required on create; on replace it must equal the\nstored type (`TYPE_IMMUTABLE` otherwise).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "value": {
-            "description": "The value to write. Required at the wire — absent is `400\nVALUE_REQUIRED` — but once present it is tri-state: a string writes a\nvalue, an explicit `null` writes none (ADR-0004 Amendment B).",
             "type": [
               "string",
               "null"
@@ -42795,7 +42795,7 @@
     },
     "/credstore/v1/credentials": {
       "get": {
-        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `value` in `$select` switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or `type` selector only, capped and unpaginated.",
+        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or `type` selector only, capped and unpaginated.",
         "operationId": "credstore.list_credentials",
         "parameters": [
           {
@@ -42853,7 +42853,7 @@
                 }
               }
             },
-            "description": "A page of reduced credential items (value-mode items additionally carry `value`)"
+            "description": "A page of reduced credential items (secret-mode items additionally carry `secret`)"
           },
           "400": {
             "content": {
@@ -43116,7 +43116,7 @@
         ]
       },
       "get": {
-        "description": "Retrieve the credential for the authenticated tenant, with walk-up resolution: the same item shape the collection returns. Without `$select`, the record fields only (never `value`); selecting `value` includes it, for a caller the projection's action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` when `value` is named, both when both. Supersedes the withdrawn `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,value` is its equivalent, and a value-only projection resolving to a value-less winner is the same canonical 404 that address gave.",
+        "description": "Retrieve the credential for the authenticated tenant, with walk-up resolution: the same item shape the collection returns. Without `$select`, the record fields only (never `secret`); selecting `secret` includes it, for a caller the projection's action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` when `secret` is named, both when both. Supersedes the withdrawn `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only projection resolving to a value-less winner is the same canonical 404 that address gave.",
         "operationId": "credstore.get_credential",
         "parameters": [
           {
@@ -43147,7 +43147,7 @@
                 }
               }
             },
-            "description": "The resolved credential, carrying `value` only when `$select` names it"
+            "description": "The resolved credential, carrying `secret` only when `$select` names it"
           },
           "400": {
             "content": {
@@ -43221,7 +43221,7 @@
         ]
       },
       "patch": {
-        "description": "RFC 7396 JSON Merge Patch over the record, the value, or both. Requires `Content-Type: application/merge-patch+json` (415 otherwise) and a mandatory `If-Match`. Never creates. A body carrying no `value` key whose metadata already matches the current record is a no-op (204, unchanged ETag).",
+        "description": "RFC 7396 JSON Merge Patch over the record, the value, or both. Requires `Content-Type: application/merge-patch+json` (415 otherwise) and a mandatory `If-Match`. Never creates. A body carrying no `secret` key whose metadata already matches the current record is a no-op (204, unchanged ETag).",
         "operationId": "credstore.patch_credential",
         "parameters": [
           {
@@ -43350,7 +43350,7 @@
         ]
       },
       "put": {
-        "description": "Whole-credential replace: record and, unless `value` is an explicit `null`, its value together, in one call. Exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded/unconditional replace) is required. `value` is required in the body (its absence is 400 VALUE_REQUIRED) but is tri-state: a string writes a value; an explicit `null` writes none -- on create the row is inserted `declared`; on replace of an active row the value is removed in the same transaction `PATCH {\"value\": null}` uses; on replace of an already-declared row nothing about the value changes.",
+        "description": "Whole-credential replace: record and, unless `secret` is an explicit `null`, its value together, in one call. Exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded/unconditional replace) is required. `secret` is required in the body (its absence is 400 SECRET_REQUIRED) but is tri-state: a string writes a value; an explicit `null` writes none -- on create the row is inserted `declared`; on replace of an active row the value is removed in the same transaction `PATCH {\"secret\": null}` uses; on replace of an already-declared row nothing about the value changes.",
         "operationId": "credstore.put_credential",
         "parameters": [
           {

@@ -50,7 +50,7 @@ impl CredStoreClientV1 for StubMutator {
         self.put_calls.lock().push((
             key.as_ref().to_owned(),
             write
-                .value
+                .secret
                 .as_ref()
                 .map(|v| v.as_bytes().to_vec())
                 .unwrap_or_default(),
