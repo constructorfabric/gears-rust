@@ -227,9 +227,7 @@ impl Gear for QuotaEnforcementGear {
         cfg.validate()?;
         tracing::Span::current().record("storage_vendor", cfg.storage_vendor.as_str());
 
-        // PEP boundary: the PDP client is a hard dependency. Without it the gear
-        // fails init and never serves a permissive decision. Whether the PDP
-        // behind the client answers is bootstrap's probe.
+        // The PDP client is mandatory; bootstrap separately probes reachability.
         let hub = ctx.client_hub();
         let authz: Arc<dyn AuthZResolverApi> = hub
             .get::<dyn AuthZResolverApi>()
@@ -237,9 +235,7 @@ impl Gear for QuotaEnforcementGear {
         let pdp_probe = Arc::new(PdpReachability::new(authz.clone()));
         let enforcer = PolicyEnforcer::new(authz);
 
-        // The projection contract catalogue is built from the types registry at
-        // bootstrap; without the client there is no catalogue to publish. The
-        // same client answers metric identity and classification for writes.
+        // Bootstrap builds the projection catalogue from this registry client.
         let registry: Arc<dyn TypesRegistryClient> = hub
             .get::<dyn TypesRegistryClient>()
             .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
@@ -277,7 +273,7 @@ impl Gear for QuotaEnforcementGear {
                 preparation_max_attempts: policy_limits.preparation_max_attempts,
             },
         ));
-        // The in-process manager client enters the domain where REST does.
+        // In-process clients share the REST domain boundary.
         hub.register::<dyn quota_enforcement_sdk::QuotaOperatorClientV1>(Arc::new(
             crate::api::in_process::InProcessQuotaOperator::new(service.clone()),
         ));
@@ -359,10 +355,7 @@ impl RestApiCapability for QuotaEnforcementGear {
 
     fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
         let service = self.service.get()?;
-        // The cluster SDK's readiness contributor re-validates the profile
-        // requirements when the resolve deferred them, and reports a process
-        // with no cluster client wired at all. It has to be returned from a
-        // gear's `healthcheck()`; the SDK cannot register it itself.
+        // The cluster contributor reports deferred profile or wiring failures.
         let cluster = self
             .hub
             .get()

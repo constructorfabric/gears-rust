@@ -1,91 +1,31 @@
 //! Storage plugin contract: [`QuotaEnforcementStoragePluginV1`].
 //!
-//! Persistence is mediated by this single trait with a closed
-//! [`StorageError`] enum (DESIGN section 3.3, "Storage Plugin Trait"). The
-//! trait surface is the contractual boundary of QE core. Locking discipline,
-//! indexing, isolation level, and table layout are plugin-internal.
+//! This trait and its closed [`StorageError`] enum form QE's persistence
+//! boundary. Locking, indexing, isolation, and table layout are plugin details.
 //!
 //! # Invariants every implementation upholds
 //!
-//! - **I1 Atomicity.** Every mutating call mutates counters, persists the
-//!   idempotency record, enqueues outbox events, and writes the operation-log
-//!   entry in one backend transaction.
-//! - **I2 Idempotency.** Replay returns the original outcome verbatim. A
-//!   different payload under the same scope returns
+//! - **I1 Atomicity.** Counter changes, idempotency, outbox events, and the
+//!   operation log commit in one transaction.
+//! - **I2 Idempotency.** Replay returns the original outcome; a different
+//!   payload under the same scope returns
 //!   [`StorageError::IdempotencyPayloadMismatch`].
-//! - **I3 Read-only.** `read_*`, `list_*`, and `lookup_idempotency` write no
-//!   persistent state. Lazy period-row creation in `read_quota_snapshot` is
-//!   the single exception: it materializes the current period row and nothing
-//!   else. Settling an elapsed period and emitting its `period-rollover` event
-//!   belong to a mutating primitive, so that a dry run enqueues no event.
-//! - **I4 Lease lazy expiry.** Every read and write path treats a lease with
-//!   `expiry_at <= now()` as released, whether or not its row still exists.
-//! - **I5 Period attribution.** Lease commit, release, auto-release, and
-//!   rollback mutate the acquisition period's counter, not the current
-//!   period's.
-//! - **I6 Cap versus consumed.** `update_quota` with a lower cap returns
-//!   [`StorageError::CapBelowConsumed`] when any active period exceeds it,
-//!   checked in the transaction under a row lock.
-//! - **I7 Active-lease cap.** `acquire_lease` returns
-//!   [`StorageError::LeaseInflightLimitExceeded`] when the per-`(tenant,
-//!   metric)` counter would exceed the configured cap.
-//! - **I8 Contention timeout.** Mutating primitives respect the per-metric
-//!   contention timeout and return [`StorageError::LeaseContentionTimeout`].
-//! - **I9 Isolation.** Concurrent row mutations serialize under the ADR-0002
-//!   acquisition order. No dirty reads inside a transaction.
-//! - **I10 Strong consistency within tenant scope.** A committed mutation is
-//!   visible to later reads in the same tenant scope.
-//! - **I11 Outbox same-tx.** Events passed to a mutating call are enqueued in
-//!   the same transaction as the mutation.
-//! - **I12 Schema version coupling.** `bootstrap()` rejects an installed
-//!   schema whose major differs from [`CONTRACT_MAJOR`] with
-//!   [`StorageError::SchemaVersionMismatch`].
-//! - **I13 Threshold-marker reset.** A newly materialized period row has a
-//!   `NULL` highest-crossed-threshold marker.
-//! # In-transaction key derivation
-//!
-//! Credit's idempotency scope is completed inside the transaction: its subject
-//! key fingerprints the locked Quota row's own subject pair, which the caller
-//! neither knows nor may supply (PRD section 5.8). Every other primitive
-//! receives a complete scope.
-//!
-//! # Denials and records
-//!
-//! Every denial except [`NO_APPLICABLE_QUOTA`] persists its idempotency record
-//! with an empty plan and writes no operation-log row, so a retry replays the
-//! denial. A [`NO_APPLICABLE_QUOTA`] denial persists nothing at all. Caller
-//! events are enqueued only when a counter actually moved.
-//!
-//! # Racing writers under one scope
-//!
-//! Two concurrent operations can share an idempotency scope and still lock
-//! disjoint rows, so the row locks alone do not serialize them. The
-//! idempotency record's primary key is the arbiter: an insert that loses the
-//! race rolls its whole transaction back, counters, period rows, and events
-//! included, and then resolves by re-reading the record under the same scope.
-//! An equal payload hash becomes a replay; a different one becomes
-//! [`StorageError::IdempotencyPayloadMismatch`]. A partial write is never
-//! observable, and each attempt is one complete transaction, so a caller that
-//! cancels between attempts leaves nothing half-applied.
-//!
-//! - **I14 Thresholds need a bounded cap.** `update_quota` returns
-//!   [`StorageError::ThresholdsRequireBoundedCap`] when the merged row would
-//!   carry notification thresholds with an unbounded cap, checked in the
-//!   transaction under the same row lock as I6. The gear pre-validates the
-//!   rule against the row it read, but two concurrent patches can each pass
-//!   that check; storage is authoritative.
+//! - **I3 Read-only.** Reads do not mutate state, except snapshot reads may
+//!   materialize their current period row without settlement or events.
+//! - **I4-I5 Lease periods.** Expired leases are treated as released; lease
+//!   settlement and rollback target the acquisition period.
+//! - **I6-I8 Bounds.** Cap updates, active-lease limits, and contention
+//!   timeouts are enforced under the relevant row locks.
+//! - **I9-I11 Consistency.** Mutations serialize in acquisition order, become
+//!   visible within tenant scope, and commit events in the same transaction.
+//! - **I12-I14 Schema and rows.** Schema majors must match; new period rows
+//!   reset threshold markers; notification thresholds require a bounded cap.
 //!
 //! # In-transaction evaluation
 //!
-//! `apply_debit_plan`, `apply_batch_debit` and `acquire_lease` accept no
-//! decision. The plugin selects the applicable policy, materializes the engine
-//! environment from rows it has already locked, and calls the caller's
-//! synchronous evaluator inside the transaction. The decision that comes back
-//! is validated before a counter moves and is recorded with the mutation, so
-//! what a replay returns is what the transaction did. A compiled artifact the
-//! transaction cannot find is not a failure of the operation: it rolls back
-//! and reports [`StorageError::PreparationRequired`], and the caller compiles
-//! outside any transaction and calls again.
+//! Debit and lease methods select and evaluate policy under the row locks. A
+//! missing artifact rolls back with [`StorageError::PreparationRequired`] so
+//! the caller can compile outside the transaction and retry.
 //!
 //! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
 //! and binds it through `SecureConn`. No scoped operation runs without it.
@@ -366,12 +306,8 @@ pub struct EvaluatedBatch<'a> {
     pub evaluate: Arc<TransactionEvaluator>,
 }
 
-/// Pluggable persistence for Quotas, counters, leases, policies, idempotency
-/// records, and the operation log.
-///
-/// Registered by a plugin gear as a scoped `ClientHub` client under its GTS
-/// instance id once every primitive exists. No partial implementation is ever
-/// wired (foundation `DoD`, "Reference Storage Plugin on toolkit-db").
+/// Persistence contract for Quotas, counters, leases, policies, idempotency,
+/// and the operation log.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-sdk-contracts:p1
 #[async_trait]
 pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
@@ -387,14 +323,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn bootstrap(&self, bundle: &BootstrapBundle) -> Result<(), StorageError>;
 
-    /// The distinct `(metric, projection_type)` pairs bound by active Quotas.
-    ///
-    /// Bootstrap-only and platform-plane: the gear calls it once, before it
-    /// reports ready, to check the configured projection catalogue against the
-    /// Quotas storage holds (projection-contracts feature, "Catalogue Bootstrap
-    /// and Consistency Set"). It therefore carries no caller context and no
-    /// `AccessScope`, returns identities only, and is never called on a request
-    /// path. A failure fails readiness.
+    /// Returns distinct `(metric, projection_type)` pairs bound by active
+    /// Quotas for the bootstrap compatibility check.
     ///
     /// # Errors
     ///
@@ -403,13 +333,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         &self,
     ) -> Result<HashSet<ProjectionBinding>, StorageError>;
 
-    /// Counts of active Quotas behind the lifecycle gauges: `cap = 0`,
-    /// unbounded cap, and per metric (quota-lifecycle feature).
-    ///
-    /// Platform-plane and caller-less like
-    /// [`Self::read_active_projection_bindings`], read periodically by the
-    /// elected replica's gauge refresh and never on a request path. Only
-    /// lifecycle status `active` counts, whatever the validity window.
+    /// Returns active-Quota counts for lifecycle gauges: zero cap, unbounded
+    /// cap, and per metric. Validity windows do not affect the counts.
     ///
     /// # Errors
     ///
@@ -505,12 +430,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- counter mutation ---
 
-    /// Select the applicable policy, evaluate it against the locked Quota rows,
-    /// and apply the resulting plan atomically (I1, I2, I9).
-    ///
-    /// The plan is the transaction's, never the caller's: selection walks from
-    /// the metric policy to the global fallback inside the same transaction
-    /// that mutates the counters.
+    /// Selects and evaluates the applicable policy under the Quota row locks,
+    /// then applies its plan atomically (I1, I2, I9).
     ///
     /// # Errors
     ///
@@ -525,16 +446,11 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///
     /// # Replay and retention
     ///
-    /// A replay reports `NoOp` carrying the stored [`Decision`], the record's
-    /// [`Retention::Recorded`] deadline, and an **empty**
-    /// [`MutationResult`]: nothing moved and no event was enqueued, and the
-    /// recorded decision is the whole of what a replay promises (I2).
+    /// A replay returns `NoOp` with the stored [`crate::Decision`], retention
+    /// deadline, and an empty [`MutationResult`].
     ///
-    /// A fresh outcome reports `Applied`. Its retention is `Recorded` except
-    /// for a denial with reason [`NO_APPLICABLE_QUOTA`], which persists no
-    /// record and no audit row and is therefore
-    /// [`Retention::Unrecorded`]: provisioning a Quota must change the answer,
-    /// so that denial may not be replayed or cached.
+    /// Fresh outcomes are recorded except [`crate::NO_APPLICABLE_QUOTA`], which
+    /// must be re-evaluated after provisioning changes.
     async fn apply_debit_plan(
         &self,
         ctx: &SecurityContext,
@@ -560,14 +476,9 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     /// Credit one named Quota, returning consumption to it.
     ///
-    /// The idempotency input is partial because the scope is not knowable
-    /// before the transaction: the subject key fingerprints the Quota's own
-    /// `(projection_type, subject_id)` pair, which is only readable under the
-    /// row lock, and a caller may not supply one. The order inside the
-    /// transaction is therefore fixed: lock the row, derive the scope, check
-    /// for a replay, and only then apply the guards that reject a *fresh*
-    /// credit. A credit that succeeded before the Quota was deactivated
-    /// replays its stored outcome instead of failing.
+    /// Storage completes the idempotency scope from the locked Quota row and
+    /// checks replay before fresh-credit guards. Thus a credit that succeeded
+    /// before deactivation still replays.
     ///
     /// # Errors
     ///
@@ -589,19 +500,14 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Reverse the committed debit `target` names.
-    ///
-    /// Each reversal is applied against the acquisition period of the original
-    /// mutation, never the current one (I5), and the original is reversed at
-    /// most once however many rollback keys target it.
+    /// Reverses the committed debit named by `target` against its original
+    /// period, at most once (I5).
     ///
     /// # Errors
     ///
-    /// - [`StorageError::OperationNotFound`] when no committed debit answers
-    ///   `target`: no record under the scope, a record that committed no
-    ///   counter change (a denial, or a credit), or one whose stored
-    ///   authorized attribution differs from `target.authorized`. The three
-    ///   are deliberately indistinguishable to the caller.
+    /// - [`StorageError::OperationNotFound`] when no matching committed debit
+    ///   exists, including an attribution mismatch. These cases are deliberately
+    ///   indistinguishable to the caller.
     /// - [`StorageError::PeriodClosed`] when the attribution period was
     ///   already settled, checked before any write.
     /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay of this

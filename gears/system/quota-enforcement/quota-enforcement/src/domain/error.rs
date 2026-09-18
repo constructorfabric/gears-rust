@@ -467,9 +467,7 @@ impl From<StorageError> for DomainError {
                 id: id.to_string(),
             },
             StorageError::QuotaDeactivated { id } => Self::QuotaDeactivated { id: id.to_string() },
-            // No committed debit answers the rollback target, whether because
-            // no record exists, because it moved no counter, or because it was
-            // authorized under another attribution. The three are one answer.
+            // Keep missing, non-mutating, and unauthorized operations indistinguishable.
             StorageError::OperationNotFound { key } => Self::NotFound {
                 kind: ResourceKind::Operation,
                 id: key,
@@ -488,23 +486,18 @@ impl From<StorageError> for DomainError {
                 field: "cursor",
                 reason: tokens::CURSOR_INVALID,
             },
-            // The transaction evaluated and refused; the same closed failures the
-            // gear lifts when it evaluates outside one. The transaction has
-            // already rolled back, so no counter moved and no record was
-            // written: the canonical error is the whole outcome.
+            // The transaction has already rolled back this evaluation failure.
             // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
             StorageError::EvaluationFailed { engine_id, failure } => {
                 super::engines::lift_evaluation(&engine_id, failure)
             }
             // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
-            // The caller prepares the artifact and retries. Reaching this lift
-            // means the bounded retry budget was spent: an internal condition.
+            // Reaching this lift means the preparation retry budget was exhausted.
             StorageError::PreparationRequired { policy_id, version } => Self::Internal(format!(
                 "artifact for policy {policy_id} version {version} was never prepared"
             )),
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
-            // Detected at bootstrap and fatal there. A runtime occurrence is a
-            // contract violation of the plugin, hence internal.
+            // A post-bootstrap mismatch violates the storage contract.
             StorageError::SchemaVersionMismatch {
                 installed,
                 expected,

@@ -139,9 +139,7 @@ impl Operations<'_> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount
         // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount-if
         self.validate_key(&request.idempotency_key)?;
-        // The digest covers what the caller sent, before mapping: two callers
-        // that sent the same thing replay each other, and a caller that
-        // changed anything does not.
+        // Hash caller input before catalogue mapping for stable replay checks.
         // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-trust
         let payload_hash = digest(&DebitPayload {
@@ -219,8 +217,7 @@ impl Operations<'_> {
                     ctx,
                     &admitted.attribution.access_scope,
                     &mutation,
-                    // The plugin builds the events only it can fill: the
-                    // counters it moved and the thresholds they crossed.
+                    // Storage supplies counter and threshold event details.
                     &[],
                 )
             })
@@ -230,10 +227,7 @@ impl Operations<'_> {
         let replayed = matches!(outcome, TransitionOutcome::NoOp(_));
         let evaluated = outcome.into_inner();
         if replayed {
-            // A replay is one operation reported twice, not two denials. The
-            // cache and lookup paths above return before counting for the same
-            // reason; this is the third way a replay can arrive, from inside
-            // the transaction that found the record under its row locks.
+            // A transaction-detected replay is not a second denial.
             self.metrics.record_idempotency_replay(OperationKind::Debit);
         } else {
             // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-denied-if
@@ -242,8 +236,7 @@ impl Operations<'_> {
             // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-denied
             // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-denied-if
         }
-        // Only a recorded outcome may be cached. The one denial that persists
-        // nothing must re-evaluate once a Quota is provisioned.
+        // Unrecorded denials must be re-evaluated after provisioning changes.
         if let Retention::Recorded { expires_at } = evaluated.retention {
             self.idempotency.insert(
                 scope,
@@ -307,9 +300,7 @@ impl Operations<'_> {
                 AdmissionTarget::tenant(request.tenant_id),
             )
             .await?;
-        // No lookup here: the subject key fingerprints the Quota's own subject
-        // pair, which only the transaction can read under the row lock, so the
-        // plugin completes the scope and checks for a replay itself.
+        // Storage completes the idempotency scope from the locked Quota row.
         let partial = PartialIdempotencyWrite {
             tenant_id: request.tenant_id,
             key: request.idempotency_key,
@@ -364,8 +355,7 @@ impl Operations<'_> {
             original_idempotency_key: &request.original_idempotency_key,
         })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-request
-        // The same admission tuple as the debit being reversed, so a caller can
-        // only reverse what it could itself have charged.
+        // Re-authorize the original debit attribution before reversing it.
         let admitted = self
             .attribution
             .admit_evaluation(
@@ -435,8 +425,6 @@ impl Operations<'_> {
         ctx: &toolkit_security::SecurityContext,
         request: PreviewRequest,
     ) -> Result<DecisionPreview, DomainError> {
-        // Symmetry with debit: a caller that previews an impossible amount
-        // learns so here rather than at the commit.
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-request
         let amount = self.validate_amount(request.amount)?;
         let admitted = self
@@ -481,8 +469,7 @@ impl Operations<'_> {
                 },
             )
             .await?;
-        // A dry run denies nothing: counting it would double-count the commit
-        // a caller makes right after it.
+        // Preview denials are not operational denials.
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-return
         Ok(DecisionPreview::of(decision))
         // @cpt-end:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-return
@@ -503,8 +490,7 @@ impl Operations<'_> {
             request,
             resource,
         } = *subject;
-        // The same walk the transaction makes: the metric's own policy when
-        // one is active, the seeded global otherwise.
+        // Match transaction policy selection: metric first, then global.
         let policy = match self
             .storage
             .read_policy(&quota_enforcement_sdk::PolicyScope::Metric {
@@ -531,8 +517,7 @@ impl Operations<'_> {
             .map(
                 |(snapshot, arbitration)| quota_enforcement_sdk::engine::EvaluationQuota {
                     snapshot,
-                    // The same tier resolution the transaction makes, so a
-                    // preview cannot disagree with the debit it previews.
+                    // Match transaction tier resolution.
                     tier: match user_projection {
                         Some(user) if snapshot.subject.projection_type == *user => {
                             quota_enforcement_sdk::engine::QuotaScopeTier::User
@@ -558,9 +543,7 @@ impl Operations<'_> {
             resource,
             budget,
         };
-        // The dry run reuses the mutation path's preparation budget, so a
-        // preview of a version whose artifact is not resident prepares it once
-        // instead of failing.
+        // Use the mutation path's bounded artifact-preparation retry.
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-engine
         let outcome = prepared
             .run(|| std::future::ready(evaluate(&context).map_err(storage_failure)))

@@ -200,8 +200,7 @@ impl<'a> Attribution<'a> {
             .catalog
             .request_contract(&shaped.metric)
             .ok_or_else(|| {
-                // Unreachable once the tenant scope mapped: the catalogue holds a
-                // request contract for every admitted metric by construction.
+                // Every admitted metric has a request contract.
                 self.metrics
                     .record_admitted_metric_violation(ValidationSurface::RequestSubject);
                 DomainError::InvalidArgument {
@@ -230,11 +229,8 @@ impl<'a> Attribution<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-forward
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-return
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
-        // Any authorized caller reached the owner's projections through the
-        // catalogue; none of them chose a projection.
-        // Digested before the shaped request is consumed, and from the very
-        // document the PDP saw, so a policy that keyed on resource metadata is
-        // honoured by the rollback check too.
+        // Bind rollback authorization to the catalogue-mapped document seen by
+        // the PDP, including resource metadata.
         let authorized = AttributionDigest::of_canonical(&pdp_properties)
             .map_err(|error| DomainError::Internal(error.to_string()))?;
         Ok(AdmittedEvaluation {
@@ -408,9 +404,7 @@ impl<'a> Attribution<'a> {
                 reason: tokens::RESOURCE_TYPE_UNKNOWN,
             });
         };
-        // The complete `{type, id?, metadata}` document, `id` present only when
-        // the caller sent one: the resource base allows an omitted id and
-        // requires a string when present.
+        // Preserve an omitted resource id instead of serializing it as `null`.
         let mut document = Map::new();
         document.insert(
             "type".to_owned(),

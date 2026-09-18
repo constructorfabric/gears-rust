@@ -138,9 +138,7 @@ fn lift(operation: &'static str, error: TxError) -> StorageError {
             );
             StorageError::Unavailable(format!("{operation} failed: outbox is not bound"))
         }
-        // A caller whose scope the ORM refuses sees rows outside its
-        // authorization as absent, which the primitives already report; a
-        // refusal reaching here is an inconsistency.
+        // ORM scope refusal here is an internal inconsistency.
         TxError::Scope(error) => corrupt(operation, &error),
         TxError::Map(error) => corrupt(operation, &error),
         TxError::Json(error) => corrupt(operation, &error),
@@ -255,8 +253,7 @@ async fn ensure_current_period(
     match counter_repo::insert_period(tx, scope, Uuid::now_v7(), &period).await {
         Ok(row) => Ok(row),
         Err(error) if error.is_unique_violation() => {
-            // Another transaction opened the same period first; the unique key
-            // on (quota_id, period_start) is the arbiter and its row is ours.
+            // The unique `(quota_id, period_start)` key arbitrates concurrent opens.
             counter_repo::find_latest_for_update(tx, scope, quota.id.as_uuid())
                 .await?
                 .ok_or_else(|| {
@@ -816,8 +813,7 @@ impl SqlConsumptionStore {
                 arbitration,
             })
             .collect();
-        // The budget belongs to the version this transaction selected, so it is
-        // resolved here rather than by a caller that could not have known it.
+        // Resolve the budget from the version selected by this transaction.
         let budget = mutation.limits.budget(policy.timeout_ms).map_err(|error| {
             TxError::Storage(StorageError::EvaluationFailed {
                 engine_id: policy.engine_id.clone(),
@@ -944,8 +940,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         const OPERATION: &str = "apply debit plan";
         let actor = actor_of(ctx);
-        // Each attempt is one complete transaction. A caller cancelled between
-        // attempts therefore leaves nothing half-applied.
+        // Each retry is a complete transaction.
         for attempt in 0..RACE_ATTEMPTS {
             let enqueuer = Arc::clone(&self.enqueuer);
             let clock = Arc::clone(&self.clock);
@@ -961,16 +956,13 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                         let mutation = &mutation;
                         let events = &events;
                         let quotas = Self::lock_applicable(tx, scope, &mutation.applicable).await?;
-                        // Read after the rows are locked, never before: a
-                        // transaction that waited out a period boundary must
-                        // charge the period it actually commits in.
+                        // Sample time after locking so boundary waits charge the
+                        // period in which the transaction commits.
                         let now = clock();
                         if let Replay::Stored(row) =
                             replay_of(tx, scope, &mutation.idempotency, now, true).await?
                         {
-                            // A replay is the recorded decision and nothing
-                            // else: no counter moved this time, and no event
-                            // was enqueued.
+                            // Replays return the recorded decision without side effects.
                             return Ok(TransitionOutcome::NoOp(EvaluatedDebit {
                                 decision: decision_of(&row.decision_blob)?,
                                 mutation: MutationResult::default(),
@@ -1092,10 +1084,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         const OPERATION: &str = "apply credit";
         let actor = actor_of(ctx);
-        // A credit shares a scope with a concurrent credit only when both name
-        // the same Quota, so the row lock already serializes them; the arbiter
-        // below is the same defensive path a debit takes, and costs nothing
-        // when it never fires.
+        // The Quota row lock normally serializes credits; the arbiter is a
+        // defensive fallback.
         for attempt in 0..RACE_ATTEMPTS {
             let actor = actor.clone();
             let enqueuer = Arc::clone(&self.enqueuer);
@@ -1109,9 +1099,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                     Box::pin(async move {
                         let scope = &scope;
                         let events: &[NotificationEvent] = &events;
-                        // The order is the contract: lock the row, derive the scope
-                        // from what it holds, answer a replay, and only then apply
-                        // the guards that reject a *fresh* credit.
+                        // Check replay before guards that apply only to fresh credits.
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-lock
                         let row = quota_repo::find_by_id(tx, scope, quota_id.as_uuid(), true)
                             .await?
@@ -1145,9 +1133,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                             return Err(StorageError::QuotaDeactivated { id: quota_id }.into());
                         }
                         let period_id = if quota.quota_type == QuotaType::Consumption {
-                            // Closure is calendar-keyed here, unlike rollback's: a
-                            // Quota never evaluated has an open current window, so
-                            // an absent row is materialized rather than refused.
+                            // Credit uses calendar closure; materialize an absent
+                            // current row.
                             let latest =
                                 counter_repo::find_latest_for_update(tx, scope, quota_id.as_uuid())
                                     .await?;
@@ -1269,9 +1256,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         const OPERATION: &str = "apply rollback";
         let actor = actor_of(ctx);
-        // Two rollbacks of one debit share the original's row lock, so the
-        // arbiter is a fallback; two rollbacks under one key that reach
-        // different Quotas are exactly what it is for.
+        // The original row lock normally serializes rollbacks; the arbiter also
+        // protects a reused key that reaches different Quotas.
         for attempt in 0..RACE_ATTEMPTS {
             let actor = actor.clone();
             let enqueuer = Arc::clone(&self.enqueuer);
@@ -1289,9 +1275,9 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                         let target = &target;
                         let idempotency = &idempotency;
                         let now = clock();
-                        // The rollback's own key first, so a replay survives the
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
+                        // Check the rollback key first so replay outlives the
                         // original record's retention window.
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
                         if let Replay::Stored(stored) =
                             replay_of(tx, scope, idempotency, now, true).await?
                         {
@@ -1313,10 +1299,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                             .await?
                             .ok_or_else(unknown)?;
                         // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-lookup
-                        // Authorization is bound to the reversed operation, not
-                        // merely to its subjects: a caller admitted for another
-                        // metric or resource must not reverse this debit, and
-                        // learns nothing about it either.
+                        // Bind authorization to the original metric and resource,
+                        // not only its subjects.
                         let authorized = original
                             .attribution_hash
                             .clone()
@@ -1538,9 +1522,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             };
             let quota =
                 quota_mapping::row_to_quota(row).map_err(|error| lift(OPERATION, error.into()))?;
-            // The I3 exception: a read may materialize the row it reports, and
-            // nothing else. It settles no elapsed period and enqueues no event,
-            // so a preview never writes an outbox row.
+            // I3 permits materializing only the row being read, without
+            // settlement or outbox events.
             if quota.quota_type == QuotaType::Consumption {
                 let quota = quota.clone();
                 let scope = scope.clone();

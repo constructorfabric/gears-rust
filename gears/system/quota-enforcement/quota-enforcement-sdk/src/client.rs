@@ -1,13 +1,8 @@
-//! Client traits of the gear (DESIGN section 3.3, "SDK Rust Traits").
+//! Client traits for quota enforcement.
 //!
 //! Every method is async, takes the caller's [`SecurityContext`] first, and
-//! returns [`QuotaEnforcementError`], the platform canonical error the REST
-//! surface renders as a `Problem`. The gear registers an in-process
-//! implementation in `ClientHub`; a REST client implements the same trait over
-//! the public API. Both enter the gear at the same admission step, so the two
-//! transports share one authorization boundary.
-//!
-//! The operator trait's remaining surfaces land with their features.
+//! returns the same canonical error exposed by REST. In-process and REST
+//! clients share the same authorization boundary.
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
@@ -22,9 +17,7 @@ use crate::models::{
 /// Error of every client method: the platform canonical error.
 pub type QuotaEnforcementError = CanonicalError;
 
-/// Quota Manager surface: the Quota lifecycle within the caller's PDP scope
-/// (quota-lifecycle feature). Platform operators use the same methods under
-/// their own grants; the difference is the PDP decision, not the trait.
+/// Manages Quotas within the caller's PDP scope.
 #[async_trait]
 pub trait QuotaManagerClientV1: Send + Sync + 'static {
     /// Create a Quota. The gear validates `spec`, resolves the metric owner's
@@ -82,20 +75,13 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError>;
 }
 
-/// Quota Consumer surface: the guarded hot path (consumption-operations
-/// feature).
+/// Performs guarded consumption operations.
 ///
-/// A denial is a successful call. `Ok(Decision)` carries either verdict, and
-/// the REST surface renders both as HTTP 200 with a decision body; only a
-/// failure to decide is an error (PRD section 3.4). Decision-shaped fields in a
-/// request are server-derived: they are ignored on the way in and never echoed
-/// back.
+/// A denial is a successful call: [`Decision`] carries either verdict. Only a
+/// failure to decide is an error.
 ///
-/// Every write carries a caller-supplied idempotency key. Its scope is
-/// `(tenant, subject key, operation type, key)`, so the same key string under
-/// another tenant, another subject set, or another operation is a different
-/// operation and is never cross-matched. Replaying a key returns the stored
-/// decision verbatim, without re-evaluating anything.
+/// Write keys are scoped by tenant, subjects, and operation. A replay returns
+/// the stored decision without re-evaluation.
 #[async_trait]
 pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
     /// Charge `amount` against every Quota applicable to the attribution, and

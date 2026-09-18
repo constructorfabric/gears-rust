@@ -172,10 +172,8 @@ impl Admission {
     ) -> Result<Admitted, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-authn
-        // The request arrives from REST or from the in-process client through
-        // this one entry. `ctx` carries the service principal the platform
-        // `api-gateway` authenticated; `target` stays untrusted request data
-        // until the PDP authorizes it.
+        // Both transports enter here; `target` remains untrusted until the PDP
+        // authorizes it for the authenticated principal in `ctx`.
         let site = LogSite {
             principal: ctx.subject_id(),
             resource: resource.name(),
@@ -195,8 +193,7 @@ impl Admission {
         for (key, value) in properties {
             request = request.resource_property(key, value);
         }
-        // Last on purpose: the authorized tenant is the explicit target, never
-        // a property the caller slipped into the tuple.
+        // Keep the authorized tenant as the explicit target.
         let request = request
             .resource_property(pep_properties::OWNER_TENANT_ID, target.tenant_id.as_uuid())
             .require_constraints(true);
@@ -216,11 +213,8 @@ impl Admission {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-scope
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-forward
-        // The PDP authorized the complete tuple, `target.tenant_id` included.
-        // The scope is not inspected here: `SecureConn` evaluates its filters
-        // at the storage boundary, and an in-memory membership check cannot
-        // evaluate an `InTenantSubtree` filter, so it would deny an authorized
-        // descendant tenant.
+        // Preserve hierarchy-aware filters for `SecureConn`; an in-memory
+        // membership check cannot evaluate `InTenantSubtree`.
         Ok(Admitted {
             tenant_id: target.tenant_id,
             access_scope,

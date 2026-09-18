@@ -1,6 +1,4 @@
-//! Domain types referenced by the quota-enforcement plugin contracts.
-//!
-//! Type-stability rules (DESIGN section 3.1):
+//! Domain types used by quota-enforcement contracts.
 //!
 //! - Every enum is closed at the SDK boundary. Deserialization rejects an
 //!   unknown value instead of a fallback variant.
@@ -8,8 +6,7 @@
 //!   `PeriodType`) serialize as their full GTS instance id. Storage rows and
 //!   events carry that form.
 //! - Timestamps serialize as RFC 3339 in UTC.
-//! - Input shapes (`QuotaDraft`, `QuotaPatch`, `PolicyDraft`, `PolicyUpdate`)
-//!   reject unknown fields.
+//! - Input shapes reject unknown fields.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -280,22 +277,13 @@ digest_newtype!(
     PayloadHash
 );
 digest_newtype!(
-    /// SHA-256 of the PDP-authorized, catalogue-mapped attribution a mutation
-    /// was admitted under: its metric, mapped subject set, and resource
-    /// document. A debit record carries it so a later rollback can prove it was
-    /// authorized for the very operation it reverses, which the idempotency
-    /// scope alone cannot show: the scope covers tenant and subjects, not
-    /// metric or resource.
+    /// SHA-256 of the authorized metric, mapped subjects, and resource. A
+    /// rollback uses it to prove authorization for the original mutation.
     AttributionDigest
 );
 
-/// Canonical JSON byte form of a payload: object keys sorted at every depth,
-/// no insertion-order dependence, compact separators.
-///
-/// `serde_json` without `preserve_order` already sorts map keys, but the
-/// workspace may enable it for another crate in the same build. Rebuilding
-/// every object through [`BTreeMap`] makes the byte form independent of that
-/// feature, so a digest computed by one process matches another's.
+/// Returns JSON with object keys sorted at every depth, independent of
+/// `serde_json`'s `preserve_order` feature.
 fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -343,14 +331,10 @@ impl AttributionDigest {
 }
 
 impl IdempotencySubjectKey {
-    /// Fingerprint of an applicable subject set: sort and deduplicate the
-    /// `(projection_type, subject_id)` pairs, then hash them length-prefixed
-    /// (PRD section 5.8).
+    /// Fingerprints sorted, deduplicated `(projection_type, subject_id)` pairs.
     ///
-    /// Length prefixes keep the encoding injective, so `("xy", "z")` and
-    /// `("x", "yz")` fingerprint differently. Order and duplicates in
-    /// `subjects` do not affect the result: the caller never supplies this
-    /// key, and two servers must agree on it.
+    /// Length prefixes prevent boundary collisions. Input order and duplicates
+    /// do not affect the result.
     #[must_use]
     pub fn of(subjects: &[SubjectRef]) -> Self {
         let pairs: BTreeSet<(&str, &str)> = subjects
@@ -365,9 +349,8 @@ impl IdempotencySubjectKey {
         let mut hasher = Sha256::new();
         for (projection_type, subject_id) in pairs {
             for field in [projection_type, subject_id] {
-                // The cast cannot truncate: a rejected length is unreachable
-                // for values that came through the catalogue, and the
-                // saturating fallback still hashes a distinct prefix.
+                // Catalogue limits keep lengths within `u32`; saturation remains
+                // deterministic for defensive callers.
                 let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
                 hasher.update(len.to_be_bytes());
                 hasher.update(field.as_bytes());
@@ -681,13 +664,8 @@ impl ContractRef {
     }
 }
 
-/// A well-known instance of the scope-discriminator type
-/// `gts.cf.core.qe.scope.v1~` (ADR-0007). The value is an identity-only
-/// discriminator: it names no `SecurityContext` accessor, and the gear compares
-/// instance ids directly.
-///
-/// The invariant "an instance of the scope type" holds for every value: the
-/// constructors validate it, and deserialization goes through [`Self::parse`].
+/// A validated instance of the `gts.cf.core.qe.scope.v1~` discriminator.
+/// Deserialization preserves the same invariant as [`Self::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct SubjectScope(GtsInstanceId);
@@ -809,13 +787,10 @@ pub struct SubjectClaim {
     pub id: String,
 }
 
-/// An optional resource projection on the wire (ADR-0007): the complete
-/// `{type, id?, metadata}` document validated against the owner contract.
+/// An optional `{type, id?, metadata}` resource projection.
 ///
-/// `id` and `metadata` distinguish omission from an explicit `null`: the
-/// resource base allows an omitted `id` and requires a string when present, and
-/// requires `metadata`. An omitted field is `None`; `null` fails
-/// deserialization; `None` is never written as `null`.
+/// Optional fields distinguish omission from `null`; explicit `null` is
+/// rejected and omitted values are not serialized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceProjection {
@@ -838,14 +813,11 @@ pub struct ResourceProjection {
     pub metadata: Option<Map<String, Value>>,
 }
 
-/// The caller-supplied attribution of one subject-based evaluation request
-/// (debit, reserve, preview, each batch item). Untrusted until the PDP
-/// authorizes the complete tuple for the authenticated service principal.
+/// Caller-supplied attribution for an evaluation request. It remains untrusted
+/// until the PDP authorizes the complete tuple.
 ///
-/// `metadata` is required on the wire, including `{}` when the request
-/// contract declares no properties; it is `Option` only so the gear can tell an
-/// omitted object from a present one and reject the omission instead of
-/// defaulting it. `null` fails deserialization for every optional field.
+/// `metadata` is represented as [`Option`] only to distinguish omission; the
+/// service requires it on the wire and rejects `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationAttribution {
@@ -983,26 +955,17 @@ pub struct Quota {
 }
 
 impl Quota {
-    /// Largest cap any surface accepts. Caps live in `0..=i64::MAX` so every
-    /// storage backend holds them in a signed 64-bit column: the REST surface
-    /// takes a signed integer and rejects negatives, the SDK checks `u64`
-    /// values against this bound (`CAP_OUT_OF_RANGE`), SQL carries a check
-    /// constraint.
+    /// Largest cap accepted by the API and signed 64-bit storage backends.
     pub const MAX_CAP: u64 = i64::MAX.unsigned_abs();
 }
 
-/// The public read shape of a Quota: the stored record plus what the gear
-/// computes at read time. Every Quota read and list returns it, over REST and
-/// in process alike (quota-lifecycle feature). Storage never produces it; its
-/// `read_quotas` returns the bare [`Quota`].
+/// Public Quota read shape: the stored record plus computed state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaView {
     /// The stored record.
     #[serde(flatten)]
     pub quota: Quota,
-    /// Server-computed: the response's clock reading lies within
-    /// `validity_window`, an absent bound being unbounded on its side. One
-    /// clock reading per response.
+    /// Whether the response clock lies within `validity_window`.
     pub currently_within_window: bool,
     /// Registry-reported kind of the metric at read time. `None` only when
     /// the registry no longer knows the metric; the record stays readable and
@@ -1024,10 +987,8 @@ impl QuotaView {
     }
 }
 
-/// Public create input of a Quota (`QuotaManagerClientV1::create_quota`): a
-/// [`QuotaDraft`] without the constraint contract, which the gear resolves from
-/// the catalogue and snapshots itself. The gear validates every field before
-/// storage sees a draft.
+/// Public Quota create input. The service resolves and snapshots the constraint
+/// contract before constructing a [`QuotaDraft`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaSpec {

@@ -167,8 +167,7 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-register
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-start
-        // Exactly one active storage plugin: the instance the configured vendor
-        // selects.
+        // Resolve the configured storage implementation.
         let storage = self
             .binding
             .resolve_storage()
@@ -176,11 +175,9 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Storage, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-start
 
-        // Schema check and default seeding are the plugin's steps.
         // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-seed
         // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-order
-        // Engines are registered above, before this seed runs, so the seeded
-        // policy can never name an engine this binary does not link.
+        // Engine registration precedes policy seeding.
         let mut bundle = BootstrapBundle::foundation();
         bundle.global_policy = Some(global_policy_seed());
         storage
@@ -192,9 +189,7 @@ impl Bootstrap {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
         // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-        // The QE-owned GTS definitions: the four abstract bases, the scope
-        // type, and its two well-known instances. Idempotent; a byte-identical
-        // definition already present is a success, a different one a conflict.
+        // Reasserting identical definitions is idempotent; conflicts fail.
         let definitions = owned_definitions().map_err(|e| {
             (
                 Dependency::Catalog,
@@ -208,9 +203,7 @@ impl Bootstrap {
             .map_err(|e| (catalog_dependency(&e), e))?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
 
-        // The consistency set over the configured projections, then the
-        // compatibility check against the Quotas storage holds. The catalogue
-        // is published only after both pass; a failure serves nothing.
+        // Publish only after the catalogue and stored bindings agree.
         let builder = CatalogBuilder::new(self.catalog.registry.as_ref(), self.metrics.as_ref());
         let catalog = builder
             .build(&self.catalog.config)
@@ -225,13 +218,8 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Catalog, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
 
-        // One pass over the registry for every metric this deployment can see:
-        // those the catalogue admits, so the evaluation path never has to call
-        // it, and those active Quotas are bound to, so a Quota stranded on a
-        // removed metric is flagged. Each distinct metric is looked up once, and
-        // a registry that does not answer fails readiness.
-        // Collected first: the lookup awaits, and holding a borrow of the
-        // catalogue across it would tie this future to their lifetimes.
+        // Resolve every admitted or stored metric once before serving traffic.
+        // Collect first to avoid borrowing the catalogue across an await.
         let to_classify: Vec<MetricId> = catalog
             .admitted_metrics()
             .cloned()
@@ -244,9 +232,7 @@ impl Bootstrap {
         );
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
-        // The cluster resolver validates the operator's binding of the
-        // `quota-enforcement` profile: an unbound profile or a backend without a
-        // linearizable election fails here. There is no probe of our own.
+        // Resolution validates the profile and linearizable-election support.
         let coordinator = self
             .coordinator
             .resolve()
@@ -255,9 +241,7 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
-        // One round trip to the PDP. `init` already proved the client is
-        // registered; a registered client over an unreachable PDP would still
-        // deny every request, so the gear must not report ready behind it.
+        // Registration alone does not prove that the PDP is reachable.
         self.pdp.probe().await.map_err(|e| (Dependency::Pdp, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
 

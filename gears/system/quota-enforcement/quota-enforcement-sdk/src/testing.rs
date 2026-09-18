@@ -788,8 +788,7 @@ impl InMemoryStorage {
                 arbitration,
             })
             .collect();
-        // The budget belongs to the version this transaction selected, so it is
-        // resolved here rather than by a caller that could not have known it.
+        // Resolve the budget from the version selected by this transaction.
         let budget = mutation.limits.budget(policy.timeout_ms).map_err(|error| {
             StorageError::EvaluationFailed {
                 engine_id: policy.engine_id.clone(),
@@ -1171,8 +1170,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         quota.status = QuotaStatus::Deactivated;
         quota.record_version += 1;
         quota.updated_at = now;
-        // The cascade: every live lease holding this Quota is resolved and its
-        // held capacity returned. Expired leases are already released (I4).
+        // Resolve live leases and return their held capacity; expired leases
+        // have already been released (I4).
         let mut resolved = Vec::new();
         let mut returned: Vec<LeaseHold> = Vec::new();
         for (token, lease) in &mut st.leases {
@@ -1232,8 +1231,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         self.transact(|st| {
             if let Some(blob) = Self::replayed(st, mutation.idempotency)? {
-                // A replay is the recorded decision and nothing else: no
-                // counter moved this time, and no event was enqueued.
+                // Replays return the recorded decision without side effects.
                 return Ok(TransitionOutcome::NoOp(EvaluatedDebit {
                     decision: Self::decision_from(blob)?,
                     mutation: MutationResult::default(),
@@ -1243,8 +1241,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             let now = Self::now(st);
             let (policy, decision) = Self::evaluated(st, mutation)?;
             if decision.is_no_applicable_quota() {
-                // The one denial that records nothing: provisioning a Quota
-                // must change the answer, so nothing may replay or cache it.
+                // Provisioning must be able to change this unrecorded denial.
                 return Ok(TransitionOutcome::Applied(EvaluatedDebit {
                     decision,
                     mutation: MutationResult::default(),
@@ -1262,8 +1259,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 Some(mutation.authorized),
             );
             if entries.is_empty() {
-                // A recorded denial occupies its key and moves nothing; caller
-                // events belong to a mutation that happened.
+                // A recorded denial occupies its key but emits no mutation event.
                 return Ok(TransitionOutcome::Applied(EvaluatedDebit {
                     decision,
                     mutation: counters,
@@ -1315,11 +1311,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                         .collect(),
                 ));
             }
-            // Each item's evaluation must see the counters every earlier item
-            // of the same batch moved, so items are applied as they are
-            // decided. The envelope is all-or-nothing: a denial or a failure
-            // leaves nothing behind, which staging gives for free, so a
-            // threshold event an earlier item produced disappears with it.
+            // Each item observes prior items in the batch. Staging preserves
+            // all-or-nothing counters and threshold events.
             let staged = st.clone();
             let run = Self::run_batch(st, batch)?;
             if !run.committed {
@@ -1327,8 +1320,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             }
             let retention_scope = batch.envelope.scope.clone();
             let blob = Self::blob(&run.decisions)?;
-            // A denied envelope still occupies its key: the replay of a denial
-            // is a denial, and no counter moved either time.
+            // A denied envelope still occupies its idempotency key.
             let expires_at = Self::remember(st, batch.envelope, blob, run.policy.as_ref(), None);
             let _ = retention_scope;
             if run.committed {
@@ -1381,10 +1373,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         let principal = ctx.subject_id();
         self.transact(|st| {
-            // The order is the contract: lock the row, derive the scope from
-            // what it holds, answer a replay, and only then apply the guards
-            // that reject a *fresh* credit. A credit that succeeded before the
-            // Quota was deactivated still replays.
+            // Check replay before fresh-credit guards so an earlier success
+            // still replays after deactivation.
             let quota = st
                 .quotas
                 .get(&quota_id)
@@ -1409,9 +1399,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             }
             let now = Self::now(st);
             if quota.quota_type == QuotaType::Consumption {
-                // Closure is calendar-keyed here, unlike rollback's: a Quota
-                // that was never evaluated has an open current window, so an
-                // absent row is materialized rather than refused.
+                // Credit uses calendar closure; materialize an absent current row.
                 let closed = st
                     .current_period
                     .get(&quota_id)
@@ -1490,10 +1478,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 .get(&target.original)
                 .cloned()
                 .ok_or_else(unknown)?;
-            // Authorization is bound to the reversed operation, not merely to
-            // its subjects: a caller admitted for another metric or resource
-            // over the same subjects must not reverse this debit, and learns
-            // nothing about it either.
+            // Bind authorization to the original metric and resource, not only
+            // its subjects.
             if committed.authorized != target.authorized {
                 return Err(unknown());
             }
@@ -1587,10 +1573,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         let mut st = self.state.lock();
         Self::check(&st)?;
         if let Some(blob) = Self::replayed(&st, mutation.idempotency)? {
-            // The acquisition's own outcome, token included. A subject may hold
-            // several leases at once, so a replay cannot look one up by subject:
-            // it would hand back an unrelated token, and a replayed denial
-            // would acquire one it never held.
+            // Persist the acquisition outcome because subjects may hold several
+            // leases and a replay must return the original token or denial.
             let acquired: EvaluatedLease =
                 serde_json::from_value(blob).map_err(|e| StorageError::Internal(e.to_string()))?;
             return Ok(TransitionOutcome::NoOp(acquired));
@@ -1776,9 +1760,8 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         _scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
-        // The I3 exception: a read may materialize the row it reports, and
-        // nothing else. It settles no elapsed period and enqueues no event, so
-        // a preview never writes an outbox row.
+        // I3 permits materializing only the row being read, without settlement
+        // or outbox events.
         self.transact(|st| {
             let now = Self::now(st);
             let matched: Vec<QuotaId> = st

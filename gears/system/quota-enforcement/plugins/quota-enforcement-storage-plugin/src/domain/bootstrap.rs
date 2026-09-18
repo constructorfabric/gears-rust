@@ -124,10 +124,7 @@ impl StoragePlugin {
         {
             return Ok(());
         }
-        // The audit actor of a seed is the system, not a principal: bootstrap
-        // runs before any request. The nil subject is that absence, and since
-        // policy rows are platform-plane (`no_tenant`, `no_owner`) it invents
-        // no synthetic tenant to stand in for one.
+        // Bootstrap has no principal; the nil subject records that absence.
         match self
             .policies
             .create_policy(&SecurityContext::anonymous(), draft, &[])
