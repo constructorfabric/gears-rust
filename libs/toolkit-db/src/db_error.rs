@@ -79,6 +79,37 @@ pub struct DriverRefusal {
 }
 
 impl DriverRefusal {
+    /// Build one, for a test of a mapping that consumes it.
+    ///
+    /// The fields are private, so without this the only source of a
+    /// `DriverRefusal` is a `DbErr` from a live driver. A gear that factors its
+    /// mapping as `fn map(refusal: &DriverRefusal) -> MyError` could then not
+    /// unit-test that function at all: ten lines of `match` would need a
+    /// container to exercise.
+    ///
+    /// Takes the code alone, because that is what every refusal has; add the
+    /// constraint name with [`with_constraint`](Self::with_constraint) when the
+    /// mapping under test reads it.
+    ///
+    /// ```rust,ignore
+    /// let refusal = DriverRefusal::new("23503").with_constraint("orders_customer_fk");
+    /// assert_eq!(map(&refusal), MyError::CustomerStillHasOrders);
+    /// ```
+    #[must_use]
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            constraint: None,
+        }
+    }
+
+    /// Name the constraint, as the server would have.
+    #[must_use]
+    pub fn with_constraint(mut self, constraint: impl Into<String>) -> Self {
+        self.constraint = Some(constraint.into());
+        self
+    }
+
     /// The code the driver reported, verbatim.
     ///
     /// On `PostgreSQL` and `MySQL` this is the five-character SQLSTATE. On
@@ -311,7 +342,7 @@ pub(crate) mod driver_shaped {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{ConstraintViolation, constraint_violation, driver_refusal};
+    use super::{ConstraintViolation, DriverRefusal, constraint_violation, driver_refusal};
 
     /// The point of the table: one condition, both codes. A `RESTRICT` refusal
     /// on `PostgreSQL` 18 and a `NO ACTION` refusal on any major must classify
@@ -326,6 +357,19 @@ mod tests {
             constraint_violation("23503"),
             Some(ConstraintViolation::ForeignKey)
         );
+    }
+
+    /// The constructor exists so a gear can test its own mapping; this is that
+    /// use, in miniature.
+    #[test]
+    fn a_refusal_can_be_built_for_a_test() {
+        let refusal = DriverRefusal::new("23503").with_constraint("orders_customer_fk");
+        assert_eq!(refusal.code(), "23503");
+        assert_eq!(refusal.constraint(), Some("orders_customer_fk"));
+        assert_eq!(refusal.violation(), Some(ConstraintViolation::ForeignKey));
+
+        // Most refusals name no constraint, and that is the default.
+        assert_eq!(DriverRefusal::new("23505").constraint(), None);
     }
 
     #[test]
