@@ -245,7 +245,7 @@ Available dimension attributes:
 
 ### Standard property auto-mapping
 
-The `Scopable` derive macro automatically maps dimension columns to well-known PEP property names via `resolve_property()`:
+The `Scopable` derive macro maps dimension columns to well-known PEP property names in the `SCOPE_PROPERTIES` table:
 
 | Dimension attribute | PEP property name | Constant |
 |---------------------|-------------------|----------|
@@ -256,15 +256,16 @@ The `Scopable` derive macro automatically maps dimension columns to well-known P
 This means if you declare `tenant_col = "tenant_id"`, the macro generates:
 
 ```rust
-fn resolve_property(property: &str) -> Option<Self::Column> {
-    match property {
-        "owner_tenant_id" => Some(Column::TenantId),
-        "id"              => Some(Column::Id),
-        // ...
-        _ => None,
-    }
-}
+const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+    ("owner_tenant_id", Column::TenantId),
+    ("id", Column::Id),
+    // ...
+];
 ```
+
+That table is the only place the mapping is written. `resolve_property()`, `scope_columns()` and the `tenant_col()` / `resource_col()` / `owner_col()` accessors are all provided by the `ScopeProperties` trait, which reads them back out of it; none of them can be implemented per entity, because `ScopeProperties` is blanket-implemented for every `ScopableEntity` and a second implementation is a coherence error. Before this, the lookup and the column list were separate hand-written methods that could — and did — describe different sets (issue #4726).
+
+`type_col` is the exception: it gets no table entry, because no property name addresses it, and it stays a method of `ScopableEntity`.
 
 When the PDP returns a constraint like `In("owner_tenant_id", [uuid1, uuid2])`, `SecureConn` calls `resolve_property("owner_tenant_id")`, gets `Column::TenantId`, and generates `WHERE tenant_id IN (uuid1, uuid2)`.
 
@@ -293,7 +294,7 @@ pub struct Model {
 }
 ```
 
-This adds `"city_id" => Some(Column::CityId)` to the generated `resolve_property()` match.
+This adds `("city_id", Column::CityId)` to the generated `SCOPE_PROPERTIES` table.
 
 To use the custom property, include it in both `ResourceType.supported_properties` and the PDP policy:
 

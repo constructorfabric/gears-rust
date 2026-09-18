@@ -11,7 +11,7 @@
 //! # What the declaration guarantees
 //!
 //! * **Every element exposes its scope columns as properties.** Derived from
-//!   [`ScopableEntity::scope_columns`], not from a list the caller repeats, so
+//!   [`ScopeProperties::scope_columns`], not from a list the caller repeats, so
 //!   the precondition for Policy 2 cannot be forgotten.
 //! * **One label per element table.** Sharing a label across tables is legal
 //!   SQL/PGQ and unsafe here: security is decided per entity, so a shared label

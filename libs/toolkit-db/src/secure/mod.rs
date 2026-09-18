@@ -66,8 +66,17 @@
 //!
 //! ```rust,ignore
 //! use toolkit_db::secure::ScopableEntity;
+//! use toolkit_security::access_scope::pep_properties;
 //!
 //! impl ScopableEntity for Entity {
+//!     // One table: every property this entity understands, and the column it
+//!     // means. The lookup, the column list and the tenant/resource/owner
+//!     // accessors are all read back out of it by `ScopeProperties`.
+//!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+//!         (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+//!         (pep_properties::RESOURCE_ID, Column::Id),
+//!     ];
+//!
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }

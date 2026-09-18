@@ -121,7 +121,7 @@ where
 ///
 /// Validates **all** scope constraints against the `ActiveModel`'s column values,
 /// not just `tenant_id`. For each constraint in the scope, every filter's property
-/// is resolved to a column via `ScopableEntity::resolve_property`, and the
+/// is resolved to a column via `ScopeProperties::resolve_property`, and the
 /// `ActiveModel`'s value for that column is checked against the filter's values.
 /// At least one constraint must match entirely (OR semantics) for the insert to
 /// proceed.
@@ -933,7 +933,7 @@ where
 
 /// A secure builder for `ON CONFLICT DO UPDATE` clauses that enforces tenant immutability.
 ///
-/// For tenant-scoped entities (`ScopableEntity::tenant_col() != None`), this builder
+/// For tenant-scoped entities (`ScopeProperties::tenant_col() != None`), this builder
 /// ensures that `tenant_id` is never included in the update columns. Attempting to
 /// update `tenant_id` via `update_columns()` or `value()` returns an error.
 ///
