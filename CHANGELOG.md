@@ -9,6 +9,12 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.2.6...cf-gears-event-broker-v0.2.7) - 2026-09-18
+
+### Other
+
+- updated the following local packages: cf-gears-cluster
+
 ## [0.2.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.2.5...cf-gears-event-broker-v0.2.6) - 2026-09-18
 
 ### Other
