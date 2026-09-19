@@ -136,3 +136,8 @@ impl StoragePlugin {
             .await
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "consumption_tests.rs"]
+mod tests;

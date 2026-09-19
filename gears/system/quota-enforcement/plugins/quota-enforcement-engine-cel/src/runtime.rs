@@ -377,3 +377,8 @@ impl Runtime {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "runtime_tests.rs"]
+mod tests;

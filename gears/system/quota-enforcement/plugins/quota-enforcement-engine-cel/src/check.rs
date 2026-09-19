@@ -898,3 +898,8 @@ impl Checker<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "check_tests.rs"]
+mod tests;
