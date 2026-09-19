@@ -17,7 +17,7 @@
     "alias": {
       "type": "string",
       "pattern": "^[a-z0-9]([a-z0-9.:-]*[a-z0-9])?$",
-      "description": "Human-readable routing identifier. Enforced by endpoint type: hostname-based endpoints auto-derive alias (user-provided alias matching the derived value is accepted as an idempotent no-op); IP-based or non-derivable endpoints require explicit alias. Derivation: single hostname with standard port (HTTP:80, HTTPS/WSS/WT/gRPC:443) → hostname; non-standard port → hostname:port; multiple hostnames with common suffix (≥2 labels) and standard port → common suffix (e.g., us.vendor.com + eu.vendor.com → vendor.com); multiple hostnames with common suffix and non-standard port → common suffix:port (e.g., us.vendor.com:8443 + eu.vendor.com:8443 → vendor.com:8443). Normalized to ASCII lowercase with trailing dots stripped."
+      "description": "Human-readable routing identifier. Enforced by endpoint type: hostname-based endpoints auto-derive alias (user-provided alias matching the derived value is accepted as an idempotent no-op); IP-based or non-derivable endpoints require explicit alias. Derivation: single hostname with standard port (HTTP:80, HTTPS/WSS/WT/gRPC:443) → hostname; non-standard port → hostname:port; multiple hostnames with common suffix (≥2 labels) and standard port → common suffix (e.g., us.vendor.com + eu.vendor.com → vendor.com); multiple hostnames with common suffix and non-standard port → common suffix:port (e.g., us.vendor.com:8443 + eu.vendor.com:8443 → vendor.com:8443). Normalized to ASCII lowercase with trailing dots stripped. Immutable once set: `PUT` rejects any change to the effective alias, including a `server.endpoints` change that would derive a different alias (delete and re-create the upstream instead)."
     },
     "tags": {
       "type": "array",
@@ -93,7 +93,8 @@
         },
         "config": {
           "type": "object",
-          "description": "Authentication plugin configuration."
+          "additionalProperties": { "type": "string" },
+          "description": "Authentication plugin configuration. Values must be strings — the wire DTO (`AuthConfig.config`) is a string-to-string map."
         }
       }
     },
@@ -113,20 +114,24 @@
         "items": {
           "type": "array",
           "items": {
-            "oneOf": [
-              {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "plugin_ref": {
                 "type": "string",
                 "format": "gts-identifier",
-                "description": "Builtin plugin GTS identifier"
+                "description": "Plugin GTS identifier. Builtin plugins use a fixed named instance (e.g. `...~cf.core.oagw.apikey.v1`); custom (Starlark) plugins use their own anonymous instance identifier (e.g. `...~<uuid>`, returned by `POST /plugins`) — never a bare UUID with no GTS prefix."
               },
-              {
-                "type": "string",
-                "format": "uuid",
-                "description": "Custom plugin UUID"
+              "config": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Plugin-specific configuration (shape defined by the referenced plugin). Values must be strings — the wire DTO is a string-to-string map."
               }
-            ]
+            },
+            "required": [ "plugin_ref" ],
+            "description": "Plugin binding. The wire DTO (`PluginBinding` in oagw/src/api/rest/dto.rs) requires this object shape — a bare string or bare UUID array element does not deserialize."
           },
-          "description": "List of plugins applied to this upstream service. Builtin plugins referenced by GTS ID, custom plugins by UUID."
+          "description": "List of plugins applied to this upstream service, each an object binding a plugin_ref (builtin or custom) with optional config."
         }
       }
     },
@@ -244,6 +249,39 @@
             }
           }
         },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [ "unlimited", "allocated", "shared" ],
+              "default": "unlimited",
+              "description": "Budget accounting mode across the tenant hierarchy."
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Total budget available for allocation/sharing, denominated per this same rate_limit block's sustained.window (e.g. total=60 with sustained.window='minute' is a 1 req/s ceiling, not an absolute count). Changing sustained.window without adjusting total changes the effective ceiling."
+            },
+            "overcommit_ratio": {
+              "type": "number",
+              "minimum": 1.0,
+              "maximum": 2.0,
+              "default": 1.0,
+              "description": "Allowed overcommit factor when allocating shared budget to descendants."
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": { "enum": [ "allocated", "shared" ] }
+            },
+            "required": [ "mode" ]
+          },
+          "then": {
+            "required": [ "total" ]
+          },
+          "description": "Hierarchical budget allocation for this rate limit. `total` is required when `mode` is 'allocated' or 'shared'."
+        },
         "scope": {
           "type": "string",
           "enum": [ "global", "tenant", "user", "ip", "route" ],
@@ -261,6 +299,11 @@
           "minimum": 1,
           "default": 1,
           "description": "Tokens consumed per request. Useful for weighted endpoints."
+        },
+        "response_headers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include X-RateLimit-* headers on responses. In a hierarchical merge, this field is not independently inherited: the effective rate_limit is selected wholesale (the stricter of ancestor vs. descendant by requests/second), and response_headers travels with whichever whole config wins — a descendant's own response_headers value has no effect if its rate_limit loses the min-rate comparison."
         }
       },
       "required": [ "sustained" ]

@@ -112,6 +112,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-2.13-crud-endpoint-update-invalidates-load-balancer.md](management-api/upstreams/positive-2.13-crud-endpoint-update-invalidates-load-balancer.md)
 - **Mechanism**: `PUT /upstreams/{id}` with new endpoints invalidates cached LoadBalancer. Next proxy request lazily rebuilds with updated endpoints.
 
+#### Alias is immutable on update
+- **Scenario**: [negative-2.14-alias-immutable-on-update.md](management-api/upstreams/negative-2.14-alias-immutable-on-update.md)
+- **Mechanism**: `PUT /upstreams/{id}` rejects any change to `alias` with `400`; every other mutable field can be updated freely.
+
 ---
 
 ### Route configuration
@@ -216,9 +220,9 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-7.5-upstream-headers-config-applies-simple-transformations.md](proxy-api/request-transforms/positive-7.5-upstream-headers-config-applies-simple-transformations.md)
 - **Mechanism**: `upstream.headers.request.set` adds/overwrites headers. Header removal rules apply. Invalid header names/values rejected with `400 PD`.
 
-#### Request correlation headers propagate end-to-end
+#### Request-ID header reaches the upstream
 - **Scenario**: [positive-7.6-request-correlation-headers-propagate-end-end.md](proxy-api/request-transforms/positive-7.6-request-correlation-headers-propagate-end-end.md)
-- **Mechanism**: Client `X-Request-ID` forwarded to upstream and included in response. If absent, gateway generates one.
+- **Mechanism**: Client `X-Request-ID` forwarded to upstream only via explicit passthrough allowlist. If absent, the `request_id` `TransformPlugin` generates one when bound. Neither path is reflected back in the response or an audit record.
 
 ---
 
@@ -366,17 +370,33 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Built-in CORS handling (preflight + actual request)
 - **Scenario**: [positive-10.2-built-cors-handling.md](plugins/guards/positive-10.2-built-cors-handling.md)
-- **Mechanism**: OPTIONS preflight returns permissive `204` at handler level (no upstream resolution). Origin enforcement happens on actual requests after upstream resolution — disallowed origins are rejected with `403` before reaching the upstream. Allowed origins receive CORS response headers (`Access-Control-Allow-Origin`, `Vary: Origin`, etc.).
+- **Mechanism**: OPTIONS preflight returns permissive `204` at handler level (no upstream resolution, unconditional even if the upstream has no `cors` config). Origin enforcement happens on actual requests after upstream resolution — disallowed origins are rejected with `403` before reaching the upstream. Allowed origins receive CORS response headers (`Access-Control-Allow-Origin`, `Vary: Origin`, etc.).
+
+#### CORS disabled by default
+- **Scenario**: [positive-10.5-cors-disabled-by-default.md](plugins/guards/positive-10.5-cors-disabled-by-default.md)
+- **Mechanism**: With no `cors` config on the upstream, actual requests get no `Access-Control-*` headers at all — CORS is strictly opt-in per upstream/route.
+
+#### Wildcard origin response
+- **Scenario**: [positive-10.6-cors-wildcard-origin-response.md](plugins/guards/positive-10.6-cors-wildcard-origin-response.md)
+- **Mechanism**: `allowed_origins: ["*"]` returns the literal `*` as `Access-Control-Allow-Origin`, not the echoed request origin.
 
 #### Hierarchical merge/union for CORS allowed origins
 - **Scenario**: *Covered within hierarchical configuration scenarios.*
 - **Mechanism**: `inherit` merges origins by union. `enforce` forbids child adding origins.
+
+#### Route vs. upstream CORS precedence
+- **Scenario**: [positive-10.8-route-vs-upstream-cors-precedence.md](plugins/guards/positive-10.8-route-vs-upstream-cors-precedence.md)
+- **Mechanism**: A separate merge axis from tenant-hierarchy sharing above. Upstream `sharing: enforce` is sticky and blocks any route override regardless of the route's own sharing. Otherwise, route `sharing: private`/`enforce` skips the route's CORS entirely; `sharing: inherit` makes the route's config win wholesale except `allowed_origins`, which is unioned with the upstream's.
 
 ---
 
 ### Guard plugins
 
 > **Flow reference**: [Plugin Execution](flows/plugin-execution.md)
+
+#### Required headers guard plugin
+- **Scenario**: [positive-10.7-required-headers-guard-plugin-enforcement.md](plugins/guards/positive-10.7-required-headers-guard-plugin-enforcement.md)
+- **Mechanism**: The only guard plugin actually bindable via `plugins.items[].plugin_ref`. Rejects requests/responses missing configured headers (`400`); unconfigured guard fails open; header matching is case-insensitive.
 
 *Note: CORS origin validation is covered in [CORS](#cors) above. Timeout and Starlark guard rejection scenarios are in [Guardrails → Guard rejections](#guard-rejections).*
 
@@ -411,6 +431,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### Plugin control flow (next, reject, respond)
 - **Scenario**: [positive-11.7-plugin-control-flow.md](plugins/transforms/positive-11.7-plugin-control-flow.md)
 - **Mechanism**: `ctx.reject` stops chain and returns gateway error. `ctx.respond` returns custom success response without calling upstream.
+
+#### Request ID transform injects/preserves correlation id
+- **Scenario**: [positive-11.9-request-id-transform-injects-correlation-id.md](plugins/transforms/positive-11.9-request-id-transform-injects-correlation-id.md)
+- **Mechanism**: Builtin `request_id` plugin injects a UUID `x-request-id` when absent, preserves a client-provided value unchanged. Not automatic — requires explicit `plugins.items[].plugin_ref` binding.
+
+#### Unresolvable transform plugin does not block the pipeline
+- **Scenario**: [positive-11.10-unknown-transform-plugin-skipped-not-blocking.md](plugins/transforms/positive-11.10-unknown-transform-plugin-skipped-not-blocking.md)
+- **Mechanism**: A `plugin_ref` matching no registered plugin is logged and skipped; the request still succeeds.
 
 ---
 
@@ -536,6 +564,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-5.2-proxy-cannot-access-upstream-not-owned-shared.md](proxy-api/authz/negative-5.2-proxy-cannot-access-upstream-not-owned-shared.md)
 - **What happens**: Tenant A invoking Tenant B private upstream returns `403` or `404` (must not leak existence).
 
+#### Nil tenant denied by authz → 403
+- **Scenario**: [negative-5.4-nil-tenant-denied-by-authz.md](proxy-api/authz/negative-5.4-nil-tenant-denied-by-authz.md)
+- **What happens**: A token whose `subject_tenant_id` is the nil UUID is denied with a clean `403 PermissionDenied` — the authz check runs before upstream resolution.
+
 ---
 
 ### Input validation
@@ -556,9 +588,13 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-7.4-well-known-header-validation-errors-400.md](proxy-api/request-transforms/negative-7.4-well-known-header-validation-errors-400.md)
 - **What happens**: Invalid `Content-Length` or mismatch with actual body returns `400 PD`.
 
-#### Maximum body size limit enforced (100MB) → 413
+#### Maximum body size limit enforced (100MB) → 400
 - **Scenario**: [negative-8.1-maximum-body-size-limit-enforced.md](proxy-api/body-validation/negative-8.1-maximum-body-size-limit-enforced.md)
-- **What happens**: Body > 100MB rejected early with `413 PD`, `ESrc=gateway`.
+- **What happens**: Body > 100MB rejected with `400 PD` (`OutOfRange`/"Out of Range" — moved off `413` in an accepted wire migration), `ESrc=gateway`.
+
+#### Body size limit at the outer api-gateway layer → 413
+- **Scenario**: [negative-8.4-body-size-limit-enforced-outer-gateway-layer.md](proxy-api/body-validation/negative-8.4-body-size-limit-enforced-outer-gateway-layer.md)
+- **What happens**: In a full deployment, the outer api-gateway's own (lower) body-limit layer rejects first with a plain-text `413`, before OAGW's own 100MB/`400` cap above is ever reached.
 
 #### Transfer-Encoding support limited to chunked → 400
 - **Scenario**: [negative-8.2-transfer-encoding-support-limited-chunked.md](proxy-api/body-validation/negative-8.2-transfer-encoding-support-limited-chunked.md)
@@ -652,6 +688,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-18.5-strategy-variants-limit-exceeded.md](rate-limiting/negative-18.5-strategy-variants-limit-exceeded.md)
 - **What happens**: `strategy=reject` returns `429`. `strategy=queue` delays then succeeds or times out with `503 queue.timeout`. `strategy=degrade` uses configured fallback.
 
+#### Budget field validation errors → 400
+- **Scenario**: [negative-18.8-budget-field-validation-errors.md](rate-limiting/negative-18.8-budget-field-validation-errors.md)
+- **What happens**: `allocated`/`shared` budget without `total` rejected (`budget.total is required`). `overcommit_ratio` outside `[1.0, 2.0]` rejected.
+
+#### Allocated budget hierarchy sum exceeded → 400
+- **Scenario**: [positive-18.9-budget-allocated-hierarchy-enforcement.md](rate-limiting/positive-18.9-budget-allocated-hierarchy-enforcement.md)
+- **What happens**: Children whose rates sum above `total * overcommit_ratio` are rejected (`budget allocation exceeded`) at creation and on update; rates are normalized to req/s across different windows before comparison; a child omitting `rate_limit` is rejected under an allocated parent. Known limitations (not exercised by any scenario): validation and persistence are not atomic (a TOCTOU race exists between concurrent sibling writes), and the descendant-tree walk itself is unbounded.
+
 ---
 
 ### Custom header routing rejections
@@ -686,9 +730,9 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 ### Guard rejections
 
-#### Timeout guard plugin enforces request timeout → 504
+#### Gear-level request timeout enforced (not a guard plugin) → 504
 - **Scenario**: [negative-10.1-timeout-guard-plugin-enforces-request-timeout.md](plugins/guards/negative-10.1-timeout-guard-plugin-enforces-request-timeout.md)
-- **What happens**: Request exceeding timeout returns `504` gateway timeout (`PD`, `ESrc=gateway`).
+- **What happens**: Request exceeding `proxy_timeout_secs` returns `504` gateway timeout (`PD`, `ESrc=gateway`). Enforced uniformly by gear config, not a bindable `timeout` guard plugin.
 
 #### CORS credentials + wildcard rejected by config validation → 400
 - **Scenario**: [negative-10.3-cors-credentials-wildcard-rejected-config-validation.md](plugins/guards/negative-10.3-cors-credentials-wildcard-rejected-config-validation.md)
@@ -737,6 +781,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### Stalled caller does not block upstream's graceful close
 - **Scenario**: [negative-14.5-stalled-caller-does-not-block-upstream-close.md](protocols/websocket/negative-14.5-stalled-caller-does-not-block-upstream-close.md)
 - **What happens**: Caller stops reading; upstream still gets Close 1001 and a half-close within the close timeout. Each side's announcement has its own grace budget.
+
+#### WebSocket upgrade rejected for non-WebSocket upstream endpoint
+- **Scenario**: [negative-14.8-websocket-upgrade-rejected-non-ws-upstream.md](protocols/websocket/negative-14.8-websocket-upgrade-rejected-non-ws-upstream.md)
+- **What happens**: Upgrading against a route that isn't a WS endpoint on the upstream fails with the upstream's actual non-`101` response, propagated as-is.
 
 ---
 

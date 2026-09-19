@@ -47,17 +47,35 @@
         "items": {
           "type": "array",
           "items": {
-            "type": "string",
-            "format": "gts-identifier"
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "plugin_ref": {
+                "type": "string",
+                "format": "gts-identifier",
+                "description": "Plugin GTS identifier. Builtin plugins use a fixed named instance (e.g. `...~cf.core.oagw.required_headers.v1`); custom (Starlark) plugins use their own anonymous instance identifier (e.g. `...~<uuid>`, returned by `POST /plugins`) — never a bare UUID with no GTS prefix."
+              },
+              "config": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Plugin-specific configuration (shape defined by the referenced plugin). Values must be strings — the wire DTO is a string-to-string map."
+              }
+            },
+            "required": [ "plugin_ref" ],
+            "description": "Plugin binding. The wire DTO (`PluginBinding` in oagw/src/api/rest/dto.rs) requires this object shape — a bare string or bare UUID array element does not deserialize."
           },
           "default": [ ],
-          "description": "List of plugins applied to this route."
+          "description": "List of plugins applied to this route, each an object binding a plugin_ref (builtin or custom) with optional config."
         }
       }
     },
     "rate_limit": {
       "$ref": "#/definitions/rate_limit",
       "description": "Rate limiting configuration for the route."
+    },
+    "cors": {
+      "$ref": "#/definitions/cors",
+      "description": "CORS configuration for the route."
     }
   },
   "required": [ "upstream_id", "match" ],
@@ -117,6 +135,7 @@
     "rate_limit": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Route-level rate limit. Unlike upstream.rate_limit, this has no `budget` property: hierarchical budget allocation/sharing is validated and pool-enforced only for upstream rate limits (domain/services/management/budget.rs; a route's bucket is always keyed by the route's own id, never a shared pool_owner_id) — a route-level `budget` would be silently inert.",
       "properties": {
         "sharing": {
           "type": "string",
@@ -174,6 +193,11 @@
           "minimum": 1,
           "default": 1,
           "description": "Tokens consumed per request. Useful for weighted endpoints."
+        },
+        "response_headers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include X-RateLimit-* headers on responses. In a hierarchical merge, this field is not independently inherited: the effective rate_limit is selected wholesale (the stricter of ancestor vs. descendant by requests/second), and response_headers travels with whichever whole config wins — a descendant's own response_headers value has no effect if its rate_limit loses the min-rate comparison."
         }
       },
       "required": [ "sustained" ]
