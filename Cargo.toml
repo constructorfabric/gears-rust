@@ -143,6 +143,11 @@ members = [
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+    "gears/system/quota-enforcement/quota-enforcement-sdk",
+    "gears/system/quota-enforcement/quota-enforcement",
+    "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
+    "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive",
+    "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
@@ -297,6 +302,8 @@ string_lit_as_bytes = "deny"
 verbose_file_reads = "deny"
 
 [workspace.dependencies]
+cel-core = "=0.5.1"
+quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.9.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.17", path = "libs/toolkit-http" }
@@ -355,6 +362,8 @@ credstore = { package = "cf-gears-credstore", version = "0.5.0", path = "gears/c
 oagw = { package = "cf-gears-oagw", version = "0.5.3", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.9.0", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.3.3", path = "gears/system/usage-collector/usage-collector" }
+quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement" }
+quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
 cluster = { package = "cf-gears-cluster", version = "0.2.7", path = "gears/system/cluster/cluster" }
 
 cf-gears-cluster-sdk = { version = "0.2.6", path = "gears/system/cluster/cluster-sdk" }
@@ -370,6 +379,8 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.0
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.4", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.14", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.12", path = "gears/system/usage-collector/usage-collector-sdk" }
+quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
+quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.7", path = "gears/bss/ledger/ledger-sdk" }

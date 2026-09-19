@@ -87,7 +87,8 @@ The Engine plugin contract requires (full surface in DESIGN §3.3):
 - **Sandboxed**: no I/O, no nondeterminism beyond `EvaluationContext.time`. The
   sandbox is the absence of unsafe bindings — verifiable by code review.
 - **Cost-bounded**: per-Policy timeout (operator-configurable, default 5 ms); engine
-  internally implements bounding (steps cap / instruction cap / wall-time cap).
+  internally implements bounding (steps cap / instruction cap / wall-time cap). The
+  effective budget reaches the engine as the typed `EvaluationBudget` on `EvaluationContext`.
 - **Pre-compilable**: validated `engine_config` is parsed/compiled once at Policy
   create/update and cached by `(policy_id, policy_version)`; cache miss rebuilds.
 - **Deterministic** given EvaluationContext — required for idempotency replay
@@ -108,13 +109,15 @@ P1 ships two reference engines bundled with QE-core for default-deployment ergon
 - **`most-restrictive-wins`** — hardcoded engine, no `engine_config`. Sub-millisecond
   hot path. Default global-Policy engine
   (per `cpt-cf-quota-enforcement-fr-quota-resolution-policy`); rejects any non-empty
-  `engine_config`. Hardcoded because this arbitration shape («every applicable Quota
-  debited equally») has no operator-authored degrees of freedom.
-- **`cel`** — sandboxed CEL evaluator backed by the `cel-interpreter` crate
-  (Rust-native, sandbox by construction, cost-bound via
-  `Context::with_cost_limit(steps)`, pre-compiled AST cache keyed by
+  `engine_config`. Hardcoded because this arbitration shape («the single binding
+  Quota is debited the full requested amount») has no operator-authored degrees of
+  freedom.
+- **`cel`** — sandboxed CEL evaluator over the `cel-core` parser
+  (Rust-native, sandbox by construction, cost-bound by a QE-owned metered evaluator
+  because no inspected Rust CEL runtime exposes an internal cost hook,
+  pre-compiled AST cache keyed by
   `(policy_id, policy_version)`). Operators author `cel` Policies via
-  `engine_config.expr` (CEL string). The `cel-interpreter` choice is the reference
+  `engine_config.expr` (CEL string). The `cel-core` choice is the reference
   realisation — a different Rust-native CEL evaluator (or even a non-CEL expression
   language) could ship as an alternative engine without contract change.
 
@@ -192,8 +195,8 @@ Confirmed for any engine impl (reference or third-party) by:
 - Good, because it isolates QE-core from specific engine technologies; no leak of
   CEL-isms (or any other engine's quirks) into QE-core code.
 - Good, because contract evolution is localized to the trait surface.
-- Good, because mirrors the pluggable-storage / pluggable-coordination /
-  pluggable-notification pattern across QE — single architectural idiom.
+- Good, because mirrors the pluggable-storage / pluggable-notification pattern across QE — single architectural
+  idiom.
 - Good, because trust boundary (Debit-Plan invariants) protects QE-core integrity
   regardless of engine quality.
 - Bad, because each engine plugin owner carries the cost of their own conformance
@@ -245,5 +248,5 @@ This decision directly addresses:
   Debit-Plan invariant validation isolates QE-core from engine bugs.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — same
   pluggable-with-capability-contract pattern applied to storage.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin` — same pattern
-  applied to singleton coordination.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin`: singleton coordination is consumed from the
+  platform `cluster` gear instead of a QE plugin.
