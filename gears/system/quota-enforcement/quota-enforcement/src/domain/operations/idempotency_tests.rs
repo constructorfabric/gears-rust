@@ -57,7 +57,7 @@ fn an_entry_expires_when_its_lifetime_elapses() {
 
 #[test]
 fn an_entry_never_outlives_the_record_behind_it() {
-    let cache = IdempotencyCache::new(4, Duration::from_secs(60));
+    let cache = IdempotencyCache::new(4, Duration::from_mins(1));
 
     // The record expires well before the cache lifetime would.
     cache.insert(scope("k1"), record(at(3)), at(0));
@@ -72,7 +72,7 @@ fn an_entry_never_outlives_the_record_behind_it() {
 
 #[test]
 fn a_record_already_at_its_deadline_is_not_cached_at_all() {
-    let cache = IdempotencyCache::new(4, Duration::from_secs(60));
+    let cache = IdempotencyCache::new(4, Duration::from_mins(1));
 
     cache.insert(scope("k1"), record(at(0)), at(0));
 
@@ -81,7 +81,7 @@ fn a_record_already_at_its_deadline_is_not_cached_at_all() {
 
 #[test]
 fn the_least_recently_used_entry_is_evicted_first() {
-    let cache = IdempotencyCache::new(2, Duration::from_secs(60));
+    let cache = IdempotencyCache::new(2, Duration::from_mins(1));
     cache.insert(scope("a"), record(at(1_000)), at(0));
     cache.insert(scope("b"), record(at(1_000)), at(0));
 
@@ -97,7 +97,7 @@ fn the_least_recently_used_entry_is_evicted_first() {
 
 #[test]
 fn reinserting_a_key_replaces_it_without_growing_the_cache() {
-    let cache = IdempotencyCache::new(1, Duration::from_secs(60));
+    let cache = IdempotencyCache::new(1, Duration::from_mins(1));
     cache.insert(scope("k1"), record(at(1_000)), at(0));
 
     cache.insert(scope("k1"), record(at(2_000)), at(0));

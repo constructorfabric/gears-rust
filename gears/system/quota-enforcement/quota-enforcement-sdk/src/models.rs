@@ -13,10 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
+use aws_lc_rs::digest::{Context, SHA256};
 use gts::{GtsId, GtsIdError, GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::serde::rfc3339;
 use uuid::Uuid;
@@ -302,7 +302,17 @@ fn canonical_json(value: &Value) -> Value {
 fn hash_canonical<T: Serialize>(payload: &T) -> Result<[u8; 32], serde_json::Error> {
     let value = canonical_json(&serde_json::to_value(payload)?);
     let bytes = serde_json::to_vec(&value)?;
-    Ok(Sha256::digest(&bytes).into())
+    let mut hasher = Context::new(&SHA256);
+    hasher.update(&bytes);
+    Ok(finish(hasher))
+}
+
+/// The 32 digest bytes, as an array rather than the slice `finish` returns.
+fn finish(hasher: Context) -> [u8; 32] {
+    let digest = hasher.finish();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    bytes
 }
 
 impl PayloadHash {
@@ -346,17 +356,17 @@ impl IdempotencySubjectKey {
                 )
             })
             .collect();
-        let mut hasher = Sha256::new();
+        let mut hasher = Context::new(&SHA256);
         for (projection_type, subject_id) in pairs {
             for field in [projection_type, subject_id] {
                 // Catalogue limits keep lengths within `u32`; saturation remains
                 // deterministic for defensive callers.
                 let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
-                hasher.update(len.to_be_bytes());
+                hasher.update(&len.to_be_bytes());
                 hasher.update(field.as_bytes());
             }
         }
-        Self::from_bytes(hasher.finalize().into())
+        Self::from_bytes(finish(hasher))
     }
 }
 

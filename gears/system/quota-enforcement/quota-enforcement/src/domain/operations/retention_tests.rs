@@ -15,7 +15,7 @@ use crate::test_support::RecordingMetrics;
 
 fn timing(batch: u32) -> RetentionTiming {
     RetentionTiming {
-        interval: std::time::Duration::from_secs(300),
+        interval: std::time::Duration::from_mins(5),
         batch_size: std::num::NonZeroU32::new(batch).expect("nonzero"),
         operation_log_retention: time::Duration::days(30),
     }

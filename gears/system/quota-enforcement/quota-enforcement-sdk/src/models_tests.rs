@@ -749,17 +749,22 @@ fn the_empty_subject_set_still_fingerprints_deterministically() {
 fn a_subject_key_is_pinned_to_its_byte_form() {
     // Golden vector: one pair, each field length-prefixed big-endian.
     let expected = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        use aws_lc_rs::digest::{Context, SHA256};
+        let mut hasher = Context::new(&SHA256);
         for field in ["gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1"] {
             hasher.update(
-                u32::try_from(field.len())
+                &u32::try_from(field.len())
                     .expect("short field")
                     .to_be_bytes(),
             );
             hasher.update(field.as_bytes());
         }
-        IdempotencySubjectKey::from_bytes(hasher.finalize().into())
+        {
+            let digest = hasher.finish();
+            let mut bytes = [0; 32];
+            bytes.copy_from_slice(digest.as_ref());
+            IdempotencySubjectKey::from_bytes(bytes)
+        }
     };
 
     assert_eq!(
@@ -887,12 +892,13 @@ fn a_preview_flattens_the_decision_next_to_its_marker() {
     let preview = DecisionPreview::of(Decision::allowed_with_plan(BTreeMap::new()));
 
     let value = serde_json::to_value(&preview).expect("serializable");
-    let keys: Vec<&str> = value
+    let mut keys: Vec<&str> = value
         .as_object()
         .expect("an object")
         .keys()
         .map(String::as_str)
         .collect();
+    keys.sort_unstable();
 
     assert_eq!(
         keys,

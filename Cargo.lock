@@ -3107,6 +3107,7 @@ name = "cf-gears-quota-enforcement-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
@@ -3116,7 +3117,6 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "time",
  "tokio",
