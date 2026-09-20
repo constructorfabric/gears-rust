@@ -624,4 +624,96 @@ mod tests {
         assert_eq!(snake_to_upper_camel("owner_user_id"), "OwnerUserId");
         assert_eq!(snake_to_upper_camel("custom_col"), "CustomCol");
     }
+
+    /// Every attribute `unrestricted` forbids, and the one setter that turns it
+    /// on in a config.
+    ///
+    /// The list is the test's own, written out rather than derived from
+    /// `first_other_attribute`: a table that builds itself from the code it
+    /// checks agrees with that code by construction.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a table of (name, setter) pairs reads better inline than behind an alias"
+    )]
+    const EVERY_FORBIDDEN_ATTRIBUTE: [(&str, fn(&mut SecureConfig)); 9] = [
+        ("tenant_col", |c| {
+            c.tenant_col = Some(("tenant_id".to_owned(), Span::call_site()));
+        }),
+        ("no_tenant", |c| c.no_tenant = Some(Span::call_site())),
+        ("resource_col", |c| {
+            c.resource_col = Some(("id".to_owned(), Span::call_site()));
+        }),
+        ("no_resource", |c| c.no_resource = Some(Span::call_site())),
+        ("owner_col", |c| {
+            c.owner_col = Some(("owner_id".to_owned(), Span::call_site()));
+        }),
+        ("no_owner", |c| c.no_owner = Some(Span::call_site())),
+        ("type_col", |c| {
+            c.type_col = Some(("kind".to_owned(), Span::call_site()));
+        }),
+        ("no_type", |c| c.no_type = Some(Span::call_site())),
+        ("pep_prop", |c| {
+            c.pep_props.push((
+                "department_id".to_owned(),
+                "department_id".to_owned(),
+                Span::call_site(),
+            ));
+        }),
+    ];
+
+    fn unrestricted_config() -> SecureConfig {
+        SecureConfig {
+            unrestricted: Some(Span::call_site()),
+            ..SecureConfig::default()
+        }
+    }
+
+    /// Each attribute is reported under its own name.
+    ///
+    /// `first_other_attribute` pairs a name with the field it reads, nine
+    /// times, and a pair written the wrong way round type-checks: every field
+    /// carries a `Span`, so `("owner_col", config.no_owner)` compiles and sends
+    /// the user looking for an attribute they did not write. The UI fixtures
+    /// pin the span on real source, but only for the few attributes it is worth
+    /// compiling a crate for; this covers all nine.
+    #[test]
+    fn every_forbidden_attribute_is_reported_under_its_own_name() {
+        for (name, set_it) in EVERY_FORBIDDEN_ATTRIBUTE {
+            let mut config = unrestricted_config();
+            set_it(&mut config);
+            assert_eq!(
+                first_other_attribute(&config).map(|(attribute, _)| attribute),
+                Some(name),
+                "an entity whose only other attribute is `{name}` must be told so"
+            );
+        }
+    }
+
+    /// Nothing else present, nothing to report -- the negative control, without
+    /// which the test above would pass for a function that always returned the
+    /// name it was handed.
+    #[test]
+    fn unrestricted_on_its_own_forbids_nothing() {
+        assert!(first_other_attribute(&unrestricted_config()).is_none());
+    }
+
+    /// With several present, the answer is the first in the fixed order, not
+    /// the first in the source.
+    ///
+    /// The order is the reason the diagnostic no longer depends on how the
+    /// attributes were written, so reordering the table changes behaviour and
+    /// should fail a test rather than only a fixture.
+    #[test]
+    fn several_attributes_report_the_first_in_the_fixed_order() {
+        let mut config = unrestricted_config();
+        // Set them back to front: the last entry first, the first entry last.
+        for (_, set_it) in EVERY_FORBIDDEN_ATTRIBUTE.iter().rev() {
+            set_it(&mut config);
+        }
+        assert_eq!(
+            first_other_attribute(&config).map(|(attribute, _)| attribute),
+            Some("tenant_col"),
+            "the fixed order decides, and `tenant_col` heads it"
+        );
+    }
 }

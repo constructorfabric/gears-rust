@@ -32,6 +32,9 @@ fn ui() {
     // Error cases: Unrestricted with other flags
     t.compile_fail("tests/ui/err_unrestricted_with_tenant.rs");
     t.compile_fail("tests/ui/err_unrestricted_with_resource.rs");
+    t.compile_fail("tests/ui/err_unrestricted_with_owner.rs");
+    t.compile_fail("tests/ui/err_unrestricted_with_type.rs");
+    t.compile_fail("tests/ui/err_unrestricted_with_no_tenant.rs");
     t.compile_fail("tests/ui/err_unrestricted_after_tenant.rs");
 
     // Error cases: pep_prop validation
@@ -47,4 +50,34 @@ fn ui() {
     // not registered here — successful expansion requires the toolkit-db crate which
     // is not available in the trybuild environment. The macro is tested in actual
     // usage across the main codebase.
+}
+
+/// Every `err_*.rs` in `tests/ui` is registered above.
+///
+/// A fixture nobody runs is worse than no fixture: it looks like coverage in a
+/// directory listing, and its `.stderr` drifts without anything noticing.
+/// `err_unrestricted_with_owner`, `..._with_type` and `..._with_no_tenant` sat
+/// here unregistered long enough to record a message the macro never emitted.
+#[test]
+fn every_error_fixture_is_registered() {
+    let driver = include_str!("ui.rs");
+
+    let mut orphans: Vec<String> = std::fs::read_dir("tests/ui")
+        .expect("the fixture directory must be readable")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "rs" {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_owned();
+            let registered = driver.contains(&format!("tests/ui/{name}\""));
+            (name.starts_with("err_") && !registered).then_some(name)
+        })
+        .collect();
+    orphans.sort();
+
+    assert!(
+        orphans.is_empty(),
+        "these fixtures are on disk but never run: {orphans:?}"
+    );
 }
