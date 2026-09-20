@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-category-management-concurrency:p1
 //! `If-Match` evaluation for conditional writes.
 //!

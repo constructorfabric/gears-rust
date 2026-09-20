@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The store over an in-memory database: append, history, retention.
 
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! REST surface.
 
 pub mod access_dto;

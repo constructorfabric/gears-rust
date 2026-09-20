@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The canonical audit resource identifier.
 //!
 //! Every audit record this service writes carries a `resource` field built

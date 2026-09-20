@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Created: 2026-09-07 by Constructor Tech
+# Created: 2026-09-07 by Virtuozzo International GmbH
 """Serve the sandbox page and reverse-proxy the settings API from the same origin.
 
 Standard library only. Static: `/` and `/app.js`. Everything under

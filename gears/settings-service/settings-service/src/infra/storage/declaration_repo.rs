@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Persistence for declarations.
 
 use async_trait::async_trait;

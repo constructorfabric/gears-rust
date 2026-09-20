@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Fakes and fixtures shared by this crate's unit tests.
 //!
 //! Every fake here stands in for a port the gear resolves from the platform at

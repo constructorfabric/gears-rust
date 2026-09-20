@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Cross-field search over the settings hub: what may be matched, and how.
 //!
 //! Search runs over **stored rows**, never resolved values (DESIGN §4.2

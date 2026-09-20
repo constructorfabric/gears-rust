@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Wire shapes of the write surface.
 
 use serde_json::Value;

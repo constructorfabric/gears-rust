@@ -1,4 +1,4 @@
-// Created: 2026-09-08 by Constructor Tech
+// Created: 2026-09-08 by Virtuozzo International GmbH
 //! The standard five-field cron dialect.
 //!
 //! Written here rather than taken from a crate because what the trait asks for

@@ -1,4 +1,4 @@
-// Created: 2026-09-15 by Constructor Tech
+// Created: 2026-09-15 by Virtuozzo International GmbH
 //! What a batch change may name in place of a secret, and who may claim it.
 
 use serde_json::json;

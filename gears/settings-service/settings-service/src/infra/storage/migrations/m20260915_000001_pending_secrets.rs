@@ -1,4 +1,4 @@
-// Created: 2026-09-15 by Constructor Tech
+// Created: 2026-09-15 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-stage:p1
 //! `pending_secrets` — a secret staged ahead of the batch (DESIGN.md §4.7).
 //!

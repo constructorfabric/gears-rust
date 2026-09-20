@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the GTS resource-type vocabulary.
 
 use super::{CATEGORY_SCHEMA, DECLARATION_SCHEMA, Resource, VALUE_SCHEMA};

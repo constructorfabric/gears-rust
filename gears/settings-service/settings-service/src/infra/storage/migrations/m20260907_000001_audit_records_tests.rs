@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The table's vocabularies are closed at the schema, not only in code.
 
 use sea_orm_migration::MigratorTrait;

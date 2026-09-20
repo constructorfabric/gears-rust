@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Effective value resolution: the hot read path.
 //!
 //! A read dispatches on the declaration's scope class, walks the caller's own

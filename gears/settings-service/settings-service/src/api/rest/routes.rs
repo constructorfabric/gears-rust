@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-category-management-crud:p1
 //! Category route registration.
 //!

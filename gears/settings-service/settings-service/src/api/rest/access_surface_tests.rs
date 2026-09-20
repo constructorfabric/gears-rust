@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The tenant-access surface driven as a client drives it.
 //!
 //! What a tenant may do with a setting is a sparse decision on a

@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The resolver over the real repositories and an in-memory database.
 //!
 //! The tree is `root → a → b`, with `c` a sibling of `a` and `s` a standalone

@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The repository over an in-memory database, through the resolution harness.
 
 use serde_json::json;

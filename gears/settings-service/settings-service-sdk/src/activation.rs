@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The consumer activation contract.
 //!
 //! The reader trait in [`crate::api`] is **pull**: a consumer calls it when it

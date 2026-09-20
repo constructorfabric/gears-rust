@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The route of the search surface.
 
 use std::sync::Arc;

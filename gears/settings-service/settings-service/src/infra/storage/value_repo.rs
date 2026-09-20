@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! `ValueRepository` over `setting_values`.
 
 use async_trait::async_trait;

@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-operations:p1
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-concurrency:p1
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-eviction:p1

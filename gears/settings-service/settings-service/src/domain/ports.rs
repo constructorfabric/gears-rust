@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Ports the write path depends on whose bindings arrive later or live in
 //! infrastructure: the Secret Manager, the Change Publisher and the counters.
 

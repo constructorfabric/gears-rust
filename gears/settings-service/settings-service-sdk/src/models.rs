@@ -1,4 +1,4 @@
-// Created: 2026-08-11 by Constructor Tech
+// Created: 2026-08-11 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-gear-foundation-sdk-models:p1
 //! Public models exchanged with settings consumers.
 //!

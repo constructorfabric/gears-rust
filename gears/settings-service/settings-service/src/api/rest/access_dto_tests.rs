@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Wire shapes of the restriction surface: the tag a mutation must present,
 //! and the difference between a stored row and an effective answer.
 

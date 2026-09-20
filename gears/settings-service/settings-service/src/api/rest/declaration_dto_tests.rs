@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Tests for the declaration wire shape.
 
 use serde_json::json;

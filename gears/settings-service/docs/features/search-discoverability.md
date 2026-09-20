@@ -1,5 +1,5 @@
-<!-- Created: 2026-09-17 by Constructor Tech -->
-<!-- Updated: 2026-09-17 by Constructor Tech -->
+<!-- Created: 2026-09-17 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-17 by Virtuozzo International GmbH -->
 
 # Feature: Search & Discoverability
 

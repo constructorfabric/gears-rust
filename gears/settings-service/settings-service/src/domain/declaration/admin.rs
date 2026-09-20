@@ -1,4 +1,4 @@
-// Created: 2026-09-08 by Constructor Tech
+// Created: 2026-09-08 by Virtuozzo International GmbH
 //! Administrative authoring of declarations: create, revive, edit metadata,
 //! retire.
 //!

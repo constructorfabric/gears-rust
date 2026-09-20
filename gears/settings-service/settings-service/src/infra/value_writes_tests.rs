@@ -1,4 +1,4 @@
-// Created: 2026-09-08 by Constructor Tech
+// Created: 2026-09-08 by Virtuozzo International GmbH
 //! The coordinator: what survives a concurrent writer, what a batch does with
 //! one step-up verification, what a clone copies, and what the impact walk
 //! counts.

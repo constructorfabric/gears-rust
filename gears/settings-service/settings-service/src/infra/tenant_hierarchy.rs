@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! `TenantHierarchy` over the tenant resolver, resolved from `ClientHub` at
 //! first use.
 //!

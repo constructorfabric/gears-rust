@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Tests for the `setting_values` schema invariants, on `SQLite`.
 //!
 //! What is pinned: the exactly-one rule and its tie to the classification, the

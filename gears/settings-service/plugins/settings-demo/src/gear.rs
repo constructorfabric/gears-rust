@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The gear: contribute the sample catalogue once the platform is ready for it.
 
 use std::sync::{Arc, OnceLock};

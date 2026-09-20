@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The verifier over a resolver whose answers the test dictates.
 //!
 //! What is pinned: the platform's `AuthN` resolver decides whether the token is

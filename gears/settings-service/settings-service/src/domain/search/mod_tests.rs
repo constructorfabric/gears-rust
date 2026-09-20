@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The search vocabulary: what a query may be, how it becomes a pattern, and
 //! how a value is read as text.
 

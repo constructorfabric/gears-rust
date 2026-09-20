@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The machine path over the resolution harness: authorized, audited, never
 //! the placeholder, never plaintext anywhere else.
 

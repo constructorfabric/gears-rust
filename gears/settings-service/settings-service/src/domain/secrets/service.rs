@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The machine-only plaintext path.
 //!
 //! Reached through the SDK reader and nowhere else. The caller is authorized

@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Adapters to the outside world.
 
 pub mod contribution_client;

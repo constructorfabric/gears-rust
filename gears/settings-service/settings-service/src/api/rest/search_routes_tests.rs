@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Guards on how the search route is declared: authenticated, and never
 //! opting out — a search served without a principal would expose the
 //! catalogue and, through its counts, the values in it.

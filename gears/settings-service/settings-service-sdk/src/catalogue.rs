@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The starter catalogue of value types a declaration's `value_type_id` names.
 //!
 //! A setting's *key* is a type of its own (ADR-002) and says nothing about the

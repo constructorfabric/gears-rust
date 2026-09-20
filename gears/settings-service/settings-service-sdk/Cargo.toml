@@ -1,4 +1,4 @@
-# Created: 2026-08-11 by Constructor Tech
+# Created: 2026-08-11 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service-sdk"
 version = "0.1.0"

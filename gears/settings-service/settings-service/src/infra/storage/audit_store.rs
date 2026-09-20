@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-transactional-sink:p1
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-retention:p1
 //! The R1 `AuditSink`: the gear's own `audit_records` table, written in the

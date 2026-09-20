@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Which categories an administrator may see.
 //!
 //! The policy decision point returns more than allow or deny — it returns

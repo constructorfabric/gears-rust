@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! `audit_records`: the gear-local audit store. Append-only by contract — no
 //! code path updates a row, and the only delete is retention pruning.
 

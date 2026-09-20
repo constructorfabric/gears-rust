@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconcile itself, one declaration at a time.
 
 use std::sync::Arc;

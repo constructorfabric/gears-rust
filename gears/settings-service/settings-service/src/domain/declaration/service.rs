@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! The declaration read service.
 //!
 //! Owns the two things a handler must not be trusted to remember: that the

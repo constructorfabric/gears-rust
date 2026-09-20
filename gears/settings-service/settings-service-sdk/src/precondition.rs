@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Precondition-violation vocabulary.
 //!
 //! A retired setting is not an absent one: the declaration row exists and

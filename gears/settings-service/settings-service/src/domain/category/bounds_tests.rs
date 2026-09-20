@@ -1,4 +1,4 @@
-// Created: 2026-08-25 by Constructor Tech
+// Created: 2026-08-25 by Virtuozzo International GmbH
 //! Tests for the descriptive-field bounds.
 //!
 //! What these pin is that the check answers *before* the driver does. Without

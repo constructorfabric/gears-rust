@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for conditional-write evaluation.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 — a mutating request

@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Shared schema prerequisites.
 //!
 //! Deliberately creates **no tables**. Every settings table belongs to the

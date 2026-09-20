@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Field-violation vocabulary for validation rejections — canonical invalid-argument, rendered as `400`.
 //!
 //! ADR 0005 keeps these constants beside the code that emits them so the wire

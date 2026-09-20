@@ -1,5 +1,5 @@
-<!-- Created: 2026-09-07 by Constructor Tech -->
-<!-- Updated: 2026-09-15 by Constructor Tech -->
+<!-- Created: 2026-09-07 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-15 by Virtuozzo International GmbH -->
 
 # Feature: Secret Values
 

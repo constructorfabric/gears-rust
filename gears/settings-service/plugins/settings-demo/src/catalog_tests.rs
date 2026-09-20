@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The sample catalogue is well-formed before it ever reaches the reconciler.
 
 use std::collections::HashSet;

@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for the consumer activation contract.
 //!
 //! Contract source: `DESIGN-activation.md` §4.2 *Consumer Activation SDK* and

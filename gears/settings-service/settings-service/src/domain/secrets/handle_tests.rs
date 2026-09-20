@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The handle: opaque, self-describing to this service only, and strict.
 
 use settings_service_sdk::SecretHandle;

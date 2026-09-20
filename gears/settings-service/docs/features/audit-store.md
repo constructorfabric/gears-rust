@@ -1,5 +1,5 @@
-<!-- Created: 2026-09-06 by Constructor Tech -->
-<!-- Updated: 2026-09-06 by Constructor Tech -->
+<!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-06 by Virtuozzo International GmbH -->
 
 # Feature: Audit Store and History
 

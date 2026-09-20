@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The browse filter's interpretation: what is accepted and what is refused.
 
 use toolkit_odata::ast::Expr;

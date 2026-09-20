@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The write surface driven as a client drives it.
 //!
 //! Validate then set: a value takes effect when the caller sets it, there is

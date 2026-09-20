@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The Secret Manager over the Credential Store, and the per-setting gate of
 //! the machine path.
 //!

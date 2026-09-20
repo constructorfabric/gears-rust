@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The audit trail: the record every mutation writes, and the sink that
 //! commits it in the mutation's own transaction.
 //!

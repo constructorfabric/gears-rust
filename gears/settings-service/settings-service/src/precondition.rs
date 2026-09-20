@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Precondition-violation types this gear emits.
 //!
 //! Kept here rather than in the SDK on purpose. ADR 0005 drives the SDK's

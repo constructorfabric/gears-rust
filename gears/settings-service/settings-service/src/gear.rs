@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! The gear scaffold and its initialization.
 //!
 //! No `@cpt-dod` marker for `dod-gear-foundation-gear-scaffold` yet: it

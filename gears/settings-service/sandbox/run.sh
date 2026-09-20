@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Created: 2026-09-07 by Constructor Tech
+# Created: 2026-09-07 by Virtuozzo International GmbH
 #
 # The settings-service sandbox: a focused example server with the demo
 # declarations, and a static page that drives every endpoint through a

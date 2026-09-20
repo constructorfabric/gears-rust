@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-gates:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-atomicity:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-stale:p1

@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Tests for the hub-backed platform scope.
 //!
 //! What is pinned: the lookup is deferred to first use and fails as

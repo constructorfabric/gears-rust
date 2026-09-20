@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 // `coverage(off)` marks the test-module declarations the coverage run should
 // not count; the attribute is nightly-only, and `cargo llvm-cov` is what sets
 // the cfg. Same line as `toolkit-security` and every other crate that uses it.

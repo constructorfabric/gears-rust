@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Handlers of the tenant access restriction surface.
 
 use std::sync::Arc;

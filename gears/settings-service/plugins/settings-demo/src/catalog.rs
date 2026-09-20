@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The sample catalogue: one declaration per value type the SDK ships.
 
 use std::num::NonZeroU32;

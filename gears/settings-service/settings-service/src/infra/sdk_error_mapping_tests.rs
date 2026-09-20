@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the problem-document contract.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 and DESIGN.md §4.3

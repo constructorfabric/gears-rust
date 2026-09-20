@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-table:p1
 //! `tenant_permissions` — sparse per-tenant restrictions (DESIGN.md §4.7).
 //!

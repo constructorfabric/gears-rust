@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for the enforcement point's fail-closed contract.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 — *a request whose

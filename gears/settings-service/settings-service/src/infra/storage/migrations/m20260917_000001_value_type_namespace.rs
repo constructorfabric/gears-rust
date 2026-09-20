@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Move stored `value_type_id`s into the gear's own namespace.
 //!
 //! The value-type catalogue moved from `gts.cf.toolkit.settings.type_*~` to

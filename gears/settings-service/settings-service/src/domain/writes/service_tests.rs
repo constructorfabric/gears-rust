@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The write path over the resolution harness: gates, commit, fallthrough.
 
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-// Created: 2026-08-25 by Constructor Tech
+// Created: 2026-08-25 by Virtuozzo International GmbH
 //! Tests for the `setting_declarations` schema.
 //!
 //! These exercise the constraints against a real database rather than asserting

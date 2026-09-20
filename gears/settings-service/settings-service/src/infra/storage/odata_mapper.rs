@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Mapping the declared category query surface onto columns.
 //!
 //! The SDK declares *which* fields are filterable; this says *where* each one

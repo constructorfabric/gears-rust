@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Tenant access restrictions: what one tenant may do with one setting.
 //!
 //! A restriction is a sparse row — `read_only` or `hidden` for one

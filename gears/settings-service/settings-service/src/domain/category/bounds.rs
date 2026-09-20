@@ -1,4 +1,4 @@
-// Created: 2026-08-25 by Constructor Tech
+// Created: 2026-08-25 by Virtuozzo International GmbH
 //! Length bounds on a category's descriptive fields.
 //!
 //! `name` and `description` are `varchar(256)` and `varchar(4096)` in the schema

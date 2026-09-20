@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! The declaration repository contract.
 //!
 //! Read-only for now: entry 2.3's read surface is the first slice, and the

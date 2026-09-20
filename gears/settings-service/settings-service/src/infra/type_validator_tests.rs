@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Tests for the registry-backed Type Validator, against a hand-built source.
 
 use serde_json::json;

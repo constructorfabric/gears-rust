@@ -1,4 +1,4 @@
-// Created: 2026-08-11 by Constructor Tech
+// Created: 2026-08-11 by Virtuozzo International GmbH
 // @cpt-algo:cpt-cf-settings-service-algo-gear-foundation-key-parse:p1
 //! The setting key value object.
 //!

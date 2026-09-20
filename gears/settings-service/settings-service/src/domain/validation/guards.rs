@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-size-cap:p1
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-canonicality:p1
 //! The two guards every value passes before its type is consulted.

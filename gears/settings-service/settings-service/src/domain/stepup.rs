@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The step-up verifier port.
 //!
 //! Setting a value on a declaration that requires elevated confirmation needs

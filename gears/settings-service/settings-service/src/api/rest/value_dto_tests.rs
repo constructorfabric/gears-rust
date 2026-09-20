@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! What the write surface puts on the wire: masking that survives both
 //! images, the closed rejection vocabulary, and the reports' shapes.
 

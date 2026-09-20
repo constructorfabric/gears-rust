@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! What the restriction handlers read off a request: the target tenant this
 //! surface insists on, and the tag a mutation must present.
 

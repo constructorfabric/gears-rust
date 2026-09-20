@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The corpus, matched on a real database: what a needle may reach and what it
 //! may never reach, on the `SQLite` dialect the tests run on.
 

@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The category surface driven as a client drives it.
 //!
 //! Categories are the tree settings hang from, so their rules are the ones a

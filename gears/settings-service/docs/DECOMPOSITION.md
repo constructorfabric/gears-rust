@@ -1,5 +1,5 @@
-<!-- Created: 2026-08-10 by Constructor Tech -->
-<!-- Updated: 2026-09-05 by Constructor Tech -->
+<!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-05 by Virtuozzo International GmbH -->
 
 # Decomposition: Settings Service
 

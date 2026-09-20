@@ -1,4 +1,4 @@
-// Created: 2026-08-12 by Constructor Tech
+// Created: 2026-08-12 by Virtuozzo International GmbH
 //! GTS resource types this gear attributes its errors to.
 //!
 //! These are the values that reach `NotFound.ctx.resource_type` and its

@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Declared `OData` query surfaces.
 //!
 //! A field is filterable only if it appears here. That is the whole mechanism

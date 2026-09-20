@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Category operations.
 //!
 //! Generic over the repository rather than holding a trait object: the

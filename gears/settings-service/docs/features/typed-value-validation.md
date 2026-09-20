@@ -1,5 +1,5 @@
-<!-- Created: 2026-08-10 by Constructor Tech -->
-<!-- Updated: 2026-08-10 by Constructor Tech -->
+<!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-08-10 by Virtuozzo International GmbH -->
 
 # Feature: Typed Value Validation
 

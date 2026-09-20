@@ -1,4 +1,4 @@
-// Created: 2026-09-15 by Constructor Tech
+// Created: 2026-09-15 by Virtuozzo International GmbH
 //! `PendingSecretRepository` over `pending_secrets`.
 
 use async_trait::async_trait;

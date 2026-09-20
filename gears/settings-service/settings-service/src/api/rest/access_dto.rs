@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Wire shapes of the tenant access restriction surface.
 
 use time::format_description::well_known::Rfc3339;

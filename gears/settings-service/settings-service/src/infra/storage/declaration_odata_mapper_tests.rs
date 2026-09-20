@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Tests for the declaration `OData` surface.
 //!
 //! Acceptance: FEATURE `setting-declarations.md` CDSL `inst-decl-read-5` — an

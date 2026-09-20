@@ -1,4 +1,4 @@
-// Created: 2026-09-17 by Constructor Tech
+// Created: 2026-09-17 by Virtuozzo International GmbH
 //! What a hit looks like on the wire: a scope only where a value is set, a
 //! value only where one matched, and the mask a read would apply.
 

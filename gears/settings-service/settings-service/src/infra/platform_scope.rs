@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The root tenant, learned from the Tenant Resolver at first use.
 
 use std::sync::{Arc, OnceLock};

@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Rendering rules: masking, recency, the review pair and the state tag.
 
 use serde_json::json;

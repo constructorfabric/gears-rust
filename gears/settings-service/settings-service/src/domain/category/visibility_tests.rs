@@ -1,4 +1,4 @@
-// Created: 2026-08-13 by Constructor Tech
+// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for category visibility.
 //!
 //! A wrong predicate here is a disclosure bug in one direction and an

@@ -1,4 +1,4 @@
-// Created: 2026-09-07 by Constructor Tech
+// Created: 2026-09-07 by Virtuozzo International GmbH
 // The sandbox page: every call goes to the same-origin proxy, which forwards
 // it to the example server. Everything the API returns is logged raw below.
 

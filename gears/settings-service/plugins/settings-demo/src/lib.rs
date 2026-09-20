@@ -1,4 +1,4 @@
-// Created: 2026-09-06 by Constructor Tech
+// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Demo contributor for the Settings Service.
 //!
 //! Registers a sample catalogue of declarations through the SDK's

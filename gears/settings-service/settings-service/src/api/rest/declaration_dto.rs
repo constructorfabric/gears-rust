@@ -1,4 +1,4 @@
-// Created: 2026-08-26 by Constructor Tech
+// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Wire shapes for the declaration read endpoints.
 
 use serde_json::Value;
