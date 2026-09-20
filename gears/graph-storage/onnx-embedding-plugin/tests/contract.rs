@@ -125,9 +125,10 @@ async fn readiness_reports_a_session_that_has_been_proven_to_run() {
 
 /// A model whose width does not match the configuration is refused at load.
 ///
-/// The probe checks the width it got, not only that something came back --
-/// otherwise a provider configured for the wrong dimension would load
-/// cleanly and produce vectors that no stored space can compare with.
+/// The width check is `run`'s, and that is the point: running one inference
+/// at load is what makes it happen before a provider that can never produce a
+/// comparable vector is handed out. Without the probe this configuration
+/// loads cleanly and fails at the first ingest.
 #[tokio::test]
 async fn a_session_whose_width_contradicts_the_configuration_does_not_load() {
     if std::env::var("ORT_DYLIB_PATH").is_err() {
@@ -146,8 +147,8 @@ async fn a_session_whose_width_contradicts_the_configuration_does_not_load() {
         .err()
         .expect("a width the model cannot produce is a load failure");
     assert!(
-        error.to_string().contains("configured for"),
-        "the refusal says the width disagreed: {error}"
+        error.to_string().contains("embedding space mismatch"),
+        "the refusal names the width disagreement: {error}"
     );
 }
 

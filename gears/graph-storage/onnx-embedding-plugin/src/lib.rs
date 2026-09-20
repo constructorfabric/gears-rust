@@ -381,16 +381,13 @@ impl OnnxEmbeddingProvider {
             .encode(std::slice::from_ref(&PROBE_INPUT.to_owned()))
             .map_err(|error| OnnxLoadError::Session(format!("probe tokenization: {error}")))?;
         let mut session = self.session.lock().await;
-        let vectors = self
-            .run(&mut session, &encoded)
+        // The width is checked by `run` itself, which answers
+        // `SpaceMismatch` -- a declared width the model does not produce is
+        // exactly what that name is for, and comparing again here would be a
+        // second answer to one question. Reaching it is the point: this makes
+        // the check happen once, before anyone depends on the provider.
+        self.run(&mut session, &encoded)
             .map_err(|error| OnnxLoadError::Session(format!("probe inference: {error}")))?;
-        let width = vectors.first().map_or(0, Vec::len);
-        if width != self.config.dimension as usize {
-            return Err(OnnxLoadError::Session(format!(
-                "the session ran and returned a width of {width}, but this provider is                  configured for {}",
-                self.config.dimension
-            )));
-        }
         Ok(())
     }
 
