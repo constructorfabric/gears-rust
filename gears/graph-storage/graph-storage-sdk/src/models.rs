@@ -948,6 +948,13 @@ pub enum TruncationReason {
     FrontierCap,
     EdgeScanCap,
     NodeBudget,
+    /// The hydrated answer reached `response_max_bytes`.
+    ///
+    /// Distinct from `NodeBudget`, and the difference is actionable: a node
+    /// budget is a number the caller asked for and can raise, while this one
+    /// says the elements were large. Asking for fewer, or for a narrower type
+    /// set, is what helps.
+    ResponseBytes,
 }
 
 /// A traversed edge reference.

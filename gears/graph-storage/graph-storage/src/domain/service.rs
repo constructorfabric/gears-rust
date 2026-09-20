@@ -964,6 +964,35 @@ impl GraphServices {
             true
         });
 
+        // Counts are not a memory bound. `traversal_max_nodes` elements of
+        // `item_max_bytes` each is gigabytes at the hard limits, and every
+        // individual number in that is legal -- so the arm whose count
+        // ceiling does not fit inside `response_max_bytes` measures instead.
+        // The projection page and the search arms do fit, which is checked
+        // once at startup rather than per request.
+        //
+        // The cut happens before the edge filter below, so edges follow the
+        // nodes that survived it rather than dangling.
+        let mut spent: u64 = 0;
+        let mut over_bytes = false;
+        let budget = self.config.response_max_bytes;
+        nodes.retain(|view| {
+            if over_bytes {
+                return false;
+            }
+            spent = spent.saturating_add(hydrated_bytes(view));
+            if spent > budget {
+                over_bytes = true;
+                return false;
+            }
+            true
+        });
+        let truncated = if over_bytes {
+            Some(graph_storage_sdk::models::TruncationReason::ResponseBytes)
+        } else {
+            result.truncated
+        };
+
         // An edge whose endpoint the filter removed goes with it. The
         // filter's whole purpose is that those nodes are not part of the
         // answer, and an edge naming one both dangles — a caller drawing the
@@ -986,7 +1015,7 @@ impl GraphServices {
             nodes,
             edges,
             seeds: admitted,
-            truncated: result.truncated,
+            truncated,
             revision: snapshot.revision,
         })
     }
@@ -1010,4 +1039,28 @@ impl GraphServices {
         }
         Ok(phantom)
     }
+}
+
+/// What one hydrated node costs to hold and to encode.
+///
+/// The payload dominates and the adjacency is the other half that grows: a
+/// node carries its neighbours' keys and types too, and a traversal returns
+/// many such nodes. Counting only the payload would make this a payload
+/// budget rather than a response budget.
+fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
+    let payload = view.payload.as_ref().map_or(0, |value| {
+        serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
+    });
+    let adjacency: u64 = view
+        .adjacency
+        .iter()
+        .map(|entry| {
+            (entry.edge_key.len() + entry.edge_type_id.len() + entry.neighbor_key.len()) as u64
+        })
+        .sum();
+    payload
+        .saturating_add(adjacency)
+        .saturating_add(view.node_key.len() as u64)
+        .saturating_add(view.type_id.len() as u64)
+        .saturating_add(view.name.as_ref().map_or(0, |name| name.len() as u64))
 }

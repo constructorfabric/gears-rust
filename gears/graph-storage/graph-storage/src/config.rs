@@ -102,7 +102,32 @@ pub struct GraphStorageConfig {
     /// vector arm embeds it; neither is work a caller should be able to ask
     /// for in unbounded quantity.
     pub search_query_max_bytes: u32,
+    /// Ceiling on one whole element -- payload, name, keys and discriminator
+    /// together -- as the caller submits it.
+    ///
+    /// `payload_max_bytes` bounds the largest field of an item and this bounds
+    /// the item, which is not the same number: an element also carries
+    /// identifiers, a name and a type. It exists so that a count limit can be
+    /// reasoned about as a size limit, which is what makes the combination
+    /// checks below possible at all.
     pub item_max_bytes: u32,
+    /// Ceiling on one whole ingest request, summed over every element in it.
+    ///
+    /// Per-item bounds do not bound a batch: fifty thousand items each just
+    /// under the item ceiling is a request no per-item check refuses and no
+    /// process survives. The count limits and this one bound it from two
+    /// directions, and the smaller of the two wins.
+    pub ingest_max_bytes: u64,
+    /// Ceiling on one hydrated response, summed over the elements in it.
+    ///
+    /// Counts alone are not a memory bound: `traversal_max_nodes` elements of
+    /// `item_max_bytes` each is gigabytes at the hard limits. Where a count
+    /// ceiling multiplied by the item ceiling already fits inside this one --
+    /// the projection page and the search arms -- that is checked at startup
+    /// and nothing needs to be measured at run time. Traversal is the arm
+    /// whose count ceiling does not fit, so it measures as it hydrates and
+    /// reports the cut.
+    pub response_max_bytes: u64,
     pub node_read_max_adjacency: u32,
     pub traversal_max_depth: u8,
     pub traversal_max_nodes: u32,
@@ -173,6 +198,8 @@ impl Default for GraphStorageConfig {
             identifier_max_bytes: 2 * 1024,
             search_query_max_bytes: 8 * 1024,
             item_max_bytes: 256 * 1024,
+            ingest_max_bytes: 64 * 1024 * 1024,
+            response_max_bytes: 64 * 1024 * 1024,
             node_read_max_adjacency: 100,
             traversal_max_depth: 5,
             traversal_max_nodes: 1_000,
@@ -216,6 +243,7 @@ impl GraphStorageConfig {
         self.check_embedding_ranges(&mut errors);
         self.check_write_ranges(&mut errors);
         self.check_graph_ranges(&mut errors);
+        self.check_limit_combinations(&mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -242,6 +270,55 @@ impl GraphStorageConfig {
         check_range!(errors, self, identifier_max_bytes, 64u32, 65_536u32);
         check_range!(errors, self, search_query_max_bytes, 64u32, 1_048_576u32);
         check_range!(errors, self, item_max_bytes, 4_096u32, 4_194_304u32);
+        check_range!(
+            errors,
+            self,
+            ingest_max_bytes,
+            1_048_576u64,
+            1_073_741_824u64
+        );
+    }
+
+    /// Limits that are each in range and wrong together.
+    ///
+    /// A count ceiling is only a memory bound in company with a size ceiling,
+    /// so the two have to be checked as a product rather than one at a time.
+    /// Every one of these combinations is reachable with values the ranges
+    /// above accept -- a thousand-row page of four-megabyte items is four
+    /// gigabytes, and every individual number in it is legal.
+    fn check_limit_combinations(&self, errors: &mut Vec<String>) {
+        check_range!(
+            errors,
+            self,
+            response_max_bytes,
+            1_048_576u64,
+            1_073_741_824u64
+        );
+        if u64::from(self.payload_max_bytes) > u64::from(self.item_max_bytes) {
+            errors.push(format!(
+                "payload_max_bytes ({}) exceeds item_max_bytes ({}): an item could never \
+                 carry a payload that large",
+                self.payload_max_bytes, self.item_max_bytes
+            ));
+        }
+        for (what, count) in [
+            ("projection_max_page", u64::from(self.projection_max_page)),
+            // Both arms of a hybrid search, fused.
+            (
+                "search_max_arm_limit x 2",
+                u64::from(self.search_max_arm_limit) * 2,
+            ),
+        ] {
+            let worst = count.saturating_mul(u64::from(self.item_max_bytes));
+            if worst > self.response_max_bytes {
+                errors.push(format!(
+                    "{what} ({count}) x item_max_bytes ({}) is {worst} bytes, above \
+                     response_max_bytes ({}): this read is bounded by its count alone, so \
+                     the product is the response it can actually return",
+                    self.item_max_bytes, self.response_max_bytes
+                ));
+            }
+        }
     }
 
     /// What one request may ask the graph to read.
@@ -284,6 +361,40 @@ mod tests {
         GraphStorageConfig::default()
             .validate()
             .unwrap_or_else(|e| panic!("defaults must validate: {e}"));
+    }
+
+    /// Every number legal on its own, and the product is four gigabytes.
+    ///
+    /// This is the check the count ceilings needed and did not have: a page
+    /// limit is a memory bound only in company with a size limit, and neither
+    /// range check can see the other.
+    #[test]
+    fn limits_that_are_each_in_range_and_wrong_together_are_refused() {
+        let cfg = GraphStorageConfig {
+            item_max_bytes: 4 * 1024 * 1024,
+            projection_max_page: 1_000,
+            ..GraphStorageConfig::default()
+        };
+        let message = match cfg.validate() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("a 4 GiB page must be refused"),
+        };
+        assert!(message.contains("projection_max_page"), "{message}");
+        assert!(message.contains("response_max_bytes"), "{message}");
+    }
+
+    #[test]
+    fn a_payload_ceiling_above_the_item_ceiling_is_refused() {
+        let cfg = GraphStorageConfig {
+            payload_max_bytes: 1_048_576,
+            item_max_bytes: 4_096,
+            ..GraphStorageConfig::default()
+        };
+        let message = match cfg.validate() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("an item that could never hold its own payload must be refused"),
+        };
+        assert!(message.contains("payload_max_bytes"), "{message}");
     }
 
     #[test]

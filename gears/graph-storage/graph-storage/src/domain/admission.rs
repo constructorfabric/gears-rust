@@ -4,10 +4,20 @@
 //!
 //! Every bound rejected here answers `out_of_range` / `LIMIT_EXCEEDED` (or
 //! `invalid_argument` / `LIMIT_COMBINATION` for inconsistent combinations)
-//! **before hydration**, so no oversized response is ever assembled.
+//! **before hydration**.
+//!
+//! That used to be written as "so no oversized response is ever assembled",
+//! which was true of one item and false of a batch: counts and per-field
+//! ceilings bound each element and said nothing about their sum. What holds
+//! now is narrower and checkable. A request is bounded by `ingest_max_bytes`
+//! as well as by its counts. A read is bounded by bytes in one of two ways:
+//! the projection page and the search arms have count ceilings small enough
+//! that the count times `item_max_bytes` fits inside `response_max_bytes`,
+//! which `GraphStorageConfig::validate` refuses to start without; traversal's
+//! does not fit, so it measures as it hydrates and reports the cut.
 
 use graph_storage_sdk::models::{
-    IngestRequest, NeighborhoodRequest, SearchRequest, TraverseRequest,
+    IngestRequest, ItemFamily, NeighborhoodRequest, SearchRequest, TraverseRequest,
 };
 
 use crate::config::GraphStorageConfig;
@@ -105,7 +115,76 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
             }
         }
     }
+
+    // Counts and per-field ceilings are not a size bound on the batch, and
+    // this is where that stopped being a theoretical point: every check above
+    // passes for fifty thousand items that are each just under their own
+    // ceiling, and the sum of them is a request the process does not survive.
+    // Measured on the serialized form, because that is what is read, parsed,
+    // held and written.
+    let mut total: u64 = 0;
+    for (family, index, bytes) in request
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (ItemFamily::Node, index, node_bytes(node)))
+        .chain(
+            request
+                .edges
+                .iter()
+                .enumerate()
+                .map(|(index, edge)| (ItemFamily::Edge, index, edge_bytes(edge))),
+        )
+    {
+        if bytes > u64::from(cfg.item_max_bytes) {
+            return Err(exceeded(format!(
+                "{family:?}[{index}] is {bytes} bytes; item_max_bytes is {}",
+                cfg.item_max_bytes
+            )));
+        }
+        total = total.saturating_add(bytes);
+        if total > cfg.ingest_max_bytes {
+            return Err(exceeded(format!(
+                "the batch is at least {total} bytes; ingest_max_bytes is {}",
+                cfg.ingest_max_bytes
+            )));
+        }
+    }
     Ok(())
+}
+
+/// What a node costs to carry: every caller-supplied field of it, not the one
+/// that happens to be largest.
+///
+/// Summed rather than serialized because the models are transport-agnostic and
+/// carry no `Serialize`, which is deliberate -- the wire shape belongs to the
+/// DTOs. The sum is a lower bound on the encoded size and an accurate one for
+/// deciding admission: it counts every byte the caller controls.
+fn node_bytes(node: &graph_storage_sdk::models::NodeSpec) -> u64 {
+    let payload = node.payload.as_ref().map_or(0, json_bytes);
+    payload
+        .saturating_add(node.node_key.len() as u64)
+        .saturating_add(node.type_id.len() as u64)
+        .saturating_add(node.name.as_ref().map_or(0, |name| name.len() as u64))
+}
+
+/// The same for an edge: two endpoint keys, a type, an optional discriminator
+/// and the payload.
+fn edge_bytes(edge: &graph_storage_sdk::models::EdgeSpec) -> u64 {
+    let payload = edge.payload.as_ref().map_or(0, json_bytes);
+    payload
+        .saturating_add(edge.src_node_key.len() as u64)
+        .saturating_add(edge.dst_node_key.len() as u64)
+        .saturating_add(edge.type_id.len() as u64)
+        .saturating_add(
+            edge.discriminator
+                .as_ref()
+                .map_or(0, |value| value.len() as u64),
+        )
+}
+
+fn json_bytes(value: &serde_json::Value) -> u64 {
+    serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
 }
 
 pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result<(), DomainError> {

@@ -16,9 +16,13 @@
 mod conformance;
 mod support;
 
+use std::sync::Arc;
+
+use graph_storage::config::GraphStorageConfig;
 use graph_storage::domain::error::DomainError;
 use graph_storage_sdk::models::{
-    NeighborhoodRequest, SearchMode, SearchRequest, TraverseRequest, TypeQuery,
+    NeighborhoodRequest, NodeSpec, SearchMode, SearchRequest, TraverseRequest, TruncationReason,
+    TypeQuery,
 };
 use support::Harness;
 
@@ -735,6 +739,162 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
             .expect("the node is deleted in-process")
             .tombstoned_nodes,
         1
+    );
+}
+
+/// A traversal stops at the byte budget and says so.
+///
+/// Traversal is the one read whose count ceiling cannot stand in for a size
+/// ceiling: `traversal_max_nodes` elements of `item_max_bytes` each is
+/// gigabytes at the hard limits, and every number in that is legal. So it
+/// measures while it hydrates, and the cut is reported rather than silent --
+/// a short answer that claimed to be complete is the failure mode worth
+/// avoiding, because the caller cannot tell it from a small graph.
+#[tokio::test]
+async fn a_traversal_stops_at_the_byte_budget_and_reports_it() {
+    let small = GraphStorageConfig {
+        response_max_bytes: 4 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // Four nodes in a chain, each carrying more than a quarter of the budget.
+    let filler = "z".repeat(1_500);
+    let fat = |key: &str| NodeSpec {
+        payload: Some(serde_json::json!({ "note": filler })),
+        ..conformance::node(key, key)
+    };
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![fat("b-a"), fat("b-b"), fat("b-c"), fat("b-d")],
+                vec![
+                    conformance::edge("b-a", "b-b"),
+                    conformance::edge("b-b", "b-c"),
+                    conformance::edge("b-c", "b-d"),
+                ],
+            ),
+        )
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["b-a".to_owned()],
+                depth: 3,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                // Well inside the node budget: the count is not what stops it.
+                max_nodes: Some(100),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+
+    assert!(
+        walked.nodes.len() < 4,
+        "the budget cut the answer short: {} nodes",
+        walked.nodes.len()
+    );
+    assert_eq!(
+        walked.truncated,
+        Some(TruncationReason::ResponseBytes),
+        "and the cut is reported as a byte budget rather than a node budget"
+    );
+
+    // Every edge still names two nodes that came back, so a caller drawing
+    // the result has no line to nothing.
+    let returned: std::collections::BTreeSet<&str> =
+        walked.nodes.iter().map(|n| n.node_key.as_str()).collect();
+    for edge in &walked.edges {
+        assert!(
+            returned.contains(edge.src.as_str()) && returned.contains(edge.dst.as_str()),
+            "the edge filter follows the byte cut: {edge:?} against {returned:?}"
+        );
+    }
+}
+
+/// A batch is bounded by its total size, not only by its counts.
+///
+/// Every per-item check can pass for a request no process survives: fifty
+/// thousand elements each just under the item ceiling is gigabytes, and the
+/// count limit, the payload limit and the identifier limit all say yes. The
+/// admission comment claimed no oversized work was ever started; for one item
+/// that was true and for a batch it was not.
+#[tokio::test]
+async fn a_batch_is_bounded_by_its_total_size_and_not_only_its_counts() {
+    let small = GraphStorageConfig {
+        // Room for a handful of the payloads below, not for all of them.
+        ingest_max_bytes: 16 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "x".repeat(2 * 1024);
+    let fat = |key: &str| NodeSpec {
+        payload: Some(serde_json::json!({ "note": filler })),
+        ..conformance::node(key, key)
+    };
+
+    // Each one of these is far inside every per-item bound.
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(vec![fat("one")], Vec::new()))
+        .await
+        .expect("one item of this size is ordinary");
+
+    let many: Vec<NodeSpec> = (0..32).map(|i| fat(&format!("many-{i}"))).collect();
+    let refused = harness
+        .services
+        .ingest(&ctx, conformance::batch(many, Vec::new()))
+        .await
+        .expect_err("the sum of them is not");
+    assert!(
+        matches!(refused, DomainError::LimitExceeded { .. }),
+        "expected a bound refusal, got {refused}"
+    );
+    assert!(
+        refused.to_string().contains("ingest_max_bytes"),
+        "the refusal names the bound it hit: {refused}"
+    );
+}
+
+/// An element is bounded as a whole, not only field by field.
+#[tokio::test]
+async fn an_element_is_bounded_as_a_whole() {
+    let small = GraphStorageConfig {
+        item_max_bytes: 4_096,
+        payload_max_bytes: 4_096,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // A payload just inside `payload_max_bytes`, plus a name and keys, is an
+    // item outside `item_max_bytes` -- which is the gap between bounding the
+    // largest field and bounding the element.
+    let node = NodeSpec {
+        payload: Some(serde_json::json!({ "note": "y".repeat(4_000) })),
+        ..conformance::node("whole", &"n".repeat(200))
+    };
+    let refused = harness
+        .services
+        .ingest(&ctx, conformance::batch(vec![node], Vec::new()))
+        .await
+        .expect_err("the element as a whole is over the ceiling");
+    assert!(
+        refused.to_string().contains("item_max_bytes"),
+        "the refusal names the bound it hit: {refused}"
     );
 }
 

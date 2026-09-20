@@ -41,7 +41,7 @@ use uuid::Uuid;
 /// which is the deployment posture the gear is written for: the PDP decides
 /// who may call, the compiled scope decides what they see. A denying variant
 /// below covers the other branch.
-struct AllowInOwnTenant;
+pub struct AllowInOwnTenant;
 
 #[async_trait]
 impl AuthZResolverApi for AllowInOwnTenant {
@@ -234,13 +234,22 @@ pub struct Harness {
 
 impl Harness {
     pub fn with(authz: Arc<dyn AuthZResolverApi>) -> Self {
+        Self::configured(authz, GraphStorageConfig::default())
+    }
+
+    /// The same, with limits a case can make small enough to reach.
+    ///
+    /// A byte ceiling of tens of megabytes is not something a test should
+    /// build its way up to: the case would spend its time allocating rather
+    /// than asserting, and would be measuring the machine.
+    pub fn configured(authz: Arc<dyn AuthZResolverApi>, config: GraphStorageConfig) -> Self {
         let store = Arc::new(FakeGraphStore::new());
         let engine = Arc::new(HopOverStore {
             store: Arc::clone(&store),
         });
         Self {
             services: Arc::new(GraphServices::new(
-                GraphStorageConfig::default(),
+                config,
                 store,
                 engine,
                 PolicyEnforcer::new(authz),

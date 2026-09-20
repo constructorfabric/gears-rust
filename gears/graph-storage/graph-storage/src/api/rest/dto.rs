@@ -927,6 +927,7 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
                     m::TruncationReason::FrontierCap => "frontier_cap",
                     m::TruncationReason::EdgeScanCap => "edge_scan_cap",
                     m::TruncationReason::NodeBudget => "node_budget",
+                    m::TruncationReason::ResponseBytes => "response_bytes",
                 }
                 .to_owned()
             }),
