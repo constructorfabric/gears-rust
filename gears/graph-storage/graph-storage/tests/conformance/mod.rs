@@ -3574,6 +3574,136 @@ pub async fn two_replacements_of_one_scope_serialize(
     );
 }
 
+/// Every update of a node advances its version by one, whoever else is
+/// writing.
+///
+/// `version` is the only optimistic-concurrency token this gear hands a
+/// caller, and it was advanced the same way the graph revision was: read the
+/// row, add one in Rust, write the number back. Two ingests of one node both
+/// read `N`; the second waits on the row lock and then writes its own stale
+/// `N + 1`. Two distinct states then share a version, so an
+/// `expected_version` that should have failed passes -- the caller is told
+/// its read was current when the node had moved under it.
+///
+/// The version is not readable, only comparable, so that is how this asks:
+/// after eight updates on top of the first write, exactly `9` is accepted.
+/// Under the old arithmetic fewer increments land and `9` is refused.
+///
+/// Against a store that serializes whole ingests -- the in-memory one takes
+/// one lock for the entire call -- the concurrency here is structural rather
+/// than real, and the case proves the counting instead. The race itself is
+/// exercised on `PostgreSQL`.
+pub async fn every_update_of_a_node_advances_its_version(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    const WRITERS: usize = 8;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    let revise = |name: &str| batch(vec![node("versioned", name)], Vec::new());
+    ingest_batch(store.as_ref(), &reader, revise("first"))
+        .await
+        .expect("the node is created at version 1");
+
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut tasks = Vec::with_capacity(WRITERS);
+    for index in 0..WRITERS {
+        let store = std::sync::Arc::clone(&store);
+        let gate = std::sync::Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = ctx(tenant, &scope, None);
+            // A distinct name each, so every one of them is a real update
+            // rather than a convergent replay that changes nothing.
+            let request = batch(
+                vec![node("versioned", &format!("revision-{index}"))],
+                Vec::new(),
+            );
+            gate.wait().await;
+            ingest_batch(store.as_ref(), &ctx, request).await
+        }));
+    }
+    for task in tasks {
+        task.await
+            .expect("the task does not panic")
+            .expect("the update commits");
+    }
+
+    // One create plus eight updates is version nine, and the only way to ask
+    // is to offer a version and see whether it is accepted.
+    let mut probe = batch(vec![node("versioned", "probe")], Vec::new());
+    let expected = i64::try_from(WRITERS + 1).expect("the writer count fits an i64");
+    probe.nodes[0].expected_version = Some(expected);
+    ingest_batch(store.as_ref(), &reader, probe)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "after one create and {WRITERS} updates the version is {}: {error}",
+                WRITERS + 1
+            )
+        });
+}
+
+/// Two writers offering the same expected version: exactly one of them wins.
+///
+/// The check used to be a branch above the statement -- read the row, compare,
+/// then write -- which is two moments with a concurrent ingest fitting between
+/// them. Both writers could read the same version, both could pass the
+/// comparison, and both could write. The comparison is in the statement now,
+/// so the loser matches no rows and is told.
+pub async fn two_writers_with_one_expected_version_do_not_both_win(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    ingest_batch(
+        store.as_ref(),
+        &reader,
+        batch(vec![node("contested", "first")], Vec::new()),
+    )
+    .await
+    .expect("the node is created at version 1");
+
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let attempt = |name: &'static str| {
+        let store = std::sync::Arc::clone(&store);
+        let gate = std::sync::Arc::clone(&gate);
+        tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = ctx(tenant, &scope, None);
+            let mut request = batch(vec![node("contested", name)], Vec::new());
+            request.nodes[0].expected_version = Some(1);
+            gate.wait().await;
+            ingest_batch(store.as_ref(), &ctx, request).await
+        })
+    };
+    // Both spawned before either is awaited. Awaiting the first here would
+    // leave it waiting at a barrier for a participant that does not exist
+    // yet, which is a hang rather than a failure -- the shape this suite's
+    // other races already use for that reason.
+    let first_task = attempt("from-one");
+    let second_task = attempt("from-two");
+    let first = first_task.await.expect("the task does not panic");
+    let second = second_task.await.expect("the task does not panic");
+
+    let winners = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(
+        winners, 1,
+        "one writer holds version 1 and the other does not: {first:?} / {second:?}"
+    );
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a

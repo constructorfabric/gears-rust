@@ -14,7 +14,7 @@
 use graph_storage_sdk::models::{ItemError, ItemFamily, TypeKind};
 use graph_storage_sdk::plugin_api::GraphStoreError;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
 use std::collections::BTreeMap;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
 
@@ -434,7 +434,16 @@ async fn migrate_nodes(
                 // The compare-and-set target moves with the row. Without this a
                 // producer holding the pre-migration version would overwrite the
                 // migrated row and undo the migration in silence.
-                .col_expr(node::Column::Version, Expr::value(model.version + 1))
+                //
+                // Incremented by `PostgreSQL` from the row's own value rather
+                // than from the one this scan read: a concurrent ingest of the
+                // same node would otherwise have its bump overwritten by this
+                // one, leaving two states sharing a version -- and a version
+                // is what `expected_version` compares against.
+                .col_expr(
+                    node::Column::Version,
+                    Expr::col(node::Column::Version).add(1),
+                )
                 .col_expr(
                     node::Column::UpdatedAt,
                     Expr::value(time::OffsetDateTime::now_utc()),

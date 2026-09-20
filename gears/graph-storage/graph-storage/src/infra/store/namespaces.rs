@@ -225,11 +225,17 @@ async fn transfer_in_tx(
         return Ok(to_model(row));
     }
 
-    owner::Entity::update_many()
+    // `previous_owner` is read from the row at UPDATE time, not carried from
+    // the SELECT above. Two concurrent transfers away from the same owner
+    // both read it, and the one that waited would otherwise record an owner
+    // that had already been replaced -- an audit trail that is wrong exactly
+    // when it is consulted, since a contested transfer is the case anyone
+    // goes looking for.
+    let written = owner::Entity::update_many()
         .col_expr(owner::Column::OwnerPrincipal, Expr::value(new_owner))
         .col_expr(
             owner::Column::PreviousOwner,
-            Expr::value(Some(row.owner_principal.clone())),
+            Expr::col(owner::Column::OwnerPrincipal),
         )
         .col_expr(owner::Column::TransferredAt, Expr::value(Some(now)))
         .col_expr(
@@ -240,12 +246,27 @@ async fn transfer_in_tx(
             owner::Column::TransferredBySubjectType,
             Expr::value(subject.subject_type.clone()),
         )
-        .filter(Condition::all().add(owner::Column::Namespace.eq(namespace)))
+        .filter(
+            Condition::all()
+                .add(owner::Column::Namespace.eq(namespace))
+                // The owner this transfer was authorized against. If another
+                // transfer moved it first, this matches nothing and says so
+                // rather than overwriting a decision it never saw.
+                .add(owner::Column::OwnerPrincipal.eq(row.owner_principal.clone())),
+        )
         .secure()
         .scope_with(scope)
         .exec(tx)
         .await
         .map_err(map_scope_err)?;
+
+    if written.rows_affected == 0 {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "namespace `{namespace}` was transferred by someone else while this                  transfer was being decided; re-read the owner and retry"
+            ),
+        });
+    }
 
     Ok(SourceNamespaceOwner {
         namespace: row.namespace,

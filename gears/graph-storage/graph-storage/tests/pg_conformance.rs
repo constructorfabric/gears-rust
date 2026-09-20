@@ -556,6 +556,31 @@ async fn two_replacements_of_one_scope_serialize() {
     .await;
 }
 
+/// Spawned tasks again, so the runtime needs threads to put them on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_update_of_a_node_advances_its_version() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::every_update_of_a_node_advances_its_version(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_writers_with_one_expected_version_do_not_both_win() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_writers_with_one_expected_version_do_not_both_win(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Written out rather than `pg_case!`d, for the same reason as the scope
 /// race: the two ingests are spawned as separate tasks and need a runtime
 /// with threads to put them on.

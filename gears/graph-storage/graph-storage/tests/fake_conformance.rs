@@ -382,6 +382,30 @@ async fn two_replacements_of_one_scope_serialize() {
     .await;
 }
 
+/// On this store the ingest takes one lock for the whole call, so the eight
+/// writers cannot interleave inside it and the concurrency is structural. What
+/// it still proves is the counting: eight updates advance the version eight
+/// times. The interleaving itself is exercised in `pg_conformance`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_update_of_a_node_advances_its_version() {
+    conformance::every_update_of_a_node_advances_its_version(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_writers_with_one_expected_version_do_not_both_win() {
+    conformance::two_writers_with_one_expected_version_do_not_both_win(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Multi-threaded and spawned for the same reason as the scope race above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_committed_mutation_gets_its_own_revision() {

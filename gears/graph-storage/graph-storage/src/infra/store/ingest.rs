@@ -16,7 +16,7 @@ use graph_storage_sdk::models::{
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 use toolkit_security::AccessScope;
@@ -944,6 +944,10 @@ async fn upsert_node(
         }
     }
 
+    // Compared here so a mismatch is reported with both numbers, and
+    // compared *again* in the statement below, which is where it is actually
+    // decided: this read and that write are two moments, and a concurrent
+    // ingest fits between them.
     if let Some(expected) = spec.expected_version
         && expected != current.version
     {
@@ -974,8 +978,26 @@ async fn upsert_node(
     }
 
     let id = current.id;
-    let version = current.version + 1;
-    node::Entity::update_many()
+    // `PostgreSQL` increments the row's own value. Computing `current.version
+    // + 1` here and writing it as a literal is the same read-compute-write
+    // that gave two committed states one graph revision: two ingests of this
+    // node both read `N`, the second waits on the row lock and then writes
+    // its own stale `N + 1`. That is worse for `version` than for the
+    // revision, because `version` is the only optimistic-concurrency token
+    // this gear gives a caller -- an `expected_version` that should have
+    // failed would pass.
+    let mut update = node::Entity::update_many().col_expr(
+        node::Column::Version,
+        Expr::col(node::Column::Version).add(1),
+    );
+    // And the compare-and-set belongs in the statement rather than in the
+    // branch above it. Filtering on the version we read means a concurrent
+    // writer that moved it leaves this update matching nothing, which is
+    // reported as the conflict it is instead of silently overwriting.
+    if let Some(expected) = spec.expected_version {
+        update = update.filter(Condition::all().add(node::Column::Version.eq(expected)));
+    }
+    let written = update
         .col_expr(node::Column::GtsNodeTypeId, Expr::value(info.id))
         .col_expr(node::Column::Name, Expr::value(name))
         .col_expr(node::Column::Payload, Expr::value(payload))
@@ -986,7 +1008,6 @@ async fn upsert_node(
             node::Column::EmbeddingInputHash,
             Expr::value(vector.input_hash),
         )
-        .col_expr(node::Column::Version, Expr::value(version))
         .col_expr(node::Column::UpdatedAt, Expr::value(now))
         .col_expr(
             node::Column::UpdatedBySubjectId,
@@ -1002,6 +1023,18 @@ async fn upsert_node(
         .exec(tx)
         .await
         .map_err(map_scope_err)?;
+
+    // Nothing matched means the version moved between the read and the write,
+    // which only a compare-and-set filter can be here to notice. Answering
+    // `Updated` on zero rows would tell the caller its write landed.
+    if spec.expected_version.is_some() && written.rows_affected == 0 {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "node `{}` changed between the check and the write; re-read it and                  retry with the version it has now",
+                spec.node_key
+            ),
+        });
+    }
 
     Ok((
         id,
