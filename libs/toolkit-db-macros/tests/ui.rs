@@ -60,7 +60,18 @@ fn ui() {
 /// here unregistered long enough to record a message the macro never emitted.
 #[test]
 fn every_error_fixture_is_registered() {
-    let driver = include_str!("ui.rs");
+    // Live lines only, and a call rather than a mention of the path. A
+    // registration commented out while debugging leaves the path in the file,
+    // and a path in a comment is exactly the fixture that no longer runs --
+    // which is what this test is here to notice.
+    //
+    // `//` only: a block comment would need a parser, and this file is a list
+    // of calls, so it has never had one.
+    let registrations: Vec<&str> = include_str!("ui.rs")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .collect();
 
     let mut orphans: Vec<String> = std::fs::read_dir("tests/ui")
         .expect("the fixture directory must be readable")
@@ -70,8 +81,12 @@ fn every_error_fixture_is_registered() {
                 return None;
             }
             let name = path.file_name()?.to_str()?.to_owned();
-            let registered = driver.contains(&format!("tests/ui/{name}\""));
-            (name.starts_with("err_") && !registered).then_some(name)
+            if !name.starts_with("err_") {
+                return None;
+            }
+            let call = format!("compile_fail(\"tests/ui/{name}\")");
+            let registered = registrations.iter().any(|line| line.contains(&call));
+            (!registered).then_some(name)
         })
         .collect();
     orphans.sort();
