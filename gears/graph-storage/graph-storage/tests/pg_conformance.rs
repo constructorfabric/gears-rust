@@ -576,6 +576,10 @@ pg_case!(
     conformance::scope_replacement_removes_an_edge_whose_endpoints_remain
 );
 pg_case!(
+    an_edge_is_not_taken_from_the_scope_that_declared_it,
+    conformance::an_edge_is_not_taken_from_the_scope_that_declared_it
+);
+pg_case!(
     one_replacement_does_not_take_another_scopes_edges,
     conformance::one_replacement_does_not_take_another_scopes_edges
 );

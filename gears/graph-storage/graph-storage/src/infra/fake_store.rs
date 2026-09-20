@@ -2402,6 +2402,20 @@ fn apply_edge(
     }
 
     let edge_key = identity::derive_edge_key(record.type_uuid, spec);
+    if let Some(owner) = edges
+        .iter()
+        .find(|e| e.key == edge_key)
+        .and_then(|e| e.scope.as_ref())
+        && let Some(declaring) = scope.as_ref()
+        && owner != declaring
+    {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "edge `{edge_key}` was declared by scope `{}={}` and may not be                  re-declared under `{}={}`; a move between scopes is a deletion and a                  re-declaration, not a write",
+                owner.0, owner.1, declaring.0, declaring.1
+            ),
+        });
+    }
     let outcome = match edges.iter_mut().find(|e| e.key == edge_key) {
         Some(existing) if existing.payload == spec.payload && !existing.deleted => {
             ItemOutcome::Unchanged
@@ -2411,7 +2425,9 @@ fn apply_edge(
             existing.deleted = false;
             // A scoped batch re-asserts ownership; an unscoped one leaves
             // whatever claim is already recorded, because writing an edge is
-            // not the same as declaring a snapshot that contains it.
+            // not the same as declaring a snapshot that contains it. What it
+            // may not do is take an edge from another scope -- see the
+            // built-in store for why that is a conflict rather than a write.
             if scope.is_some() {
                 existing.scope.clone_from(&scope);
             }

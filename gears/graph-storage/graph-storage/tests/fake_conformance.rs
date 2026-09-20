@@ -349,6 +349,12 @@ async fn scope_replacement_removes_an_edge_whose_endpoints_remain() {
 }
 
 #[tokio::test]
+async fn an_edge_is_not_taken_from_the_scope_that_declared_it() {
+    conformance::an_edge_is_not_taken_from_the_scope_that_declared_it(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
 async fn one_replacement_does_not_take_another_scopes_edges() {
     conformance::one_replacement_does_not_take_another_scopes_edges(&store(), Uuid::now_v7()).await;
 }

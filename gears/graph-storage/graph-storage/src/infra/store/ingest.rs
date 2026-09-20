@@ -1144,6 +1144,30 @@ async fn upsert_edge(
     // it without making the batch a change: the revision must not advance for
     // a convergent replay. The claim still has to happen, or an edge first
     // written by an unscoped ingest would stay unowned and never converge.
+    //
+    // **An owned edge is not adopted away from its owner.** Overwriting the
+    // mark whenever the declaring scope differed made ownership follow
+    // whoever wrote last: a second scope re-declaring the same edge took it,
+    // and from then on the first scope's replacement no longer removed it
+    // while the second one's did. The producer that lost the edge was told
+    // nothing. That is the union-state problem the scope registry already
+    // refuses for a whole scope, so an edge answers the same way -- a
+    // conflict, which the caller can act on, rather than a silent transfer it
+    // cannot see.
+    let owned_by = current
+        .scope_attribute
+        .as_deref()
+        .zip(current.scope_value.as_deref());
+    if let (Some((attribute, value)), Some(owner)) = (declaring, owned_by)
+        && owner != (attribute, value)
+    {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "edge `{edge_key}` was declared by scope `{}={}` and may not be                  re-declared under `{attribute}={value}`; a move between scopes is a                  deletion and a re-declaration, not a write",
+                owner.0, owner.1
+            ),
+        });
+    }
     let claim = declaring.filter(|(attribute, value)| {
         current.scope_attribute.as_deref() != Some(*attribute)
             || current.scope_value.as_deref() != Some(*value)

@@ -3278,6 +3278,94 @@ pub async fn scope_replacement_removes_an_edge_whose_endpoints_remain(
     );
 }
 
+/// An edge belongs to the scope that declared it, and no other may take it.
+///
+/// The companion case below proves one scope's replacement leaves another's
+/// edges alone -- and could not see this, because each scope there declares
+/// an edge of its own: different discriminators, different keys, no collision
+/// to resolve. The question this asks is what happens when the keys *are* the
+/// same.
+///
+/// The answer used to be that ownership followed whoever wrote last. A second
+/// scope re-declaring the edge took it, and from then on the first scope's
+/// replacement no longer removed it while the second one's did -- the producer
+/// that lost it was told nothing, and found out only when its own snapshot
+/// stopped converging. That is the union state the scope registry already
+/// refuses for a whole scope, so an edge answers the same way.
+pub async fn an_edge_is_not_taken_from_the_scope_that_declared_it(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // Both nodes satisfy both scope attributes, so either scope may speak
+    // about them -- which is what makes the collision reachable at all.
+    let shared = |key: &str| NodeSpec {
+        node_key: key.to_owned(),
+        type_id: OWNED.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(serde_json::json!({
+            "repository": "acme/infra",
+            "component": "auth",
+        })),
+        ..NodeSpec::default()
+    };
+    // One edge, one key: no discriminator to tell two declarations apart.
+    let contested = || edge("first", "second");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![shared("first"), shared("second")],
+            vec![contested()],
+            1,
+        ),
+    )
+    .await
+    .expect("the repository scope declares the edge");
+
+    let stolen = ingest_batch(
+        store,
+        &ctx,
+        IngestRequest {
+            replace_scope: Some(ReplaceScope {
+                attribute: "component".to_owned(),
+                value: "auth".to_owned(),
+                generation: 1,
+            }),
+            ..batch(vec![shared("first"), shared("second")], vec![contested()])
+        },
+    )
+    .await
+    .expect_err("the component scope may not take it");
+    assert!(
+        matches!(stolen, GraphStoreError::Conflict { .. }),
+        "a contested edge is a conflict the caller can act on, not a silent \
+         transfer: {stolen:?}"
+    );
+
+    // And the edge is still the first scope's: its replacement removes it,
+    // which is the observable half of ownership.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![shared("first"), shared("second")], Vec::new(), 2),
+    )
+    .await
+    .expect("the owner re-declares itself without the edge");
+    assert_eq!(
+        outcome.counts.scope_removed_edges, 1,
+        "the edge left with the scope that still owned it: {:?}",
+        outcome.counts
+    );
+}
+
 /// Two scopes may share endpoint nodes, and neither may remove the other's
 /// edges.
 ///
