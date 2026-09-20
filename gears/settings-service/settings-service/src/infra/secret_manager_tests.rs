@@ -296,11 +296,14 @@ async fn a_non_string_plaintext_is_stored_as_its_json_text() {
         .await
         .expect("stored");
     assert_eq!(
-        manager
-            .resolve_plaintext(KEY, tenant, &reference)
-            .await
-            .expect("resolved"),
-        r#"{"pass":"p","user":"u"}"#
+        serde_json::from_str::<serde_json::Value>(
+            &manager
+                .resolve_plaintext(KEY, tenant, &reference)
+                .await
+                .expect("resolved")
+        )
+        .expect("valid json"),
+        json!({"user": "u", "pass": "p"})
     );
 }
 

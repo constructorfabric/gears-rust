@@ -368,3 +368,7 @@ pub fn render_validation(report: &ValidationReport, may_read_pii: bool) -> Valid
         impact,
     }
 }
+
+#[cfg(test)]
+#[path = "value_dto_tests.rs"]
+mod value_dto_tests;

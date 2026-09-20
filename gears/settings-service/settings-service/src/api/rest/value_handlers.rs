@@ -476,3 +476,7 @@ pub async fn impact(
     .into_response())
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-5
 }
+
+#[cfg(test)]
+#[path = "value_handlers_tests.rs"]
+mod value_handlers_tests;

@@ -225,3 +225,140 @@ mod history {
         assert_eq!(entitled.pre_value, Some(json!("old")));
     }
 }
+
+mod browse_entry {
+    use serde_json::json;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use crate::api::rest::setting_dto::{SettingItemDto, render_flagged};
+    use crate::domain::error::DomainError;
+    use crate::domain::resolution::MASK_TOKEN;
+    use crate::domain::value::StoredValue;
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).expect("in range")
+    }
+
+    fn stored(classification: &str, tenant: Uuid) -> StoredValue {
+        StoredValue {
+            id: Uuid::nil(),
+            declaration_id: Uuid::nil(),
+            tenant_id: tenant,
+            value: Some(json!("kept")),
+            secret_ref: None,
+            data_classification: classification.to_owned(),
+            needs_review: true,
+            needs_review_detail: Some("no longer a port".to_owned()),
+            last_change_at: at(200),
+            updated_at: at(300),
+            set_by: "tenant-admin".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_key_that_could_not_be_resolved_carries_its_own_outcome() {
+        // The browse page answers per key: one unreadable setting must not
+        // fail the page, or a single retired declaration empties the screen.
+        let cases = [
+            (
+                DomainError::NotFound {
+                    resource: "declaration",
+                },
+                "not_found",
+            ),
+            (
+                DomainError::Retired {
+                    key: "k".to_owned(),
+                },
+                "retired",
+            ),
+            (
+                DomainError::Unavailable {
+                    detail: "registry down".to_owned(),
+                },
+                "unavailable",
+            ),
+            (
+                DomainError::Conflict {
+                    detail: "unexpected".to_owned(),
+                },
+                "error",
+            ),
+        ];
+
+        for (err, expected) in cases {
+            let item = SettingItemDto::failed("k", &err);
+            assert_eq!(item.outcome, expected);
+            assert_eq!(item.key, "k");
+            assert!(item.effective.is_none());
+            assert!(item.flagged.is_none());
+            assert!(item.detail.is_some(), "the entry says why");
+        }
+    }
+
+    #[test]
+    fn a_requested_key_with_no_declaration_reads_as_not_found() {
+        let item = SettingItemDto::not_found("absent.v1~");
+        assert_eq!(item.outcome, "not_found");
+        assert_eq!(item.key, "absent.v1~");
+    }
+
+    #[test]
+    fn mode_is_a_tag_added_to_an_entry_not_a_field_of_its_own_shape() {
+        // Every page carries every setting; the client groups by this tag. An
+        // entry that never got one omits it rather than guessing a default.
+        let untagged = SettingItemDto::not_found("k");
+        assert_eq!(untagged.mode, None);
+        let wire = serde_json::to_value(&untagged).expect("serializes");
+        assert!(wire.get("mode").is_none(), "{wire}");
+
+        let tagged = SettingItemDto::not_found("k").with_mode("advanced");
+        assert_eq!(tagged.mode.as_deref(), Some("advanced"));
+        assert_eq!(tagged.outcome, "not_found", "the tag changes nothing else");
+    }
+
+    #[test]
+    fn a_flagged_override_is_masked_and_keeps_why_it_was_flagged() {
+        let tenant = Uuid::from_u128(4);
+        let root = Uuid::from_u128(1);
+
+        let shown = render_flagged("k", &stored("public", tenant), root, false);
+        assert_eq!(shown.value, json!("kept"));
+        assert!(!shown.masked);
+        assert_eq!(
+            shown.needs_review_detail.as_deref(),
+            Some("no longer a port")
+        );
+        assert_eq!(shown.set_by, "tenant-admin");
+        assert_eq!(shown.last_change_at, "1970-01-01T00:03:20Z");
+        assert_eq!(shown.etag, at(300).unix_timestamp_nanos().to_string());
+
+        // A flagged secret is still a secret: the review listing shows that
+        // one exists and needs attention, never what it holds.
+        let secret = render_flagged("k", &stored("secret", tenant), root, true);
+        assert_eq!(secret.value, json!(MASK_TOKEN));
+        assert!(secret.masked);
+        assert_eq!(
+            secret.needs_review_detail.as_deref(),
+            Some("no longer a port")
+        );
+    }
+
+    #[test]
+    fn a_secret_row_holds_no_inline_value_and_still_renders_masked() {
+        // A `secret` row keeps its plaintext in the Credential Store, so the
+        // inline column is empty. Rendering must not produce a null value a
+        // client would show as "unset".
+        let tenant = Uuid::from_u128(4);
+        let mut row = stored("secret", tenant);
+        row.value = None;
+        row.secret_ref = Some("settings/abc/def".to_owned());
+
+        let dto = render_flagged("k", &row, Uuid::from_u128(1), true);
+        assert_eq!(dto.value, json!(MASK_TOKEN));
+        assert!(dto.masked);
+        let wire = serde_json::to_string(&dto).expect("serializes");
+        assert!(!wire.contains("settings/abc/def"), "{wire}");
+    }
+}

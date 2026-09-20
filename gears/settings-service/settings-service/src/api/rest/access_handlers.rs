@@ -245,3 +245,7 @@ pub async fn list_access(
     }))
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
 }
+
+#[cfg(test)]
+#[path = "access_handlers_tests.rs"]
+mod access_handlers_tests;
