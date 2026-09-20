@@ -743,6 +743,76 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
     );
 }
 
+/// No new work starts once the deadline is gone.
+///
+/// Every request opens with an absolute budget and, until now, only the
+/// embedding and type-evolution loops ever looked at it. A traversal whose
+/// ten seconds elapsed on its first hop went on issuing the rest; a
+/// producer-sized ingest went on issuing tens of thousands of statements
+/// inside one transaction, holding one connection from a pool the whole
+/// tenant shares. The client had stopped waiting either way.
+///
+/// A zero budget is the deadline already gone, which is the state every
+/// expired request passes through -- and the only one a test can be in
+/// deterministically, since waiting for a real ten seconds to elapse is a
+/// test that measures the machine.
+#[tokio::test]
+async fn no_new_work_starts_after_the_budget_is_spent() {
+    let expired = GraphStorageConfig {
+        deadline_interactive_secs: 0,
+        ..GraphStorageConfig::default()
+    };
+    // The bound is one second, so the config has to be built past its own
+    // validation -- which is the point: this state is not configurable, it is
+    // what every request becomes on its way out.
+    assert!(
+        expired.validate().is_err(),
+        "a zero deadline is not a configuration anyone can set"
+    );
+
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), expired);
+    let ctx = harness.ctx();
+
+    harness.seed_ontology(&ctx).await;
+    let refused = harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![
+                    conformance::node("late-a", "a"),
+                    conformance::node("late-b", "b"),
+                ],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect_err("an ingest does not start under a spent budget");
+    assert!(
+        matches!(refused, DomainError::Deadline),
+        "expected a deadline refusal, got {refused}"
+    );
+
+    let refused = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["late-a".to_owned()],
+                depth: 2,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(10),
+            },
+        )
+        .await
+        .expect_err("a compound read does not start under a spent budget");
+    assert!(
+        matches!(refused, DomainError::Deadline),
+        "expected a deadline refusal, got {refused}"
+    );
+}
+
 /// A store that declares it has no snapshots is taken at its word.
 ///
 /// The declaration existed and the service ignored it: it opened a handle

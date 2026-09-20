@@ -82,6 +82,21 @@ pub async fn walk(
         if frontier.is_empty() || truncated.is_some() {
             break;
         }
+        // A hop not started is work not done. The request opened with an
+        // absolute budget and every hop is a fresh round of statements, so
+        // this is the last moment the walk can decline to spend more of a
+        // deadline that is already gone -- otherwise a client whose ten
+        // seconds elapsed on the first hop still pays for the rest, and so do
+        // the other tenants sharing the pool.
+        //
+        // Answered as `deadline_exceeded` rather than as a truncated result
+        // on purpose. The other budgets here are capacities the caller chose
+        // and can reason about; a clock is not, and a partial answer that
+        // would have been complete on a quieter server is not something a
+        // caller can plan around.
+        if ctx.budget.is_exhausted() {
+            return Err(DomainError::Deadline);
+        }
         let response = engine
             .expand(
                 ctx,

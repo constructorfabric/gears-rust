@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeSpec, EffectiveTraits, GraphRevision, IngestCounts,
-    IngestOutcome, IngestRequest, ItemError, ItemFamily, ItemOutcome, NodeSpec, ReplaceScope,
-    Subject,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, ItemOutcome, NodeSpec, RemainingBudget,
+    ReplaceScope, Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
@@ -298,6 +298,7 @@ pub async fn ingest(
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
     let subject = ctx.subject.clone();
+    let budget = ctx.budget;
     // The producer is the writing principal, not a placeholder: the
     // idempotency key is documented as tenant- *and* producer-scoped, and a
     // scope's canonical identity includes its owning producer (Concurrent
@@ -321,6 +322,7 @@ pub async fn ingest(
                         tenant,
                         scope: &scope,
                         subject: &subject,
+                        budget,
                     },
                     &producer,
                     tx,
@@ -344,6 +346,15 @@ struct Writer<'a> {
     tenant: Uuid,
     scope: &'a AccessScope,
     subject: &'a Subject,
+    /// What is left of the request's absolute deadline.
+    ///
+    /// A producer-sized batch is tens of thousands of sequential statements
+    /// inside one transaction holding one pool connection, so "the deadline
+    /// passed" has to be able to stop it between items. It cannot stop a
+    /// statement already in flight -- that needs a server-side bound
+    /// toolkit-db does not offer yet (gears-rust #4761) -- but it can stop
+    /// the gear from starting the next ten thousand.
+    budget: RemainingBudget,
 }
 
 async fn ingest_in_tx(
@@ -1477,6 +1488,11 @@ async fn write_nodes(
 ) -> Result<bool, GraphStoreError> {
     let mut changed = false;
     for (index, spec) in request.nodes.iter().enumerate() {
+        // Between items, not inside one: an item half written is not a state
+        // this store has, and the transaction is what guarantees that.
+        if w.budget.is_exhausted() {
+            return Err(GraphStoreError::Deadline);
+        }
         let info = types.get(&spec.type_id).ok_or_else(|| {
             item_error(
                 index,
@@ -1588,6 +1604,9 @@ async fn write_edges(
     let mut changed = false;
 
     for (index, spec) in request.edges.iter().enumerate() {
+        if w.budget.is_exhausted() {
+            return Err(GraphStoreError::Deadline);
+        }
         let info = types.get(&spec.type_id).ok_or_else(|| {
             item_error(
                 index,

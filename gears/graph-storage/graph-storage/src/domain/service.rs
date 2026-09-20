@@ -945,6 +945,12 @@ impl GraphServices {
         // bracketed by a revision read instead, which turns "the arms may
         // disagree" from an invisible property into a reported one.
         let snapshot_ctx = self.store_ctx(auth, None);
+        // Before the first statement, not before the second hop: seed
+        // resolution is a query too, and a read that starts at all under a
+        // spent deadline is work nobody is waiting for.
+        if snapshot_ctx.budget.is_exhausted() {
+            return Err(DomainError::Deadline);
+        }
         if !self.store.capabilities().snapshots {
             let before = self.store.revision(&snapshot_ctx).await?;
             let mut result = self
