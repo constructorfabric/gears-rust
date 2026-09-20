@@ -1052,14 +1052,31 @@ impl GraphServices {
         // `item_max_bytes` each is gigabytes at the hard limits, and every
         // individual number in that is legal -- so the arm whose count
         // ceiling does not fit inside `response_max_bytes` measures instead.
-        // The projection page and the search arms do fit, which is checked
-        // once at startup rather than per request.
+        // The projection page, the search arms and a node read do fit, which
+        // is checked once at startup rather than per request.
         //
-        // The cut happens before the edge filter below, so edges follow the
-        // nodes that survived it rather than dangling.
-        let mut spent: u64 = 0;
-        let mut over_bytes = false;
+        // **Seeds are exempt, exactly as they are from the filter above.**
+        // The response echoes the seeds it admitted, so a seed cut here
+        // leaves the answer naming a node that is not in it -- and the
+        // contract says seeds always survive truncation. When the seeds alone
+        // do not fit there is no honest truncation left to make, and the read
+        // is refused rather than answered with something that breaks its own
+        // promise.
         let budget = self.config.response_max_bytes;
+        let mut spent: u64 = nodes
+            .iter()
+            .filter(|view| seed_keys.contains(view.node_key.as_str()))
+            .map(hydrated_bytes)
+            .sum();
+        if spent > budget {
+            return Err(DomainError::LimitExceeded {
+                what: format!(
+                    "the seeds alone hydrate to {spent} bytes; response_max_bytes is \
+                     {budget}. Ask for fewer seeds, or for a narrower node type set"
+                ),
+            });
+        }
+        let mut over_bytes = false;
         nodes.retain(|view| {
             if over_bytes {
                 return false;
@@ -1071,11 +1088,6 @@ impl GraphServices {
             }
             true
         });
-        let truncated = if over_bytes {
-            Some(graph_storage_sdk::models::TruncationReason::ResponseBytes)
-        } else {
-            result.truncated
-        };
 
         // An edge whose endpoint the filter removed goes with it. The
         // filter's whole purpose is that those nodes are not part of the
@@ -1086,7 +1098,7 @@ impl GraphServices {
         // nodes, and it is returned when both are visible.
         let surviving: std::collections::BTreeSet<&str> =
             nodes.iter().map(|view| view.node_key.as_str()).collect();
-        let edges: Vec<_> = result
+        let mut edges: Vec<_> = result
             .edges
             .iter()
             .filter(|edge| {
@@ -1094,6 +1106,33 @@ impl GraphServices {
             })
             .cloned()
             .collect();
+
+        // Edges pay too. Measuring the nodes and appending the edges for free
+        // is a budget on half the answer, and the half it leaves out is the
+        // one that grows fastest: a dense neighbourhood has many more edges
+        // than nodes, and each carries four caller-controlled strings.
+        //
+        // Cut after the nodes rather than before, because the asymmetry runs
+        // that way: an edge without its endpoints is a line drawn to nothing,
+        // while a node without some of its edges is simply a node with fewer
+        // edges.
+        edges.retain(|edge| {
+            if over_bytes {
+                return false;
+            }
+            spent = spent.saturating_add(edge_bytes(edge));
+            if spent > budget {
+                over_bytes = true;
+                return false;
+            }
+            true
+        });
+
+        let truncated = if over_bytes {
+            Some(graph_storage_sdk::models::TruncationReason::ResponseBytes)
+        } else {
+            result.truncated
+        };
 
         Ok(TraversalResponse {
             // Overwritten by the caller when the store declines snapshots.
@@ -1173,4 +1212,9 @@ fn row_bytes(row: &NodeRow) -> u64 {
         .saturating_add(row.node_key.len() as u64)
         .saturating_add(row.type_id.len() as u64)
         .saturating_add(row.name.as_ref().map_or(0, |name| name.len() as u64))
+}
+
+/// What one traversed edge costs to carry: four caller-controlled strings.
+fn edge_bytes(edge: &graph_storage_sdk::models::EdgeRef) -> u64 {
+    (edge.edge_key.len() + edge.edge_type_id.len() + edge.src.len() + edge.dst.len()) as u64
 }

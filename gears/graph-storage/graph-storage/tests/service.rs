@@ -1086,6 +1086,153 @@ async fn an_oversized_hit_list_is_cut_and_reported() {
     );
 }
 
+/// The edges are charged to the budget rather than carried for free.
+///
+/// The first version measured the nodes and appended the edges afterwards,
+/// which is a budget on half the answer -- and on the half that grows
+/// fastest, since a dense neighbourhood has many more edges than nodes and
+/// each carries four caller-controlled strings.
+///
+/// The seed invariant is asserted here too, but it is not what this case
+/// proves. Seeds are hydrated at the front of the list, so a cut reaches one
+/// only when the seeds do not fit at all -- which is
+/// `seeds_that_cannot_fit_the_budget_are_refused`, and that case does fail
+/// without the exemption.
+#[tokio::test]
+async fn the_byte_budget_charges_the_edges_too() {
+    /// The star's leaves. Enough of them that the edges outweigh the nodes,
+    /// which is the whole point of the fixture.
+    const LEAVES: usize = 8;
+
+    // A star with small nodes: every node fits comfortably, so whatever the
+    // budget cuts is the edges and only the edges. A chain of fat nodes
+    // cannot show this -- there the node cut removes endpoints and the edge
+    // filter drops their edges as a consequence, which looks identical from
+    // the outside whether or not the edges were ever charged.
+    // Nine small nodes are a few hundred bytes; eight edges are more, because
+    // an edge carries two keys and two GTS identifiers while a node carries
+    // one of each and no adjacency (traversal hydration does not fill it).
+    let small = GraphStorageConfig {
+        response_max_bytes: 1_536,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let mut nodes = vec![conformance::node("hub", "hub")];
+    let mut edges = Vec::new();
+    for index in 0..LEAVES {
+        let leaf = format!("leaf-{index}");
+        edges.push(conformance::edge("hub", &leaf));
+        nodes.push(conformance::node(&leaf, &leaf));
+    }
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["hub".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(100),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+
+    let returned: std::collections::BTreeSet<&str> =
+        walked.nodes.iter().map(|n| n.node_key.as_str()).collect();
+    for seed in &walked.seeds {
+        assert!(
+            returned.contains(seed.as_str()),
+            "a seed the answer names is a seed the answer contains: {seed} not in {returned:?}"
+        );
+    }
+    assert_eq!(
+        walked.nodes.len(),
+        LEAVES + 1,
+        "every node fits, so the nodes are not what the budget cut: {returned:?}"
+    );
+    assert!(
+        walked.edges.len() < LEAVES,
+        "the edges are what it cut, which is only possible if they were \
+         charged: {} of {LEAVES}",
+        walked.edges.len()
+    );
+    assert_eq!(
+        walked.truncated,
+        Some(TruncationReason::ResponseBytes),
+        "and the cut is reported"
+    );
+    for edge in &walked.edges {
+        assert!(
+            returned.contains(edge.src.as_str()) && returned.contains(edge.dst.as_str()),
+            "an edge names two returned nodes: {edge:?}"
+        );
+    }
+}
+
+/// Seeds that do not fit are a refusal, not a silent short answer.
+///
+/// Seeds are exempt from the cut, so when they alone exceed the budget there
+/// is no honest truncation left to make: answering would break the promise
+/// the exemption exists to keep.
+#[tokio::test]
+async fn seeds_that_cannot_fit_the_budget_are_refused() {
+    let tiny = GraphStorageConfig {
+        response_max_bytes: 2 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), tiny);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "w".repeat(1_500);
+    let fat = |key: &str| NodeSpec {
+        payload: Some(serde_json::json!({ "note": filler })),
+        ..conformance::node(key, key)
+    };
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(vec![fat("s-1"), fat("s-2")], Vec::new()),
+        )
+        .await
+        .expect("the batch commits");
+
+    let refused = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["s-1".to_owned(), "s-2".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(10),
+            },
+        )
+        .await
+        .expect_err("two seeds larger than the budget cannot be answered");
+    assert!(
+        matches!(refused, DomainError::LimitExceeded { .. }),
+        "expected a bound refusal, got {refused}"
+    );
+    assert!(
+        refused.to_string().contains("the seeds alone"),
+        "the refusal says which part did not fit: {refused}"
+    );
+}
+
 /// A batch is bounded by its total size, not only by its counts.
 ///
 /// Every per-item check can pass for a request no process survives: fifty

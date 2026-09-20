@@ -301,6 +301,34 @@ impl GraphStorageConfig {
                 self.payload_max_bytes, self.item_max_bytes
             ));
         }
+        if u64::from(self.item_max_bytes) > self.ingest_max_bytes {
+            errors.push(format!(
+                "item_max_bytes ({}) exceeds ingest_max_bytes ({}): a batch could never \
+                 carry even one item that large",
+                self.item_max_bytes, self.ingest_max_bytes
+            ));
+        }
+        // A node read is one element plus its adjacency, and the adjacency is
+        // the half that grows: every entry carries an edge key, an edge type,
+        // a neighbour key and a neighbour type, each of them a
+        // caller-controlled identifier. Bounded by a count alone it is the
+        // same shape of gap as a page bounded by a count alone, and it has no
+        // runtime measure behind it -- the ceiling is small and fixed, which
+        // is exactly when a startup check is the right instrument.
+        let entry = 4u64.saturating_mul(u64::from(self.identifier_max_bytes));
+        let node_read = u64::from(self.item_max_bytes)
+            .saturating_add(u64::from(self.node_read_max_adjacency).saturating_mul(entry));
+        if node_read > self.response_max_bytes {
+            errors.push(format!(
+                "one node read is up to {node_read} bytes -- item_max_bytes ({}) plus \
+                 node_read_max_adjacency ({}) entries of four identifiers each \
+                 ({}) -- above response_max_bytes ({})",
+                self.item_max_bytes,
+                self.node_read_max_adjacency,
+                self.identifier_max_bytes,
+                self.response_max_bytes
+            ));
+        }
         for (what, count) in [
             ("projection_max_page", u64::from(self.projection_max_page)),
             // Both arms of a hybrid search, fused.
@@ -395,6 +423,41 @@ mod tests {
             Ok(()) => panic!("an item that could never hold its own payload must be refused"),
         };
         assert!(message.contains("payload_max_bytes"), "{message}");
+    }
+
+    /// One legal item larger than the whole legal batch.
+    #[test]
+    fn an_item_ceiling_above_the_batch_ceiling_is_refused() {
+        let cfg = GraphStorageConfig {
+            item_max_bytes: 4 * 1024 * 1024,
+            ingest_max_bytes: 1_048_576,
+            ..GraphStorageConfig::default()
+        };
+        let message = match cfg.validate() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("a batch that could never carry one item must be refused"),
+        };
+        assert!(message.contains("ingest_max_bytes"), "{message}");
+    }
+
+    /// A node read is an element *plus its adjacency*, and the adjacency is
+    /// what grows. Bounded by a count alone it is the same gap as a page
+    /// bounded by a count alone -- and unlike traversal it has no runtime
+    /// measure behind it, so the startup check is the whole guard.
+    #[test]
+    fn an_unbounded_node_read_is_refused_at_startup() {
+        let cfg = GraphStorageConfig {
+            identifier_max_bytes: 65_536,
+            response_max_bytes: 1_048_576,
+            node_read_max_adjacency: 1_000,
+            ..GraphStorageConfig::default()
+        };
+        let message = match cfg.validate() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("a quarter-gigabyte node read must be refused"),
+        };
+        assert!(message.contains("node_read_max_adjacency"), "{message}");
+        assert!(message.contains("response_max_bytes"), "{message}");
     }
 
     #[test]
