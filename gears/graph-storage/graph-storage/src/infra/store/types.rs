@@ -937,9 +937,18 @@ pub async fn list_types(
         }
         // Each pass is a fresh statement, so this loop has the same shape as
         // a traversal's hops and the same rule applies: a pass not started is
-        // work not done. The page already gathered is not thrown away -- the
-        // cap's own continuation cursor covers it -- but nothing new begins.
-        super::admit_deadline(ctx)?;
+        // work not done.
+        //
+        // Unlike a traversal it *breaks* rather than failing, and the
+        // difference is the cursor. A catalogue page is already allowed to be
+        // short and to carry a continuation, so stopping early is an answer
+        // the caller can act on rather than a degraded one -- which a partial
+        // traversal is not, having nothing to resume from. Returning the
+        // error here instead would throw away the passes already paid for,
+        // which the comment this replaces claimed it did not.
+        if ctx.budget.is_exhausted() {
+            break;
+        }
         let mut select = gts_type::Entity::find()
             .secure()
             .scope_with(ctx.scope)

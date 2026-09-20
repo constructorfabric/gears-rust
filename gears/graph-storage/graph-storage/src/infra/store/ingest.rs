@@ -1196,7 +1196,9 @@ async fn upsert_edge(
     {
         return Err(GraphStoreError::Conflict {
             reason: format!(
-                "edge `{edge_key}` was declared by scope `{}={}` and may not be                  re-declared under `{attribute}={value}`; a move between scopes is a                  deletion and a re-declaration, not a write",
+                "edge `{edge_key}` was declared by scope `{}={}` and may not be \
+                 re-declared under `{attribute}={value}`; a move between scopes \
+                 is a deletion and a re-declaration, not a write",
                 owner.0, owner.1
             ),
         });

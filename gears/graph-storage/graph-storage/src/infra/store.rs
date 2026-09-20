@@ -69,27 +69,6 @@ impl PgGraphStore {
     }
 }
 
-/// Refuse to start a *chunk* whose deadline is already gone.
-///
-/// Admitting the operation itself is the domain layer's job, once, so every
-/// store gets the rule rather than each implementing it -- putting it here
-/// first made it a property of the built-in store, and the in-memory one went
-/// on answering reads under a spent deadline.
-///
-/// What is left here is what only the store knows: where its loops divide.
-/// A catalogue pass and an ingest item are fresh statements, and a chunk not
-/// started is work not done.
-///
-/// It cannot stop a statement already issued to the server; that needs a
-/// server-side bound toolkit-db does not offer yet (gears-rust #4761). What it
-/// stops is the gear from starting the next one.
-pub(crate) fn admit_deadline(ctx: &StoreCtx<'_>) -> Result<(), GraphStoreError> {
-    if ctx.budget.is_exhausted() {
-        return Err(GraphStoreError::Deadline);
-    }
-    Ok(())
-}
-
 /// Scope failures are a denial, not an internal error: a scope the store
 /// cannot render is a routing signal the gateway resolves.
 #[must_use]

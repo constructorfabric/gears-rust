@@ -462,13 +462,34 @@ async fn migrate_nodes(
                     Expr::value(Option::<i64>::None),
                 );
             }
-            update
-                .filter(Condition::all().add(node::Column::Id.eq(model.id)))
+            // Tied to the row this scan read. The payload written here was
+            // computed from `model`, so a concurrent ingest that changed the
+            // node between the scan and this write would be overwritten by a
+            // migration of content that no longer exists -- and the version
+            // increment alone does not stop that, it only stops two writers
+            // computing the same number. Nothing matching means the row
+            // moved, and a migration that silently skipped it would report a
+            // type fully migrated when it is not.
+            let written = update
+                .filter(
+                    Condition::all()
+                        .add(node::Column::Id.eq(model.id))
+                        .add(node::Column::Version.eq(model.version)),
+                )
                 .secure()
                 .scope_with(who.scope)
                 .exec(tx)
                 .await
                 .map_err(map_scope_err)?;
+            if written.rows_affected == 0 {
+                return Err(GraphStoreError::Conflict {
+                    reason: format!(
+                        "node `{}` was written while this migration was reading it; \
+                         re-run the migration",
+                        model.node_key
+                    ),
+                });
+            }
         }
     }
 }
@@ -539,7 +560,7 @@ async fn migrate_edges(
             if who.dry_run {
                 continue;
             }
-            edge::Entity::update_many()
+            let written = edge::Entity::update_many()
                 .col_expr(edge::Column::Payload, Expr::value(payload))
                 .col_expr(
                     edge::Column::UpdatedAt,
@@ -553,12 +574,31 @@ async fn migrate_edges(
                     edge::Column::UpdatedBySubjectType,
                     Expr::value(who.subject.subject_type.clone()),
                 )
-                .filter(Condition::all().add(edge::Column::Id.eq(model.id)))
+                // An edge carries no version, so the compare-and-set names
+                // the precondition directly: this migration computed its new
+                // payload *from* the one it read, so that payload being
+                // unchanged is exactly what makes the result valid. If a
+                // concurrent ingest rewrote it, the migrated value describes
+                // content that is no longer there.
+                .filter(
+                    Condition::all()
+                        .add(edge::Column::Id.eq(model.id))
+                        .add(edge::Column::Payload.eq(model.payload.clone())),
+                )
                 .secure()
                 .scope_with(who.scope)
                 .exec(tx)
                 .await
                 .map_err(map_scope_err)?;
+            if written.rows_affected == 0 {
+                return Err(GraphStoreError::Conflict {
+                    reason: format!(
+                        "edge `{}` was written while this migration was reading it; \
+                         re-run the migration",
+                        model.edge_key
+                    ),
+                });
+            }
         }
     }
 }
