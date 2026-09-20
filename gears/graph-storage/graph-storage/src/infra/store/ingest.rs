@@ -251,17 +251,30 @@ pub(crate) async fn bump_revision(
     scope: &AccessScope,
     runner: &impl DBRunner,
 ) -> Result<i64, GraphStoreError> {
-    let next = current_revision(scope, runner).await? + 1;
+    // `PostgreSQL` computes the increment from the conflicting row's own
+    // value. This used to read the value, add one in Rust, and write that
+    // number back -- and a read-compute-write loses under concurrency in a way
+    // the row conflict does not save it from. Two transactions mutating
+    // different rows of one tenant both read `N` and both prepare `N + 1`; the
+    // second waits on the conflict, and then writes its own stale `N + 1` over
+    // the committed one. Two distinct committed states, one revision, and the
+    // contract this counter exists for -- a revision advances if and only if
+    // stored state changed -- silently broken. It is easiest to see on a fresh
+    // tenant, where both first writes answer `1`.
+    let incremented = Expr::cust("to_jsonb(((graph_meta.value #>> '{}')::bigint) + 1)");
     let active = graph_meta::ActiveModel {
         tenant_id: ActiveValue::Set(tenant),
         key: ActiveValue::Set(graph_meta::KEY_GRAPH_REVISION.to_owned()),
-        value: ActiveValue::Set(serde_json::json!(next)),
+        // No row yet: the insert stands, and the tenant's first committed
+        // state is revision 1. This path is load-bearing rather than
+        // defensive -- nothing bootstraps the meta rows.
+        value: ActiveValue::Set(serde_json::json!(1)),
     };
     let on_conflict = toolkit_db::secure::SecureOnConflict::<graph_meta::Entity>::columns([
         graph_meta::Column::TenantId,
         graph_meta::Column::Key,
     ])
-    .update_columns([graph_meta::Column::Value])
+    .value(graph_meta::Column::Value, incremented)
     .map_err(map_scope_err)?;
     graph_meta::Entity::insert(active)
         .secure()
@@ -271,7 +284,9 @@ pub(crate) async fn bump_revision(
         .exec(runner)
         .await
         .map_err(map_scope_err)?;
-    Ok(next)
+    // Read back inside the same transaction, which sees the row this
+    // statement just wrote -- whichever of the racing transactions this is.
+    current_revision(scope, runner).await
 }
 
 pub async fn ingest(

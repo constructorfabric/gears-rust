@@ -3242,6 +3242,103 @@ pub async fn two_replacements_of_one_scope_serialize(
     );
 }
 
+/// Two mutations of one tenant never share a revision.
+///
+/// The counter carries the Read Consistency Contract's central promise: a
+/// revision advances if and only if stored state changed, so two reads at one
+/// revision cannot observe different content. A read-compute-write breaks it
+/// without breaking anything visible at the call site -- both ingests answer
+/// success, both answer the same number, and the consumer that keyed a cache
+/// or an event stream on it never learns that the second change happened.
+///
+/// Written as two spawned tasks for the same reason the scope race is: two
+/// futures joined on one task cannot be inside the store at once, and the
+/// sequential interleaving passes whether the increment is atomic or not.
+pub async fn every_committed_mutation_gets_its_own_revision(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    /// Eight writers, not two. Two is enough to describe the race and not
+    /// enough to lose it: the losing interleaving needs the second
+    /// transaction to read the counter before the first commits, and with two
+    /// transactions that window is a few milliseconds of one ingest. Eight
+    /// released together from one barrier overlap reliably -- with the
+    /// read-compute-write in place this case reported five distinct
+    /// revisions for eight commits.
+    const WRITERS: usize = 8;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut tasks = Vec::with_capacity(WRITERS);
+    for index in 0..WRITERS {
+        let store = std::sync::Arc::clone(&store);
+        let gate = std::sync::Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = ctx(tenant, &scope, None);
+            // A distinct row each, so none is a convergent replay and every
+            // one of them is obliged to advance the counter.
+            let key = format!("rev-{index}");
+            let request = batch(vec![node(&key, &key)], Vec::new());
+            gate.wait().await;
+            ingest_batch(store.as_ref(), &ctx, request).await
+        }));
+    }
+
+    let mut revisions = Vec::with_capacity(WRITERS);
+    for task in tasks {
+        let outcome = task
+            .await
+            .expect("the task does not panic")
+            .expect("the ingest commits");
+        revisions.push(outcome.revision.revision);
+    }
+
+    let distinct: std::collections::BTreeSet<i64> = revisions.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        WRITERS,
+        "every committed state gets its own revision, but {WRITERS} commits answered \
+         {revisions:?}"
+    );
+
+    // The counter is a high-water mark, not merely a set of different
+    // numbers: a later mutation is above all of them.
+    let later = ingest_batch(
+        store.as_ref(),
+        &reader,
+        batch(vec![node("rev-last", "last")], Vec::new()),
+    )
+    .await
+    .expect("a later ingest commits");
+    let highest = distinct.iter().copied().next_back().unwrap_or(0);
+    assert!(
+        later.revision.revision > highest,
+        "the revision is monotonic: {} follows {highest}",
+        later.revision.revision
+    );
+
+    // The other half of "if and only if": a replay that changes nothing
+    // leaves the counter where it is.
+    let replay = ingest_batch(
+        store.as_ref(),
+        &reader,
+        batch(vec![node("rev-last", "last")], Vec::new()),
+    )
+    .await
+    .expect("the convergent replay is accepted");
+    assert_eq!(
+        replay.revision.revision, later.revision.revision,
+        "a batch that changed nothing does not advance the revision"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Both node families and both edge families, and the edge read
 // ---------------------------------------------------------------------------

@@ -453,6 +453,21 @@ async fn two_replacements_of_one_scope_serialize() {
     .await;
 }
 
+/// Written out rather than `pg_case!`d, for the same reason as the scope
+/// race: the two ingests are spawned as separate tasks and need a runtime
+/// with threads to put them on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_committed_mutation_gets_its_own_revision() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::every_committed_mutation_gets_its_own_revision(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 pg_case!(
     scope_replacement_removes_what_the_batch_no_longer_names,
     conformance::scope_replacement_removes_what_the_batch_no_longer_names

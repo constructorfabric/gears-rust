@@ -365,6 +365,17 @@ async fn two_replacements_of_one_scope_serialize() {
     .await;
 }
 
+/// Multi-threaded and spawned for the same reason as the scope race above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_committed_mutation_gets_its_own_revision() {
+    conformance::every_committed_mutation_gets_its_own_revision(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 // --- both families, and the edge read -----------------------------------------
 
 #[tokio::test]
