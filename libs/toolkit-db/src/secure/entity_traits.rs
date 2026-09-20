@@ -358,6 +358,28 @@ pub trait ScopeProperties: ScopableEntity {
          write guards that ask for its column would skip themselves in silence"
     );
 
+    /// Compile-time proof that an unrestricted entity scopes on nothing.
+    ///
+    /// [`IS_UNRESTRICTED`](ScopableEntity::IS_UNRESTRICTED) and the table are
+    /// read by different halves of this module and would disagree in silence:
+    /// `validate_insert_scope` returns `Ok` for any unrestricted entity, so
+    /// every write skips scope validation, while the read path compiles the
+    /// table as it finds it and keeps filtering by tenant. An entity that set
+    /// the flag and still named `owner_tenant_id` would be readable per tenant
+    /// and writable by anyone.
+    ///
+    /// `#[derive(Scopable)]` cannot produce that pair -- `unrestricted` forbids
+    /// every other attribute and emits an empty table -- so this is the rule
+    /// for a hand-written implementation, the same audience as
+    /// [`DIMENSIONS_ARE_DECLARED`](Self::DIMENSIONS_ARE_DECLARED).
+    const UNRESTRICTED_SCOPES_ON_NOTHING: () = assert!(
+        !Self::IS_UNRESTRICTED || Self::SCOPE_PROPERTIES.is_empty(),
+        "an entity that sets IS_UNRESTRICTED must declare an empty \
+         SCOPE_PROPERTIES: insert-time scope validation is skipped for it \
+         entirely, while the read path would still compile every property the \
+         table names"
+    );
+
     /// Resolve an authorization property name to a database column.
     ///
     /// Maps PEP property names (e.g. `"owner_tenant_id"`) to `SeaORM` columns
@@ -372,6 +394,7 @@ pub trait ScopeProperties: ScopableEntity {
     fn resolve_property(property: &str) -> Option<Self::Column> {
         const { Self::PROPERTIES_ARE_UNIQUE }
         const { Self::DIMENSIONS_ARE_DECLARED }
+        const { Self::UNRESTRICTED_SCOPES_ON_NOTHING }
         Self::SCOPE_PROPERTIES
             .iter()
             .find(|(name, _)| *name == property)
@@ -392,6 +415,7 @@ pub trait ScopeProperties: ScopableEntity {
     fn scope_columns() -> Vec<Self::Column> {
         const { Self::PROPERTIES_ARE_UNIQUE }
         const { Self::DIMENSIONS_ARE_DECLARED }
+        const { Self::UNRESTRICTED_SCOPES_ON_NOTHING }
         Self::SCOPE_PROPERTIES
             .iter()
             .map(|(_, column)| *column)
@@ -560,42 +584,52 @@ mod tests {
         );
     }
 
-    /// The property this change exists for (#4726): the lookup and the list are
-    /// two views of one table, so an entity cannot answer for a property whose
-    /// column the list omits, nor list a column no property resolves to.
+    /// Each dimension accessor answers with the column its well-known property
+    /// names, and with `None` when the table names no such property.
     ///
-    /// Checked for the derive and for a hand-written implementation, because
-    /// those were the two places that could drift when the two were written
-    /// separately.
+    /// The accessors are the only readers of the table that a caller reaches by
+    /// name rather than by property, and `owner_col` had no assertion at all:
+    /// wiring it to the wrong property name, or to `None`, passed every test in
+    /// the repo while `insert_from_select_allowed` -- its one production
+    /// caller -- would have let an owner-scoped entity through.
+    ///
+    /// Written per entity rather than as a loop over the table, so that a
+    /// change to how the accessors read it cannot make the expectation change
+    /// with them.
     #[test]
-    fn the_lookup_and_the_list_are_two_views_of_one_table() {
-        fn check<E: ScopableEntity>(what: &str) {
-            let table = table_of::<E>();
-            let listed = listed_columns::<E>();
-            assert_eq!(
-                listed.len(),
-                table.len(),
-                "{what}: the list must have one column per table entry"
-            );
-            for (index, (property, column)) in table.iter().enumerate() {
-                assert_eq!(
-                    E::resolve_property(property).map(|c| c.as_str()),
-                    Some(*column),
-                    "{what}: the lookup must answer every property the table declares"
-                );
-                assert_eq!(
-                    listed[index], *column,
-                    "{what}: the list must carry every column the table declares"
-                );
-            }
-        }
+    fn each_dimension_accessor_answers_from_the_table() {
+        assert_eq!(
+            derived::Entity::tenant_col().map(|c| c.as_str()),
+            Some("tenant_id")
+        );
+        assert_eq!(
+            derived::Entity::resource_col().map(|c| c.as_str()),
+            Some("id")
+        );
+        assert_eq!(
+            derived::Entity::owner_col().map(|c| c.as_str()),
+            Some("owner_id")
+        );
 
-        check::<derived::Entity>("derived");
-        check::<manual::Entity>("manual");
-        // `unrestricted::Entity` is deliberately not walked here: its table is
-        // empty, so the loop runs zero times and the only surviving assertion
-        // is `0 == 0`, which nothing can make fail.
-        // `an_unrestricted_entity_declares_an_empty_table` covers that case.
+        // The hand-written fixture declares no owner, and says so in
+        // `UNSCOPED_DIMENSIONS`. `None` here is that declaration, not silence.
+        assert_eq!(
+            manual::Entity::tenant_col().map(|c| c.as_str()),
+            Some("tenant_id")
+        );
+        assert_eq!(
+            manual::Entity::resource_col().map(|c| c.as_str()),
+            Some("id")
+        );
+        assert_eq!(manual::Entity::owner_col().map(|c| c.as_str()), None);
+
+        // And an unrestricted entity answers `None` for all three.
+        assert_eq!(unrestricted::Entity::tenant_col().map(|c| c.as_str()), None);
+        assert_eq!(
+            unrestricted::Entity::resource_col().map(|c| c.as_str()),
+            None
+        );
+        assert_eq!(unrestricted::Entity::owner_col().map(|c| c.as_str()), None);
     }
 
     /// A column two properties both name is reported once per entry, and the

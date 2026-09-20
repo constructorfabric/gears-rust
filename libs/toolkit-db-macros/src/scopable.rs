@@ -207,6 +207,45 @@ fn generate_scope_properties(config: &SecureConfig, span: Span) -> TokenStream {
     }
 }
 
+/// The first attribute `unrestricted` forbids, if the entity wrote one.
+///
+/// `unrestricted` means the entity scopes on nothing, so every other
+/// `#[secure(...)]` attribute contradicts it. The rule lives here alone: it
+/// used to be checked a second time while parsing, which read
+/// `config.unrestricted` and therefore only fired for an attribute written
+/// *after* `unrestricted`. Which of the two diagnostics a user saw depended on
+/// writing order, and one of them named the attribute while the other named
+/// `unrestricted`.
+///
+/// The order below is fixed rather than source order, so the same
+/// configuration always reports the same attribute.
+fn first_other_attribute(config: &SecureConfig) -> Option<(&'static str, Span)> {
+    let dimensions: [(&'static str, Option<Span>); 8] = [
+        ("tenant_col", config.tenant_col.as_ref().map(|(_, s)| *s)),
+        ("no_tenant", config.no_tenant),
+        (
+            "resource_col",
+            config.resource_col.as_ref().map(|(_, s)| *s),
+        ),
+        ("no_resource", config.no_resource),
+        ("owner_col", config.owner_col.as_ref().map(|(_, s)| *s)),
+        ("no_owner", config.no_owner),
+        ("type_col", config.type_col.as_ref().map(|(_, s)| *s)),
+        ("no_type", config.no_type),
+    ];
+
+    for (attribute, span) in dimensions {
+        if let Some(span) = span {
+            return Some((attribute, span));
+        }
+    }
+
+    config
+        .pep_props
+        .first()
+        .map(|(_, _, span)| ("pep_prop", *span))
+}
+
 /// Validate the configuration for strict compile-time checks
 fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()> {
     let struct_span = input.span();
@@ -220,21 +259,11 @@ fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()
     // `expand_derive_scopable`, which emits an empty `SCOPE_PROPERTIES` -- so
     // the property was dropped in silence and the entity came out fully
     // unscoped. Attribute order decided whether that was a hard error.
-    if let Some(unrestricted_span) = config.unrestricted {
-        let has_other = config.tenant_col.is_some()
-            || config.no_tenant.is_some()
-            || config.resource_col.is_some()
-            || config.no_resource.is_some()
-            || config.owner_col.is_some()
-            || config.no_owner.is_some()
-            || config.type_col.is_some()
-            || config.no_type.is_some()
-            || !config.pep_props.is_empty();
-
-        if has_other {
+    if config.unrestricted.is_some() {
+        if let Some((attribute, span)) = first_other_attribute(config) {
             return Err(syn::Error::new(
-                unrestricted_span,
-                "When using 'unrestricted', no other column attributes are allowed",
+                span,
+                format!("secure: '{attribute}' cannot be used with 'unrestricted'"),
             ));
         }
         return Ok(()); // Valid unrestricted config
@@ -302,23 +331,7 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
             ));
         }
 
-        // Check the column name forms a usable column variant.
-        //
-        // `syn::Ident::new` panics on anything that is not a valid Rust
-        // identifier, which aborts expansion with a bare `proc macro panicked`
-        // and no span at all. Every other bad input here gets a spanned error;
-        // the column name was the last one that could still crash the macro
-        // instead of reporting.
-        let variant = snake_to_upper_camel(column);
-        if !is_ident(&variant) {
-            return Err(syn::Error::new(
-                *span,
-                format!(
-                    "pep_prop: column name '{column}' does not form a valid column variant \
-                     ('{variant}'); use a snake_case identifier"
-                ),
-            ));
-        }
+        validate_column_name("pep_prop", column, *span)?;
 
         // Check for duplicate property names
         if !seen.insert(property.clone()) {
@@ -330,6 +343,30 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
     }
 
     Ok(())
+}
+
+/// Check that `column` forms a usable `Self::Column` variant.
+///
+/// `syn::Ident::new` panics on anything that is not a valid Rust identifier,
+/// which aborts expansion with a bare `proc macro panicked` and no span at all.
+/// Every other bad input to `#[secure(...)]` gets a spanned error, and every
+/// column name reaches `Ident::new`: the four dimensions through
+/// `generate_col_impl` and `generate_scope_properties`, the `pep_prop` entries
+/// through the latter. So the check belongs to all of them, not to one.
+///
+/// `what` names the attribute for the message -- `tenant_col`, `pep_prop`.
+fn validate_column_name(what: &str, column: &str, span: Span) -> syn::Result<()> {
+    let variant = snake_to_upper_camel(column);
+    if is_ident(&variant) {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "{what}: column name '{column}' does not form a valid column variant \
+             ('{variant}'); use a snake_case identifier"
+        ),
+    ))
 }
 
 /// Whether `s` is a valid Rust identifier.
@@ -366,10 +403,12 @@ fn validate_dimension(
             let msg = format!("secure: specify either `{name}_col` or `no_{name}`, not both");
             Err(syn::Error::new(*col_span, msg))
         }
-        _ => {
-            // Valid: exactly one is specified
-            Ok(())
+        (Some((column, col_span)), None) => {
+            // Exactly one is specified, and it names a column. The name still
+            // has to survive `Ident::new`.
+            validate_column_name(&format!("{name}_col"), column, *col_span)
         }
+        (None, Some(_)) => Ok(()),
     }
 }
 
@@ -395,12 +434,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_tenant") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_tenant' with 'unrestricted'",
-                    ));
-                }
                 if config.no_tenant.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_tenant'"));
                 }
@@ -415,12 +448,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_resource") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_resource' with 'unrestricted'",
-                    ));
-                }
                 if config.no_resource.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_resource'"));
                 }
@@ -435,12 +462,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_owner") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_owner' with 'unrestricted'",
-                    ));
-                }
                 if config.no_owner.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_owner'"));
                 }
@@ -455,12 +476,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_type") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_type' with 'unrestricted'",
-                    ));
-                }
                 if config.no_type.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_type'"));
                 }
@@ -476,12 +491,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
 
             // Check for pep_prop(name = "column") — nested meta with parentheses
             if meta.path.is_ident("pep_prop") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'pep_prop' with 'unrestricted'",
-                    ));
-                }
                 meta.parse_nested_meta(|pep_meta| {
                     let property = pep_meta
                         .path
@@ -536,12 +545,6 @@ fn parse_key_value_attr(
 
     match key.as_str() {
         "tenant_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'tenant_col' with 'unrestricted'",
-                ));
-            }
             if config.tenant_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'tenant_col'"));
             }
@@ -554,12 +557,6 @@ fn parse_key_value_attr(
             config.tenant_col = Some((value, span));
         }
         "resource_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'resource_col' with 'unrestricted'",
-                ));
-            }
             if config.resource_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'resource_col'"));
             }
@@ -572,12 +569,6 @@ fn parse_key_value_attr(
             config.resource_col = Some((value, span));
         }
         "owner_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'owner_col' with 'unrestricted'",
-                ));
-            }
             if config.owner_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'owner_col'"));
             }
@@ -590,12 +581,6 @@ fn parse_key_value_attr(
             config.owner_col = Some((value, span));
         }
         "type_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'type_col' with 'unrestricted'",
-                ));
-            }
             if config.type_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'type_col'"));
             }

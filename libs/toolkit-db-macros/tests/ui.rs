@@ -16,6 +16,8 @@ fn ui() {
     t.compile_fail("tests/ui/err_unknown_attr.rs");
     t.compile_fail("tests/ui/err_non_struct.rs");
     t.compile_fail("tests/ui/err_duplicate_tenant_col.rs");
+    t.compile_fail("tests/ui/err_dimension_column_not_an_identifier.rs");
+    t.compile_fail("tests/ui/err_dimension_column_empty.rs");
 
     // Error cases: Missing explicit decisions
     t.compile_fail("tests/ui/err_missing_tenant_decision.rs");
@@ -30,6 +32,7 @@ fn ui() {
     // Error cases: Unrestricted with other flags
     t.compile_fail("tests/ui/err_unrestricted_with_tenant.rs");
     t.compile_fail("tests/ui/err_unrestricted_with_resource.rs");
+    t.compile_fail("tests/ui/err_unrestricted_after_tenant.rs");
 
     // Error cases: pep_prop validation
     t.compile_fail("tests/ui/err_pep_reserved_owner_tenant_id.rs");

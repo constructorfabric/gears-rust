@@ -304,6 +304,18 @@ where
 /// Only an entity that declares no scope column at all may be written this
 /// way.
 ///
+/// Asked of the table, not of the three dimension accessors. They answer for
+/// the well-known properties only, so an entity declared `no_tenant,
+/// no_resource, no_owner, no_type, pep_prop(department_id = "department_id")`
+/// gives `None` four times while declaring a scope column all the same -- and
+/// this path exists precisely because rows produced inside the database cannot
+/// be validated against a scope per row. The Policy 2 gates in
+/// [`crate::secure::pgq`] ask the same question of the same const, for the
+/// same reason.
+///
+/// `type_col` is still asked separately: it has no property name, so it is the
+/// one dimension the table cannot carry.
+///
 /// # Errors
 ///
 /// `ScopeError::Invalid` when `E` declares any scope column.
@@ -311,11 +323,7 @@ fn insert_from_select_allowed<E>() -> Result<(), ScopeError>
 where
     E: ScopableEntity + EntityTrait,
 {
-    if E::tenant_col().is_some()
-        || E::resource_col().is_some()
-        || E::owner_col().is_some()
-        || E::type_col().is_some()
-    {
+    if !E::SCOPE_PROPERTIES.is_empty() || E::type_col().is_some() {
         return Err(ScopeError::Invalid(
             "insert-from-select is limited to entities without scope columns: \
              rows produced inside the database cannot be validated per row",
@@ -1379,6 +1387,51 @@ mod tests {
         // shape this helper exists for.
         insert_from_select_allowed::<unscoped_entity::Entity>()
             .expect("an entity with no scope columns must be allowed");
+    }
+
+    /// The gate answers for a scope column the three dimension accessors cannot
+    /// see. `no_tenant, no_resource, no_owner, no_type` plus one `pep_prop` is
+    /// the shape: four `None`s, and a column a scope can still constrain.
+    #[test]
+    fn insert_from_select_refuses_an_entity_scoped_only_by_a_pep_prop() {
+        use pep_prop_entity::Entity;
+
+        assert!(
+            <Entity as ScopeProperties>::tenant_col().is_none()
+                && <Entity as ScopeProperties>::resource_col().is_none()
+                && <Entity as ScopeProperties>::owner_col().is_none()
+                && Entity::type_col().is_none(),
+            "premise: no dimension accessor answers for this entity"
+        );
+
+        let err = insert_from_select_allowed::<Entity>()
+            .expect_err("a pep_prop is a scope column like any other");
+        assert!(matches!(err, ScopeError::Invalid(_)), "got: {err:?}");
+    }
+
+    /// An entity whose only scope column is a custom PEP property.
+    mod pep_prop_entity {
+        use super::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db_macros::Scopable)]
+        #[sea_orm(table_name = "pep_prop_table")]
+        #[secure(
+            no_tenant,
+            no_resource,
+            no_owner,
+            no_type,
+            pep_prop(department_id = "department_id")
+        )]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: Uuid,
+            pub department_id: Uuid,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
     }
 
     /// A link table: two foreign keys and a value, no identity the scope

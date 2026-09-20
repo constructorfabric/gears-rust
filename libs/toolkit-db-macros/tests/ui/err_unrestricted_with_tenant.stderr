@@ -1,4 +1,4 @@
-error: Cannot use 'tenant_col' with 'unrestricted'
+error: secure: 'tenant_col' cannot be used with 'unrestricted'
  --> tests/ui/err_unrestricted_with_tenant.rs:6:24
   |
 6 | #[secure(unrestricted, tenant_col = "tenant_id")]

@@ -64,10 +64,30 @@
 //!     }
 //! }
 //!
-//! // A scoped entity that happens to scope on nothing: an empty table, and
-//! // all three dimensions declared. `#[secure(unrestricted)]` is the other
-//! // shape -- it sets `IS_UNRESTRICTED` and is exempt from the check.
+//! // A global entity. `IS_UNRESTRICTED` is the part that makes it one.
+//! //
+//! // An empty table on its own is the opposite: no property resolves, so
+//! // every constrained scope compiles to `WHERE false` and
+//! // `validate_insert_scope` denies every write. That is a deny-all entity,
+//! // and it is a legitimate shape -- a link table with no identity of its own
+//! // -- but it is not this one.
 //! impl ScopableEntity for system_config::Entity {
+//!     const IS_UNRESTRICTED: bool = true;
+//!
+//!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+//!
+//!     // Exempt from the dimension check: an entity that scopes on nothing by
+//!     // construction has no dimension left to decide about.
+//!     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
+//!
+//!     fn type_col() -> Option<Self::Column> {
+//!         None
+//!     }
+//! }
+//!
+//! // The deny-all shape, for contrast: the flag stays at its `false` default,
+//! // and the three dimensions are declared rather than left unanswered.
+//! impl ScopableEntity for resource_group_closure::Entity {
 //!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 //!
 //!     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[

@@ -1,0 +1,11 @@
+error: tenant_col: column name '2fa_id' does not form a valid column variant ('2faId'); use a snake_case identifier
+  --> tests/ui/err_dimension_column_not_an_identifier.rs:13:5
+   |
+13 |     tenant_col = "2fa_id",
+   |     ^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/err_dimension_column_not_an_identifier.rs:18:14
+   |
+18 | struct Model;
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/err_dimension_column_not_an_identifier.rs`
