@@ -271,6 +271,109 @@ async fn tenant_on(stand: &Stand) -> Uuid {
     tenant
 }
 
+/// A second pool against the same server, with session parameters of its own.
+///
+/// The DSN is where a gear can reach `PostgreSQL`'s runtime parameters at all:
+/// `DBRunner` exposes no statement surface, so `SET LOCAL` is unavailable to
+/// gear code (gears-rust #4871), and `ConnectOpts` carries pool settings only.
+/// A deployment sets the same things through `params:` in its database
+/// configuration, which toolkit-db forwards to the connection verbatim.
+async fn store_with(stand: &Stand, options: &str) -> Arc<PgGraphStore> {
+    let encoded = options.replace(' ', "%20").replace('=', "%3D");
+    let dsn = format!("{}?options={encoded}", stand.dsn);
+    let db = connect_db(
+        &dsn,
+        ConnectOpts {
+            max_conns: Some(2),
+            min_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("a second pool with `{options}` connects: {error}"));
+    let db = Arc::new(db);
+    let pgq = graph_storage::infra::engine::probe_pgq(&db).await;
+    Arc::new(PgGraphStore::new(db, GraphStorageConfig::default(), pgq))
+}
+
+/// Filtered vector search under-returns without `hnsw.iterative_scan`.
+///
+/// HNSW is an approximate index and pgvector applies filters *after* the
+/// approximate scan, so the tenant predicate this gear always adds removes
+/// candidates that the scan has already spent its budget finding. A small
+/// tenant sharing an index with a large one can therefore get an empty page
+/// while its own matching vectors sit in the table -- and the answer looks
+/// exactly like "there is nothing here", which is the part that makes it
+/// dangerous rather than merely lossy.
+///
+/// `ef_search = 1` and a disabled sequential scan are what make the collapse
+/// reachable in a test instead of at production scale: the same effect needs
+/// tens of thousands of rows at the default of 40, and a fixture that large
+/// would measure the machine rather than the behaviour.
+#[tokio::test]
+async fn a_filtered_vector_search_under_returns_without_iterative_scan() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let crowd = tenant_on(&stand).await;
+    let alone = tenant_on(&stand).await;
+
+    for (tenant, keys) in [
+        (
+            crowd,
+            (0..60).map(|i| format!("crowd-{i}")).collect::<Vec<_>>(),
+        ),
+        (alone, vec!["the-only-one".to_owned()]),
+    ] {
+        let scope = AccessScope::for_tenant(tenant);
+        let ctx = conformance::ctx(tenant, &scope, None);
+        stand
+            .store
+            .register_types(&ctx, conformance::ontology_batch())
+            .await
+            .expect("the ontology registers");
+        let nodes: Vec<_> = keys
+            .iter()
+            .map(|key| conformance::summarized(key, key, key))
+            .collect();
+        conformance::ingest_batch(
+            stand.store.as_ref(),
+            &ctx,
+            conformance::batch(nodes, Vec::new()),
+        )
+        .await
+        .expect("the fixture commits");
+    }
+
+    let scope = AccessScope::for_tenant(alone);
+    let ctx = conformance::ctx(alone, &scope, None);
+    let epoch = conformance::EPOCH;
+    let probe = "a probe that names nothing in particular";
+
+    let strict = store_with(&stand, "-c enable_seqscan=off -c hnsw.ef_search=1").await;
+    let missed = conformance::search_vector(strict.as_ref(), &ctx, probe, epoch).await;
+
+    let iterative = store_with(
+        &stand,
+        "-c enable_seqscan=off -c hnsw.ef_search=1 -c hnsw.iterative_scan=relaxed_order",
+    )
+    .await;
+    let found = conformance::search_vector(iterative.as_ref(), &ctx, probe, epoch).await;
+
+    assert!(
+        missed.is_empty(),
+        "the small tenant's vector is not among the candidates the scan spent \
+         its budget on: {missed:?}"
+    );
+    assert_eq!(
+        found,
+        vec!["the-only-one".to_owned()],
+        "iterative scanning keeps going until the filter has something to \
+         return, which is the difference between a recall setting and a \
+         correctness one"
+    );
+}
+
 /// One conformance case against a live server: bring the stand up, mint a
 /// tenant, run the shared case. The lane skips when `PostgreSQL` 19 is absent.
 macro_rules! pg_case {

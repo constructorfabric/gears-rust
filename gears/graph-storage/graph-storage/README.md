@@ -144,6 +144,29 @@ type-revision history.
   builds its own from [`docker/pg19-pgvector.Dockerfile`](../docker/pg19-pgvector.Dockerfile);
   `test-containers` should publish one. PostgreSQL 16, the documented
   baseline, has no lane at all.
+- *Vector search needs two session parameters the gear cannot set for itself.*
+  HNSW is an approximate index and pgvector applies filters **after** the
+  approximate scan, while every query this gear issues carries a tenant scope,
+  a `deleted_at` predicate, an embedding epoch and optionally a type set. At
+  the default `hnsw.ef_search` of 40 a filter admitting a tenth of the rows
+  leaves about four candidates, so a small tenant sharing an index with a large
+  one can get an empty page while its own matching vectors are in the table --
+  and an empty page is indistinguishable from an empty graph. A deployment
+  serving vector search must therefore set, in its database configuration:
+
+  ```yaml
+  params:
+    hnsw.iterative_scan: relaxed_order   # `strict_order` if exact ordering matters
+    hnsw.ef_search: "200"                # tune against measured selectivity
+  ```
+
+  toolkit-db forwards unrecognized `params` keys to `PostgreSQL` as runtime
+  parameters, which is the only route available: `DBRunner` exposes no
+  statement surface, so the gear cannot issue `SET LOCAL` per query
+  (gears-rust #4871) — and per query is the granularity this actually wants,
+  since an unfiltered search should not pay for iterative scanning.
+  `a_filtered_vector_search_under_returns_without_iterative_scan` demonstrates
+  the collapse and the fix against a live server.
 - *The `remote` embedding provider has no per-tenant egress policy in front of
   it* (ADR-0004 asks for one); it is off by default and sends every tenant's
   node and query text to the one configured endpoint when selected. It also

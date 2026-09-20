@@ -1063,7 +1063,7 @@ pub async fn search_is_scoped(store: &dyn GraphStoreV1, tenant: Uuid) {
 
 /// Query the vector arm the way the domain service does: embed the text with
 /// the same provider ingest used, and rank only the active epoch.
-async fn search_vector(
+pub async fn search_vector(
     store: &(impl GraphStoreV1 + ?Sized),
     ctx: &StoreCtx<'_>,
     text: &str,
@@ -1100,7 +1100,7 @@ async fn search_vector(
         .collect()
 }
 
-fn summarized(key: &str, name: &str, summary: &str) -> NodeSpec {
+pub fn summarized(key: &str, name: &str, summary: &str) -> NodeSpec {
     NodeSpec {
         node_key: key.to_owned(),
         type_id: OWNED.to_owned(),
