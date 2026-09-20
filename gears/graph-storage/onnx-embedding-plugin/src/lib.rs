@@ -136,6 +136,15 @@ pub struct OnnxEmbeddingProvider {
     tokenizer: Tokenizer,
     space: EmbeddingSpaceId,
     config: OnnxProviderConfig,
+    /// What the last real exchange with the session showed, if it failed.
+    ///
+    /// Readiness reports this rather than running inference of its own. A
+    /// probe that embedded something would make an anonymous, scheduled
+    /// endpoint the busiest caller of the model -- the same amplification the
+    /// remote provider is guarded against -- and a probe that only takes the
+    /// lock, which is what this used to do, reports that the weights are
+    /// resident and nothing else.
+    observed: std::sync::Mutex<Option<String>>,
 }
 
 impl OnnxEmbeddingProvider {
@@ -190,12 +199,21 @@ impl OnnxEmbeddingProvider {
             config.dimension,
         );
 
-        Ok(Self {
+        let provider = Self {
             session: Arc::new(Mutex::new(session)),
             tokenizer,
             space,
             config,
-        })
+            observed: std::sync::Mutex::new(None),
+        };
+        // One inference before the provider is handed out. A session can load
+        // and still be unable to run -- a runtime built without the execution
+        // provider the graph needs is the usual way -- and every check up to
+        // here would pass: the file hashes, the tokenizer parses, the session
+        // opens. Without this the first evidence arrives when a producer's
+        // ingest fails, long after readiness said the deployment was fine.
+        provider.probe().await?;
+        Ok(provider)
     }
 }
 
@@ -316,13 +334,21 @@ impl EmbeddingProviderV1 for OnnxEmbeddingProvider {
         // what the gear runs on; a current-thread runtime (some tests) gets
         // the direct call, which is correct there because there are no other
         // tasks to starve.
-        let vectors = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        let outcome = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
             handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
         }) {
-            tokio::task::block_in_place(|| self.run(&mut session, &encoded))?
+            tokio::task::block_in_place(|| self.run(&mut session, &encoded))
         } else {
-            self.run(&mut session, &encoded)?
+            self.run(&mut session, &encoded)
         };
+        // Both outcomes are evidence, which is what lets readiness answer
+        // without running inference of its own: a failure here is what a
+        // later probe reports, and a success clears one.
+        self.record(match &outcome {
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        });
+        let vectors = outcome?;
 
         Ok(EmbedResponse {
             vectors,
@@ -331,12 +357,64 @@ impl EmbeddingProviderV1 for OnnxEmbeddingProvider {
     }
 
     async fn health(&self) -> Result<(), EmbeddingProviderError> {
-        // A session that cannot be locked is one whose holder panicked; the
-        // model is otherwise resident and has nothing to report.
+        // Observed, not polled: `load` proved the session can infer, and
+        // every `embed` since has been evidence of its own. Taking the lock
+        // still matters -- a session whose holder panicked cannot be locked
+        // -- but on its own it only reports that the weights are resident.
         drop(self.session.lock().await);
-        Ok(())
+        match self.failure() {
+            Some(reason) => Err(EmbeddingProviderError::Unavailable { reason }),
+            None => Ok(()),
+        }
     }
 }
+
+impl OnnxEmbeddingProvider {
+    /// Run one inference, so "the session loaded" and "the session works" are
+    /// not the same claim.
+    ///
+    /// The input is a fixed short string: the point is that the graph
+    /// executes end to end and returns a vector of the declared width, not
+    /// what the vector says.
+    async fn probe(&self) -> Result<(), OnnxLoadError> {
+        let encoded = self
+            .encode(std::slice::from_ref(&PROBE_INPUT.to_owned()))
+            .map_err(|error| OnnxLoadError::Session(format!("probe tokenization: {error}")))?;
+        let mut session = self.session.lock().await;
+        let vectors = self
+            .run(&mut session, &encoded)
+            .map_err(|error| OnnxLoadError::Session(format!("probe inference: {error}")))?;
+        let width = vectors.first().map_or(0, Vec::len);
+        if width != self.config.dimension as usize {
+            return Err(OnnxLoadError::Session(format!(
+                "the session ran and returned a width of {width}, but this provider is                  configured for {}",
+                self.config.dimension
+            )));
+        }
+        Ok(())
+    }
+
+    /// The failure the last exchange left behind, if any.
+    fn failure(&self) -> Option<String> {
+        self.observed.lock().map_or(
+            Some("the observation lock is poisoned".to_owned()),
+            |seen| seen.clone(),
+        )
+    }
+
+    /// Record what an exchange showed. `None` clears an earlier failure: a
+    /// session that has just produced a vector is working, whatever it did
+    /// before.
+    fn record(&self, failure: Option<String>) {
+        if let Ok(mut seen) = self.observed.lock() {
+            *seen = failure;
+        }
+    }
+}
+
+/// What the boot probe embeds. Fixed and short: it is asked whether the graph
+/// runs, not what it thinks.
+const PROBE_INPUT: &str = "graph storage readiness probe";
 
 /// One tokenized batch, padded to its own longest sequence.
 struct Encoded {

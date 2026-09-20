@@ -88,6 +88,69 @@ fn cosine(one: &[f32], other: &[f32]) -> f64 {
         .sum()
 }
 
+/// Readiness reports what the session has shown, and `load` makes sure it has
+/// shown something.
+///
+/// `health()` used to take the session lock and answer `Ok`, which says the
+/// weights are resident and nothing more. A session can load and still be
+/// unable to run -- a runtime built without the execution provider the graph
+/// needs is the usual way -- and every check before this one passes: the
+/// hashes match, the tokenizer parses, the session opens. The first evidence
+/// then arrived when a producer's ingest failed, long after readiness had
+/// called the deployment healthy.
+///
+/// Running inference on every probe would trade that for the opposite
+/// problem: readiness is anonymous and polled on a schedule, so it would
+/// become the busiest caller of the model. So the probe happens once, at
+/// load, and every `embed` afterwards is evidence of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_reports_a_session_that_has_been_proven_to_run() {
+    let Some(provider) = provider().await else {
+        return;
+    };
+    // Loading at all now means one inference already succeeded.
+    provider
+        .health()
+        .await
+        .expect("a provider that loaded has run its probe");
+
+    // And the evidence keeps coming from real work rather than from probes:
+    // a successful embed leaves readiness healthy.
+    embed(&provider, &["something to embed"]).await;
+    provider
+        .health()
+        .await
+        .expect("a session that just produced a vector is healthy");
+}
+
+/// A model whose width does not match the configuration is refused at load.
+///
+/// The probe checks the width it got, not only that something came back --
+/// otherwise a provider configured for the wrong dimension would load
+/// cleanly and produce vectors that no stored space can compare with.
+#[tokio::test]
+async fn a_session_whose_width_contradicts_the_configuration_does_not_load() {
+    if std::env::var("ORT_DYLIB_PATH").is_err() {
+        return;
+    }
+    let (Ok(model), Ok(tokenizer)) = (
+        std::env::var("GRAPH_STORAGE_ONNX_MODEL"),
+        std::env::var("GRAPH_STORAGE_ONNX_TOKENIZER"),
+    ) else {
+        return;
+    };
+    let mut config = OnnxProviderConfig::new(model, tokenizer);
+    config.dimension += 1;
+    let error = OnnxEmbeddingProvider::load(config)
+        .await
+        .err()
+        .expect("a width the model cannot produce is a load failure");
+    assert!(
+        error.to_string().contains("configured for"),
+        "the refusal says the width disagreed: {error}"
+    );
+}
+
 /// The same contract on the runtime a deployment actually uses.
 ///
 /// `embed` hands the synchronous inference to `block_in_place` when it finds
