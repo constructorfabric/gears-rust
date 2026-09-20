@@ -145,6 +145,61 @@ fn ingest_body() -> serde_json::Value {
     })
 }
 
+/// The byte bounds are the domain's, so REST answers them the same way the
+/// in-process client does.
+///
+/// Worth asserting at this level rather than inferring it: the finding that
+/// prompted these bounds pointed out that a gateway body cap, wherever one
+/// exists, is not the gear's admission -- and a `ClientHub` caller has no
+/// gateway in front of it at all. Both paths reach the same check because it
+/// lives below both, and this is where that stops being a claim.
+#[tokio::test]
+async fn an_oversized_batch_is_refused_over_rest_with_the_bound_named() {
+    let small = graph_storage::config::GraphStorageConfig {
+        ingest_max_bytes: 16 * 1024,
+        ..graph_storage::config::GraphStorageConfig::default()
+    };
+    let stand = Stand::new(Harness::configured(
+        std::sync::Arc::new(support::AllowInOwnTenant),
+        small,
+    ));
+    seed(&stand).await;
+
+    let filler = "x".repeat(2 * 1024);
+    let nodes: Vec<serde_json::Value> = (0..32)
+        .map(|index| {
+            serde_json::json!({
+                "node_key": format!("rest-fat-{index}"),
+                "type_id": conformance::OWNED,
+                "payload": { "note": filler },
+            })
+        })
+        .collect();
+
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({ "nodes": nodes, "edges": [] }),
+        )
+        .await;
+    // `out_of_range`, not a server error and not a validation error: a value
+    // outside a documented hard range is something backoff can never make
+    // valid, which is the distinction the error model draws.
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an over-budget batch is a limit refusal: {body}"
+    );
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"], "LIMIT_EXCEEDED",
+        "{body}"
+    );
+    assert!(
+        body.to_string().contains("ingest_max_bytes"),
+        "the refusal names the bound it hit: {body}"
+    );
+}
+
 #[tokio::test]
 async fn the_write_and_read_endpoints_answer_the_documented_documents() {
     let stand = Stand::new(Harness::allowed());

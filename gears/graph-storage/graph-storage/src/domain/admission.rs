@@ -8,13 +8,26 @@
 //!
 //! That used to be written as "so no oversized response is ever assembled",
 //! which was true of one item and false of a batch: counts and per-field
-//! ceilings bound each element and said nothing about their sum. What holds
-//! now is narrower and checkable. A request is bounded by `ingest_max_bytes`
-//! as well as by its counts. A read is bounded by bytes in one of two ways:
-//! the projection page and the search arms have count ceilings small enough
-//! that the count times `item_max_bytes` fits inside `response_max_bytes`,
-//! which `GraphStorageConfig::validate` refuses to start without; traversal's
-//! does not fit, so it measures as it hydrates and reports the cut.
+//! ceilings bound each element and said nothing about their sum.
+//!
+//! Bytes are now bounded from both ends, and deliberately twice over. A
+//! request is bounded by `ingest_max_bytes` and each element by
+//! `item_max_bytes`. Every hydrated read measures what it assembled against
+//! `response_max_bytes`. And `GraphStorageConfig::validate` refuses a
+//! configuration whose count ceiling multiplied by `item_max_bytes` could
+//! exceed that budget -- a thousand-row page of four-megabyte items is four
+//! gigabytes, and every individual number in it is inside its own range, so
+//! no range check on its own could ever see it.
+//!
+//! The startup check is a promise about the deployment; the runtime measure
+//! is what happens if the promise is wrong, and neither is a substitute for
+//! the other.
+//!
+//! What a read does when it reaches the budget differs by what its contract
+//! allows. Traversal and search cut and report `ResponseBytes`. The tabular
+//! projection refuses instead: its continuation token is minted for the rows
+//! the statement returned, so trimming behind it and handing it back would
+//! make the caller resume past rows it never saw.
 
 use graph_storage_sdk::models::{
     IngestRequest, ItemFamily, NeighborhoodRequest, SearchRequest, TraverseRequest,

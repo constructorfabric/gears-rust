@@ -765,13 +765,32 @@ impl GraphServices {
             .await?;
         admission::admit_projection(&self.config, &query)?;
         let type_set = self.resolve_patterns(&auth, type_patterns).await?;
-        Ok(self
+        let page = self
             .store
             .project_table(
                 &self.store_ctx(&auth, None),
                 ProjectionRequest { type_set, query },
             )
-            .await?)
+            .await?;
+
+        // A page is refused rather than trimmed, which is the opposite of
+        // what traversal does and for a reason the cursor forces. The
+        // continuation token is minted by the platform pager for the rows the
+        // *statement* returned; dropping rows behind it and handing the token
+        // back would make the client resume past the rows it never saw --
+        // silently losing them, which is worse than a refusal it can act on.
+        // So the caller is told to ask for fewer.
+        let spent: u64 = page.items.iter().map(row_bytes).sum();
+        if spent > self.config.response_max_bytes {
+            return Err(DomainError::LimitExceeded {
+                what: format!(
+                    "the page hydrates to {spent} bytes; response_max_bytes is {}. \
+                     Ask for fewer rows with `$top`, or narrow `$select`",
+                    self.config.response_max_bytes
+                ),
+            });
+        }
+        Ok(page)
     }
 
     pub async fn search(
@@ -804,7 +823,24 @@ impl GraphServices {
             None
         };
 
-        Ok(self.store.search(&store_ctx, request, arm).await?)
+        let mut answer = self.store.search(&store_ctx, request, arm).await?;
+        // The same rule the traversal follows, in the same layer: counts are
+        // not a memory bound, so the bytes are measured rather than inferred
+        // from the arm limits. The startup check makes this unreachable under
+        // a validated configuration, which is the point of having both -- one
+        // is a promise about the deployment and the other is what happens if
+        // the promise is wrong.
+        let budget = self.config.response_max_bytes;
+        let mut spent: u64 = 0;
+        let before = answer.hits.len();
+        answer.hits.retain(|hit| {
+            spent = spent.saturating_add(hit_bytes(hit));
+            spent <= budget
+        });
+        if answer.hits.len() < before {
+            answer.truncated = Some(graph_storage_sdk::models::TruncationReason::ResponseBytes);
+        }
+        Ok(answer)
     }
 
     pub async fn revision(&self, ctx: &SecurityContext) -> Result<GraphRevision, DomainError> {
@@ -1063,4 +1099,28 @@ fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
         .saturating_add(view.node_key.len() as u64)
         .saturating_add(view.type_id.len() as u64)
         .saturating_add(view.name.as_ref().map_or(0, |name| name.len() as u64))
+}
+
+/// What one search hit costs to carry.
+///
+/// A hit is a key, a type, a name and its per-arm ranks -- deliberately not a
+/// payload, which is what the ranking projection exists to avoid reading. It
+/// is still caller-controlled text, so it is still measured.
+fn hit_bytes(hit: &graph_storage_sdk::models::SearchHit) -> u64 {
+    (hit.node_key.len()
+        + hit.type_id.len()
+        + hit.name.as_ref().map_or(0, String::len)
+        + hit.snippet.as_ref().map_or(0, String::len)
+        + hit.arms.len() * std::mem::size_of::<graph_storage_sdk::models::ArmHit>()) as u64
+}
+
+/// What one projected row costs to carry.
+fn row_bytes(row: &NodeRow) -> u64 {
+    let payload = row.payload.as_ref().map_or(0, |value| {
+        serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
+    });
+    payload
+        .saturating_add(row.node_key.len() as u64)
+        .saturating_add(row.type_id.len() as u64)
+        .saturating_add(row.name.as_ref().map_or(0, |name| name.len() as u64))
 }

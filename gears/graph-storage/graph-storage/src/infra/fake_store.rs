@@ -1044,6 +1044,7 @@ impl GraphStoreV1 for FakeGraphStore {
     ) -> Result<SearchResponse, GraphStoreError> {
         if !scope_admits(ctx.scope, ctx.tenant) {
             return Ok(SearchResponse {
+                truncated: None,
                 hits: Vec::new(),
                 revision: GraphRevision {
                     source_epoch: self.epoch,
@@ -1131,6 +1132,7 @@ impl GraphStoreV1 for FakeGraphStore {
         };
 
         Ok(SearchResponse {
+            truncated: None,
             hits: fuse_arms(&lexical, &ranked, req.limit as usize),
             revision: GraphRevision {
                 source_epoch: self.epoch,

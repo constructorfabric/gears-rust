@@ -821,6 +821,107 @@ async fn a_traversal_stops_at_the_byte_budget_and_reports_it() {
     }
 }
 
+/// A projection page is refused rather than trimmed when it hydrates past the
+/// budget.
+///
+/// The opposite of what traversal does, and the cursor is why. The
+/// continuation token is minted for the rows the statement returned, so
+/// dropping rows behind it and handing it back would make the client resume
+/// past rows it never saw. Losing rows silently is worse than a refusal the
+/// caller can act on by asking for fewer.
+#[tokio::test]
+async fn an_oversized_projection_page_is_refused_rather_than_trimmed() {
+    let small = GraphStorageConfig {
+        response_max_bytes: 4 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "p".repeat(1_500);
+    let fat = |key: &str| NodeSpec {
+        payload: Some(serde_json::json!({ "note": filler })),
+        ..conformance::node(key, key)
+    };
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![fat("p-a"), fat("p-b"), fat("p-c"), fat("p-d")],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("the batch commits");
+
+    let refused = harness
+        .services
+        .project_nodes(&ctx, &[], toolkit_odata::ODataQuery::default())
+        .await
+        .expect_err("the page hydrates past the budget");
+    assert!(
+        matches!(refused, DomainError::LimitExceeded { .. }),
+        "expected a bound refusal, got {refused}"
+    );
+    assert!(
+        refused.to_string().contains("response_max_bytes") && refused.to_string().contains("$top"),
+        "the refusal names the bound and what to do about it: {refused}"
+    );
+}
+
+/// A search hit list is cut at the budget and says so.
+#[tokio::test]
+async fn an_oversized_hit_list_is_cut_and_reported() {
+    let small = GraphStorageConfig {
+        // Smaller than the names below add up to, larger than one of them.
+        response_max_bytes: 1_024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // Names are caller-controlled text and travel on every hit, so they are
+    // what a hit costs once the ranking stopped reading payloads.
+    let long = "s".repeat(400);
+    let nodes: Vec<NodeSpec> = (0..6)
+        .map(|i| conformance::node(&format!("hit-{i}"), &format!("{long}-{i}")))
+        .collect();
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, Vec::new()))
+        .await
+        .expect("the batch commits");
+
+    let found = harness
+        .services
+        .search(
+            &ctx,
+            SearchRequest {
+                mode: SearchMode::Lexical,
+                query: Some(long.clone()),
+                arm_limit: 50,
+                limit: 50,
+                type_patterns: Vec::new(),
+            },
+        )
+        .await
+        .expect("the search answers");
+
+    assert!(
+        found.hits.len() < 6,
+        "the budget cut the list: {} hits",
+        found.hits.len()
+    );
+    assert_eq!(
+        found.truncated,
+        Some(TruncationReason::ResponseBytes),
+        "and a short list says why, since a small graph looks the same"
+    );
+}
+
 /// A batch is bounded by its total size, not only by its counts.
 ///
 /// Every per-item check can pass for a request no process survives: fifty

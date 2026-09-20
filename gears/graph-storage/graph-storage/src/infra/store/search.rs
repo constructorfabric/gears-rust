@@ -86,7 +86,13 @@ pub async fn search(
 
     let hits = fuse(&lexical, &vector, &names, request.limit);
     let revision = super::reads::read_revision(ctx, &conn).await?;
-    Ok(SearchResponse { hits, revision })
+    // The byte budget is applied by the domain service, which is where the
+    // configuration and the same rule for every store live.
+    Ok(SearchResponse {
+        hits,
+        revision,
+        truncated: None,
+    })
 }
 
 async fn lexical_arm(

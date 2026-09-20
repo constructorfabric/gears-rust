@@ -919,6 +919,13 @@ pub struct SearchHit {
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub revision: GraphRevision,
+    /// Set when the hit list was cut short by `response_max_bytes` rather
+    /// than by the caller's `limit`.
+    ///
+    /// A short list is otherwise indistinguishable from a small graph, and
+    /// the two call for opposite reactions: one is a reason to narrow the
+    /// query, the other a reason to stop looking.
+    pub truncated: Option<TruncationReason>,
 }
 
 // ---------------------------------------------------------------------------

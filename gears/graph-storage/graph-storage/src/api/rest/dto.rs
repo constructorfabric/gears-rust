@@ -506,6 +506,10 @@ pub struct GraphSearchHitDto {
 pub struct GraphSearchResponseDto {
     pub hits: Vec<GraphSearchHitDto>,
     pub revision: GraphRevisionDto,
+    /// `response_bytes` when the hit list was cut short by the response byte
+    /// budget rather than by the caller's `limit`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +905,7 @@ impl From<m::SearchResponse> for GraphSearchResponseDto {
         Self {
             hits: value.hits.into_iter().map(Into::into).collect(),
             revision: value.revision.into(),
+            truncated: value.truncated.map(truncation_name),
         }
     }
 }
@@ -922,16 +927,20 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
             nodes: value.nodes.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             seeds: value.seeds,
-            truncated: value.truncated.map(|reason| {
-                match reason {
-                    m::TruncationReason::FrontierCap => "frontier_cap",
-                    m::TruncationReason::EdgeScanCap => "edge_scan_cap",
-                    m::TruncationReason::NodeBudget => "node_budget",
-                    m::TruncationReason::ResponseBytes => "response_bytes",
-                }
-                .to_owned()
-            }),
+            truncated: value.truncated.map(truncation_name),
             revision: value.revision.into(),
         }
     }
+}
+
+/// The wire name of a truncation reason, shared by every answer that can
+/// carry one so two surfaces cannot spell the same cause differently.
+fn truncation_name(reason: m::TruncationReason) -> String {
+    match reason {
+        m::TruncationReason::FrontierCap => "frontier_cap",
+        m::TruncationReason::EdgeScanCap => "edge_scan_cap",
+        m::TruncationReason::NodeBudget => "node_budget",
+        m::TruncationReason::ResponseBytes => "response_bytes",
+    }
+    .to_owned()
 }
