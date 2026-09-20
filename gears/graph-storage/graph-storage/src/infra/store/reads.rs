@@ -12,7 +12,8 @@ use graph_storage_sdk::models::{
     NodeKey, NodeRow, NodeView, ProjectionRequest, ReadSnapshot, Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingState, GraphStoreError, StoreCtx};
-use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, QuerySelect};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_odata::{Page as OdataPage, SortDir};
@@ -161,29 +162,58 @@ pub async fn embedding_state(
         return Ok(Vec::new());
     }
     let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-    let rows = node::Entity::find()
+    // Whether a vector is there, not the vector. This runs once per ingest
+    // over every key in the batch, so reading whole rows here meant dragging
+    // back a payload and a 384-lane embedding per node to answer three
+    // questions about each of them -- and `embedding IS NOT NULL` is the one
+    // field of the three that the row does not even have to carry.
+    let rows: Vec<StoredVector> = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(&conn)
+        .project_all(&conn, |query| {
+            query
+                .select_only()
+                .column(node::Column::NodeKey)
+                .column(node::Column::EmbeddingInputHash)
+                .column(node::Column::EmbeddingEpoch)
+                .column_as(
+                    Expr::col(node::Column::Embedding).is_not_null(),
+                    "has_vector",
+                )
+                .into_model::<StoredVector>()
+        })
         .await
         .map_err(map_scope_err)?;
     let by_key: BTreeMap<String, EmbeddingState> = rows
         .into_iter()
         .map(|r| {
-            let has_vector = r.embedding.is_some();
             (
                 r.node_key,
                 EmbeddingState {
                     input_hash: r.embedding_input_hash,
                     // A vector without an epoch is stale; no vector, no epoch.
-                    vector_epoch: if has_vector { r.embedding_epoch } else { None },
+                    vector_epoch: if r.has_vector {
+                        r.embedding_epoch
+                    } else {
+                        None
+                    },
                 },
             )
         })
         .collect();
     Ok(keys.iter().map(|key| by_key.get(key).cloned()).collect())
+}
+
+/// What the ingest path needs to know about a stored vector: whether there is
+/// one, what it was made from, and which space it belongs to.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct StoredVector {
+    node_key: String,
+    embedding_input_hash: Option<String>,
+    embedding_epoch: Option<i64>,
+    has_vector: bool,
 }
 
 async fn type_names(

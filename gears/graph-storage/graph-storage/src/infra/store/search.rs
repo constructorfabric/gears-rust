@@ -17,7 +17,7 @@ use graph_storage_sdk::models::{
 };
 use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx, VectorArm};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QueryOrder, QuerySelect};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 
 use crate::infra::storage::entity::{gts_type, node};
@@ -51,8 +51,8 @@ pub async fn search(
         Some(rows.into_iter().map(|r| r.id).collect::<Vec<_>>())
     };
 
-    let mut lexical: Vec<node::Model> = Vec::new();
-    let mut vector: Vec<node::Model> = Vec::new();
+    let mut lexical: Vec<Ranked> = Vec::new();
+    let mut vector: Vec<Ranked> = Vec::new();
 
     if matches!(request.mode, SearchMode::Lexical | SearchMode::Hybrid) {
         lexical = lexical_arm(ctx, &conn, &request, type_ids.as_deref()).await?;
@@ -95,12 +95,40 @@ pub async fn search(
     })
 }
 
+/// What ranking needs of a candidate, and nothing else.
+///
+/// Fusion reads three fields: the key it groups by, the interned type id it
+/// resolves to a name, and the name. Reading `node::Model` instead brought
+/// back the payload, the search text and the stored 384-lane vector for every
+/// candidate of every arm -- megabytes of transfer and deserialization per
+/// request to produce a list of keys, and no chance of an index-only plan,
+/// since projecting after `SELECT *` does not un-read the heap.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct Ranked {
+    node_key: String,
+    gts_node_type_id: i32,
+    name: String,
+}
+
+/// The three columns a candidate is ranked by, named once.
+///
+/// Shared by both arms so the projection cannot drift between them, and
+/// reachable from a test so the claim that the wide columns are not read is
+/// checked against the rendered statement rather than asserted in a comment.
+fn ranked_columns(query: sea_orm::Select<node::Entity>) -> sea_orm::Select<node::Entity> {
+    query
+        .select_only()
+        .column(node::Column::NodeKey)
+        .column(node::Column::GtsNodeTypeId)
+        .column(node::Column::Name)
+}
+
 async fn lexical_arm(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
     request: &SearchRequest,
     type_ids: Option<&[i32]>,
-) -> Result<Vec<node::Model>, GraphStoreError> {
+) -> Result<Vec<Ranked>, GraphStoreError> {
     let Some(query) = request.query.as_ref() else {
         return Ok(Vec::new());
     };
@@ -134,11 +162,15 @@ async fn lexical_arm(
         select =
             select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids.to_vec())));
     }
+    let limit = u64::from(request.arm_limit);
     select
-        .order_by(rank, Order::Desc)
-        .order_by(node::Column::Id, Order::Asc)
-        .limit(u64::from(request.arm_limit))
-        .all(runner)
+        .project_all(runner, move |query| {
+            ranked_columns(query)
+                .order_by(rank, Order::Desc)
+                .order_by(node::Column::Id, Order::Asc)
+                .limit(limit)
+                .into_model::<Ranked>()
+        })
         .await
         .map_err(map_scope_err)
 }
@@ -149,7 +181,7 @@ async fn vector_arm(
     request: &SearchRequest,
     type_ids: Option<&[i32]>,
     arm: &VectorArm,
-) -> Result<Vec<node::Model>, GraphStoreError> {
+) -> Result<Vec<Ranked>, GraphStoreError> {
     // The literal is the pgvector text form; the cast is what lets the HNSW
     // cosine index serve the ordering.
     let literal = format!(
@@ -180,19 +212,23 @@ async fn vector_arm(
         select =
             select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids.to_vec())));
     }
+    let limit = u64::from(request.arm_limit);
     select
-        .order_by(distance, Order::Asc)
-        .order_by(node::Column::Id, Order::Asc)
-        .limit(u64::from(request.arm_limit))
-        .all(runner)
+        .project_all(runner, move |query| {
+            ranked_columns(query)
+                .order_by(distance, Order::Asc)
+                .order_by(node::Column::Id, Order::Asc)
+                .limit(limit)
+                .into_model::<Ranked>()
+        })
         .await
         .map_err(map_scope_err)
 }
 
 /// Reciprocal Rank Fusion over the two arms' ranks.
 fn fuse(
-    lexical: &[node::Model],
-    vector: &[node::Model],
+    lexical: &[Ranked],
+    vector: &[Ranked],
     names: &BTreeMap<i32, String>,
     limit: u32,
 ) -> Vec<SearchHit> {
@@ -268,30 +304,37 @@ fn fuse(
 mod tests {
     use super::*;
 
-    fn model(key: &str) -> node::Model {
-        node::Model {
-            tenant_id: uuid::Uuid::nil(),
-            id: 1,
+    /// The ranking statement does not read the wide columns.
+    ///
+    /// Asserted on the rendered SQL rather than trusted, because the failure
+    /// this guards against is silent: `.all()` returning `node::Model` looks
+    /// identical at the call site and costs a payload, a search text and a
+    /// 384-lane vector per candidate. Projecting after the fact does not
+    /// un-read a heap page, so the only place this can be got right is the
+    /// statement.
+    #[test]
+    fn the_ranking_statement_reads_three_columns_and_no_more() {
+        use sea_orm::QueryTrait;
+
+        let sql = ranked_columns(node::Entity::find())
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        for wide in ["payload", "search_text", "embedding"] {
+            assert!(!sql.contains(wide), "ranking must not read `{wide}`: {sql}");
+        }
+        for needed in ["node_key", "gts_node_type_id", "name"] {
+            assert!(sql.contains(needed), "ranking needs `{needed}`: {sql}");
+        }
+    }
+
+    /// A candidate as the arms now return it. That this is three fields long
+    /// is the point of the projection: everything the old twenty-two-field
+    /// literal carried was read from the database and thrown away.
+    fn model(key: &str) -> Ranked {
+        Ranked {
             node_key: key.to_owned(),
             gts_node_type_id: 1,
             name: String::new(),
-            payload: serde_json::json!({}),
-            search_text: String::new(),
-            embedding: None,
-            embedding_epoch: None,
-            embedding_input_hash: None,
-            source_namespace: None,
-            owner_principal: String::new(),
-            version: 1,
-            created_at: time::OffsetDateTime::UNIX_EPOCH,
-            updated_at: time::OffsetDateTime::UNIX_EPOCH,
-            deleted_at: None,
-            created_by_subject_id: uuid::Uuid::nil(),
-            created_by_subject_type: None,
-            updated_by_subject_id: uuid::Uuid::nil(),
-            updated_by_subject_type: None,
-            deleted_by_subject_id: None,
-            deleted_by_subject_type: None,
         }
     }
 
