@@ -242,6 +242,24 @@ impl Harness {
     /// A byte ceiling of tens of megabytes is not something a test should
     /// build its way up to: the case would spend its time allocating rather
     /// than asserting, and would be measuring the machine.
+    /// The same, over a store the case supplies -- one that declines
+    /// snapshots, for instance.
+    pub fn over(store: Arc<FakeGraphStore>, authz: Arc<dyn AuthZResolverApi>) -> Self {
+        let engine = Arc::new(HopOverStore {
+            store: Arc::clone(&store),
+        });
+        Self {
+            services: Arc::new(GraphServices::new(
+                GraphStorageConfig::default(),
+                store,
+                engine,
+                PolicyEnforcer::new(authz),
+                conformance::coordinator(),
+            )),
+            tenant: Uuid::now_v7(),
+        }
+    }
+
     pub fn configured(authz: Arc<dyn AuthZResolverApi>, config: GraphStorageConfig) -> Self {
         let store = Arc::new(FakeGraphStore::new());
         let engine = Arc::new(HopOverStore {

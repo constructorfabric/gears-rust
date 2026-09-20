@@ -559,6 +559,13 @@ pub struct GraphTraversalResponseDto {
     /// Present when a budget stopped the walk. Never silent.
     pub truncated: Option<String>,
     pub revision: GraphRevisionDto,
+    /// Whether every arm of this read observed one graph state.
+    ///
+    /// `false` means the store cannot hold a repeatable-read snapshot and the
+    /// revision moved while the walk ran, so `revision` is where it ended
+    /// rather than a state the whole answer existed at. A revision-keyed
+    /// cache should not store this response under that key.
+    pub consistent_snapshot: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +936,7 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
             seeds: value.seeds,
             truncated: value.truncated.map(truncation_name),
             revision: value.revision.into(),
+            consistent_snapshot: value.consistent_snapshot,
         }
     }
 }

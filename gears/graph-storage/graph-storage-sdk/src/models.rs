@@ -1017,6 +1017,19 @@ pub struct TraversalResponse {
     pub seeds: Vec<NodeKey>,
     pub truncated: Option<TruncationReason>,
     pub revision: GraphRevision,
+    /// Whether every arm of this read observed one graph state.
+    ///
+    /// The contract asks for a repeatable-read snapshot across seed
+    /// resolution, every hop and hydration. A store that cannot hold one
+    /// declares `StoreCapabilities::snapshots = false`, and the service then
+    /// brackets the walk with a revision read: unchanged means nothing
+    /// committed while it ran and the answer is as good as a snapshot, while
+    /// a moved revision means the arms may not agree with each other.
+    ///
+    /// Said out loud because the alternative is a `revision` field that names
+    /// a state the response never existed at, which no consumer can detect
+    /// and every revision-keyed cache would trust.
+    pub consistent_snapshot: bool,
 }
 
 // ---------------------------------------------------------------------------

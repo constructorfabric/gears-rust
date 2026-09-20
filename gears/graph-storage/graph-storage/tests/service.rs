@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use graph_storage::config::GraphStorageConfig;
 use graph_storage::domain::error::DomainError;
+use graph_storage::infra::fake_store::FakeGraphStore;
 use graph_storage_sdk::models::{
     NeighborhoodRequest, NodeSpec, SearchMode, SearchRequest, TraverseRequest, TruncationReason,
     TypeQuery,
@@ -739,6 +740,99 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
             .expect("the node is deleted in-process")
             .tombstoned_nodes,
         1
+    );
+}
+
+/// A store that declares it has no snapshots is taken at its word.
+///
+/// The declaration existed and the service ignored it: it opened a handle
+/// anyway, threaded it through every arm, and stamped the answer with the
+/// handle's revision. So `snapshots = false` protected nobody, and the
+/// response named a graph state it had never existed at -- which no consumer
+/// can detect and every revision-keyed cache would believe.
+///
+/// The fake honours the obligation, which is exactly why it could not catch
+/// this before: its handle worked, so nothing downstream noticed it was being
+/// asked for under false pretences. `declining_snapshots` panics if asked.
+#[tokio::test]
+async fn a_store_without_snapshots_is_not_asked_for_one() {
+    let store = Arc::new(FakeGraphStore::declining_snapshots(0));
+    let harness = Harness::over(store, Arc::new(support::AllowInOwnTenant));
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![conformance::node("s-a", "a"), conformance::node("s-b", "b")],
+                vec![conformance::edge("s-a", "s-b")],
+            ),
+        )
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["s-a".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(10),
+            },
+        )
+        .await
+        .expect("the traversal answers without a snapshot");
+
+    assert_eq!(walked.nodes.len(), 2, "the walk still works: {walked:?}");
+    assert!(
+        walked.consistent_snapshot,
+        "nothing was written while it ran, so the arms agree even without a snapshot"
+    );
+}
+
+/// A walk that spanned a commit says so rather than stamping a revision it
+/// never existed at.
+#[tokio::test]
+async fn a_walk_that_spans_a_commit_is_reported_as_inconsistent() {
+    // One revision per read, which is what a tenant being written to by
+    // somebody else looks like from here. Forcing that interleaving against a
+    // real store is a race, and a race asserts nothing on the run where it
+    // does not happen.
+    let store = Arc::new(FakeGraphStore::declining_snapshots(1));
+    let harness = Harness::over(store, Arc::new(support::AllowInOwnTenant));
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("d-a", "a")], Vec::new()),
+        )
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["d-a".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(10),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+
+    assert!(
+        !walked.consistent_snapshot,
+        "the revision moved under the walk, and the answer says so"
     );
 }
 

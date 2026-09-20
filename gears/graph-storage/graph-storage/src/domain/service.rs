@@ -936,7 +936,26 @@ impl GraphServices {
     ) -> Result<TraversalResponse, DomainError> {
         // One snapshot across the whole compound read: seed resolution, every
         // hop, and the final hydration observe one graph state.
+        //
+        // Unless the store cannot hold one. It says so -- `snapshots = false`
+        // -- and this used to open a handle from it anyway and stamp the
+        // answer with the handle's revision, so the declaration protected
+        // nobody and the response named a state it never existed at. A store
+        // that declines is now taken at its word: no handle, and the walk is
+        // bracketed by a revision read instead, which turns "the arms may
+        // disagree" from an invisible property into a reported one.
         let snapshot_ctx = self.store_ctx(auth, None);
+        if !self.store.capabilities().snapshots {
+            let before = self.store.revision(&snapshot_ctx).await?;
+            let mut result = self
+                .walk_without_snapshot(auth, seeds, plan, node_types, include_phantoms)
+                .await?;
+            let after = self.store.revision(&snapshot_ctx).await?;
+            result.consistent_snapshot = before == after;
+            result.revision = after;
+            return Ok(result);
+        }
+
         let snapshot = self.store.begin_read(&snapshot_ctx).await?;
         let result = self
             .walk_under_snapshot(auth, seeds, plan, node_types, include_phantoms, &snapshot)
@@ -947,6 +966,28 @@ impl GraphServices {
             tracing::warn!(%error, "could not release the read snapshot");
         }
         result
+    }
+
+    /// The same walk with no snapshot handle, for a store that declines them.
+    ///
+    /// The store context carries `None` where a snapshot would go, which is
+    /// what every arm already does with a store that ignores it -- the
+    /// difference is that nothing now claims otherwise.
+    async fn walk_without_snapshot(
+        &self,
+        auth: &Authorized,
+        seeds: &[NodeKey],
+        plan: WalkPlan,
+        node_types: Option<TypeIdSet>,
+        include_phantoms: bool,
+    ) -> Result<TraversalResponse, DomainError> {
+        let revision = self.store.revision(&self.store_ctx(auth, None)).await?;
+        let standin = graph_storage_sdk::models::ReadSnapshot {
+            id: uuid::Uuid::now_v7(),
+            revision,
+        };
+        self.walk_under_snapshot(auth, seeds, plan, node_types, include_phantoms, &standin)
+            .await
     }
 
     async fn walk_under_snapshot(
@@ -971,6 +1012,7 @@ impl GraphServices {
             // Denied and nonexistent seeds are indistinguishable; an empty
             // authorized seed set is an empty answer, not an error.
             return Ok(TraversalResponse {
+                consistent_snapshot: true,
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 seeds: Vec::new(),
@@ -1048,6 +1090,8 @@ impl GraphServices {
             .collect();
 
         Ok(TraversalResponse {
+            // Overwritten by the caller when the store declines snapshots.
+            consistent_snapshot: true,
             nodes,
             edges,
             seeds: admitted,

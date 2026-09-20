@@ -197,6 +197,13 @@ pub struct FakeGraphStore {
     /// Longest admitted derivation chain, in segments; the platform posture
     /// (3) unless a test raises it, exactly like `ontology_max_chain_depth`.
     max_chain_depth: usize,
+    /// Report `snapshots = false`, and refuse to hand one out.
+    declines_snapshots: bool,
+    /// How much each revision read advances the answer, standing in for a
+    /// tenant being written to by somebody else.
+    drift_per_revision_read: i64,
+    /// How many revision reads have happened, so the drift accumulates.
+    revision_reads: std::sync::atomic::AtomicI64,
 }
 
 impl Default for FakeGraphStore {
@@ -213,6 +220,28 @@ impl FakeGraphStore {
             tenants: Mutex::new(BTreeMap::new()),
             next_id: std::sync::atomic::AtomicI64::new(0),
             max_chain_depth: 3,
+            declines_snapshots: false,
+            drift_per_revision_read: 0,
+            revision_reads: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// A store shaped like the built-in one: it declares `snapshots = false`
+    /// and means it.
+    ///
+    /// The fake honours the snapshot obligation, which is exactly why it
+    /// could not catch a service that ignored the declaration -- the handle
+    /// worked, so nothing downstream noticed it was being asked for under
+    /// false pretences. `drift` makes each revision read answer that many
+    /// higher, standing in for a tenant being written to while a walk runs:
+    /// forcing that interleaving for real is a race, and a race is not a
+    /// test.
+    #[must_use]
+    pub fn declining_snapshots(drift: i64) -> Self {
+        Self {
+            declines_snapshots: true,
+            drift_per_revision_read: drift,
+            ..Self::new()
         }
     }
 
@@ -273,7 +302,7 @@ impl GraphStoreV1 for FakeGraphStore {
     fn capabilities(&self) -> StoreCapabilities {
         StoreCapabilities {
             scope_replace: true,
-            snapshots: true,
+            snapshots: !self.declines_snapshots,
             // A real cosine arm over the stored vectors, not a stub.
             vector_search: true,
             labels: false,
@@ -880,6 +909,11 @@ impl GraphStoreV1 for FakeGraphStore {
     }
 
     async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {
+        assert!(
+            !self.declines_snapshots,
+            "a caller asked for a snapshot from a store that declares it has none; \
+             the declaration is the contract, not a hint"
+        );
         let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let tenant = tenants.entry(ctx.tenant).or_default();
         let id = Uuid::now_v7();
@@ -898,14 +932,22 @@ impl GraphStoreV1 for FakeGraphStore {
     }
 
     async fn revision(&self, ctx: &StoreCtx<'_>) -> Result<GraphRevision, GraphStoreError> {
+        let drift = self.drift_per_revision_read
+            * self
+                .revision_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tenants = self.tenants.lock().map_err(|_| poisoned())?;
-        Ok(tenants.get(&ctx.tenant).map_or(
+        let observed = tenants.get(&ctx.tenant).map_or(
             GraphRevision {
                 source_epoch: self.epoch,
                 revision: 0,
             },
             |t| self.revision_of(t),
-        ))
+        );
+        Ok(GraphRevision {
+            revision: observed.revision + drift,
+            ..observed
+        })
     }
 
     async fn get_node(
