@@ -773,18 +773,17 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
     let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), expired);
     let ctx = harness.ctx();
 
-    harness.seed_ontology(&ctx).await;
+    // No fixture, and that is the assertion: the refusal happens before the
+    // policy call and therefore before anything looks at data, so a read of a
+    // key that was never written answers `deadline_exceeded` rather than
+    // `not_found`. Seeding would not be possible under this config anyway --
+    // a registration is an operation too, and it is refused for the same
+    // reason.
     let refused = harness
         .services
         .ingest(
             &ctx,
-            conformance::batch(
-                vec![
-                    conformance::node("late-a", "a"),
-                    conformance::node("late-b", "b"),
-                ],
-                Vec::new(),
-            ),
+            conformance::batch(vec![conformance::node("late-a", "a")], Vec::new()),
         )
         .await
         .expect_err("an ingest does not start under a spent budget");
@@ -811,6 +810,74 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
         matches!(refused, DomainError::Deadline),
         "expected a deadline refusal, got {refused}"
     );
+
+    let search = harness.services.search(
+        &ctx,
+        SearchRequest {
+            mode: SearchMode::Lexical,
+            query: Some("anything".to_owned()),
+            arm_limit: 10,
+            limit: 10,
+            type_patterns: Vec::new(),
+        },
+    );
+    let reads: Vec<(&str, DomainError)> = vec![
+        (
+            "get_node",
+            harness
+                .services
+                .get_node(&ctx, &"late-a".to_owned(), Some(10))
+                .await
+                .expect_err("get_node does not start"),
+        ),
+        ("search", search.await.expect_err("search does not start")),
+        (
+            "list_types",
+            harness
+                .services
+                .list_types(&ctx, TypeQuery::default())
+                .await
+                .expect_err("the catalogue does not start"),
+        ),
+        (
+            "project_nodes",
+            harness
+                .services
+                .project_nodes(&ctx, &[], toolkit_odata::ODataQuery::default())
+                .await
+                .expect_err("the projection does not start"),
+        ),
+        (
+            "revision",
+            harness
+                .services
+                .revision(&ctx)
+                .await
+                .expect_err("the revision read does not start"),
+        ),
+        (
+            "neighborhood",
+            harness
+                .services
+                .neighborhood(
+                    &ctx,
+                    NeighborhoodRequest {
+                        root: "late-a".to_owned(),
+                        depth: 1,
+                        node_budget: Some(10),
+                        include_phantoms: false,
+                    },
+                )
+                .await
+                .expect_err("the neighborhood does not start"),
+        ),
+    ];
+    for (what, error) in reads {
+        assert!(
+            matches!(error, DomainError::Deadline),
+            "{what} must refuse a spent deadline, got {error}"
+        );
+    }
 }
 
 /// A store that declares it has no snapshots is taken at its word.

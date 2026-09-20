@@ -94,6 +94,11 @@ pub async fn walk(
         // and can reason about; a clock is not, and a partial answer that
         // would have been complete on a quieter server is not something a
         // caller can plan around.
+        //
+        // Like every deadline check in this gear it can decline to start the
+        // next hop and cannot abort one already issued to the server; that
+        // needs a server-side bound toolkit-db does not offer yet
+        // (gears-rust #4761).
         if ctx.budget.is_exhausted() {
             return Err(DomainError::Deadline);
         }

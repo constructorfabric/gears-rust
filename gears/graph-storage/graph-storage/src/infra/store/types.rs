@@ -935,6 +935,11 @@ pub async fn list_types(
         if items.len() >= limit {
             break;
         }
+        // Each pass is a fresh statement, so this loop has the same shape as
+        // a traversal's hops and the same rule applies: a pass not started is
+        // work not done. The page already gathered is not thrown away -- the
+        // cap's own continuation cursor covers it -- but nothing new begins.
+        super::admit_deadline(ctx)?;
         let mut select = gts_type::Entity::find()
             .secure()
             .scope_with(ctx.scope)

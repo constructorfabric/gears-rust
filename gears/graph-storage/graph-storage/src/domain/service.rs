@@ -43,6 +43,16 @@ struct Authorized {
     /// Resolved once per request beside the scope, so every stage of that
     /// request stamps the same subject on the elements it writes.
     subject: graph_storage_sdk::models::Subject,
+    /// The one absolute deadline this operation gets, opened where the
+    /// operation was admitted.
+    ///
+    /// It lives here because `Authorized` is built exactly once per public
+    /// call, and `store_ctx` may be built several times inside one. Starting
+    /// the clock in `store_ctx` -- which is what this used to do -- gave a
+    /// traversal a fresh ten seconds for its seed resolution and another ten
+    /// for its hops, so "one absolute deadline per logical operation" was a
+    /// deadline per store call, and a walk could outlive any number of them.
+    budget: RemainingBudget,
 }
 
 impl GraphServices {
@@ -73,16 +83,30 @@ impl GraphServices {
         resource: &authz_resolver_sdk::pep::ResourceType,
         action: &str,
     ) -> Result<Authorized, DomainError> {
+        // Before the policy call, which is itself work: a request whose
+        // deadline is already gone should not spend a PDP round trip either.
+        //
+        // This is the only place the clock starts, and the only place an
+        // operation is refused for being out of time. Everything below --
+        // the hop loop, the catalogue passes, the ingest item loops -- is a
+        // chunk boundary inside an operation already admitted here. None of
+        // them can abort a statement already issued to the server; that needs
+        // a server-side bound toolkit-db does not offer yet (gears-rust
+        // #4761).
+        let budget = RemainingBudget::starting_now(self.config.deadline_interactive());
+        if budget.is_exhausted() {
+            return Err(DomainError::Deadline);
+        }
         let scope = authz::scope_for(&self.enforcer, ctx, resource, action).await?;
         Ok(Authorized {
             tenant: ctx.subject_tenant_id(),
             scope,
             subject: graph_storage_sdk::models::Subject::from_security_context(ctx),
+            budget,
         })
     }
 
     fn store_ctx<'a>(
-        &self,
         auth: &'a Authorized,
         snapshot: Option<&'a graph_storage_sdk::models::ReadSnapshot>,
     ) -> StoreCtx<'a> {
@@ -91,7 +115,7 @@ impl GraphServices {
             scope: &auth.scope,
             subject: auth.subject.clone(),
             snapshot,
-            budget: RemainingBudget::starting_now(self.config.deadline_interactive()),
+            budget: auth.budget,
             cancel: CancellationToken::new(),
         }
     }
@@ -155,7 +179,7 @@ impl GraphServices {
         } else {
             auth
         };
-        let store_ctx = self.store_ctx(&auth, None);
+        let store_ctx = Self::store_ctx(&auth, None);
 
         // The base ontology is published per tenant on first use rather than
         // at boot: a tenant that never touches the graph gets no rows, and a
@@ -373,7 +397,7 @@ impl GraphServices {
             .await?;
         Ok(self
             .store
-            .list_source_namespaces(&self.store_ctx(&auth, None))
+            .list_source_namespaces(&Self::store_ctx(&auth, None))
             .await?)
     }
 
@@ -394,7 +418,7 @@ impl GraphServices {
             .await?;
         Ok(self
             .store
-            .transfer_source_namespace(&self.store_ctx(&auth, None), namespace, owner_principal)
+            .transfer_source_namespace(&Self::store_ctx(&auth, None), namespace, owner_principal)
             .await?)
     }
 
@@ -408,7 +432,7 @@ impl GraphServices {
             .await?;
         Ok(self
             .store
-            .get_type(&self.store_ctx(&auth, None), type_id)
+            .get_type(&Self::store_ctx(&auth, None), type_id)
             .await?)
     }
 
@@ -423,7 +447,7 @@ impl GraphServices {
         admission::admit_type_query(&self.config, &query)?;
         Ok(self
             .store
-            .list_types(&self.store_ctx(&auth, None), query)
+            .list_types(&Self::store_ctx(&auth, None), query)
             .await?)
     }
 
@@ -439,7 +463,7 @@ impl GraphServices {
             .await?;
         admission::admit_ingest(&self.config, &request)?;
 
-        let store_ctx = self.store_ctx(&auth, None);
+        let store_ctx = Self::store_ctx(&auth, None);
         let records = self.validate_batch(&store_ctx, &request).await?;
 
         // Composed and embedded *before* the transaction, as DESIGN's ingest
@@ -693,7 +717,7 @@ impl GraphServices {
         Ok(self
             .store
             .soft_delete(
-                &self.store_ctx(&auth, None),
+                &Self::store_ctx(&auth, None),
                 DeleteRequest::Node(node_key.clone()),
             )
             .await?)
@@ -710,7 +734,7 @@ impl GraphServices {
         Ok(self
             .store
             .soft_delete(
-                &self.store_ctx(&auth, None),
+                &Self::store_ctx(&auth, None),
                 DeleteRequest::Edge(edge_key.clone()),
             )
             .await?)
@@ -730,7 +754,7 @@ impl GraphServices {
         let limit = admission::admit_adjacency_limit(&self.config, adjacency_limit)?;
         Ok(self
             .store
-            .get_node(&self.store_ctx(&auth, None), node_key, limit)
+            .get_node(&Self::store_ctx(&auth, None), node_key, limit)
             .await?)
     }
 
@@ -750,7 +774,7 @@ impl GraphServices {
             .await?;
         Ok(self
             .store
-            .get_edge(&self.store_ctx(&auth, None), edge_key)
+            .get_edge(&Self::store_ctx(&auth, None), edge_key)
             .await?)
     }
 
@@ -768,7 +792,7 @@ impl GraphServices {
         let page = self
             .store
             .project_table(
-                &self.store_ctx(&auth, None),
+                &Self::store_ctx(&auth, None),
                 ProjectionRequest { type_set, query },
             )
             .await?;
@@ -802,7 +826,7 @@ impl GraphServices {
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_search(&self.config, &request)?;
-        let store_ctx = self.store_ctx(&auth, None);
+        let store_ctx = Self::store_ctx(&auth, None);
 
         // The query is embedded by the same provider ingest used
         // (`fr-vector-search`). No caller supplies a vector: one that came
@@ -847,7 +871,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
-        Ok(self.store.revision(&self.store_ctx(&auth, None)).await?)
+        Ok(self.store.revision(&Self::store_ctx(&auth, None)).await?)
     }
 
     // --- traversal -------------------------------------------------------------
@@ -921,7 +945,7 @@ impl GraphServices {
         }
         let set = self
             .store
-            .resolve_type_set(&self.store_ctx(auth, None), patterns)
+            .resolve_type_set(&Self::store_ctx(auth, None), patterns)
             .await?;
         Ok(Some(set))
     }
@@ -944,13 +968,7 @@ impl GraphServices {
         // that declines is now taken at its word: no handle, and the walk is
         // bracketed by a revision read instead, which turns "the arms may
         // disagree" from an invisible property into a reported one.
-        let snapshot_ctx = self.store_ctx(auth, None);
-        // Before the first statement, not before the second hop: seed
-        // resolution is a query too, and a read that starts at all under a
-        // spent deadline is work nobody is waiting for.
-        if snapshot_ctx.budget.is_exhausted() {
-            return Err(DomainError::Deadline);
-        }
+        let snapshot_ctx = Self::store_ctx(auth, None);
         if !self.store.capabilities().snapshots {
             let before = self.store.revision(&snapshot_ctx).await?;
             let mut result = self
@@ -987,7 +1005,7 @@ impl GraphServices {
         node_types: Option<TypeIdSet>,
         include_phantoms: bool,
     ) -> Result<TraversalResponse, DomainError> {
-        let revision = self.store.revision(&self.store_ctx(auth, None)).await?;
+        let revision = self.store.revision(&Self::store_ctx(auth, None)).await?;
         let standin = graph_storage_sdk::models::ReadSnapshot {
             id: uuid::Uuid::now_v7(),
             revision,
@@ -1005,7 +1023,7 @@ impl GraphServices {
         include_phantoms: bool,
         snapshot: &graph_storage_sdk::models::ReadSnapshot,
     ) -> Result<TraversalResponse, DomainError> {
-        let ctx = self.store_ctx(auth, Some(snapshot));
+        let ctx = Self::store_ctx(auth, Some(snapshot));
 
         let resolved = self.store.resolve_node_ids(&ctx, seeds).await?;
         // Deduped: the walk starts from a set, so the echo is that set and
