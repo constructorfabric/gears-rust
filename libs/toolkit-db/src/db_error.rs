@@ -41,6 +41,31 @@
 //!   [`DriverRefusal::code`] still returns the code verbatim, so a caller that
 //!   does need to tell immediate `RESTRICT` from deferrable `NO ACTION` can,
 //!   without this module having to guess on its behalf.
+//!
+//! # How a renumbering is caught
+//!
+//! The tables here name codes, and a server can renumber a condition out from
+//! under them — which is what issue #4645 was. Nothing in this module reports a
+//! code it fails to recognise, and that is deliberate: [`violation_of`] answers
+//! `None` for every error that is not a constraint violation, so "a code no
+//! table names" is the ordinary case rather than an anomaly. Narrowing the
+//! alarm to Class 23 does not rescue it, because the codes this module
+//! deliberately leaves unnamed — `23502`, `23514`, `23P01` — are all in it: the
+//! alarm would have to be told which unmapped codes are expected, which is the
+//! very table whose staleness it was meant to watch.
+//!
+//! What catches a renumbering is a test against a live server. Every condition
+//! named here is provoked on every backend that supports it, and
+//! `pg_restrict_delete_is_classified_as_foreign_key_violation` in
+//! `tests/error_classification.rs` is the one `PostgreSQL` 18 would have
+//! failed. `cargo xtask check-test-container-pins` holds those servers at
+//! pinned images, so the next major version arrives as a deliberate pin bump
+//! with CI attached, not as a production symptom.
+//!
+//! The operational half belongs to the caller, not here: these are pure
+//! predicates with no backend, tenant or span to log against, while a gear's
+//! classification boundary has all three and already logs the branch an
+//! unmapped code falls into.
 
 use std::borrow::Cow;
 
@@ -750,15 +775,20 @@ mod tests {
     }
 
     // The classifiers are reached through two shapes: the typed `SqlErr` the
-    // driver produces, and the `DbErr::Custom` left by a caller that
-    // re-wrapped the error through `to_string()`.
+    // driver produces, and the `DbErr::Custom` left by a caller that re-wrapped
+    // the error through `to_string()`.
     //
-    // In this workspace the *typed* shape is the production one for these two
-    // functions: every call site classifies the raw `ScopeError::Db` straight
-    // out of `secure_insert`/`secure_delete`, and only stringifies what the
-    // classifier already rejected. (`is_retryable_contention` is the opposite
-    // case, and the one RG-15 was about -- do not carry that conclusion
-    // across.)
+    // Both are production shapes now that these functions are public --
+    // ledger's `repo_to_db` formats a repo error into `DbErr::Custom` before
+    // the classifier ever sees it -- so what keeps the message tier honest is
+    // not who calls it but `classifies_as`: the text is read only when the
+    // error carries no driver code at all. A driver that spoke cannot be
+    // contradicted by a rendering of what it said, and
+    // `a_value_the_caller_chose_does_not_classify_the_error` pins the other
+    // half of it, that a value the caller supplied cannot answer for the
+    // driver. (`is_retryable_contention` reaches the same conclusion under a
+    // stricter rule, because retrying is an action and classifying is not --
+    // do not carry one across.)
     //
     // The typed path cannot be exercised from here: it needs a `DbErr` whose
     // `sql_err()` resolves, and that requires a real `PgDatabaseError` or
