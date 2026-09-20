@@ -277,3 +277,18 @@ $("token").onchange = (e) => { state.token = e.target.value; loadCategories().th
 $("tenant").onchange = (e) => { state.tenant = e.target.value; loadCategory(); };
 $("reload").onclick = () => loadCategories().then(loadCategory);
 loadCategories().then(() => { if (state.categories[0]) { state.category = state.categories[0]; loadCategory(); } });
+
+$("searchRun").onclick = async () => {
+  const q = $("searchQ").value;
+  const { ok, json } = await api("GET", `/settings-service/v1/search?q=${encodeURIComponent(q)}${tenantQuery("&")}`);
+  const list = $("searchHits");
+  list.replaceChildren();
+  if (!ok) return;
+  for (const hit of json.items) {
+    const li = document.createElement("li");
+    const where = hit.scope ? ` @ ${hit.scope}` : "";
+    const value = hit.value === undefined ? "" : ` = ${JSON.stringify(hit.value)}`;
+    li.textContent = `${hit.category.name} › ${hit.leaf_slug}  [${hit.matched_field}]${where}${value}`;
+    list.append(li);
+  }
+};

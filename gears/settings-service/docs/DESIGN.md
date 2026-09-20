@@ -1075,7 +1075,7 @@ Handles `secret`-trait values, backed by the platform **Credential Store** (the 
 
 #### Component: Search
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-component-search`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-component-search`
 
 **Dependencies:** PostgreSQL, `AuthZResolverClient` (with `PolicyEnforcer` built over it), `LicenseResolverClient` (License Resolver — feature/licence entitlement)
 

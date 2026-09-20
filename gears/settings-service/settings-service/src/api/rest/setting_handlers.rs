@@ -40,7 +40,7 @@ pub struct TenantParam {
     pub tenant: Option<String>,
 }
 
-fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainError> {
+pub(crate) fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainError> {
     match raw {
         None | Some("") => Ok(None),
         Some(raw) => Uuid::parse_str(raw)
@@ -61,7 +61,7 @@ fn parse_key(raw: &str) -> Result<SettingKey, DomainError> {
     })
 }
 
-fn conn_error(err: &toolkit_db::DbError) -> DomainError {
+pub(crate) fn conn_error(err: &toolkit_db::DbError) -> DomainError {
     DomainError::Internal {
         diagnostic: err.to_string(),
     }
@@ -73,7 +73,7 @@ fn conn_error(err: &toolkit_db::DbError) -> DomainError {
 /// a descendant that is not standalone. Anything else is a denial: an
 /// administrator above a standalone tenant may not read its values, and a
 /// sibling or an ancestor is not the caller's to read at all.
-async fn gate_target(
+pub(crate) async fn gate_target(
     resolver: &ConcreteResolver,
     ctx: &SecurityContext,
     requested: Option<Uuid>,
@@ -109,7 +109,7 @@ async fn gate_target(
 
 /// Whether the caller may see `pii` values unmasked: a separate decision on
 /// the value resource, asked only when a `pii` value is on the page.
-async fn may_read_pii(
+pub(crate) async fn may_read_pii(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
 ) -> bool {
@@ -202,7 +202,7 @@ struct BrowseFilter {
     declarations: Option<Expr>,
 }
 
-fn unsupported(message: impl Into<String>) -> DomainError {
+pub(crate) fn unsupported(message: impl Into<String>) -> DomainError {
     DomainError::Validation {
         field: "$filter".to_owned(),
         code: field::ODATA_QUERY,

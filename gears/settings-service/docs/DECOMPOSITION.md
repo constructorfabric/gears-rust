@@ -20,6 +20,7 @@
   - [2.8 Validate and Set Values &mdash; HIGH](#28-validate-and-set-values-mdash-high)
   - [2.9 Secret Values &mdash; HIGH](#29-secret-values-mdash-high)
   - [2.10 Module-Contributed Declarations &mdash; HIGH](#210-module-contributed-declarations-mdash-high)
+  - [2.11 Search & Discoverability &mdash; MEDIUM](#211-search--discoverability-mdash-medium)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
@@ -81,7 +82,6 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 | `cpt-cf-settings-service-fr-service-writes` | R2 | Value Writer (2.8) — the gate table already refuses a service principal on a `requires_step_up` declaration; the authorized service-write SDK operation `set_value` is R2 |
 | `cpt-cf-settings-service-fr-anonymous-exposable` | R2 | the anonymous read route `GET /settings-service/v1/public/settings`; the declaration flag and its schema check ship in 2.3 |
 | `cpt-cf-settings-service-fr-feature-license-gating`, `cpt-cf-settings-service-constraint-licence-entitlement-fail-closed` | R2 | the licence predicate seam in 2.3 and 2.5 reads; waits on the License Resolver gear |
-| `cpt-cf-settings-service-fr-search-discoverability`, `cpt-cf-settings-service-component-search` | R2 | a search feature over the trigram indexes 2.2–2.4 already create |
 | `cpt-cf-settings-service-fr-standard-advanced-mode` | R2 | mode-filtered reads; the preference is a field addition on the `simple-user-settings` contract |
 | `cpt-cf-settings-service-fr-file-valued-settings`, `cpt-cf-settings-service-constraint-files-by-reference`, `cpt-cf-settings-service-seq-file-valued-setting` | R2 | a file-reference value type over the platform file store |
 | `cpt-cf-settings-service-fr-subject-scoped-values` — resolution half | R2 | Value Resolver, over the identity model 2.4 delivers |
@@ -638,6 +638,42 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 ---
 
+### 2.11 Search & Discoverability &mdash; MEDIUM
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-feature-search-discoverability`
+
+- **Purpose**: Let an administrator reach any setting from one query — by key, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
+
+- **Depends On**: `cpt-cf-settings-service-feature-value-resolution`, `cpt-cf-settings-service-feature-tenant-access`, `cpt-cf-settings-service-feature-category-management`
+
+- **Scope**:
+  - `GET /settings-service/v1/search?q=…&tenant=…` with `limit`/`cursor`: one page query over active declarations ordered by key, matching key, description, category name (subquery), Schema Default within the corpus, or an override within the corpus at the target's non-standalone subtree (subquery); one query for the page's matching overrides
+  - The corpus rule of DESIGN §4.2 *Search*: `secret` never (`secret_ref IS NULL` and classification predicate), `pii` only with `read_unmasked`, JSON `null` defaults excluded, the same predicate in both queries so the split trigram index pairs of §4.7 serve them on PostgreSQL
+  - Hits: declaration-level for key/description/category/default with the first matching field in that order; one per matching override with its tenant and scope; values masked by classification; `mode` as a tag
+  - Browse's gates reused: `read` on the value resource as the secure scope, target within the subtree and not standalone, domain visibility, `hidden` excluded
+  - Dialect chosen at gear init from the database in use: `ILIKE` over the indexed expressions on PostgreSQL, `LIKE` with identical escaping on SQLite
+  - Cursor bound to `(q, target, corpus)` so a continuation cannot be replayed against another search
+
+- **Out of scope**:
+  - Licence gating of the corpus, which waits on the License Resolver (R2, same seam as browse)
+  - Domain-affinity filtering of hits (R3)
+  - Snippets, highlighting and relevance ranking: the contract names the matched field, not the matched text
+  - A search index of its own: the existing trigram indexes are the whole access path
+
+- **Requirements Covered**:
+
+  - [x] `p2` - `cpt-cf-settings-service-fr-search-discoverability`
+
+- **Design Components**:
+
+  - [x] `p1` - `cpt-cf-settings-service-component-search`
+
+- **API**:
+  - GET /settings-service/v1/search?q={query}&tenant={tenant_id}
+
+- **Data**:
+  - No new tables or indexes; reads `setting_declarations`, `setting_values`, `categories` through the trigram indexes 2.2–2.4 created
+
 ## 3. Feature Dependencies
 
 ```text
@@ -652,8 +688,8 @@ cpt-cf-settings-service-feature-typed-value-validation
 cpt-cf-settings-service-feature-value-resolution      cpt-cf-settings-service-feature-audit-store
     ↓                                                     ↓            ↓
 cpt-cf-settings-service-feature-tenant-access ────────────┘            ↓
-    ↓                                                                  ↓
-cpt-cf-settings-service-feature-value-writes                           ↓
+    ↓                              ↓                                   ↓
+cpt-cf-settings-service-feature-value-writes   cpt-cf-settings-service-feature-search-discoverability
     ↓                                                                  ↓
 cpt-cf-settings-service-feature-secret-values                          ↓
                                                                        ↓
@@ -672,6 +708,8 @@ cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-se
 - `cpt-cf-settings-service-feature-value-writes` requires the audit store, because every write commits its record in the same transaction and refuses without it, and tenant access, because a write requires the caller's own effective access to be `overridable`. Through those it also requires resolution, which supplies the current effective value the validate report and the impact preview compare against.
 - `cpt-cf-settings-service-feature-secret-values` requires value writes: a secret is set as a value at a scope, and `set` is what routes the plaintext through the Secret Manager and persists only the reference.
 - `cpt-cf-settings-service-feature-module-contributions` requires typed value validation, for the defaults and the copied values an upgrade re-validates and for the `setting_values` table the copies land in. It writes **no** audit records at all — a declaration has no scope to write one against — so the audit store never enters its ordering; and it does not require value writes, since the upgrade migration copies rows directly rather than setting them.
+
+- `cpt-cf-settings-service-feature-search-discoverability` requires resolution and tenant access: it reuses the browse path's gates — the value-resource scope, the subtree target check, domain visibility and the `hidden` exclusion — and the hierarchy's non-standalone descendants bound its override corpus. It writes nothing and adds no table, so nothing depends on it.
 
 **Parallelism**: wave 1 is strictly sequential. In wave 2, `audit-store` can start as soon as 2.3 lands and run alongside 2.4 and 2.5; `module-contributions` needs only 2.4 and can run alongside 2.5 through 2.9; `tenant-access`, `value-writes`, and `secret-values` form a chain. Work also parallelizes inside 2.1, where the SDK crate, persistence harness, REST and OData infrastructure, error mapping, and the Audit Emitter are largely independent of one another.
 
