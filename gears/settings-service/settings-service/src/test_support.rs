@@ -349,6 +349,9 @@ impl TenantHierarchy for FakeHierarchy {
 
 pub const BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
 pub const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
+/// A plain string, for the settings whose values are personal data rather than
+/// credentials: classified `pii`, held inline, masked without the entitlement.
+pub const TEXT: &str = "gts.cf.core.settings.type_plain_text.v1~";
 
 pub fn resolution_catalogue() -> FakeSource {
     FakeSource::default()
@@ -363,6 +366,10 @@ pub fn resolution_catalogue() -> FakeSource {
                 "type": "string",
                 "x-gts-traits": { "secret": true }
             }),
+        )
+        .with_type(
+            TEXT,
+            json!({ "$id": format!("gts://{TEXT}"), "type": "string" }),
         )
 }
 
@@ -523,6 +530,19 @@ impl ResolutionHarness {
     pub async fn set_flagged(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
         self.write(declaration_id, tenant, Some(value), None, true)
             .await;
+    }
+
+    /// A secret override that stopped validating: held by reference, as every
+    /// secret row is, and flagged for review.
+    pub async fn set_flagged_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        self.write(
+            declaration_id,
+            tenant,
+            None,
+            Some(secret_ref.to_owned()),
+            true,
+        )
+        .await;
     }
 
     pub async fn set_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
@@ -770,4 +790,423 @@ impl crate::domain::ports::SecretResolveGate for DenyAllGate {
             resource: settings_service_sdk::gts::VALUE_SCHEMA,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The REST harness
+// ---------------------------------------------------------------------------
+
+/// A policy decision point that allows everything, with no scope constraints.
+///
+/// The read surface asks with `require_constraints(false)`, so an unconstrained
+/// allow yields an unrestricted `AccessScope` — the grant a platform
+/// administrator holds. What a test exercises through it is therefore the
+/// gear's **own** rules (the subtree check, tenant access, masking), not the
+/// policy manager's, which is a different system with its own tests.
+struct AllowAll;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowAll {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// A policy decision point that allows every action but the one that unmasks
+/// `pii` values.
+///
+/// The entitlement is a separate decision from the read, and the interesting
+/// caller is the one that holds the read and not the entitlement — an
+/// administrator who may see that a setting is configured without seeing
+/// personal data in it.
+struct AllowButMasked;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowButMasked {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: request.action.name != "read_unmasked",
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// A policy decision point that denies everything.
+struct DenyAll;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: false,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// What a request answered with: the status, the decoded body, and the two
+/// headers a conditional write needs to follow a read.
+pub struct Answer {
+    pub status: axum::http::StatusCode,
+    pub body: Value,
+    pub etag: Option<String>,
+    pub location: Option<String>,
+    /// Every response header as text, for the ones a test reads by name —
+    /// the RFC 9470 challenge among them.
+    pub headers: HashMap<String, String>,
+}
+
+/// The gear's read surface, registered exactly as the gear registers it and
+/// answering real requests.
+///
+/// The point of going through the router rather than calling a handler is that
+/// the parts only a request exercises are the parts that carry the contract:
+/// the query string is parsed by the same extractors, an unsupported `OData`
+/// option is refused where a client would meet it, and a refusal is rendered
+/// by the error layer into the status code the API promises.
+pub struct RestHarness {
+    /// The resolution fixtures underneath: the database, the tenant tree and
+    /// the seeding helpers.
+    pub inner: ResolutionHarness,
+    /// Where a secret's plaintext went, for the tests that assert it left the
+    /// settings row.
+    pub secrets: Arc<RecordingSecrets>,
+    /// What the write path published, for the tests that assert the event as
+    /// well as the answer.
+    pub published: Arc<RecordingPublisher>,
+    router: axum::Router,
+}
+
+impl RestHarness {
+    /// Build the surface over a fresh database, with every authorization
+    /// decision allowed and a step-up assertion that passes.
+    pub async fn new() -> Self {
+        Self::build(Arc::new(AllowAll), Arc::new(FixedStepUp::verified())).await
+    }
+
+    /// The same surface with every authorization decision denied, for the
+    /// tests that assert the gate rather than what is behind it.
+    pub async fn denying() -> Self {
+        Self::build(Arc::new(DenyAll), Arc::new(FixedStepUp::verified())).await
+    }
+
+    /// The same surface for a caller that may read but may not see `pii`
+    /// values unmasked.
+    pub async fn without_pii_entitlement() -> Self {
+        Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
+    }
+
+    /// The same surface where the caller's last re-authentication is too old,
+    /// for the tests that assert the second gate.
+    pub async fn stale_step_up() -> Self {
+        Self::build(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::refusing(
+                crate::domain::stepup::StepUpRefusal::Stale,
+            )),
+        )
+        .await
+    }
+
+    async fn build(
+        pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
+        step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+    ) -> Self {
+        let inner = ResolutionHarness::new().await;
+        let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
+        let openapi = toolkit::api::OpenApiRegistryImpl::new();
+        let search = Arc::new(crate::domain::search::service::SearchService::new(
+            crate::infra::storage::search_repo::SearchRepo::new(inner.db.db().backend()),
+        ));
+        let categories = Arc::new(crate::domain::category::CategoryService::new(
+            crate::infra::storage::category_repo::CategoryRepo,
+            crate::infra::storage::audit_store::AuditStore,
+        ));
+        let router = crate::api::rest::routes::register_routes(
+            axum::Router::new(),
+            &openapi,
+            categories,
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let router = crate::api::rest::setting_routes::register_routes(
+            router,
+            &openapi,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let router = crate::api::rest::search_routes::register_routes(
+            router,
+            &openapi,
+            search,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let access = Arc::new(crate::domain::access::AccessService::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::access_repo::AccessRepo,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
+            Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
+            Arc::clone(&inner.cache),
+        ));
+        let router = crate::api::rest::access_routes::register_routes(
+            router,
+            &openapi,
+            access,
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        // The declaration surface. The types registry is the SDK's own mock:
+        // the reads only ask it for a type's traits, and an answer it does not
+        // have degrades to an empty trait set rather than failing the read.
+        let types: Arc<dyn types_registry_sdk::TypesRegistryClient> =
+            Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new());
+        let declarations = Arc::new(crate::domain::declaration::DeclarationService::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            Arc::clone(&types),
+        ));
+        let step_up_for_writes = Arc::clone(&step_up);
+        let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
+            crate::infra::storage::declaration_repo::DeclarationRepo,
+            crate::infra::storage::category_repo::CategoryRepo,
+            crate::infra::storage::value_repo::ValueRepo,
+            Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
+                resolution_catalogue(),
+            )),
+            Arc::new(RecordingRegistrar::default()),
+            step_up,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::clone(&inner.cache),
+        ));
+        let router = crate::api::rest::declaration_routes::register_routes(
+            router,
+            &openapi,
+            declarations,
+            admin,
+            Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        // The write surface. Every port behind it is doubled except the
+        // repositories and the audit store, which run for real against the
+        // same database the reads use.
+        let secrets = Arc::new(RecordingSecrets::default());
+        let published = Arc::new(RecordingPublisher::default());
+        let coordinator = write_coordinator(
+            &inner,
+            Arc::clone(&secrets),
+            Arc::clone(&published),
+            step_up_for_writes,
+        );
+        let router = crate::api::rest::value_routes::register_routes(
+            router,
+            &openapi,
+            coordinator,
+            enforcer,
+        );
+        Self {
+            inner,
+            secrets,
+            published,
+            router,
+        }
+    }
+
+    /// Send a `GET` as the given tenant's administrator and answer with the
+    /// status and the decoded body.
+    pub async fn get(&self, uri: &str, caller: Uuid) -> (axum::http::StatusCode, Value) {
+        let answer = self.send("GET", uri, None, None, caller).await;
+        (answer.status, answer.body)
+    }
+
+    /// Send any request: a method, a URI, an optional JSON body and an
+    /// optional `If-Match`, as the given tenant's administrator.
+    pub async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        if_match: Option<&str>,
+        caller: Uuid,
+    ) -> Answer {
+        self.send_as(method, uri, body, if_match, context_for(caller))
+            .await
+    }
+
+    /// The same, as a caller the test builds itself — a service principal, for
+    /// the rules that turn on there being a person behind the request.
+    pub async fn send_as(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        if_match: Option<&str>,
+        caller: SecurityContext,
+    ) -> Answer {
+        use tower::ServiceExt as _;
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        if let Some(tag) = if_match {
+            builder = builder.header("if-match", tag);
+        }
+        let payload = body.map_or_else(axum::body::Body::empty, |json| {
+            axum::body::Body::from(serde_json::to_vec(&json).expect("serializes"))
+        });
+        let mut request = builder.body(payload).expect("a well-formed request");
+        request.extensions_mut().insert(caller);
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
+            })
+            .collect();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("a bounded body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Answer {
+            status,
+            body,
+            etag,
+            location,
+            headers,
+        }
+    }
+
+    /// Record an access restriction for a `(setting, tenant)` pair, the way an
+    /// ancestor's administrator would.
+    pub async fn restrict(
+        &self,
+        declaration_id: Uuid,
+        tenant: Uuid,
+        access: crate::domain::access::TenantAccess,
+    ) {
+        use crate::domain::access::AccessRepository as _;
+        let conn = self.inner.db.conn().expect("connection");
+        crate::infra::storage::access_repo::AccessRepo
+            .upsert(
+                &conn,
+                &AccessScope::allow_all(),
+                crate::domain::access::RestrictionDraft {
+                    declaration_id,
+                    tenant_id: tenant,
+                    access,
+                    set_by: "an ancestor's administrator".to_owned(),
+                },
+            )
+            .await
+            .expect("restriction");
+    }
+
+    /// The items of a paginated answer, or an empty list when the body is a
+    /// problem document.
+    pub async fn items(&self, uri: &str, caller: Uuid) -> Vec<Value> {
+        let (_, body) = self.get(uri, caller).await;
+        body.get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The write coordinator over a harness's database.
+///
+/// Every port behind it is doubled except the repositories and the audit
+/// store, which run for real against the same database the reads use.
+pub fn write_coordinator(
+    inner: &ResolutionHarness,
+    secrets: Arc<RecordingSecrets>,
+    published: Arc<RecordingPublisher>,
+    step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+) -> Arc<crate::infra::value_writes::WriteCoordinator> {
+    let writer = Arc::new(crate::domain::writes::ValueWriter::new(
+        crate::infra::storage::value_repo::ValueRepo,
+        Arc::clone(&inner.resolver),
+        Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
+            resolution_catalogue(),
+        )),
+        crate::infra::storage::audit_store::AuditStore,
+        step_up,
+        secrets as Arc<dyn crate::domain::ports::SecretManager>,
+        published as Arc<dyn crate::domain::ports::ChangePublisher>,
+        Arc::new(crate::domain::ports::NoMetrics),
+    ));
+    Arc::new(crate::infra::value_writes::WriteCoordinator::new(
+        Arc::clone(&inner.db),
+        writer,
+    ))
+}
+
+/// An interactive administrator of one tenant.
+///
+/// The subject is derived from the tenant rather than drawn fresh, so the same
+/// administrator is recognisable across requests — which is what a single-use
+/// token staged by one request and claimed by the next depends on.
+pub fn context_for(tenant: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v5(&Uuid::NAMESPACE_OID, tenant.as_bytes()))
+        .subject_tenant_id(tenant)
+        .subject_type(crate::domain::stepup::USER_SUBJECT_TYPE)
+        .build()
+        .expect("context")
+}
+
+/// A service principal of one tenant: no person behind it, so a declaration
+/// that requires a recent re-authentication has nobody to ask.
+pub fn service_context_for(tenant: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v5(&Uuid::NAMESPACE_DNS, tenant.as_bytes()))
+        .subject_tenant_id(tenant)
+        .subject_type("gts.cf.core.security.subject_service.v1~")
+        .build()
+        .expect("context")
 }

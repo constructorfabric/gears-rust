@@ -3162,6 +3162,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",

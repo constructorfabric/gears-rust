@@ -19,3 +19,23 @@ pub mod setting_routes;
 pub mod value_dto;
 pub mod value_handlers;
 pub mod value_routes;
+
+#[cfg(test)]
+#[path = "read_surface_tests.rs"]
+mod read_surface_tests;
+
+#[cfg(test)]
+#[path = "category_surface_tests.rs"]
+mod category_surface_tests;
+
+#[cfg(test)]
+#[path = "access_surface_tests.rs"]
+mod access_surface_tests;
+
+#[cfg(test)]
+#[path = "declaration_surface_tests.rs"]
+mod declaration_surface_tests;
+
+#[cfg(test)]
+#[path = "value_surface_tests.rs"]
+mod value_surface_tests;

@@ -203,8 +203,8 @@ On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed express
 - [x] A `pii` default or override is matched only for a caller holding `read_unmasked`; without it neither a hit nor a count reveals it
 - [x] `%`, `_` and `\` in the needle match literally
 - [x] A retired declaration is not matched
-- [ ] A declaration `hidden` for the caller is absent from the results
+- [x] A declaration `hidden` for the caller is absent from the results
 - [x] `q` of one character, or of two hundred and one, is refused `400` on field `q`
-- [ ] `$filter`, `$orderby` or `$select` on the resource is refused `400`
+- [x] `$filter`, `$orderby` or `$select` on the resource is refused `400`
 - [x] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused
 - [x] Every hit carries its declaration's `mode`, and no hit is withheld by it

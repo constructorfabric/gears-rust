@@ -161,3 +161,7 @@ impl TenantHierarchy for HubTenantHierarchy {
         Ok((order, truncated))
     }
 }
+
+#[cfg(test)]
+#[path = "tenant_hierarchy_tests.rs"]
+mod tenant_hierarchy_tests;
