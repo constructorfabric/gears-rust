@@ -70,13 +70,13 @@ fn rejects_a_key_rooted_under_another_base() {
     // anywhere else — here, under a value type — is not a setting whatever else
     // it may be.
     let err = SettingKey::parse(&format!(
-        "gts.cf.toolkit.settings.type_bool_flag.v1~{VALID_DERIVED}"
+        "gts.cf.core.settings.type_bool_flag.v1~{VALID_DERIVED}"
     ))
     .expect_err("a value type is not the setting base");
     assert_eq!(
         err,
         SettingKeyError::WrongBaseType {
-            found: "gts.cf.toolkit.settings.type_bool_flag.v1~".to_owned()
+            found: "gts.cf.core.settings.type_bool_flag.v1~".to_owned()
         }
     );
 }

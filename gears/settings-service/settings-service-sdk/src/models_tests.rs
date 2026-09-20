@@ -85,7 +85,7 @@ fn a_contributed_declaration_carries_only_what_the_module_stated() {
     .expect("key");
     let decl = ContributedDeclaration::new(
         key,
-        "gts.cf.toolkit.settings.type_bool_flag.v1~",
+        "gts.cf.core.settings.type_bool_flag.v1~",
         serde_json::json!(false),
         ScopeClass::Cascading,
     );
@@ -94,7 +94,7 @@ fn a_contributed_declaration_carries_only_what_the_module_stated() {
         wire,
         serde_json::json!({
             "key": "gts.cf.core.settings.setting_type.v1~cf.settings_demo.network.proxy_enabled.v1~",
-            "valueTypeId": "gts.cf.toolkit.settings.type_bool_flag.v1~",
+            "valueTypeId": "gts.cf.core.settings.type_bool_flag.v1~",
             "defaultValue": false,
             "scopeClass": "cascading"
         })

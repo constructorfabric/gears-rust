@@ -3,13 +3,14 @@
 //!
 //! A setting's *key* is a type of its own (ADR-002) and says nothing about the
 //! shape of its value; the shape comes from a curated **value type** under
-//! `gts.cf.toolkit.settings.type_*~`, named by the declaration's
-//! `value_type_id` and validated against by the Type Validator. DESIGN.md §4.7
-//! gives that catalogue to the toolkit. Nothing in the workspace declares it
-//! yet, so this module carries a starter set as the interim owner — recorded in
-//! DECOMPOSITION §1 — declared the way every other platform base type is:
-//! submitted to the link-time schema inventory that the types registry drains
-//! when it initializes.
+//! `gts.cf.core.settings.type_*~`, named by the declaration's
+//! `value_type_id` and validated against by the Type Validator. The catalogue
+//! is the Settings gear's, under the gear's own namespace and beside the
+//! control-plane types it already owns: it ships from this SDK, and an
+//! identifier that said `toolkit` would name an owner that never held it.
+//! Declared the way every other platform base type is — submitted to the
+//! link-time schema inventory that the types registry drains when it
+//! initializes.
 //!
 //! # Why hand-written JSON rather than `#[gts_type_schema]`
 //!
@@ -35,7 +36,7 @@ use toolkit_gts::InventoryTypeSchema;
 // catalogue's own ids below are complete and pass; this is the string they
 // start with.
 #[allow(unknown_lints, de0901_gts_string_pattern)]
-pub const VALUE_TYPE_PREFIX: &str = "gts.cf.toolkit.settings.type_";
+pub const VALUE_TYPE_PREFIX: &str = "gts.cf.core.settings.type_";
 
 /// One catalogue entry: the type id and the schema it registers.
 #[derive(Debug, Clone, Copy)]
@@ -94,7 +95,7 @@ fn value_type(id: &str, description: &str, mut body: serde_json::Map<String, Val
 macro_rules! catalogue_type {
     ($(#[$doc:meta])* $const_name:ident, $type_name:literal, $fn_name:ident, $description:literal, $body:tt) => {
         $(#[$doc])*
-        pub const $const_name: &str = concat!("gts.cf.toolkit.settings.type_", $type_name, ".v1~");
+        pub const $const_name: &str = concat!("gts.cf.core.settings.type_", $type_name, ".v1~");
 
         fn $fn_name() -> Value {
             let Value::Object(body) = json!($body) else {

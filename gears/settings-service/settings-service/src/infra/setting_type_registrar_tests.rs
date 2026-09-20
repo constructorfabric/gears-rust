@@ -17,7 +17,7 @@ fn a_setting_type_derives_from_the_base_and_narrows_the_payload() {
         std::num::NonZeroU32::new(1).expect("non-zero"),
     )
     .expect("key");
-    let schema = setting_type_schema(&key, "gts.cf.toolkit.settings.type_bool_flag.v1~");
+    let schema = setting_type_schema(&key, "gts.cf.core.settings.type_bool_flag.v1~");
     assert_eq!(schema["$id"], json!(format!("gts://{key}")));
     assert_eq!(
         schema["allOf"],
@@ -25,7 +25,7 @@ fn a_setting_type_derives_from_the_base_and_narrows_the_payload() {
     );
     assert_eq!(
         schema["properties"]["payload"],
-        json!({ "$ref": "gts://gts.cf.toolkit.settings.type_bool_flag.v1~" })
+        json!({ "$ref": "gts://gts.cf.core.settings.type_bool_flag.v1~" })
     );
 }
 
@@ -34,7 +34,7 @@ fn a_setting_type_carries_no_default() {
     // The Schema Default lives in the declaration alone; a `default` here would
     // be a second home the two could drift between.
     let key = SettingKey::compose("acme", "network", "enable_proxy").expect("key");
-    let schema = setting_type_schema(&key, "gts.cf.toolkit.settings.type_bool_flag.v1~");
+    let schema = setting_type_schema(&key, "gts.cf.core.settings.type_bool_flag.v1~");
     assert!(schema.get("default").is_none());
     assert!(schema["properties"]["payload"].get("default").is_none());
 }

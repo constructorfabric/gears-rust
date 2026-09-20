@@ -22,7 +22,7 @@
 //! The derived half carries four name tokens with the **category third**; an
 //! admin key is composed as `<vendor>.settings.<category>.<name>.v1~`, a module
 //! supplies its own. The value's shape is *not* in the key: it is a separate
-//! curated catalog type (`gts.cf.toolkit.settings.type_*~`) named by the
+//! curated catalog type (`gts.cf.core.settings.type_*~`) named by the
 //! declaration's `value_type_id`. Registered when the declaration is created
 //! (ADR-002).
 //!

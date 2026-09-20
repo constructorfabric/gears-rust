@@ -61,7 +61,7 @@ fn insert(id: &str, category: &str, leaf: &str, overrides: &str) -> String {
         ("leaf_slug", format!("'{leaf}'")),
         (
             "value_type_id",
-            "'gts.cf.toolkit.settings.type_bool_flag.v1~'".to_owned(),
+            "'gts.cf.core.settings.type_bool_flag.v1~'".to_owned(),
         ),
         ("category_id", format!("'{category}'")),
         ("default_value", "'true'".to_owned()),

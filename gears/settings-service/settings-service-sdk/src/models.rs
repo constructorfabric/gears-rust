@@ -179,7 +179,7 @@ pub struct ContributedDeclaration {
     /// The setting key the module supplies.
     pub key: SettingKey,
     /// The curated value type the setting's values validate against, from
-    /// `gts.cf.toolkit.settings.type_*~`.
+    /// `gts.cf.core.settings.type_*~`.
     pub value_type_id: String,
     /// The Schema Default, validated against `value_type_id`. Mandatory: a
     /// setting with no meaningful default sends JSON `null` on a type that

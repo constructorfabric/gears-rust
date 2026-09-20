@@ -60,7 +60,7 @@ typed projection a consumer matches on — `Unavailable`, `Retired`, `NotFound`,
 `catalogue::CATALOGUE` ships one registered type per shape a setting may take —
 `bool_flag`, `string`, `text`, `secret_string`, `integer`, `number`, `port`,
 `duration_seconds`, `url`, `hostname`, `email`, `cron`, `regex`, `json` — each
-under `gts.cf.toolkit.settings.type_<name>.v1~`, with its JSON Schema and trait
+under `gts.cf.core.settings.type_<name>.v1~`, with its JSON Schema and trait
 set. A declaration names one of these; the service validates every value
 against it, and the traits drive both rendering and the checks the shape alone
 cannot express.

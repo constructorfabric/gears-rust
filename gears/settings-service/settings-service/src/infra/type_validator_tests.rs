@@ -9,16 +9,16 @@ use crate::domain::validation::TypeValidator;
 use crate::field;
 use crate::test_support::FakeSource;
 
-const PORT_TYPE: &str = "gts.cf.toolkit.settings.type_port.v1~";
-const IP_TYPE: &str = "gts.cf.toolkit.settings.type_ipv4.v1~";
-const REGEX_TYPE: &str = "gts.cf.toolkit.settings.type_regex.v1~";
-const REF_TYPE: &str = "gts.cf.toolkit.settings.type_tenant_ref.v1~";
-const SECRET_TYPE: &str = "gts.cf.toolkit.settings.type_api_token.v1~";
+const PORT_TYPE: &str = "gts.cf.core.settings.type_port.v1~";
+const IP_TYPE: &str = "gts.cf.core.settings.type_ipv4.v1~";
+const REGEX_TYPE: &str = "gts.cf.core.settings.type_regex.v1~";
+const REF_TYPE: &str = "gts.cf.core.settings.type_tenant_ref.v1~";
+const SECRET_TYPE: &str = "gts.cf.core.settings.type_api_token.v1~";
 const TENANT_TYPE: &str = "gts.cf.core.am.tenant.v1~";
-const CRON_TYPE: &str = "gts.cf.toolkit.settings.type_cron.v1~";
-const ODD_DIALECT_TYPE: &str = "gts.cf.toolkit.settings.type_quartz_cron.v1~";
-const REGION_TYPE: &str = "gts.cf.toolkit.settings.type_region.v1~";
-const UNKNOWN_SOURCE_TYPE: &str = "gts.cf.toolkit.settings.type_ghost_enum.v1~";
+const CRON_TYPE: &str = "gts.cf.core.settings.type_cron.v1~";
+const ODD_DIALECT_TYPE: &str = "gts.cf.core.settings.type_quartz_cron.v1~";
+const REGION_TYPE: &str = "gts.cf.core.settings.type_region.v1~";
+const UNKNOWN_SOURCE_TYPE: &str = "gts.cf.core.settings.type_ghost_enum.v1~";
 const REGION_SOURCE: &str = "gts.cf.core.platform.region.v1~";
 
 fn catalogue() -> FakeSource {
@@ -106,7 +106,7 @@ async fn an_unknown_type_is_a_rejection_not_an_acceptance() {
     // The fault is the declaration's, so it is reported on `value_type_id`.
     let v = GtsTypeValidator::new(catalogue());
     let result = v
-        .validate_value("gts.cf.toolkit.settings.type_missing.v1~", &json!(1))
+        .validate_value("gts.cf.core.settings.type_missing.v1~", &json!(1))
         .await
         .expect("a rejection, not an error");
     assert!(!result.is_accepted());
@@ -226,9 +226,9 @@ async fn an_entity_reference_must_resolve_to_an_instance_of_its_type() {
 #[tokio::test]
 async fn every_fault_is_collected_rather_than_the_first() {
     let source = catalogue().with_type(
-        "gts.cf.toolkit.settings.type_regex_pair.v1~",
+        "gts.cf.core.settings.type_regex_pair.v1~",
         json!({
-            "$id": "gts://gts.cf.toolkit.settings.type_regex_pair.v1~",
+            "$id": "gts://gts.cf.core.settings.type_regex_pair.v1~",
             "type": "object",
             "properties": {
                 "include": { "type": "string" },
@@ -241,7 +241,7 @@ async fn every_fault_is_collected_rather_than_the_first() {
     let v = GtsTypeValidator::new(source);
     let result = v
         .validate_value(
-            "gts.cf.toolkit.settings.type_regex_pair.v1~",
+            "gts.cf.core.settings.type_regex_pair.v1~",
             &json!({ "include": "(", "exclude": "[", "limit": 11 }),
         )
         .await
@@ -272,7 +272,7 @@ async fn trait_resolution_of_an_unknown_type_fails_rather_than_returning_an_empt
     // An empty set would classify a secret-trait type as public.
     let v = GtsTypeValidator::new(catalogue());
     match v
-        .resolve_traits("gts.cf.toolkit.settings.type_missing.v1~")
+        .resolve_traits("gts.cf.core.settings.type_missing.v1~")
         .await
     {
         Err(DomainError::Validation { field, code, .. }) => {
@@ -368,9 +368,9 @@ async fn every_trait_failure_is_collected_rather_than_only_the_first() {
     // A structured value carrying a trait on the whole is checked leaf by leaf,
     // and each bad leaf is its own field-level error.
     let source = catalogue().with_type(
-        "gts.cf.toolkit.settings.type_schedules.v1~",
+        "gts.cf.core.settings.type_schedules.v1~",
         json!({
-            "$id": "gts://gts.cf.toolkit.settings.type_schedules.v1~",
+            "$id": "gts://gts.cf.core.settings.type_schedules.v1~",
             "type": "array",
             "items": { "type": "string" },
             "x-gts-traits": { "cron_dialect": "standard" }
@@ -379,7 +379,7 @@ async fn every_trait_failure_is_collected_rather_than_only_the_first() {
     let v = GtsTypeValidator::new(source);
     let result = v
         .validate_value(
-            "gts.cf.toolkit.settings.type_schedules.v1~",
+            "gts.cf.core.settings.type_schedules.v1~",
             &json!(["0 3 * * *", "not cron", "60 0 * * *"]),
         )
         .await
