@@ -56,10 +56,6 @@ cargo run --bin cf-gears-example-server --features settings-service -- \
     --config config/quickstart.yaml
 ```
 
-Add `settings-demo` for a sample catalogue of seventeen declarations in four
-categories, and see [`../sandbox`](../sandbox) for a page that drives every
-endpoint against a local server.
-
 ## Configuration
 
 Bootstrap values are deployment-owned and read fail-closed: the `config:`

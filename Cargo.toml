@@ -125,7 +125,6 @@ members = [
     "gears/simple-user-settings/simple-user-settings",
     "gears/settings-service/settings-service-sdk",
     "gears/settings-service/settings-service",
-    "gears/settings-service/plugins/settings-demo",
     "gears/system/tenant-resolver/tenant-resolver-sdk",
     "gears/system/tenant-resolver/tenant-resolver",
     "gears/system/tenant-resolver/plugins/static-tr-plugin",

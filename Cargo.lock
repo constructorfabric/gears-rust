@@ -2359,7 +2359,6 @@ dependencies = [
  "cf-gears-oagw",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
- "cf-gears-settings-demo",
  "cf-gears-settings-service",
  "cf-gears-simple-user-settings",
  "cf-gears-single-tenant-tr-plugin",
@@ -3107,22 +3106,6 @@ version = "0.1.2"
 dependencies = [
  "hyper-rustls",
  "rustls",
-]
-
-[[package]]
-name = "cf-gears-settings-demo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "cf-gears-settings-service",
- "cf-gears-settings-service-sdk",
- "cf-gears-toolkit",
- "cf-gears-toolkit-macros",
- "cf-gears-toolkit-security",
- "inventory",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
