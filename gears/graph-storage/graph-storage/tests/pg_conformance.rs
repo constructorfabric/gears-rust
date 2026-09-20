@@ -469,6 +469,14 @@ async fn every_committed_mutation_gets_its_own_revision() {
 }
 
 pg_case!(
+    scope_replacement_removes_an_edge_whose_endpoints_remain,
+    conformance::scope_replacement_removes_an_edge_whose_endpoints_remain
+);
+pg_case!(
+    one_replacement_does_not_take_another_scopes_edges,
+    conformance::one_replacement_does_not_take_another_scopes_edges
+);
+pg_case!(
     scope_replacement_removes_what_the_batch_no_longer_names,
     conformance::scope_replacement_removes_what_the_batch_no_longer_names
 );

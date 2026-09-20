@@ -68,6 +68,16 @@ struct FakeEdge {
     discriminator: Option<String>,
     payload: Option<serde_json::Value>,
     deleted: bool,
+    /// The scope whose declared snapshot this edge belongs to, as
+    /// `(attribute, value)`, when a scoped batch wrote it.
+    ///
+    /// A replacement converges on edges by *ownership*, not by where their
+    /// endpoints happen to be: an edge between two nodes of this scope may
+    /// have been declared by a different producer under a different scope,
+    /// and endpoint membership cannot tell the two apart. `None` means no
+    /// scope has declared this edge, and a replacement leaves it alone
+    /// unless one of its endpoints is departing.
+    scope: Option<(String, String)>,
     audit: FakeAudit,
 }
 
@@ -701,7 +711,13 @@ impl GraphStoreV1 for FakeGraphStore {
                 &mut state,
                 index,
                 spec,
-                req.options.create_phantoms.unwrap_or(true),
+                &EdgeDeclaration {
+                    create_phantoms: req.options.create_phantoms.unwrap_or(true),
+                    scope: req
+                        .replace_scope
+                        .as_ref()
+                        .map(|replace| (replace.attribute.clone(), replace.value.clone())),
+                },
             )?;
         }
 
@@ -718,6 +734,7 @@ impl GraphStoreV1 for FakeGraphStore {
                     edges: &mut edges,
                     managed_node_types: &managed_node_types,
                     static_edge_types: &static_edge_types,
+                    types: &tenant.types,
                 },
                 &req,
                 replace,
@@ -2239,6 +2256,14 @@ fn apply_endpoint(
     Ok(*state.next_id)
 }
 
+/// What the batch as a whole says, which one edge spec does not carry.
+struct EdgeDeclaration {
+    create_phantoms: bool,
+    /// The scope this batch declares, when it is a replacement. An edge
+    /// written under one belongs to that scope's snapshot and leaves with it.
+    scope: Option<(String, String)>,
+}
+
 /// Apply one edge spec to the working copy. Returns whether it changed state.
 fn apply_edge(
     tenant: &Tenant,
@@ -2247,8 +2272,14 @@ fn apply_edge(
     state: &mut BatchState<'_>,
     index: usize,
     spec: &graph_storage_sdk::models::EdgeSpec,
-    create_phantoms: bool,
+    declaration: &EdgeDeclaration,
 ) -> Result<bool, GraphStoreError> {
+    let EdgeDeclaration {
+        create_phantoms,
+        scope,
+    } = declaration;
+    let create_phantoms = *create_phantoms;
+    let scope = scope.clone();
     let record = tenant.types.get(&spec.type_id).cloned().ok_or_else(|| {
         validation(
             index,
@@ -2334,6 +2365,12 @@ fn apply_edge(
         Some(existing) => {
             existing.payload.clone_from(&spec.payload);
             existing.deleted = false;
+            // A scoped batch re-asserts ownership; an unscoped one leaves
+            // whatever claim is already recorded, because writing an edge is
+            // not the same as declaring a snapshot that contains it.
+            if scope.is_some() {
+                existing.scope.clone_from(&scope);
+            }
             existing.audit.updated(state.subject);
             ItemOutcome::Updated
         }
@@ -2346,6 +2383,7 @@ fn apply_edge(
                 discriminator: spec.discriminator.clone(),
                 payload: spec.payload.clone(),
                 deleted: false,
+                scope,
                 audit: FakeAudit::created(state.subject),
             });
             ItemOutcome::Inserted
@@ -2362,6 +2400,9 @@ struct ScopeReplacement<'a> {
     edges: &'a mut Vec<FakeEdge>,
     managed_node_types: &'a BTreeSet<String>,
     static_edge_types: &'a BTreeSet<String>,
+    /// Needed to derive the deterministic key of each declared edge, which is
+    /// what tells a re-declared edge from one the producer dropped.
+    types: &'a BTreeMap<String, TypeRecord>,
 }
 
 /// Remove the scope's static content that the batch no longer names.
@@ -2381,12 +2422,28 @@ fn replace_scope(
         edges,
         managed_node_types,
         static_edge_types,
+        types,
     } = working;
     let written: BTreeSet<&str> = req
         .nodes
         .iter()
         .map(|spec| spec.node_key.as_str())
         .collect();
+    // The edges this batch declared, by their deterministic key. An edge the
+    // scope owns and this batch did not name is one the producer removed --
+    // which is the whole point of a declarative snapshot, and the case the
+    // node-only reckoning below could never see: with both endpoints
+    // re-supplied nothing was stale, so nothing was removed and the edge
+    // stayed visible forever.
+    let declared: BTreeSet<String> = req
+        .edges
+        .iter()
+        .filter_map(|spec| {
+            let record = types.get(&spec.type_id)?;
+            Some(identity::derive_edge_key(record.type_uuid, spec))
+        })
+        .collect();
+    let owner = (replace.attribute.clone(), replace.value.clone());
     let dropped: Vec<i64> = nodes
         .iter()
         .filter(|node| {
@@ -2402,16 +2459,26 @@ fn replace_scope(
         })
         .map(|node| node.id)
         .collect();
-    if dropped.is_empty() {
-        return false;
-    }
 
     let before = edges.len();
     edges.retain(|edge| {
-        !(static_edge_types.contains(&edge.type_id)
-            && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
+        if !static_edge_types.contains(&edge.type_id) {
+            // An analysis edge is a conclusion about the content, not a copy
+            // of it, and survives the re-import of what it was drawn about.
+            return true;
+        }
+        // Owned by this scope and not re-declared: the producer dropped it.
+        let abandoned = edge.scope.as_ref() == Some(&owner) && !declared.contains(&edge.key);
+        // Or incident to a node that is itself departing, whoever owns it --
+        // the endpoint is going, so the edge cannot stay.
+        let orphaned = dropped.contains(&edge.src) || dropped.contains(&edge.dst);
+        !(abandoned || orphaned)
     });
     tally.counts.scope_removed_edges = (before - edges.len()) as u64;
+
+    if dropped.is_empty() {
+        return tally.counts.scope_removed_edges > 0;
+    }
 
     // A tombstoned edge is a deleted conclusion and must not keep a departing
     // node alive on its behalf; left in place it would make the scope stop

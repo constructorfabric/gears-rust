@@ -95,6 +95,7 @@ pub(crate) async fn remove_stale(
     attribute: &str,
     value: &str,
     written: &BTreeSet<String>,
+    declared_edges: &BTreeSet<String>,
 ) -> Result<(u64, u64), GraphStoreError> {
     if !plain(attribute) {
         return Err(GraphStoreError::InvalidQuery {
@@ -132,25 +133,46 @@ pub(crate) async fn remove_stale(
         .iter()
         .filter(|row| !written.contains(&row.node_key))
         .collect();
-    if stale.is_empty() {
-        return Ok((0, 0));
-    }
     let stale_ids: Vec<i64> = stale.iter().map(|row| row.id).collect();
 
     // Edges first, and only the static ones: an analysis edge is a conclusion
     // about the content, not a copy of it.
+    //
+    // Two ways a static edge leaves, and the first of them is why this
+    // function no longer returns early when no node is stale. An edge the
+    // producer stopped declaring is gone even when both of its endpoints were
+    // re-supplied -- that is what a declarative snapshot means, and reckoning
+    // only through endpoints could never see it: nothing was stale, so
+    // nothing was removed, and the edge stayed visible for good with no
+    // replay able to repair it.
+    //
+    // Ownership rather than endpoint membership decides the first case. Two
+    // scopes may share endpoint nodes -- different payload attributes, one
+    // node satisfying both -- so "every edge between nodes of this scope"
+    // would take edges another producer declared. An edge no scope has
+    // claimed is left alone here and leaves only by the second route.
     let removed_edges = if types.static_edges.is_empty() {
         0
     } else {
+        let abandoned = Condition::all()
+            .add(edge::Column::ScopeAttribute.eq(attribute.to_owned()))
+            .add(edge::Column::ScopeValue.eq(value.to_owned()))
+            .add(edge::Column::EdgeKey.is_not_in(declared_edges.iter().cloned()));
+        let mut leaves = Condition::any().add(abandoned);
+        if !stale_ids.is_empty() {
+            // Incident to a node that is itself departing, whoever declared
+            // it: the endpoint is going, so the edge cannot stay.
+            leaves = leaves.add(
+                Condition::any()
+                    .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
+                    .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
+            );
+        }
         edge::Entity::delete_many()
             .filter(
                 Condition::all()
                     .add(edge::Column::GtsEdgeTypeId.is_in(types.static_edges))
-                    .add(
-                        Condition::any()
-                            .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
-                            .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
-                    ),
+                    .add(leaves),
             )
             .secure()
             .scope_with(scope)
@@ -159,6 +181,10 @@ pub(crate) async fn remove_stale(
             .map_err(map_scope_err)?
             .rows_affected
     };
+
+    if stale_ids.is_empty() {
+        return Ok((0, removed_edges));
+    }
 
     // A tombstoned edge is a deleted conclusion, and it must not keep a node
     // alive on behalf of one. Left in place it does exactly that: the row is

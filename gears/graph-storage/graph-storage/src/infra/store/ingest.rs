@@ -399,9 +399,27 @@ async fn ingest_in_tx(
             .iter()
             .map(|spec| spec.node_key.clone())
             .collect();
-        let (removed_nodes, removed_edges) =
-            super::scope::remove_stale(scope, tx, &replace.attribute, &replace.value, &written)
-                .await?;
+        // The deterministic key of every edge this batch declared. What the
+        // scope owns and this set does not contain is what the producer
+        // removed -- including an edge whose endpoints both survived, which
+        // the node reckoning alone can never notice.
+        let declared_edges: std::collections::BTreeSet<String> = request
+            .edges
+            .iter()
+            .filter_map(|spec| {
+                let info = types.get(&spec.type_id)?;
+                Some(identity::derive_edge_key(info.uuid, spec))
+            })
+            .collect();
+        let (removed_nodes, removed_edges) = super::scope::remove_stale(
+            scope,
+            tx,
+            &replace.attribute,
+            &replace.value,
+            &written,
+            &declared_edges,
+        )
+        .await?;
         tally.counts.scope_removed_nodes = removed_nodes;
         tally.counts.scope_removed_edges = removed_edges;
         changed |= removed_nodes > 0 || removed_edges > 0;
@@ -1060,6 +1078,7 @@ async fn upsert_edge(
     info: &TypeInfo,
     src: i64,
     dst: i64,
+    declaring: Option<(&str, &str)>,
 ) -> Result<ItemOutcome, GraphStoreError> {
     let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let edge_key = identity::derive_edge_key(info.uuid, spec);
@@ -1090,6 +1109,8 @@ async fn upsert_edge(
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
             deleted_at: ActiveValue::Set(None),
+            scope_attribute: ActiveValue::Set(declaring.map(|(attribute, _)| attribute.to_owned())),
+            scope_value: ActiveValue::Set(declaring.map(|(_, value)| value.to_owned())),
             created_by_subject_id: ActiveValue::Set(subject.subject_id),
             created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
             updated_by_subject_id: ActiveValue::Set(subject.subject_id),
@@ -1107,12 +1128,50 @@ async fn upsert_edge(
         return Ok(ItemOutcome::Inserted);
     };
 
+    // Ownership is bookkeeping about who declared the edge, not content a
+    // reader can observe, so re-declaring an otherwise identical edge claims
+    // it without making the batch a change: the revision must not advance for
+    // a convergent replay. The claim still has to happen, or an edge first
+    // written by an unscoped ingest would stay unowned and never converge.
+    let claim = declaring.filter(|(attribute, value)| {
+        current.scope_attribute.as_deref() != Some(*attribute)
+            || current.scope_value.as_deref() != Some(*value)
+    });
     if current.payload == payload && current.deleted_at.is_none() {
+        if let Some((attribute, value)) = claim {
+            edge::Entity::update_many()
+                .col_expr(
+                    edge::Column::ScopeAttribute,
+                    Expr::value(Some(attribute.to_owned())),
+                )
+                .col_expr(
+                    edge::Column::ScopeValue,
+                    Expr::value(Some(value.to_owned())),
+                )
+                .filter(Condition::all().add(edge::Column::Id.eq(current.id)))
+                .secure()
+                .scope_with(scope)
+                .exec(tx)
+                .await
+                .map_err(map_scope_err)?;
+        }
         return Ok(ItemOutcome::Unchanged);
     }
 
     let id = current.id;
-    edge::Entity::update_many()
+    let mut update = edge::Entity::update_many();
+    if let Some((attribute, value)) = claim {
+        update = update
+            .col_expr(
+                edge::Column::ScopeAttribute,
+                Expr::value(Some(attribute.to_owned())),
+            )
+            .col_expr(
+                edge::Column::ScopeValue,
+                Expr::value(Some(value.to_owned())),
+            );
+    }
+    update
         .col_expr(edge::Column::Payload, Expr::value(payload))
         .col_expr(edge::Column::UpdatedAt, Expr::value(now))
         .col_expr(
@@ -1585,7 +1644,21 @@ async fn write_edges(
             }
         }
 
-        changed |= tally.edge(&upsert_edge(w, tx, spec, info, src.id, dst.id).await?);
+        changed |= tally.edge(
+            &upsert_edge(
+                w,
+                tx,
+                spec,
+                info,
+                src.id,
+                dst.id,
+                request
+                    .replace_scope
+                    .as_ref()
+                    .map(|replace| (replace.attribute.as_str(), replace.value.as_str())),
+            )
+            .await?,
+        );
     }
     Ok(changed)
 }

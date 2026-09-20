@@ -343,6 +343,17 @@ async fn scope_replacement_removes_what_the_batch_no_longer_names() {
 }
 
 #[tokio::test]
+async fn scope_replacement_removes_an_edge_whose_endpoints_remain() {
+    conformance::scope_replacement_removes_an_edge_whose_endpoints_remain(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn one_replacement_does_not_take_another_scopes_edges() {
+    conformance::one_replacement_does_not_take_another_scopes_edges(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn scope_replacement_preserves_analysis_edges_and_their_endpoints() {
     conformance::scope_replacement_preserves_analysis_edges_and_their_endpoints(
         &store(),

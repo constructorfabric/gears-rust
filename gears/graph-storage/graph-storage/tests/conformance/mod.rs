@@ -3152,6 +3152,250 @@ pub async fn scope_replacement_preserves_analysis_edges_and_their_endpoints(
     );
 }
 
+/// A snapshot converges on its edges, not only on its nodes.
+///
+/// The removal used to be reckoned entirely through nodes: an edge went only
+/// when one of its endpoints was stale. So an edge the producer stopped
+/// declaring while re-supplying both of its endpoints was never stale, never
+/// removed, and stayed visible for good -- and replaying the same snapshot
+/// could not repair it, because the replay is what keeps the endpoints alive.
+/// Traversal and search kept serving a relationship the source had deleted.
+///
+/// Parallel edges have the same shape: dropping one of several edges that
+/// differ only by `discriminator` leaves both endpoints and every sibling in
+/// place, so nothing about the nodes says anything happened.
+pub async fn scope_replacement_removes_an_edge_whose_endpoints_remain(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(TypeRegistration {
+        type_id: ANALYSIS.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{ANALYSIS}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~" }]
+        }),
+    });
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    let parallel = |discriminator: &str| EdgeSpec {
+        discriminator: Some(discriminator.to_owned()),
+        ..edge("left", "right")
+    };
+    let conclusion = EdgeSpec {
+        type_id: ANALYSIS.to_owned(),
+        src_node_key: "left".to_owned(),
+        dst_node_key: "right".to_owned(),
+        payload: Some(serde_json::json!({
+            "provenance": {
+                "produced_by": {
+                    "subject_id": "00000000-0000-0000-0000-0000000000aa",
+                    "subject_type": "gts.cf.core.security.subject_service.v1~"
+                },
+                "method": "static-analysis"
+            }
+        })),
+        ..EdgeSpec::default()
+    };
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("left", "acme/infra"),
+                scoped_node("right", "acme/infra"),
+            ],
+            vec![
+                edge("left", "right"),
+                parallel("second"),
+                parallel("third"),
+                conclusion,
+            ],
+            1,
+        ),
+    )
+    .await
+    .expect("the first snapshot lands");
+
+    // The second snapshot keeps both nodes and one of the three static edges.
+    // Nothing about the nodes changes, so the node reckoning sees no work.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(
+            vec![
+                scoped_node("left", "acme/infra"),
+                scoped_node("right", "acme/infra"),
+            ],
+            vec![parallel("second")],
+            2,
+        ),
+    )
+    .await
+    .expect("the second snapshot lands");
+
+    assert_eq!(
+        outcome.counts.scope_removed_nodes, 0,
+        "no node departs, which is exactly why this case exists"
+    );
+    assert_eq!(
+        outcome.counts.scope_removed_edges, 2,
+        "the undeclared static edge and the undeclared parallel one go: {:?}",
+        outcome.counts
+    );
+
+    let left = store
+        .get_node(&ctx, &"left".to_owned(), 10)
+        .await
+        .expect("both endpoints were re-supplied and stay");
+    store
+        .get_node(&ctx, &"right".to_owned(), 10)
+        .await
+        .expect("both endpoints were re-supplied and stay");
+
+    let statics = static_discriminators(store, &ctx, &left.adjacency).await;
+    assert_eq!(
+        statics,
+        vec![Some("second".to_owned())],
+        "only the re-declared edge survives: {:?}",
+        left.adjacency
+    );
+
+    assert!(
+        left.adjacency
+            .iter()
+            .any(|entry| entry.edge_type_id == ANALYSIS),
+        "an analysis edge is a conclusion, not part of the declared snapshot, \
+         so omitting it does not delete it: {:?}",
+        left.adjacency
+    );
+}
+
+/// Two scopes may share endpoint nodes, and neither may remove the other's
+/// edges.
+///
+/// This is why the edge carries the scope that declared it rather than being
+/// reckoned about through its endpoints. Membership is a payload attribute,
+/// and one node can satisfy two of them -- a repository *and* a component --
+/// so "every edge between nodes of this scope" is not a description of what
+/// this scope declared. It is a description of what happens to be nearby.
+pub async fn one_replacement_does_not_take_another_scopes_edges(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // Both nodes carry both attributes, so both scopes own both nodes.
+    let shared = |key: &str| NodeSpec {
+        node_key: key.to_owned(),
+        type_id: OWNED.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(serde_json::json!({
+            "repository": "acme/infra",
+            "component": "auth",
+        })),
+        ..NodeSpec::default()
+    };
+    let by_component =
+        |nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>, generation: i64| IngestRequest {
+            replace_scope: Some(ReplaceScope {
+                attribute: "component".to_owned(),
+                value: "auth".to_owned(),
+                generation,
+            }),
+            ..batch(nodes, edges)
+        };
+    let from_repository = EdgeSpec {
+        discriminator: Some("declared-by-repository".to_owned()),
+        ..edge("one", "two")
+    };
+    let from_component = EdgeSpec {
+        discriminator: Some("declared-by-component".to_owned()),
+        ..edge("one", "two")
+    };
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![shared("one"), shared("two")], vec![from_repository], 1),
+    )
+    .await
+    .expect("the repository scope declares its edge");
+    ingest_batch(
+        store,
+        &ctx,
+        by_component(vec![shared("one"), shared("two")], vec![from_component], 1),
+    )
+    .await
+    .expect("the component scope declares its own");
+
+    // The repository scope now re-declares itself with no edges at all.
+    let outcome = ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(vec![shared("one"), shared("two")], Vec::new(), 2),
+    )
+    .await
+    .expect("the repository scope re-declares itself");
+
+    assert_eq!(
+        outcome.counts.scope_removed_edges, 1,
+        "it removes its own edge and only its own: {:?}",
+        outcome.counts
+    );
+
+    let one = store
+        .get_node(&ctx, &"one".to_owned(), 10)
+        .await
+        .expect("the shared node stays");
+    let surviving = static_discriminators(store, &ctx, &one.adjacency).await;
+    assert_eq!(
+        surviving,
+        vec![Some("declared-by-component".to_owned())],
+        "the other scope's edge is untouched: {:?}",
+        one.adjacency
+    );
+}
+
+/// The discriminators of the static edges an adjacency names, sorted.
+///
+/// Adjacency carries the edge key rather than the discriminator, so the edge
+/// itself has to be read to tell two parallel edges apart -- which is also a
+/// small check that the two surfaces name edges the same way.
+async fn static_discriminators(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    adjacency: &[graph_storage_sdk::models::AdjacencyEntry],
+) -> Vec<Option<String>> {
+    let mut found = Vec::new();
+    for entry in adjacency.iter().filter(|e| e.edge_type_id == LINK) {
+        let view = store
+            .get_edge(ctx, &entry.edge_key)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "adjacency names edge `{}`, which reads: {error}",
+                    entry.edge_key
+                )
+            });
+        found.push(view.discriminator);
+    }
+    found.sort();
+    found
+}
+
 /// Obligation 2 of the store contract, which the suite's header has claimed
 /// since the beginning with no case behind it: two concurrent replacements of
 /// one scope serialize rather than union.

@@ -35,6 +35,11 @@ pub struct Model {
     pub updated_at: OffsetDateTime,
     /// Soft-delete tombstone; `NULL` for live rows.
     pub deleted_at: Option<OffsetDateTime>,
+    /// The scope whose declared snapshot this edge belongs to, when a scoped
+    /// batch wrote it. `NULL` means no scope has declared it, and a
+    /// replacement leaves it alone unless an endpoint is departing.
+    pub scope_attribute: Option<String>,
+    pub scope_value: Option<String>,
     /// Subject that first wrote the row (DESIGN § API element envelope).
     pub created_by_subject_id: Uuid,
     pub created_by_subject_type: Option<String>,
