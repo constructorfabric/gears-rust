@@ -44,6 +44,8 @@ impl ScopableEntity for ent::Entity {
         (pep_properties::RESOURCE_ID, ent::Column::ResourceId),
     ];
 
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

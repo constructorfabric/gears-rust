@@ -35,6 +35,8 @@ mod test_entity {
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] =
             &[("owner_tenant_id", Column::TenantId)];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &["id", "owner_id"];
+
         fn type_col() -> Option<Column> {
             None
         }

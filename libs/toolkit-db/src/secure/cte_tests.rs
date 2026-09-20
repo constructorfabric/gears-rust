@@ -39,6 +39,8 @@ mod node {
             (pep_properties::RESOURCE_ID, Column::Id),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -70,6 +72,8 @@ mod item {
             (pep_properties::OWNER_TENANT_ID, Column::TenantId),
             (pep_properties::RESOURCE_ID, Column::Id),
         ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
 
         fn type_col() -> Option<Column> {
             None

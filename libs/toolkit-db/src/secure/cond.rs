@@ -983,6 +983,8 @@ mod tests {
                 ("department_id", Column::DepartmentId),
             ];
 
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
             fn type_col() -> Option<Column> {
                 None
             }

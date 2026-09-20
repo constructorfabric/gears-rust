@@ -3,13 +3,14 @@ use toolkit_security::access_scope::pep_properties;
 
 /// Defines the contract for entities that can be scoped by tenant, resource, owner, and type.
 ///
-/// An entity declares two things: the property-to-column table
-/// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES), and
+/// An entity declares three things: the property-to-column table
+/// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES), the dimensions it deliberately
+/// leaves out of it ([`UNSCOPED_DIMENSIONS`](Self::UNSCOPED_DIMENSIONS)), and
 /// [`type_col()`](Self::type_col).
 ///
-/// The tenant, resource and owner dimensions are **not** declared separately.
-/// They are the well-known properties of that same table, and
-/// [`ScopeProperties`] reads them out of it:
+/// The tenant, resource and owner **columns** are not declared separately: they
+/// are the well-known properties of that same table, and [`ScopeProperties`]
+/// reads them out of it:
 /// `tenant_col()` is `resolve_property("owner_tenant_id")`, `resource_col()` is
 /// `resolve_property("id")` and `owner_col()` is `resolve_property("owner_id")`.
 /// Writing them by hand next to the table would be the same column in two
@@ -20,8 +21,13 @@ use toolkit_security::access_scope::pep_properties;
 /// property name: no scope can address it, so it cannot come from the table.
 ///
 /// **Important**: No implicit defaults are allowed. A dimension is scoped when
-/// the table names its property and unscoped when it does not, and `type_col`
-/// must be answered explicitly.
+/// the table names its property and unscoped when
+/// [`UNSCOPED_DIMENSIONS`](Self::UNSCOPED_DIMENSIONS) names it; one of the two
+/// must, and never both, or the entity does not build. `type_col` must be
+/// answered explicitly for the same reason. Silence is not an answer here: the
+/// write-side guards that ask for a column skip themselves when there is none,
+/// and nothing at runtime can tell a dimension that was decided against from
+/// one whose row was forgotten.
 ///
 /// # Example (Manual Implementation)
 /// ```rust,ignore
@@ -35,8 +41,14 @@ use toolkit_security::access_scope::pep_properties;
 ///         (pep_properties::RESOURCE_ID, user::Column::Id),
 ///     ];
 ///
-///     // Tenant and resource are scoped, owner is not — all three follow from
-///     // the table above. Only `type_col` is written out.
+///     // And the dimensions the table does not name. Each of the three
+///     // belongs to exactly one of the two lists; a dimension in neither is a
+///     // build error, because nothing at runtime could tell it from a
+///     // dimension the entity genuinely has no column for.
+///     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+///
+///     // Tenant and resource are scoped, owner is not — the columns follow
+///     // from the table above. Only `type_col` is written out.
 ///     fn type_col() -> Option<Self::Column> {
 ///         None
 ///     }
@@ -153,6 +165,92 @@ pub trait ScopableEntity: EntityTrait {
     ///
     /// An unrestricted entity declares an empty table.
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)];
+
+    /// The well-known dimensions this entity deliberately does not scope on.
+    ///
+    /// Each of `owner_tenant_id`, `id` and `owner_id` must appear either in
+    /// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES) or here, never in both and
+    /// never in neither. [`ScopeProperties::DIMENSIONS_ARE_DECLARED`] is the
+    /// check, and it fails the build.
+    ///
+    /// This is not the column written twice that issue #4726 was about: no
+    /// column is named here at all. What is named is the *decision* — the
+    /// dimensions this entity was asked about and answered "no" to. Without it
+    /// a missing row is indistinguishable from a deliberate omission, and the
+    /// write-side guards that ask for a column (`tenant_id is required`,
+    /// `tenant_id is immutable`) are skipped in silence for both.
+    ///
+    /// `#[derive(Scopable)]` fills it from `no_tenant`, `no_resource` and
+    /// `no_owner`, which it already requires. A manual implementation writes
+    /// it out:
+    ///
+    /// ```rust,ignore
+    /// const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+    /// ```
+    ///
+    /// An unrestricted entity is exempt: it declares an empty table and scopes
+    /// on nothing by construction.
+    const UNSCOPED_DIMENSIONS: &'static [&'static str];
+}
+
+/// The dimensions every entity has to account for, one way or the other.
+///
+/// `type_col` is absent on purpose: no property name addresses it, so it
+/// cannot be in the table, and it is a required method instead.
+const WELL_KNOWN_DIMENSIONS: [&str; 3] = [
+    pep_properties::OWNER_TENANT_ID,
+    pep_properties::RESOURCE_ID,
+    pep_properties::OWNER_ID,
+];
+
+/// Whether `names` contains `name`, in a `const` context.
+const fn names_contain(names: &[&str], name: &str) -> bool {
+    let mut i = 0;
+    while i < names.len() {
+        if property_names_equal(names[i], name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a `SCOPE_PROPERTIES` table has an entry for `property`.
+const fn table_names<C>(table: &[(&str, C)], property: &str) -> bool {
+    let mut i = 0;
+    while i < table.len() {
+        if property_names_equal(table[i].0, property) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether every well-known dimension was decided about exactly once.
+///
+/// Scoped means the table names it; unscoped means `UNSCOPED_DIMENSIONS` does.
+/// Both is a contradiction, neither is an omission, and a name in the list that
+/// is not a well-known dimension accounts for nothing — a misspelt
+/// `owner_tenat_id` would otherwise read as an answer.
+const fn dimensions_are_declared<C>(table: &[(&str, C)], unscoped: &[&str]) -> bool {
+    let mut i = 0;
+    while i < WELL_KNOWN_DIMENSIONS.len() {
+        if table_names(table, WELL_KNOWN_DIMENSIONS[i])
+            == names_contain(unscoped, WELL_KNOWN_DIMENSIONS[i])
+        {
+            return false;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < unscoped.len() {
+        if !names_contain(&WELL_KNOWN_DIMENSIONS, unscoped[j]) {
+            return false;
+        }
+        j += 1;
+    }
+    true
 }
 
 /// `a == b` for two `&str`, in a `const` context.
@@ -241,6 +339,25 @@ pub trait ScopeProperties: ScopableEntity {
          with the first entry and quietly ignore the rest"
     );
 
+    /// Compile-time proof that every well-known dimension was decided about.
+    ///
+    /// The three dimension accessors below answer `None` both for an entity
+    /// that has no such column and for one whose table forgot the row, and the
+    /// write-side guards skip themselves on `None` either way. Nothing at
+    /// runtime can tell the two apart, so the decision is made a declaration
+    /// and checked here.
+    ///
+    /// Forced, evaluated and unavailable to `trybuild` for the same reasons as
+    /// [`PROPERTIES_ARE_UNIQUE`](Self::PROPERTIES_ARE_UNIQUE); see there.
+    const DIMENSIONS_ARE_DECLARED: () = assert!(
+        Self::IS_UNRESTRICTED
+            || dimensions_are_declared(Self::SCOPE_PROPERTIES, Self::UNSCOPED_DIMENSIONS),
+        "every one of `owner_tenant_id`, `id` and `owner_id` must be named by \
+         SCOPE_PROPERTIES or by UNSCOPED_DIMENSIONS, and by exactly one of \
+         them: a dimension in neither is one nobody decided about, and the \
+         write guards that ask for its column would skip themselves in silence"
+    );
+
     /// Resolve an authorization property name to a database column.
     ///
     /// Maps PEP property names (e.g. `"owner_tenant_id"`) to `SeaORM` columns
@@ -254,6 +371,7 @@ pub trait ScopeProperties: ScopableEntity {
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column> {
         const { Self::PROPERTIES_ARE_UNIQUE }
+        const { Self::DIMENSIONS_ARE_DECLARED }
         Self::SCOPE_PROPERTIES
             .iter()
             .find(|(name, _)| *name == property)
@@ -273,6 +391,7 @@ pub trait ScopeProperties: ScopableEntity {
     #[must_use]
     fn scope_columns() -> Vec<Self::Column> {
         const { Self::PROPERTIES_ARE_UNIQUE }
+        const { Self::DIMENSIONS_ARE_DECLARED }
         Self::SCOPE_PROPERTIES
             .iter()
             .map(|(_, column)| *column)
@@ -417,6 +536,8 @@ mod tests {
                 (pep_properties::RESOURCE_ID, Column::Id),
                 ("department_id", Column::DepartmentId),
             ];
+
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
 
             fn type_col() -> Option<Column> {
                 None
@@ -613,10 +734,104 @@ mod tests {
 
         #[test]
         fn names_compare_by_content_not_by_pointer() {
-            assert!(property_names_equal("owner_tenant_id", "owner_tenant_id"));
+            // One side owns its bytes, so the two arguments cannot be the same
+            // static address. A comparison by pointer would answer `false`
+            // here, which is what the name of this test promises it rules out.
+            let owned = String::from("owner_tenant_id");
+            assert!(property_names_equal(&owned, "owner_tenant_id"));
             assert!(!property_names_equal("owner_tenant_id", "owner_id"));
             // A prefix is not a match: the length is checked first.
             assert!(!property_names_equal("owner", "owner_id"));
+        }
+    }
+
+    /// The rule [`ScopeProperties::DIMENSIONS_ARE_DECLARED`] enforces.
+    ///
+    /// Tested here rather than as a `trybuild` fixture for the reason that
+    /// const documents: the assertion is evaluated at monomorphization, and
+    /// `trybuild` runs `cargo check`, which stops at metadata.
+    mod dimension_rule {
+        use super::super::dimensions_are_declared;
+        use toolkit_security::access_scope::pep_properties;
+
+        /// A table naming all three, and nothing left to declare.
+        #[test]
+        fn a_fully_scoped_entity_declares_nothing_unscoped() {
+            assert!(dimensions_are_declared(
+                &[
+                    (pep_properties::OWNER_TENANT_ID, 1),
+                    (pep_properties::RESOURCE_ID, 2),
+                    (pep_properties::OWNER_ID, 3),
+                ],
+                &[]
+            ));
+        }
+
+        /// The complement: nothing scoped, all three declared unscoped. A link
+        /// table with no identity of its own is the real shape.
+        #[test]
+        fn an_entity_that_scopes_on_nothing_declares_all_three() {
+            assert!(dimensions_are_declared::<u8>(
+                &[],
+                &[
+                    pep_properties::OWNER_TENANT_ID,
+                    pep_properties::RESOURCE_ID,
+                    pep_properties::OWNER_ID,
+                ]
+            ));
+        }
+
+        /// The regression this rule exists for: a dimension in neither place.
+        /// `tenant_col()` answers `None`, and every write-side guard that asks
+        /// for the column skips itself, exactly as it would for an entity that
+        /// has no tenant at all.
+        #[test]
+        fn a_dimension_in_neither_place_is_rejected() {
+            assert!(!dimensions_are_declared(
+                &[
+                    (pep_properties::RESOURCE_ID, 2),
+                    (pep_properties::OWNER_ID, 3),
+                ],
+                &[]
+            ));
+        }
+
+        /// And the contradiction: scoped and unscoped at once. The table would
+        /// win silently, so the declaration would be a lie nobody reads.
+        #[test]
+        fn a_dimension_in_both_places_is_rejected() {
+            assert!(!dimensions_are_declared(
+                &[
+                    (pep_properties::OWNER_TENANT_ID, 1),
+                    (pep_properties::RESOURCE_ID, 2),
+                    (pep_properties::OWNER_ID, 3),
+                ],
+                &[pep_properties::OWNER_ID]
+            ));
+        }
+
+        /// A name that is not a dimension accounts for nothing. Without this,
+        /// `owner_tenat_id` would leave the tenant undeclared while looking
+        /// like an answer -- the same silence the rule is here to end.
+        #[test]
+        fn a_name_that_is_not_a_dimension_is_rejected() {
+            assert!(!dimensions_are_declared(
+                &[(pep_properties::RESOURCE_ID, 2)],
+                &["owner_tenat_id", pep_properties::OWNER_ID]
+            ));
+        }
+
+        /// A `pep_prop` entry is not a dimension and must not stand in for one.
+        #[test]
+        fn a_pep_prop_does_not_answer_for_a_dimension() {
+            assert!(!dimensions_are_declared(
+                &[
+                    (pep_properties::RESOURCE_ID, 2),
+                    ("department_id", 4),
+                    (pep_properties::OWNER_ID, 3),
+                ],
+                &[]
+            ));
         }
     }
 }

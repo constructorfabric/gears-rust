@@ -1,7 +1,7 @@
 error[E0407]: method `tenant_col` is not a member of trait `toolkit_db::secure::ScopableEntity`
-  --> tests/ui/fail/dimension_columns_come_from_the_table.rs:44:9
+  --> tests/ui/fail/dimension_columns_come_from_the_table.rs:46:9
    |
-44 | /         fn tenant_col() -> Option<Column> {
-45 | |             Some(Column::LegacyTenantId)
-46 | |         }
+46 | /         fn tenant_col() -> Option<Column> {
+47 | |             Some(Column::LegacyTenantId)
+48 | |         }
    | |_________^ not a member of trait `toolkit_db::secure::ScopableEntity`

@@ -38,6 +38,8 @@ mod test_entity {
             ("id", Column::Id),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &["owner_id"];
+
         fn type_col() -> Option<Column> {
             None
         }

@@ -51,17 +51,30 @@
 //!         (pep_properties::RESOURCE_ID, user::Column::Id),
 //!     ];
 //!
-//!     // Tenant- and resource-scoped, not owner-scoped: all three follow from
-//!     // the table. Only `type_col` is written out, because no property name
-//!     // addresses it.
+//!     // The dimensions the table does not name, stated rather than left to be
+//!     // inferred from the silence. Every one of the three must appear in one
+//!     // list or the other.
+//!     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+//!
+//!     // Tenant- and resource-scoped, not owner-scoped: the columns follow
+//!     // from the table. Only `type_col` is written out, because no property
+//!     // name addresses it.
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }
 //! }
 //!
-//! // Global entity (no scoping at all): an empty table.
+//! // A scoped entity that happens to scope on nothing: an empty table, and
+//! // all three dimensions declared. `#[secure(unrestricted)]` is the other
+//! // shape -- it sets `IS_UNRESTRICTED` and is exempt from the check.
 //! impl ScopableEntity for system_config::Entity {
 //!     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+//!
+//!     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[
+//!         pep_properties::OWNER_TENANT_ID,
+//!         pep_properties::RESOURCE_ID,
+//!         pep_properties::OWNER_ID,
+//!     ];
 //!
 //!     fn type_col() -> Option<Self::Column> {
 //!         None

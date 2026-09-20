@@ -474,6 +474,20 @@ fn rows_per_insert<E: EntityTrait>(backend: sea_orm::DbBackend) -> usize {
 /// - Verifies the target row exists **within the scope** before updating.
 /// - For tenant-scoped entities, forbids changing `tenant_id` (immutable).
 ///
+/// The tenant column, and not every scope column. The difference is the kind of
+/// refusal each one would be: a row moved into another tenant has crossed the
+/// boundary inside which policy applies at all, so no policy can permit it and
+/// the refusal belongs here, below policy. Changing an owner is a domain action
+/// a PDP is meant to allow or deny -- `file-storage`'s `update_owner`
+/// (`@cpt-cf-file-storage-fr-ownership-transfer`) is one the platform ships --
+/// and forbidding it here would take that decision away from the component it
+/// belongs to. The resource column is the primary key, which no caller updates.
+///
+/// The rule that would cover all of them is not "a scope column is immutable"
+/// but "an update must leave the row inside the scope that authorised it",
+/// which is `validate_insert_scope` applied to updates. That changes what a
+/// scoped update means for every gear and is not decided here.
+///
 /// # Errors
 /// - `ScopeError::Denied` if the row is not accessible in the scope.
 /// - `ScopeError::Denied("tenant_id is immutable")` if caller attempts to change `tenant_id`.
@@ -1336,6 +1350,8 @@ mod tests {
                 (pep_properties::RESOURCE_ID, Column::Id),
             ];
 
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1388,6 +1404,12 @@ mod tests {
         impl ScopableEntity for Entity {
             const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                toolkit_security::pep_properties::RESOURCE_ID,
+                toolkit_security::pep_properties::OWNER_ID,
+            ];
+
             fn type_col() -> Option<Column> {
                 None
             }
@@ -1414,6 +1436,11 @@ mod tests {
 
         impl ScopableEntity for Entity {
             const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[("id", Column::Id)];
+
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                toolkit_security::pep_properties::OWNER_ID,
+            ];
 
             fn type_col() -> Option<Column> {
                 None
@@ -1617,6 +1644,8 @@ mod tests {
                 (pep_properties::OWNER_ID, Column::UserId),
                 ("city_id", Column::CityId),
             ];
+
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
 
             fn type_col() -> Option<Column> {
                 None
@@ -1886,6 +1915,9 @@ mod tests {
                 (pep_properties::OWNER_TENANT_ID, Column::TenantId),
                 ("score", Column::Score),
             ];
+
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+                &[pep_properties::RESOURCE_ID, pep_properties::OWNER_ID];
 
             fn type_col() -> Option<Column> {
                 None
@@ -2171,6 +2203,46 @@ mod tests {
         assert!(
             matches!(result, Err(ScopeError::Denied(_))),
             "tenant_id must stay immutable through an upsert"
+        );
+    }
+
+    /// The three write-side guards that skip themselves when the entity
+    /// declares no tenant column, asserted on an entity that declares one.
+    ///
+    /// The counterpart -- an entity whose table forgets the row -- cannot be
+    /// written any more: `ScopeProperties::DIMENSIONS_ARE_DECLARED` fails the
+    /// build for it. `dimensions_are_declared` in `entity_traits` is where that
+    /// rule is tested; this is what the rule protects.
+    #[test]
+    fn the_write_guards_fire_when_the_entity_declares_its_tenant() {
+        use sea_orm::sea_query::Expr;
+        use test_entity::{Column, Entity};
+
+        assert!(
+            <Entity as ScopeProperties>::tenant_col().is_some(),
+            "premise: this entity declares its tenant column"
+        );
+
+        assert!(
+            SecureOnConflict::<Entity>::columns([Column::Id])
+                .update_columns([Column::TenantId])
+                .is_err(),
+            "the upsert guard fires when the entity declares a tenant"
+        );
+        assert!(
+            SecureOnConflict::<Entity>::columns([Column::Id])
+                .value(Column::TenantId, Expr::value(Uuid::new_v4()))
+                .is_err(),
+            "and so does the by-expression form"
+        );
+
+        let update = Entity::update_many()
+            .secure()
+            .col_expr(Column::TenantId, Expr::value(Uuid::new_v4()))
+            .scope_with(&crate::secure::AccessScope::for_tenant(Uuid::new_v4()));
+        assert!(
+            update.tenant_update_attempted,
+            "the bulk-update guard raises its flag"
         );
     }
 

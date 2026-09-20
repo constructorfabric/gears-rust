@@ -77,6 +77,10 @@
 //!         (pep_properties::RESOURCE_ID, Column::Id),
 //!     ];
 //!
+//!     // And the dimensions it does not name. Each of the three belongs to
+//!     // exactly one of the two lists, checked when the entity is compiled.
+//!     const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+//!
 //!     fn type_col() -> Option<Self::Column> {
 //!         None
 //!     }

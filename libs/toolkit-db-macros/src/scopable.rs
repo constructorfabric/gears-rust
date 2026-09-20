@@ -77,6 +77,11 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
                 // empty, and the three dimension accessors `ScopeProperties`
                 // derives from this table all answer `None`.
                 const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
+                // An unrestricted entity scopes on nothing by construction, so
+                // there is no dimension left to decide about. The check in
+                // `ScopeProperties` exempts it; the const is still required.
+                const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
             }
         });
     }
@@ -92,6 +97,11 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
     // dimension accessors from it, so none of them can describe a different set.
     let scope_properties_impl = generate_scope_properties(&config, input.ident.span());
 
+    // The other half of the same decision: the dimensions `#[secure(...)]`
+    // answered `no_*` to. `validate_config` has already required an answer for
+    // each one, so this cannot be partial.
+    let unscoped_dimensions_impl = generate_unscoped_dimensions(&config);
+
     // Generate the implementation
     Ok(quote! {
         impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
@@ -100,8 +110,35 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
             #type_col_impl
 
             #scope_properties_impl
+
+            #unscoped_dimensions_impl
         }
     })
+}
+
+/// Build `UNSCOPED_DIMENSIONS`: the well-known dimensions this entity was asked
+/// about and answered `no_tenant` / `no_resource` / `no_owner` to.
+///
+/// The complement of the dimension entries in [`generate_scope_properties`],
+/// from the same configuration, so the two cannot disagree. It exists because
+/// the trait cannot tell a dimension an entity has no column for from one whose
+/// row was forgotten, and the write-side guards skip themselves on both.
+fn generate_unscoped_dimensions(config: &SecureConfig) -> TokenStream {
+    let mut entries = Vec::new();
+
+    for (property, dimension) in [
+        (PEP_PROP_OWNER_TENANT_ID, config.tenant_col.as_ref()),
+        (PEP_PROP_RESOURCE_ID, config.resource_col.as_ref()),
+        (PEP_PROP_OWNER_ID, config.owner_col.as_ref()),
+    ] {
+        if dimension.is_none() {
+            entries.push(quote! { #property });
+        }
+    }
+
+    quote! {
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[#(#entries),*];
+    }
 }
 
 /// Generate a column method implementation

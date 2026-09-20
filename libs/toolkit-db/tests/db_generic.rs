@@ -84,6 +84,8 @@ impl toolkit_db::secure::ScopableEntity for ent::Entity {
         (pep_properties::RESOURCE_ID, ent::Column::Id),
     ];
 
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
     fn type_col() -> Option<<Self as sea_orm::EntityTrait>::Column> {
         None
     }
@@ -346,6 +348,8 @@ impl toolkit_db::secure::ScopableEntity for cte_ent::Entity {
         (pep_properties::OWNER_TENANT_ID, cte_ent::Column::TenantId),
         (pep_properties::RESOURCE_ID, cte_ent::Column::Id),
     ];
+
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
 
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None

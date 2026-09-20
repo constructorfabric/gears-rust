@@ -78,6 +78,9 @@ mod node {
             (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -111,6 +114,9 @@ mod edge {
             ),
             (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
         ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
 
         fn type_col() -> Option<Column> {
             None
@@ -180,6 +186,9 @@ mod open_node {
             (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -212,6 +221,9 @@ mod open_edge {
             ),
             (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
         ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
 
         fn type_col() -> Option<Column> {
             None

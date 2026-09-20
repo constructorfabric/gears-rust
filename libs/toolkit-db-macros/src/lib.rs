@@ -76,6 +76,12 @@ mod scopable;
 /// `type_col` gets no entry: no property name addresses it, so no scope can.
 /// It is the one dimension the macro still emits as a method.
 ///
+/// The `no_*` answers are emitted too, as `UNSCOPED_DIMENSIONS`. Nothing there
+/// names a column -- the list records which dimensions were decided against, so
+/// that a table missing a row can be told from an entity that genuinely has no
+/// such column. `unrestricted` emits an empty list and is exempt from the
+/// check, because it scopes on nothing by construction.
+///
 /// `resolve_property()`, `scope_columns()`, `tenant_col()`, `resource_col()`
 /// and `owner_col()` are **not** generated. They are provided by the
 /// `ScopeProperties` trait, which reads them all back out of that one table --

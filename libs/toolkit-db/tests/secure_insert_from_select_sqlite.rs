@@ -36,6 +36,12 @@ mod link {
 impl ScopableEntity for link::Entity {
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[
+        toolkit_security::pep_properties::OWNER_TENANT_ID,
+        toolkit_security::pep_properties::RESOURCE_ID,
+        toolkit_security::pep_properties::OWNER_ID,
+    ];
+
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }

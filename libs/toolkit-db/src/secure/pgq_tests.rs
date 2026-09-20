@@ -39,6 +39,9 @@ mod node {
             ),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -76,6 +79,9 @@ mod edge {
                 Column::Id,
             ),
         ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
 
         fn type_col() -> Option<Column> {
             None
@@ -119,6 +125,8 @@ mod owned {
             ),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -160,6 +168,9 @@ mod aliased {
             ),
         ];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
         }
@@ -188,6 +199,12 @@ mod closure {
 
     impl crate::secure::ScopableEntity for Entity {
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[
+            toolkit_security::pep_properties::OWNER_TENANT_ID,
+            toolkit_security::pep_properties::RESOURCE_ID,
+            toolkit_security::pep_properties::OWNER_ID,
+        ];
 
         fn type_col() -> Option<Column> {
             None

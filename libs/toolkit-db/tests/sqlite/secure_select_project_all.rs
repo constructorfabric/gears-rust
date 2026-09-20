@@ -54,6 +54,8 @@ impl ScopableEntity for order_ent::Entity {
         (pep_properties::RESOURCE_ID, order_ent::Column::Id),
     ];
 
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -96,6 +98,8 @@ impl ScopableEntity for item_ent::Entity {
         (pep_properties::OWNER_TENANT_ID, item_ent::Column::TenantId),
         (pep_properties::RESOURCE_ID, item_ent::Column::Id),
     ];
+
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
 
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None

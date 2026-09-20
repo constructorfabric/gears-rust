@@ -39,6 +39,9 @@ impl ScopableEntity for tenant_ent::Entity {
         tenant_ent::Column::TenantId,
     )];
 
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+        &[pep_properties::RESOURCE_ID, pep_properties::OWNER_ID];
+
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -65,6 +68,8 @@ impl ScopableEntity for unrestricted_ent::Entity {
     const IS_UNRESTRICTED: bool = true;
 
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
 
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None

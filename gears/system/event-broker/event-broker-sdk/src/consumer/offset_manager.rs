@@ -43,6 +43,8 @@ mod offset_row {
 
         const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
+
         fn type_col() -> Option<Self::Column> {
             None
         }
