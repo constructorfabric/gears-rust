@@ -119,7 +119,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 - **Requirements Covered**:
 
   - [ ] `p1` - `cpt-cf-settings-service-fr-authn-role-gating`
-  - [ ] `p1` - `cpt-cf-settings-service-nfr-security-baseline`
+  - [x] `p1` - `cpt-cf-settings-service-nfr-security-baseline`
   - [ ] `p1` - `cpt-cf-settings-service-nfr-availability`
 
 - **Design Principles Covered**:
@@ -177,7 +177,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-settings-category-model`
+  - [x] `p1` - `cpt-cf-settings-service-fr-settings-category-model`
 
 - **Design Constraints Covered**:
 
@@ -233,7 +233,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-setting-scope-class`
+  - [x] `p1` - `cpt-cf-settings-service-fr-setting-scope-class`
   - [ ] `p3` - `cpt-cf-settings-service-fr-dependency-group-declaration`
   - [ ] `p2` - `cpt-cf-settings-service-nfr-versatility-gts-scope-class`
 
@@ -290,7 +290,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-typed-value-validation`
+  - [x] `p1` - `cpt-cf-settings-service-fr-typed-value-validation`
   - [ ] `p2` - `cpt-cf-settings-service-fr-subject-scoped-values`
 
 - **Design Principles Covered**:
@@ -344,11 +344,11 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-cascading-inheritance`
+  - [x] `p1` - `cpt-cf-settings-service-fr-cascading-inheritance`
   - [ ] `p2` - `cpt-cf-settings-service-fr-defaults-revert`
-  - [ ] `p1` - `cpt-cf-settings-service-fr-bulk-effective-read`
+  - [x] `p1` - `cpt-cf-settings-service-fr-bulk-effective-read`
   - [ ] `p1` - `cpt-cf-settings-service-nfr-performance-read-cache`
-  - [ ] `p1` - `cpt-cf-settings-service-nfr-efficiency-live-read`
+  - [x] `p1` - `cpt-cf-settings-service-nfr-efficiency-live-read`
 
 - **Design Principles Covered**:
 
@@ -449,7 +449,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-tenant-scope-enforcement`
+  - [x] `p1` - `cpt-cf-settings-service-fr-tenant-scope-enforcement`
   - [ ] `p2` - `cpt-cf-settings-service-fr-per-setting-access`
   - [ ] `p2` - `cpt-cf-settings-service-fr-barrier-default-seam`
   - [ ] `p1` - `cpt-cf-settings-service-nfr-scope-isolation`
@@ -504,10 +504,10 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-set-value`
-  - [ ] `p1` - `cpt-cf-settings-service-fr-validate-before-set`
+  - [x] `p1` - `cpt-cf-settings-service-fr-set-value`
+  - [x] `p1` - `cpt-cf-settings-service-fr-validate-before-set`
   - [ ] `p1` - `cpt-cf-settings-service-fr-live-read-activation`
-  - [ ] `p1` - `cpt-cf-settings-service-fr-tenant-overrides`
+  - [x] `p1` - `cpt-cf-settings-service-fr-tenant-overrides`
   - [ ] `p1` - `cpt-cf-settings-service-nfr-reliability-validated-set`
   - [ ] `p2` - `cpt-cf-settings-service-nfr-ops-set-monitoring`
 
@@ -619,8 +619,8 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-settings-service-fr-module-contributed-declarations`
-  - [ ] `p1` - `cpt-cf-settings-service-fr-contributed-lifecycle`
+  - [x] `p1` - `cpt-cf-settings-service-fr-module-contributed-declarations`
+  - [x] `p1` - `cpt-cf-settings-service-fr-contributed-lifecycle`
 
 - **Domain Model Entities**:
   - ContributedDeclaration, ReconcileResult

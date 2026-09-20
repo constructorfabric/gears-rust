@@ -294,7 +294,7 @@ No constraints beyond project defaults apply to this gear (no GPU/async-runtime/
 
 #### Category and Setting Lifecycle
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-settings-category-model`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-settings-category-model`
 
 The system **MUST** let a platform administrator create a named, flat, single-level category with a unique name and description; creating a category with a duplicate name **MUST** be rejected with a clear error. The system **MUST** reject removal of a category that still contains one or more settings; removal **MUST** succeed only when the category is empty. The system **MUST** let an administrator create a setting under an existing category with a key (unique within its category), type, default value, mode, and description; creating a setting under a non-existent category, or with a duplicate key, **MUST** be rejected.
 
@@ -307,7 +307,7 @@ Once a setting is created, its **descriptive metadata** (description, Mode, Doma
 
 #### GTS Type Validation, Trait Discovery & Secret Protection
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-typed-value-validation`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-typed-value-validation`
 
 The system **MUST** validate every setting value (override or default) against its declared GTS type at creation or change time and **MUST** reject invalid values with a clear, field-level error; `format` keywords (e.g. `uri`, `ipv4`/`ipv6`) and trait-driven rules (e.g. cron dialect, regex-compiles) **MUST** be asserted, not treated as advisory. The system **MUST** include, or let a client resolve, a setting's type and resolved trait set when read, so the client can render the appropriate input and pre-validate; structured (object/array) values **MUST** be supported, not only scalar values. A setting whose type carries the `secret` trait **MUST** be stored encrypted at rest and **MUST** be masked in every **administrative** read, search, or audit response; its plaintext **MUST NOT** be retrievable through any administrative or human-facing path (single get, bulk get, search, list-by-category, audit). Plaintext secret resolution **MUST** be available only through one explicit, authenticated **machine-only runtime path** — the Settings Read SDK / internal in-process reader ([§7.1](#71-public-api-surface)) — and only for a consuming service authorized to that specific setting; every such plaintext resolution **MUST** be recorded as a secret-use audit event ([§5.7](#57-security-secrets--audit)) and its value **MUST NOT** be cached in plaintext ([§6.1](#61-gear-specific-nfrs)). Subject types, setting value types, and event payload schemas **MUST** resolve through the platform type system (GTS): setting keys are GTS type identifiers, registered when their declarations are created, event payloads carry a registered `dataschema`, and schema evolution follows GTS major/minor compatibility rules.
 
@@ -383,7 +383,7 @@ The system **MUST** maintain an independent Schema Default per setting that is n
 
 #### Setting a Value
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-set-value`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-set-value`
 
 A **value** operation on a setting — set, revert, remove-value, or clone (at platform or any tenant scope) — **MUST** take effect when the caller sets it. The service **MUST NOT** keep the change in a pending state first, and there **MUST NOT** be a separate step that activates it later. A client that lets an administrator collect several changes before sending them **MUST** keep that collection on its own side.
 
@@ -398,7 +398,7 @@ Operations on a **setting Declaration itself** follow a different rule, and **MU
 
 #### Validate Before Setting; Step-Up on Set
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-validate-before-set`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-validate-before-set`
 
 The system **MUST** let a caller ask what a value would do before setting it. This check **MUST** report whether the value is valid, the current effective value and where it comes from, and which descendant scopes the change would affect, in pages rather than all at once. It **MUST** change nothing, **MUST** give the same answer every time, and **MUST NOT** be required before setting: a caller may set a value directly, and the same validation runs inside the set anyway.
 
@@ -463,7 +463,7 @@ The system **MUST** let a declaration author declare a **Dependency Group** — 
 
 #### Setting Scope Class Governs Cascade/Override Behaviour
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-setting-scope-class`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-setting-scope-class`
 
 Every setting **MUST** declare a Scope Class (global | cascading | local), and cascade/override behaviour **MUST** be derived deterministically from it: **global** **MUST NOT** be overridable by any tenant nor inherited by tenants; **cascading** **MUST** inherit down the tenant scope hierarchy with overrides at permitted scopes; **local** **MUST** apply only at the scope where set and **MUST NOT** be inherited by descendants. Cascade/override behaviour **MUST NOT** depend on independently-set booleans that can be forgotten.
 
@@ -482,7 +482,7 @@ For `global`, "not inherited" means tenants read the platform value directly; it
 
 #### Tenant Override of a Cascading Value
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-tenant-overrides`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-tenant-overrides`
 
 Given a `cascading` setting with a platform-level value, when a value is set at a target tenant, it **MUST** override the inherited value there and for non-overriding descendants. The target **MUST** be inside the caller's subtree. A tenant caller may write only when the caller's own effective access to the setting is `overridable`; a restriction on the target does not block an authorized ancestor from managing that target. Setting, cloning, and removing overrides follow the same authorization and validation rules.
 
@@ -491,7 +491,7 @@ Given a `cascading` setting with a platform-level value, when a value is set at 
 
 #### Cascading Inheritance with Source Trace and Impact Warning
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-cascading-inheritance`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-cascading-inheritance`
 
 For a cascading setting at a tenant scope, the system **MUST** resolve the effective value by walking up the tenant scope hierarchy — against the locally cached hierarchy snapshot on the warm read path, refreshed from `tenant-resolver` within a bounded freshness window ([§6.1](#61-gear-specific-nfrs)) — to the first override, else the platform default, and the read API **MUST** expose the effective source / inheritance trail so clients can show where the value came from. When an administrator is about to change a cascading setting at scope X and descendants of X would have their effective value changed, the system **MUST** report a non-blocking warning listing affected descendants with current vs. new effective values; the administrator **MUST** be able to proceed — the service informs, it does not block.
 
@@ -520,7 +520,7 @@ A tenant marked **standalone** (isolated / unmanaged, as modeled by `tenant-reso
 
 #### Tenant Access Enforcement and Subtree Scope Isolation
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-tenant-scope-enforcement`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-tenant-scope-enforcement`
 
 Tenant access is **not** part of a declaration. It is a sparse policy on a **(setting, tenant)** pair:
 
@@ -624,7 +624,7 @@ The system **MUST** offer one **unauthenticated read surface** that takes a tena
 
 #### Gears Contribute Declarations; Admins Change Values
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-module-contributed-declarations`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-module-contributed-declarations`
 
 When a gear that owns configuration is installed or upgraded, it **MUST** be able to contribute its Setting Declarations (namespaced key, GTS type, default, metadata, Scope Class) to the Settings Service, and administrators **MUST** be able to change the contributed settings' **values** (subject to permissions and Scope Class) but **MUST NOT** alter the Declarations. Contributed keys **MUST** be namespaced to their owning gear to prevent collisions.
 
@@ -633,7 +633,7 @@ When a gear that owns configuration is installed or upgraded, it **MUST** be abl
 
 #### Contributed-Declaration Register/Retire Lifecycle
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-contributed-lifecycle`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-contributed-lifecycle`
 
 When a gear registers, upgrades, or retires a declaration, the Settings Service **MUST** reconcile the declaration set (add / update descriptive metadata / mark-retired), preserving administrator-set values across compatible upgrades. A gear upgrade **MUST NOT** change a contributed declaration's behavior-affecting fields (Schema Default, GTS type, Scope Class) in place; such a change **MUST** be carried as a new major GTS type version or a replacement (re-namespaced) declaration, following the same immutability rule as admin-authored declarations ([§5.1](#51-settings--category-model)). Declarations that would invalidate existing values **MUST** follow the GTS type-versioning policy ([§5.2](#52-typed-values--validation)); the lifecycle of values on full gear removal is an open question ([§13 Open Questions](#13-open-questions)).
 
@@ -644,7 +644,7 @@ When a gear registers, upgrades, or retires a declaration, the Settings Service 
 
 #### Bulk Effective-Value Retrieval
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-bulk-effective-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-fr-bulk-effective-read`
 
 The system **MUST** support retrieval of effective values in bulk — by key set and by category — as a single operation, with per-key outcomes (never all-or-nothing), on every read surface, subject to the same visibility, scope, and secret-masking rules as single reads.
 
@@ -669,7 +669,7 @@ The system **MUST** support an optional Domain Affinity per setting (not every s
 
 #### Efficiency: Live-Read, No Central Reload/Restart
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-nfr-efficiency-live-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-nfr-efficiency-live-read`
 
 The system **MUST** activate every stored value via live-read (pull) with no service disruption; the Settings Service **MUST NOT** reload or restart consumers. A consumer that needs more than a live re-read self-reacts, reacting only to the settings it consumes (per setting, not a blanket per-category restart).
 
@@ -705,7 +705,7 @@ Given services and UIs resolving effective values frequently, cache-served effec
 
 #### Security: Authentication, Secrets, and Step-Up
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-nfr-security-baseline`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-nfr-security-baseline`
 
 The system **MUST** enforce authentication and access-level gating on every operation, encrypt secrets at rest and mask them on every administrative/human read (no human reveal path, including audit) — plaintext resolvable only via the authenticated machine-only runtime path, with each resolution audited — require a recent credential step-up on an interactive write to a declaration that demands elevated confirmation, audit all mutations, and enforce scope isolation server-side.
 
