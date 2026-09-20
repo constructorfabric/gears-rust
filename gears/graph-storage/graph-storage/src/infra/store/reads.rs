@@ -173,16 +173,7 @@ pub async fn embedding_state(
         .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
         .project_all(&conn, |query| {
-            query
-                .select_only()
-                .column(node::Column::NodeKey)
-                .column(node::Column::EmbeddingInputHash)
-                .column(node::Column::EmbeddingEpoch)
-                .column_as(
-                    Expr::col(node::Column::Embedding).is_not_null(),
-                    "has_vector",
-                )
-                .into_model::<StoredVector>()
+            stored_vector_columns(query).into_model::<StoredVector>()
         })
         .await
         .map_err(map_scope_err)?;
@@ -204,6 +195,25 @@ pub async fn embedding_state(
         })
         .collect();
     Ok(keys.iter().map(|key| by_key.get(key).cloned()).collect())
+}
+
+/// The four values the ingest path needs about a stored vector, named once.
+///
+/// Reachable from a test for the same reason the ranking projection's list is:
+/// the failure this guards against is invisible at the call site. `.all()`
+/// returning `node::Model` compiles, runs and answers correctly -- it just
+/// drags a payload and a 384-lane embedding back per node, on every ingest,
+/// to decide three things and one `IS NOT NULL`.
+fn stored_vector_columns(query: sea_orm::Select<node::Entity>) -> sea_orm::Select<node::Entity> {
+    query
+        .select_only()
+        .column(node::Column::NodeKey)
+        .column(node::Column::EmbeddingInputHash)
+        .column(node::Column::EmbeddingEpoch)
+        .column_as(
+            Expr::col(node::Column::Embedding).is_not_null(),
+            "has_vector",
+        )
 }
 
 /// What the ingest path needs to know about a stored vector: whether there is
@@ -724,4 +734,42 @@ async fn rows_to_page(
             .collect(),
         page_info,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{node, stored_vector_columns};
+
+    /// The embedding-state statement does not read the wide columns.
+    ///
+    /// Asserted on the rendered SQL rather than trusted. This runs once per
+    /// ingest over every key in the batch, so a regression here is paid on
+    /// every write, and it is the kind that looks identical from the call
+    /// site: the answer is still correct, it just costs a payload and a
+    /// vector per node to produce.
+    #[test]
+    fn the_embedding_state_statement_reads_four_values_and_no_more() {
+        use sea_orm::{EntityTrait, QueryTrait};
+
+        let sql = stored_vector_columns(node::Entity::find())
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        assert!(
+            !sql.contains("payload") && !sql.contains("search_text"),
+            "embedding state must not read the wide columns: {sql}"
+        );
+        // The vector itself is named only inside `IS NOT NULL`, never
+        // selected: that is the difference between asking whether there is
+        // one and fetching it.
+        assert!(
+            sql.contains("IS NOT NULL"),
+            "presence is asked of the server, not decided here: {sql}"
+        );
+        for needed in ["node_key", "embedding_input_hash", "embedding_epoch"] {
+            assert!(
+                sql.contains(needed),
+                "embedding state needs `{needed}`: {sql}"
+            );
+        }
+    }
 }

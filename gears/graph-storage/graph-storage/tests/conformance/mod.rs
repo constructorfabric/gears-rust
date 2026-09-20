@@ -3727,6 +3727,11 @@ pub async fn every_committed_mutation_gets_its_own_revision(
     /// released together from one barrier overlap reliably -- with the
     /// read-compute-write in place this case reported five distinct
     /// revisions for eight commits.
+    ///
+    /// On a store that serializes the whole of `ingest` under one lock the
+    /// overlap cannot happen at all, and the case proves the arithmetic
+    /// rather than the race. Which store does which is recorded where each
+    /// harness wires this in.
     const WRITERS: usize = 8;
 
     let scope = AccessScope::for_tenant(tenant);
@@ -5264,6 +5269,10 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
     store: &dyn GraphStoreV1,
     ctx: &StoreCtx<'_>,
 ) {
+    /// What one request examines: `MAX_CATALOGUE_PASSES` passes of one row
+    /// each, which is the number the bound below is derived from.
+    const PASSES_PER_REQUEST: usize = 16;
+
     /// Sorts after every filler, so a walk of one row per request has to get
     /// past all of them to see it.
     const FAR: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.zz_far.v1~";
@@ -5333,10 +5342,30 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
     // the last *matching* row instead, or advanced one row per request, would
     // still find `FAR` inside the sixty-attempt ceiling above and pass — it
     // would just cost twenty-five round trips to do it.
+    // Derived, not guessed. A fixed bound is either loose enough to admit
+    // the regression it guards against -- five would admit a cursor moving
+    // half a slice -- or tight enough to break when the base ontology gains a
+    // type. The arithmetic is the contract itself: sixteen passes examine
+    // sixteen rows per request, so a catalogue of `total` rows takes
+    // `ceil(total / 16)` requests to walk, plus the one that returns the
+    // match.
+    let total = store
+        .list_types(
+            ctx,
+            graph_storage_sdk::models::TypeQuery {
+                top: Some(1_000),
+                ..graph_storage_sdk::models::TypeQuery::default()
+            },
+        )
+        .await
+        .expect("the catalogue lists")
+        .items
+        .len();
+    let bound = total.div_ceil(PASSES_PER_REQUEST) + 1;
     assert!(
-        requests <= 5,
+        requests <= bound,
         "the cursor must advance by the whole examined slice: {requests} requests \
-         for 25 types means it is advancing a row at a time"
+         for {total} types, where {bound} is what advancing a full slice needs"
     );
 }
 

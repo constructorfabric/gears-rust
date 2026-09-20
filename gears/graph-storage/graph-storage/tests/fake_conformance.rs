@@ -406,7 +406,14 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
     .await;
 }
 
-/// Multi-threaded and spawned for the same reason as the scope race above.
+/// Spawned and multi-threaded like the case it shares, but the race it
+/// describes cannot happen here: this store takes one lock for the whole of
+/// `ingest` and holds it across the body, with no `.await` inside, so the
+/// eight writers are serialized before they reach the counter. What the case
+/// proves against this store is the arithmetic -- eight commits, eight
+/// revisions, and a replay that does not move it. The interleaving is
+/// exercised in `pg_conformance`, where removing the fix reports five
+/// distinct revisions for eight states.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_committed_mutation_gets_its_own_revision() {
     conformance::every_committed_mutation_gets_its_own_revision(
