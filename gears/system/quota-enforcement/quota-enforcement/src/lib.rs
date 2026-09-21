@@ -14,7 +14,10 @@
 pub mod api;
 pub mod config;
 pub mod domain;
+pub mod gear;
 pub mod infra;
+
+pub use gear::QuotaEnforcementGear;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
