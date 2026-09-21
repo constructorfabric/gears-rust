@@ -144,6 +144,7 @@ members = [
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
     "gears/system/quota-enforcement/quota-enforcement-sdk",
+    "gears/system/quota-enforcement/quota-enforcement",
     "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
@@ -357,6 +358,7 @@ credstore = { package = "cf-gears-credstore", version = "0.5.1", path = "gears/c
 oagw = { package = "cf-gears-oagw", version = "0.5.4", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.9.1", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.3.4", path = "gears/system/usage-collector/usage-collector" }
+quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement" }
 quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
 cluster = { package = "cf-gears-cluster", version = "0.2.8", path = "gears/system/cluster/cluster" }
 
