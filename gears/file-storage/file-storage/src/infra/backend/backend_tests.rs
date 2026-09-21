@@ -559,6 +559,71 @@ async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
     );
 }
 
+/// `InMemoryBackend::publish_exclusive` must surface a chunk-level I/O error
+/// as `DomainError::Backend` (the `map_err` closure on the failing chunk)
+/// rather than panicking, and must not publish anything when the stream
+/// fails partway through.
+#[tokio::test]
+async fn in_memory_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"good-chunk-1")),
+        Err(std::io::Error::other("simulated stream failure")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, None).await;
+    match result {
+        Ok(_) => panic!("a stream that errors partway through must not be published successfully"),
+        Err(DomainError::Backend { backend_id, .. }) => {
+            assert_eq!(
+                backend_id, "mem",
+                "the backend error must be attributed to the failing backend's id"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Backend, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a publish_exclusive call whose stream errors must not leave a partial object behind"
+    );
+}
+
+/// `InMemoryBackend::publish_exclusive` must enforce `max_size` as chunks
+/// arrive, rejecting with `DomainError::Validation` on the `size` field and
+/// leaving nothing published when the running total crosses the limit.
+#[tokio::test]
+async fn in_memory_publish_exclusive_enforces_max_size_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    // Two 10-byte chunks (20 bytes total) against a 15-byte max_size: the
+    // limit is crossed on the second chunk, before the stream ends.
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"0123456789")),
+        Ok(Bytes::from_static(b"0123456789")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, Some(15)).await;
+    match result {
+        Ok(_) => panic!("a stream exceeding max_size must be rejected, not published"),
+        Err(DomainError::Validation { field, .. }) => {
+            assert_eq!(
+                field, "size",
+                "the rejection must be attributed to the size field"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Validation, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a rejected publish_exclusive must not leave a partial object behind"
+    );
+}
+
 /// Simulates a file truncated on disk between `get_stream`'s open (which
 /// observes the length via `file.metadata()`) and the stream actually being
 /// read: `LocalFsBackend` must surface `UnexpectedEof` on the resulting short
@@ -626,4 +691,223 @@ async fn registry_resolves_default_and_unknown() {
 fn registry_rejects_absent_default() {
     let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     assert!(BackendRegistry::new(vec![mem], "other").is_err());
+}
+
+// --- StorageBackend trait defaults (mod.rs) ------------------------------
+//
+// `LocalFsBackend`, `InMemoryBackend` and `S3Backend` all override
+// `put_stream`, `publish_exclusive`, `get_stream`, `get_range_stream` and
+// `stat` with backend-native implementations, so nothing in this crate ever
+// runs the trait's own default bodies for those methods. `DefaultsOnlyBackend`
+// below implements only the methods `StorageBackend` has no default for
+// (`id`, `capabilities`, `put`, `get`, `delete`, `exists`) so the tests that
+// follow it can pin the default bodies' own behavior directly.
+
+use async_trait::async_trait;
+
+/// Minimal in-memory `StorageBackend` that deliberately overrides nothing
+/// beyond the methods the trait requires every implementor to supply. Used
+/// only to exercise `mod.rs`'s default `put_stream`/`publish_exclusive`/
+/// `get_stream`/`get_range`/`get_range_stream`/`size`/`stat` bodies, which no
+/// shipping backend leaves in place.
+struct DefaultsOnlyBackend {
+    id: String,
+    store: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl DefaultsOnlyBackend {
+    fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            store: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for DefaultsOnlyBackend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        self.store
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
+        self.store
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .map(Bytes::from)
+            .ok_or_else(|| DomainError::backend(self.id.clone(), format!("no such path: {path}")))
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.store.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        Ok(self.store.lock().unwrap().contains_key(path))
+    }
+}
+
+/// The trait-default `publish_exclusive` (mod.rs), on a fresh path, must
+/// buffer the stream, report `created: true`, and compute the same sha256
+/// digest `hash::sha256` would compute over the fully concatenated bytes —
+/// mirroring `local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_hash`
+/// for the default (non-incremental) buffering path.
+#[tokio::test]
+async fn defaults_only_publish_exclusive_creates_and_hashes_via_default_impl() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+    let payload: &[u8] = b"default publish_exclusive payload";
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(payload))]));
+
+    let outcome = b
+        .publish_exclusive("fid/vid", stream, None)
+        .await
+        .expect("the trait-default publish_exclusive must succeed for a fresh path");
+
+    assert!(
+        outcome.created,
+        "a fresh path must be reported as newly created"
+    );
+    assert_eq!(outcome.bytes_written, payload.len() as u64);
+    let expected_digest = hash::digest_to_array(hash::sha256(payload));
+    assert_eq!(outcome.digest, expected_digest);
+    assert_eq!(b.get("fid/vid").await.unwrap(), Bytes::from_static(payload));
+}
+
+/// The trait-default `publish_exclusive` must still enforce `max_size` as
+/// chunks arrive (it is only the memory-bounding that the default forgoes,
+/// not the limit itself) and must leave nothing published when the stream
+/// is rejected.
+#[tokio::test]
+async fn defaults_only_publish_exclusive_enforces_max_size_and_publishes_nothing() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+
+    // Two 10-byte chunks (20 bytes total) against a 15-byte max_size: the
+    // limit is crossed on the second chunk.
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"0123456789")),
+        Ok(Bytes::from_static(b"0123456789")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, Some(15)).await;
+    match result {
+        Ok(_) => panic!("a stream exceeding max_size must be rejected, not published"),
+        Err(DomainError::Validation { field, .. }) => {
+            assert_eq!(
+                field, "size",
+                "the rejection must be attributed to the size field"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Validation, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a rejected publish_exclusive must not leave a partial object behind"
+    );
+}
+
+/// The trait-default `get_stream` (a single-chunk fallback onto `get`) must
+/// still satisfy the same streamed-chunks-equal-`get`-bytes contract every
+/// native override satisfies.
+#[tokio::test]
+async fn defaults_only_get_stream_via_default_impl_matches_get() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+    let payload: &[u8] = b"default get_stream payload, unpinned by any override";
+    b.put("fid/vid", Bytes::copy_from_slice(payload))
+        .await
+        .unwrap();
+
+    assert_get_stream_matches_get(&b, "fid/vid", payload).await;
+}
+
+/// The trait-default `get_range_stream` (a single-chunk fallback onto
+/// `get_range`) must still stream exactly the requested slice.
+#[tokio::test]
+async fn defaults_only_get_range_stream_via_default_impl_matches_slice() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+    b.put("fid/vid", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+
+    assert_get_range_stream_matches_slice(
+        &b,
+        "fid/vid",
+        ByteRange::Inclusive { start: 2, end: 4 },
+        b"234",
+    )
+    .await;
+}
+
+/// The trait-default `stat` (composed from `exists` + `size`) must report
+/// `None` for a path nothing was ever published to and `Some(len)` for a
+/// present one, matching the contract `assert_stat_contract` pins for every
+/// backend with a native override.
+#[tokio::test]
+async fn defaults_only_stat_via_default_impl_reports_presence_and_length() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+
+    assert_eq!(
+        b.stat("fid/missing").await.unwrap(),
+        None,
+        "stat of a path nothing was ever published to must be None"
+    );
+
+    b.put("fid/vid", Bytes::from_static(b"twelve bytes"))
+        .await
+        .unwrap();
+    assert_eq!(
+        b.stat("fid/vid").await.unwrap(),
+        Some(12),
+        "stat of a present object must report its real byte length"
+    );
+}
+
+/// The trait-default `publish_exclusive` must surface a chunk-level I/O error
+/// as `DomainError::Backend` (via the `map_err` closure on the failing
+/// chunk) rather than panicking, and must not publish anything when the
+/// stream fails partway through.
+#[tokio::test]
+async fn defaults_only_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
+    let b = DefaultsOnlyBackend::new("defaults-only");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"good-chunk-1")),
+        Ok(Bytes::from_static(b"good-chunk-2")),
+        Err(std::io::Error::other("simulated stream failure")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, None).await;
+    match result {
+        Ok(_) => panic!("a stream that errors partway through must not be published successfully"),
+        Err(DomainError::Backend { backend_id, .. }) => {
+            assert_eq!(
+                backend_id, "defaults-only",
+                "the backend error must be attributed to the failing backend's id"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Backend, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a publish_exclusive call whose stream errors must not leave a partial object behind"
+    );
 }
