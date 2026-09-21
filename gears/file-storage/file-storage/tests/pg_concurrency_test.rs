@@ -46,12 +46,15 @@
 //! - `f1_*` -- orphan file on multipart-initiate failure: a multipart-initiate
 //!   failure (capability reject on a non-`multipart_native` backend, or a
 //!   backend-level initiation error) leaves a version-less orphan `files` row
-//!   that a real sweep pass does not reclaim (`sweep_abandoned_pending` only
-//!   ever visits rows returned by `list_abandoned_pending_versions`, and
-//!   there is no pending version here to trigger it). Fixed at the
-//!   orchestration layer: `api/rest/handlers.rs::create_file`'s multipart
-//!   branch now calls `compensate_failed_multipart_initiate` on exactly this
-//!   failure.
+//!   that step 1's abandoned-pending phase cannot reach (it only ever visits
+//!   rows returned by `list_abandoned_pending_versions`, and there is no
+//!   pending version here to trigger it). Fixed twice over: primarily at the
+//!   orchestration layer, where `api/rest/handlers.rs::create_file`'s
+//!   multipart branch calls `compensate_failed_multipart_initiate` on exactly
+//!   this failure, and as a backstop by step 1's dedicated versionless-files
+//!   phase (`CleanupEngine::sweep_versionless_files`), which reclaims such a
+//!   row once it ages past `orphan_grace_secs` even when no compensation ever
+//!   ran.
 //! - `f2_*` -- completion is not owner-fenced end-to-end (the most severe
 //!   scenario in this file): two completers, A and B, race the same
 //!   session's lease; deterministic checkpoints (`tokio::sync::Notify` gates
@@ -442,19 +445,22 @@ async fn simulate_all_parts(
 /// Capability-reject half: `LocalFsBackend` never advertises
 /// `multipart_native` (confirmed by reading `local_fs.rs`'s
 /// `BackendCapabilities::default()`), so initiate is rejected before any
-/// pending version is created, and a real `run_sweep()` pass does not
-/// reclaim the resulting orphan (see the module doc's `f1_*` entry).
+/// pending version is created, leaving a `files` row that never received a
+/// version at all (see the module doc's `f1_*` entry).
 ///
-/// The fix lives at the orchestration layer, not in the sweep: only the
-/// caller that made the failed initiate attempt knows which file to clean
-/// up. This test calls `create_file_bare` + `initiate_multipart_upload`
-/// directly -- the same raw sequence the handler makes *before* its own
-/// error-handling branch -- so it still shows the sweep alone not
-/// reclaiming the orphan, by design. See
-/// `f1_capability_reject_with_compensation_reclaims_orphan` below for the
-/// fixed end-to-end flow.
+/// Two independent mechanisms now reclaim it, and this test pins the second
+/// one: the orchestration layer compensates immediately (see
+/// `f1_capability_reject_with_compensation_reclaims_orphan` below, the
+/// primary path -- only the caller that made the failed initiate attempt
+/// knows which file to clean up), and the sweep's dedicated versionless-files
+/// phase (`CleanupEngine::sweep_versionless_files`) is the backstop for a
+/// compensation that never ran or itself failed. This test calls
+/// `create_file_bare` + `initiate_multipart_upload` directly -- the same raw
+/// sequence the handler makes *before* its own error-handling branch -- so
+/// no compensation is invoked and the sweep is left to reclaim the row on
+/// its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f1_capability_reject_orphan_survives_real_sweep() {
+async fn f1_capability_reject_orphan_reclaimed_by_versionless_sweep() {
     let (db, _pg_guard) = pg_db_or_skip!();
     let store = Store::new(Arc::clone(&db));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -488,16 +494,21 @@ async fn f1_capability_reject_orphan_survives_real_sweep() {
 
     let result = engine.run_sweep().await;
     eprintln!(
-        "f1_capability_reject_orphan_survives_real_sweep: sweep result = {}",
+        "f1_capability_reject_orphan_reclaimed_by_versionless_sweep: sweep result = {}",
         describe_sweep(&result)
     );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "the versionless-files phase must reclaim the bare file in this same pass -- no pending \
+         version was ever created, so step 1's abandoned-pending phase cannot reach it and this \
+         is the phase that has to"
+    );
 
-    let still_there = svc.get_file(&ctx, file_id).await;
+    let file_after = svc.get_file(&ctx, file_id).await;
     assert!(
-        still_there.is_ok(),
-        "expected the orphaned bare file to survive a real sweep pass with no compensation \
-         invoked (no pending version was ever created to trigger the sweep's own orphan-parent \
-         reclamation path) -- got: {still_there:?}"
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "the orphaned bare file must be gone after a real sweep pass, even with no compensation \
+         invoked -- got: {file_after:?}"
     );
 }
 
@@ -625,12 +636,13 @@ impl StorageBackend for FailingInitiateBackend {
 
 /// Backend-initiation-failure half: the backend genuinely advertises
 /// `multipart_native`, but its `initiate_multipart` call itself fails (a
-/// transient S3-side error, say) -- same orphan outcome as the
-/// capability-reject half, confirming the defect is not specific to the
-/// capability check but to the absence of any rollback/compensation around
-/// `create_file_bare` + initiate as a pair.
+/// transient S3-side error, say) -- same orphan shape as the
+/// capability-reject half, confirming neither the defect nor the sweep's
+/// backstop is specific to the capability check: both halves leave the very
+/// same versionless `files` row, and the versionless-files phase reclaims it
+/// either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f1_backend_initiation_failure_orphan_survives_real_sweep() {
+async fn f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep() {
     let (db, _pg_guard) = pg_db_or_skip!();
     let store = Store::new(Arc::clone(&db));
     let inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -664,15 +676,20 @@ async fn f1_backend_initiation_failure_orphan_survives_real_sweep() {
 
     let result = engine.run_sweep().await;
     eprintln!(
-        "f1_backend_initiation_failure_orphan_survives_real_sweep: sweep result = {}",
+        "f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep: sweep result = {}",
         describe_sweep(&result)
     );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "the versionless-files phase must reclaim this half's orphan too -- the row is identical \
+         to the capability-reject half's, whatever made initiate fail"
+    );
 
-    let still_there = svc.get_file(&ctx, file_id).await;
+    let file_after = svc.get_file(&ctx, file_id).await;
     assert!(
-        still_there.is_ok(),
-        "known defect FS-01/F1 (backend-initiation-failure half): expected the orphaned bare \
-         file to survive a real sweep pass, got: {still_there:?}"
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "FS-01/F1: the orphaned bare file must be reclaimed by a real sweep pass, got: \
+         {file_after:?}"
     );
 }
 
