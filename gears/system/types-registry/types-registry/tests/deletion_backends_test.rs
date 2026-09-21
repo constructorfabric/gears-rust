@@ -1,4 +1,4 @@
-//! Deletion and dry-run checks on PostgreSQL and MySQL (T20).
+//! Deletion and dry-run checks on `PostgreSQL` and `MySQL` (T20).
 //! Cover dependant rechecks under the write-order claim, unchanged dry-run entity
 //! state and sequence, and publication accepted by `ck_tr_operation_item_state`.
 
