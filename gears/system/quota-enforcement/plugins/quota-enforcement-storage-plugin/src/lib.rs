@@ -5,4 +5,8 @@
 //! no `QuotaEnforcementStoragePluginV1` client is published yet.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod domain;
 pub mod infra;
+
+pub use domain::{FoundationStore, SeedReport, StoreError};
+pub use infra::storage::SqlFoundationStore;
