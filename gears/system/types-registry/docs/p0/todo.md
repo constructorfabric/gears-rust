@@ -1573,12 +1573,14 @@ extracted edges, before storage reads. The dialect pin runs before comparison
 because it needs the baseline. See SPEC §8.1 for placement and refusal semantics.
 Removing the pin makes both dialect tests fail with `compatibility_undecidable`.
 
-**Known gap:** [gts-rust#120](https://github.com/GlobalTypeSystem/gts-rust/issues/120).
-`compare_documents` compares `$schema` verbatim and rejects equivalent Draft-07
-spellings (`…/schema#` vs `…/schema`) as `Unknown`, although the pin accepts them.
-`a_respelled_dialect_is_refused_downstream_and_not_by_the_pin` records this behavior.
-Wait for a library fix: normalizing at acceptance would rewrite retained content
-and its request fingerprint. Revisit after the workspace adopts the fixed release.
+**Closed gap:** [gts-rust#120](https://github.com/GlobalTypeSystem/gts-rust/issues/120).
+`compare_documents` used to compare `$schema` verbatim and reject equivalent
+Draft-07 spellings (`…/schema#` vs `…/schema`) as `Unknown`, although the pin
+accepted them. Fixed upstream by gts-rust#121 and adopted here with gts 0.12.1, so
+admission now succeeds instead of refusing with `compatibility_undecidable`.
+`a_respelled_dialect_is_accepted_by_the_pin_and_the_library` covers the new behavior.
+Normalizing at acceptance was rejected as the alternative: it would rewrite retained
+content and its request fingerprint.
 
 **Added:** `compat/derivation.rs` and tests; four admission reasons;
 `DependencyKind::quarantine_verb`; dialect fixtures, quarantine integration tests,
