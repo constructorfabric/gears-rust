@@ -11,6 +11,7 @@
 //! - [`api`]: REST mount point and the readiness health check.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod api;
 pub mod config;
 pub mod domain;
 pub mod infra;
