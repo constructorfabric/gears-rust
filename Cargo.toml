@@ -143,6 +143,7 @@ members = [
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+    "gears/system/quota-enforcement/quota-enforcement-sdk",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
@@ -370,6 +371,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.1
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.5", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.15", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.13", path = "gears/system/usage-collector/usage-collector-sdk" }
+quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.8", path = "gears/bss/ledger/ledger-sdk" }

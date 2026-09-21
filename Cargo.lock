@@ -3020,6 +3020,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-quota-enforcement-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "gts",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-resource-group"
 version = "0.4.4"
 dependencies = [
