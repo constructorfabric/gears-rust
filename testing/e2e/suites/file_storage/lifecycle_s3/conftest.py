@@ -73,8 +73,8 @@ Option B — MinIO (docker), as an alternative test double::
 
     docker run -d --name fs-e2e-minio -p 19099:9000 \\
         -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \\
-        minio/minio server /data
-    docker run --rm --network host --entrypoint sh minio/mc -c \\
+        quay.io/minio/minio server /data
+    docker run --rm --network host --entrypoint sh quay.io/minio/mc -c \\
         "mc alias set local http://127.0.0.1:19099 test-access-key test-secret-key && \\
          mc mb local/file-storage-e2e"
     # then export the same FS_E2E_S3_* vars as Option A and run pytest.
