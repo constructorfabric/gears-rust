@@ -41,6 +41,7 @@
 //!   `Denied`; `violated_quota_ids` may be omitted.
 //!
 //! The SDK boundary then applies the closed Debit-Plan invariants.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod check;
 mod runtime;
