@@ -3038,6 +3038,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-quota-enforcement-storage-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-quota-enforcement-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "inventory",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-resource-group"
 version = "0.4.4"
 dependencies = [
