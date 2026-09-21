@@ -3027,6 +3027,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
  "gts",
+ "parking_lot",
  "schemars 1.2.1",
  "serde",
  "serde_json",

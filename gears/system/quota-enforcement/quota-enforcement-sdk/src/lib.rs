@@ -13,12 +13,17 @@
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
 //!
 //! The consumer, manager, and operator client traits land with their features.
-
+//!
+//! Enable the `test-util` feature for a complete in-memory double of the
+//! storage contract in [`testing`].
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod gts;
 pub mod models;
 pub mod storage_plugin;
+
+#[cfg(feature = "test-util")]
+pub mod testing;
 
 pub use gts::{
     LEASE_RESOURCE, OPERATION_RESOURCE, POLICY_RESOURCE, QUOTA_RESOURCE,

@@ -18,6 +18,11 @@ name = "quota_enforcement_sdk"
 [lints]
 workspace = true
 
+[features]
+# Exposes `pub mod testing`: a complete in-memory double of the storage plugin
+# contract. Test-only; never enable in a production build.
+test-util = ["dep:parking_lot"]
+
 [dependencies]
 async-trait = { workspace = true }
 thiserror = { workspace = true }
@@ -34,6 +39,7 @@ toolkit-gts = { workspace = true }
 # `AccessScope` and `SecurityContext` on the plugin contract signatures.
 toolkit-security = { workspace = true }
 
+parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
