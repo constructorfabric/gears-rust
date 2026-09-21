@@ -1925,7 +1925,7 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
     // P2 0.1 remaining: `report_multipart_part` now also requires a
     // `FinalizeAuth` extension. `None` reproduces this test's pre-existing
     // behavior (no internal-secret gate configured, token-only trust model).
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
 
     let router = Router::new()
         .route(
@@ -2124,7 +2124,7 @@ async fn report_part_rejects_forged_size() {
     // P2 0.1 remaining: `report_multipart_part` now also requires a
     // `FinalizeAuth` extension. `None` reproduces this test's pre-existing
     // behavior (no internal-secret gate configured, token-only trust model).
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
 
     let router = Router::new()
         .route(
@@ -2262,7 +2262,7 @@ async fn report_part_rejects_short_hash() {
     let part = &plan.parts[0];
     let planned_size = i64::try_from(part.size).unwrap();
 
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
 
     let router = Router::new()
         .route(

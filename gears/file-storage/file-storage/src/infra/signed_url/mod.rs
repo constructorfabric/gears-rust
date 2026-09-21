@@ -21,7 +21,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -326,6 +326,34 @@ impl Verifier {
     /// `Verifier` would return — a caller can never tell from the response
     /// how many keys were tried or which (if any) came close.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<Claims, DomainError> {
+        self.verify_with_grace(token, now, Duration::ZERO)
+    }
+
+    /// Verify a token exactly like [`Self::verify`], except a token whose
+    /// `exp` has already passed is still accepted as long as `now` is no
+    /// more than `grace` past it (`now < exp + grace`).
+    ///
+    /// This is for the **server-to-server finalize/report-part callbacks
+    /// only**, never for a request that starts a content operation (PUT/GET/
+    /// a part upload). Those callbacks carry the very same signed PUT token
+    /// the sidecar already checked with strict `verify` at the start of the
+    /// upload; the sidecar then deliberately does not re-check it for the
+    /// rest of the stream, so a slow-but-live upload can legitimately take
+    /// longer than the token's TTL and only reach finalize afterwards, with
+    /// the bytes already durably written. Rejecting that finalize call would
+    /// strand durable data behind a callback that can never succeed. The
+    /// grace window does not weaken what is being verified: the signature,
+    /// `op`, and the token's binding to `(file_id, version_id)` are checked
+    /// exactly as before -- only the `exp` deadline gets slack, and only by
+    /// as much as the caller (`FileStorageConfig::finalize_token_grace_secs`)
+    /// configures. `grace = Duration::ZERO` is exactly [`Self::verify`]'s
+    /// behaviour.
+    pub fn verify_with_grace(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+        grace: Duration,
+    ) -> Result<Claims, DomainError> {
         let (payload_b64, sig_b64) = token
             .split_once('.')
             .ok_or_else(|| DomainError::token_invalid("malformed token"))?;
@@ -347,9 +375,13 @@ impl Verifier {
         let claims: Claims = serde_json::from_slice(&payload)
             .map_err(|_| DomainError::token_invalid("bad claims"))?;
 
-        // Expiry is exclusive: a token stops being usable at `exp`, not one
-        // second later.
-        if now.unix_timestamp() >= claims.exp {
+        // Expiry is exclusive: a token stops being usable at `exp` (plus the
+        // grace window, if any), not one second later. `grace` is clamped to
+        // whole seconds and saturates rather than overflowing `i64`, which
+        // matches `exp`'s own unit and cannot practically be reached by any
+        // configured grace value.
+        let expires_at = claims.exp.saturating_add(grace.whole_seconds());
+        if now.unix_timestamp() >= expires_at {
             return Err(DomainError::token_invalid("token expired"));
         }
         Ok(claims)

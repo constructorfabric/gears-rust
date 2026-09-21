@@ -398,7 +398,7 @@ async fn finalize_version_bind_claim_won_sets_bound_header_and_etag() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, _multipart_store, backend, store) = build_env(Arc::clone(&issuer)).await;
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::ZERO));
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
@@ -483,7 +483,7 @@ async fn finalize_version_bind_claim_lost_cas_reports_conflict_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, _multipart_store, backend, store) = build_env(Arc::clone(&issuer)).await;
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::ZERO));
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();

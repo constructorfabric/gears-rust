@@ -740,7 +740,10 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some("interim-shared-secret".to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new(
+        Some("interim-shared-secret".to_owned()),
+        time::Duration::ZERO,
+    ));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 
@@ -808,7 +811,10 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
 
     let verifier = Arc::new(svc.verifier());
     let secret = "interim-shared-secret";
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some(secret.to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new(
+        Some(secret.to_owned()),
+        time::Duration::ZERO,
+    ));
 
     let mut headers = headers_with_token(&token);
     headers.insert(
@@ -845,6 +851,286 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
         version.status,
         VersionStatus::Available,
         "finalize must have actually gone through once the internal credential matched"
+    );
+}
+
+// -- finalize_token_grace_secs: grace window on the s2s finalize/report-part
+// callbacks' re-check of the signed PUT token's `exp` (see
+// `FileStorageConfig::finalize_token_grace_secs`, `Verifier::verify_with_grace`).
+// The sidecar checks the token once at PUT start and never again, so a
+// slow-but-live upload can legitimately reach finalize after the token's
+// `exp` with its bytes already durably written; these two tests exercise
+// that scenario end to end through the real `finalize_version` handler.
+
+#[tokio::test]
+async fn finalize_with_expired_token_accepted_within_grace() {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let (svc, _msvc, backend, store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let known_bytes = Bytes::from_static(b"hello, world!");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, known_bytes.clone()).await.unwrap();
+
+    let true_size = i64::try_from(known_bytes.len()).unwrap();
+    let true_hash = hash::sha256(&known_bytes);
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        // Expired 2 minutes ago -- simulates a slow-but-live PUT that took
+        // longer than the token's TTL to finish.
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() - 120,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    let verifier = Arc::new(svc.verifier());
+    // 1-hour grace comfortably covers the 2-minute-past-exp token above.
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::seconds(3600)));
+    let headers = headers_with_token(&token);
+
+    let req = FinalizeUploadReq {
+        size: true_size,
+        hash_hex: hex::encode(&true_hash),
+    };
+
+    let result = finalize_version(
+        Extension(Arc::clone(&svc)),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let response = result
+        .expect("an expired-but-within-grace token must still be accepted by finalize")
+        .into_response();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let version = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Available,
+        "finalize must have actually gone through for the within-grace expired token"
+    );
+}
+
+#[tokio::test]
+async fn finalize_with_expired_token_rejected_beyond_grace() {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let (svc, _msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: backend_path(ticket.file_id, ticket.version_id),
+        // Expired 2 hours ago -- well beyond the 1-minute grace configured
+        // below, so this must still be rejected as expired.
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() - 7200,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    let verifier = Arc::new(svc.verifier());
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::seconds(60)));
+    let headers = headers_with_token(&token);
+
+    let req = FinalizeUploadReq {
+        size: 5,
+        hash_hex: hex::encode(hash::sha256(b"hello")),
+    };
+
+    let result = finalize_version(
+        Extension(svc),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let Err(err) = result else {
+        panic!("a token expired well beyond the configured grace must be rejected");
+    };
+    assert_eq!(
+        err.status_code(),
+        403,
+        "an expired-beyond-grace token must map to 403, same as any other invalid token"
+    );
+}
+
+#[tokio::test]
+async fn report_part_with_expired_token_passes_verification_within_grace() {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let (svc, msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let upload_id = Uuid::now_v7();
+    let part_number = 1u32;
+    let claims = Claims {
+        op: Op::MultipartPart,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: backend_path(ticket.file_id, ticket.version_id),
+        // Expired 2 minutes ago, well inside the 1-hour grace below.
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() - 120,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims {
+            upload_id,
+            part_number,
+            offset: 0,
+            size: 5,
+            backend_handle: String::new(),
+        },
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    let verifier = Arc::new(svc.verifier());
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::seconds(3600)));
+    let headers = headers_with_token(&token);
+
+    let req = ReportPartReq {
+        backend_etag: "etag-1".to_owned(),
+        hash_hex: hex::encode(hash::sha256(b"hello")),
+        size: 5,
+    };
+
+    let result = report_multipart_part(
+        Extension(msvc),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id, upload_id, part_number)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    // The call still fails -- this test deliberately never opened a multipart
+    // session for `upload_id` -- but it must fail for that reason, not as an
+    // expired token. `403` is the token-rejection status the
+    // beyond-grace test above asserts, so anything else means verification
+    // accepted the expired-but-within-grace token and the handler moved on.
+    if let Err(err) = result {
+        assert_ne!(
+            err.status_code(),
+            403,
+            "an expired-but-within-grace token must pass verification, not be rejected as expired"
+        );
+    }
+}
+
+#[tokio::test]
+async fn report_part_with_expired_token_rejected_beyond_grace() {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let (svc, msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let upload_id = Uuid::now_v7();
+    let part_number = 1u32;
+    let claims = Claims {
+        op: Op::MultipartPart,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: backend_path(ticket.file_id, ticket.version_id),
+        // Expired 2 hours ago -- well beyond the 1-minute grace configured
+        // below, so this must still be rejected as expired.
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() - 7200,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims {
+            upload_id,
+            part_number,
+            offset: 0,
+            size: 5,
+            backend_handle: String::new(),
+        },
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    let verifier = Arc::new(svc.verifier());
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::seconds(60)));
+    let headers = headers_with_token(&token);
+
+    let req = ReportPartReq {
+        backend_etag: "etag-1".to_owned(),
+        hash_hex: hex::encode(hash::sha256(b"hello")),
+        size: 5,
+    };
+
+    let result = report_multipart_part(
+        Extension(msvc),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id, upload_id, part_number)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let Err(err) = result else {
+        panic!("a token expired well beyond the configured grace must be rejected");
+    };
+    assert_eq!(
+        err.status_code(),
+        403,
+        "an expired-beyond-grace token must map to 403, same as any other invalid token"
     );
 }
 
@@ -885,7 +1171,10 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some("interim-shared-secret".to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new(
+        Some("interim-shared-secret".to_owned()),
+        time::Duration::ZERO,
+    ));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 

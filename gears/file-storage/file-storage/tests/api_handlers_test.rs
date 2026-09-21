@@ -623,7 +623,7 @@ async fn build_multi_harness() -> (MultiHarness, SecurityContext) {
     ));
     // No internal-secret gate configured: reproduces the token-only trust
     // model, matching `enforce_test.rs` / `multipart_test.rs`.
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
     let subject = ctx(Uuid::now_v7());
     (
         MultiHarness {

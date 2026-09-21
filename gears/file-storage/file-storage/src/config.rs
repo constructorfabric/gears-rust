@@ -31,6 +31,26 @@ pub struct FileStorageConfig {
     #[serde(default = "default_max_url_ttl_secs")]
     pub max_url_ttl_secs: u64,
 
+    /// Grace period (seconds) applied to the signed PUT token's `exp` when it
+    /// is re-checked on the server-to-server finalize and report-part
+    /// callbacks, on top of `verify`'s strict check. The sidecar checks the
+    /// token once at the start of a PUT and deliberately does not re-check
+    /// it for the rest of the stream (`FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS`
+    /// bounds only inter-chunk idle time, not the upload's total duration);
+    /// it then forwards that same token to the control plane's finalize
+    /// callback once the upload completes. A slow-but-live upload that
+    /// takes longer than the token's TTL (`default_url_ttl_secs`, 15
+    /// minutes by default) can therefore reach finalize with an already-
+    /// expired token even though every byte was legitimately written to the
+    /// backend. This grace absorbs exactly that gap: it applies ONLY to the
+    /// `exp` check on the s2s finalize/report-part callbacks, never to the
+    /// token check the sidecar performs at the start of a PUT/GET request or
+    /// a part upload. `0` disables it, restoring the previous strict
+    /// behaviour where `exp` is enforced with no slack. Default: 3600 (1
+    /// hour).
+    #[serde(default = "default_finalize_token_grace_secs")]
+    pub finalize_token_grace_secs: u64,
+
     /// Lifetime (seconds) of a multipart upload *session* -- i.e. how long
     /// `MultipartUploadSession::expires_at` is set to at initiate time.
     /// **Deliberately independent of `default_url_ttl_secs`**: before this
@@ -376,6 +396,7 @@ impl fmt::Debug for FileStorageConfig {
         f.debug_struct("FileStorageConfig")
             .field("default_url_ttl_secs", &self.default_url_ttl_secs)
             .field("max_url_ttl_secs", &self.max_url_ttl_secs)
+            .field("finalize_token_grace_secs", &self.finalize_token_grace_secs)
             .field(
                 "multipart_session_ttl_secs",
                 &self.multipart_session_ttl_secs,
@@ -424,6 +445,7 @@ impl Default for FileStorageConfig {
         Self {
             default_url_ttl_secs: default_default_url_ttl_secs(),
             max_url_ttl_secs: default_max_url_ttl_secs(),
+            finalize_token_grace_secs: default_finalize_token_grace_secs(),
             multipart_session_ttl_secs: default_multipart_session_ttl_secs(),
             multipart_complete_lease_secs: default_multipart_complete_lease_secs(),
             sidecar_base_url: default_sidecar_base_url(),
@@ -454,6 +476,10 @@ fn default_default_url_ttl_secs() -> u64 {
 fn default_max_url_ttl_secs() -> u64 {
     // 7 days, the recommended maximum from the signed-URL FR.
     7 * 24 * 60 * 60
+}
+
+fn default_finalize_token_grace_secs() -> u64 {
+    3600 // 1 hour: see FileStorageConfig::finalize_token_grace_secs
 }
 
 fn default_multipart_complete_lease_secs() -> u64 {

@@ -96,10 +96,18 @@ impl Gear for FileStorageGear {
         // pre-0.1 token-only trust model). `cfg.validate()` above already
         // rejected an absent secret when `require_finalize_internal_secret`
         // is set, so this is a plain construction.
+        // The grace absorbs a slow-but-live upload that legitimately outlasts
+        // the signed token's TTL before reaching finalize/report-part -- see
+        // `FileStorageConfig::finalize_token_grace_secs`. Saturating
+        // conversion, as for every other `*_secs` field below.
+        let finalize_token_grace = time::Duration::seconds(
+            i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
+        );
         let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
             cfg.finalize_internal_secret
                 .as_ref()
                 .map(|s| s.expose().to_owned()),
+            finalize_token_grace,
         ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
