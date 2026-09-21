@@ -233,11 +233,18 @@ jobs:
       # crates.io binary on every run.
       - name: Start S3 test double (MinIO) for file-storage e2e
         env:
-          # Floating `minio/minio`/`minio/mc` tags make this step
-          # non-reproducible and liable to break without warning. Pinned to a
-          # specific release, by digest, so the image can't change under us.
-          MINIO_IMAGE: "minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
-          MC_IMAGE: "minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+          # Floating `minio`/`mc` tags make this step non-reproducible and
+          # liable to break without warning. Pinned to a specific release, by
+          # digest, so the image can't change under us.
+          #
+          # Pulled from quay.io, not Docker Hub: `docker.io/minio/minio` now
+          # answers every pull — including `:latest` — with "pull access
+          # denied ... repository does not exist or may require 'docker
+          # login'", which took this step (and only this step) down with
+          # exit 125. quay.io is MinIO's other official registry and still
+          # serves the same releases.
+          MINIO_IMAGE: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:9966a92a734f9411e32f4f41d7d9d826fcdc0f68c4e20b70295bd4e7c11f8a2f"
+          MC_IMAGE: "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:37d109dddbbb2c95873f5fc81ac93f37023264770fc580a7564148892087b1b7"
         run: |
           docker run -d --name fs-e2e-minio -p 19099:9000 \
             -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \
