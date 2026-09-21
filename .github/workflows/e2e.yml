@@ -241,10 +241,14 @@ jobs:
           # answers every pull — including `:latest` — with "pull access
           # denied ... repository does not exist or may require 'docker
           # login'", which took this step (and only this step) down with
-          # exit 125. quay.io is MinIO's other official registry and still
-          # serves the same releases.
-          MINIO_IMAGE: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:9966a92a734f9411e32f4f41d7d9d826fcdc0f68c4e20b70295bd4e7c11f8a2f"
-          MC_IMAGE: "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:37d109dddbbb2c95873f5fc81ac93f37023264770fc580a7564148892087b1b7"
+          # exit 125. quay.io is MinIO's other official registry and serves
+          # the very same images: these digests are unchanged from the
+          # Docker Hub ones, because they name the same multi-arch manifest
+          # list. Keep them pointing at the LIST, never at one platform's
+          # manifest — an arm64-only digest pulls happily on a laptop and
+          # then dies with "exec format error" on the amd64 runner.
+          MINIO_IMAGE: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+          MC_IMAGE: "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
         run: |
           docker run -d --name fs-e2e-minio -p 19099:9000 \
             -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \
