@@ -397,7 +397,7 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
     // P2 0.1 remaining: `finalize_version` now also requires a `FinalizeAuth`
     // extension. `None` reproduces this test's pre-existing behavior (no
     // internal-secret gate configured, token-only trust model).
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
 
     let router = Router::new()
         .route(

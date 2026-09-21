@@ -69,26 +69,47 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Interim gear-local shared-secret credential for the s2s finalize/
-/// report-part callback routes (P2 0.1 remaining — see
-/// `docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section). This is a
-/// stop-gap until the platform's `toolkit-security::internal_auth` profiles
-/// are deployable in this gear; swap the comparator below for
-/// `InternalAuthenticator` when that lands.
+/// Bundles the two s2s policies the finalize/report-part callback routes
+/// apply on top of the signed upload token itself:
 ///
-/// When `secret` is `None` (the default — `FileStorageConfig::finalize_internal_secret`
-/// unset), [`FinalizeAuth::verify`] is a no-op: the signed upload token
-/// (already verified by the caller) remains the sole authorization,
-/// preserving pre-0.1 behavior. When `Some`, callers must additionally
-/// present a matching `x-fs-internal-token` header.
+/// * An interim gear-local shared-secret credential (P2 0.1 remaining — see
+///   `docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section). This is
+///   a stop-gap until the platform's `toolkit-security::internal_auth`
+///   profiles are deployable in this gear; swap the comparator below for
+///   `InternalAuthenticator` when that lands.
+///
+///   When `secret` is `None` (the default — `FileStorageConfig::finalize_internal_secret`
+///   unset), [`FinalizeAuth::verify`] is a no-op: the signed upload token
+///   (already verified by the caller) remains the sole authorization,
+///   preserving pre-0.1 behavior. When `Some`, callers must additionally
+///   present a matching `x-fs-internal-token` header.
+///
+/// * A grace window (`FileStorageConfig::finalize_token_grace_secs`) applied
+///   to the signed upload token's `exp` when these routes re-check it via
+///   `Verifier::verify_with_grace`. The sidecar checks the same token once
+///   at the start of the upload and never again; a slow-but-live upload can
+///   legitimately outlast the token's TTL and only reach finalize/report-part
+///   afterwards, with the bytes already durably written. `0` disables the
+///   grace, restoring strict `exp` enforcement on these routes.
 pub struct FinalizeAuth {
     secret: Option<String>,
+    token_grace: time::Duration,
 }
 
 impl FinalizeAuth {
     #[must_use]
-    pub fn new(secret: Option<String>) -> Self {
-        Self { secret }
+    pub fn new(secret: Option<String>, token_grace: time::Duration) -> Self {
+        Self {
+            secret,
+            token_grace,
+        }
+    }
+
+    /// Grace window applied to the signed upload token's `exp` on the
+    /// finalize/report-part callbacks (see the struct-level doc comment).
+    #[must_use]
+    pub fn token_grace(&self) -> time::Duration {
+        self.token_grace
     }
 
     /// Verify the `x-fs-internal-token` header against the configured
@@ -793,8 +814,18 @@ pub async fn finalize_version(
         .map(str::to_owned)
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
+    // Grace on `exp` only: the sidecar already checked this same token
+    // strictly at the start of the PUT and does not re-check it for the
+    // rest of the stream, so a slow-but-live upload can legitimately reach
+    // this callback after the token's `exp` with its bytes already durably
+    // written. The signature and the (file_id, version_id) binding below
+    // are still checked exactly as before -- only the deadline gets slack.
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize a PUT to exactly this (file_id, version_id).
@@ -906,8 +937,17 @@ pub async fn report_multipart_part(
         .map(str::to_owned)
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
+    // Grace on `exp` only: same reasoning as `finalize_version` -- the
+    // sidecar's report-part callback can legitimately arrive after the
+    // token's `exp` for a slow-but-live multipart upload, and the part has
+    // already been durably written. Signature and claim-binding checks
+    // below are unchanged.
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize a report for exactly this

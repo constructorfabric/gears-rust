@@ -17,6 +17,19 @@ fn default_url_ttl_is_short_and_within_ceiling() {
 }
 
 #[test]
+fn default_finalize_token_grace_is_one_hour() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.finalize_token_grace_secs, 3600);
+}
+
+#[test]
+fn finalize_token_grace_can_be_overridden() {
+    let cfg: FileStorageConfig =
+        serde_json::from_str(r#"{"finalize_token_grace_secs": 0}"#).unwrap();
+    assert_eq!(cfg.finalize_token_grace_secs, 0);
+}
+
+#[test]
 fn default_url_ttl_can_be_overridden() {
     let cfg: FileStorageConfig = serde_json::from_str(r#"{"default_url_ttl_secs": 300}"#).unwrap();
     assert_eq!(cfg.default_url_ttl_secs, 300);
