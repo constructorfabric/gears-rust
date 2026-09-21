@@ -36,6 +36,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use file_storage::api::rest::dto::TransferOwnershipReq;
 use file_storage::api::rest::handlers;
 use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer, actions};
 use file_storage::domain::data_plane::DataPlaneService;
@@ -48,7 +49,7 @@ use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBack
 use file_storage::infra::signed_url::{Issuer, Verifier};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{NewFile, OwnerKind};
+use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 const BASE: &str = "/api/file-storage/v1";
@@ -1026,7 +1027,165 @@ async fn report_multipart_part_invalid_hash_length_returns_400() {
     );
 }
 
-// -- 6. error-shape doctrine: RFC 9457 problem+json, no leaked internals -----
+// -- 6. list_files / transfer_ownership: direct handler calls ----------------
+//
+// Both handlers are exercised by calling them directly (extractors built by
+// hand), mirroring `finalize_test.rs`'s pattern, rather than through a
+// `Router` -- there is no header/CAS parsing under test here, just the
+// handler bodies' own batching/assembly logic.
+
+async fn build_files_harness() -> (Arc<FileService>, SecurityContext) {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store,
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    ));
+    let subject = ctx(Uuid::now_v7());
+    (svc, subject)
+}
+
+/// `list_files` batches metadata for the whole page in one
+/// `list_metadata_for_files` call (`svc.list_metadata_for_files(&file_ids)`)
+/// and then re-attaches each file's own metadata by `file_id`
+/// (`metadata_by_file.remove(&f.file_id)`). This pins that re-attachment
+/// against cross-wiring: a file with custom metadata must get exactly its
+/// own entries, and a file with none must still appear in the page with an
+/// empty (not missing) `custom_metadata`.
+#[tokio::test]
+async fn list_files_batches_metadata_without_cross_wiring_between_files() {
+    let (svc, subject) = build_files_harness().await;
+    let owner = subject.subject_id();
+
+    let ticket_a = svc
+        .create_file(&subject, new_file(owner, "text/plain"), None, false)
+        .await
+        .expect("create_file a");
+    let ticket_b = svc
+        .create_file(&subject, new_file(owner, "text/plain"), None, false)
+        .await
+        .expect("create_file b");
+
+    // Only file A gets custom metadata; file B stays without any.
+    svc.update_metadata(
+        &subject,
+        ticket_a.file_id,
+        CustomMetadataPatch {
+            entries: vec![("color".to_owned(), Some("blue".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .expect("update_metadata a");
+
+    let resp = handlers::list_files(
+        axum::Extension(subject.clone()),
+        axum::Extension(Arc::clone(&svc)),
+        axum::extract::Query(handlers::ListQuery {
+            owner_kind: "user".to_owned(),
+            owner_id: owner,
+            limit: None,
+            offset: None,
+        }),
+    )
+    .await
+    .expect("list_files");
+
+    let items = resp.0.0;
+    assert_eq!(items.len(), 2, "expected both files in the page");
+
+    let dto_a = items
+        .iter()
+        .find(|f| f.file_id == ticket_a.file_id)
+        .expect("file a present in the page");
+    let dto_b = items
+        .iter()
+        .find(|f| f.file_id == ticket_b.file_id)
+        .expect("file b present in the page");
+
+    assert!(
+        dto_a
+            .custom_metadata
+            .iter()
+            .any(|e| e.key == "color" && e.value == "blue"),
+        "file a must carry its own metadata, got: {:?}",
+        dto_a.custom_metadata
+    );
+    assert!(
+        dto_b.custom_metadata.is_empty(),
+        "file b has no metadata and must come back with an empty list, not be missing from the page, got: {:?}",
+        dto_b.custom_metadata
+    );
+}
+
+/// `transfer_ownership` returns `FileDto::from_parts(file, meta)` built from
+/// the (file, metadata) pair the service call returns -- the response must
+/// carry the new owner and the file's existing custom metadata untouched.
+#[tokio::test]
+async fn transfer_ownership_returns_file_dto_with_new_owner_and_metadata() {
+    let (svc, subject) = build_files_harness().await;
+    let owner = subject.subject_id();
+    let new_owner = Uuid::now_v7();
+
+    let ticket = svc
+        .create_file(&subject, new_file(owner, "text/plain"), None, false)
+        .await
+        .expect("create_file");
+    svc.update_metadata(
+        &subject,
+        ticket.file_id,
+        CustomMetadataPatch {
+            entries: vec![("team".to_owned(), Some("platform".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .expect("update_metadata");
+
+    let resp = handlers::transfer_ownership(
+        axum::Extension(subject.clone()),
+        axum::Extension(Arc::clone(&svc)),
+        axum::extract::Path(ticket.file_id),
+        axum::Json(TransferOwnershipReq {
+            new_owner_kind: "user".to_owned(),
+            new_owner_id: new_owner,
+        }),
+    )
+    .await
+    .expect("transfer_ownership");
+
+    let dto = resp.0;
+    assert_eq!(
+        dto.owner_id, new_owner,
+        "the response must reflect the new owner"
+    );
+    assert_eq!(dto.owner_kind, "user");
+    assert!(
+        dto.custom_metadata
+            .iter()
+            .any(|e| e.key == "team" && e.value == "platform"),
+        "transfer must preserve existing custom metadata in the response, got: {:?}",
+        dto.custom_metadata
+    );
+
+    // Sanity: the DB actually reflects the new owner, not just the response echo.
+    let (file, _) = svc
+        .get_file_with_metadata(&subject, ticket.file_id)
+        .await
+        .expect("re-fetch");
+    assert_eq!(file.owner_id, new_owner);
+}
+
+// -- 7. error-shape doctrine: RFC 9457 problem+json, no leaked internals -----
 
 #[tokio::test]
 async fn error_response_is_rfc9457_problem_json_without_stack_traces() {
