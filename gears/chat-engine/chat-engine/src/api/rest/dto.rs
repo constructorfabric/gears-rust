@@ -20,6 +20,8 @@ use serde_json::Value as JsonValue;
 use toolkit_macros::api_dto;
 use uuid::Uuid;
 
+use crate::domain::error::{ChatEngineError, Result};
+
 use chat_engine_sdk::models::{
     CapabilityValue, LifecycleState, Message as SdkMessage, MessagePart as SdkMessagePart,
     MessagePartInput as SdkMessagePartInput, MessagePartType, MessageRole, Session as SdkSession,
@@ -202,10 +204,17 @@ pub struct MessagePartInputDto {
     pub content: JsonValue,
 }
 
-impl From<MessagePartInputDto> for SdkMessagePartInput {
-    fn from(d: MessagePartInputDto) -> Self {
-        let part_type = part_type_from_wire(&d.part_type);
-        Self {
+impl TryFrom<MessagePartInputDto> for SdkMessagePartInput {
+    type Error = ChatEngineError;
+
+    fn try_from(d: MessagePartInputDto) -> Result<Self> {
+        let part_type = part_type_from_wire(&d.part_type).ok_or_else(|| {
+            ChatEngineError::bad_request(format!(
+                "unknown message part type: {}",
+                d.part_type.escape_debug()
+            ))
+        })?;
+        Ok(Self {
             content: normalize_part_content(part_type, d.content),
             part_type,
             // Citations/references are plugin-produced (assistant side); the
@@ -213,7 +222,7 @@ impl From<MessagePartInputDto> for SdkMessagePartInput {
             file_citations: Vec::new(),
             link_citations: Vec::new(),
             references: Vec::new(),
-        }
+        })
     }
 }
 
@@ -244,26 +253,36 @@ fn part_type_to_wire(t: MessagePartType) -> &'static str {
         MessagePartType::Videos => "videos",
         MessagePartType::Links => "links",
         MessagePartType::Statuses => "statuses",
+        MessagePartType::ToolCall => "tool_call",
+        MessagePartType::ToolResult => "tool_result",
     }
 }
 
-/// Parse a wire part-type string, defaulting unknown values to `text` so a
-/// malformed body never panics. Strict validation lives in the service layer.
-fn part_type_from_wire(s: &str) -> MessagePartType {
-    match s {
+/// Parse a wire part-type string. `None` for a value outside the closed
+/// [`MessagePartType`] set — callers reject the request rather than coerce an
+/// unrecognized part into `text`, which would persist a body the client never
+/// sent. Per-type `content` shape validation stays in the service layer.
+fn part_type_from_wire(s: &str) -> Option<MessagePartType> {
+    Some(match s {
+        "text" => MessagePartType::Text,
         "code" => MessagePartType::Code,
         "images" => MessagePartType::Images,
         "videos" => MessagePartType::Videos,
         "links" => MessagePartType::Links,
         "statuses" => MessagePartType::Statuses,
-        _ => MessagePartType::Text,
-    }
+        "tool_call" => MessagePartType::ToolCall,
+        "tool_result" => MessagePartType::ToolResult,
+        _ => return None,
+    })
 }
 
-/// Convenience: convert wire parts to the SDK input shape.
-#[must_use]
-pub fn parts_into_sdk(parts: Vec<MessagePartInputDto>) -> Vec<SdkMessagePartInput> {
-    parts.into_iter().map(SdkMessagePartInput::from).collect()
+/// Convert wire parts to the SDK input shape. Rejects the whole body with a
+/// 400 if any part carries a `type` outside the known set.
+pub fn parts_into_sdk(parts: Vec<MessagePartInputDto>) -> Result<Vec<SdkMessagePartInput>> {
+    parts
+        .into_iter()
+        .map(SdkMessagePartInput::try_from)
+        .collect()
 }
 
 /// Wire-shape projection of [`SdkMessage`].

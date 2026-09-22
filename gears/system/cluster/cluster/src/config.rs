@@ -136,7 +136,7 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackendBinding {
     /// The backend provider name, e.g. `standalone`, `postgres`, `redis`,
-    /// `k8s-lease`. Matched against the registered providers at wiring time; an
+    /// `k8s`. Matched against the registered providers at wiring time; an
     /// unknown provider fails startup with `ClusterError::InvalidConfig`.
     ///
     /// [`DEFAULT_PROVIDER`] (`default`) is reserved: on `leader_election` or `lock`

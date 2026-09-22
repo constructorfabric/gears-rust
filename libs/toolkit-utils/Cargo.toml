@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-utils"
-version = "0.7.0"
+version = "0.7.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -23,7 +23,7 @@ serde = ["dep:serde"]
 humantime-serde = ["serde", "dep:humantime"]
 # JSON Schema reflection, so a duration field can appear in a generated GTS type
 # schema or a REST DTO while keeping its ISO 8601 string form on the wire.
-schemars = ["dep:schemars"]
+schemars = ["serde", "dep:schemars"]
 
 [dependencies]
 serde = { workspace = true, optional = true }

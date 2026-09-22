@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Detect changed paths
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -247,6 +247,15 @@ jobs:
       - name: Validate gear naming conventions
         run: python3 tools/scripts/validate_gear_names.py
 
+      - name: Validate PR-review rule set
+        run: python3 tools/scripts/toolkit-pr-review/lint.py
+
+      - name: PR-review agent rules are up to date
+        run: python3 tools/scripts/toolkit-pr-review/review.py render-rules --check
+
+      - name: PR-review script tests
+        run: python3 -m unittest discover -s tools/scripts/toolkit-pr-review/tests
+
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
 
@@ -383,6 +392,12 @@ jobs:
 
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
+
+      - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
+        # k3s runs in a **privileged** container (testcontainers-modules sets it);
+        # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
+        # nextest, so one k3s container is shared per test binary -- see the Makefile.
+        run: make test-cluster-k8s
 
       - name: Test resource-group (pg smoke, integration)
         # Fail if Docker is unreachable instead of letting the suite skip itself
@@ -771,14 +786,14 @@ jobs:
           rustup show
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Probe sccache & set RUSTC_WRAPPER
         shell: bash
@@ -908,15 +923,15 @@ jobs:
       #
       #   1. `nextest --workspace` — the whole workspace at default features.
       #   2. The redis-cluster-plugin integration suites. These live behind
-      #      `required-features = ["integration"]` and drive a real Redis via
-      #      testcontainers, so pass 1 never builds or runs them and the plugin's
-      #      actual logic (connection / lock / pub-sub / lifecycle) showed as
-      #      uncovered — the reason this crate's patch coverage understates it.
-      #      Running them here, instead of mocking the Redis connection (brittle,
-      #      tautological), credits that code with the coverage its integration
-      #      tests already exercise. Redis containers are lightweight and
-      #      unprivileged, so this mirrors `make test-cluster-redis` verbatim
-      #      (plain `nextest`, no per-binary loop) — keep the two in sync.
+      #      `required-features = ["integration"]`.
+      #   3. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
+      #      `required-features = ["integration"]`.
+      #
+      # The per-binary k3s loop (one container per binary, cleaned between —
+      # nextest's process-per-test would start ~70 of them) lives in the
+      # `coverage-cluster-k8s` Makefile target so this step stays readable; it
+      # inherits this step's CARGO_LLVM_COV_* env and accumulates into the same
+      # session. Keep it in sync with `test-cluster-k8s`.
       - name: Coverage (lcov)
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
@@ -927,9 +942,11 @@ jobs:
           # Pass 1: whole workspace, default features. Accumulate, don't report.
           cargo llvm-cov nextest --workspace --no-report
           # Pass 2: redis-cluster-plugin integration suites (real Redis via
-          # testcontainers). Same instrumentation, still no report.
+          # testcontainers).
           cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
-          # Merge both passes into the single report that gets uploaded.
+          # Pass 3: k8s-cluster-plugin k3s suites
+          make coverage-cluster-k8s
+          # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
@@ -951,7 +968,7 @@ jobs:
       # disable_search prevents auto-discovery of unrelated files (e.g.
       # coverage_guard.rs) — only lcov.info is sent.
       - name: Upload to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
         with:
           use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info

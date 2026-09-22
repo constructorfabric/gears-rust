@@ -153,6 +153,28 @@ impl From<WorkerError> for CanonicalError {
                 &format!("operation item {item_id} carries no request payload"),
                 "admission",
             ),
+            WorkerError::MissingItemWrite { item_id } => opaque_internal(
+                &format!(
+                    "the commit path for operation item {item_id} recorded no terminal item write"
+                ),
+                "admission",
+            ),
+            WorkerError::MissingPrediction { item_id } => opaque_internal(
+                &format!("the dry-run pass left operation item {item_id} without a prediction"),
+                "admission",
+            ),
+            // Corruption, not input: acceptance canonicalized this identifier
+            // before the row was written.
+            WorkerError::StoredIdentifierUnparsable {
+                item_id,
+                gts_id,
+                reason,
+            } => opaque_internal(
+                &format!(
+                    "operation item {item_id} holds an unparsable stored identifier '{gts_id}': {reason}"
+                ),
+                "admission",
+            ),
             // Kept only for exhaustiveness: `run_operation` catches this one and
             // reports the outcome the winning pass recorded, so it does not reach a
             // handler. If it ever does, it is a worker bug and not a client's.
@@ -182,6 +204,12 @@ impl From<WorkerError> for CanonicalError {
             // which points at a different table and a different cause.
             WorkerError::EntityVanished { gts_id, entity_id } => opaque_internal(
                 &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
+                "admission",
+            ),
+            // Corruption of an immutable stored revision, so the document itself
+            // stays in the operator log and never reaches the caller.
+            WorkerError::BaselineUnparsable { gts_id, source } => opaque_internal(
+                &format!("the stored baseline document for '{gts_id}' is not valid JSON: {source}"),
                 "admission",
             ),
             // A retryable snapshot race, not a malformed candidate.
@@ -218,8 +246,6 @@ impl From<WorkerError> for CanonicalError {
 mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
     pub const ITEMS: &str = "items";
-    pub const KIND: &str = "kind";
-    pub const DRY_RUN: &str = "dry_run";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
 }
@@ -285,16 +311,6 @@ impl From<AcceptanceError> for CanonicalError {
                 format!("{count} entities exceeds the limit of {limit} per request"),
                 field::VALIDATION_FAILED,
             ),
-            AcceptanceError::UnsupportedOperationKind => invalid_field(
-                vf::KIND,
-                "only registration is accepted; deletion is not available yet".to_owned(),
-                field::VALIDATION_FAILED,
-            ),
-            AcceptanceError::DryRunNotAccepted => invalid_field(
-                vf::DRY_RUN,
-                "dry_run is not available yet; omit it or set it to false".to_owned(),
-                field::VALIDATION_FAILED,
-            ),
 
             // --- the candidate identifier -------------------------------------
             AcceptanceError::InvalidIdentifier { gts_id, reason } => invalid_candidate(
@@ -350,6 +366,23 @@ impl From<AcceptanceError> for CanonicalError {
                 format!("'{gts_id}' carries no document, which a registration requires"),
                 field::VALIDATION_FAILED,
             ),
+            // Named on the precondition field rather than on the entity: what is
+            // missing is the version, and "delete if present" is not the fallback.
+            AcceptanceError::DeletionRequiresVersion { gts_id } => invalid_candidate(
+                gts_id,
+                vf::EXPECTED_RESOURCE_VERSION,
+                format!(
+                    "deleting '{gts_id}' requires a positive expected_resource_version; \
+                     an absent one is not a request to delete whatever is there"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::DeletionCarriesContent { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!("deleting '{gts_id}' takes no document, and nothing would read one"),
+                field::VALIDATION_FAILED,
+            ),
             AcceptanceError::AuthoredDocumentTooLarge {
                 gts_id,
                 size,
@@ -376,13 +409,13 @@ impl From<AcceptanceError> for CanonicalError {
                 format!("force on '{gts_id}' has no cross-minor compatibility check to waive"),
                 field::VALIDATION_FAILED,
             ),
-            AcceptanceError::ForceCompatibilityUnavailable { gts_id } => invalid_candidate(
+            // The identifier is at fault, not the flag, so the violation points at
+            // the identifier field rather than at `force`.
+            AcceptanceError::UnreadableVersion { gts_id } => invalid_candidate(
                 gts_id,
-                vf::FORCE,
-                format!(
-                    "force on '{gts_id}' is not available until compatibility evaluation is enabled"
-                ),
-                field::VALIDATION_FAILED,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' names no readable major in its last segment"),
+                field::INVALID_GTS_ID,
             ),
             AcceptanceError::MinorTypeSchemaRevision { gts_id } => invalid_candidate(
                 gts_id,
@@ -520,16 +553,6 @@ mod tests {
                 field::VALIDATION_FAILED,
             ),
             (
-                AcceptanceError::UnsupportedOperationKind,
-                violation_field::KIND,
-                field::VALIDATION_FAILED,
-            ),
-            (
-                AcceptanceError::DryRunNotAccepted,
-                violation_field::DRY_RUN,
-                field::VALIDATION_FAILED,
-            ),
-            (
                 AcceptanceError::InvalidIdentifier {
                     gts_id: id.clone(),
                     reason: "bad id".to_owned(),
@@ -601,9 +624,9 @@ mod tests {
                 field::VALIDATION_FAILED,
             ),
             (
-                AcceptanceError::ForceCompatibilityUnavailable { gts_id: id.clone() },
-                violation_field::FORCE,
-                field::VALIDATION_FAILED,
+                AcceptanceError::UnreadableVersion { gts_id: id.clone() },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
             ),
             (
                 AcceptanceError::MinorTypeSchemaRevision { gts_id: id.clone() },
@@ -722,6 +745,13 @@ mod tests {
                 recorded: 1,
                 found: 2,
             })),
+            // The `source` is a real serde error, since the variant interpolates both
+            // it and the identifier into its `Display`.
+            worker_problem(WorkerError::BaselineUnparsable {
+                gts_id: "baseline-secret".to_owned(),
+                source: serde_json::from_str::<serde_json::Value>("{not-secret-json")
+                    .expect_err("the fixture must not parse"),
+            }),
             worker_problem(WorkerError::Storage(ScopeError::Invalid("storage-secret"))),
             worker_problem(WorkerError::Db(DbError::InvalidConfig(
                 "database-secret".to_owned(),

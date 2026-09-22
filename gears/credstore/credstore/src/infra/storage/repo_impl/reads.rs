@@ -285,8 +285,9 @@ pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
     // stricter than tenant granularity fails closed (403) instead of being
     // silently widened to the whole tenant on a lone `OWNER_TENANT_ID` match.
     'constraints: for constraint in scope.constraints() {
-        // An empty constraint matches everything (mirrors SecureORM's
-        // `build_constraint_condition`, which compiles it to `WHERE true`).
+        // A constraint always carries at least one filter: `ScopeConstraint`
+        // refuses to build an empty one, because an AND over nothing is TRUE
+        // and would match every row.
         for filter in constraint.filters() {
             // Only `OWNER_TENANT_ID` predicates can affirm tenant-level access.
             if filter.property() != pep_properties::OWNER_TENANT_ID {
@@ -304,9 +305,9 @@ pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
                 // capability-contract breach. Group membership over
                 // `OWNER_TENANT_ID` is likewise not a plain tenant predicate
                 // this gate resolves.
-                ScopeFilter::InTenantSubtree(_)
-                | ScopeFilter::InGroup(_)
-                | ScopeFilter::InGroupSubtree(_) => false,
+                // ...and on any variant added later, for the same reason: a
+                // predicate this build cannot resolve is not one it may ignore.
+                _ => false,
             };
             if !admits {
                 continue 'constraints;

@@ -188,9 +188,9 @@ async fn an_accepted_request_writes_one_operation_its_items_and_one_dispatch() {
     assert_eq!(recorder.calls(), vec![accepted.operation_id]);
 }
 
-/// The configured maximum batch crosses the 70-row SQLite-safe insert chunk.
+/// The configured maximum batch crosses the 66-row SQLite-safe insert chunk.
 /// Persisting all 100 items proves acceptance splits the multi-row INSERT rather
-/// than binding all 1,400 operation-item values in one statement.
+/// than binding all 1,500 operation-item values in one statement.
 #[tokio::test]
 async fn maximum_batch_is_inserted_across_sqlite_bind_chunks() {
     let db = test_db().await;
@@ -485,10 +485,11 @@ async fn a_different_fingerprint_under_one_key_is_a_conflict() {
     }
 }
 
-/// The temporary pre-T20 dry-run refusal happens before idempotency storage, so it
-/// cannot reserve a key that a later ordinary submission needs.
+/// A dry run and a commit are different requests under one key: the mode is a
+/// fingerprint input (T20), so the second is a conflict rather than a replay of
+/// the first.
 #[tokio::test]
-async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
+async fn a_dry_run_and_a_commit_cannot_share_one_idempotency_key() {
     let db = test_db().await;
     let provider = provider(&db);
     let policy = RegistrationPolicy::default();
@@ -500,7 +501,7 @@ async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
 
     let mut dry = request(KEY, schema(CF_TYPE));
     dry.dry_run = true;
-    let err = accept(
+    let dry_accepted = accept(
         &stores(),
         &provider,
         &allow_all(),
@@ -510,10 +511,9 @@ async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
         NOW,
     )
     .await
-    .expect_err("dry-run is unavailable until T20");
-    assert!(matches!(err, AcceptanceError::DryRunNotAccepted));
+    .expect("a dry run is an ordinary accepted operation");
 
-    let accepted = accept(
+    let conflict = accept(
         &stores(),
         &provider,
         &allow_all(),
@@ -522,10 +522,16 @@ async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
         &request(KEY, schema(CF_TYPE)),
         NOW,
     )
-    .await
-    .expect("the ordinary request can still use the key");
-    assert!(!accepted.replayed);
-    assert_eq!(recorder.calls(), vec![accepted.operation_id]);
+    .await;
+    assert!(
+        matches!(conflict, Err(AcceptanceError::FingerprintConflict { .. })),
+        "the key is taken by a request that differs in mode: {conflict:?}",
+    );
+    assert_eq!(
+        recorder.calls(),
+        vec![dry_accepted.operation_id],
+        "only the dry run was dispatched",
+    );
 }
 
 // ---------------------------------------------------------------------------

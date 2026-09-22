@@ -591,9 +591,10 @@ fn evaluate_filter(filter: &ScopeFilter, key: &AttributionTupleKey) -> FilterOut
                 .iter()
                 .any(|v| value_matches(value, field.kind, v))
         }
-        ScopeFilter::InGroup(_)
-        | ScopeFilter::InGroupSubtree(_)
-        | ScopeFilter::InTenantSubtree(_) => {
+        // Tree predicates, and any variant added later: a predicate this build
+        // cannot evaluate is a restriction it cannot honour, so it must reject
+        // rather than skip.
+        _ => {
             tracing::warn!(
                 target: "authz",
                 property = %filter.property(),
@@ -896,9 +897,9 @@ fn is_owner_tenant_filter(filter: &ScopeFilter) -> bool {
     match filter {
         ScopeFilter::Eq(eq) => eq.property() == pep_properties::OWNER_TENANT_ID,
         ScopeFilter::In(in_filter) => in_filter.property() == pep_properties::OWNER_TENANT_ID,
-        ScopeFilter::InGroup(_)
-        | ScopeFilter::InGroupSubtree(_)
-        | ScopeFilter::InTenantSubtree(_) => false,
+        // Only a flat predicate on `owner_tenant_id` counts as tenant
+        // narrowing; a tree predicate, or one from a newer build, does not.
+        _ => false,
     }
 }
 
@@ -926,9 +927,10 @@ fn scope_filter_to_expr(filter: &ScopeFilter) -> Result<ast::Expr, DomainError> 
                 values,
             ))
         }
-        ScopeFilter::InGroup(_)
-        | ScopeFilter::InGroupSubtree(_)
-        | ScopeFilter::InTenantSubtree(_) => {
+        // Tree predicates, and any variant added later: the projection cannot
+        // express the restriction, so it denies instead of emitting a filter
+        // that leaves the restriction out.
+        _ => {
             tracing::warn!(
                 target: "authz",
                 property = %filter.property(),

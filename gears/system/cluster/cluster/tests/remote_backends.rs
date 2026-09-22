@@ -174,7 +174,10 @@ async fn the_descriptor_makes_the_sync_accessors_answer_like_the_real_backend() 
         local.consistency(),
         "the remote handle must declare what the real backend declares"
     );
-    assert_eq!(cache.features().prefix_watch, local.features().prefix_watch);
+    assert_eq!(
+        cache.features().prefix_watch(),
+        local.features().prefix_watch()
+    );
     assert_eq!(
         cache.provider_name(),
         "standalone",

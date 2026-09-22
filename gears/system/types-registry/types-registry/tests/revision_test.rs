@@ -148,6 +148,7 @@ async fn admit(
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         op,
         LATER,
@@ -394,25 +395,27 @@ async fn a_revision_is_refused_on_a_tombstoned_entity() {
     );
     let after_delete = resource_version_of(&db, CF_TYPE).await;
 
-    // The precondition names the version the deletion left behind, so nothing but
-    // the lifecycle can refuse this.
-    let outcome = admit(
-        &db,
-        "k2",
-        CF_TYPE,
-        schema(CF_TYPE, "second"),
-        Some(after_delete),
-    )
-    .await;
+    // Both an old GET's version and the tombstone's current version must identify
+    // withdrawal, rather than advising the caller to retry with a newer version.
+    for expected in [entity.resource_version, after_delete] {
+        let outcome = admit(
+            &db,
+            &format!("revision-{expected}"),
+            CF_TYPE,
+            schema(CF_TYPE, "second"),
+            Some(expected),
+        )
+        .await;
 
-    let item = &outcome.items[0];
-    assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
-    assert_eq!(
-        item.failure.as_ref().expect("a recorded failure").reason,
-        AdmissionFailureReason::EntityDeleted,
-        "a withdrawn entity is not a stale version, and must not be reported as one",
-    );
-    assert_eq!(item.revision_no, None);
+        let item = &outcome.items[0];
+        assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
+        assert_eq!(
+            item.failure.as_ref().expect("a recorded failure").reason,
+            AdmissionFailureReason::EntityDeleted,
+            "a withdrawn entity is not a stale version, and must not be reported as one",
+        );
+        assert_eq!(item.revision_no, None);
+    }
 
     let entity_id = entity_id_of(&db, CF_TYPE).await;
     assert_eq!(
@@ -465,20 +468,30 @@ async fn an_instance_value_equal_to_its_current_revision_is_unchanged() {
     assert_eq!(resource_version_of(&db, CF_INSTANCE).await, 1);
 }
 
-/// Equality is about authored content, even when the conforming schema changed
-/// and would reject that old value if it were submitted as a new revision.
+/// An identical Instance resubmission retains its schema-revision pointer after
+/// a compatible type revision. A title edit moves the schema without changing validation.
 #[tokio::test]
 async fn unchanged_instance_is_not_revalidated_against_a_new_conforming_schema() {
     let db = test_db().await;
     admit(&db, "type", CF_TYPE, schema(CF_TYPE, "t"), None).await;
     admit(&db, "value", CF_INSTANCE, json!({ "name": "first" }), None).await;
-    let mut revised = schema(CF_TYPE, "numeric-name");
-    revised["properties"]["name"]["type"] = json!("integer");
-    let changed_type = admit(&db, "type-revised", CF_TYPE, revised, Some(1)).await;
+
+    // A title edit preserves compatibility while advancing the type to revision 2.
+    let changed_type = admit(
+        &db,
+        "type-revised",
+        CF_TYPE,
+        schema(CF_TYPE, "retitled"),
+        Some(1),
+    )
+    .await;
     assert_eq!(
         changed_type.items[0].status,
-        domain_enums::OperationItemStatus::Succeeded
+        domain_enums::OperationItemStatus::Succeeded,
+        "{:?}",
+        changed_type.items[0].failure,
     );
+    assert_eq!(changed_type.items[0].revision_no, Some(2));
 
     let outcome = admit(
         &db,
@@ -496,6 +509,7 @@ async fn unchanged_instance_is_not_revalidated_against_a_new_conforming_schema()
     );
     assert_eq!(item.resource_version, Some(1));
     assert_eq!(item.revision_no, None);
+
     let id = entity_id_of(&db, CF_INSTANCE).await;
     let revisions = instance_revision::Entity::find()
         .filter(instance_revision::Column::EntityId.eq(id))
@@ -504,8 +518,16 @@ async fn unchanged_instance_is_not_revalidated_against_a_new_conforming_schema()
         .all(&db.conn().expect("conn"))
         .await
         .expect("revisions");
-    assert_eq!(revisions.len(), 1);
-    assert_eq!(revisions[0].type_schema_revision_no, 1);
+    assert_eq!(
+        revisions.len(),
+        1,
+        "no second Instance revision was written"
+    );
+    assert_eq!(
+        revisions[0].type_schema_revision_no, 1,
+        "the recorded revision is the one that validated the value, not the type's \
+         current one",
+    );
 }
 
 /// ADR-0005: content equal to an **older, non-current** revision is a new update.
@@ -581,6 +603,7 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
             limits: &common::limits(),
             worker: &common::worker_settings(),
             metrics: &common::metrics(),
+            allow_compatibility_force: false,
         },
         created,
         LATER,
@@ -608,6 +631,7 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
                 limits: &common::limits(),
                 worker: &common::worker_settings(),
                 metrics: &common::metrics(),
+                allow_compatibility_force: false,
             },
             op,
             LATER,

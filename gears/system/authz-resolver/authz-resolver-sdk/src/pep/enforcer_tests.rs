@@ -5,7 +5,7 @@ use super::*;
 use crate::constraints::{Constraint, InPredicate, Predicate};
 use crate::models::{EvaluationResponse, EvaluationResponseContext};
 use toolkit_gts::gts_id;
-use toolkit_security::{PlatformIdentity, PlatformSecurityContext, pep_properties};
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 
 fn uuid(s: &str) -> Uuid {
     Uuid::parse_str(s).expect("valid test UUID")
@@ -344,8 +344,10 @@ async fn access_scope_threads_caller_identity_into_subject() {
         "caller bearer token must reach the PDP"
     );
 
-    // The ctx argument is a credential-free plane marker carrying no identity.
-    assert!(matches!(plane_ctx.identity(), PlatformIdentity::Unknown));
+    // The ctx argument is a credential-free plane marker carrying no identity,
+    // and it says so in its own variant rather than sharing `Unknown` with a
+    // peer identity this build does not recognise.
+    assert!(plane_ctx.is_outbound_marker());
 }
 
 #[tokio::test]

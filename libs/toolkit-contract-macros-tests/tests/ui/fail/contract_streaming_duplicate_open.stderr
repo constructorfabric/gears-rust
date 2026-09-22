@@ -1,0 +1,5 @@
+error: duplicate `open` selector
+ --> tests/ui/fail/contract_streaming_duplicate_open.rs:8:34
+  |
+8 |     #[streaming(open = fallible, open = immediate)]
+  |                                  ^^^^

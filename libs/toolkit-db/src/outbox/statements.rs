@@ -11,9 +11,11 @@ pub(super) struct OutboxStatements {
     tables: OutboxTables,
     registration: RegistrationStatements,
     enqueue: EnqueueStatements,
+    trace: TraceStatements,
     sequencer: SequencerStatements,
     processor: ProcessorStatements,
     vacuum: VacuumStatements,
+    sweep: SweepStatements,
     dead_letters: DeadLetterStatements,
 }
 
@@ -27,6 +29,7 @@ pub(super) struct EnqueueStatements {
     insert_body_and_incoming_cte: Option<String>,
     insert_body: String,
     insert_incoming: String,
+    insert_trace: String,
     body_id_reservation: Option<MySqlIdReservationStatements>,
     incoming_id_reservation: Option<MySqlIdReservationStatements>,
 }
@@ -34,6 +37,15 @@ pub(super) struct EnqueueStatements {
 pub(super) struct MySqlIdReservationStatements {
     select_next_id_for_update: String,
     advance_next_id: String,
+}
+pub(super) struct TraceStatements {
+    advance: String,
+    retry: String,
+    status: String,
+    claim_mail: String,
+    claim_mail_outcome: String,
+    mail: String,
+    retrying: String,
 }
 
 pub(super) struct SequencerStatements {
@@ -53,6 +65,11 @@ pub(super) struct ProcessorStatements {
     lease_record_retry: String,
     lease_release: String,
     read_processor: String,
+}
+
+/// Statements for collecting trace rows that have outlived their usefulness.
+pub(super) struct SweepStatements {
+    select_collectable_traces: String,
 }
 
 pub(super) struct VacuumStatements {
@@ -79,9 +96,11 @@ impl OutboxStatements {
             tables: tables.clone(),
             registration: RegistrationStatements::new(dialect, tables),
             enqueue: EnqueueStatements::new(dialect, tables),
+            trace: TraceStatements::new(dialect, tables),
             sequencer: SequencerStatements::new(dialect, tables),
             processor: ProcessorStatements::new(dialect, tables),
             vacuum: VacuumStatements::new(dialect, tables),
+            sweep: SweepStatements::new(dialect, tables),
             dead_letters: DeadLetterStatements::new(tables),
         }
     }
@@ -108,6 +127,14 @@ impl OutboxStatements {
 
     pub(super) fn sequencer(&self) -> &SequencerStatements {
         &self.sequencer
+    }
+
+    pub(super) fn trace(&self) -> &TraceStatements {
+        &self.trace
+    }
+
+    pub(super) fn sweep(&self) -> &SweepStatements {
+        &self.sweep
     }
 
     pub(super) fn processor(&self) -> &ProcessorStatements {
@@ -150,6 +177,7 @@ impl EnqueueStatements {
         Self {
             insert_body_and_incoming_cte: insert_body_and_incoming_cte(dialect, tables),
             insert_body: insert_body(dialect, tables),
+            insert_trace: insert_trace(dialect, tables),
             insert_incoming: insert_incoming(dialect, tables),
             body_id_reservation: mysql_id_reservation(dialect, tables.body_id_sequence()),
             incoming_id_reservation: mysql_id_reservation(dialect, tables.incoming_id_sequence()),
@@ -166,6 +194,10 @@ impl EnqueueStatements {
 
     pub(super) fn insert_incoming(&self) -> &str {
         &self.insert_incoming
+    }
+
+    pub(super) fn insert_trace(&self) -> &str {
+        &self.insert_trace
     }
 
     pub(super) fn body_id_reservation(&self) -> Option<&MySqlIdReservationStatements> {
@@ -193,6 +225,48 @@ impl MySqlIdReservationStatements {
 
     pub(super) fn advance_next_id(&self) -> &str {
         &self.advance_next_id
+    }
+}
+
+impl TraceStatements {
+    fn new(dialect: Dialect, tables: &OutboxTables) -> Self {
+        Self {
+            advance: trace_advance(dialect, tables),
+            retry: trace_retry(dialect, tables),
+            status: trace_status(dialect, tables),
+            claim_mail: trace_claim_mail(dialect, tables),
+            claim_mail_outcome: trace_claim_mail_outcome(dialect, tables),
+            mail: trace_mail(dialect, tables),
+            retrying: trace_retrying(dialect, tables),
+        }
+    }
+
+    pub(super) fn advance(&self) -> &str {
+        &self.advance
+    }
+
+    pub(super) fn retry(&self) -> &str {
+        &self.retry
+    }
+
+    pub(super) fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub(super) fn claim_mail(&self) -> &str {
+        &self.claim_mail
+    }
+
+    pub(super) fn claim_mail_outcome(&self) -> &str {
+        &self.claim_mail_outcome
+    }
+
+    pub(super) fn mail(&self) -> &str {
+        &self.mail
+    }
+
+    pub(super) fn retrying(&self) -> &str {
+        &self.retrying
     }
 }
 
@@ -272,6 +346,48 @@ impl ProcessorStatements {
 
     pub(super) fn read_processor(&self) -> &str {
         &self.read_processor
+    }
+}
+
+impl SweepStatements {
+    fn new(dialect: Dialect, tables: &OutboxTables) -> Self {
+        let (p1, p2, p3, p4, p5) = match dialect {
+            Dialect::Postgres | Dialect::Sqlite => ("$1", "$2", "$3", "$4", "$5"),
+            Dialect::MySql => ("?", "?", "?", "?", "?"),
+        };
+        Self {
+            // One table, and deliberately so: an anti-join against the body
+            // or the dead letters would make a background sweep touch the
+            // hottest table in the outbox every few minutes, unindexed.
+            //
+            // Liveness comes from the trace row's own fields instead. A trace
+            // still working has `pending > 0` and is held by the fourth rule;
+            // one that produced dead letters has `failures > 0` and is held
+            // for longer, because a dead letter outlives the delivery it
+            // failed. Nothing else needs another table to decide.
+            select_collectable_traces: format!(
+                "SELECT t.id FROM {trace} t \
+                 WHERE ( \
+                       (t.notified_at IS NOT NULL AND t.failures = 0 \
+                        AND t.notified_at < {before1}) \
+                    OR (t.completed_at IS NOT NULL AND t.notified_at IS NULL \
+                        AND t.completed_at < {before2}) \
+                    OR (t.notified_at IS NOT NULL AND t.failures > 0 \
+                        AND t.notified_at < {before3}) \
+                    OR (t.completed_at IS NULL AND t.created_at < {before4}) \
+                 ) \
+                 ORDER BY t.id LIMIT {p5}",
+                trace = tables.trace(),
+                before1 = seconds_ago(dialect, p1),
+                before2 = seconds_ago(dialect, p2),
+                before3 = seconds_ago(dialect, p3),
+                before4 = seconds_ago(dialect, p4),
+            ),
+        }
+    }
+
+    pub(super) fn select_collectable_traces(&self) -> &str {
+        &self.select_collectable_traces
     }
 }
 
@@ -371,11 +487,11 @@ fn insert_body_and_incoming_cte(dialect: Dialect, tables: &OutboxTables) -> Opti
     match dialect {
         Dialect::Postgres => Some(format!(
             "WITH b AS (\
-               INSERT INTO {} (payload, payload_type) \
-               VALUES ($1, $2) RETURNING id\
+               INSERT INTO {} (payload, payload_type, trace) \
+               VALUES ($1, $2, $3) RETURNING id\
              ) \
              INSERT INTO {} (partition_id, body_id) \
-             SELECT $3, id FROM b RETURNING id",
+             SELECT $4, id FROM b RETURNING id",
             tables.body(),
             tables.incoming()
         )),
@@ -386,12 +502,30 @@ fn insert_body_and_incoming_cte(dialect: Dialect, tables: &OutboxTables) -> Opti
 fn insert_body(dialect: Dialect, tables: &OutboxTables) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!(
-            "INSERT INTO {} (payload, payload_type) VALUES ($1, $2) RETURNING id",
+            "INSERT INTO {} (payload, payload_type, trace) \
+             VALUES ($1, $2, $3) RETURNING id",
             tables.body()
         ),
         Dialect::MySql => format!(
-            "INSERT INTO {} (payload, payload_type) VALUES (?, ?)",
+            "INSERT INTO {} (payload, payload_type, trace) VALUES (?, ?, ?)",
             tables.body()
+        ),
+    }
+}
+
+/// One row per traced batch. `pending` starts at `entities` and the ack counts
+/// it down; reaching zero is what completion means.
+fn insert_trace(dialect: Dialect, tables: &OutboxTables) -> String {
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => format!(
+            "INSERT INTO {} (trace, owner_instance, queue, entities, pending) \
+             VALUES ($1, $2, $3, $4, $5)",
+            tables.trace()
+        ),
+        Dialect::MySql => format!(
+            "INSERT INTO {} (trace, owner_instance, queue, entities, pending) \
+             VALUES (?, ?, ?, ?, ?)",
+            tables.trace()
         ),
     }
 }
@@ -423,9 +557,9 @@ fn allocate_sequences(dialect: Dialect, tables: &OutboxTables) -> AllocSql {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => AllocSql::UpdateReturning(format!(
             "UPDATE {} \
-             SET sequence = sequence + $2 \
-             WHERE id = $1 \
-             RETURNING sequence - $2 AS start_seq",
+             SET sequence = sequence + $1 \
+             WHERE id = $2 \
+             RETURNING sequence - $1 AS start_seq",
             tables.partitions()
         )),
         Dialect::MySql => AllocSql::UpdateThenSelect {
@@ -438,6 +572,231 @@ fn allocate_sequences(dialect: Dialect, tables: &OutboxTables) -> AllocSql {
                 tables.partitions()
             ),
         },
+    }
+}
+
+/// Count a trace down by what an ack just terminalized.
+///
+/// The subtraction reads the value before this statement, so the completion
+/// stamp lands in the same UPDATE that reaches zero. Guarded on `pending > 0`
+/// so a stray advance cannot drive it negative, and clears the retry fields
+/// because progress is the answer to a retry.
+///
+/// `attempts` is cleared by progress for the same reason, *except* on the
+/// advance that completes the batch: the completion is read back from this row
+/// and a caller being told its batch finished wants to know what it cost, so
+/// zeroing it there would deliver a nought every time.
+fn trace_advance(dialect: Dialect, tables: &OutboxTables) -> String {
+    let now = now_expr(dialect);
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => format!(
+            "UPDATE {} \
+             SET pending = pending - $1, \
+                 failures = failures + $2, \
+                 attempts = CASE WHEN pending - $3 <= 0 THEN attempts ELSE 0 END, \
+                 retrying_since = NULL, \
+                 last_error = NULL, \
+                 completed_at = CASE WHEN pending - $4 <= 0 THEN {now} ELSE completed_at END \
+             WHERE trace = $5 AND pending > 0 \
+             RETURNING pending",
+            tables.trace()
+        ),
+        // No RETURNING, so this only counts down and stamps `completed_at`; the
+        // `notified_at` delivery stamp is left entirely to the claim on every
+        // dialect (see `trace_claim_mail`), so there is one stamping path, not
+        // two. MySQL evaluates SET assignments left to right, so by the time the
+        // CASE expressions run, `pending` already holds `pending - ?` from the
+        // first assignment - the new post-ack value. They test it directly
+        // rather than subtracting the delta a second time. The `WHERE` guard is
+        // evaluated before the SET, so `pending > 0` there still sees the
+        // pre-ack value and selects the row correctly.
+        Dialect::MySql => format!(
+            "UPDATE {} \
+             SET pending = pending - ?, \
+                 failures = failures + ?, \
+                 attempts = CASE WHEN pending <= 0 THEN attempts ELSE 0 END, \
+                 retrying_since = NULL, \
+                 last_error = NULL, \
+                 completed_at = CASE WHEN pending <= 0 THEN {now} ELSE completed_at END \
+             WHERE trace = ? AND pending > 0",
+            tables.trace()
+        ),
+    }
+}
+
+/// Record that a trace is being retried rather than progressing.
+///
+/// `retrying_since` keeps the *first* retry time, so a consumer sees how long
+/// the trace has been stuck rather than when it was last attempted.
+fn trace_retry(dialect: Dialect, tables: &OutboxTables) -> String {
+    let now = now_expr(dialect);
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => format!(
+            "UPDATE {} \
+             SET attempts = attempts + 1, \
+                 last_error = $1, \
+                 retrying_since = COALESCE(retrying_since, {now}) \
+             WHERE trace = $2 AND completed_at IS NULL",
+            tables.trace()
+        ),
+        Dialect::MySql => format!(
+            "UPDATE {} \
+             SET attempts = attempts + 1, \
+                 last_error = ?, \
+                 retrying_since = COALESCE(retrying_since, {now}) \
+             WHERE trace = ? AND completed_at IS NULL",
+            tables.trace()
+        ),
+    }
+}
+
+/// The most recent trace recorded under a given trace string.
+///
+/// Nothing requires a caller to make its traces unique, so the newest is the
+/// one reported.
+fn trace_status(dialect: Dialect, tables: &OutboxTables) -> String {
+    let placeholder = match dialect {
+        Dialect::Postgres | Dialect::Sqlite => "$1",
+        Dialect::MySql => "?",
+    };
+    format!(
+        "SELECT trace, queue, entities, pending, failures, attempts, last_error, \
+                retrying_since, created_at, completed_at \
+         FROM {} \
+         WHERE trace = {placeholder} \
+         ORDER BY created_at DESC, id DESC \
+         LIMIT 1",
+        tables.trace()
+    )
+}
+
+/// Claim one completed trace as delivered, and return what to deliver.
+///
+/// One statement decides everything: it stamps `notified_at` only if the trace
+/// has completed, has not been delivered, and belongs to *this* instance. So a
+/// row it affects is mail this instance may deliver, and a row it does not
+/// affect is either unfinished or someone else's - no read is needed to tell
+/// the cases apart, and two instances cannot both deliver.
+fn trace_claim_mail(dialect: Dialect, tables: &OutboxTables) -> String {
+    let now = now_expr(dialect);
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => format!(
+            "UPDATE {} SET notified_at = {now} \
+             WHERE trace = $1 \
+               AND pending <= 0 \
+               AND notified_at IS NULL \
+               AND owner_instance = $2 \
+             RETURNING trace, entities, failures, attempts, completed_at",
+            tables.trace()
+        ),
+        // No RETURNING: the caller reads the row back only when the UPDATE
+        // affected one, so the extra round trip is paid per delivery rather
+        // than per attempt.
+        Dialect::MySql => format!(
+            "UPDATE {} SET notified_at = {now} \
+             WHERE trace = ? \
+               AND pending <= 0 \
+               AND notified_at IS NULL \
+               AND owner_instance = ?",
+            tables.trace()
+        ),
+    }
+}
+
+/// Read back what a trace this instance just claimed should deliver.
+///
+/// Guarded rather than a bare lookup by id, because on the dialect without
+/// `RETURNING` the claim rides the countdown and this read is how the caller
+/// learns whether it claimed anything. Exactly one ack can drive `pending` to
+/// zero - every later advance is refused by `pending > 0` - so a row coming
+/// back here means this ack is that one, and the owner check keeps another
+/// instance's mail out of it.
+fn trace_claim_mail_outcome(dialect: Dialect, tables: &OutboxTables) -> String {
+    let (p1, p2) = match dialect {
+        Dialect::Postgres | Dialect::Sqlite => ("$1", "$2"),
+        Dialect::MySql => ("?", "?"),
+    };
+    format!(
+        "SELECT trace, entities, failures, attempts, completed_at \
+         FROM {} \
+         WHERE trace = {p1} \
+           AND pending <= 0 \
+           AND notified_at IS NOT NULL \
+           AND owner_instance = {p2}",
+        tables.trace()
+    )
+}
+
+/// This instance's undelivered mail.
+///
+/// Only the id, because the claim returns the rest. On Postgres the supporting
+/// index is partial on exactly this predicate, so the query is an index probe
+/// that normally finds nothing.
+fn trace_mail(dialect: Dialect, tables: &OutboxTables) -> String {
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => format!(
+            "SELECT trace FROM {} \
+             WHERE owner_instance = $1 \
+               AND completed_at IS NOT NULL \
+               AND notified_at IS NULL \
+             ORDER BY completed_at LIMIT $2",
+            tables.trace()
+        ),
+        Dialect::MySql => format!(
+            "SELECT trace FROM {} \
+             WHERE owner_instance = ? \
+               AND completed_at IS NOT NULL \
+               AND notified_at IS NULL \
+             ORDER BY completed_at LIMIT ?",
+            tables.trace()
+        ),
+    }
+}
+
+/// This instance's traces that are stuck rather than merely slow.
+///
+/// A trace appears here from the moment a handler first retried one of its
+/// entities until the batch makes progress again, which clears `retrying_since`
+/// in the same UPDATE that counts the batch down. On Postgres the supporting
+/// index is partial on exactly this predicate, so a healthy instance probes an
+/// empty index.
+fn trace_retrying(dialect: Dialect, tables: &OutboxTables) -> String {
+    let (owner, limit) = match dialect {
+        Dialect::Postgres | Dialect::Sqlite => ("$1", "$2"),
+        Dialect::MySql => ("?", "?"),
+    };
+    format!(
+        "SELECT trace, entities, pending, failures, attempts, last_error, retrying_since \
+         FROM {} \
+         WHERE owner_instance = {owner} \
+           AND completed_at IS NULL \
+           AND retrying_since IS NOT NULL \
+         ORDER BY retrying_since LIMIT {limit}",
+        tables.trace()
+    )
+}
+
+/// The backend's expression for "`n` seconds before now", with `n` bound.
+///
+/// The arithmetic belongs in SQL, not in Rust: a bound timestamp is
+/// serialised in a format that does not compare correctly against the text
+/// `SQLite` stores for `datetime('now')` - the space separator sorts before
+/// `T`, so every row would look older than any bound value. The lease
+/// statements already compute their deadlines this way.
+fn seconds_ago(dialect: Dialect, placeholder: &str) -> String {
+    match dialect {
+        Dialect::Postgres => format!("now() - ({placeholder} * INTERVAL '1 second')"),
+        Dialect::Sqlite => format!("datetime('now', '-' || {placeholder} || ' seconds')"),
+        Dialect::MySql => format!("DATE_SUB(NOW(6), INTERVAL {placeholder} SECOND)"),
+    }
+}
+
+/// The backend's expression for "now".
+const fn now_expr(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Postgres => "now()",
+        Dialect::Sqlite => "datetime('now')",
+        Dialect::MySql => "NOW(6)",
     }
 }
 
@@ -531,14 +890,14 @@ fn insert_dead_letter(dialect: Dialect, tables: &OutboxTables) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!(
             "INSERT INTO {} \
-             (partition_id, seq, payload, payload_type, created_at, last_error, attempts) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (partition_id, seq, payload, payload_type, created_at, last_error, attempts, trace) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             tables.dead_letters()
         ),
         Dialect::MySql => format!(
             "INSERT INTO {} \
-             (partition_id, seq, payload, payload_type, created_at, last_error, attempts) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (partition_id, seq, payload, payload_type, created_at, last_error, attempts, trace) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             tables.dead_letters()
         ),
     }
@@ -731,21 +1090,16 @@ fn reset_vacuum_counter(dialect: Dialect, tables: &OutboxTables) -> String {
     }
 }
 
+/// One row per partition, created at registration and never deleted.
 fn insert_vacuum_counter_row(dialect: Dialect, tables: &OutboxTables) -> String {
+    let table = tables.vacuum_counter();
     match dialect {
         Dialect::Postgres => format!(
-            "INSERT INTO {} (partition_id) \
-             VALUES ($1) ON CONFLICT (partition_id) DO NOTHING",
-            tables.vacuum_counter()
+            "INSERT INTO {table} (partition_id) \
+             VALUES ($1) ON CONFLICT (partition_id) DO NOTHING"
         ),
-        Dialect::Sqlite => format!(
-            "INSERT OR IGNORE INTO {} (partition_id) VALUES ($1)",
-            tables.vacuum_counter()
-        ),
-        Dialect::MySql => format!(
-            "INSERT IGNORE INTO {} (partition_id) VALUES (?)",
-            tables.vacuum_counter()
-        ),
+        Dialect::Sqlite => format!("INSERT OR IGNORE INTO {table} (partition_id) VALUES ($1)"),
+        Dialect::MySql => format!("INSERT IGNORE INTO {table} (partition_id) VALUES (?)"),
     }
 }
 
@@ -870,6 +1224,221 @@ mod tests {
         );
     }
 
+    /// Every value's position must be the same under both placeholder schemes.
+    ///
+    /// `Postgres` and `SQLite` take numbered `$n`, `MySQL` takes positional `?`, and
+    /// one values vector serves both. So a `$n` sequence that does not ascend
+    /// textually binds correctly on one backend and to the wrong columns on
+    /// the other - silently, because the types usually still fit.
+    /// The dialects that number their parameters tolerate a placeholder
+    /// repeated for the same value; the one that uses bare positional markers
+    /// silently expects one value per marker. A statement written with a
+    /// repeated placeholder therefore works on two backends and takes the
+    /// wrong number of values on the third, which is a defect no amount of
+    /// `SQLite` testing can see. So every statement must want the same number of
+    /// values on every backend.
+    #[test]
+    fn every_statement_wants_the_same_parameter_count_on_every_backend() {
+        fn highest_numbered(sql: &str) -> usize {
+            let bytes = sql.as_bytes();
+            let mut highest = 0;
+            for (i, b) in bytes.iter().enumerate() {
+                if *b != b'$' {
+                    continue;
+                }
+                if let Some(d) = bytes.get(i + 1).and_then(|c| char::from(*c).to_digit(10)) {
+                    highest = highest.max(d as usize);
+                }
+            }
+            highest
+        }
+        fn positional(sql: &str) -> usize {
+            sql.bytes().filter(|b| *b == b'?').count()
+        }
+
+        let pg = statements(DbBackend::Postgres);
+        let my = statements(DbBackend::MySql);
+        let pairs: Vec<(&str, &str, &str)> = vec![
+            (
+                "insert_trace",
+                pg.enqueue().insert_trace(),
+                my.enqueue().insert_trace(),
+            ),
+            ("trace_retry", pg.trace().retry(), my.trace().retry()),
+            ("trace_status", pg.trace().status(), my.trace().status()),
+            (
+                "trace_claim_mail",
+                pg.trace().claim_mail(),
+                my.trace().claim_mail(),
+            ),
+            ("trace_mail", pg.trace().mail(), my.trace().mail()),
+            (
+                "trace_retrying",
+                pg.trace().retrying(),
+                my.trace().retrying(),
+            ),
+            (
+                "select_collectable_traces",
+                pg.sweep().select_collectable_traces(),
+                my.sweep().select_collectable_traces(),
+            ),
+            (
+                "advance_processed_seq",
+                pg.processor().advance_processed_seq(),
+                my.processor().advance_processed_seq(),
+            ),
+            (
+                "record_retry",
+                pg.processor().record_retry(),
+                my.processor().record_retry(),
+            ),
+            (
+                "lease_ack_advance",
+                pg.processor().lease_ack_advance(),
+                my.processor().lease_ack_advance(),
+            ),
+            (
+                "lease_record_retry",
+                pg.processor().lease_record_retry(),
+                my.processor().lease_record_retry(),
+            ),
+            (
+                "lease_release",
+                pg.processor().lease_release(),
+                my.processor().lease_release(),
+            ),
+            (
+                "read_processor",
+                pg.processor().read_processor(),
+                my.processor().read_processor(),
+            ),
+            (
+                "decrement_vacuum_counter",
+                pg.vacuum().decrement_counter(),
+                my.vacuum().decrement_counter(),
+            ),
+            (
+                "bump_vacuum_counter",
+                pg.vacuum().bump_counter(),
+                my.vacuum().bump_counter(),
+            ),
+            (
+                "fetch_dirty_partitions",
+                pg.vacuum().fetch_dirty_partitions(),
+                my.vacuum().fetch_dirty_partitions(),
+            ),
+        ];
+
+        // One statement deliberately differs, and a deliberate difference has
+        // to be declared rather than quietly skipped. MySQL binds fewer values,
+        // not more: the numbered dialects re-subtract the delta in each
+        // completion CASE (`pending - $n`), while MySQL reads the already-updated
+        // `pending` and needs no rebind there. Neither dialect stamps delivery in
+        // the advance any more - the claim is the sole `notified_at` writer.
+        // Pinned here so a change to either side still has to come past this test.
+        assert_eq!(
+            (
+                highest_numbered(pg.trace().advance()),
+                positional(my.trace().advance())
+            ),
+            (5, 3),
+            "trace_advance: numbered dialects re-subtract the delta per CASE; \
+             the positional one reads the already-updated pending"
+        );
+
+        // MySQL evaluates SET assignments left to right, so the completion
+        // CASEs run after `pending` has already been reduced to the post-ack
+        // value. They must test that value directly (`pending <= 0`); a
+        // `pending - <delta>` there would subtract the delta a second time and
+        // stamp completion when the batch is only half drained. The numbered
+        // dialects evaluate every RHS against the pre-update row, so there the
+        // re-subtraction is correct and required.
+        let my_advance = my.trace().advance();
+        for clause in ["attempts = CASE", "completed_at = CASE"] {
+            let case = &my_advance[my_advance.find(clause).expect("clause present")..];
+            let case = &case[..case.find("END").expect("CASE end")];
+            assert!(
+                case.contains("pending <="),
+                "MySQL trace_advance `{clause}` must test the updated pending: {case}"
+            );
+            assert!(
+                !case.contains("pending -"),
+                "MySQL trace_advance `{clause}` must not re-subtract the delta: {case}"
+            );
+        }
+        let pg_advance = pg.trace().advance();
+        assert!(
+            pg_advance.contains("pending - $3") && pg_advance.contains("pending - $4"),
+            "numbered trace_advance re-subtracts the delta in each completion CASE"
+        );
+
+        let mut checked = 0;
+        for (name, pg_sql, my_sql) in pairs {
+            assert_eq!(
+                highest_numbered(pg_sql),
+                positional(my_sql),
+                "{name} wants a different number of values per backend\n  numbered: {pg_sql}\n  positional: {my_sql}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 16, "only {checked} statements checked");
+    }
+
+    #[test]
+    fn every_statement_binds_its_values_in_textual_order() {
+        fn placeholder_order(sql: &str) -> Vec<u32> {
+            let bytes = sql.as_bytes();
+            let mut seen: Vec<u32> = Vec::new();
+            for (i, b) in bytes.iter().enumerate() {
+                if *b != b'$' {
+                    continue;
+                }
+                if let Some(d) = bytes.get(i + 1).and_then(|c| char::from(*c).to_digit(10))
+                    && !seen.contains(&d)
+                {
+                    seen.push(d);
+                }
+            }
+            seen
+        }
+
+        let pg = statements(DbBackend::Postgres);
+        let mut checked = 0;
+        let mut statements_to_check: Vec<String> = vec![
+            pg.enqueue().insert_body().to_owned(),
+            pg.enqueue().insert_incoming().to_owned(),
+            pg.enqueue().insert_trace().to_owned(),
+            pg.trace().advance().to_owned(),
+            pg.trace().retry().to_owned(),
+            pg.trace().status().to_owned(),
+            pg.trace().claim_mail().to_owned(),
+            pg.trace().mail().to_owned(),
+            pg.trace().retrying().to_owned(),
+            pg.processor().advance_processed_seq().to_owned(),
+            pg.processor().record_retry().to_owned(),
+            pg.processor().lease_ack_advance().to_owned(),
+            pg.processor().lease_record_retry().to_owned(),
+            pg.processor().lease_release().to_owned(),
+            pg.processor().read_processor().to_owned(),
+            pg.vacuum().decrement_counter().to_owned(),
+            pg.vacuum().bump_counter().to_owned(),
+            pg.vacuum().fetch_dirty_partitions().to_owned(),
+            pg.vacuum().cleanup().select_outgoing_chunk.clone(),
+            pg.sweep().select_collectable_traces().to_owned(),
+        ];
+        if let AllocSql::UpdateReturning(sql) = pg.sequencer().allocate_sequences() {
+            statements_to_check.push(sql.clone());
+        }
+
+        for sql in statements_to_check {
+            let order = placeholder_order(&sql);
+            let ascending: Vec<u32> = (1..=u32::try_from(order.len()).unwrap_or(0)).collect();
+            assert_eq!(order, ascending, "placeholders out of textual order: {sql}");
+            checked += 1;
+        }
+        assert!(checked >= 21, "only {checked} statements checked");
+    }
+
     #[test]
     fn allocation_and_vacuum_groups_keep_backend_syntax() {
         let pg = statements(DbBackend::Postgres);
@@ -877,7 +1446,7 @@ mod tests {
             AllocSql::UpdateReturning(sql) => {
                 assert!(sql.contains("$1"));
                 assert!(sql.contains("$2"));
-                assert!(sql.contains("RETURNING sequence - $2"));
+                assert!(sql.contains("RETURNING sequence - $1"));
             }
             AllocSql::UpdateThenSelect { .. } => panic!("postgres should use returning"),
         }

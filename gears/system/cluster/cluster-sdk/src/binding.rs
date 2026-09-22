@@ -331,7 +331,9 @@ impl ClusterCacheBackend for UnboundCacheBackend {
     }
 
     fn features(&self) -> CacheFeatures {
-        CacheFeatures::new(false)
+        // An unbound stub can serve nothing, watch included: the weakest honest
+        // reading, matching `consistency()` above.
+        CacheFeatures::without_watch()
     }
 
     fn provider_name(&self) -> &'static str {
@@ -379,6 +381,15 @@ impl ClusterCacheBackend for UnboundCacheBackend {
         Err(not_bound(self.profile))
     }
 
+    /// `ProfileNotBound`, **not** the `Unsupported { feature: "watch" }` that a
+    /// *bound* backend declaring `features().watch == false` owes the trait
+    /// contract. Deliberate, and consistent with `features()` above reporting the
+    /// weakest reading: an unbound facade is not making a capability statement, it
+    /// is reporting that nothing is wired. Kept the same way `scan_prefix` keeps
+    /// `ProfileNotBound` over the trait's `Unsupported` default — every op on this
+    /// stub answers with the one variant that names the real problem, so a consumer
+    /// that gates a CAS lock/leader on this cache sees `ProfileNotBound` rather than
+    /// a spurious "backend has no exact watch".
     async fn watch(&self, _key: &str) -> Result<CacheWatch, ClusterError> {
         Err(not_bound(self.profile))
     }

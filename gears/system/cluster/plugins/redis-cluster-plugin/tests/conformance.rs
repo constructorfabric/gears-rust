@@ -136,6 +136,46 @@ async fn cache_conformance() {
     .await;
 }
 
+/// The same `SC-CACHE-*` suite against a `watch_mode: disabled` cache, which
+/// declares `features().watch == false` and answers `Unsupported` from `watch`.
+///
+/// Proves a watchless Redis deployment passes conformance rather than panicking
+/// on `.expect("watch")`: the exact-watch scenarios (010/012/015) are
+/// capability-gated, and SC-CACHE-012 asserts the `Unsupported` contract. This is
+/// the plugin half of the exact-watch fix — the same declaration that lets an
+/// omitted `leader_election`/`lock` degrade instead of failing at first call.
+#[tokio::test]
+async fn cache_conformance_watch_mode_disabled() {
+    use cluster_conformance::run_cache_conformance;
+
+    let (_container, base_config) = common::start_redis().await;
+    let url = base_config.url;
+    let scenario_index = AtomicUsize::new(0);
+
+    Box::pin(run_cache_conformance(
+        || {
+            let url = url.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let config = common::cluster_config_for_scenario(
+                    &url,
+                    "confnowatch",
+                    index,
+                    serde_json::json!({ "watch_mode": "disabled" }),
+                );
+                let handle = RedisClusterPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("a fresh per-scenario instance starts against the test container");
+                let cache = handle.cache();
+                ScenarioBackend::with_teardown(cache, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    ))
+    .await;
+}
+
 /// Every `SC-LOCK-*` scenario against the **standalone** `RedisLockPlugin`.
 ///
 /// The standalone shape rather than the combined plugin's `handle.lock()`, and
@@ -232,4 +272,151 @@ async fn leader_conformance() {
         TimeControl::Real,
     ))
     .await;
+}
+
+/// The `SC-LOCK-*` suite for the **CAS default lock** wired over this plugin's
+/// cache in `watch_mode: disabled` — the shape the reported live bug hit.
+///
+/// The sibling `lock_conformance` covers the *native* standalone lock; this one
+/// covers the SDK `CasBasedDistributedLockBackend` over a cache that declares
+/// `features().watch == false` and answers `Unsupported` from `watch()`, so the
+/// blocking-acquisition scenarios exercise the watchless poll-fallback against
+/// **real** redis rather than only the in-memory fixture. On `start_redis_durable`
+/// for the same reason as `leader_conformance`: `::new` rejects a cache declaring
+/// `EventuallyConsistent`, so the strict constructor's `expect` is a real assertion.
+#[tokio::test]
+async fn cas_lock_conformance_watch_mode_disabled() {
+    use cluster::defaults::CasBasedDistributedLockBackend;
+    use cluster_conformance::run_lock_conformance;
+    use cluster_sdk::DistributedLockBackend;
+
+    let (_container, base_config) = common::start_redis_durable().await;
+    let url = base_config.url;
+    let scenario_index = AtomicUsize::new(0);
+
+    Box::pin(run_lock_conformance(
+        || {
+            let url = url.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let config = common::cluster_config_for_scenario(
+                    &url,
+                    "conflocknowatch",
+                    index,
+                    serde_json::json!({ "watch_mode": "disabled" }),
+                );
+                let handle = RedisClusterPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("a fresh per-scenario instance starts against the durable container");
+                let lock = Arc::new(CasBasedDistributedLockBackend::new(handle.cache()).expect(
+                    "the durable single-node fixture's cache must declare Linearizable, or the \
+                     strict CAS-lock constructor refuses it and this suite cannot run at all",
+                )) as Arc<dyn DistributedLockBackend>;
+                ScenarioBackend::with_teardown(lock, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    ))
+    .await;
+}
+
+/// The CAS leader over this plugin's cache in `watch_mode: disabled` — the
+/// production degradation path (redis has no native leader, so the CAS default is
+/// the only way leader election is served on it) — reaches leadership at first use
+/// and holds it by renewing off the timer alone, against **real** redis.
+///
+/// A focused test rather than the full `run_leader_conformance`: that suite's
+/// `SC-LEAD-004` asserts a *reactive* property — a successor elected within
+/// `poll_watch`'s ~3s budget after a graceful `resign()`. A resign is an early
+/// release that writes nothing a watch would announce, so over a watchless cache a
+/// follower only re-checks on its own reclaim tick (`min(renewal_interval,
+/// incumbent_lapse)`, ~10s with the scenario's default 30s TTL), which the budget
+/// cannot cover. That promptness is watch-dependent and legitimately lost under the
+/// timer-only degradation — so it is not asserted here. The watchless-appropriate
+/// properties are: `elect()` must not fail at first use (the reported bug — before
+/// the fix `features()` claimed `watch: true` and the pre-claim subscribe took a
+/// terminal `Unsupported`), leadership is reached off the first `try_acquire`, and
+/// the claim is held by renewing off the timer. Successor-after-*lapse* (the timer
+/// path, not a resign) is covered by the `leader_tests` unit test. Durable fixture
+/// for the linearizable declaration the strict constructor requires.
+#[tokio::test]
+async fn cas_leader_over_a_watchless_cache_elects_and_holds() {
+    use std::time::Duration;
+
+    use cluster::defaults::CasBasedLeaderElectionBackend;
+    use cluster_sdk::LeaderElectionBackend;
+    use cluster_sdk::leader::{LeaderStatus, LeaderWatchEvent};
+    // A TTL short enough that the renewal timer (interval ≈ ttl/3) fires several
+    // times inside the hold window, so a broken renewal path would drop the claim
+    // and fail the assertion — but long enough to be robust against real-redis
+    // round-trip latency.
+    use cluster_sdk::ElectionConfig;
+
+    let (_container, base_config) = common::start_redis_durable().await;
+    let config = common::cluster_config_for_scenario(
+        &base_config.url,
+        "confleadernowatch",
+        0,
+        serde_json::json!({ "watch_mode": "disabled" }),
+    );
+    let handle = RedisClusterPlugin::builder(config)
+        .build_and_start()
+        .await
+        .expect("a fresh instance starts against the durable container");
+    let leader = CasBasedLeaderElectionBackend::new(handle.cache()).expect(
+        "the durable single-node fixture's cache must declare Linearizable, or the \
+         strict leader constructor refuses it",
+    );
+
+    let election = ElectionConfig::new(Duration::from_secs(2), 2).expect("a valid election config");
+    let mut watch = leader
+        .elect_with_config("primary", election)
+        .await
+        .expect("elect() must not fail at first use over a watchless cache");
+
+    // Reaches Leader off the first try_acquire (bounded so a regression fails fast
+    // rather than hanging CI).
+    let reach_leader = async {
+        while !watch.is_leader() {
+            if let LeaderWatchEvent::Closed(err) = watch.changed().await {
+                panic!("the watch closed before leadership: {err:?}");
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), reach_leader)
+        .await
+        .expect("a watchless CAS leader must reach Leader off its first try_acquire");
+    assert!(matches!(watch.status(), LeaderStatus::Leader));
+
+    // Held across a window LONGER than the 2s TTL by renewing off the timer alone.
+    // The window must exceed the TTL to actually exercise renewal: a shorter one
+    // would pass on the strength of the initial lease, whether or not any renewal
+    // ran. If renewal did nothing, the initial lease lapses at ~2s and the task
+    // emits `Lost` (before any re-claim could mask it), so observing **no** `Lost`
+    // across >2s proves at least one renewal wrote a fresh lease. A watchless cache
+    // serves no reactive feed, so timer-driven renewal is the whole claim.
+    let stays_leader = async {
+        loop {
+            match watch.changed().await {
+                LeaderWatchEvent::Status(LeaderStatus::Lost) => {
+                    panic!("leadership lapsed: timer-driven renewal is not sustaining the claim")
+                }
+                LeaderWatchEvent::Closed(err) => panic!("the watch closed while leading: {err:?}"),
+                _ => {}
+            }
+        }
+    };
+    // A stable leader's renewals emit no event, so this times out with no `Lost` —
+    // that timeout is the success path.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2500), stays_leader)
+            .await
+            .is_err(),
+        "no Lost event must fire across a window exceeding the TTL"
+    );
+    assert!(watch.is_leader());
+
+    drop(watch);
+    handle.stop().await;
 }

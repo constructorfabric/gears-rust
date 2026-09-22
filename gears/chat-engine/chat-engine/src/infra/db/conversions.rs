@@ -225,6 +225,8 @@ fn part_type_from_entity(t: &message_part_entity::MessagePartType) -> MessagePar
         message_part_entity::MessagePartType::Videos => MessagePartType::Videos,
         message_part_entity::MessagePartType::Links => MessagePartType::Links,
         message_part_entity::MessagePartType::Statuses => MessagePartType::Statuses,
+        message_part_entity::MessagePartType::ToolCall => MessagePartType::ToolCall,
+        message_part_entity::MessagePartType::ToolResult => MessagePartType::ToolResult,
     }
 }
 
@@ -237,6 +239,8 @@ pub fn part_type_to_entity(t: &MessagePartType) -> message_part_entity::MessageP
         MessagePartType::Videos => message_part_entity::MessagePartType::Videos,
         MessagePartType::Links => message_part_entity::MessagePartType::Links,
         MessagePartType::Statuses => message_part_entity::MessagePartType::Statuses,
+        MessagePartType::ToolCall => message_part_entity::MessagePartType::ToolCall,
+        MessagePartType::ToolResult => message_part_entity::MessagePartType::ToolResult,
     }
 }
 

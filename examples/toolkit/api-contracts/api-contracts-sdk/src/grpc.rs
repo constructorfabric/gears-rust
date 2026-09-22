@@ -53,6 +53,23 @@ pub trait PaymentApiGrpc: PaymentApi {
         ctx: SecurityContext,
         filter: ListPaymentsFilter,
     ) -> Result<PaymentSummary, CanonicalError>;
+
+    // The fallible open (`#[streaming] async fn`) projects onto gRPC with no
+    // extra ceremony — no framing selector, because gRPC's framing is fixed by
+    // the transport, and no opt-out, because gRPC expresses this shape
+    // natively: tonic's client call already returns
+    // `Result<Response<Streaming<T>>, Status>`, and its server trait method
+    // already returns `Result<Response<Self::Stream>, Status>`. The open and
+    // the messages are two phases on the wire; the generated client keeps them
+    // apart instead of flattening the open into the stream's first item.
+    #[rpc(name = "StreamPayments")]
+    #[idempotency_level(NoSideEffects)]
+    #[streaming(open = fallible)]
+    async fn stream_payments(
+        &self,
+        ctx: SecurityContext,
+        filter: ListPaymentsFilter,
+    ) -> Result<PaymentSummary, toolkit_canonical_errors::CanonicalError>;
 }
 
 // `From<Primitive> for stubs::*Request` impls for methods with a single

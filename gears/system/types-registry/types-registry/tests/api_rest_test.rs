@@ -644,29 +644,33 @@ async fn a_missing_idempotency_key_is_a_synchronous_refusal() {
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
 }
 
-/// Dry Run is part of the final P0 contract, but its rollback-only worker path
-/// lands at T20. Until then it must fail synchronously rather than leave a
-/// non-terminal operation behind.
+/// Dry Run is an ordinary accepted operation (T20): it gets a receipt and a
+/// terminal outcome like any other, and it leaves nothing readable behind.
 #[tokio::test]
-async fn a_dry_run_is_a_synchronous_refusal_until_t20() {
+async fn a_dry_run_is_accepted_and_writes_nothing() {
     let router = router_with_db().await;
     let mut body = one_candidate(CF_TYPE);
     body["dry_run"] = json!(true);
 
-    let refused = call(&router, submit(Some("dry-run-key"), &body)).await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-    let text = serde_json::to_string(&refused.body).expect("serialize");
-    assert!(
-        text.contains("dry_run"),
-        "the problem must name the unsupported field: {text}",
+    let accepted = call(&router, submit(Some("dry-run-key"), &body)).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::ACCEPTED,
+        "a dry run is accepted like any other request: {:?}",
+        accepted.body,
     );
     assert!(
-        refused.body.get("operation_id").is_none(),
-        "a synchronous refusal must not return an operation receipt",
+        accepted.body.get("operation_id").is_some(),
+        "and it is owed the receipt it asked for: {:?}",
+        accepted.body,
     );
 
     let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
-    assert_eq!(entity.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        entity.status,
+        StatusCode::NOT_FOUND,
+        "nothing a dry run evaluated is readable afterwards",
+    );
 }
 
 /// A header that was sent but cannot be decoded is told apart from one that was not

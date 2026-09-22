@@ -101,7 +101,7 @@ pub async fn refresh_dependents(
         });
     }
 
-    let mut store = load_unit_store(stores, tx, scope, documents)
+    let mut store = load_unit_store(stores, tx, scope, documents, &[])
         .await
         .map_err(WorkerError::StoreBuild)?;
 

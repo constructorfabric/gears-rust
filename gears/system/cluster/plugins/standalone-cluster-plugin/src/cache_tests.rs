@@ -12,7 +12,7 @@ use super::StandaloneCache;
 async fn put_get_and_versioning() {
     let cache = StandaloneCache::new();
     assert_eq!(cache.consistency(), CacheConsistency::Linearizable);
-    assert!(cache.features().prefix_watch);
+    assert!(cache.features().prefix_watch());
 
     let Ok(Some(created)) = cache
         .put_if_absent(PutRequest {

@@ -255,6 +255,122 @@ async fn http_list_payments_sse() {
     assert_eq!(eur_items[0].currency, "EUR");
 }
 
+// --- multipart/mixed feed, fallible open (#4734) ---
+//
+// The same items as `http_list_payments_sse` above, over the second framing and
+// the second open shape, end to end: a `#[streaming(multipart_mixed)] async fn`
+// contract method, its macro-generated client, the toolkit's multipart framer
+// on the server, and a real HTTP hop between them. Nothing here is written by
+// hand except the route registration.
+
+#[tokio::test]
+async fn http_payment_feed_multipart_round_trip() {
+    let (base_url, _svc) = start_test_server().await;
+    let client = http_client(&base_url);
+
+    for (amount, currency, desc) in [
+        (500, "USD", "usd1"),
+        (600, "USD", "usd2"),
+        (300, "EUR", "eur1"),
+    ] {
+        PaymentApi::charge(
+            &client,
+            test_ctx(),
+            ChargeRequest::new(amount, currency, desc),
+        )
+        .await
+        .unwrap();
+    }
+
+    // The open is awaited and returns `Result<Stream, _>`: by the time this
+    // `?` succeeds, the connect, the status check and the multipart boundary
+    // lookup have all happened.
+    let stream = PaymentApi::stream_payments(&client, test_ctx(), ListPaymentsFilter::default())
+        .await
+        .expect("the feed must open");
+    let items: Vec<_> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("no error item, and no manufactured missing-terminator error");
+    assert_eq!(items.len(), 3);
+
+    let eur = PaymentApi::stream_payments(
+        &client,
+        test_ctx(),
+        ListPaymentsFilter::new(None, Some("EUR".to_owned())),
+    )
+    .await
+    .expect("the feed must open")
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    assert_eq!(eur.len(), 1);
+    assert_eq!(eur[0].currency, "EUR");
+}
+
+/// The point of the fallible open: a filter the server rejects is an `Err` from
+/// the *call*, carrying a real domain error, and no stream is produced.
+///
+/// The SSE sibling cannot express this — `list_payments` hands back a stream
+/// synchronously, so the same failure could only arrive as that stream's first
+/// item, after the caller already believes it holds a live subscription.
+#[tokio::test]
+async fn http_payment_feed_open_failure_is_not_a_stream_item() {
+    let (base_url, _svc) = start_test_server().await;
+    let client = http_client(&base_url);
+
+    let err = PaymentApi::stream_payments(
+        &client,
+        test_ctx(),
+        ListPaymentsFilter::new(None, Some("dollars".to_owned())),
+    )
+    .await
+    .map(|_| ())
+    .expect_err("an unacceptable filter must fail the open, not the stream");
+
+    assert!(
+        matches!(err, CanonicalError::InvalidArgument { .. }),
+        "the open must surface the server's rejected-filter error as an \
+         InvalidArgument, got {err:?}"
+    );
+}
+
+/// **The open failure's canonical category survives the HTTP round-trip.**
+///
+/// The `PaymentStatus::Failed` filter stands in for event-broker's
+/// `409 PositionsNotSet`: a feed over partitions with no committed position
+/// can't be opened. The domain reports it as a `FailedPrecondition`
+/// `CanonicalError` (each unseeded partition a precondition violation), and the
+/// client reconstructs that category from the `application/problem+json` body.
+///
+/// A richer *typed* payload — so a consumer could branch on exactly which
+/// partitions to seed — is deferred to a future canonical-error-macro change;
+/// for now the category is what round-trips (#4734).
+#[tokio::test]
+async fn http_payment_feed_open_failure_carries_the_canonical_category() {
+    let (base_url, _svc) = start_test_server().await;
+    let client = http_client(&base_url);
+
+    let err = PaymentApi::stream_payments(
+        &client,
+        test_ctx(),
+        ListPaymentsFilter::new(Some(PaymentStatus::Failed), None),
+    )
+    .await
+    .map(|_| ())
+    .expect_err("unseeded positions must fail the open");
+
+    assert!(
+        matches!(err, CanonicalError::FailedPrecondition { .. }),
+        "the open failure must arrive as a FailedPrecondition, not degrade to \
+         Internal, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn client_hub_resolves_http_client() {
     let (base_url, _svc) = start_test_server().await;

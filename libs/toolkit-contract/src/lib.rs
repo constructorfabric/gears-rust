@@ -23,8 +23,8 @@ pub use grpc_repr::{
 pub use ir::{
     ContractIr, FieldIr, FieldRole, GrpcBindingIr, GrpcIdempotency, GrpcMethodBindingIr,
     HttpBindingIr, HttpFieldBinding, HttpMethod, HttpMethodBindingIr, Idempotency, InputShape,
-    MethodIr, MethodKind, PrimitiveType, ServiceIr, TypeRef, ValidationError, validate_contract,
-    validate_grpc_binding, validate_http_binding,
+    MethodIr, MethodKind, PrimitiveType, ServiceIr, StreamFraming, TypeRef, ValidationError,
+    validate_contract, validate_grpc_binding, validate_http_binding,
 };
 pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use query::{QueryParamSpec, QueryParams, QueryScalar};

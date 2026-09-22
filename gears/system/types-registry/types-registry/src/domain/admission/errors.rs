@@ -24,6 +24,16 @@ pub enum WorkerError {
     OperationNotFound { operation_id: Uuid },
     #[error("operation item {item_id} carries no request payload")]
     MissingPayload { item_id: i64 },
+    /// The dry-run overlay has no terminal item write after a successful admission.
+    #[error("the commit path for operation item {item_id} recorded no terminal item write")]
+    MissingItemWrite { item_id: i64 },
+    /// The dry-run pass left a prediction slot unfilled.
+    ///
+    /// `order_batch` partitions a batch into the ordered and the cyclic, so every
+    /// position is written exactly once. Reaching this means the partition no
+    /// longer holds, which is a worker bug rather than anything about the request.
+    #[error("the dry-run pass left operation item {item_id} without a prediction")]
+    MissingPrediction { item_id: i64 },
     /// Not a fault, and never reaches a caller: the worker catches it and reports
     /// the outcome the other pass recorded. It exists as an error because rolling
     /// the commit transaction back is the only way to *not* write an entity behind
@@ -57,6 +67,21 @@ pub enum WorkerError {
     /// projection is missing behind an entity that is still there.
     #[error("entity '{gts_id}' (id {entity_id}) vanished mid-transaction")]
     EntityVanished { gts_id: String, entity_id: i64 },
+    /// A stored `gts_id` no longer parses despite acceptance-time canonicalization.
+    /// Report corruption: deriving the required Registry Reference is impossible.
+    #[error("operation item {item_id} holds an unparsable stored identifier '{gts_id}': {reason}")]
+    StoredIdentifierUnparsable {
+        item_id: i64,
+        gts_id: String,
+        reason: String,
+    },
+    /// Invalid JSON in a stored baseline indicates corruption, not a candidate refusal.
+    #[error("the stored baseline document for '{gts_id}' is not valid JSON: {source}")]
+    BaselineUnparsable {
+        gts_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
     /// A resolved edge target disappeared before commit.
     #[error("dependency target '{gts_id}' vanished before its edge was committed")]
     DependencyTargetAbsent { gts_id: String },

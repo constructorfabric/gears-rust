@@ -33,7 +33,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-fmt-stable-1.95
+          shared-key: pr-fmt-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: cargo fmt (check)
         run: make fmt

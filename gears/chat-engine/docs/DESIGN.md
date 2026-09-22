@@ -1,5 +1,5 @@
 Created:  2026-03-06 by Constructor Tech
-Updated:  2026-06-23 by Constructor Tech
+Updated:  2026-09-15 by Constructor Tech
 # Technical Design: Chat Engine
 
 
@@ -76,7 +76,7 @@ The system supports both **linear conversations** (traditional chat) and **non-l
 | `cpt-cf-chat-engine-fr-session-summary` | Routes `session.summary` event to dedicated summarization service URL or backend plugin based on session type config |
 | `cpt-cf-chat-engine-fr-search-session` | Full-text search over `message_parts` (text parts) joined to messages, filtered by session_id; returns matches with context window |
 | `cpt-cf-chat-engine-fr-search-sessions` | Full-text search over `message_parts` (text parts) joined with messages + sessions; ranks by relevance, returns session metadata |
-| `cpt-cf-chat-engine-fr-message-parts` | Messages persist an ordered list of typed `message_parts` rows (text/code/images/videos/links/statuses); the send/get APIs and plugin responses exchange `parts` arrays |
+| `cpt-cf-chat-engine-fr-message-parts` | Messages persist an ordered list of typed `message_parts` rows (text/code/images/videos/links/statuses/tool_call/tool_result); the send/get APIs and plugin responses exchange `parts` arrays |
 | `cpt-cf-chat-engine-fr-citations` | Plugin-supplied file/link citations and URL references attach to a `text` part (child tables, CASCADE); engine forwards `text_positions`/anchors verbatim and surfaces them on read |
 | `cpt-cf-chat-engine-fr-delete-session` | Sends `session.deleted` event to backend plugin, then soft-deletes session and messages in database |
 | `cpt-cf-chat-engine-fr-conversation-memory` | Message history forwarded to backend plugin with configurable depth; visibility flags (`is_hidden_from_backend`) enable context management strategies |
@@ -425,7 +425,7 @@ Session entity (session_id, tenant_id, user_id, client_id?, session_type_id?, en
 
 Message entity (message_id, session_id, tenant_id?, user_id?, parent_message_id?, role, parts, file_ids, variant_index, is_active, is_complete, is_hidden_from_user, is_hidden_from_backend, metadata, created_at, updated_at).
 
-The message body is no longer a single `content` blob. A message **owns an ordered list of `MessagePart` rows** (`parts`), each a typed fragment (`text`, `code`, `images`, `videos`, `links`, `statuses`) — see `cpt-cf-chat-engine-design-entity-message-part`. The former `content` field/column is removed; on read the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. This follows a parts-based message model and enables per-part typing, text-only full-text search, and (future) per-part citations.
+The message body is no longer a single `content` blob. A message **owns an ordered list of `MessagePart` rows** (`parts`), each a typed fragment (`text`, `code`, `images`, `videos`, `links`, `statuses`, `tool_call`, `tool_result`) — see `cpt-cf-chat-engine-design-entity-message-part`. The former `content` field/column is removed; on read the SDK `Message` carries `parts: Vec<MessagePart>` ordered by `number`. This follows a parts-based message model and enables per-part typing, text-only full-text search, and (future) per-part citations.
 
 Serde deserialization defaults (defined in the SDK on `chat-engine-sdk::models::Message`): `variant_index = 0`, `is_active = false`, `is_complete = true` (note: defaults to **true**, not false, so payloads that omit it represent fully-persisted messages), `is_hidden_from_user = false`, `is_hidden_from_backend = false`, `file_ids = []`, `parts = []`, `tenant_id = None`, `user_id = None`. `parent_message_id` is `None` only for the root message of a session.
 
@@ -471,7 +471,7 @@ Fields: `id` (UUID PK), `message_id` (UUID FK → messages, CASCADE), `type` (`M
 - **Immutability**: like the message tree, persisted parts are append-mostly; the streaming text part is filled in as chunks arrive, then frozen on completion.
 - **Input vs persisted**: `MessagePartInput {type, content}` is the wire/plugin shape (no `id`/`number`); Chat Engine assigns `id` and `number` on persist and returns the full `MessagePart`.
 
-**MessagePartType** — Enum: `text`, `code`, `images`, `videos`, `links`, `statuses`. The set is extensible by plugin vendors via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`); `audio` / `document` / `table` are out of initial scope (§5).
+**MessagePartType** — Enum: `text`, `code`, `images`, `videos`, `links`, `statuses`, `tool_call`, `tool_result`. The set is **closed**: the REST layer rejects an unknown `type` with 400 and the persisted enum cannot hold one, so a new discriminant means a code change, not a configuration one. Vendor-defined discriminants via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) remain **unimplemented** — no registration, validation, or forwarding path exists — so vendor extension happens inside `content` today; `audio` / `document` / `table` are out of initial scope (§5).
 
 **Per-type `content` shapes** (validated structurally by Chat Engine, semantics owned by plugins):
 - **text** — `{ text: string, title?: string }`
@@ -480,6 +480,8 @@ Fields: `id` (UUID PK), `message_id` (UUID FK → messages, CASCADE), `type` (`M
 - **videos** — `{ videos: [{ video_id: uuid, mime_type?: string, format?: string, thumbnail_url?: string, width?: int, height?: int }] }`
 - **links** — `{ links: [{ url: string, title?: string, description?: string, icon?: string, source?: string }] }`
 - **statuses** — `{ statuses: [{ code: string, detail?: string }] }`
+- **tool_call** — `{ tool_call_id: string, name: string, arguments: object, title?: string }` — one invocation the backend decided to make. `arguments` is the plugin-defined call payload; a turn that calls several tools emits several `tool_call` parts, one each, so `number` order preserves the call order
+- **tool_result** — `{ tool_call_id: string, name?: string, result: json, is_error?: boolean }` — the outcome of the `tool_call` part carrying the same `tool_call_id`. `result` is the tool's payload (any JSON); `is_error: true` marks a failed invocation whose `result` carries the error instead. Pairing is by `tool_call_id`, so a result may sit in a later message than its call
 
 A `text` part may additionally own **citations and references** (`cpt-cf-chat-engine-design-entity-file-citation`, `-link-citation`, `-link-reference`) anchoring spans of its text to sources. They are carried on the part's wire shape as optional `file_citations`, `link_citations`, `references` arrays and persisted into their own child tables.
 
@@ -572,7 +574,8 @@ Common Types:
 - Message → Usage: optional in metadata
 - SessionType → SummarizationSettings: optional config
 - MessagePart → MessagePartType: has type enum
-- MessagePart content ← text, code, images, videos, links, statuses: polymorphic by `type`
+- MessagePart content ← text, code, images, videos, links, statuses, tool_call, tool_result: polymorphic by `type`
+- MessagePart (tool_result) → MessagePart (tool_call): pairs via `content.tool_call_id` (not a DB foreign key; the pair may span messages)
 - MessagePart → FileCitation / LinkCitation / LinkReference: a `text` part owns zero or more of each (via message_part_id, CASCADE delete)
 - FileCitation → TextPositionAnchor: contains a parallel array of anchors
 - MessageReaction → Message: references via message_id
@@ -1510,7 +1513,7 @@ sequenceDiagram
 | message_id | UUID FK | References messages (CASCADE DELETE) |
 | owner_tenant_id | UUID NOT NULL | Session owner tenant, copied from parent at insert (defense-in-depth tenant scoping); added by `cpt-cf-chat-engine-dbtable-authz-owner-columns`. No per-part PDP call |
 | owner_id | UUID NOT NULL | Session owner user, copied from parent at insert; added by the same migration |
-| type | VARCHAR | `text` / `code` / `images` / `videos` / `links` / `statuses` |
+| type | VARCHAR | `text` / `code` / `images` / `videos` / `links` / `statuses` / `tool_call` / `tool_result` |
 | content | JSONB | Typed payload; shape determined by `type` (see `cpt-cf-chat-engine-design-entity-message-part`) |
 | number | INT | 0-based ordinal of the part within the message |
 
@@ -2017,7 +2020,7 @@ Aspects acknowledged and intentionally excluded from this DESIGN.
 | **Redis stream buffer** | Redis-backed resume buffer (`XADD`/`XREAD`) | The default resume buffer is the DB table (`cpt-cf-chat-engine-dbtable-stream-events`), keeping the gear within `cpt-cf-chat-engine-constraint-single-database`. Redis Streams is an optional, config-gated backend that relaxes that constraint; not enabled by default |
 | **Durable stream replay** | Long-term replay of historical streams | The event buffer is short-TTL (live-reconnect window only); historical reads use the persisted message (`GET /messages/{id}`), not the stream |
 | **Citation position computation** | Engine-side scanning of part text to compute `[N]` marker offsets | `text_positions` / anchors are forwarded verbatim from the plugin (`cpt-cf-chat-engine-principle-zero-business-logic`); the engine never parses message text to derive citation positions |
-| **Extra part types** | `audio`, `document`, `table` part types | Out of initial scope; the `MessagePartType` set starts at text/code/images/videos/links/statuses and is extensible via GTS (`cpt-cf-chat-engine-fr-schema-extensibility`) |
+| **Extra part types** | `audio`, `document`, `table` part types, and vendor-defined discriminants via GTS | Out of initial scope; the `MessagePartType` set is closed at text/code/images/videos/links/statuses/tool_call/tool_result. GTS-based vendor discriminants (`cpt-cf-chat-engine-fr-schema-extensibility`) are not implemented; adding a type is a code change until they are |
 | **Accessibility** | UI/UX accessibility requirements | Backend service; client application responsibility |
 | **Internationalization** | Multi-language UI, locale handling | Not applicable; message content is opaque to Chat Engine |
 | **Rate Limiting** | Throttling algorithms, quota management | Handled at API gateway layer upstream of Chat Engine |

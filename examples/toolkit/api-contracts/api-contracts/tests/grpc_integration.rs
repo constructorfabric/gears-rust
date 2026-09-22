@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use api_contracts_sdk::contract::PaymentApi;
 use api_contracts_sdk::grpc::PaymentApiGrpcClient;
-use api_contracts_sdk::models::{ChargeRequest, ListPaymentsFilter};
+use api_contracts_sdk::models::{ChargeRequest, ListPaymentsFilter, PaymentStatus};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -145,6 +145,104 @@ async fn grpc_list_payments_streams_three() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(items.len(), 3);
+}
+
+/// The fallible open over gRPC (#4734, amending Q1). Same items as
+/// `grpc_list_payments_streams_three` above, reached through
+/// `#[streaming] async fn` instead of `#[streaming] fn`.
+#[tokio::test]
+async fn grpc_stream_payments_awaited_open_streams_three() {
+    let (_domain, addr, _shutdown) = start_server().await;
+    let client = PaymentApiGrpcClient::connect(client_for(addr))
+        .await
+        .unwrap();
+
+    for amount in [100i64, 200, 300] {
+        PaymentApi::charge(
+            &client,
+            anonymous_ctx(),
+            ChargeRequest::new(amount, "USD", "test"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stream =
+        PaymentApi::stream_payments(&client, anonymous_ctx(), ListPaymentsFilter::default())
+            .await
+            .expect("the open must succeed");
+    let items: Vec<_> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(items.len(), 3);
+}
+
+/// The whole point of the shape, over gRPC: a `Status` the server returns
+/// *before its first message* is an `Err` from the awaited call, and no stream
+/// is produced.
+///
+/// This is what `#[streaming] fn` cannot express. Its generated body buries the
+/// same `client.rpc(req).await` inside an `async_stream`, so the identical
+/// server-side rejection would arrive as the stream's first item — after the
+/// caller already holds a stream it believes is live. Nothing about the wire
+/// changes between the two; only where the failure surfaces.
+#[tokio::test]
+async fn grpc_stream_payments_open_failure_is_not_a_stream_item() {
+    let (_domain, addr, _shutdown) = start_server().await;
+    let client = PaymentApiGrpcClient::connect(client_for(addr))
+        .await
+        .unwrap();
+
+    let err = PaymentApi::stream_payments(
+        &client,
+        anonymous_ctx(),
+        ListPaymentsFilter::new(None, Some("dollars".to_owned())),
+    )
+    .await
+    .map(|_| ())
+    .expect_err("an unacceptable filter must fail the open, not the stream");
+
+    assert!(
+        matches!(err, CanonicalError::InvalidArgument { .. }),
+        "the open must carry the server's rejected-filter error as an \
+         InvalidArgument, got {err:?}"
+    );
+}
+
+/// **The open failure's canonical category survives over gRPC**, which is the
+/// half that could plausibly have differed: HTTP carries the RFC 9457 envelope
+/// as the response *body*, while gRPC carries it as the `x-toolkit-problem-bin`
+/// trailer on a `Status`.
+///
+/// It does not differ: `map_tonic_status` decodes that trailer into the *same*
+/// `CanonicalError` the REST leg reconstructs from the body, so a
+/// `FailedPrecondition` open failure arrives as `FailedPrecondition` on both
+/// transports rather than degrading to `Internal`. (A richer typed payload is
+/// deferred to a future canonical-error-macro change — #4734.)
+#[tokio::test]
+async fn grpc_stream_payments_open_failure_carries_the_canonical_category() {
+    let (_domain, addr, _shutdown) = start_server().await;
+    let client = PaymentApiGrpcClient::connect(client_for(addr))
+        .await
+        .unwrap();
+
+    let err = PaymentApi::stream_payments(
+        &client,
+        anonymous_ctx(),
+        ListPaymentsFilter::new(Some(PaymentStatus::Failed), None),
+    )
+    .await
+    .map(|_| ())
+    .expect_err("unseeded positions must fail the open");
+
+    assert!(
+        matches!(err, CanonicalError::FailedPrecondition { .. }),
+        "the open failure must arrive as a FailedPrecondition over the gRPC \
+         trailer, not degrade to Internal, got {err:?}"
+    );
 }
 
 #[tokio::test]

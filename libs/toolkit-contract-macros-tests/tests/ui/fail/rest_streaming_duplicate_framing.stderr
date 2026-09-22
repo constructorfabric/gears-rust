@@ -1,0 +1,5 @@
+error: duplicate framing selector
+  --> tests/ui/fail/rest_streaming_duplicate_framing.rs:16:22
+   |
+16 |     #[streaming(sse, multipart_mixed)]
+   |                      ^^^^^^^^^^^^^^^

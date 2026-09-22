@@ -8,6 +8,16 @@
 # Paths where direct sha2/sha1/md5 imports are permitted (substring-matched).
 hasher_allowed_paths = [
     "gears/file-storage/file-storage/src/infra/content/hash.rs",
+    # TokenKey digests the bearer credential to key the internal-auth cache.
+    # Unlike the FNV-1a fingerprints elsewhere (cache-busting only, backed by
+    # a real re-validation on miss), a cache hit here returns a principal with
+    # no further check -- a collision would let one token answer for another,
+    # so it needs an actual cryptographic digest, not a fast hash.
+    "libs/toolkit-security/src/internal_auth_cache.rs",
+    # SHA-256 as an injective object-name mapping only (DESIGN.md 2.2): derives a
+    # stable, DNS-safe Lease/CRD object name from a coordination name. Not a
+    # security or integrity hash — no FIPS boundary — so RustCrypto sha2 is fine.
+    "gears/system/cluster/plugins/k8s-cluster-plugin/src/naming.rs",
 ]
 
 # DE1101: Tests must be in separate files.
