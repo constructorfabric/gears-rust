@@ -174,12 +174,20 @@ type-revision history.
   `a_filtered_vector_search_under_returns_without_iterative_scan` demonstrates
   the collapse and the fix against a live server.
 - *The `remote` embedding provider has no per-tenant egress policy in front of
-  it* (ADR-0004 asks for one); it is off by default and sends every tenant's
-  node and query text to the one configured endpoint when selected. It also
-  builds its own HTTP client rather than going through the `oagw` gear, so the
-  centralized egress policy, credential injection and audit trail that gear
-  provides are not in this path. Routing it through `oagw` is the intended
-  remediation and the natural place to put the per-tenant policy; it is not
-  done here because the plugin is a reference implementation of the provider
-  port, and which gear owns egress is a platform decision rather than this
-  gear's.
+  it.* ADR-0004 requires one; it is not implemented. The provider sends every
+  tenant's node and query text to the one configured endpoint, and builds its
+  own HTTP client rather than going through the `oagw` gear, so that gear's
+  centralized egress policy, credential injection from `credstore`, rate
+  limiting and audit trail are not in this path. Tracked as
+  [#4877](https://github.com/constructorfabric/gears-rust/issues/4877);
+  `mini-chat`'s OpenAI provider routes through `ServiceGatewayClientV1` and is
+  the reference for the fix.
+
+  **This limitation is reachable only by a deployment that opts in.** `remote`
+  is a Cargo feature that is off by default: a binary built without
+  `--features remote` does not link the plugin at all, and naming `remote` in
+  such a build fails at boot with a message saying so rather than falling back
+  to another provider. A deployment built with `onnx` alone therefore has no
+  external embedding egress path, and #4877 neither applies to it nor blocks
+  it. Shipping `onnx`-only is the supported way to run this gear before #4877
+  lands.
