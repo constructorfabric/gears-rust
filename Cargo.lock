@@ -2480,7 +2480,7 @@ dependencies = [
  "hex",
  "http",
  "hyper-util",
- "infer",
+ "infer 0.22.0",
  "inventory",
  "opentelemetry",
  "quick-xml 0.42.0",
@@ -6650,6 +6650,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
+dependencies = [
+ "cfb 0.14.0",
+]
+
+[[package]]
 name = "inlinable_string"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7002,7 +7011,7 @@ dependencies = [
  "html-to-markdown-rs",
  "image",
  "indexmap 2.14.0",
- "infer",
+ "infer 0.19.0",
  "jotdown",
  "kreuzberg-pdfium-render",
  "libc",
