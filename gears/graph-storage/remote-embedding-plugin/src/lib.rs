@@ -297,6 +297,7 @@ impl EmbeddingProviderV1 for RemoteEmbeddingProvider {
         )
         .await
         .map(drop)
+        .map_err(|refusal| refusal.error)
     }
 }
 
@@ -327,19 +328,20 @@ impl RemoteEmbeddingProvider {
                 () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
                 result = call => result,
             };
-            let error = match outcome {
+            let refusal = match outcome {
                 Ok(vectors) => return Ok(vectors),
-                Err(error) => error,
+                Err(refusal) => refusal,
             };
             // A credential the endpoint refuses, a malformed answer or a
             // width that does not match are not going to be different next
-            // time; a deadline is the caller's, not the endpoint's.
-            if attempt == self.config.max_retries || !is_transient(&error) {
-                return Err(error);
+            // time; a deadline is the caller's, not the endpoint's. Each said
+            // so at the point it was classified.
+            if attempt == self.config.max_retries || !refusal.retryable {
+                return Err(refusal.error);
             }
             let wait = backoff.min(req.budget.remaining());
             if wait.is_zero() {
-                return Err(error);
+                return Err(refusal.error);
             }
             warn!(
                 endpoint = %endpoint_name(&self.endpoint),
@@ -366,7 +368,7 @@ impl RemoteEmbeddingProvider {
         &self,
         inputs: &[String],
         timeout: Duration,
-    ) -> Result<Vec<Vec<f32>>, EmbeddingProviderError> {
+    ) -> Result<Vec<Vec<f32>>, Refusal> {
         let body = EmbeddingsRequest {
             model: self.config.model.trim(),
             input: inputs
@@ -396,11 +398,12 @@ impl RemoteEmbeddingProvider {
 
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
-                EmbeddingProviderError::Deadline
+                // The caller's deadline, not the endpoint's refusal.
+                Refusal::permanent(EmbeddingProviderError::Deadline)
             } else {
-                EmbeddingProviderError::Unavailable {
+                Refusal::transient(EmbeddingProviderError::Unavailable {
                     reason: format!("{}: {error}", endpoint_name(&self.endpoint)),
-                }
+                })
             }
         })?;
 
@@ -420,9 +423,12 @@ impl RemoteEmbeddingProvider {
         }
 
         let parsed: EmbeddingsResponse = response.json().await.map_err(|error| {
-            EmbeddingProviderError::Internal(format!("unparseable embeddings response: {error}"))
+            Refusal::permanent(EmbeddingProviderError::Internal(format!(
+                "unparseable embeddings response: {error}"
+            )))
         })?;
         self.align(inputs.len(), parsed.data)
+            .map_err(Refusal::permanent)
     }
 
     /// Place each returned vector at its declared index, and refuse a
@@ -481,30 +487,59 @@ impl RemoteEmbeddingProvider {
     }
 }
 
-/// A credential problem and a capacity problem are both "not now, and not
-/// because of the input": the caller cannot repair either by changing the
-/// batch, and neither says anything about the space.
-/// Whether another attempt could plausibly answer differently.
+/// A refusal, plus the one thing the port's error type cannot carry: whether
+/// another identical request could answer differently.
 ///
-/// `Unavailable` is the endpoint saying "not now" — a rate limit, a gateway,
-/// a connection that did not open. Everything else is either the caller's
-/// (a deadline, a cancellation) or a disagreement no repetition resolves (a
-/// refused credential is reported as unavailable by this provider, and is the
-/// one case a retry cannot fix — but retrying it a couple of times costs two
-/// requests and keeps the classification simple, which is the trade taken).
-fn is_transient(error: &EmbeddingProviderError) -> bool {
-    matches!(error, EmbeddingProviderError::Unavailable { .. })
+/// The retry loop used to re-derive that from the error variant, which cannot
+/// work. A refused credential and an overloaded endpoint are both `Unavailable`
+/// to the gear, and rightly so -- either way the vector arm is down and the
+/// caller can repair neither by changing the batch. The difference between
+/// them is only visible here, where the status code still exists, so it is
+/// decided here and carried rather than guessed at later.
+struct Refusal {
+    error: EmbeddingProviderError,
+    retryable: bool,
 }
 
-fn classify_status(status: reqwest::StatusCode) -> EmbeddingProviderError {
+impl Refusal {
+    /// Another attempt could answer differently: a rate limit, a gateway
+    /// error, a connection that did not open.
+    const fn transient(error: EmbeddingProviderError) -> Self {
+        Self {
+            error,
+            retryable: true,
+        }
+    }
+
+    /// No repetition resolves this one (ADR-0004): a refused credential, a
+    /// malformed answer, a width that does not match -- or a deadline and a
+    /// cancellation, which are the caller's and not the endpoint's.
+    const fn permanent(error: EmbeddingProviderError) -> Self {
+        Self {
+            error,
+            retryable: false,
+        }
+    }
+}
+
+/// Map a refused status onto what the gear is told and whether to try again.
+///
+/// 401 and 403 stay `Unavailable`, because that is what they mean to the gear:
+/// the provider cannot serve, and the vector arm is down until an operator
+/// acts. They are not retried, because a credential the endpoint just refused
+/// will be refused again -- and a rotated key retried on every chunk of every
+/// batch is how a misconfiguration turns into provider-side rate limiting.
+fn classify_status(status: reqwest::StatusCode) -> Refusal {
     match status.as_u16() {
-        401 | 403 => EmbeddingProviderError::Unavailable {
+        401 | 403 => Refusal::permanent(EmbeddingProviderError::Unavailable {
             reason: format!("the endpoint refused the credential (HTTP {status})"),
-        },
-        408 | 429 | 500..=599 => EmbeddingProviderError::Unavailable {
+        }),
+        408 | 429 | 500..=599 => Refusal::transient(EmbeddingProviderError::Unavailable {
             reason: format!("HTTP {status}"),
-        },
-        _ => EmbeddingProviderError::Internal(format!("the endpoint answered HTTP {status}")),
+        }),
+        _ => Refusal::permanent(EmbeddingProviderError::Internal(format!(
+            "the endpoint answered HTTP {status}"
+        ))),
     }
 }
 
@@ -665,11 +700,15 @@ mod tests {
         assert_eq!(normalize(vec![0.0, 0.0]), vec![0.0, 0.0]);
     }
 
+    fn classify(code: u16) -> Refusal {
+        classify_status(reqwest::StatusCode::from_u16(code).unwrap_or_default())
+    }
+
     #[test]
     fn statuses_split_into_unavailable_and_internal() {
         let unavailable = |code: u16| {
             matches!(
-                classify_status(reqwest::StatusCode::from_u16(code).unwrap_or_default()),
+                classify(code).error,
                 EmbeddingProviderError::Unavailable { .. }
             )
         };
@@ -678,5 +717,42 @@ mod tests {
         assert!(unavailable(503));
         assert!(!unavailable(400));
         assert!(!unavailable(404));
+    }
+
+    /// ADR-0004: "A refused credential, a malformed answer or a width that
+    /// does not match are not retried, because no repetition resolves them."
+    /// A refused credential reads as `Unavailable` to the gear -- the vector
+    /// arm is down either way -- so the variant cannot carry this and the
+    /// classification has to.
+    #[test]
+    fn a_refused_credential_is_unavailable_but_not_retried() {
+        for code in [401, 403] {
+            let refusal = classify(code);
+            assert!(
+                matches!(refusal.error, EmbeddingProviderError::Unavailable { .. }),
+                "HTTP {code} is still an unavailable provider"
+            );
+            assert!(
+                !refusal.retryable,
+                "HTTP {code} must not be retried: the credential will be refused again, and \
+                 retrying every chunk of every batch is how a rotated key becomes a rate limit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_statuses_a_retry_can_fix_are_still_retried() {
+        for code in [408, 429, 500, 502, 503] {
+            assert!(
+                classify(code).retryable,
+                "HTTP {code} is the endpoint saying `not now`, which is what retrying is for"
+            );
+        }
+        for code in [400, 404, 422] {
+            assert!(
+                !classify(code).retryable,
+                "HTTP {code} is about the request, and repeating it repeats the request"
+            );
+        }
     }
 }

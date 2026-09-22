@@ -200,6 +200,22 @@ async fn a_refused_credential_is_unavailable_and_names_no_secret() {
     );
     assert!(rendered.contains("401"), "{rendered}");
     assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+
+    // ADR-0004: a refused credential is not retried, because no repetition
+    // resolves it. `max_retries` defaults to 2, so a loop that treated this
+    // like a rate limit would have sent three requests -- and would send three
+    // for every chunk of every batch for as long as the key stays wrong, which
+    // is how a rotated credential turns into provider-side rate limiting.
+    let sent = server
+        .received_requests()
+        .await
+        .expect("the mock server records what it was sent");
+    assert_eq!(
+        sent.len(),
+        1,
+        "a refused credential must cost exactly one request, not {}",
+        sent.len()
+    );
 }
 
 #[tokio::test]
