@@ -600,6 +600,63 @@ pg_case!(
     scope_replacement_removes_an_edge_whose_endpoints_remain,
     conformance::scope_replacement_removes_an_edge_whose_endpoints_remain
 );
+/// A catalogue scan that has read nothing refuses rather than answering
+/// "there is nothing".
+///
+/// The scan breaks out of its pass loop when the deadline is gone, so the
+/// page already gathered survives with the cursor that resumes it. Before the
+/// first pass there is no such page: breaking there would answer with an
+/// empty list and no cursor, which every client reads as the end of the
+/// catalogue -- the silent loss the break was introduced to avoid, in a
+/// different shape.
+///
+/// The other half of the branch, breaking *after* progress, resumes through
+/// the same `reached_overall` cursor the scan-cap exit uses, which
+/// `the_type_catalogue_pages_through_its_own_cursor` covers. Forcing the
+/// deadline to fall between two passes is a race, and a race asserts nothing
+/// on the run where it does not happen.
+#[tokio::test]
+async fn a_catalogue_scan_with_no_progress_refuses_rather_than_answering_empty() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let live = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&live, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // A budget that is already gone: the state every request reaches on its
+    // way out, and the only one a case can be in without measuring the clock.
+    let spent = graph_storage_sdk::plugin_api::StoreCtx {
+        budget: graph_storage_sdk::models::RemainingBudget::starting_now(std::time::Duration::ZERO),
+        ..conformance::ctx(tenant, &scope, None)
+    };
+    let refused = stand
+        .store
+        .list_types(&spent, graph_storage_sdk::models::TypeQuery::default())
+        .await
+        .expect_err("a scan that read nothing has nothing to hand back");
+    assert!(
+        matches!(
+            refused,
+            graph_storage_sdk::plugin_api::GraphStoreError::Deadline
+        ),
+        "expected a deadline refusal, got {refused:?}"
+    );
+
+    // And the ordinary path is untouched: a live budget still answers.
+    let page = stand
+        .store
+        .list_types(&live, graph_storage_sdk::models::TypeQuery::default())
+        .await
+        .expect("a live budget lists the catalogue");
+    assert!(!page.items.is_empty(), "the fixture is there to be listed");
+}
+
 pg_case!(
     an_edge_is_not_taken_from_the_scope_that_declared_it,
     conformance::an_edge_is_not_taken_from_the_scope_that_declared_it

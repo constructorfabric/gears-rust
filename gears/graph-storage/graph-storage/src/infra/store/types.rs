@@ -943,10 +943,18 @@ pub async fn list_types(
         // difference is the cursor. A catalogue page is already allowed to be
         // short and to carry a continuation, so stopping early is an answer
         // the caller can act on rather than a degraded one -- which a partial
-        // traversal is not, having nothing to resume from. Returning the
-        // error here instead would throw away the passes already paid for,
-        // which the comment this replaces claimed it did not.
+        // traversal is not, having nothing to resume from. Returning an error
+        // here instead would throw away the passes already paid for.
+        //
+        // Unless there are none. A break before the first pass answers with
+        // an empty page and no cursor, which reads as "the catalogue ends
+        // here" -- the same silent loss in a different shape. With nothing to
+        // hand back there is nothing to resume from either, so that is the
+        // refusal case.
         if ctx.budget.is_exhausted() {
+            if reached_overall.is_none() {
+                return Err(GraphStoreError::Deadline);
+            }
             break;
         }
         let mut select = gts_type::Entity::find()
@@ -1035,7 +1043,7 @@ pub async fn list_types(
 /// has. A pattern that matches nothing would otherwise walk the whole
 /// catalogue inside one request; the caller gets a short page and a cursor,
 /// which is the same contract as any other short page.
-const MAX_CATALOGUE_PASSES: usize = 16;
+pub const MAX_CATALOGUE_PASSES: usize = 16;
 
 pub async fn resolve_type_set(
     store: &PgGraphStore,

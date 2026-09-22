@@ -5269,10 +5269,6 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
     store: &dyn GraphStoreV1,
     ctx: &StoreCtx<'_>,
 ) {
-    /// What one request examines: `MAX_CATALOGUE_PASSES` passes of one row
-    /// each, which is the number the bound below is derived from.
-    const PASSES_PER_REQUEST: usize = 16;
-
     /// Sorts after every filler, so a walk of one row per request has to get
     /// past all of them to see it.
     const FAR: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.zz_far.v1~";
@@ -5361,7 +5357,10 @@ async fn a_match_beyond_the_scan_cap_is_still_reachable(
         .expect("the catalogue lists")
         .items
         .len();
-    let bound = total.div_ceil(PASSES_PER_REQUEST) + 1;
+    // The production constant, not a copy of its value: a second `16` here
+    // would let the two drift apart silently, which is the same mistake the
+    // derived bound was introduced to avoid one level up.
+    let bound = total.div_ceil(graph_storage::infra::store::types::MAX_CATALOGUE_PASSES) + 1;
     assert!(
         requests <= bound,
         "the cursor must advance by the whole examined slice: {requests} requests \

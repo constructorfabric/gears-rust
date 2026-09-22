@@ -482,6 +482,14 @@ async fn migrate_nodes(
                 .await
                 .map_err(map_scope_err)?;
             if written.rows_affected == 0 {
+                // Not covered by a case, and deliberately said so rather than
+                // left to be assumed. Reaching this needs a concurrent commit
+                // to land between the scan above and this write, both of
+                // which are inside one transaction -- there is no seam to
+                // hold it open at, and a test that raced for it would assert
+                // nothing on the runs where the timing did not happen. The
+                // predicate itself is the same shape as the ingest
+                // compare-and-set, which is covered.
                 return Err(GraphStoreError::Conflict {
                     reason: format!(
                         "node `{}` was written while this migration was reading it; \
