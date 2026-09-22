@@ -577,6 +577,15 @@ jobs:
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # The Codecov upload below asks for OIDC off pull requests, and an OIDC
+    # token needs `id-token: write` — the workflow default is `contents: read`
+    # alone, so without this the token request is denied. That upload also sets
+    # `fail_ci_if_error` on the same events, so the denial would fail the job
+    # after the tests and the coverage floor had both passed. The `coverage`
+    # job carries the same pair for the same reason.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
