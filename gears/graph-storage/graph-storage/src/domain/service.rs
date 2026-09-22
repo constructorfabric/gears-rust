@@ -413,6 +413,24 @@ impl GraphServices {
         namespace: &str,
         owner_principal: &str,
     ) -> Result<graph_storage_sdk::models::SourceNamespaceOwner, DomainError> {
+        // The registry is only useful because the owner it holds is the exact
+        // string a writer presents, and a writer's never carries surrounding
+        // whitespace or a control character. Storing one that does reports a
+        // successful transfer and leaves the namespace writable by nobody,
+        // until an administrator notices and transfers again. Refused here
+        // rather than trimmed: the administrator asked for a specific
+        // principal and is owed either that one or an error.
+        //
+        // Here rather than in a store, because every store answers the same
+        // registry contract and the fake one must refuse what PostgreSQL
+        // refuses.
+        if !crate::domain::ownership::is_canonical_principal(owner_principal) {
+            return Err(DomainError::InvalidQuery {
+                message: "the principal is compared to the writer's exactly, so it cannot \
+                          carry surrounding whitespace or control characters"
+                    .to_owned(),
+            });
+        }
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
             .await?;

@@ -539,6 +539,32 @@ async fn the_namespace_surface_lists_and_transfers() {
         .expect("the list answers");
     assert_eq!(listed.len(), 1, "the boundary is visible: {listed:?}");
     assert_eq!(listed[0].owner_principal, "other-gear");
+
+    // A principal is compared to the writer's exactly, and a writer's never
+    // carries surrounding whitespace or a control character. Accepting one
+    // would report a successful transfer and leave the namespace writable by
+    // nobody, so it is refused -- and the owner on record is untouched.
+    for stranded in ["other-gear ", " other-gear", "other-gear\n"] {
+        let error = harness
+            .services
+            .transfer_source_namespace(&ctx, "unclaimed", stranded)
+            .await
+            .expect_err("a principal no writer could equal is not a transfer");
+        assert!(
+            matches!(error, DomainError::InvalidQuery { .. }),
+            "{stranded:?} must be refused as invalid, got {error:?}"
+        );
+    }
+
+    let after = harness
+        .services
+        .list_source_namespaces(&ctx)
+        .await
+        .expect("the list answers");
+    assert_eq!(
+        after[0].owner_principal, "other-gear",
+        "a refused transfer leaves the owner where it was"
+    );
 }
 
 #[tokio::test]

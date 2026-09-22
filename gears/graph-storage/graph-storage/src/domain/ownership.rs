@@ -81,6 +81,29 @@ pub fn decide(current_owner: Option<&str>, writer: &str) -> Claim {
     }
 }
 
+/// Whether a principal is in the form the security context produces.
+///
+/// [`decide`] compares by exact equality, and the writer's side of that
+/// comparison always comes from `Subject::principal()`, which carries neither
+/// surrounding whitespace nor control characters. An owner that carries either
+/// therefore matches no writer that can ever exist: storing one does not
+/// transfer the namespace, it strands it, and every write from the intended
+/// producer is refused until an administrator notices and transfers again.
+///
+/// This reports rather than repairs. Trimming would store an owner the
+/// administrator did not ask for, and it would fix only half the shape anyway
+/// -- a principal's case is not ours to fold, because nothing says principals
+/// are compared case-insensitively, and folding it would be the same silent
+/// substitution in the other direction.
+///
+/// Emptiness is deliberately not checked here: a caller that wants to say
+/// "name someone" says it in its own words, and this answers a different
+/// question.
+#[must_use]
+pub fn is_canonical_principal(principal: &str) -> bool {
+    principal.trim() == principal && !principal.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +150,38 @@ mod tests {
         assert_eq!(decide(None, "producer-a"), Claim::Take);
         assert_eq!(decide(Some("producer-a"), "producer-a"), Claim::Allowed);
         assert_eq!(decide(Some("producer-a"), "producer-b"), Claim::Forbidden);
+    }
+
+    /// The shapes that read as a transfer but cannot be one. Each of these
+    /// stores an owner no writer can equal, so the namespace stops accepting
+    /// writes from the producer it was just handed to.
+    #[test]
+    fn a_principal_no_writer_could_equal_is_not_canonical() {
+        for principal in [
+            "mirror-gear ",
+            " mirror-gear",
+            "mirror-gear\n",
+            "mirror\tgear",
+            "mirror-gear\u{0}",
+        ] {
+            assert!(
+                !is_canonical_principal(principal),
+                "{principal:?} must not pass as a principal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shapes_a_security_context_produces_are_canonical() {
+        for principal in [
+            "mirror-gear",
+            "0191f0a4-1b2c-7def-8a90-0123456789ab",
+            "service:mirror-gear",
+        ] {
+            assert!(
+                is_canonical_principal(principal),
+                "{principal:?} must pass as a principal"
+            );
+        }
     }
 }
