@@ -35,14 +35,26 @@ the graph is re-embedded, and every other path keeps working.
 
 ## What the identity promises
 
-The space is named by *model at endpoint at width*. Two deployments pointing
-one model name at one host share a space; a different host or requested width
-does not. A vendor silently changing the weights behind a stable model name is
-not detectable from this side — ADR-0004 places that under model governance and
+The space is named by *model at endpoint at width*, **and by how the vectors
+are asked for and kept**: whether the request carries an explicit
+`dimensions` field (`embedding_remote_request_dimensions`) and whether the
+answer is L2-normalized both fold into the identity hash alongside the model,
+the transport and the width.
+
+So two deployments pointing one model name at one host share a space only if
+those settings match too — flipping either gives a different identity, and
+stored vectors under the old one stop ranking. That is the intended behaviour
+and the README used not to say it: a reader taking "model at endpoint at
+width" literally would expect a normalization change to be invisible, and
+would be surprised by a deployment that suddenly declares its space mismatched.
+
+A vendor silently changing the weights behind a stable model name is still not
+detectable from this side — ADR-0004 places that under model governance and
 treats remote embedding as governed data egress.
 
-Vectors are L2-normalized before storage, because the gear's index serves
-cosine similarity and not every compatible endpoint returns unit vectors.
+Vectors are L2-normalized before storage by default, because the gear's index
+serves cosine similarity and not every compatible endpoint returns unit
+vectors.
 
 ## Testing
 

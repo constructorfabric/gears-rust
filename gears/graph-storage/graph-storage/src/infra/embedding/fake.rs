@@ -126,11 +126,24 @@ impl EmbeddingProviderV1 for FakeEmbeddingProvider {
         if req.budget.is_exhausted() {
             return Err(EmbeddingProviderError::Deadline);
         }
-        let vectors = req
-            .inputs
-            .iter()
-            .map(|input| self.vector(input))
-            .collect::<Vec<_>>();
+        // And between items, because an item is this provider's unit of work:
+        // each one is a counter-mode hash chain as long as the configured
+        // dimension, so a large batch is real CPU time. Checking once at the
+        // top honours the contract for a batch of one and spends the whole of
+        // a batch of twenty thousand after the caller stopped waiting. The
+        // remote provider checks between chunks for the same reason; the ONNX
+        // one checks after the session lock, because its unit is the whole
+        // batch in a single inference.
+        let mut vectors = Vec::with_capacity(req.inputs.len());
+        for input in &req.inputs {
+            if req.cancel.is_cancelled() {
+                return Err(EmbeddingProviderError::Cancelled);
+            }
+            if req.budget.is_exhausted() {
+                return Err(EmbeddingProviderError::Deadline);
+            }
+            vectors.push(self.vector(input));
+        }
         Ok(EmbedResponse {
             vectors,
             space: self.space.clone(),
@@ -144,6 +157,36 @@ impl EmbeddingProviderV1 for FakeEmbeddingProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// A batch this provider is still working through is abandoned when the
+    /// caller's deadline passes, not finished and then thrown away.
+    ///
+    /// The check used to run once, at the top. That honours the contract for
+    /// a batch of one and spends the whole of a large one after the caller
+    /// stopped waiting -- each item is a counter-mode hash chain as long as
+    /// the configured dimension, so a batch of twenty thousand is real CPU
+    /// time, and this provider is what every service-level case embeds with.
+    ///
+    /// A millisecond is not a measurement of the machine: no machine finishes
+    /// twenty thousand of these chains inside one, and a provider that
+    /// checked only at the top would answer `Ok` on all of them.
+    #[tokio::test]
+    async fn a_batch_stops_when_the_budget_runs_out_partway() {
+        let provider = FakeEmbeddingProvider::new(384);
+        let answer = provider
+            .embed(EmbedRequest {
+                inputs: (0..20_000).map(|i| format!("input-{i}")).collect(),
+                budget: graph_storage_sdk::models::RemainingBudget::starting_now(
+                    std::time::Duration::from_millis(1),
+                ),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            })
+            .await;
+        assert!(
+            matches!(answer, Err(EmbeddingProviderError::Deadline)),
+            "a batch that outlives its deadline is abandoned, not finished"
+        );
+    }
     use super::*;
 
     fn vectors_of(provider: &FakeEmbeddingProvider, texts: &[&str]) -> Vec<Vec<f32>> {

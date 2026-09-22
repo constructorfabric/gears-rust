@@ -162,6 +162,16 @@ async fn assert_empty_batch<P: EmbeddingProviderV1 + ?Sized>(provider: &P) {
     );
 }
 
+/// What every provider can be held to: a call that is already over is
+/// refused before any work.
+///
+/// Deliberately not "cancellation is honoured mid-batch", which is not a
+/// clause this contract can make universal -- providers do not share a unit of
+/// work. The ONNX one turns a whole batch into a single inference and can
+/// only check around it; the remote one sends chunks and checks between them;
+/// the in-memory one hashes item by item and checks between those. Each
+/// boundary is asserted where it exists, in that provider's own tests, because
+/// only there is it known where the boundary is.
 async fn assert_budget_and_cancellation<P: EmbeddingProviderV1 + ?Sized>(provider: &P) {
     let exhausted = EmbedRequest {
         inputs: vec!["anything".to_owned()],
