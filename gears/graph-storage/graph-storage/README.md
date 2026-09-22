@@ -123,6 +123,10 @@ type-revision history.
   (`EdgeScanCap`), and the ceiling covers the whole hop -- a neighbourhood
   asking for degree-ordered retention reads its degrees out of what the
   incidence scan left, rather than out of a second allowance of the same size.
+- *Every error names the node resource*, including the ones the type surface
+  raises: `DomainError` does not carry which resource it is about, and one
+  conversion serves every operation. A consumer switching on `resource_type`
+  cannot tell a rejected type registration from a rejected ingest.
 - *Reason codes for `not_found`, `unimplemented`, `deadline_exceeded`,
   `cancelled`, `unavailable`, `data_loss` and `unknown` are not on the wire*:
   the platform's builders for those categories carry no reason slot.

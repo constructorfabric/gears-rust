@@ -8,6 +8,11 @@
 
 pub mod embedding;
 pub mod engine;
+/// The in-memory double, behind `test-support` so it never reaches a release
+/// artifact. It exists to make the conformance suite run against a second
+/// implementation -- a change only the built-in store can satisfy fails on it
+/// -- which is a test concern, not a shipped one.
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake_store;
 pub mod storage;
 pub mod store;

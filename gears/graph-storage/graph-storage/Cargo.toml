@@ -21,6 +21,12 @@ workspace = true
 [features]
 default = []
 integration = []
+# The in-memory `GraphStoreV1` / `GraphEngineV1` double. Consumed by this
+# crate's own tests and by the conformance suite in `tests/`, which sees the
+# crate as any other dependency would -- so `#[cfg(test)]` alone cannot reach
+# it and the module would otherwise compile into a release artifact, ~2,800
+# lines of test fixture reachable by anything with an edge on this crate.
+test-support = []
 # The in-process ONNX embedding provider (ADR-0004's default). Off by default:
 # it pulls in ONNX Runtime bindings, and a deployment that has not been given
 # model artifacts cannot use it anyway. Mirrors file-parser's `magika`.
@@ -71,6 +77,10 @@ toolkit-db = { workspace = true, features = ["pg", "pgq"] }
 toolkit-db-macros = { workspace = true }
 
 [dev-dependencies]
+# Re-imports this crate with `test-support` on, so the in-memory double is
+# available to `tests/`. Cargo unifies the lib-under-test edge with this one
+# into a single compilation, exactly as bss-pricing does for its own harness.
+graph-storage = { package = "cf-gears-graph-storage", path = ".", features = ["test-support"] }
 test-containers = { workspace = true }
 # The executable plugin contracts: every provider and store implementation
 # proves itself against the same assertions, wherever it lives.

@@ -2626,6 +2626,7 @@ dependencies = [
  "axum",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
+ "cf-gears-graph-storage",
  "cf-gears-graph-storage-onnx-embedding-plugin",
  "cf-gears-graph-storage-remote-embedding-plugin",
  "cf-gears-graph-storage-sdk",

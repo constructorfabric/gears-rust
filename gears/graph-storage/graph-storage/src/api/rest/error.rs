@@ -13,12 +13,16 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 use crate::domain::error::{DomainError, reasons};
 
 /// Errors attributable to a graph node as a resource.
+///
+/// Every answer this module builds uses it, including the ones raised by the
+/// type surface. A `GraphTypeError` was declared beside it and never used,
+/// which promised a distinction the conversion cannot make: `DomainError`
+/// does not carry which resource it is about, and one `From` impl serves every
+/// operation. Making the distinction real means threading the subject through
+/// the domain error, which is a deliberate change rather than a drive-by one;
+/// the unused declaration is gone so it does not read as already made.
 #[resource_error(gts_id!("cf.core.graph.node.v1~"))]
 pub struct GraphNodeError;
-
-/// Errors attributable to a registered ontology type.
-#[resource_error(gts_id!("cf.core.graph.type.v1~"))]
-pub struct GraphTypeError;
 
 /// The field name a per-item violation is reported under: which collection,
 /// which index, and the JSON pointer inside it.

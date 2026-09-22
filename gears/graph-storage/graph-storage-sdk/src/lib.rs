@@ -11,7 +11,7 @@
 //!
 //! Consumers obtain the client from `ClientHub`:
 //! ```ignore
-//! let client = hub.get::<dyn `GraphStorageClientV1`>()?;
+//! let client = hub.get::<dyn GraphStorageClientV1>()?;
 //! ```
 
 #![forbid(unsafe_code)]
