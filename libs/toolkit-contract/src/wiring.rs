@@ -162,6 +162,49 @@ pub enum ClientWiring {
     },
 }
 
+/// Consumer-side wiring for one dependency, read from
+/// `gears.<owner>.config.consumer_wiring.<dep>` by the runtime's proxy-wiring
+/// phase and applied to the directory-resolving REST client that
+/// `#[toolkit::consumes]` registers.
+///
+/// An object with an optional `endpoint` (omit to keep discovery) plus a
+/// flattened [`ClientTuning`]:
+///
+/// ```yaml
+/// consumer_wiring:
+///   api-contracts:
+///     timeout: "5s"
+///     max_concurrent_requests: 256
+///     # endpoint: "http://..."   # optional; omit to keep discovery
+/// ```
+///
+/// Unlike [`ClientWiring`] there is **no** `transport` tag: the consumer path is
+/// REST-only (`#[toolkit::consumes]` always wires a `<Contract>RestResolvingClient`;
+/// there is no gRPC resolving client), so every tuning knob applies and there is
+/// no gRPC disambiguation or `rest_only_knobs_set` warning to emit here.
+///
+/// Must be an object: a bare `<dep>: "http://host"` string (the old static-endpoint
+/// shape) is rejected at parse time — use the `endpoint` field instead.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ConsumerWiring {
+    /// Static-endpoint override (ADR-0004 dev/test escape hatch): when set, the
+    /// dep is wired to this fixed endpoint instead of being discovered.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// REST client tuning, flattened into the same map as `endpoint`.
+    #[serde(default, flatten)]
+    pub tuning: ClientTuning,
+}
+
+impl ConsumerWiring {
+    /// Split the wiring into its static-endpoint override (if any) and the
+    /// [`ClientTuning`] to apply.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<String>, ClientTuning) {
+        (self.endpoint, self.tuning)
+    }
+}
+
 #[cfg(feature = "runtime-client")]
 impl ClientTuning {
     /// Apply tuning overrides onto a fresh [`ClientConfig`] built from `endpoint`.

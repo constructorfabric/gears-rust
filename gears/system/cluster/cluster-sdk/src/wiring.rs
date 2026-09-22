@@ -69,6 +69,7 @@ use std::sync::Arc;
 use toolkit::client_hub::ClientHub;
 use toolkit::discovery::{ConsumerRegistration, EndpointResolver, WireOutcome};
 use toolkit_contract::runtime::config::InternalTokenProvider;
+use toolkit_contract::wiring::ClientTuning;
 
 use crate::client::ClusterClient;
 use crate::client::remote::RemoteClusterClient;
@@ -266,8 +267,15 @@ fn spawn_descriptor_prefetch(client: Arc<dyn ClusterClient>) {
 fn wire(
     hub: &ClientHub,
     _resolver: Arc<dyn EndpointResolver>,
-    internal_token_provider: Option<&InternalTokenProvider>,
+    tuning: ClientTuning,
 ) -> toolkit::Result<WireOutcome> {
+    // The signature is fixed by `toolkit::discovery::WireFn`, which hands over the
+    // whole prepared `ClientTuning` by value. Cluster's coordination plane is gRPC
+    // and reads none of the REST pool/concurrency knobs, so we take ownership of
+    // just the platform-plane credential source (moving it out of `tuning`, which
+    // is why the by-value parameter is genuinely consumed) and forward it to
+    // `RemoteClusterClient::connect_lazy`. `None` attaches nothing.
+    let internal_token_provider = tuning.internal_token_provider;
     // 1. Local wins, and `try_get_local` is the right probe: it ignores anything
     //    registered through `register_remote_proxy`, so a second consumer in this
     //    process cannot mistake the proxy *this* closure registered for a
@@ -285,7 +293,7 @@ fn wire(
     }
 
     // 2. Build and register the remote client. Pure - no I/O, nothing awaited.
-    let client = register_remote_client(hub, internal_token_provider)?;
+    let client = register_remote_client(hub, internal_token_provider.as_ref())?;
 
     // 3. Warm the descriptor cache in the background. Readiness only.
     spawn_descriptor_prefetch(client);

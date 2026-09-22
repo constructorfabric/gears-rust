@@ -99,7 +99,7 @@ inventory::submit! {
         dep_gear:   "billing",
         wire: |hub: &ClientHub,
                resolver: Arc<dyn EndpointResolver>,
-               internal_token_provider: Option<&InternalTokenProvider>|
+               tuning: ClientTuning|
               -> anyhow::Result<WireOutcome> {
             // Short-circuit: Profile 1 in-process impl already present.
             if hub.try_get_local::<dyn billing_sdk::BillingApi>().is_some() {
@@ -109,11 +109,12 @@ inventory::submit! {
             if hub.has_remote_proxy::<dyn billing_sdk::BillingApi>() {
                 return Ok(WireOutcome::Remote);
             }
-            // The process's platform-plane credential source is threaded onto the
-            // resolving client so its platform-plane methods attach
-            // `X-ToolKit-Internal-Token` (`None` in Profile 1 attaches nothing).
-            let tuning = ClientTuning::default()
-                .with_internal_token_provider(internal_token_provider.cloned());
+            // `tuning` is prepared by the proxy-wiring phase from the consumer's
+            // `consumer_wiring.<dep>` config (timeout/retry/pool/concurrency) and
+            // already carries the process's platform-plane credential source, so
+            // the resolving client's platform-plane methods attach
+            // `X-ToolKit-Internal-Token` (no credential in Profile 1 attaches
+            // nothing).
             let client = billing_sdk::BillingApiRestResolvingClient::new(resolver, "billing", tuning);
             hub.register_remote_proxy::<dyn billing_sdk::BillingApi>(Arc::new(client));
             Ok(WireOutcome::Remote)
@@ -159,7 +160,8 @@ resolve loop for those that bound remotely:
 
 ```text
 for each ConsumerRegistration where owner_gear == this_gear:
-    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear), internal_token_provider)?
+    (endpoint, tuning) = consumer_wiring(dep_gear)     // parsed ConsumerWiring, then credential-threaded
+    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear, endpoint), tuning)?
     if outcome == Local:
         mark dep_gear readiness-resolved       // no directory probe at all
     else:
@@ -211,24 +213,50 @@ resolving client. That is a correctness-preserving fallback rather than a failur
 resolves per call — but it costs an HTTP hop to an in-process gear, so declare co-located providers
 in `deps` when you want the local path guaranteed.
 
-### Static endpoint override (escape hatch)
+### Consumer wiring: endpoint override + client tuning
 
-For local development and integration tests a static endpoint overrides discovery, set per gear
-under the same `config` block the provider side already uses for `client_wiring`:
+Each consumed dependency is configured per gear under the same `config` block the provider side uses
+for `client_wiring`, keyed by the dependency (provider) gear name. `consumer_wiring.<dep>` is an
+**object** (`ConsumerWiring`) carrying an optional `endpoint` plus a flattened `ClientTuning`:
 
 ```yaml
-# config.yaml (development / test only)
+# config.yaml
 gears:
   orders:
     config:
       consumer_wiring:
-        billing: "http://localhost:8081"
+        api-contracts:
+          timeout: "5s"
+          max_concurrent_requests: 256
+          pool_max_idle_per_host: 256
+          # endpoint: "http://localhost:8081"   # optional; omit to keep discovery
 ```
 
-When the key is present the proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads it via
-`static_endpoint_override(...)` and wires the dep through a `StaticEndpointResolver`
-(`toolkit::discovery`), which bypasses the directory entirely and is readiness-resolved immediately —
-no probe loop. Every use is logged at `warn!`.
+The bare-string form earlier drafts of this ADR accepted (`billing: "http://localhost:8081"`) is
+**no longer supported**: it was only ever the dev/test static-endpoint escape hatch, and it now lives
+as the optional `endpoint` field on the object above. A bare string is rejected at parse time (logged
+at `warn!`, treated as absent) rather than silently honoured.
+
+Because the consumer path is **REST-only** (`#[toolkit::consumes]` always wires a
+`<Contract>RestResolvingClient`; there is no gRPC resolving client), `ConsumerWiring` carries **no**
+`transport` tag and every `ClientTuning` knob applies — no gRPC disambiguation and no
+`rest_only_knobs_set` warning (contrast the provider-side `client_wiring`).
+
+This is the caller-owned config surface that [DESIGN §1.3](../DESIGN.md#13-operational-semantics)
+specifies for remote contracts — "Own config (URL, timeout, retry policy) via `ClientConfig`" — now
+reachable on the actual high-concurrency gear-to-gear caller. `ConsumerWiring` deserializes into a
+`ClientTuning` whose `apply_to(endpoint)` produces that per-call `ClientConfig`.
+
+The proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads the entry via
+`consumer_wiring(...)`, splits it into `(endpoint, tuning)`, threads the process's platform-plane
+credential onto the tuning, and hands the tuning to `ConsumerRegistration::wire` (which builds the
+resolving client with it, replacing the former `ClientTuning::default()` stub). A malformed entry is
+logged at `warn!` and ignored (untuned discovery), so one typo does not abort startup.
+
+**`endpoint` present** → the dep is wired through a `StaticEndpointResolver` (`toolkit::discovery`),
+bypassing the directory entirely and readiness-resolved immediately (no probe loop). This is the
+dev/test escape hatch and every use is logged at `warn!`. **`endpoint` omitted** → discovery is
+untouched; only the tuning is applied.
 
 The `<owner>` segment is `ConsumerRegistration::owner_gear`, which `#[toolkit::consumes]` derives as
 the **kebab-case of the annotated struct's ident** — a separate attribute cannot read the
@@ -413,3 +441,7 @@ Document the current pattern; require authors to configure static endpoints.
   `run_proxy_wiring_phase`, after `DirectoryClient` is in the hub and before `gear.run()`. It is
   shared by both runtime paths (in-process host and OoP serving); `bootstrap/oop.rs` contains no
   consumer-wiring code.
+* Consumer client tuning: this ADR's original scope was *discovery* (the endpoint), so the
+  wired client was built with a hardcoded `ClientTuning::default()`. Now, it richens
+  `consumer_wiring.<dep>` into `ConsumerWiring` (optional `endpoint` + flattened `ClientTuning`) and
+  threads it through `WireFn` into the resolving client, delivering the caller-owned config that is specified for remote contracts.

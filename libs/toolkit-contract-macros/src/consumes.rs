@@ -190,9 +190,7 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         fn #wire_fn(
             __hub: &::toolkit::ClientHub,
             __resolver: ::std::sync::Arc<dyn ::toolkit::discovery::EndpointResolver>,
-            __internal_token_provider: ::std::option::Option<
-                &::toolkit::contract_support::runtime::config::InternalTokenProvider,
-            >,
+            __tuning: ::toolkit::contract_support::wiring::ClientTuning,
         ) -> ::anyhow::Result<::toolkit::discovery::WireOutcome> {
             // A compile-time (local) impl already registered wins — Profile 1.
             // Report `Local` so the runtime treats the dep as readiness-resolved
@@ -212,12 +210,13 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
                 return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote);
             }
             // Otherwise register the directory-resolving REST client. The tuning
-            // carries the process's platform-plane credential source so the
-            // resolved client attaches `X-ToolKit-Internal-Token` on
-            // platform-plane methods (`cpt-cf-adr-two-plane-auth`); `None`
-            // (Profile 1 / no credential) attaches nothing.
-            let __tuning = ::toolkit::contract_support::wiring::ClientTuning::default()
-                .with_internal_token_provider(__internal_token_provider.cloned());
+            // is prepared by the runtime's proxy-wiring phase from the
+            // consumer's `consumer_wiring.<dep>` config (timeout/retry/pool/
+            // concurrency knobs) and carries the process's platform-plane
+            // credential source, so the resolved client attaches
+            // `X-ToolKit-Internal-Token` on platform-plane methods
+            // (`cpt-cf-adr-two-plane-auth`); no credential (Profile 1) attaches
+            // nothing.
             let __client = #resolving_client_path::new(
                 __resolver,
                 #from,

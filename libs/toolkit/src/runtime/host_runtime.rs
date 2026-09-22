@@ -76,21 +76,40 @@ pub const DEFAULT_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::
 /// `HostRuntime` owns the lifecycle orchestration for `ToolKit`.
 ///
 /// It encapsulates all runtime state and drives gears through the full lifecycle (see gear docs).
-/// Read a consumer's ADR-0004 static-endpoint override for `dep_gear` from
-/// `gears.<owner_gear>.config.consumer_wiring.<dep_gear>` (a base endpoint URI
-/// string). This is the dev/test escape hatch that bypasses service discovery;
-/// returns `None` when unset.
-fn static_endpoint_override(
+/// Read a consumer's `consumer_wiring` entry for `dep_gear` from
+/// `gears.<owner_gear>.config.consumer_wiring.<dep_gear>`, parsed into a
+/// [`ConsumerWiring`]: an object carrying an optional `endpoint` (an ADR-0004
+/// static-endpoint override) plus `ClientTuning` (timeout/retry/pool/concurrency
+/// knobs).
+///
+/// Returns `None` when the key is unset. A key that is present but malformed is
+/// logged at `warn!` and treated as absent, so a typo in one dep's tuning does
+/// not abort startup for the whole process — the dep falls back to untuned
+/// discovery.
+fn consumer_wiring(
     cfg: &dyn ConfigProvider,
     owner_gear: &str,
     dep_gear: &str,
-) -> Option<String> {
-    cfg.get_gear_config(owner_gear)?
+) -> Option<toolkit_contract::wiring::ConsumerWiring> {
+    let value = cfg
+        .get_gear_config(owner_gear)?
         .get("config")?
         .get("consumer_wiring")?
-        .get(dep_gear)?
-        .as_str()
-        .map(str::to_owned)
+        .get(dep_gear)?;
+    match serde_json::from_value(value.clone()) {
+        Ok(wiring) => Some(wiring),
+        Err(source) => {
+            tracing::warn!(
+                owner = owner_gear,
+                dep = dep_gear,
+                error = %source,
+                "proxy-wiring: `consumer_wiring.{dep_gear}` is present but could not be parsed as \
+                 a ConsumerWiring (an object with optional `endpoint` + tuning; the bare-string \
+                 form is no longer accepted); ignoring it and falling back to untuned discovery",
+            );
+            None
+        }
+    }
 }
 
 pub struct HostRuntime {
@@ -500,46 +519,51 @@ impl HostRuntime {
 
         let mut remote_deps: Vec<String> = Vec::new();
         for reg in &regs {
+            // Read the consumer's `consumer_wiring.<dep>` entry (if any) and
+            // split it into an optional static-endpoint override and the
+            // per-deployment `ClientTuning` (timeout/retry/pool/concurrency).
+            let (endpoint_override, mut tuning) =
+                match consumer_wiring(self.gears_cfg.as_ref(), reg.owner_gear, reg.dep_gear) {
+                    Some(wiring) => wiring.into_parts(),
+                    None => (None, toolkit_contract::wiring::ClientTuning::default()),
+                };
+
+            // Thread the process's platform-plane credential onto the tuning so
+            // the wired (directory-resolving) client's platform-plane methods
+            // attach `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`).
+            // This is the genuine remote inter-gear path (Profile 2/3); a
+            // co-located local impl short-circuits before the credential is used.
+            tuning = tuning
+                .with_internal_token_provider(self.ctx_builder.internal_token_provider().cloned());
+
             // ADR-0004 static-endpoint override (dev/test escape hatch): if the
             // consumer's config declares a fixed endpoint for this dep, wire it
             // directly (bypassing discovery) via a `StaticEndpointResolver`. A
             // fixed endpoint needs no probe loop, so it is readiness-resolved
             // immediately. Emitted at `warn!` — it must not be used in production.
-            let static_override =
-                static_endpoint_override(self.gears_cfg.as_ref(), reg.owner_gear, reg.dep_gear);
-            let (reg_resolver, is_static): (Arc<dyn EndpointResolver>, bool) =
-                if let Some(endpoint) = &static_override {
-                    tracing::warn!(
-                        owner = reg.owner_gear,
-                        dep = reg.dep_gear,
-                        endpoint = %endpoint,
-                        "proxy-wiring: STATIC endpoint override in use (ADR-0004 dev/test \
-                         escape hatch) - bypasses service discovery; MUST NOT be used in \
-                         production"
-                    );
-                    (
-                        Arc::new(crate::discovery::StaticEndpointResolver::new(
-                            endpoint.clone(),
-                        )),
-                        true,
-                    )
-                } else {
-                    (Arc::clone(&resolver), false)
-                };
+            let is_static = endpoint_override.is_some();
+            let reg_resolver: Arc<dyn EndpointResolver> = if let Some(endpoint) = &endpoint_override
+            {
+                tracing::warn!(
+                    owner = reg.owner_gear,
+                    dep = reg.dep_gear,
+                    endpoint = %endpoint,
+                    "proxy-wiring: STATIC endpoint override in use (ADR-0004 dev/test \
+                     escape hatch) - bypasses service discovery; MUST NOT be used in \
+                     production"
+                );
+                Arc::new(crate::discovery::StaticEndpointResolver::new(
+                    endpoint.clone(),
+                ))
+            } else {
+                Arc::clone(&resolver)
+            };
 
-            // Thread the process's platform-plane credential onto the wired
-            // (directory-resolving) client so its platform-plane methods attach
-            // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`). This is
-            // the genuine remote inter-gear path (Profile 2/3); a co-located
-            // local impl short-circuits before the credential is used.
-            let outcome = (reg.wire)(
-                &self.client_hub,
-                reg_resolver,
-                self.ctx_builder.internal_token_provider(),
-            )
-            .map_err(|source| RegistryError::ProxyWiring {
-                gear: reg.owner_gear,
-                source,
+            let outcome = (reg.wire)(&self.client_hub, reg_resolver, tuning).map_err(|source| {
+                RegistryError::ProxyWiring {
+                    gear: reg.owner_gear,
+                    source,
+                }
             })?;
             self.dep_checker.register_dep(reg.dep_gear.to_owned());
             match outcome {
@@ -1748,6 +1772,11 @@ mod tests {
         }
     }
 
+    /// Extract just the static-endpoint override from a `consumer_wiring` entry.
+    fn endpoint_override(cfg: &dyn ConfigProvider, owner: &str, dep: &str) -> Option<String> {
+        super::consumer_wiring(cfg, owner, dep).and_then(|w| w.into_parts().0)
+    }
+
     #[test]
     fn static_endpoint_override_reads_nested_consumer_wiring_key() {
         struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
@@ -1760,29 +1789,199 @@ mod tests {
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": { "consumer_wiring": { "billing": "http://localhost:8081" } }
+                "config": {
+                    "consumer_wiring": { "billing": { "endpoint": "http://localhost:8081" } }
+                }
             }),
         );
         let cfg = MapCfg(map);
 
-        // Present override is read from `config.consumer_wiring.<dep>`.
+        // Present override is read from `config.consumer_wiring.<dep>.endpoint`.
         assert_eq!(
-            super::static_endpoint_override(&cfg, "orders", "billing").as_deref(),
+            endpoint_override(&cfg, "orders", "billing").as_deref(),
             Some("http://localhost:8081")
         );
         // Absent dep / owner → None (falls through to directory resolution).
+        assert_eq!(endpoint_override(&cfg, "orders", "inventory"), None);
+        assert_eq!(endpoint_override(&cfg, "warehouse", "billing"), None);
         assert_eq!(
-            super::static_endpoint_override(&cfg, "orders", "inventory"),
+            endpoint_override(&EmptyConfigProvider, "orders", "billing"),
             None
         );
-        assert_eq!(
-            super::static_endpoint_override(&cfg, "warehouse", "billing"),
-            None
+    }
+
+    /// The object form of `consumer_wiring.<dep>` carries an optional `endpoint`
+    /// alongside flattened `ClientTuning`. Both must be derived so the wired
+    /// client is both pointed and tuned per deployment.
+    #[test]
+    fn consumer_wiring_object_form_yields_endpoint_and_tuning() {
+        struct MapCfg(serde_json::Value);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                (gear == "orders").then_some(&self.0)
+            }
+        }
+        let cfg = MapCfg(serde_json::json!({
+            "config": {
+                "consumer_wiring": {
+                    "billing": {
+                        "endpoint": "http://billing:8080",
+                        "timeout": "5s",
+                        "max_concurrent_requests": 256,
+                        "pool_max_idle_per_host": 256
+                    }
+                }
+            }
+        }));
+
+        let (endpoint, tuning) = super::consumer_wiring(&cfg, "orders", "billing")
+            .expect("wiring present")
+            .into_parts();
+        assert_eq!(endpoint.as_deref(), Some("http://billing:8080"));
+        assert_eq!(tuning.timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(tuning.max_concurrent_requests, Some(256));
+        assert_eq!(tuning.pool_max_idle_per_host, Some(256));
+    }
+
+    /// The object form with `endpoint` omitted keeps discovery (no static
+    /// override) while still applying the tuning knobs.
+    #[test]
+    fn consumer_wiring_object_without_endpoint_keeps_discovery() {
+        struct MapCfg(serde_json::Value);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                (gear == "orders").then_some(&self.0)
+            }
+        }
+        let cfg = MapCfg(serde_json::json!({
+            "config": {
+                "consumer_wiring": { "billing": { "max_concurrent_requests": 1 } }
+            }
+        }));
+
+        let (endpoint, tuning) = super::consumer_wiring(&cfg, "orders", "billing")
+            .expect("wiring present")
+            .into_parts();
+        assert_eq!(endpoint, None, "omitted endpoint must keep discovery");
+        assert_eq!(tuning.max_concurrent_requests, Some(1));
+    }
+
+    /// A malformed `consumer_wiring.<dep>` is treated as absent (logged, not
+    /// fatal) so one typo does not abort proxy-wiring for the whole process.
+    #[test]
+    fn consumer_wiring_malformed_entry_is_ignored() {
+        struct MapCfg(serde_json::Value);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                (gear == "orders").then_some(&self.0)
+            }
+        }
+        // A list is not a valid ConsumerWiring object → parse error → None.
+        let cfg = MapCfg(serde_json::json!({
+            "config": { "consumer_wiring": { "billing": [1, 2, 3] } }
+        }));
+        assert!(super::consumer_wiring(&cfg, "orders", "billing").is_none());
+    }
+
+    /// Every `(resolver, max_concurrent_requests)` pair the test registration
+    /// below has been wired with. `inventory` registrations are link-time
+    /// global, so this records calls from *any* test in the binary that drives
+    /// the phase — assertions must therefore look for the configured values
+    /// among the entries rather than checking exact contents.
+    type WiredCall = (Arc<dyn crate::discovery::EndpointResolver>, Option<usize>);
+    static WIRED: std::sync::Mutex<Vec<WiredCall>> = std::sync::Mutex::new(Vec::new());
+
+    /// Stands in for the `#[toolkit::consumes]`-generated wire fn: records the
+    /// resolver and tuning it was handed so the test can verify which arm of
+    /// the phase built them, then reports a remote binding.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::needless_pass_by_value,
+        reason = "must match the ConsumerRegistration::wire signature the macro emits"
+    )]
+    fn record_wire(
+        _hub: &ClientHub,
+        resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        WIRED
+            .lock()
+            .unwrap()
+            .push((resolver, tuning.max_concurrent_requests));
+        Ok(crate::discovery::WireOutcome::Remote)
+    }
+
+    inventory::submit! {
+        crate::discovery::ConsumerRegistration {
+            owner_gear: "orders",
+            dep_gear: "billing",
+            wire: record_wire,
+        }
+    }
+
+    /// Phase-level coverage of the static-endpoint arm: with
+    /// `consumer_wiring.<dep>.endpoint` set, the wiring loop must build a
+    /// `StaticEndpointResolver` pinned to that endpoint, thread the entry's
+    /// tuning through to the wire fn, and mark the dep readiness-resolved
+    /// immediately (a fixed endpoint needs no probe loop).
+    #[tokio::test]
+    async fn proxy_wiring_static_override_uses_static_resolver_and_marks_ready() {
+        struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                self.0.get(gear)
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "orders".to_owned(),
+            serde_json::json!({
+                "config": {
+                    "consumer_wiring": {
+                        "billing": {
+                            "endpoint": "http://localhost:8081",
+                            "max_concurrent_requests": 7
+                        }
+                    }
+                }
+            }),
         );
-        assert_eq!(
-            super::static_endpoint_override(&EmptyConfigProvider, "orders", "billing"),
-            None
+
+        let registry = RegistryBuilder::default().build_topo_sorted().unwrap();
+        let runtime = HostRuntime::new(
+            registry,
+            Arc::new(MapCfg(map)),
+            DbOptions::None,
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
         );
+
+        runtime.run_proxy_wiring_phase().await.unwrap();
+
+        let calls: Vec<WiredCall> = WIRED.lock().unwrap().clone();
+        let mut saw_endpoint = false;
+        let mut saw_tuning = false;
+        for (resolver, max_concurrent) in &calls {
+            if let Ok(Some(ep)) = resolver.resolve_endpoint("billing").await {
+                saw_endpoint |= ep == "http://localhost:8081";
+            }
+            saw_tuning |= *max_concurrent == Some(7);
+        }
+        assert!(
+            saw_endpoint,
+            "static override must wire a resolver pinned to the configured endpoint"
+        );
+        assert!(
+            saw_tuning,
+            "the entry's tuning must reach the wire fn alongside the endpoint"
+        );
+
+        // A static endpoint is resolvable by construction: the dep must be
+        // resolved immediately rather than left gating /readyz.
+        assert!(runtime.dep_checker.all_resolved());
+        assert!(runtime.dep_checker.unresolved_deps().is_empty());
     }
 
     /// The override is keyed by the *gear name* (kebab), which is what
@@ -1802,19 +2001,22 @@ mod tests {
         map.insert(
             "api-contracts-consumer".to_owned(),
             serde_json::json!({
-                "config": { "consumer_wiring": { "api-contracts": "http://localhost:9099" } }
+                "config": {
+                    "consumer_wiring": {
+                        "api-contracts": { "endpoint": "http://localhost:9099" }
+                    }
+                }
             }),
         );
         let cfg = MapCfg(map);
 
         assert_eq!(
-            super::static_endpoint_override(&cfg, "api-contracts-consumer", "api-contracts")
-                .as_deref(),
+            endpoint_override(&cfg, "api-contracts-consumer", "api-contracts").as_deref(),
             Some("http://localhost:9099"),
         );
         // The pre-fix value — the Rust struct ident — must NOT resolve.
         assert_eq!(
-            super::static_endpoint_override(&cfg, "ApiContractsConsumer", "api-contracts"),
+            endpoint_override(&cfg, "ApiContractsConsumer", "api-contracts"),
             None,
         );
     }
