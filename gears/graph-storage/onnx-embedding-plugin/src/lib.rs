@@ -125,6 +125,15 @@ pub enum OnnxLoadError {
 /// How long to wait for the runtime before deciding it has hung.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the boot probe's single inference may take.
+///
+/// Shorter than `LOAD_TIMEOUT` because it measures a different thing: loading
+/// a model reads and plans a graph, running one short input through it should
+/// be milliseconds. The bound exists for the same reason the load one does --
+/// `ort` can hang rather than error -- and a probe that could hang would turn
+/// a check meant to catch a broken session into a gear that never starts.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A `MiniLM`-class sentence-embedding model, in this process.
 pub struct OnnxEmbeddingProvider {
     /// `ort`'s `Session::run` takes `&mut self`, so inference is serialized
@@ -199,21 +208,24 @@ impl OnnxEmbeddingProvider {
             config.dimension,
         );
 
-        let provider = Self {
+        let provider = Arc::new(Self {
             session: Arc::new(Mutex::new(session)),
             tokenizer,
             space,
             config,
             observed: std::sync::Mutex::new(None),
-        };
+        });
         // One inference before the provider is handed out. A session can load
         // and still be unable to run -- a runtime built without the execution
         // provider the graph needs is the usual way -- and every check up to
         // here would pass: the file hashes, the tokenizer parses, the session
         // opens. Without this the first evidence arrives when a producer's
         // ingest fails, long after readiness said the deployment was fine.
-        provider.probe().await?;
-        Ok(provider)
+        Self::probe(Arc::clone(&provider)).await?;
+        // The probe's task has ended, so this is the only reference left.
+        Ok(Arc::try_unwrap(provider).unwrap_or_else(|_| {
+            unreachable!("the probe task is the only other holder and it has finished")
+        }))
     }
 }
 
@@ -376,19 +388,48 @@ impl OnnxEmbeddingProvider {
     /// The input is a fixed short string: the point is that the graph
     /// executes end to end and returns a vector of the declared width, not
     /// what the vector says.
-    async fn probe(&self) -> Result<(), OnnxLoadError> {
-        let encoded = self
-            .encode(std::slice::from_ref(&PROBE_INPUT.to_owned()))
-            .map_err(|error| OnnxLoadError::Session(format!("probe tokenization: {error}")))?;
-        let mut session = self.session.lock().await;
-        // The width is checked by `run` itself, which answers
-        // `SpaceMismatch` -- a declared width the model does not produce is
-        // exactly what that name is for, and comparing again here would be a
-        // second answer to one question. Reaching it is the point: this makes
-        // the check happen once, before anyone depends on the provider.
-        self.run(&mut session, &encoded)
-            .map_err(|error| OnnxLoadError::Session(format!("probe inference: {error}")))?;
-        Ok(())
+    async fn probe(provider: Arc<Self>) -> Result<(), OnnxLoadError> {
+        // On a blocking thread and under a bound, for the same two reasons
+        // `open_session` uses them. `Session::run` is synchronous CPU work,
+        // so calling it on a Tokio worker holds that worker for the duration
+        // -- the reason `embed` uses `block_in_place`. And `ort` can hang
+        // rather than error, which is what `LOAD_TIMEOUT` is there for: a
+        // probe added to catch a session that cannot run would otherwise be
+        // able to stop the gear from ever starting, which is worse than the
+        // fault it looks for.
+        let inference = tokio::task::spawn_blocking(move || {
+            let encoded = provider
+                .encode(std::slice::from_ref(&PROBE_INPUT.to_owned()))
+                .map_err(|error| OnnxLoadError::Session(format!("probe tokenization: {error}")))?;
+            // Nobody else holds the session yet; this is load.
+            let mut session = provider.session.blocking_lock();
+            // The width is checked by `run` itself, which answers
+            // `SpaceMismatch` -- a declared width the model does not produce
+            // is exactly what that name is for, and comparing again here
+            // would be a second answer to one question. Reaching it is the
+            // point: this makes the check happen once, before anyone depends
+            // on the provider.
+            provider
+                .run(&mut session, &encoded)
+                .map_err(|error| OnnxLoadError::Session(format!("probe inference: {error}")))?;
+            Ok::<(), OnnxLoadError>(())
+        });
+
+        match tokio::time::timeout(PROBE_TIMEOUT, inference).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(OnnxLoadError::Session(format!(
+                "the ONNX probe thread ended without a result: {join}"
+            ))),
+            Err(_) => {
+                warn!(
+                    seconds = PROBE_TIMEOUT.as_secs(),
+                    "the ONNX session loaded but did not answer one inference in time"
+                );
+                Err(OnnxLoadError::RuntimeHung {
+                    seconds: PROBE_TIMEOUT.as_secs(),
+                })
+            }
+        }
     }
 
     /// The failure the last exchange left behind, if any.
@@ -525,6 +566,18 @@ impl OnnxEmbeddingProvider {
         // A configuration that names one and loads another would write
         // vectors nothing can rank, and the column would refuse them anyway.
         if hidden != self.config.dimension as usize {
+            // The numbers, because `SpaceMismatch` carries none and this is
+            // the only place that knows them. At boot the probe turns this
+            // into a startup failure, and "embedding space mismatch" on its
+            // own leaves an operator to find the model's real width by
+            // reading code -- which is what happened the first time this
+            // fired. Same shape as the remote plugin's.
+            warn!(
+                got = hidden,
+                want = self.config.dimension,
+                model = %self.config.model_path.display(),
+                "the model's output width is not the configured embedding dimension"
+            );
             return Err(EmbeddingProviderError::SpaceMismatch);
         }
 
