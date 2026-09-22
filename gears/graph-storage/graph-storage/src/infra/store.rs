@@ -97,25 +97,73 @@ pub fn map_scope_err(error: ScopeError) -> GraphStoreError {
     }
 }
 
+/// Read the driver's SQLSTATE out of the structured error, when it left one.
+///
+/// `DbErr::sql_err` only names unique- and foreign-key violations, so it
+/// cannot see `23001` or `40001`; sea-orm's own documentation points at the
+/// underlying driver error for every other code, which is what this reads.
+/// Only `Exec` and `Query` carry one -- a connection failure has no statement
+/// behind it -- and that is the pair `sql_err` itself inspects.
+fn sqlstate_of(error: &sea_orm::DbErr) -> Option<String> {
+    use sea_orm::{DbErr, RuntimeErr, sqlx};
+
+    let (DbErr::Exec(RuntimeErr::SqlxError(inner)) | DbErr::Query(RuntimeErr::SqlxError(inner))) =
+        error
+    else {
+        return None;
+    };
+    let sqlx::Error::Database(db) = inner.as_ref() else {
+        return None;
+    };
+    db.code().map(std::borrow::Cow::into_owned)
+}
+
+/// The SQLSTATEs this store answers for, and nothing else.
+fn classify_sqlstate(sqlstate: &str) -> Option<GraphStoreError> {
+    match sqlstate {
+        "23505" => Some(GraphStoreError::Conflict {
+            reason: "unique violation".into(),
+        }),
+        "23503" | "23001" => Some(GraphStoreError::Conflict {
+            reason: "a live edge still references this node".into(),
+        }),
+        "40001" => Some(GraphStoreError::Serialization),
+        _ => None,
+    }
+}
+
 /// Classify a database failure. **`PostgreSQL` 18+ reports an `ON DELETE
 /// RESTRICT` refusal as SQLSTATE `23001` (`restrict_violation`); 17 and
 /// earlier report `23503`.** Both must classify as a foreign-key violation,
 /// or a live-edge refusal reads as an internal error on PG19.
+///
+/// The driver's own code is authoritative and is read first, out of the
+/// structured error rather than the rendered message. When the driver stated
+/// one, it decides alone -- including when it names a class this store does
+/// not handle, which is `Internal` and never a conflict.
+///
+/// Matching the message is the fallback, for an error that arrived without a
+/// structured code because something between the driver and here re-wrapped it
+/// through `to_string()`. It is a fallback rather than the rule because a
+/// rendered message quotes user-supplied values: `PostgreSQL` echoes the
+/// offending input into `22P02 invalid_text_representation`, so a node key of
+/// `23505-retry` reads as a unique violation to a substring search. Reaching
+/// for the code first means such an error is classified by what the server
+/// said, not by what the caller managed to get quoted back.
 #[must_use]
 pub fn map_db_err(error: &sea_orm::DbErr) -> GraphStoreError {
     let text = error.to_string();
-    if text.contains("23505") {
-        return GraphStoreError::Conflict {
-            reason: "unique violation".into(),
-        };
+
+    if let Some(sqlstate) = sqlstate_of(error) {
+        return classify_sqlstate(&sqlstate).unwrap_or(GraphStoreError::Internal(text));
     }
-    if text.contains("23503") || text.contains("23001") {
-        return GraphStoreError::Conflict {
-            reason: "a live edge still references this node".into(),
-        };
-    }
-    if text.contains("40001") {
-        return GraphStoreError::Serialization;
+
+    for sqlstate in ["23505", "23503", "23001", "40001"] {
+        if text.contains(sqlstate)
+            && let Some(classified) = classify_sqlstate(sqlstate)
+        {
+            return classified;
+        }
     }
     GraphStoreError::Internal(text)
 }
@@ -433,6 +481,105 @@ mod tests {
                 "SQLSTATE {sqlstate} must classify as a conflict"
             );
         }
+    }
+
+    /// A driver error whose stated SQLSTATE and whose rendered message
+    /// disagree. `PostgreSQL` echoes the offending input into a `22P02`
+    /// (`invalid_text_representation`), so this is the shape a caller produces
+    /// by naming a node `23505-retry` and letting it reach a `uuid` cast.
+    #[derive(Debug)]
+    struct DriverError {
+        code: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for DriverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for DriverError {}
+
+    impl sea_orm::sqlx::error::DatabaseError for DriverError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sea_orm::sqlx::error::ErrorKind {
+            sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn driver_error(code: &'static str, message: &str) -> sea_orm::DbErr {
+        sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(std::sync::Arc::new(
+            sea_orm::sqlx::Error::Database(Box::new(DriverError {
+                code,
+                message: message.to_owned(),
+            })),
+        )))
+    }
+
+    /// The message is the caller's to influence; the SQLSTATE is not. A
+    /// substring search cannot tell the two apart, so it read this as a unique
+    /// violation and handed the caller a `409` -- and, where a conflict is
+    /// retried, a retry that could never succeed.
+    #[test]
+    fn a_stated_sqlstate_decides_over_a_message_quoting_the_callers_value() {
+        let error = driver_error(
+            "22P02",
+            r#"invalid input syntax for type uuid: "23505-retry""#,
+        );
+        assert!(
+            error.to_string().contains("23505"),
+            "the message must carry the digits, or this proves nothing"
+        );
+        assert!(
+            matches!(map_db_err(&error), GraphStoreError::Internal(_)),
+            "a 22P02 whose message quotes 23505 must classify as internal"
+        );
+    }
+
+    /// The other half of the same rule: reading the code first must not lose
+    /// the codes this store does answer for.
+    #[test]
+    fn a_stated_sqlstate_still_classifies_what_this_store_answers_for() {
+        for sqlstate in ["23505", "23503", "23001"] {
+            let error = driver_error_for(sqlstate);
+            assert!(
+                matches!(map_db_err(&error), GraphStoreError::Conflict { .. }),
+                "SQLSTATE {sqlstate} must classify as a conflict"
+            );
+        }
+        assert!(
+            matches!(
+                map_db_err(&driver_error_for("40001")),
+                GraphStoreError::Serialization
+            ),
+            "SQLSTATE 40001 must classify as a serialization failure"
+        );
+    }
+
+    /// Deliberately message-free: the classification has to come from the code
+    /// alone, not from a phrase the message happens to carry.
+    fn driver_error_for(sqlstate: &'static str) -> sea_orm::DbErr {
+        driver_error(sqlstate, "the server said no")
     }
 
     #[test]
