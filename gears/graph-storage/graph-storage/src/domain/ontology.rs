@@ -357,13 +357,95 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Validate every `x-gts-traits` object in the chain against the base's own
+/// `x-gts-traits-schema`.
+///
+/// The base already declares what a trait may be -- `family` is an enum of
+/// `owned | reference | phantom` for nodes and `static | analysis` for edges,
+/// and `additionalProperties` is false -- and nothing was checking it. The
+/// traits were read as raw JSON and merged, so `"Reference"` or a misspelling
+/// resolved to a family no rule matches, which does not fail: it silently
+/// removes the type from every decision keyed on the family it meant to be
+/// in. `namespace_of` is the sharpest of those, because it gates the
+/// source-namespace boundary on `family == "reference"` and answers "not
+/// namespaced" for everything else.
+///
+/// Checked against the declaration rather than a list in Rust, so the
+/// ontology stays the single place the families are named.
+fn check_declared_traits(type_id: &str, chain_schemas: &[&Value]) -> Result<(), DomainError> {
+    let Some(declared) = chain_schemas
+        .first()
+        .and_then(|base| base.get("x-gts-traits-schema"))
+    else {
+        return Ok(());
+    };
+    // The *resolved* map, not each schema's own object. Traits merge down the
+    // chain by design -- a leaf declaring only `index` inherits its family --
+    // so checking the objects one at a time would demand that every link
+    // repeat what it inherits. What has to satisfy the declaration is the
+    // answer the chain produces.
+    let merged = Value::Object(merge_traits(chain_schemas).into_iter().collect());
+    let validator = jsonschema::validator_for(declared).map_err(|error| {
+        invalid_type(
+            type_id,
+            format!("the base's `x-gts-traits-schema` does not compile: {error}"),
+        )
+    })?;
+    if let Some(error) = validator.iter_errors(&merged).next() {
+        return Err(invalid_type(
+            type_id,
+            format!("the resolved `x-gts-traits` are not what the base declares: {error}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a type that gives `family` a different value from the one an
+/// ancestor already fixed.
+///
+/// The enum above stops a misspelling; this stops the same hole reached with
+/// a legal value. A type deriving from `reference_node` and declaring
+/// `family: "owned"` passes every other check and leaves the source-namespace
+/// boundary switched off for its rows, with nothing in the answer to say so.
+/// A family is a property of the branch, so the place to change it is the
+/// branch -- derive from a different one.
+fn check_family_is_not_reassigned(
+    type_id: &str,
+    ancestor_schemas: &[&Value],
+    schema: &Value,
+) -> Result<(), DomainError> {
+    let Some(own) = traits_object(schema)
+        .and_then(|t| t.get("family"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let inherited = ancestor_schemas.iter().rev().find_map(|ancestor| {
+        traits_object(ancestor)
+            .and_then(|t| t.get("family"))
+            .and_then(Value::as_str)
+    });
+    match inherited {
+        Some(fixed) if fixed != own => Err(invalid_type(
+            type_id,
+            format!(
+                "declares `family: {own}` while it derives from a type that fixes \
+                 `family: {fixed}`; a family is a property of the branch, so derive \
+                 from the one you mean"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Merge trait values down the chain: base defaults first (from the base's
 /// `x-gts-traits-schema`), then every `x-gts-traits` from the outermost
 /// ancestor to the leaf. A registered type stores this resolution, so a
 /// 10,000-item batch validates without re-walking the chain.
-fn resolve_traits(chain_schemas: &[&Value]) -> EffectiveTraits {
+/// The trait map a chain resolves to: the base's declared defaults first,
+/// then every `x-gts-traits` from the outermost ancestor to the leaf.
+fn merge_traits(chain_schemas: &[&Value]) -> BTreeMap<String, Value> {
     let mut merged: BTreeMap<String, Value> = BTreeMap::new();
-
     if let Some(base) = chain_schemas.first()
         && let Some(declared) = base
             .get("x-gts-traits-schema")
@@ -376,7 +458,6 @@ fn resolve_traits(chain_schemas: &[&Value]) -> EffectiveTraits {
             }
         }
     }
-
     for schema in chain_schemas {
         if let Some(traits) = traits_object(schema) {
             for (name, value) in traits {
@@ -384,6 +465,11 @@ fn resolve_traits(chain_schemas: &[&Value]) -> EffectiveTraits {
             }
         }
     }
+    merged
+}
+
+fn resolve_traits(chain_schemas: &[&Value]) -> EffectiveTraits {
+    let merged = merge_traits(chain_schemas);
 
     EffectiveTraits {
         family: merged
@@ -512,6 +598,14 @@ pub fn analyze(
 
     let mut chain_schemas: Vec<&Value> = ancestor_schemas.to_vec();
     chain_schemas.push(schema);
+    let is_abstract = schema.get("x-gts-abstract").and_then(Value::as_bool) == Some(true);
+    // Abstract types are allowed to leave `family` open -- the declaration
+    // requires it, and requiring it of a type that exists to be derived from
+    // would contradict the rule a few lines below.
+    if !is_abstract {
+        check_declared_traits(type_id, &chain_schemas)?;
+    }
+    check_family_is_not_reassigned(type_id, ancestor_schemas, schema)?;
     let effective_traits = resolve_traits(&chain_schemas);
     let index_paths = if kind == TypeKind::Node {
         resolve_index_paths(type_id, &chain_schemas, &effective_traits.index)?
@@ -519,7 +613,6 @@ pub fn analyze(
         Vec::new()
     };
 
-    let is_abstract = schema.get("x-gts-abstract").and_then(Value::as_bool) == Some(true);
     if !is_abstract && kind != TypeKind::Attribute && effective_traits.family.is_none() {
         return Err(invalid_type(
             type_id,
@@ -655,6 +748,78 @@ mod tests {
             base_schema(graph_storage_sdk::gts::NODE_BASE_TYPE),
             base_schema(graph_storage_sdk::gts::OWNED_NODE_TYPE),
         ]
+    }
+
+    /// A family the base does not declare is refused, however it is spelled.
+    ///
+    /// `family` decides storage semantics, and several rules are a string
+    /// comparison against it -- the sharpest being `namespace_of`, which
+    /// gates the source-namespace boundary on `family == "reference"` and
+    /// answers "not namespaced" for anything else. A misspelling therefore
+    /// does not fail: it removes the type from the rule, silently, and the
+    /// write it should have refused succeeds.
+    ///
+    /// The base already declares the legal values as an enum. Nothing was
+    /// checking the declaration.
+    #[test]
+    fn a_family_the_base_does_not_declare_is_refused() {
+        for spelling in ["Reference", "referense", "owned_node", ""] {
+            let (id, schema) = owned_leaf(
+                "acme.dm._.mistyped.v1~",
+                serde_json::json!({ "family": spelling }),
+                serde_json::json!({}),
+            );
+            let ancestors = owned_ancestors();
+            let refs: Vec<&Value> = ancestors.iter().collect();
+            let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH)
+                .expect_err(&format!("`{spelling}` is not a family the base declares"));
+            assert!(
+                error.to_string().contains("x-gts-traits"),
+                "the refusal names the declaration it failed: {error}"
+            );
+        }
+    }
+
+    /// A legal family that contradicts the branch is refused too.
+    ///
+    /// The enum stops a misspelling; this stops the same hole reached with a
+    /// value that is spelled correctly. A type deriving from `owned_node` and
+    /// declaring `family: "reference"` would pass every other check and be
+    /// treated as a reference node by the ownership boundary while living on
+    /// the owned branch -- a family is a property of the branch, so changing
+    /// it means deriving from a different one.
+    #[test]
+    fn a_family_that_contradicts_the_branch_is_refused() {
+        let (id, schema) = owned_leaf(
+            "acme.dm._.defector.v1~",
+            serde_json::json!({ "family": "reference" }),
+            serde_json::json!({}),
+        );
+        let ancestors = owned_ancestors();
+        let refs: Vec<&Value> = ancestors.iter().collect();
+        let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH)
+            .expect_err("an owned leaf may not call itself a reference");
+        assert!(
+            error.to_string().contains("derives from a type that fixes"),
+            "the refusal says the branch already fixed it: {error}"
+        );
+    }
+
+    /// And the ordinary case still works: a leaf that inherits its family and
+    /// declares only its own traits is admitted.
+    #[test]
+    fn a_leaf_that_only_inherits_its_family_is_admitted() {
+        let (id, schema) = owned_leaf(
+            "acme.dm._.ordinary.v1~",
+            serde_json::json!({ "emit_events": true }),
+            serde_json::json!({}),
+        );
+        let ancestors = owned_ancestors();
+        let refs: Vec<&Value> = ancestors.iter().collect();
+        let descriptor = analyze(&id, &schema, &refs, DEFAULT_DEPTH)
+            .unwrap_or_else(|error| panic!("an ordinary leaf registers: {error}"));
+        assert_eq!(descriptor.effective_traits.family.as_deref(), Some("owned"));
+        assert!(descriptor.effective_traits.emit_events);
     }
 
     #[test]
