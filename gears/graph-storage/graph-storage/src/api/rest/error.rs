@@ -136,6 +136,14 @@ fn routing_outcome(error: DomainError) -> Result<CanonicalError, DomainError> {
         // `AccessDenied` arm above: anti-enumeration hides what the caller has
         // no business knowing exists, and a namespace's owner is not that.
         DomainError::SourceNamespaceForbidden { namespace } => {
+            // `%namespace` is a `Display` field and `tracing` does not escape
+            // one, so under the text console formatter a newline in this value
+            // would be written as a newline -- a forged second record, put
+            // there by the producer this line is about refusing. It is safe
+            // because the value cannot contain one: `ownership::namespace_of`
+            // refuses a control character where the namespace is read out of
+            // the payload, and the transfer surface refuses one where it
+            // arrives as a path segment. Those two are the only sources.
             tracing::info!(
                 namespace = %namespace,
                 "refused a write under a source namespace owned by another producer"

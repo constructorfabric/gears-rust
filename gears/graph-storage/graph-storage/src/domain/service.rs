@@ -424,6 +424,22 @@ impl GraphServices {
         // Here rather than in a store, because every store answers the same
         // registry contract and the fake one must refuse what PostgreSQL
         // refuses.
+        // The namespace arrives as a path segment here rather than out of a
+        // payload, so `namespace_of`'s refusal never sees it -- and this is the
+        // one route that writes a registry row for a namespace nobody has
+        // written under yet. A row keyed by a namespace no payload can produce
+        // is unreachable by design, so it would sit in the registry and in
+        // every listing of it, owned by someone, matching nothing.
+        if namespace.trim() != namespace
+            || namespace.trim().is_empty()
+            || namespace.chars().any(char::is_control)
+        {
+            return Err(DomainError::InvalidQuery {
+                message: "the namespace is compared to a node's `payload.source.system` exactly, \
+                          so it cannot carry surrounding whitespace or control characters"
+                    .to_owned(),
+            });
+        }
         if !crate::domain::ownership::is_canonical_principal(owner_principal) {
             return Err(DomainError::InvalidQuery {
                 message: "the principal is compared to the writer's exactly, so it cannot \

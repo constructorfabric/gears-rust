@@ -44,6 +44,18 @@ pub fn namespace_of<'a>(
         .map(str::trim)
         .filter(|system| !system.is_empty());
     match system {
+        // A namespace is an identity: it is compared to the registry's owner
+        // by exact equality, and an operator reads it back out of a log line.
+        // A control character breaks both. `tracing`'s `Display` fields are
+        // not escaped, and the text console formatter is a supported
+        // production choice, so a `system` of "github\nlevel=error msg=..."
+        // reaches an operator's stream as a second, forged record -- written
+        // by a producer that was refused the write. Refused here, where the
+        // value is first read, so it reaches neither the log nor the registry.
+        Some(system) if system.chars().any(char::is_control) => Err(DomainError::invalid(
+            "`payload.source.system` cannot carry control characters: it is the namespace the \
+             write is authorized against, and it is written to the operator log",
+        )),
         Some(system) => Ok(Namespaced::Under(system)),
         None => Err(DomainError::invalid(
             "a reference node must carry `payload.source.system`: it is the namespace the write \
@@ -155,6 +167,41 @@ mod tests {
     /// The shapes that read as a transfer but cannot be one. Each of these
     /// stores an owner no writer can equal, so the namespace stops accepting
     /// writes from the producer it was just handed to.
+    /// The refusal is logged with the namespace in it, and `tracing` does not
+    /// escape a `Display` field. Under the text console formatter an embedded
+    /// newline is written as one, so a producer that is refused the write
+    /// could still put a line of its choosing into the operator's stream.
+    #[test]
+    fn a_namespace_that_could_forge_a_log_line_is_malformed() {
+        for system in [
+            "github\nlevel=error msg=\"fake alert\"",
+            "github\rlevel=error",
+            "git\u{0}hub",
+        ] {
+            let payload = json!({
+                "source": { "system": system, "kind": "commit", "native_id": "a1" }
+            });
+            assert!(
+                namespace_of(Some("reference"), Some(&payload)).is_err(),
+                "{system:?} must be refused rather than logged"
+            );
+        }
+    }
+
+    /// The trim happens first, so a value that is only padded is still a
+    /// perfectly good namespace -- the refusal above is about what a trim
+    /// cannot reach.
+    #[test]
+    fn a_padded_namespace_is_still_read_as_its_trimmed_self() {
+        let payload = json!({
+            "source": { "system": "  github  ", "kind": "commit", "native_id": "a1" }
+        });
+        assert_eq!(
+            namespace_of(Some("reference"), Some(&payload)).expect("padding is not a control char"),
+            Namespaced::Under("github")
+        );
+    }
+
     #[test]
     fn a_principal_no_writer_could_equal_is_not_canonical() {
         for principal in [
