@@ -463,6 +463,7 @@ async fn live_edges(
         .map_err(scope_error)?;
     let over_edge_budget = rows.len() as u64 > req.budget.max_edges_scanned;
     rows.truncate(usize::try_from(req.budget.max_edges_scanned).unwrap_or(usize::MAX));
+    let rows_scanned = rows.len();
 
     // Endpoints the caller may not see are not reachable: a scoped node read
     // decides which endpoints exist for this caller.
@@ -530,8 +531,17 @@ async fn live_edges(
     // the whole failure the requirement names. So it is a second scoped read
     // over the edges incident to the reached set, taken only when the caller
     // asked (a traversal does not pay for it).
+    // The budget is per hop, not per scan. This second read used to take a
+    // fresh `max_edges_scanned` of its own, so asking for degrees quietly
+    // doubled what a hop could read -- and a ceiling that means one number
+    // when you ask for degrees and another when you do not is not a number a
+    // deployment can plan around. It gets what the first scan left.
+    let remaining = req
+        .budget
+        .max_edges_scanned
+        .saturating_sub(rows_scanned as u64);
     let (degrees, degree_scan_over_budget) = if req.with_degrees && !reached.is_empty() {
-        degrees_of(ctx, runner, req, &reached).await?
+        degrees_of(ctx, runner, &reached, remaining).await?
     } else {
         (Vec::new(), false)
     };
@@ -556,9 +566,15 @@ async fn live_edges(
 async fn degrees_of(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
-    req: &ExpandRequest,
     reached: &[i64],
+    budget: u64,
 ) -> Result<(Vec<u32>, bool), GraphEngineError> {
+    // Nothing left of the hop's allowance: the degrees are unknown rather
+    // than zero, and the answer says the scan was cut short so retention does
+    // not silently rank every neighbour the same.
+    if budget == 0 {
+        return Ok((vec![0; reached.len()], true));
+    }
     let incidence = Condition::any()
         .add(edge::Column::SrcNodeId.is_in(reached.to_vec()))
         .add(edge::Column::DstNodeId.is_in(reached.to_vec()));
@@ -567,12 +583,12 @@ async fn degrees_of(
         .scope_with(ctx.scope)
         .filter(incidence)
         .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
-        .limit(req.budget.max_edges_scanned.saturating_add(1))
+        .limit(budget.saturating_add(1))
         .all(runner)
         .await
         .map_err(scope_error)?;
-    let over_budget = rows.len() as u64 > req.budget.max_edges_scanned;
-    rows.truncate(usize::try_from(req.budget.max_edges_scanned).unwrap_or(usize::MAX));
+    let over_budget = rows.len() as u64 > budget;
+    rows.truncate(usize::try_from(budget).unwrap_or(usize::MAX));
 
     let mut incident: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
     for row in &rows {

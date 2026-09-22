@@ -1122,6 +1122,100 @@ async fn a_stopped_hop_reports_why() {
     );
 }
 
+/// Asking for degrees does not buy a second edge budget.
+///
+/// `max_edges_scanned` is documented as the bound on one hop. The incidence
+/// scan took it, and the degree scan -- a separate read, taken only when a
+/// neighbourhood asks for degree-ordered retention -- took a fresh one of its
+/// own, so the same configured ceiling meant one number for a traversal and
+/// twice that for a neighbourhood. A limit whose value depends on which
+/// caller is asking is not a limit anyone can size a deployment against.
+#[tokio::test]
+async fn asking_for_degrees_does_not_double_the_hop_edge_budget() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    // A hub with eight edges and a budget of four: the incidence scan spends
+    // the whole allowance, so a degree scan that respects the same hop budget
+    // has nothing left and must say so rather than read four more.
+    let mut nodes = vec![conformance::node("hub", "hub")];
+    let mut edges = Vec::new();
+    for index in 0..8 {
+        let key = format!("spoke-{index}");
+        nodes.push(conformance::node(&key, &key));
+        edges.push(conformance::edge("hub", &key));
+    }
+    conformance::ingest_batch(stand.store.as_ref(), &ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the hub commits");
+
+    let ids = stand
+        .store
+        .resolve_node_ids(&ctx, &["hub".to_owned()])
+        .await
+        .expect("the hub resolves");
+    let frontier: Vec<_> = ids.into_iter().map(|(_, id)| id).collect();
+
+    let request = |with_degrees| ExpandRequest {
+        frontier: frontier.clone(),
+        direction: Direction::Either,
+        edge_types: None,
+        labels: None,
+        budget: HopBudget {
+            max_frontier: 1_000,
+            max_edges_scanned: 4,
+        },
+        with_degrees,
+    };
+
+    let plain = stand
+        .engine
+        .expand(&ctx, request(false))
+        .await
+        .expect("the hop runs");
+    let with_degrees = stand
+        .engine
+        .expand(&ctx, request(true))
+        .await
+        .expect("the hop runs with degrees");
+
+    assert_eq!(
+        plain.edges.len(),
+        with_degrees.edges.len(),
+        "the same budget reads the same number of edges whoever is asking"
+    );
+    assert_eq!(
+        with_degrees.truncated,
+        Some(TruncationReason::EdgeScanCap),
+        "and the hop still reports that its scan was cut short"
+    );
+    assert_eq!(
+        with_degrees.degrees.len(),
+        with_degrees.reached.len(),
+        "degrees stay index-aligned with the reached set even when unknown"
+    );
+    // The observable difference. Edge counts and the truncation flag come
+    // from the first scan and say nothing about the second, so what proves
+    // the budget is shared is that the degree scan had nothing left to spend:
+    // the degrees come back unknown rather than computed from four more rows
+    // nobody accounted for.
+    assert!(
+        with_degrees.degrees.iter().all(|degree| *degree == 0),
+        "the first scan spent the hop's allowance, so the degrees are unknown \
+         rather than bought with a second one: {:?}",
+        with_degrees.degrees
+    );
+}
+
 /// The edge-scan budget is a bound *and* a report.
 ///
 /// It was neither: `live_edges` passed the budget to `LIMIT` and nothing

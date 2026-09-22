@@ -120,7 +120,9 @@ type-revision history.
   they observed.
 - *The traversal edge-scan budget is per hop*, not per walk: a walk can scan
   the per-hop ceiling at every depth. A hop that reaches it does say so
-  (`EdgeScanCap`).
+  (`EdgeScanCap`), and the ceiling covers the whole hop -- a neighbourhood
+  asking for degree-ordered retention reads its degrees out of what the
+  incidence scan left, rather than out of a second allowance of the same size.
 - *Reason codes for `not_found`, `unimplemented`, `deadline_exceeded`,
   `cancelled`, `unavailable`, `data_loss` and `unknown` are not on the wire*:
   the platform's builders for those categories carry no reason slot.
