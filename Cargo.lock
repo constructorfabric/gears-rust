@@ -2408,6 +2408,7 @@ dependencies = [
  "cf-gears-tr-authz-plugin",
  "cf-gears-types-registry",
  "cf-gears-usage-collector",
+ "cf-gears-vault-credstore-plugin",
  "clap",
  "mimalloc",
  "serde-saphyr 1.3.0",
@@ -4113,6 +4114,31 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-vault-credstore-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-credstore-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "httpmock",
+ "inventory",
+ "reqwest",
+ "serde",
+ "serde-saphyr 1.3.0",
+ "serde_json",
+ "temp-env",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -1,0 +1,7 @@
+[gear]
+name = "Vault CredStore Plugin"
+description = "HashiCorp Vault / OpenBao (KV v2) credential storage backend plugin."
+category = "core-platform-integration"
+is_plugin = true
+has_plugins = false
+has_extension_point = false
