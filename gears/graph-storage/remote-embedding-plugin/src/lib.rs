@@ -117,6 +117,12 @@ pub enum RemoteConfigError {
          logged, echoed in an error, or copied into a bug report"
     )]
     CredentialsInUrl,
+    #[error(
+        "an api_key is configured and base_url is plain http to {host}, which puts the bearer \
+         token on the wire in clear for every proxy and log in between; use https, or a \
+         loopback host if this is a local endpoint"
+    )]
+    CredentialOverPlainHttp { host: String },
     #[error("model must not be empty")]
     Model,
     #[error("model must be at most {max} characters, and this one is {got}")]
@@ -132,6 +138,21 @@ pub enum RemoteConfigError {
     BatchSize,
     #[error("the HTTP client could not be built: {0}")]
     Client(String),
+}
+
+/// Whether a URL's host is the local machine.
+///
+/// A literal `127.0.0.0/8` or `::1` address, or the name `localhost`. The name
+/// is included because that is how a local endpoint is usually written, and
+/// resolving it to check would make configuration validation depend on DNS --
+/// which would also be a lie, since resolution can change after boot.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 /// The longest a model name may be, in characters.
@@ -179,6 +200,22 @@ impl RemoteEmbeddingProvider {
         // is the one place this plugin already reads one from.
         if !base.username().is_empty() || base.password().is_some() {
             return Err(RemoteConfigError::CredentialsInUrl);
+        }
+        // A bearer token is a header, and a header on plain `http` is on the
+        // wire in clear: every proxy, NAT, TLS-inspecting middlebox and load
+        // balancer log between here and the endpoint reads it. The scheme
+        // check above allows `http` because a local endpoint is a real thing
+        // to run against; what it cannot allow is `http` to somewhere else
+        // while a credential is attached, and `embed_chunk` attaches it
+        // whenever one is configured, without consulting the scheme.
+        //
+        // Loopback stays allowed with a key. There the traffic does not leave
+        // the machine, and refusing it would push a developer towards putting
+        // the credential somewhere worse.
+        if config.api_key.is_some() && base.scheme() == "http" && !is_loopback(&base) {
+            return Err(RemoteConfigError::CredentialOverPlainHttp {
+                host: base.host_str().unwrap_or_default().to_owned(),
+            });
         }
         // The model is not a free-text field. It is trimmed into the
         // embedding-space identity, which is compared for equality to decide
@@ -566,8 +603,23 @@ fn classify_status(status: reqwest::StatusCode) -> Refusal {
         401 | 403 => Refusal::permanent(EmbeddingProviderError::Unavailable {
             reason: format!("the endpoint refused the credential (HTTP {status})"),
         }),
-        408 | 429 | 500..=599 => Refusal::transient(EmbeddingProviderError::Unavailable {
-            reason: format!("HTTP {status}"),
+        // Listed rather than a `500..=599` range. 5xx is not one class: 500,
+        // 502, 503 and 504 say the server is having a moment, while 501 says
+        // it does not implement this and 505 says the two sides cannot agree
+        // on a protocol version. Neither of those changes on the next attempt,
+        // and ADR-0004 scopes the retry to "a rate limit, a gateway error, a
+        // connection that did not open" -- which is this list and not the
+        // range. A misconfigured endpoint answering 501 would otherwise spend
+        // three requests and the whole backoff per chunk of every batch.
+        408 | 429 | 500 | 502 | 503 | 504 => {
+            Refusal::transient(EmbeddingProviderError::Unavailable {
+                reason: format!("HTTP {status}"),
+            })
+        }
+        // Still `Unavailable` to the gear -- the vector arm is down either way
+        // -- but there is nothing a repeat can fix.
+        501 | 505 => Refusal::permanent(EmbeddingProviderError::Unavailable {
+            reason: format!("the endpoint cannot serve this request at all (HTTP {status})"),
         }),
         _ => Refusal::permanent(EmbeddingProviderError::Internal(format!(
             "the endpoint answered HTTP {status}"
@@ -736,6 +788,69 @@ mod tests {
         classify_status(reqwest::StatusCode::from_u16(code).unwrap_or_default())
     }
 
+    /// A bearer token on plain `http` is on the wire in clear. The scheme
+    /// check allows `http` because a local endpoint is a real thing to run
+    /// against, and `embed_chunk` attaches the credential whenever one is
+    /// configured without looking at the scheme, so the combination is what
+    /// has to be refused -- at configuration time, before the first request
+    /// carries the token past a proxy.
+    #[test]
+    fn a_credential_is_not_sent_in_clear_to_another_host() {
+        let build = |url: &str, key: Option<&str>| {
+            let mut config = RemoteProviderConfig::new(url, "text-embedding-3-small");
+            if let Some(key) = key {
+                config = config.with_api_key(key);
+            }
+            RemoteEmbeddingProvider::new(config)
+        };
+
+        for url in [
+            "http://embeddings.internal/v1",
+            "http://10.0.0.7:8080/v1",
+            "http://example.test/v1",
+        ] {
+            let refused = build(url, Some("sk-secret"))
+                .err()
+                .expect("a credential over plain http to another host must be refused");
+            assert!(
+                matches!(refused, RemoteConfigError::CredentialOverPlainHttp { .. }),
+                "{url} must be refused for the scheme, got {refused}"
+            );
+            assert!(
+                !refused.to_string().contains("sk-secret"),
+                "and the refusal must not quote the credential: {refused}"
+            );
+        }
+
+        // The same hosts are fine without a credential: there is nothing to
+        // expose, and the plugin is not in the business of banning `http`.
+        for url in ["http://embeddings.internal/v1", "http://10.0.0.7:8080/v1"] {
+            assert!(
+                build(url, None).is_ok(),
+                "{url} carries no credential and stays allowed"
+            );
+        }
+
+        // Loopback keeps its credential: the traffic never leaves the machine,
+        // and refusing it would push the key somewhere worse.
+        for url in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert!(
+                build(url, Some("sk-secret")).is_ok(),
+                "{url} is the local machine and stays allowed"
+            );
+        }
+
+        // And https is the ordinary case.
+        assert!(
+            build("https://api.openai.com/v1", Some("sk-secret")).is_ok(),
+            "https with a credential is the point of the feature"
+        );
+    }
+
     /// The model is checked as hard as its neighbours in the same constructor.
     /// It is not free text: it is trimmed into the embedding-space identity,
     /// which decides whether a stored vector is still valid, and it is written
@@ -829,9 +944,28 @@ mod tests {
         }
     }
 
+    /// 5xx is not one class. A server having a moment and a server that does
+    /// not implement the endpoint answer in the same hundred, and only one of
+    /// them is worth asking again.
+    #[test]
+    fn a_permanent_5xx_is_not_retried() {
+        for code in [501, 505] {
+            let refusal = classify(code);
+            assert!(
+                !refusal.retryable,
+                "HTTP {code} describes a fixed capability, so repeating the request repeats \
+                 the answer"
+            );
+            assert!(
+                matches!(refusal.error, EmbeddingProviderError::Unavailable { .. }),
+                "HTTP {code} still leaves the vector arm down, so it is still unavailable"
+            );
+        }
+    }
+
     #[test]
     fn the_statuses_a_retry_can_fix_are_still_retried() {
-        for code in [408, 429, 500, 502, 503] {
+        for code in [408, 429, 500, 502, 503, 504] {
             assert!(
                 classify(code).retryable,
                 "HTTP {code} is the endpoint saying `not now`, which is what retrying is for"
