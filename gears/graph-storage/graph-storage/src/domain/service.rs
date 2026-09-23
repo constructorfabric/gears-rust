@@ -417,23 +417,24 @@ impl GraphServices {
         namespace: &str,
         owner_principal: &str,
     ) -> Result<graph_storage_sdk::models::SourceNamespaceOwner, DomainError> {
-        // The registry is only useful because the owner it holds is the exact
-        // string a writer presents, and a writer's never carries surrounding
-        // whitespace or a control character. Storing one that does reports a
-        // successful transfer and leaves the namespace writable by nobody,
-        // until an administrator notices and transfers again. Refused here
-        // rather than trimmed: the administrator asked for a specific
-        // principal and is owed either that one or an error.
-        //
-        // Here rather than in a store, because every store answers the same
-        // registry contract and the fake one must refuse what PostgreSQL
-        // refuses.
-        // The namespace arrives as a path segment here rather than out of a
-        // payload, so `namespace_of`'s refusal never sees it -- and this is the
-        // one route that writes a registry row for a namespace nobody has
-        // written under yet. A row keyed by a namespace no payload can produce
-        // is unreachable by design, so it would sit in the registry and in
-        // every listing of it, owned by someone, matching nothing.
+        // Authorization first, before either shape check, as every other
+        // method on this type does. The order is part of what a caller can
+        // observe: one without ADMIN used to get `400 invalid_argument` for a
+        // malformed namespace and `404` for a well-formed one, and could read
+        // the format rule out of that difference without ever being allowed to
+        // call this. The rule is published, so little leaks -- but this file
+        // spends real care elsewhere on answers that do not vary with what the
+        // caller has no business knowing, and this sat one call away from it.
+        let auth = self
+            .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
+            .await?;
+
+        // The namespace arrives as a path segment rather than out of a
+        // payload, so `ownership::namespace_of`'s refusal never sees it -- and
+        // this is the one route that writes a registry row for a namespace
+        // nobody has written under yet. A row keyed by something no payload
+        // can produce would sit in the registry and in every listing of it,
+        // owned by someone and matching nothing.
         if namespace.trim() != namespace
             || namespace.trim().is_empty()
             || namespace.chars().any(char::is_control)
@@ -444,6 +445,18 @@ impl GraphServices {
                     .to_owned(),
             });
         }
+
+        // The registry is only useful because the owner it holds is the exact
+        // string a writer presents, and a writer's never carries surrounding
+        // whitespace or a control character. Storing one that does reports a
+        // successful transfer and leaves the namespace writable by nobody,
+        // until an administrator notices and transfers again. Refused rather
+        // than trimmed: the administrator asked for a specific principal and
+        // is owed either that one or an error.
+        //
+        // Here rather than in a store, because every store answers the same
+        // registry contract and the fake one must refuse what PostgreSQL
+        // refuses.
         if !crate::domain::ownership::is_canonical_principal(owner_principal) {
             return Err(DomainError::InvalidQuery {
                 message: "the principal is compared to the writer's exactly, so it cannot \
@@ -451,9 +464,7 @@ impl GraphServices {
                     .to_owned(),
             });
         }
-        let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
-            .await?;
+
         Ok(self
             .store
             .transfer_source_namespace(&Self::store_ctx(&auth, None), namespace, owner_principal)

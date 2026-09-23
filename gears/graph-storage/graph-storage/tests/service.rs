@@ -568,6 +568,38 @@ async fn the_namespace_surface_lists_and_transfers() {
 }
 
 #[tokio::test]
+async fn an_unauthorized_transfer_answers_the_same_whatever_it_was_given() {
+    // The shape checks on this method used to run before `authorize`, so a
+    // caller with no ADMIN could tell a malformed namespace (`400
+    // invalid_argument`) from a well-formed one (`404` via the denial) and
+    // read the format rule out of the difference. Authorization decides
+    // first now, and the answer no longer varies with an input this caller was
+    // never entitled to submit.
+    let harness = Harness::denied();
+    let ctx = harness.ctx();
+
+    let mut refusals = Vec::new();
+    for (namespace, principal) in [
+        ("github", "mirror-gear"),     // both well-formed
+        ("git\nhub", "mirror-gear"),   // a namespace the shape check rejects
+        ("  github  ", "mirror-gear"), // and another
+        ("github", "mirror-gear "),    // a principal the shape check rejects
+    ] {
+        let refused = harness
+            .services
+            .transfer_source_namespace(&ctx, namespace, principal)
+            .await
+            .expect_err("a denied caller never transfers anything");
+        refusals.push(std::mem::discriminant(&refused));
+    }
+
+    assert!(
+        refusals.windows(2).all(|pair| pair[0] == pair[1]),
+        "every refusal must be the same variant, whatever the input looked like"
+    );
+}
+
+#[tokio::test]
 async fn a_denying_pdp_stops_every_surface_before_the_store() {
     let harness = Harness::denied();
     let ctx = harness.ctx();
