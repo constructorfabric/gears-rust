@@ -93,6 +93,40 @@ impl AuthZResolverApi for DenyEverything {
     }
 }
 
+/// A PDP that must never be asked.
+///
+/// `no_new_work_starts_after_the_budget_is_spent` claims the refusal happens
+/// before the policy call. Asserting the returned variant cannot show that: a
+/// deadline check moved below `authorize` returns the same `Deadline` and the
+/// wasted round trip is invisible. This one records every evaluation, so the
+/// claim in the test's name becomes something the test can fail on.
+#[derive(Default)]
+pub struct CountingPdp {
+    pub calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingPdp {
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for CountingPdp {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Answers exactly as `AllowInOwnTenant` does, so swapping it in
+        // changes what is observed and not what the service decides. A decision
+        // with no constraints would compile to a different scope and make this
+        // case fail for a reason that has nothing to do with deadlines.
+        AllowInOwnTenant.evaluate(ctx, request).await
+    }
+}
+
 /// A one-hop engine over the same store the service uses.
 ///
 /// Enough to drive the traversal service for real -- seeds resolve, hops

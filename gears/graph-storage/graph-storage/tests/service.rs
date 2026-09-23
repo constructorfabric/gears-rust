@@ -828,7 +828,15 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
         "a zero deadline is not a configuration anyone can set"
     );
 
-    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), expired);
+    // A PDP that counts, so the claim in this test's name is one the test can
+    // fail on. Asserting the returned variant alone cannot: a deadline check
+    // moved below `authorize` still answers `Deadline`, and the round trip it
+    // wasted would be invisible.
+    let pdp = Arc::new(support::CountingPdp::default());
+    let harness = Harness::configured(
+        Arc::clone(&pdp) as Arc<dyn authz_resolver_sdk::api::AuthZResolverApi>,
+        expired,
+    );
     let ctx = harness.ctx();
 
     // No fixture, and that is the assertion: the refusal happens before the
@@ -936,6 +944,17 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
             "{what} must refuse a spent deadline, got {error}"
         );
     }
+
+    // The claim this case is named for. Every call above returned `Deadline`,
+    // which it would have done just as well with the check below the policy
+    // call -- so the variant is not the assertion. This is: the PDP was never
+    // asked, because no work starts once the budget is spent.
+    assert_eq!(
+        pdp.calls(),
+        0,
+        "the policy decision point must not be reached by a request that is already over \
+         its deadline"
+    );
 }
 
 /// A store that declares it has no snapshots is taken at its word.
