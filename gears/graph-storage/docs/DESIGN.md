@@ -22,6 +22,7 @@
   - [Phantom Materialization Contract](#phantom-materialization-contract)
   - [Concurrent Ingest Protocol](#concurrent-ingest-protocol)
   - [Soft Delete Contract](#soft-delete-contract)
+  - [Closed Enum Contract](#closed-enum-contract)
   - [Label Contract](#label-contract)
   - [Authorization Model](#authorization-model)
   - [Read Consistency Contract](#read-consistency-contract)
