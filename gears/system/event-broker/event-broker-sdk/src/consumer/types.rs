@@ -3,6 +3,7 @@ use std::time::Duration;
 use toolkit_gts::gts_id;
 
 use chrono::{DateTime, Utc};
+use gts::{GtsIdPattern, GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -10,23 +11,24 @@ use uuid::Uuid;
 use super::commit::TxCommitHandle;
 #[cfg(feature = "db")]
 use super::offset_manager::CommitOffsetInTx;
-use crate::api::{AssignedPartition, ResolvedPosition};
+use crate::api::{AssignedPartition, Position};
 use crate::error::{ConsumerError, EventBrokerError};
-use crate::ids::{ConsumerGroupId, EventTypeId, SubscriptionId, TopicId};
+use crate::ids::{ConsumerGroupId, SubscriptionId, TopicId};
+use crate::sequence::Sequence;
 
 /// Raw event delivered to v1 handlers. `data` is untyped JSON;
 /// typed dispatch is deferred to v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawEvent {
     pub id: Uuid,
-    pub type_id: String,
-    pub topic: String,
+    pub type_id: GtsTypeId,
+    pub topic: GtsInstanceId,
     pub tenant_id: Uuid,
     pub subject: String,
-    pub subject_type: String,
+    pub subject_type: GtsTypeId,
     pub partition: u32,
-    pub sequence: i64,
-    pub offset: i64,
+    pub sequence: Sequence,
+    pub offset: Sequence,
     pub occurred_at: DateTime<Utc>,
     pub sequence_time: DateTime<Utc>,
     pub trace_parent: Option<String>,
@@ -45,7 +47,7 @@ pub enum HandlerOutcome {
 #[derive(Debug, Clone)]
 pub enum BatchHandlerOutcome {
     Success,
-    AdvanceThrough { offset: i64 },
+    AdvanceThrough { offset: Sequence },
     Retry { reason: String },
 }
 
@@ -85,67 +87,16 @@ impl<'a> EventBatch<'a> {
 /// Tracks the committed frontier for one topic partition.
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionFrontier {
-    committed: i64,
+    committed: Sequence,
 }
 
 impl PartitionFrontier {
-    pub(crate) fn new(committed: i64) -> Self {
+    pub(crate) fn new(committed: Sequence) -> Self {
         Self { committed }
     }
 
-    pub(crate) fn committed(&self) -> i64 {
+    pub(crate) fn committed(&self) -> Sequence {
         self.committed
-    }
-}
-
-/// Topic reference accepted by the consumer builder before registry resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TopicRef {
-    Id(TopicId),
-    Gts(String),
-}
-
-impl TopicRef {
-    pub fn id(id: TopicId) -> Self {
-        Self::Id(id)
-    }
-
-    pub fn gts(gts: impl Into<String>) -> Self {
-        Self::Gts(gts.into())
-    }
-}
-
-impl From<TopicId> for TopicRef {
-    fn from(value: TopicId) -> Self {
-        Self::Id(value)
-    }
-}
-
-/// Event-type reference accepted by the consumer builder before registry resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum EventTypeRef {
-    Id(EventTypeId),
-    Gts(String),
-    GtsPattern(String),
-}
-
-impl EventTypeRef {
-    pub fn id(id: EventTypeId) -> Self {
-        Self::Id(id)
-    }
-
-    pub fn gts(gts: impl Into<String>) -> Self {
-        Self::Gts(gts.into())
-    }
-
-    pub fn gts_pattern(pattern: impl Into<String>) -> Self {
-        Self::GtsPattern(pattern.into())
-    }
-}
-
-impl From<EventTypeId> for EventTypeRef {
-    fn from(value: EventTypeId) -> Self {
-        Self::Id(value)
     }
 }
 
@@ -153,7 +104,7 @@ impl From<EventTypeId> for EventTypeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConsumerGroupRef {
     Id(ConsumerGroupId),
-    Gts(String),
+    Gts(GtsInstanceId),
     AutoAnonymous { alias: String },
 }
 
@@ -166,8 +117,8 @@ impl ConsumerGroupRef {
         Self::Id(id)
     }
 
-    pub fn gts(gts: impl Into<String>) -> Self {
-        Self::Gts(gts.into())
+    pub fn gts(gts: GtsInstanceId) -> Self {
+        Self::Gts(gts)
     }
 
     pub fn auto_anonymous(alias: impl Into<String>) -> Self {
@@ -183,32 +134,16 @@ impl From<ConsumerGroupId> for ConsumerGroupRef {
     }
 }
 
-/// Broker-side filter engine reference accepted before registry resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FilterEngineRef {
-    Id(Uuid),
-    Gts(String),
-}
-
-impl FilterEngineRef {
-    pub fn id(id: Uuid) -> Self {
-        Self::Id(id)
-    }
-
-    pub fn gts(gts: impl Into<String>) -> Self {
-        Self::Gts(gts.into())
-    }
-}
-
-/// Per-interest imperative subscription filter.
+/// Per-interest imperative subscription filter. `engine` is the filter engine's
+/// GTS instance id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubscriptionFilterRef {
-    pub engine: FilterEngineRef,
+    pub engine: GtsInstanceId,
     pub expression: String,
 }
 
 impl SubscriptionFilterRef {
-    pub fn new(engine: FilterEngineRef, expression: impl Into<String>) -> Self {
+    pub fn new(engine: GtsInstanceId, expression: impl Into<String>) -> Self {
         Self {
             engine,
             expression: expression.into(),
@@ -217,20 +152,22 @@ impl SubscriptionFilterRef {
 
     pub fn cel(expression: impl Into<String>) -> Self {
         Self::new(
-            FilterEngineRef::gts(gts_id!(
-                "cf.core.events.filter.v1~cf.core.expression.cel.v1"
-            )),
+            GtsInstanceId::new(
+                gts_id!("cf.core.events.filter.v1~"),
+                "cf.core.expression.cel.v1",
+            ),
             expression,
         )
     }
 }
 
 /// Topic-scoped consumer interest. Event type selectors and filters belong to
-/// exactly one topic.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// exactly one topic. A selector is a [`GtsIdPattern`]: a bare type id already
+/// covers itself and its derived subtree, and `…event.v1~*` selects every type.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubscriptionInterest {
-    pub topic: TopicRef,
-    pub event_types: Vec<EventTypeRef>,
+    pub topic: GtsInstanceId,
+    pub event_types: Vec<GtsIdPattern>,
     pub filter: Option<SubscriptionFilterRef>,
 }
 
@@ -242,20 +179,20 @@ impl SubscriptionInterest {
 
 #[derive(Default)]
 pub struct SubscriptionInterestBuilder {
-    topic: Option<TopicRef>,
-    event_types: Vec<EventTypeRef>,
+    topic: Option<GtsInstanceId>,
+    event_types: Vec<GtsIdPattern>,
     filter: Option<SubscriptionFilterRef>,
 }
 
 impl SubscriptionInterestBuilder {
-    pub fn topic(mut self, topic: impl Into<TopicRef>) -> Self {
-        self.topic = Some(topic.into());
+    pub fn topic(mut self, topic: GtsInstanceId) -> Self {
+        self.topic = Some(topic);
         self
     }
 
     pub fn types<I>(mut self, event_types: I) -> Self
     where
-        I: IntoIterator<Item = EventTypeRef>,
+        I: IntoIterator<Item = GtsIdPattern>,
     {
         self.event_types.extend(event_types);
         self
@@ -271,13 +208,11 @@ impl SubscriptionInterestBuilder {
             .topic
             .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
                 detail: "subscription interest requires a topic".to_owned(),
-                instance: String::new(),
             })?;
         if self.event_types.is_empty() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "subscription interest requires at least one event type selector"
                     .to_owned(),
-                instance: String::new(),
             });
         }
         Ok(SubscriptionInterest {
@@ -469,49 +404,41 @@ impl ConsumerSettings {
         if self.buffering.partition_capacity == 0 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "partition buffer capacity must be greater than zero".to_owned(),
-                instance: String::new(),
             });
         }
         if self.buffering.high_watermark > self.buffering.partition_capacity {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "buffer high watermark must not exceed partition capacity".to_owned(),
-                instance: String::new(),
             });
         }
         if self.buffering.low_watermark > self.buffering.high_watermark {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "buffer low watermark must not exceed high watermark".to_owned(),
-                instance: String::new(),
             });
         }
         if self.batching.max_events == 0 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "batching max_events must be greater than zero".to_owned(),
-                instance: String::new(),
             });
         }
         if self.slow_detection.handler_strikes == 0 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "slow detection handler_strikes must be greater than zero".to_owned(),
-                instance: String::new(),
             });
         }
         if self.retry.max_delay < self.retry.base_delay {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "retry max_delay must be greater than or equal to base_delay".to_owned(),
-                instance: String::new(),
             });
         }
         if self.listener.channel_capacity == 0 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "listener channel capacity must be greater than zero".to_owned(),
-                instance: String::new(),
             });
         }
         if self.listener.timeout.is_zero() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "listener timeout must be greater than zero".to_owned(),
-                instance: String::new(),
             });
         }
         Ok(())
@@ -602,14 +529,14 @@ pub struct PartitionBufferStateSnapshot {
     pub group_id: ConsumerGroupId,
     pub subscription_id: SubscriptionId,
     pub topic_id: TopicId,
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: u32,
     pub state: PartitionBufferState,
     pub trigger: Option<SlowConsumerTrigger>,
     pub buffered_count: usize,
     pub capacity: usize,
-    pub latest_observed_offset: Option<i64>,
-    pub last_delivered_offset: Option<i64>,
+    pub latest_observed_offset: Option<Sequence>,
+    pub last_delivered_offset: Option<Sequence>,
     pub consecutive_slow_handlers: u16,
 }
 
@@ -617,7 +544,7 @@ pub struct PartitionBufferStateSnapshot {
 pub enum ConnectionDropReason {
     SlowConsumer {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
         trigger: SlowConsumerTrigger,
     },
@@ -629,9 +556,9 @@ pub enum ConnectionDropReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionProgress {
     pub topic_id: TopicId,
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
 }
 
 #[derive(Debug, Clone)]
@@ -670,37 +597,37 @@ pub enum ConsumerRuntimeEvent {
     },
     HandlerBatchStarted {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
         len: usize,
     },
     HandlerBatchCompleted {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
         outcome: BatchHandlerOutcome,
     },
     HandlerFailed {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
         error: String,
     },
     OffsetLoaded {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
-        position: ResolvedPosition,
+        position: Position,
     },
     OffsetCommitted {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     },
     RetryScheduled {
         topic_id: TopicId,
-        topic: String,
+        topic: GtsInstanceId,
         partition: u32,
         attempt: u16,
         delay: Duration,

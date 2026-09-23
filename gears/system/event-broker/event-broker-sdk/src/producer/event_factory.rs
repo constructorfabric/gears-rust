@@ -1,4 +1,5 @@
 use chrono::Utc;
+use gts::GtsTypeId;
 use uuid::Uuid;
 
 use crate::error::EventBrokerError;
@@ -37,19 +38,17 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
 
     let mut prepared = Event {
         id: Uuid::now_v7(),
-        type_id: type_id.to_owned(),
+        type_id: GtsTypeId::new(type_id),
         tenant_id,
         source: identity.source_ref().to_owned(),
         subject: subject.into_owned(),
-        subject_type: E::SUBJECT_TYPE.to_owned(),
+        subject_type: GtsTypeId::new(E::SUBJECT_TYPE),
         occurred_at: Utc::now(),
         trace_parent: event.trace_parent().map(|value| value.into_owned()),
         data: Some(data),
         partition: None,
         sequence: None,
         sequence_time: None,
-        offset: None,
-        offset_time: None,
         meta: None,
     };
 
