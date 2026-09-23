@@ -108,7 +108,16 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     let router = OperationBuilder::get(format!("{BASE}/types"))
         .operation_id("graph_storage.list_types")
         .summary("List registered types")
-        .description("Lists types, optionally narrowed by kind and by a GTS identifier pattern")
+        .description(
+            "Lists types, optionally narrowed by kind and by a GTS identifier \
+             pattern. Keep paging while `next_cursor` is non-null, even when \
+             `items` is empty: a `pattern` is applied after rows are read and \
+             the scan bounds each pass, so a page can legitimately carry no \
+             items and a cursor to resume from. An empty page means `nothing \
+             here yet`, not `nothing left` -- only a null `next_cursor` means \
+             that, and a client that stops on the empty page drops every \
+             later match.",
+        )
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])

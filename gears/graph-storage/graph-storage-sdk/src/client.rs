@@ -70,6 +70,17 @@ pub trait GraphStorageClientV1: Send + Sync {
         type_id: &GtsTypeId,
     ) -> Result<TypeRecord, CanonicalError>;
 
+    /// One page of the type catalogue.
+    ///
+    /// **Continue while `next_cursor` is `Some`, even when `items` is empty.**
+    /// This endpoint does not follow the common "stop when the page is empty"
+    /// convention. A `pattern` is applied after rows are read, and the scan
+    /// gives up its pass after a bounded number of rows; when no row in that
+    /// pass matches, the answer is an empty page carrying the cursor to resume
+    /// from. An empty page therefore means "nothing here yet", not "nothing
+    /// left" -- only a `next_cursor` of `None` means that. A client that stops
+    /// on the empty page silently drops every match beyond it, which is most
+    /// likely exactly where a selective pattern finds them.
     async fn list_types(
         &self,
         ctx: &SecurityContext,
