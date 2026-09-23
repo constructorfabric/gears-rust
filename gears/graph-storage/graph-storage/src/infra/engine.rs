@@ -22,7 +22,7 @@ use graph_storage_sdk::plugin_api::{
     PathResponse, PatternRequest, PatternResponse, ShortestPathRequest, StoreCtx,
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait as _};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt};
 use toolkit_security::AccessScope;
 use tracing::warn;
@@ -406,6 +406,17 @@ struct Incidence {
     over_edge_budget: bool,
 }
 
+/// The two fields an endpoint-visibility map is built from.
+///
+/// Named so the projection can be narrow. A `node::Model` here compiles, runs
+/// and answers correctly; it just carries a payload and a vector back per
+/// endpoint to be thrown away on the next line.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct EndpointKey {
+    id: i64,
+    node_key: String,
+}
+
 async fn live_edges(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
@@ -474,12 +485,23 @@ async fn live_edges(
     endpoint_ids.sort_unstable();
     endpoint_ids.dedup();
 
-    let visible = node::Entity::find()
+    // The key and the id, not the node. This runs per hop over every distinct
+    // endpoint the hop touched, and reading whole rows meant dragging back a
+    // payload and a 384-lane embedding per endpoint to build a map of two
+    // small fields -- on the latency path, where the cost scales with how wide
+    // the tenant's payloads happen to be rather than with the work.
+    let visible: Vec<EndpointKey> = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::Id.is_in(endpoint_ids)))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(runner)
+        .project_all(runner, |query| {
+            query
+                .select_only()
+                .column(node::Column::Id)
+                .column(node::Column::NodeKey)
+                .into_model::<EndpointKey>()
+        })
         .await
         .map_err(scope_error)?;
     let keys: std::collections::BTreeMap<i64, String> =
