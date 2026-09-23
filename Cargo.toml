@@ -91,6 +91,7 @@ members = [
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
+    "gears/credstore/plugins/vault-credstore-plugin",
     "gears/graph-storage/graph-storage-sdk",
     "gears/graph-storage/graph-storage",
     "gears/graph-storage/onnx-embedding-plugin",
