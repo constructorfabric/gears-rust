@@ -597,6 +597,19 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
 
 /// Spawned tasks again, so a multi-thread runtime rather than `pg_case!`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_type_updates_do_not_share_one_revision() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_type_updates_do_not_share_one_revision(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+/// Spawned tasks again, so a multi-thread runtime rather than `pg_case!`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     let Some(stand) = stand(HopStrategy::Pgq).await else {
         return;

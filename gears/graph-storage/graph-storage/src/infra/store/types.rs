@@ -18,7 +18,7 @@ use graph_storage_sdk::models::{
 };
 use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
 use toolkit_db::secure::{SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 
 use crate::domain::{evolution, ontology};
@@ -438,22 +438,30 @@ async fn register_in_tx(
             // so the default path is unchanged.
             if stored_resolution_is_stale && update && !options.dry_run {
                 let revision = model.revision.saturating_add(1);
-                gts_type::Entity::update_many()
+                let written = gts_type::Entity::update_many()
                     .col_expr(
                         gts_type::Column::EffectiveTraits,
                         Expr::value(traits_json.clone()),
                     )
-                    .col_expr(gts_type::Column::Revision, Expr::value(revision))
+                    .col_expr(
+                        gts_type::Column::Revision,
+                        Expr::col(gts_type::Column::Revision).add(1),
+                    )
                     .col_expr(
                         gts_type::Column::UpdatedAt,
                         Expr::value(time::OffsetDateTime::now_utc()),
                     )
-                    .filter(Condition::all().add(gts_type::Column::Id.eq(model.id)))
+                    .filter(
+                        Condition::all()
+                            .add(gts_type::Column::Id.eq(model.id))
+                            .add(gts_type::Column::Revision.eq(model.revision)),
+                    )
                     .secure()
                     .scope_with(scope)
                     .exec(tx)
                     .await
                     .map_err(map_scope_err)?;
+                revision_moved(written.rows_affected, &descriptor.type_id)?;
                 super::ingest::bump_revision(tenant, scope, tx).await?;
                 out.push(RegisteredType {
                     record: written_record(&model, &descriptor, revision),
@@ -569,7 +577,7 @@ async fn register_in_tx(
         }
 
         let revision = model.revision.saturating_add(1);
-        gts_type::Entity::update_many()
+        let written = gts_type::Entity::update_many()
             .col_expr(
                 gts_type::Column::TypeSchema,
                 Expr::value(descriptor.schema.clone()),
@@ -578,17 +586,25 @@ async fn register_in_tx(
                 gts_type::Column::EffectiveTraits,
                 Expr::value(traits_json.clone()),
             )
-            .col_expr(gts_type::Column::Revision, Expr::value(revision))
+            .col_expr(
+                gts_type::Column::Revision,
+                Expr::col(gts_type::Column::Revision).add(1),
+            )
             .col_expr(
                 gts_type::Column::UpdatedAt,
                 Expr::value(time::OffsetDateTime::now_utc()),
             )
-            .filter(Condition::all().add(gts_type::Column::Id.eq(model.id)))
+            .filter(
+                Condition::all()
+                    .add(gts_type::Column::Id.eq(model.id))
+                    .add(gts_type::Column::Revision.eq(model.revision)),
+            )
             .secure()
             .scope_with(scope)
             .exec(tx)
             .await
             .map_err(map_scope_err)?;
+        revision_moved(written.rows_affected, &descriptor.type_id)?;
         // A read at the previous revision could refuse a filter this definition
         // admits, or accept a payload it now rejects. That is exactly what the
         // revision exists to fence, so an accepted update advances it — once
@@ -1044,6 +1060,33 @@ pub async fn list_types(
 /// catalogue inside one request; the caller gets a short page and a cursor,
 /// which is the same contract as any other short page.
 pub const MAX_CATALOGUE_PASSES: usize = 16;
+
+/// Report a type-revision compare-and-set that matched nothing.
+///
+/// The revision is written as `revision + 1` computed by `PostgreSQL` from the
+/// row's own value, and filtered on the revision this transaction read.
+/// Computing `N + 1` here and writing it as a literal is the read-compute-write
+/// that was fixed for the graph revision and for `node.version` earlier in this
+/// work: two registrations both read `N`, both write `N + 1`, and two committed
+/// definitions share one revision. A consumer that caches by revision then
+/// holds one number for two different schemas, which is the fencing the column
+/// exists to provide, gone.
+///
+/// The filter is what makes the loser visible. Without it the database-side
+/// increment alone would still advance twice, but the value this call reports
+/// back would be a guess, since the row's value at write time is not the one
+/// that was read.
+fn revision_moved(rows_affected: u64, type_id: &str) -> Result<(), GraphStoreError> {
+    if rows_affected == 0 {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "type `{type_id}` was registered again while this registration was being \
+                 decided; re-read it and retry against the revision it has now"
+            ),
+        });
+    }
+    Ok(())
+}
 
 pub async fn resolve_type_set(
     store: &PgGraphStore,

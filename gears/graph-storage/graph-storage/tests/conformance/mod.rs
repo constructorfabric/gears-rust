@@ -3754,6 +3754,100 @@ pub async fn two_writers_with_one_expected_version_do_not_both_win(
     );
 }
 
+/// Two concurrent updates of one type never share a revision.
+///
+/// `revision` is the type's own fencing token: a read at the previous revision
+/// could refuse a filter the new definition admits, so a consumer caching by
+/// it must never see two different definitions under one number. The update
+/// used to read `revision`, compute `N + 1` in Rust and write that literal
+/// filtered on the row id alone -- the same read-compute-write already fixed
+/// for the graph revision and for `node.version`, and left in place here. Two
+/// registrations both reading `N` both wrote `N + 1`, and one accepted change
+/// went unaccounted for.
+///
+/// The invariant is arithmetic and so does not depend on who wins: the
+/// revision advances exactly once per accepted update. Both attempts offer the
+/// same widening, so whichever lands second finds its schema already stored
+/// and converges without advancing anything -- one `Updated`, one revision.
+/// Under the old code a lost update reported `Updated` as well, and the count
+/// and the revision stopped agreeing.
+pub async fn two_type_updates_do_not_share_one_revision(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(requirement_v1());
+    store
+        .register_types(&reader, types)
+        .await
+        .expect("the ontology registers");
+
+    let before = store
+        .get_type(&reader, &EVOLVING.to_owned())
+        .await
+        .expect("the type is readable")
+        .revision;
+
+    // A widened enum: compatible from the schemas alone, so both attempts are
+    // admissible and neither needs to read a row.
+    let widened = || {
+        requirement_revision(
+            &requirement_properties(&["proposed", "approved", "done"], false, false),
+            &["key", "statement"],
+            &["/payload/status"],
+        )
+    };
+
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let attempt = || {
+        let store = std::sync::Arc::clone(&store);
+        let gate = std::sync::Arc::clone(&gate);
+        let registration = widened();
+        tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = ctx(tenant, &scope, None);
+            gate.wait().await;
+            store
+                .register_types_with(&ctx, vec![registration], update_options())
+                .await
+        })
+    };
+    // Spawned before either is awaited, as the other races here are.
+    let first_task = attempt();
+    let second_task = attempt();
+    let first = first_task.await.expect("the task does not panic");
+    let second = second_task.await.expect("the task does not panic");
+
+    let updates: usize = [&first, &second]
+        .into_iter()
+        .map(|outcome| match outcome {
+            Ok(registered) => registered
+                .iter()
+                .filter(|r| r.outcome == graph_storage_sdk::models::TypeOutcome::Updated)
+                .count(),
+            // A compare-and-set loser is a conflict, which is an answer and
+            // not a failure of this case.
+            Err(GraphStoreError::Conflict { .. }) => 0,
+            Err(other) => panic!("unexpected refusal: {other}"),
+        })
+        .sum();
+
+    let after = store
+        .get_type(&reader, &EVOLVING.to_owned())
+        .await
+        .expect("the type is readable")
+        .revision;
+
+    let advanced = usize::try_from(after - before).expect("a revision never goes backwards");
+    assert_eq!(
+        advanced, updates,
+        "the revision advances once per accepted update: {updates} update(s) took it from \
+         {before} to {after}"
+    );
+}
+
 /// A delete racing an upsert of the same node: the answer is one of two, and
 /// the row agrees with it.
 ///

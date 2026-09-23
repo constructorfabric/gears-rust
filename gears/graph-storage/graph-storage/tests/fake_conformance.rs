@@ -407,6 +407,19 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
     .await;
 }
 
+/// Run here too: the in-memory store serializes registrations under one lock,
+/// so the race cannot open, and what this holds it to is the same arithmetic --
+/// one revision per accepted update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_type_updates_do_not_share_one_revision() {
+    conformance::two_type_updates_do_not_share_one_revision(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Run here too, so both stores answer a delete racing an upsert the same
 /// way. The window itself cannot open in this one -- the lock is held across
 /// the whole of `ingest` -- so what this proves for the fake store is that the
