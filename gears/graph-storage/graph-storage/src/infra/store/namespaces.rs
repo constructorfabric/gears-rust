@@ -263,7 +263,8 @@ async fn transfer_in_tx(
     if written.rows_affected == 0 {
         return Err(GraphStoreError::Conflict {
             reason: format!(
-                "namespace `{namespace}` was transferred by someone else while this                  transfer was being decided; re-read the owner and retry"
+                "namespace `{namespace}` was transferred by someone else while this transfer was \
+                 being decided; re-read the owner and retry"
             ),
         });
     }
