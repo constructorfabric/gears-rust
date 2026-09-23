@@ -52,7 +52,7 @@ The example server uses the gear prefix `/cf`. This comes from `gears.api-gatewa
 gears:
   credstore:
     config:
-      vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric")
+      vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric"; "constructorfabric" -> static-credstore-plugin, "openbao" -> vault-credstore-plugin)
       gc:
         pending_max_age_secs: 3600 # pending-intent reclaim threshold (default: 3600)
         batch_size: 256             # rows per batch in the maintenance job's passes (default: 256)
@@ -69,6 +69,13 @@ operator-chosen schedule outside the gear, not on an in-gear timer.
 an opaque version id, minted by the gear on write — there is no way to seed
 one directly in the plugin's own configuration. Always create/rotate a
 credential with `PUT`/`PATCH` below so a record exists.
+
+Two backend plugins currently exist: `static-credstore-plugin` (in-memory,
+for dev/test, feature `static-credstore`) and `vault-credstore-plugin`
+(Vault/OpenBao KV v2, prototype, feature `vault-credstore`, vendor
+`"openbao"`) — see its
+[README](plugins/vault-credstore-plugin/README.md) for local setup against
+OpenBao.
 
 ## PDP actions and permissions
 
