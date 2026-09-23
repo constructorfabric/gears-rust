@@ -38,6 +38,17 @@ pub type LabelId = i32;
 // ---------------------------------------------------------------------------
 
 /// Kind of a registrable GTS type.
+///
+/// One of this crate's **closed enums**: a fixed set that is stored as `TEXT`
+/// under a `CHECK` constraint and carried over REST as a plain string, so the
+/// storage form and the wire form are the same string. DESIGN
+/// § Closed Enum Contract is normative for all of them, and states the three
+/// rules a client depends on: a spelling never changes meaning and is never
+/// reused; adding a variant is compatible while removing or renaming one is
+/// breaking; and an unrecognized value must be carried through or refused by
+/// name, never mapped onto a known variant or defaulted -- an unknown outcome
+/// decoded as `ok` turns a value the server chose into one it denied. The set
+/// is not an extension point: a deployment cannot add to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeKind {
     Node,

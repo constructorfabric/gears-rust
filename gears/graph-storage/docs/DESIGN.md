@@ -2300,6 +2300,45 @@ p2. They are separated deliberately: the tombstone is reversible and cheap,
 while purge has to decide cascade ordering, key reuse and index reconciliation,
 and none of those need to block v1.
 
+### Closed Enum Contract
+
+Several values cross both the storage boundary and the wire as short lowercase
+strings: `gts_type.kind` (`node` / `edge` / `attribute`), readiness states, item
+and type outcomes, truncation reasons, search arms and modes, adjacency sides
+and directions. In the database they are `TEXT` under a `CHECK`; in the SDK they
+are Rust enums; over REST they are plain strings. Three rules apply to all of
+them, and a fourth to none of them.
+
+**1. A spelling is permanent.** Once a variant has been written to a database or
+returned over the wire, its string never changes meaning and is never reused for
+a different one. Renaming `attribute` is not a rename, it is a new variant plus
+a migration of every stored row; reusing a retired spelling is prohibited
+outright, because a row written years earlier carries no version to disambiguate
+it. There is no numeric form and none will be added: the storage form is the
+wire form, so there is nothing to renumber.
+
+**2. Adding a variant is a compatible change; removing or renaming one is
+breaking.** An addition needs a migration to widen the `CHECK` and it may make a
+server return a value an older client has never seen, which rule 3 covers. A
+removal or a rename invalidates stored rows and is a breaking change to both the
+schema and the API, handled as a version bump rather than a migration.
+
+**3. An unrecognized value is not an error, and is never silently coerced.** A
+client reading a value it does not know must either carry it through unchanged
+or refuse the specific item, and must not map it onto a variant it does know,
+drop it, or treat the response as malformed. The dangerous shape is a client
+whose decode falls back to a default: an unknown outcome read as `ok`, or an
+unknown readiness read as `ready`, converts a value the server chose into a
+value the server denied. Where a strict decode is preferred, the failure has to
+name the field and the value rather than report a generic parse error, because
+the operator's next question is which variant arrived.
+
+**4. These are not extension points.** A deployment does not add its own
+variants, and a producer cannot introduce one through a payload. The set is
+closed by the `CHECK` constraint and by the gear's own mapping, deliberately: an
+open set would have to be carried through every comparison, index and decision
+in this document with no way to say what the new value means.
+
 ### Label Contract
 
 Labels are per-tenant, N:N, and independent of the type system: attaching one
