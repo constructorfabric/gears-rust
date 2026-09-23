@@ -3754,6 +3754,117 @@ pub async fn two_writers_with_one_expected_version_do_not_both_win(
     );
 }
 
+/// A delete racing an upsert of the same node: the answer is one of two, and
+/// the row agrees with it.
+///
+/// `upsert_node` reads the row, sees no tombstone, and then writes. Those are
+/// two moments, and a `soft_delete` that commits between them used to leave
+/// the check passed and the write unguarded -- the update matched on id alone,
+/// so it rewrote a row that was by then a tombstone and answered `Updated`.
+/// The filter is in the statement now, so the loser matches nothing.
+///
+/// **What this case proves, and what carries the rest.** It drives the new
+/// write-time branch under real contention and pins that the branch answers
+/// correctly: the only refusal available here is the tombstone conflict, and
+/// after either outcome the key reads as gone.
+///
+/// The window is genuinely reached. The two tombstone refusals word
+/// themselves differently on purpose -- the pre-read check says a key "is
+/// tombstoned", the write-time filter says it "was tombstoned while this write
+/// was being prepared" -- and a measured run of sixteen rounds against
+/// `PostgreSQL` 19 produced both, along with rounds the upsert simply won.
+/// Every round that reported the second wording is a round the old code would
+/// have answered `Updated` on, having rewritten a row that was already a
+/// tombstone.
+///
+/// The assertions still do not *require* the window to be hit, because
+/// requiring it would be a flake on a machine that schedules differently. That
+/// is the one thing this case leaves to construction rather than to evidence,
+/// and construction covers it: the filter is in the statement, so the
+/// guarantee is a property of the SQL rather than of an interleaving. Forcing
+/// the window would need a hook holding `upsert_node` between its read and its
+/// write, and the store has none; the content of a tombstoned row cannot be
+/// read back to reconstruct the order either, since a tombstone reads as
+/// `NotFound`.
+pub async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // Sixteen rounds rather than one: the window is narrow, and a single
+    // round would mostly exercise the two orderings that were never in
+    // question -- the delete landing wholly before the read, or wholly after
+    // the write.
+    for round in 0..16 {
+        let key = format!("raced-{round}");
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(vec![node(&key, "before")], Vec::new()),
+        )
+        .await
+        .expect("the node is created");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let writer = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let key = key.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                ingest_batch(
+                    store.as_ref(),
+                    &ctx,
+                    batch(vec![node(&key, "after")], Vec::new()),
+                )
+                .await
+            })
+        };
+        let deleter = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let key = key.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                store.soft_delete(&ctx, DeleteRequest::Node(key)).await
+            })
+        };
+        // Both spawned before either is awaited, for the reason the other
+        // races in this file spell out: awaiting the first leaves it at a
+        // barrier nobody else has reached.
+        let upserted = writer.await.expect("the writer task does not panic");
+        let removal = deleter.await.expect("the deleter task does not panic");
+        removal.expect("the delete succeeds whichever order it lands in");
+
+        match upserted {
+            Ok(_) => {}
+            Err(GraphStoreError::Conflict { ref reason }) => assert!(
+                reason.contains("tombstone"),
+                "the only conflict available here is the tombstone, got: {reason}"
+            ),
+            Err(other) => panic!("unexpected refusal for {key}: {other}"),
+        }
+
+        assert!(
+            matches!(
+                store.get_node(&reader, &key, 0).await,
+                Err(GraphStoreError::NotFound)
+            ),
+            "whichever way the race went, the key is tombstoned afterwards: {key}"
+        );
+    }
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a

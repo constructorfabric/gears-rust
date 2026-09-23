@@ -595,6 +595,19 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
     .await;
 }
 
+/// Spawned tasks again, so a multi-thread runtime rather than `pg_case!`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::a_delete_racing_an_upsert_leaves_no_rewritten_tombstone(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Written out rather than `pg_case!`d, for the same reason as the scope
 /// race: the two ingests are spawned as separate tasks and need a runtime
 /// with threads to put them on.

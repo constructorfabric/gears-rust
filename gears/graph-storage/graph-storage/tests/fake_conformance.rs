@@ -407,6 +407,20 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
     .await;
 }
 
+/// Run here too, so both stores answer a delete racing an upsert the same
+/// way. The window itself cannot open in this one -- the lock is held across
+/// the whole of `ingest` -- so what this proves for the fake store is that the
+/// two orderings either side of the window agree with `PostgreSQL`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
+    conformance::a_delete_racing_an_upsert_leaves_no_rewritten_tombstone(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Spawned and multi-threaded like the case it shares, but the race it
 /// describes cannot happen here: this store takes one lock for the whole of
 /// `ingest` and holds it across the body, with no `.await` inside, so the

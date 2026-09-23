@@ -997,6 +997,14 @@ async fn upsert_node(
     if let Some(expected) = spec.expected_version {
         update = update.filter(Condition::all().add(node::Column::Version.eq(expected)));
     }
+    // The tombstone check above reads the row before this statement writes
+    // it, so on its own it is advice rather than a boundary: a delete that
+    // commits in between leaves the check passed and the row tombstoned. The
+    // filter is what makes the check hold at the instant of the write.
+    // Unconditional, unlike the version filter -- a caller does not opt into
+    // "do not resurrect what someone just deleted", and `soft_delete` never
+    // touches `version`, so the version CAS cannot see a delete either.
+    update = update.filter(Condition::all().add(node::Column::DeletedAt.is_null()));
     let written = update
         .col_expr(node::Column::GtsNodeTypeId, Expr::value(info.id))
         .col_expr(node::Column::Name, Expr::value(name))
@@ -1024,15 +1032,40 @@ async fn upsert_node(
         .await
         .map_err(map_scope_err)?;
 
-    // Nothing matched means the version moved between the read and the write,
-    // which only a compare-and-set filter can be here to notice. Answering
+    // Nothing matched means the row moved between the read and the write, and
+    // only a filter in the statement can be here to notice. Answering
     // `Updated` on zero rows would tell the caller its write landed.
-    if spec.expected_version.is_some() && written.rows_affected == 0 {
+    //
+    // Which filter missed is worth separating, because the two ask different
+    // things of the caller: a version that moved is retryable against the
+    // version the row has now, while a tombstone is not retryable at all
+    // before purge. The row is re-read to say which, and a row that has since
+    // vanished is reported as the tombstone case -- a delete is the only way
+    // it goes away, and saying "re-read and retry" about a row that is gone
+    // would send the caller in a circle.
+    if written.rows_affected == 0 {
+        let settled = node::Entity::find()
+            .filter(Condition::all().add(node::Column::Id.eq(id)))
+            .secure()
+            .scope_with(scope)
+            .one(tx)
+            .await
+            .map_err(map_scope_err)?;
+        let tombstoned = settled.as_ref().is_none_or(|row| row.deleted_at.is_some());
         return Err(GraphStoreError::Conflict {
-            reason: format!(
-                "node `{}` changed between the check and the write; re-read it and                  retry with the version it has now",
-                spec.node_key
-            ),
+            reason: if tombstoned {
+                format!(
+                    "node key `{}` was tombstoned while this write was being prepared, and a \
+                     tombstoned key cannot be re-ingested before purge",
+                    spec.node_key
+                )
+            } else {
+                format!(
+                    "node `{}` changed between the check and the write; re-read it and retry \
+                     with the version it has now",
+                    spec.node_key
+                )
+            },
         });
     }
 
