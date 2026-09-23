@@ -691,44 +691,32 @@ Handler                CanonicalError          Problem              Client
 1. Handler constructs `CanonicalError` via builder + `.create()` or `#[resource_error]` macro builder + `.create()`
 2. Handler returns `Err(canonical_error)` from the handler function
 3. Error middleware catches the error, calls `Problem::from_error()`
-4. Middleware sets `trace_id` from span context, `instance` from request URI
-5. Middleware logs error details server-side at WARN/ERROR with `trace_id` for correlation
+4. Middleware sets `trace_id` from the trace context, `instance` from request URI
+5. Middleware logs error details server-side at WARN/ERROR; the log-correlation formatter splices the live trace id onto the record for correlation
 6. Middleware returns `application/problem+json` response to client
 
 #### Trace ID Injection
 
 The `trace_id` and `instance` fields are **not** set by handler code. They are injected automatically by the error middleware layer when converting `CanonicalError` to `Problem`.
 
-**How trace_id is injected**:
-
-1. **Tracing span extraction**: The middleware extracts the trace ID from incoming request headers (`x-trace-id`, `x-request-id`, `traceparent`). If no W3C trace ID is available, the current span ID may be used as a temporary fallback until the W3C extraction workstream is completed.
-2. **Problem enrichment**: After calling `Problem::from_error()`, the middleware sets `trace_id` and `instance` before serializing the response
-3. **Logging correlation**: The same `trace_id` is used when logging error details at WARN/ERROR level
+**How trace_id is resolved**: W3C `traceparent` (32-hex trace-id segment) if present, otherwise the currently active OpenTelemetry span context. `x-request-id` and the tracing span handle are **not** used — they are different identifiers and would put a non-trace value on the wire. When neither source exists, `trace_id` is left absent.
 
 **Middleware implementation example**:
 
 ```rust
 use cf_toolkit_errors::{CanonicalError, Problem};
-use axum::http::Uri;
+use axum::http::{HeaderMap, Uri};
 
 // In error middleware layer:
-async fn handle_error(err: CanonicalError, uri: &Uri, trace_id: Option<String>) -> Problem {
-    let mut problem = Problem::from_error(err);
-
-    // Inject trace_id from span or request headers
-    problem.trace_id = trace_id.or_else(|| {
-        tracing::Span::current()
-            .id()
-            // Temporary fallback only; replace with W3C trace-id extraction.
-            .map(|id| format!("{:?}", id))
-    });
-
-    // Inject instance from request URI
+fn enrich(mut problem: Problem, uri: &Uri, headers: &HeaderMap) -> Problem {
+    // traceparent -> live OTel span context; absent otherwise.
+    problem.trace_id = extract_trace_id(headers);
     problem.instance = Some(uri.path().to_string());
-
     problem
 }
 ```
+
+The error-response log event does **not** carry its own `trace_id` field: the JSON log-correlation formatter splices the live span's `trace_id`/`span_id` onto the top level of every record, so a second nested copy would be a duplicate key.
 
 **Handler code does NOT set trace_id**:
 

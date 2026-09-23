@@ -6,10 +6,10 @@ Each handler that takes `extract::Json<T>` or `extract::Path<T>` must render
 a malformed request as a full RFC 9457 `Problem` body - not axum's default
 plain-text rejection. Every assertion below compares the complete response
 body as a literal dict, not a spot-checked subset, mirroring this PR's own
-Rust test convention (`assert_eq!(json, json!({...}))`). `trace_id` is the
-one field neither side can predict (a fresh, opaque per-request value) - it
-is copied from the real response into the expected dict before comparing,
-so the rest of the literal still has to match exactly.
+Rust test convention (`assert_eq!(json, json!({...}))`). `trace_id` is
+unpredictable and optional (emitted only when a trace context is in scope),
+so `_optional_trace_id` copies it from the response into the expected dict
+when present; the rest of the literal must match exactly.
 
 These exercise the real, running server (not a unit-level
 `tower::oneshot`), so they also confirm the migration didn't regress at the
@@ -21,6 +21,11 @@ import httpx
 import pytest
 
 from .conftest import REQUEST_TIMEOUT, TENANT_A_ID
+
+
+def _optional_trace_id(body: dict) -> dict:
+    """`{"trace_id": <value>}` when the response carries one, else `{}`."""
+    return {"trace_id": body["trace_id"]} if "trace_id" in body else {}
 
 
 def _users(base: str) -> str:
@@ -101,7 +106,7 @@ async def test_malformed_json_body_returns_problem_not_plain_text(base_url, auth
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -131,7 +136,7 @@ async def test_malformed_json_body_on_update_user(base_url, auth_headers, existi
             "status": 400,
             "detail": "Request validation failed",
             "instance": f"/users-info/v1/users/{existing_user}",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -160,7 +165,7 @@ async def test_malformed_json_body_on_create_city(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/cities",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -189,7 +194,7 @@ async def test_malformed_json_body_on_put_user_address(base_url, auth_headers, e
             "status": 400,
             "detail": "Request validation failed",
             "instance": f"/users-info/v1/users/{existing_user}/address",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -219,7 +224,7 @@ async def test_wrong_field_type_returns_422(base_url, auth_headers):
             "status": 422,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -250,7 +255,7 @@ async def test_missing_required_field_returns_422(base_url, auth_headers):
             "status": 422,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -282,7 +287,7 @@ async def test_missing_content_type_returns_415(base_url, auth_headers):
             "status": 415,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -312,7 +317,7 @@ async def test_invalid_path_uuid_returns_problem_not_plain_text(base_url, auth_h
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -336,7 +341,7 @@ async def test_invalid_path_uuid_on_delete_user(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -361,7 +366,7 @@ async def test_invalid_path_uuid_on_get_city(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/cities/not-a-uuid",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -386,7 +391,7 @@ async def test_invalid_path_uuid_on_user_address(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid/address",
-            "trace_id": body["trace_id"],
+            **_optional_trace_id(body),
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{

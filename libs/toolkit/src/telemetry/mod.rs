@@ -6,6 +6,7 @@
 pub mod config;
 pub mod init;
 pub mod throttled_log;
+pub(crate) mod trace_context;
 
 pub use config::{
     Exporter, HttpOpts, LogsCorrelation, MetricsConfig, OpenTelemetryConfig, OpenTelemetryResource,

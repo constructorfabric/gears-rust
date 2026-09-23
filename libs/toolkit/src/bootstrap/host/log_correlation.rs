@@ -59,7 +59,7 @@ where
             return self.inner.format_event(ctx, writer, event);
         }
 
-        let Some(ids) = current_trace_ids() else {
+        let Some(ids) = crate::telemetry::trace_context::current_trace_ids() else {
             // No active OTel span (or no tracer installed): nothing to add.
             return self.inner.format_event(ctx, writer, event);
         };
@@ -75,31 +75,6 @@ where
             None => writer.write_str(&buf),
         }
     }
-}
-
-/// The ids of the currently active span, if there is a valid one.
-///
-/// Reads OpenTelemetry's own thread-local context. `OpenTelemetrySpanExt::context()`
-/// would be the obvious route but it re-enters the subscriber to build the span,
-/// which is not possible from inside `on_event` — it silently yields an empty
-/// context there. `OpenTelemetryLayer` attaches the context on span entry
-/// (`context_activation`, on by default), so by the time an event is formatted
-/// the current context already carries the span.
-fn current_trace_ids() -> Option<(String, String)> {
-    use opentelemetry::trace::TraceContextExt as _;
-
-    let context = opentelemetry::Context::current();
-    let span = context.span();
-    let span_context = span.span_context();
-    if !span_context.is_valid() {
-        return None;
-    }
-    // `Display` for both is lowercase hex (32 and 16 chars), matching the
-    // `traceparent` wire form and `toolkit_http::otel::parse_trace_id`.
-    Some((
-        span_context.trace_id().to_string(),
-        span_context.span_id().to_string(),
-    ))
 }
 
 /// Insert the ids into a rendered JSON object, before its closing brace.

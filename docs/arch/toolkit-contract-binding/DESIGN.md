@@ -808,9 +808,9 @@ The span code is routed through a `#[doc(hidden)] pub use tracing as __tracing;`
 `toolkit-contract`, so SDK crates need no direct `tracing` dependency.
 
 **`request_id`.** By convention `request_id == trace_id` (the W3C `traceparent` 32-hex trace-id). The
-server-side error envelope already derives it via the fallback chain
-`traceparent → x-trace-id → x-request-id → span-id` (`libs/toolkit/src/api/canonical_error_layer.rs`).
-No separate request-context type is introduced.
+server-side error envelope already derives it from the W3C `traceparent`, falling back to the live
+`OTel` span context (`libs/toolkit/src/api/canonical_error_layer.rs`). No separate request-context
+type is introduced.
 
 **Metrics.** RED metrics (`http.client.request.duration`, labeled by `client_type` = the projection
 trait name) are **feature-gated on `otel`**. The `toolkit-contract` `otel` feature forwards
