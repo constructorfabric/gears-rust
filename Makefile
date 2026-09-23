@@ -66,6 +66,14 @@ define check_tool
     @command -v $(1) >/dev/null || (echo "ERROR: $(1) is not installed. Run 'make setup' to install required tools." && exit 1)
 endef
 
+# Dockerfiles that use BuildKit cache mounts need the Buildx CLI plugin. Without
+# it `docker build` stops at "BuildKit is enabled but the buildx component is
+# missing or broken", which does not say which plugin to install. $(1) is the
+# Dockerfile that needs it.
+define check_docker_buildx
+    @docker buildx version >/dev/null 2>&1 || (echo "ERROR: 'docker buildx' is not available, and $(1) uses BuildKit cache mounts. Install the Buildx plugin for your Docker distribution - see 'Prepare environment > Docker' in docs/web-docs/build-with-gears/index.mdx." && exit 1)
+endef
+
 # Minimum tool versions — checked via `cargo gears tools check-version`.
 DENY_MIN_VERSION := 0.20.0
 NEXTEST_MIN_VERSION := 0.9.130
@@ -342,7 +350,7 @@ clippy-deep:
 lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs
+	lychee --exclude-path 'docs/web-docs' *.md docs examples guidelines gears/system/event-broker/docs
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
@@ -1223,6 +1231,7 @@ ifeq ($(shell uname -s),Linux)
 	@rm -rf .docker-stage
 else
 	@echo "==> Non-linux host: full Docker build"
+	$(call check_docker_buildx,mini-chat.Dockerfile)
 	DOCKER_BUILDKIT=1 docker build \
 		-f gears/mini-chat/deploy/docker/mini-chat.Dockerfile \
 		--build-arg CARGO_FEATURES="$(MINI_CHAT_K8S_FEATURES)" \

@@ -113,6 +113,47 @@ pipx install git+https://github.com/constructorfabric/studio.git
 </TabItem>
 </Tabs>
 
+### Docker, for the container-based lanes
+
+Building the framework and running `make quickstart` need no Docker. These targets do:
+`make e2e-docker`, `make test-pgq`, `make e2e-usage-collector`, and `make mini-chat-docker`.
+
+They need a running Docker daemon **and** two CLI plugins: **Compose**, which brings up the
+test environments, and **Buildx**, because `gears/mini-chat/deploy/docker/mini-chat.Dockerfile`
+uses BuildKit cache mounts and cannot be built without it.
+
+Any Docker distribution will do. Check the one you have:
+
+```sh
+docker version          # a daemon is reachable
+docker compose version  # Compose plugin
+docker buildx version   # Buildx plugin
+```
+
+If all three print a version, you are ready. If a plugin reports `unknown command`, install it
+for your platform:
+
+- **Linux, and Windows inside WSL 2** — the official Docker Engine packages already include
+  both: `docker-buildx-plugin` and `docker-compose-plugin`. Install the missing one with your
+  package manager if the engine was set up without it.
+- **Windows** — Docker Desktop with the WSL 2 backend exposes its daemon to the Ubuntu
+  distribution, so the checks above should pass inside WSL. Installing Docker Engine directly
+  in the Ubuntu distribution works too; then follow the Linux note.
+- **macOS with the Homebrew `docker` formula** — that formula is the client only, so neither
+  plugin is present and no plugin directory is created. This is the usual setup when the daemon
+  comes from colima, Lima, or another non-Desktop runtime:
+
+  ```sh
+  brew install docker-buildx docker-compose
+  mkdir -p ~/.docker/cli-plugins
+  ln -sfn "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" ~/.docker/cli-plugins/docker-buildx
+  ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose
+  ```
+
+Integrated distributions such as Docker Desktop, OrbStack, and Rancher Desktop ship both
+plugins. If a check fails on one of those, the daemon is most likely not running rather than a
+plugin missing.
+
 ## Build and run
 
 :::caution[No published crate yet]
