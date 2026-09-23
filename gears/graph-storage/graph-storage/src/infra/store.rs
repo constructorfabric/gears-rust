@@ -32,7 +32,7 @@ use graph_storage_sdk::plugin_api::{
 };
 use toolkit_db::secure::{Db, ScopeError};
 
-use crate::config::GraphStorageConfig;
+use crate::config::{GraphStorageConfig, ValidatedConfig};
 
 /// The built-in store.
 pub struct PgGraphStore {
@@ -44,11 +44,15 @@ pub struct PgGraphStore {
 }
 
 impl PgGraphStore {
+    /// Takes a [`ValidatedConfig`] rather than a [`GraphStorageConfig`]: the
+    /// ranges are refused at startup so a deployment asking for the impossible
+    /// does not boot into something else, and asking for the checked type here
+    /// is what keeps a second construction path from skipping that.
     #[must_use]
-    pub fn new(db: Arc<Db>, config: GraphStorageConfig, pgq_available: bool) -> Self {
+    pub fn new(db: Arc<Db>, config: ValidatedConfig, pgq_available: bool) -> Self {
         Self {
             db,
-            config,
+            config: config.into_inner(),
             pgq_available,
         }
     }

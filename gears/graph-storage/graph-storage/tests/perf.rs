@@ -150,7 +150,9 @@ async fn stand() -> Option<Stand> {
         GraphStorageConfig {
             traversal_hop: HopStrategy::Pgq,
             ..GraphStorageConfig::default()
-        },
+        }
+        .validated()
+        .expect("the perf configuration is valid"),
         pgq,
     ));
     let engine = PgGraphEngine::new(Arc::clone(&store));

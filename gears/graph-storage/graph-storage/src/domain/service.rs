@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 
-use crate::config::GraphStorageConfig;
+use crate::config::{GraphStorageConfig, ValidatedConfig};
 use crate::domain::embedding;
 use crate::domain::embedding::EmbeddingCoordinator;
 use crate::domain::error::DomainError;
@@ -56,15 +56,19 @@ struct Authorized {
 }
 
 impl GraphServices {
+    /// Takes a [`ValidatedConfig`] for the same reason `PgGraphStore::new`
+    /// does: the byte budgets and limits here are enforced at startup, and a
+    /// construction path that skipped the check would run outside them
+    /// silently.
     pub fn new(
-        config: GraphStorageConfig,
+        config: ValidatedConfig,
         store: Arc<dyn GraphStoreV1>,
         engine: Arc<dyn GraphEngineV1>,
         enforcer: PolicyEnforcer,
         embedding: EmbeddingCoordinator,
     ) -> Self {
         Self {
-            config,
+            config: config.into_inner(),
             store,
             engine,
             enforcer,

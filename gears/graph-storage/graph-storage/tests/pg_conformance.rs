@@ -249,7 +249,11 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
     // The stand probes exactly as the gear's composition root does, so a
     // change to the probe is exercised by every case here.
     let pgq_available = graph_storage::infra::engine::probe_pgq(&db).await;
-    let store = Arc::new(PgGraphStore::new(Arc::clone(&db), config, pgq_available));
+    let store = Arc::new(PgGraphStore::new(
+        Arc::clone(&db),
+        config.validated().expect("the test configuration is valid"),
+        pgq_available,
+    ));
     let engine = PgGraphEngine::new(Arc::clone(&store));
     Some(Stand {
         store,
@@ -293,7 +297,13 @@ async fn store_with(stand: &Stand, options: &str) -> Arc<PgGraphStore> {
     .unwrap_or_else(|error| panic!("a second pool with `{options}` connects: {error}"));
     let db = Arc::new(db);
     let pgq = graph_storage::infra::engine::probe_pgq(&db).await;
-    Arc::new(PgGraphStore::new(db, GraphStorageConfig::default(), pgq))
+    Arc::new(PgGraphStore::new(
+        db,
+        GraphStorageConfig::default()
+            .validated()
+            .expect("the default configuration is valid"),
+        pgq,
+    ))
 }
 
 /// Filtered vector search under-returns without `hnsw.iterative_scan`.
@@ -1509,7 +1519,9 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         GraphStorageConfig {
             traversal_hop: HopStrategy::Pgq,
             ..GraphStorageConfig::default()
-        },
+        }
+        .validated()
+        .expect("the test configuration is valid"),
         graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
     )));
     let again = unprobed

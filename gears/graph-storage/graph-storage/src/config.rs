@@ -236,7 +236,71 @@ macro_rules! check_range {
     };
 }
 
+/// A [`GraphStorageConfig`] whose ranges have been checked.
+///
+/// The only way to obtain one is [`GraphStorageConfig::validated`], so a
+/// constructor that asks for this cannot be handed a config nobody checked.
+/// That used to depend on every call site remembering to call `validate`
+/// first, which held only because there was one production call site: a second
+/// path -- another gear variant, a test helper promoted to production -- would
+/// have run with out-of-range limits and byte budgets and said nothing, since
+/// the ranges are refused at startup precisely so a deployment that asks for
+/// the impossible does not boot into something else.
+///
+/// It is a newtype rather than a parse into a different shape because the
+/// checked and unchecked values are the same value; what differs is whether
+/// anything has looked at it.
+#[derive(Clone, Debug)]
+pub struct ValidatedConfig(GraphStorageConfig);
+
+impl ValidatedConfig {
+    /// The checked configuration.
+    #[must_use]
+    pub fn into_inner(self) -> GraphStorageConfig {
+        self.0
+    }
+
+    /// Carry a configuration past the ranges, for tests only.
+    ///
+    /// Several cases exist to prove what happens *at* a limit, and the
+    /// cheapest way to reach one is to set it low: a response budget of a
+    /// kilobyte, or an interactive deadline of zero seconds. Those are not
+    /// configurations a deployment may have -- which is the point of the
+    /// ranges -- and the zero deadline has no legal equivalent at all, so
+    /// rewriting the cases against the floors would not have been possible
+    /// even at the price of multi-megabyte fixtures.
+    ///
+    /// This is `cfg`-gated to tests and the `test-support` feature, so no
+    /// production path can reach it. The guarantee `ValidatedConfig` carries
+    /// is that nothing *shipped* constructs a store or a service from a
+    /// configuration nobody checked; it was never that the type is
+    /// unconstructible.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn unchecked(config: GraphStorageConfig) -> Self {
+        Self(config)
+    }
+}
+
+impl std::ops::Deref for ValidatedConfig {
+    type Target = GraphStorageConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl GraphStorageConfig {
+    /// Check the hard ranges and carry the proof in the type.
+    ///
+    /// # Errors
+    /// Every range violation at once, not the first -- an operator fixing a
+    /// configuration file should see the whole list.
+    pub fn validated(self) -> anyhow::Result<ValidatedConfig> {
+        self.validate()?;
+        Ok(ValidatedConfig(self))
+    }
+
     /// Enforce the hard ranges of the Capacity and Admission Contract.
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errors: Vec<String> = Vec::new();
@@ -389,6 +453,31 @@ mod tests {
         GraphStorageConfig::default()
             .validate()
             .unwrap_or_else(|e| panic!("defaults must validate: {e}"));
+    }
+
+    /// The checked type cannot be made out of a config that fails the check,
+    /// which is the whole point of it: `PgGraphStore::new` and
+    /// `GraphServices::new` ask for `ValidatedConfig`, so there is no
+    /// construction path that skips the ranges. This test is the assertion
+    /// that `validated` refuses; that the constructors demand the type is
+    /// enforced by the compiler, and the test call sites that had to be
+    /// changed to call `validated` are the evidence.
+    #[test]
+    fn an_out_of_range_config_cannot_become_a_validated_one() {
+        let refused = GraphStorageConfig {
+            embedding_dimension: 0,
+            ..GraphStorageConfig::default()
+        }
+        .validated();
+        assert!(
+            refused.is_err(),
+            "a zero embedding width is outside the hard range and must not validate"
+        );
+
+        assert!(
+            GraphStorageConfig::default().validated().is_ok(),
+            "and the defaults still produce one"
+        );
     }
 
     /// Every number legal on its own, and the product is four gigabytes.

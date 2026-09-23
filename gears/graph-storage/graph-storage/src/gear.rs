@@ -38,8 +38,7 @@ impl Default for GraphStorage {
 #[async_trait]
 impl Gear for GraphStorage {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        let cfg: GraphStorageConfig = ctx.config_or_default()?;
-        cfg.validate()?;
+        let cfg = ctx.config_or_default::<GraphStorageConfig>()?.validated()?;
         debug!(
             traversal_hop = ?cfg.traversal_hop,
             ingest_max_nodes = cfg.ingest_max_nodes,

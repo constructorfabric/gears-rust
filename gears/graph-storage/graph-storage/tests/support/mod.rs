@@ -19,7 +19,7 @@ use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use authz_resolver_sdk::pep::PolicyEnforcer;
-use graph_storage::config::GraphStorageConfig;
+use graph_storage::config::{GraphStorageConfig, ValidatedConfig};
 use graph_storage::domain::service::GraphServices;
 use graph_storage::infra::fake_store::FakeGraphStore;
 use graph_storage_sdk::models::{Direction, EdgeRef, GraphRevision, NodeId};
@@ -250,7 +250,9 @@ impl Harness {
         });
         Self {
             services: Arc::new(GraphServices::new(
-                GraphStorageConfig::default(),
+                GraphStorageConfig::default()
+                    .validated()
+                    .expect("the default configuration is valid"),
                 store,
                 engine,
                 PolicyEnforcer::new(authz),
@@ -267,7 +269,10 @@ impl Harness {
         });
         Self {
             services: Arc::new(GraphServices::new(
-                config,
+                // Deliberately unchecked: cases reach a limit by setting it
+                // below the hard range, which is the only cheap way to prove
+                // what happens there, and a zero deadline has no legal value.
+                ValidatedConfig::unchecked(config),
                 store,
                 engine,
                 PolicyEnforcer::new(authz),
