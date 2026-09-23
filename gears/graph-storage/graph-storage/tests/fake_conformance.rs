@@ -49,6 +49,7 @@ async fn an_edge_type_refuses_an_endpoint_it_does_not_admit() {
 #[tokio::test]
 async fn a_recorded_idempotency_key_replays() {
     conformance::idempotency(&store(), Uuid::now_v7()).await;
+    conformance::a_keyless_retry_is_a_new_request(&store(), Uuid::now_v7()).await;
 }
 
 #[tokio::test]

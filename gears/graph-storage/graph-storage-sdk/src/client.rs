@@ -80,6 +80,17 @@ pub trait GraphStorageClientV1: Send + Sync {
 
     /// Apply one atomic ingest batch. `request.idempotency_key` carries the
     /// same value the REST path reads from the `Idempotency-Key` header.
+    ///
+    /// The key is optional, and it is what makes a retry safe after an unknown
+    /// commit outcome -- the case where the batch committed and the response
+    /// was lost. With a key, an identical retry returns the recorded outcome
+    /// and touches no graph state; the same key with a different request is a
+    /// conflict. **Without one, none of that happens**: no receipt is read and
+    /// none is written, so a retry is a new logical request that re-runs the
+    /// write path. That is not always harmless -- a batch that replaces a scope
+    /// removes what it does not re-declare, and running it twice is not the
+    /// same as running it once. A producer that retries on timeout should send
+    /// a key.
     async fn ingest(
         &self,
         ctx: &SecurityContext,

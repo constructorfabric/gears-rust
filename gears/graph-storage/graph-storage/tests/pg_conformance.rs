@@ -420,6 +420,10 @@ pg_case!(
 
 pg_case!(a_recorded_idempotency_key_replays, conformance::idempotency);
 pg_case!(
+    a_keyless_retry_is_a_new_request,
+    conformance::a_keyless_retry_is_a_new_request
+);
+pg_case!(
     a_document_is_retrieved_by_its_own_text,
     conformance::a_document_is_retrieved_by_its_own_text
 );

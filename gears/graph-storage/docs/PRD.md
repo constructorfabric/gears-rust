@@ -287,12 +287,12 @@ Type registrations whose declared `index`, `full_text_search` or `vector_search`
 
 The system **MUST** accept batches of nodes and edges in one ingest request, validate every payload against its GTS type before writing, and apply the batch atomically — either all valid writes commit or the batch is rejected with per-item errors. Writes **MUST** use batched database statements. Repeating an identical ingest **MUST** be a no-op that converges to the same stored state. The tenant's graph revision **MUST** be incremented in the same transaction if and only if stored state actually changed — a converging replay leaves the revision untouched, so retries do not invalidate metric caches.
 
-Convergence **MUST** hold under retries with unknown commit outcomes: every ingest request carries a tenant- and producer-scoped idempotency key, and the system persists that key with a canonical request hash, the committed graph revision, and the response atomically with the batch. An identical retry **MUST** return the recorded outcome without touching graph state; reuse of a key with a different request **MUST** be rejected as a conflict (see DESIGN § Concurrent Ingest Protocol).
+Convergence **MUST** hold under retries with unknown commit outcomes **for an ingest request that carries a tenant- and producer-scoped idempotency key**: the system persists that key with a canonical request hash, the committed graph revision, and the response atomically with the batch. An identical retry **MUST** return the recorded outcome without touching graph state; reuse of a key with a different request **MUST** be rejected as a conflict (see DESIGN § Concurrent Ingest Protocol). The key is optional, and an ingest without one gets none of this: no receipt is looked up and none is written, so a retry after a lost response is a new logical request that re-runs the write path. Producers that retry on timeout **MUST** send a key.
 
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
-> **Found while building the prototype.** One clause is not met as written:
+> **Found while building the prototype.** Two clauses are not met as written:
 > writes are one statement per node and per edge rather than batched
 > statements. The measured § 6.1 ingest budget is met regardless (10k nodes +
 > 20k edges in ~20 s on developer hardware), so batching is a cost question
@@ -303,6 +303,16 @@ Convergence **MUST** hold under retries with unknown commit outcomes: every inge
 > the first migration and both were written empty, so every check around them
 > passed vacuously until this was found; rows written before the fix carry an
 > empty owner and are adopted by the producer that next replaces the scope.
+>
+> The second clause is the idempotency key: the requirement above reads as
+> though every ingest carries one, and the API makes it optional. A request
+> without a key takes neither half of the machinery — no receipt is read and
+> none is written — so a retry after a lost response is indistinguishable from
+> a new batch and re-runs the write path. The convergence clause above is
+> therefore scoped to keyed requests, and the keyless path is named for what it
+> is. Making the key mandatory was considered and not taken: it is a breaking
+> change to the ingest contract, and the guarantee is the producer's to opt
+> into per request rather than the gear's to impose.
 
 #### Stable Identity and Parallel Edges
 

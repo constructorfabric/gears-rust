@@ -625,6 +625,56 @@ pub async fn idempotency(store: &dyn GraphStoreV1, tenant: Uuid) {
     );
 }
 
+/// The other half of the idempotency contract: without a key there is no
+/// contract.
+///
+/// The key is optional, and an ingest that omits it reads no receipt and
+/// writes none, so a retry is a fresh logical request. This pins that, because
+/// the documentation used to read as though every ingest were protected.
+///
+/// It also pins why the gap is easy to miss: an *identical* keyless retry
+/// still converges, because convergence is a property of the write path rather
+/// than of the receipt. So the retry looks harmless here and the missing
+/// protection shows only where a re-run is not naturally convergent -- a batch
+/// that replaces a scope removes what it does not re-declare, and running that
+/// twice is not running it once.
+pub async fn a_keyless_retry_is_a_new_request(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    let request = || {
+        let request = batch(vec![node("keyless-1", "one")], Vec::new());
+        assert!(
+            request.idempotency_key.is_none(),
+            "this case is about the absence of a key"
+        );
+        request
+    };
+
+    let first = ingest_batch(store, &ctx, request())
+        .await
+        .expect("first commits");
+    assert!(!first.replayed);
+    assert_eq!(first.counts.nodes_inserted, 1);
+
+    let second = ingest_batch(store, &ctx, request())
+        .await
+        .expect("the retry is accepted");
+    assert!(
+        !second.replayed,
+        "without a key there is no receipt to replay: the write path runs again"
+    );
+    assert_eq!(
+        second.revision, first.revision,
+        "and yet an identical batch still converges -- the revision does not \
+         advance, which is what makes the missing protection easy to miss"
+    );
+}
+
 /// Convergence: re-ingesting an identical batch changes nothing, and the
 /// revision advances **if and only if** stored state actually changed.
 pub async fn convergent_replay(store: &dyn GraphStoreV1, tenant: Uuid) {
