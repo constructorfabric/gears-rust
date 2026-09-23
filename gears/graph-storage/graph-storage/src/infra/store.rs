@@ -131,7 +131,19 @@ fn classify_sqlstate(sqlstate: &str) -> Option<GraphStoreError> {
         "23503" | "23001" => Some(GraphStoreError::Conflict {
             reason: "a live edge still references this node".into(),
         }),
-        "40001" => Some(GraphStoreError::Serialization),
+        // Two codes, one answer. `40001` is the serialization failure a
+        // conflicting snapshot raises; `40P01` is a deadlock the server broke
+        // by killing one side. Both mean the transaction did not happen and
+        // the same statements may succeed if sent again, which is what
+        // `Serialization` tells a caller -- retry unchanged, as against
+        // `Internal`'s retry once and escalate.
+        //
+        // `40P01` is not hypothetical here. Ingest takes row locks in a fixed
+        // order because the secure ORM exposes no `FOR UPDATE`, and fixed-order
+        // locking across concurrent writers is the shape that produces
+        // deadlocks. Leaving it out meant the one failure this design invites
+        // was the one the classifier could not name.
+        "40001" | "40P01" => Some(GraphStoreError::Serialization),
         _ => None,
     }
 }
@@ -162,7 +174,7 @@ pub fn map_db_err(error: &sea_orm::DbErr) -> GraphStoreError {
         return classify_sqlstate(&sqlstate).unwrap_or(GraphStoreError::Internal(text));
     }
 
-    for sqlstate in ["23505", "23503", "23001", "40001"] {
+    for sqlstate in ["23505", "23503", "23001", "40001", "40P01"] {
         if text.contains(sqlstate)
             && let Some(classified) = classify_sqlstate(sqlstate)
         {
@@ -571,13 +583,16 @@ mod tests {
                 "SQLSTATE {sqlstate} must classify as a conflict"
             );
         }
-        assert!(
-            matches!(
-                map_db_err(&driver_error_for("40001")),
-                GraphStoreError::Serialization
-            ),
-            "SQLSTATE 40001 must classify as a serialization failure"
-        );
+        for sqlstate in ["40001", "40P01"] {
+            assert!(
+                matches!(
+                    map_db_err(&driver_error_for(sqlstate)),
+                    GraphStoreError::Serialization
+                ),
+                "SQLSTATE {sqlstate} must classify as a serialization failure: both say the \
+                 transaction did not happen and the same statements may succeed if sent again"
+            );
+        }
     }
 
     /// Deliberately message-free: the classification has to come from the code
