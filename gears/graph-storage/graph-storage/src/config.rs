@@ -324,6 +324,45 @@ impl GraphStorageConfig {
         check_range!(errors, self, embedding_input_max_bytes, 64u32, 262_144u32);
         check_range!(errors, self, embedding_remote_batch_size, 1u32, 2_048u32);
         check_range!(errors, self, embedding_remote_timeout_secs, 1u64, 600u64);
+        self.check_api_key_env(errors);
+    }
+
+    /// The name of the environment variable the credential is read from.
+    ///
+    /// The value never enters the configuration -- that is the point of naming
+    /// a variable rather than carrying a key -- but the *name* does, and it is
+    /// used twice: as the key `std::env::var` is called with, and interpolated
+    /// into the boot error when the variable is missing or empty. An
+    /// unvalidated name therefore reaches the operator's log, where `tracing`
+    /// does not escape a `Display` field and a newline is written as one. The
+    /// gear already refuses a control character in a source namespace and in a
+    /// remote model name for that reason; this is the same field class and was
+    /// the one left unchecked.
+    ///
+    /// The shape is not this gear's invention. POSIX says an environment
+    /// variable name is `[A-Za-z_][A-Za-z0-9_]*`, and a name outside that
+    /// cannot be exported by an ordinary shell, so refusing it costs a
+    /// deployment nothing it could have used -- and says at configuration time
+    /// what it would otherwise learn from a lookup that silently never matches.
+    fn check_api_key_env(&self, errors: &mut Vec<String>) {
+        let Some(variable) = &self.embedding_remote_api_key_env else {
+            return;
+        };
+        let shaped = !variable.is_empty()
+            && variable.len() <= 128
+            && variable
+                .chars()
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && variable
+                .chars()
+                .all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if !shaped {
+            errors.push(format!(
+                "graph-storage.embedding_remote_api_key_env = {variable:?} is not an environment \
+                 variable name: it must match [A-Za-z_][A-Za-z0-9_]* and be at most 128 characters"
+            ));
+        }
     }
 
     /// What one request may ask the graph to write.
@@ -477,6 +516,56 @@ mod tests {
         assert!(
             GraphStorageConfig::default().validated().is_ok(),
             "and the defaults still produce one"
+        );
+    }
+
+    /// The credential's variable *name* is configuration, and it reaches the
+    /// operator's log through the boot error that quotes it. `tracing` does
+    /// not escape a `Display` field, so a newline in it is written as one --
+    /// the same shape already refused for a source namespace and a remote
+    /// model name.
+    #[test]
+    fn a_credential_variable_that_is_not_a_variable_name_is_refused() {
+        for name in [
+            "",
+            "1PASSWORD",            // a digit cannot start one
+            "OPENAI KEY",           // nor a space appear in one
+            "OPENAI\nKEY=injected", // the shape that forges a log line
+            "OPENAI\u{0}KEY",
+            "OPENAI-KEY", // a hyphen is not in the set
+            &"K".repeat(129),
+        ] {
+            let cfg = GraphStorageConfig {
+                embedding_remote_api_key_env: Some(name.to_owned()),
+                ..GraphStorageConfig::default()
+            };
+            let message = match cfg.validate() {
+                Err(error) => error.to_string(),
+                Ok(()) => panic!("{name:?} must not pass as a variable name"),
+            };
+            assert!(
+                message.contains("embedding_remote_api_key_env"),
+                "the refusal must name the field, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_variable_names_a_shell_can_export_are_accepted() {
+        for name in ["OPENAI_API_KEY", "_KEY", "K", "a1_B2"] {
+            let cfg = GraphStorageConfig {
+                embedding_remote_api_key_env: Some(name.to_owned()),
+                ..GraphStorageConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "{name:?} is an ordinary environment variable name"
+            );
+        }
+        // Unset is the deployment whose endpoint takes no credential.
+        assert!(
+            GraphStorageConfig::default().validate().is_ok(),
+            "no variable named is not a malformed name"
         );
     }
 
