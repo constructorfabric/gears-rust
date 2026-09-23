@@ -54,7 +54,9 @@ The `cf-gears-credstore` module provides:
 
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
-`cf-gears-static-credstore-plugin`, or an OpenBao-backed plugin).
+`cf-gears-static-credstore-plugin`, or
+[`cf-gears-vault-credstore-plugin`](../plugins/vault-credstore-plugin/README.md)
+(prototype), backed by Vault/OpenBao).
 
 A credential is created in one request — a `PUT` on the record address
 carries the record and a tri-state `secret` together: a string writes it,
