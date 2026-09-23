@@ -236,9 +236,17 @@ impl<A: WorkerAction> WorkerTask<A> {
 
             self.notify_listeners(|l| l.on_execute_start());
             last_execute = tokio::time::Instant::now();
+            // `WorkerAction::execute` is declared as `fn(...) -> impl Future<...> +
+            // Send`, not `async fn` — an implementor is entitled to run
+            // arbitrary code *before* it returns its future, not just while
+            // that future is polled. `catch_unwind` only covers polling, so
+            // the call to `execute(...)` itself must happen inside the async
+            // block below, not while constructing it, or a panic thrown
+            // before the future is even created would escape uncaught and
+            // this policy would silently fail to contain it.
             let result = match self.panic_policy {
                 PanicPolicy::CatchAndRetry => {
-                    AssertUnwindSafe(self.action.execute(&self.cancel))
+                    AssertUnwindSafe(async { self.action.execute(&self.cancel).await })
                         .catch_unwind()
                         .await
                 }
@@ -297,9 +305,12 @@ mod tests {
     impl WorkerAction for AlwaysContinue {
         type Payload = ();
         type Error = String;
-        async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+        fn execute(
+            &mut self,
+            _cancel: &CancellationToken,
+        ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Directive::proceed())
+            std::future::ready(Ok(Directive::proceed()))
         }
     }
 
@@ -309,11 +320,14 @@ mod tests {
     impl WorkerAction for CheckCancel {
         type Payload = ();
         type Error = String;
-        async fn execute(&mut self, cancel: &CancellationToken) -> Result<Directive, String> {
+        fn execute(
+            &mut self,
+            cancel: &CancellationToken,
+        ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
             if cancel.is_cancelled() {
                 self.saw_cancelled = true;
             }
-            Ok(Directive::sleep(Duration::from_mins(1)))
+            std::future::ready(Ok(Directive::sleep(Duration::from_mins(1))))
         }
     }
 
@@ -354,11 +368,16 @@ mod tests {
         type Payload = ();
         type Error = String;
 
-        async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+        fn execute(
+            &mut self,
+            _cancel: &CancellationToken,
+        ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.results
+            let result = self
+                .results
                 .pop_front()
-                .unwrap_or(Ok(Directive::sleep(Duration::from_mins(1))))
+                .unwrap_or(Ok(Directive::sleep(Duration::from_mins(1))));
+            std::future::ready(result)
         }
     }
 

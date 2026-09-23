@@ -431,11 +431,10 @@ impl HostRuntime {
     /// client, so this phase never waits on provider availability (ADR-0007).
     /// A no-op when no consumer is registered, preserving the phase-order
     /// invariants relied on by existing tests.
-    #[allow(
-        clippy::unused_async,
-        reason = "kept async for symmetry with the other `run_*_phase` steps awaited in sequence by `run_gear_phases`; the awaited work runs in a spawned readiness-probe task"
-    )]
-    async fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
+    // Unlike the other `run_*_phase` steps, this one awaits nothing itself:
+    // the only asynchronous work (directory resolution) runs in a spawned
+    // readiness-probe task rather than being awaited here.
+    fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
         use crate::discovery::{
             ConsumerRegistration, DirectoryEndpointResolver, NullEndpointResolver,
         };
@@ -631,7 +630,7 @@ impl HostRuntime {
     async fn run_init_wiring_post_init(&self) -> Result<(), RegistryError> {
         self.run_init_phase().await?;
 
-        self.run_proxy_wiring_phase().await?;
+        self.run_proxy_wiring_phase()?;
 
         self.run_post_init_phase().await
     }

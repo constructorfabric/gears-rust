@@ -864,7 +864,6 @@ impl PostSidecar for RevaluationCompletedSidecar {
                     posted_at_utc: self.posted_at_utc,
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish fx_revaluation_completed: {e}")))
     }
 }
@@ -911,7 +910,6 @@ impl PostSidecar for RevaluationReversedSidecar {
                     posted_at_utc: self.posted_at_utc,
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish fx_revaluation_reversed: {e}")))
     }
 }

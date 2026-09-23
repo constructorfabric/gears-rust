@@ -65,7 +65,6 @@
         dead_code,
         unreachable_code,
         unused_lifetimes,
-        clippy::unused_async,
     )
 )]
 
@@ -387,6 +386,7 @@ impl DbHandle {
     ///
     /// # Errors
     /// Returns an error if the connection fails or the DSN is invalid.
+    #[cfg(any(feature = "sqlite", feature = "pg", feature = "mysql"))]
     pub(crate) async fn connect(dsn: &str, opts: ConnectOpts) -> Result<Self> {
         let engine = Self::detect(dsn)?;
         #[cfg(any(feature = "pg", feature = "mysql"))]
@@ -517,6 +517,21 @@ impl DbHandle {
             #[cfg(not(feature = "sqlite"))]
             DbEngine::Sqlite => Err(DbError::FeatureDisabled("SQLite feature not enabled")),
         }
+    }
+
+    /// Connect and build handle.
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or the DSN is invalid.
+    #[cfg(not(any(feature = "sqlite", feature = "pg", feature = "mysql")))]
+    pub(crate) fn connect(dsn: &str, _opts: ConnectOpts) -> std::future::Ready<Result<Self>> {
+        // No backend feature is enabled, so every engine is disabled — this can never await.
+        let result = Self::detect(dsn).and_then(|engine| match engine {
+            DbEngine::Postgres => Err(DbError::FeatureDisabled("PostgreSQL feature not enabled")),
+            DbEngine::MySql => Err(DbError::FeatureDisabled("MySQL feature not enabled")),
+            DbEngine::Sqlite => Err(DbError::FeatureDisabled("SQLite feature not enabled")),
+        });
+        std::future::ready(result)
     }
 
     /// Get the backend.

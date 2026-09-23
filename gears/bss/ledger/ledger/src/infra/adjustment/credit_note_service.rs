@@ -902,7 +902,7 @@ impl CreditNoteHandler {
                 actual_minor: 0,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
 
         // Slice 7 Phase 2: ADDITIVELY open a durable close-blocking exception row
         // beside the alarm above (the split-ambiguous note is still rejected; this
@@ -1149,7 +1149,6 @@ impl PostSidecar for CreditNotePostSidecar {
                     posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish credit_note_posted: {e}")))?;
 
         Ok(())

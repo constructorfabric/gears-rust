@@ -3620,15 +3620,20 @@ dependencies = [
 name = "cf-gears-toolkit-contract-macros-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "cf-gears-toolkit",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-security",
  "futures-core",
  "secrecy",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
+ "tracing",
  "trybuild",
  "uuid",
 ]

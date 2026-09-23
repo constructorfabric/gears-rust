@@ -1,5 +1,7 @@
 use super::*;
 
+use std::future::Future;
+
 use axum::{
     Extension, Router,
     body::{Body, to_bytes},
@@ -27,13 +29,17 @@ const PROBLEM_JSON: &str = "application/problem+json";
 struct StubAuthenticator;
 
 impl BearerAuthenticator for StubAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
-        match token {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<SecurityContext, AuthNError>> + Send {
+        let result = match token {
             GOOD_TOKEN => Ok(SecurityContext::anonymous()),
             UNAVAILABLE_TOKEN => Err(AuthNError::Unavailable),
             INTERNAL_TOKEN => Err(AuthNError::Other("boom".to_owned())),
             _ => Err(AuthNError::InvalidToken),
-        }
+        };
+        std::future::ready(result)
     }
 }
 
@@ -82,8 +88,11 @@ async fn send(router: Router, auth: Option<&str>) -> (StatusCode, Option<String>
 struct StubInternalAuthenticator;
 
 impl InternalAuthenticator for StubInternalAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        match token {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+        let result = match token {
             SA_GOOD => Ok(PlatformIdentity::KubernetesServiceAccount {
                 namespace: "toolkit".to_owned(),
                 service_account: "flight-control".to_owned(),
@@ -92,7 +101,8 @@ impl InternalAuthenticator for StubInternalAuthenticator {
             SA_UNAVAILABLE => Err(InternalAuthNError::Unavailable),
             SA_INTERNAL => Err(InternalAuthNError::Other("boom".to_owned())),
             _ => Err(InternalAuthNError::InvalidToken),
-        }
+        };
+        std::future::ready(result)
     }
 }
 

@@ -1010,8 +1010,7 @@ fn llm_body_logging_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("MINI_CHAT_LOG_LLM_BODIES")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
     })
 }
 

@@ -317,11 +317,14 @@ impl WorkerAction for StatsReporter {
     type Payload = ();
     type Error = Infallible;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, Self::Error> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, Self::Error>> + Send {
         if let Some(report) = self.drain_and_format() {
             tracing::info!("{report}");
         }
-        Ok(Directive::idle())
+        std::future::ready(Ok(Directive::idle()))
     }
 }
 

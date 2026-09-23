@@ -40,10 +40,13 @@ const TTL: Duration = Duration::from_secs(30);
 struct TokenIsName;
 
 impl InternalAuthenticator for TokenIsName {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        Ok(PlatformIdentity::Shared {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+        std::future::ready(Ok(PlatformIdentity::Shared {
             name: token.to_owned(),
-        })
+        }))
     }
 }
 

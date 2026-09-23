@@ -787,7 +787,6 @@ impl PostSidecar for DebitNotePostSidecar {
                     posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish debit_note_posted: {e}")))?;
 
         Ok(())

@@ -14,10 +14,10 @@ pub fn murmur3_x86_32(bytes: &[u8], seed: u32) -> u32 {
     const C2: u32 = 0x1b87_3593;
 
     let mut hash = seed;
-    let mut blocks = bytes.chunks_exact(4);
+    let (blocks, tail) = bytes.as_chunks::<4>();
 
-    for bytes in &mut blocks {
-        let mut block = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for block_bytes in blocks {
+        let mut block = u32::from_le_bytes(*block_bytes);
         block = block.wrapping_mul(C1);
         block = block.rotate_left(15);
         block = block.wrapping_mul(C2);
@@ -26,7 +26,6 @@ pub fn murmur3_x86_32(bytes: &[u8], seed: u32) -> u32 {
         hash = hash.wrapping_mul(5).wrapping_add(0xe654_6b64);
     }
 
-    let tail = blocks.remainder();
     let mut block = 0_u32;
     match tail.len() {
         3 => {

@@ -431,9 +431,14 @@ pub fn parse_config_get(reply: &[String]) -> Result<BTreeMap<String, String>, Cl
             ),
         });
     }
+    // The even-length check above means the remainder here is always empty;
+    // `as_chunks` still returns the pair so a future change to that guard
+    // cannot silently start dropping a trailing unpaired element again.
     Ok(reply
-        .chunks_exact(2)
-        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[first, second]| (first.clone(), second.clone()))
         .collect())
 }
 

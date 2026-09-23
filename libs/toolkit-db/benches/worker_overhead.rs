@@ -36,14 +36,18 @@ impl WorkerAction for NoOpAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.remaining -= 1;
-        if self.remaining == 0 {
+        let result = if self.remaining == 0 {
             self.cancel.cancel();
             Ok(Directive::sleep(Duration::from_secs(1)))
         } else {
             Ok(self.directive)
-        }
+        };
+        std::future::ready(result)
     }
 }
 
@@ -58,18 +62,23 @@ impl WorkerAction for AlternatingAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.remaining -= 1;
-        if self.remaining == 0 {
+        let result = if self.remaining == 0 {
             self.cancel.cancel();
-            return Ok(Directive::sleep(Duration::from_secs(1)));
-        }
-        self.flip = !self.flip;
-        if self.flip {
-            Ok(Directive::proceed())
+            Ok(Directive::sleep(Duration::from_secs(1)))
         } else {
-            Ok(Directive::idle())
-        }
+            self.flip = !self.flip;
+            if self.flip {
+                Ok(Directive::proceed())
+            } else {
+                Ok(Directive::idle())
+            }
+        };
+        std::future::ready(result)
     }
 }
 
