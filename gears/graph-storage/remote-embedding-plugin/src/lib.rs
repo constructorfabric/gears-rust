@@ -119,6 +119,13 @@ pub enum RemoteConfigError {
     CredentialsInUrl,
     #[error("model must not be empty")]
     Model,
+    #[error("model must be at most {max} characters, and this one is {got}")]
+    ModelTooLong { max: usize, got: usize },
+    #[error(
+        "model must not carry control characters: it becomes part of the embedding-space \
+         identity, which is compared for equality and written to the operator log"
+    )]
+    ModelControlCharacters,
     #[error("dimension must be positive")]
     Dimension,
     #[error("batch_size must be positive")]
@@ -126,6 +133,14 @@ pub enum RemoteConfigError {
     #[error("the HTTP client could not be built: {0}")]
     Client(String),
 }
+
+/// The longest a model name may be, in characters.
+///
+/// Generous next to any real one -- `text-embedding-3-small` is 22 -- because
+/// the point is to have a bound at all rather than to guess a vendor's naming.
+/// An identity this string is part of gets compared and logged, so it cannot be
+/// unbounded.
+const MAX_MODEL_LEN: usize = 200;
 
 /// What an endpoint that cannot embed an empty string is asked to embed
 /// instead. The coordinator composes a node's input from its name and
@@ -165,8 +180,25 @@ impl RemoteEmbeddingProvider {
         if !base.username().is_empty() || base.password().is_some() {
             return Err(RemoteConfigError::CredentialsInUrl);
         }
-        if config.model.trim().is_empty() {
+        // The model is not a free-text field. It is trimmed into the
+        // embedding-space identity, which is compared for equality to decide
+        // whether a stored vector is still valid, it is written to the
+        // operator log at boot, and it is sent in the body of every request.
+        // So it is bounded and shaped here, where `base_url` and the two
+        // counts are already checked -- refusing at configuration time rather
+        // than discovering it in an identity comparison or a log line.
+        let model = config.model.trim();
+        if model.is_empty() {
             return Err(RemoteConfigError::Model);
+        }
+        if model.chars().count() > MAX_MODEL_LEN {
+            return Err(RemoteConfigError::ModelTooLong {
+                max: MAX_MODEL_LEN,
+                got: model.chars().count(),
+            });
+        }
+        if model.chars().any(char::is_control) {
+            return Err(RemoteConfigError::ModelControlCharacters);
         }
         if config.dimension == 0 {
             return Err(RemoteConfigError::Dimension);
@@ -702,6 +734,63 @@ mod tests {
 
     fn classify(code: u16) -> Refusal {
         classify_status(reqwest::StatusCode::from_u16(code).unwrap_or_default())
+    }
+
+    /// The model is checked as hard as its neighbours in the same constructor.
+    /// It is not free text: it is trimmed into the embedding-space identity,
+    /// which decides whether a stored vector is still valid, and it is written
+    /// to the operator log at boot.
+    #[test]
+    fn a_model_that_is_not_a_model_name_is_refused() {
+        // `.err()` rather than `expect_err`: the provider is not `Debug`, and
+        // giving it one would print a configuration that carries a credential.
+        let refused = |model: &str| {
+            RemoteEmbeddingProvider::new(RemoteProviderConfig::new(
+                "https://example.test/v1",
+                model,
+            ))
+            .err()
+            .expect("this model must be refused")
+        };
+
+        assert!(
+            matches!(refused("  "), RemoteConfigError::Model),
+            "a blank model keeps its own error"
+        );
+        assert!(
+            matches!(
+                refused(&"m".repeat(MAX_MODEL_LEN + 1)),
+                RemoteConfigError::ModelTooLong { .. }
+            ),
+            "a model past the bound must be refused"
+        );
+        for model in ["text-embedding\n3-small", "text\u{0}embedding", "a\tb"] {
+            assert!(
+                matches!(refused(model), RemoteConfigError::ModelControlCharacters),
+                "{model:?} must be refused"
+            );
+        }
+    }
+
+    /// And the shapes a real vendor uses still pass, including the bound
+    /// exactly.
+    #[test]
+    fn a_real_model_name_is_accepted() {
+        for model in [
+            "text-embedding-3-small",
+            "  text-embedding-3-small  ",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            &"m".repeat(MAX_MODEL_LEN),
+        ] {
+            assert!(
+                RemoteEmbeddingProvider::new(RemoteProviderConfig::new(
+                    "https://example.test/v1",
+                    model,
+                ))
+                .is_ok(),
+                "{model:?} must be accepted"
+            );
+        }
     }
 
     #[test]
