@@ -729,10 +729,43 @@ fn parse_sqlite_path_from_dsn(dsn: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// The longest environment-variable name this accepts.
+///
+/// Nothing in POSIX fixes one, but a name is an operator-typed identifier:
+/// past a hundred-odd characters the value is a mistake, and the name is
+/// about to be printed in a diagnostic.
+const MAX_ENV_VAR_NAME: usize = 128;
+
+/// A `${VAR}` placeholder names an environment variable, so it has to look
+/// like one.
+///
+/// The name is taken from configuration, handed to `std::env::var`, and --
+/// when the lookup fails -- printed in `DbError::EnvVar`'s message, which
+/// reaches logs. Unvalidated, a name carrying a newline splits that line in
+/// two and the second half is attacker-shaped text in the position a log
+/// reader expects a record. A name outside this shape could not have been
+/// exported by a POSIX shell in the first place, so refusing it rejects
+/// nothing that would have worked.
+fn check_env_var_name(name: &str) -> Result<()> {
+    let shaped = !name.is_empty()
+        && name.len() <= MAX_ENV_VAR_NAME
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if shaped {
+        return Ok(());
+    }
+    Err(DbError::InvalidParameter(format!(
+        "a ${{VAR}} password placeholder names an environment variable, and {name:?} is \
+         not one: at most {MAX_ENV_VAR_NAME} characters of [A-Za-z0-9_], not starting \
+         with a digit"
+    )))
+}
+
 /// Resolve password from environment variable if it starts with ${VAR}.
 fn resolve_password(password: &str) -> Result<String> {
     if password.starts_with("${") && password.ends_with('}') {
         let var_name = &password[2..password.len() - 1];
+        check_env_var_name(var_name)?;
         std::env::var(var_name).map_err(|source| DbError::EnvVar {
             name: var_name.to_owned(),
             source,
@@ -846,6 +879,56 @@ pub fn redact_credentials_in_dsn(dsn: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `${VAR}` placeholder's name is printed in a diagnostic when the
+    /// lookup fails, so it is checked before it gets there.
+    ///
+    /// The newline case is the one that matters: unvalidated, it splits the
+    /// log line in two and the second half is configuration-shaped text
+    /// sitting where a log reader expects a record.
+    #[test]
+    fn a_password_placeholder_names_a_real_environment_variable() {
+        for name in ["PGPASSWORD", "db_password", "_SECRET", "A1"] {
+            assert!(
+                check_env_var_name(name).is_ok(),
+                "{name} is a name a shell can export"
+            );
+        }
+        for name in [
+            "",
+            "PG PASSWORD",
+            "PG\nPASSWORD",
+            "PG=PASSWORD",
+            "1PASSWORD",
+            "PG-PASSWORD",
+        ] {
+            let refused = check_env_var_name(name)
+                .expect_err("a name no shell could export is not looked up");
+            assert!(matches!(refused, DbError::InvalidParameter(_)), "{refused}");
+        }
+        let long = "A".repeat(MAX_ENV_VAR_NAME + 1);
+        assert!(check_env_var_name(&long).is_err(), "and a name is bounded");
+        assert!(
+            check_env_var_name(&long[1..]).is_ok(),
+            "at exactly the bound"
+        );
+    }
+
+    /// The check runs before the lookup, so a malformed name never reaches
+    /// `std::env::var` or the error message it would land in.
+    #[test]
+    fn a_malformed_placeholder_is_refused_rather_than_looked_up() {
+        let refused = resolve_password("${PG\nPASSWORD}")
+            .expect_err("a placeholder with a newline in its name is not a variable");
+        assert!(
+            matches!(refused, DbError::InvalidParameter(_)),
+            "the shape is refused before the lookup, got {refused}"
+        );
+        assert_eq!(
+            resolve_password("plain-text").expect("a literal password is not a placeholder"),
+            "plain-text"
+        );
+    }
 
     #[test]
     fn determine_engine_requires_engine_when_dsn_missing() {
