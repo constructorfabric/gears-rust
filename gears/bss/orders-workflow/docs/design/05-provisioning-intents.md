@@ -201,7 +201,7 @@ allowance or the aggregate cap exhausted, a downstream throttle, an open hold �
 calls again under the next dispatch round (§4.5). It is never a `retryable-failure`, because the
 PRD forbids a throttle from consuming the retry budget
 (`cpt-cf-bss-orders-workflow-fr-owf-backpressure`) and the retry budget is now the platform's
-task retry policy, which counts every failed attempt. (decision recorded by commit D as D-6x: an
+task retry policy, which counts every failed attempt. (decision D-96: an
 admission deferral settles as success carrying `deferred[]` and `retryAfterMs`, amending the
 first rule of `01 §4.12`, which settles a non-admitted dispatch as `retryable-failure`.)
 
@@ -609,7 +609,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation` |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous refusal moves `draft_created → failed` |
 | `compensation` | `compensate-order` (06) — the activated-cancel leg for every line whose activation was accepted |
-| `reasons` | `wave2-activation-failed` (per line), `activation-precondition-unmet` (the run-time barrier guard; registered by commit D, §4.6), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `idempotency-key-mismatch`, `version-mismatch`, `not-found` |
+| `reasons` | `wave2-activation-failed` (per line), `activation-precondition-unmet` (the run-time barrier guard; registered in `01 §4.9`, §4.6), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `idempotency-key-mismatch`, `version-mismatch`, `not-found` |
 | `audit_kind` | `step-completion` |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
@@ -669,7 +669,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reconcile-intent:{sweepRound}`; the worker's in-process run is not a step call and carries no step key — its settlements are keyed by `settle-from-lookup`'s own family |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line whose task reaches a terminal state in the unit of work |
 | `compensation` | none |
-| `reasons` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` (per line, in `failed[]`), `intent-unresolved` (per line, in `unresolved[]`; registered by commit D, §4.6), `not-found` (an unmatched hint), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-mismatch` |
+| `reasons` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` (per line, in `failed[]`), `intent-unresolved` (per line, in `unresolved[]`; registered in `01 §4.9`, §4.6), `not-found` (an unmatched hint), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-mismatch` |
 | `audit_kind` | `sweep` (and `sweep-settlement`, written by `settle-from-lookup` in the same unit of work where it settles a stuck key) |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
@@ -825,7 +825,7 @@ intent; the rebuild always precedes any further activation for the line, and its
 goes through the one dispatcher that stamps envelope, key and admission. A `lapsed` row is
 terminal and distinct from `voided`: compensation (06) has nothing to void for it. The
 `draft_created → pending` transition with reason `draft-voided` is a machine transition slice
-04's table must carry (decision recorded by commit D as D-6x: 04 §3.7 gains `draft_created →
+04's table must carry (decision D-95: 04 §3.7 gains `draft_created →
 pending`, reason `draft-voided`, driven only by `rebuild-wave1`).
 
 **Algorithm: rebuild-wave1**
@@ -906,8 +906,7 @@ accepted-but-hanging intent is recovered by the sweep, never by a resubmit.
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-db-provisioning-intents`
 
-This slice keeps `owf_provisioning_intent` and adds `owf_dispatch_admission` (decision recorded by
-commit D as D-6x: the admission state of the controls moved from 01 is a slice-05 table serialized
+This slice keeps `owf_provisioning_intent` and adds `owf_dispatch_admission` (decision D-96: the admission state of the controls moved from 01 is a slice-05 table serialized
 by row locks, not an in-memory controller). It writes no `owf_durable_timer` row (retired), no
 `owf_dead_letter_record` row (retired) and no `owf_retry_state` row (retired).
 
@@ -1025,7 +1024,7 @@ selects one page (500 rows, 30 s transaction budget) of `owf_provisioning_intent
 in-process. Its correctness check is the row lock of step 1 and `settle-from-lookup`'s recheck,
 so two overlapping passes never double-apply. The worker selects due rows **whether or not** the
 instance has a live invocation; it reads invocation status only to report, as a metric, intents
-whose instance has no live invocation. (decision recorded by commit D as D-6x: the worker's
+whose instance has no live invocation. (decision D-71: the worker's
 candidate set is `next_sweep_at <= now` over every non-terminal intent, and the definition's poll
 arm is an early read; `01 §3.8`'s worker row, which selects only dead-invocation registry rows, is
 aligned to this.)
@@ -1052,13 +1051,13 @@ This design set treats `SEAMS.md` as canonical and renumbers this gear's four as
 Each is labelled **UNASKED** — the canonical register has never contained these asks at any
 number. [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1 is the **definition site** of every
 Subscriptions ask; the table below restates status and the field lists this slice depends on, and
-where they differ from the register the register is amended by commit D.
+where they differ from the register the register is amended (`UPSTREAM_REQS.md`).
 
 | New ID | Status | Description | Replaces (PRD) |
 |--------|--------|--------------|----------------|
 | `SUB-O11` | **UNASKED** | Machine-readable in-flight rejection, so a retry can distinguish "already accepted" from "not accepted." | PRD `SUB-O6` |
 | `SUB-O12` | **UNASKED** | Cancel or void of an accepted transition request — the superseding action for an accepted in-flight intent. | PRD `SUB-O7` |
-| `SUB-O13` | **UNASKED** | Status-read of a non-terminal intent, by transition-request id or by the full lookup tuple `orderId` + `orderVersion` + order-line + wave + `intentKind` + `wave_attempt` (equivalently, by the intent idempotency key). The register's four-component tuple cannot distinguish a lapsed draft, its rebuilt successor and a void (commit D amends `UPSTREAM_REQS.md`). | PRD `SUB-O8` |
+| `SUB-O13` | **UNASKED** | Status-read of a non-terminal intent, by transition-request id or by the full lookup tuple `orderId` + `orderVersion` + order-line + wave + `intentKind` + `wave_attempt` (equivalently, by the intent idempotency key). The register's four-component tuple cannot distinguish a lapsed draft, its rebuilt successor and a void (amended in `UPSTREAM_REQS.md`, D-97). | PRD `SUB-O8` |
 | `SUB-O14` | **UNASKED** | `correlationId` propagation along the Subscriptions → Policy Engine → OSS path. | PRD `SUB-O9` |
 | `SUB-O16` | **UNASKED** | Identity-envelope echo on every confirmation and failure event: the union of the register's list (`correlationId`, the intent idempotency key, the asserting principal) and this slice's (`orderId`, `orderVersion`, `orderLineId`, wave, the opaque binding reference). `subscriptionId` is no longer needed on the echo, because it is taken from the `SUB-O13` read (§2.1). | none — new |
 
@@ -1073,12 +1072,11 @@ Related, already-registered asks:
 - `SUB-O5` — overlap-scope-key presence read; registered in `SEAMS.md` but **unagreed**; consumed
   by slice 04 and inherited by the draft-liveness gate, which fails closed on an unevaluable read.
 
-**Platform asks this slice depends on** (recorded by commit D in `UPSTREAM_REQS.md`,
+**Platform asks this slice depends on** (recorded in `UPSTREAM_REQS.md` §2.9,
 serverless-runtime section): a `wait` whose duration is a runtime expression (`retryAfterMs`,
 `expectedFulfillmentAt`; Q-11 (i)); a `listen` whose stored event can be restricted to the
 exported members, because the Subscriptions outcome event as published carries a
-`subscriptionId`, which ADR-0013 keeps out of engine history (decision recorded by commit D as
-D-6x: until the platform can filter a consumed event, the confirmation arm targets a
+`subscriptionId`, which ADR-0013 keeps out of engine history (decision D-97: until the platform can filter a consumed event, the confirmation arm targets a
 reference-only Subscriptions notification — a further Subscriptions ask — or is dropped in favour
 of the poll arm alone); and the handling of a Subscriptions outcome event that correlates to no
 running invocation, which is the platform trigger path's.
@@ -1194,7 +1192,8 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
 ### 4.5 Constraints this slice places on the definition
 
 These are this slice's inputs to the validation rules of ADR-0012 (`10 §2.2`, `10 §4`). Items marked
-† are not yet expressed in the canonical YAML of `10 §3.6` (b) and are folded in by commit D.
+† were folded into the canonical YAML of `10 §3.6` (b) when the fragments were reconciled with the
+slice operations (D-80, D-81).
 
 1. **Order.** `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation`
    **<** `report-spawn-signal` **<** `dispatch-wave2-activate` (the Waves row of `10 §4.1`), and
@@ -1239,11 +1238,11 @@ These are this slice's inputs to the validation rules of ADR-0012 (`10 §2.2`, `
 - `cfs validate --artifact` reports this file as unmatched: `docs/design/*.md` is excluded from
   `cfs` autodetect per `.cf-studio/config/artifacts.toml`. This is expected. `cfs toc`,
   `cfs validate-toc` and `cfs check-language` were run instead.
-- **Reasons pending registration** (decision recorded by commit D as D-6x: `01 §4.9` registers
+- **Reasons pending registration** (decision D-77: `01 §4.9` registers
   `activation-precondition-unmet` — owner `05-provisioning-intents`, `ACTIVATION_PRECONDITION_UNMET`,
   Aborted, 409 — and `intent-unresolved` — owner `05-provisioning-intents`, `INTENT_UNRESOLVED`,
   FailedPrecondition, 400).
-- **Deviations from `01` this slice depends on**, each deferred to commit D: the admission deferral
+- **Deviations from `01` this slice depends on**, each now reflected in `01` (D-96, D-71): the admission deferral
   is a settled success (§2.1, amends `01 §4.12`); the worker's candidate set is `next_sweep_at`
   (§3.8, aligns `01 §3.8`); `settle-from-lookup`'s `absent` outcome leaves a step key `open` for
   the dispatch re-run (§4.4, clarifies `01 §3.3`).

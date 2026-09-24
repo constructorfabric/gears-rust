@@ -152,7 +152,7 @@ election and Workflow **MUST NOT** independently suppress that transition reques
 Lifecycle's `authorization-failed` refusal is the "begin-fulfillment not taken" of the PRD, the
 operation records it as `withheld` and the order stays `approved`. A tolerated failure proceeds
 with the risk flag Lifecycle records (Lifecycle [`06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
-§3.6 *Begin Fulfillment*, step 3). (decision recorded by commit D as D-6x: Lifecycle is the sole
+§3.6 *Begin Fulfillment*, step 3). (decision D-89: Lifecycle is the sole
 tolerate-failure evaluator; a conclusive `failed` is carried to `begin-fulfillment` and a
 Lifecycle refusal is recorded as `withheld`; PRD §6.3 *Payment Authorization Precondition* is
 amended to say "begin-fulfillment is not committed" rather than "not called".)
@@ -614,7 +614,7 @@ therefore an **outbound read inside `evaluate-payment-auth-eligibility`**, polle
 definition, with no inbound Payments arm and no Payments timer in this gear. If Payments later
 offers a push, it is delivered as the `reauthorize-requested` signal
 ([`10 §3.3`](./10-process-definition.md#33-api-contracts)) and changes no operation. (decision
-recorded by commit D as D-6x: the Payments coupling is an outbound read-by-request inside
+recorded as D-90: the Payments coupling is an outbound read-by-request inside
 `evaluate-payment-auth-eligibility`, polled by a definition `wait`; the inbound reporting arm and
 the `payment-auth-wait` timer are withdrawn.)
 
@@ -847,8 +847,7 @@ satisfiable by construction, and slice 06 produces it. The freshness leg is here
 barrier can defer wave 2 by up to the future-dated horizon, and an authorization observed before
 begin-fulfillment can age out inside that wait. The previous revision treated an unevaluable
 overlap read as a collision on the first failure; this revision follows Lifecycle's `defer`
-ladder and aborts only on its exhaustion, with the honest reason (decision recorded by commit D as
-D-6x: an unevaluable re-check follows Lifecycle's `defer` ladder, 3 attempts within 60 s, and then
+ladder and aborts only on its exhaustion, with the honest reason (decision D-91: an unevaluable re-check follows Lifecycle's `defer` ladder, 3 attempts within 60 s, and then
 aborts with `overlap-read-unevaluable`; the construction-time check is advisory; the reason
 `identity-party-unavailable` for an unavailable identity port is registered in the catalogue of
 `01 §4.9` beside `overlap-read-unevaluable`, and until it is, that case carries
@@ -911,7 +910,7 @@ remediation that drives every failed line to `activated` (completion); **remedia
 definition enters order-level compensation through `compensate-order`, which cancels the
 activated lines; or an operator-initiated workflow-mediated cancel. Remediation exhaustion is
 therefore the one **automatic** path that compensates activated lines, as `PRD.md:339` states
-(decision recorded by commit D as D-6x: D-54's "only an operator-initiated cancel" is amended to
+(decision D-94: D-54's "only an operator-initiated cancel" is amended to
 include D-55's exhaustion as the automatic route to order-level compensation).
 
 ### 3.7 Database schemas & tables
@@ -1026,8 +1025,7 @@ terminal_event_emitted_seq, created_at; `line_ref` UNIQUE; `failed_wave` NOT NUL
 
 Every exit from `failed` requires `last_transition_actor`; a machine-driven exit is refused.
 `activated` has no outgoing transition: an activated line is undone only by compensation
-(slice 06), which records its own outcome and does not rewrite `state`. (decision recorded by
-commit D as D-6x: an operator retry returns a failed line to the state before the failed wave —
+(slice 06), which records its own outcome and does not rewrite `state`. (decision D-95: an operator retry returns a failed line to the state before the failed wave —
 `pending` for wave 1, `draft_created` for wave 2 — and slice 07's `retry` is defined per wave
 accordingly; `draft_created → pending`, reason `draft-voided`, is a machine transition driven
 only by `rebuild-wave1`.)
@@ -1069,8 +1067,7 @@ next call, so a new evaluation is a first call under a new key and a re-issued c
 duplicate of the same evaluation. `begin-fulfillment` extends the lifecycle-transition family
 (`orderId + orderVersion + transitionName`) with the `eligibilitySeq` of the `eligible` answer it
 follows, because a `withheld` answer is a settled outcome and a later eligible round needs a new
-key; a replay of the committed round is absorbed by both gears. (decision recorded by commit D as
-D-6x: the begin-fulfillment key carries the eligibility round, amending ADR-0006's
+key; a replay of the committed round is absorbed by both gears. (decision D-74: the begin-fulfillment key carries the eligibility round, amending ADR-0006's
 lifecycle-transition family for this one transition.)
 
 ### 4.2 The re-check: advisory at construction, authoritative before wave 2
@@ -1105,7 +1102,7 @@ A plan that does not freeze has no `FulfillmentTask` to key a line task on, and 
   applies to permanent line failures, and a Catalog outage is neither — and resolves by `retry`
   (new `attempt`) once Catalog answers completely; exhaustion follows the `invalid-graph` rule.
 
-(decision recorded by commit D as D-6x: plan-level failures never take a Lifecycle transition from
+(decision D-92: plan-level failures never take a Lifecycle transition from
 `approved`; `topology-unavailable` is a plan-level manual task under either policy; a plan-level
 failure that must report `fulfillment_failed` passes `begin-fulfillment` first.) The plan-scope
 reference on `owf_manual_task` / `owf_incident` is asked of slice 07 (§4.7).
@@ -1156,7 +1153,7 @@ this slice derives, proposed into the program-wide NFR workshop:
 | Authorization validity | **30 days** (`payment_auth_validity`) | The horizon the freshness leg of `re-check-pre-activation` applies; the barrier can defer wave 2 up to the future-dated horizon inside a 90-day lifetime. |
 | Re-check defer ladder | **3 attempts within 60 s** | Lifecycle's `activation-recheck-retry-budget`, executed by this gear ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)). |
 
-(decision recorded by commit D as D-6x: the SLA population is N ≤ 40 lines, the plan-size
+(decision D-93: the SLA population is N ≤ 40 lines, the plan-size
 admission bound is 200 lines, and `payment_auth_validity` is 30 days; this replaces the
 non-existent "D-5" the previous revision cited.)
 
@@ -1184,7 +1181,8 @@ catalogue** (`01 §4.9`) — `identity-party-unavailable` (§3.6); (h) **`DESIGN
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
 the fence of `10 §4.1`; the items marked **alignment** are where the canonical fragment of
-`10 §3.6` (b) does not yet express the constraint and must be brought into line (commit D):
+`10 §3.6` (b) was brought into line when the fragments were reconciled with the slice operations
+(D-80, D-81):
 
 1. **Order.** `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<**
    `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<**

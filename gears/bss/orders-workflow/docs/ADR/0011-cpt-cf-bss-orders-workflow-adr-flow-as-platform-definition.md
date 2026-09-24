@@ -220,7 +220,7 @@ section; stated here as asks because no platform document states them as facts):
   `POST /bss-orders-workflow/v1/steps/{operation}` as the serverless-runtime service principal
   with a token whose `token_scopes` name this gear. The platform lists execution identity per
   function as an unaddressed blocker
-  ([NEXT_ADR_SCOPE.md](../../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 18, BR-006).
+  ([NEXT_ADR_SCOPE.md](../../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 15, BR-006).
 * **Named signals to a running invocation.** Hold, resume, cancel and re-authorisation must reach a
   `listen` arm as distinguishable signals; the platform has generic `suspend`/`resume`/`cancel`
   (DESIGN.md lines 885–888) and a plugin-control passthrough (line 893) but records "no signal

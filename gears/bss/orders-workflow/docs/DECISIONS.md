@@ -2023,7 +2023,7 @@ the one the consuming operation reads.
 
 ### D-86 (M) An operator re-drive keeps the invocation, or the instance is unwound and re-submitted
 
-**Accepted.** *(orchestrator ruling)*
+**Accepted.**
 
 **Decision**: an operator re-drive of an invocation the platform reports `failed` or
 `dead_lettered` is the platform's `…:control` `retry` **keeping `invocation_id`**, once the
@@ -2246,7 +2246,7 @@ task record need no round trip through the platform.
 
 ### D-101 (L) The task queue sorts on the immutable `(created_at, task_id)` key
 
-**Accepted.** *(orchestrator decision, commit `d71fcbaaf`)*
+**Accepted.**
 
 **Decision**: the operator task queue pages on the immutable key `(created_at, task_id)`, as slice
 09's paging rule requires; `sla_deadline` is mutable on reopen and is therefore not a sort key.

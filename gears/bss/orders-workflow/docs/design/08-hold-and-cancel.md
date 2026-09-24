@@ -208,8 +208,7 @@ decided outcome through a human, not through a timeout. The ceiling most often f
 instance is `suspended`; the phase table of
 [`01 §3.7`](./01-foundation.md#table-owf_process_instance) permits `park` only from `started`, so a
 `suspended → parked` transition for `parkReason = lifetime-ceiling` is required there, with the
-open suspension left open because the hold is still Lifecycle's fact (decision recorded by commit
-D as D-6x: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
+open suspension left open because the hold is still Lifecycle's fact (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
 open). This slice writes nothing against the ceiling.
 
 #### One Open Suspension Per Order, Reconciled Regardless of Arrival Order
@@ -438,7 +437,7 @@ breaker is applied by every operation to its own outbound calls
 exhaustion is the definition's failure arm and the partial-failure policy (`10 §3.6` (c)). The
 per-dependency budget table formerly here is superseded by the definition's per-task retry policy,
 which **MAY** be tighter per task and **MUST** nest inside the task timeout (`10 §2.2` rule 4)
-(decision recorded by commit D as D-6x: the per-dependency retry budgets of the former governor
+(decision D-70: the per-dependency retry budgets of the former governor
 are superseded by the definition's task retry policy under the nesting rule). Slice 04's Catalog
 read, which the governor used to wrap, is covered by the same rule (`04 §3.2`).
 
@@ -910,7 +909,7 @@ these before the validation hook enforces this list. Item 1 depends on the runti
 
 ### 4.8 Cross-slice asks raised by this slice
 
-1. [ ] - `p2` - **01 §3.7**: a `suspended → parked` transition for `parkReason = lifetime-ceiling`, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision recorded by commit D as D-6x) - `inst-x8-phase`
+1. [ ] - `p2` - **01 §3.7**: a `suspended → parked` transition for `parkReason = lifetime-ceiling`, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision D-82) - `inst-x8-phase`
 2. [ ] - `p2` - **05**: the dispatch operations read `owf_process_instance.suspended` (not `owf_process_suspension`) and permit a same-key re-issue while suspended; `reconcile-intent` records a failure observed while suspended as deferred on `owf_provisioning_intent` with its observation instant - `inst-x8-05`
 3. [ ] - `p2` - **06**: `run-cancellation-fence` calls the suspension closure port in fencing step 1; `compensate-order` and `report-outcome` call the cancel-authority port at `pre-compensation` and `pre-submission` on the cancel trigger and mark the fence awaiting re-authorization on `withdrawn` - `inst-x8-06`
 4. [ ] - `p2` - **09**: the accepted cancel's request record, carrying the authorization snapshot, is declared as a table of 09 and is what `cancelRequestRef` names; `09 §4.4` step 4 is reworded per §4.3 - `inst-x8-09`
@@ -949,7 +948,7 @@ buffering until an arm consumes it (`10 §3.3`, `10 §4.4`); the platform `attem
   §3.3 (`workflow-cancel`, called by slice 06's `report-outcome`, not by this slice)
 - **Upstream asks**: `SUB-O11`–`SUB-O14` ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1) no
   longer apply to this slice directly; they are exercised by slice 05's and 06's operations. The
-  platform asks of §4.8 are registered by commit D.
+  platform asks of §4.8 are registered in `UPSTREAM_REQS.md` §2.9.
 - **Retired here**: `cpt-cf-bss-orders-workflow-component-dependency-retry-governor`,
   `cpt-cf-bss-orders-workflow-entity-timer-pause-record`,
   `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause` (ADR-0011); the former dependency on

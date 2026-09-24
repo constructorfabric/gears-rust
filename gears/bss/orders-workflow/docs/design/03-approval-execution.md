@@ -620,7 +620,7 @@ the arms they serve.
 | `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `subject_id` — the PDP constraint `assigned_principal = subject_id`, compiled to the `AccessScope` the query runs under (`09 §3.1`); keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
 | `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`. **`Idempotency-Key` is REQUIRED**, recomposed server-side as `{tenant}:{gateId}:decision:{subject_id}` (`idempotency-key-mismatch` otherwise); `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision statement, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (`owf_approval_request.submitter_subject_id`, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
 
-| `EVENT` | The Generic Approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`UPSTREAM_REQS.md`, commit D) | unstable |
+| `EVENT` | The Generic Approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`../UPSTREAM_REQS.md` §2.9) | unstable |
 
 Both endpoints follow the platform's canonical OperationBuilder registration and RFC-9457 Problem
 error envelope conventions; the one gear-level deviation — 404 for a target outside the caller's
@@ -1183,7 +1183,7 @@ silently assume a TTL this gear does not own:
 
 | Value | Setting | Derivation |
 |-------|---------|------------|
-| Generic-Approval outage escalation threshold | `min(30 min, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | How long the verdict may stay unobtainable before the **parked process** becomes an operator-visible incident (ADR-0007 *Consequences*, `ADR/0007:72`), **and** how long a gate-open outage may persist before the operator queue is raised directly. One threshold governs both clocks: `escalation_due_at` on the park and `outageThresholdRemaining` from `escalate-gate` (`probe`) are both measured from the instant the dependency was first observed unavailable (decision recorded by commit D as D-6x: the outage threshold governs the park clock as well as the gate pause, and the park escalates at `min(parked_at + threshold, TTL margin)`) |
+| Generic-Approval outage escalation threshold | `min(30 min, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | How long the verdict may stay unobtainable before the **parked process** becomes an operator-visible incident (ADR-0007 *Consequences*, `ADR/0007:72`), **and** how long a gate-open outage may persist before the operator queue is raised directly. One threshold governs both clocks: `escalation_due_at` on the park and `outageThresholdRemaining` from `escalate-gate` (`probe`) are both measured from the instant the dependency was first observed unavailable (decision D-87: the outage threshold governs the park clock as well as the gate pause, and the park escalates at `min(parked_at + threshold, TTL margin)`) |
 | Escalation lead time before `submitted` TTL | `max(4 h, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | The margin ADR-0007 requires escalation to fire with; the cap on `escalation_due_at`. 4 h is a floor for "actionable by a human in a staffed queue"; the TTL-relative arm scales it up rather than leaving a 72 h TTL escalated 4 h before expiry |
 
 **`lifecycle_submitted_ttl` is a deliberately mirrored constant.** It is **read from
@@ -1260,7 +1260,7 @@ interval is an engineering value with no commercial consequence, like the breake
 On a probe that finds the breaker open, `escalate-gate` adds `approval-outage` to `pause_causes` on
 every open gate at the position and captures the remainder, and answers `outage`; on the first
 probe that finds it closed again, it removes the cause, re-arms where no cause remains and answers
-`available` with the remainder (decision recorded by commit D as D-6x: the gate-open outage pause
+`available` with the remainder (decision D-87: the gate-open outage pause
 is a definition probe arm over `escalate-gate` in `probe` mode, replacing the Orders-side probe
 loop and the `owf_timer_pause` `approval-outage` row).
 
@@ -1303,7 +1303,7 @@ cancels every gate at every other position, and the definition reflects the deni
 so no later stage is ever asked about an order an earlier stage refused. Purely parallel routing is
 the degenerate case where every gate carries `sequence_index = 0`, which is also the default — so a
 routing configuration that says nothing about ordering behaves exactly as it does today (decision
-recorded by commit D as D-6x: the routing plan is persisted at the first `open-gates` with the
+recorded as D-88: the routing plan is persisted at the first `open-gates` with the
 `planned` gate state).
 
 The Gate Manager records this ordering; it does not decide it, and it does not execute it — the

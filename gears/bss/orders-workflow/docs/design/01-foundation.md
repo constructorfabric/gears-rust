@@ -776,7 +776,7 @@ Every call on this surface **MUST** satisfy, in this order, before the operation
 **Attempt identity.** `attempt_id` is the platform's identifier for the attempt that issued the
 call and is recorded on every step record. Whether the plugin's HTTP `call` task carries its
 attempt identifier to the callee is **not stated** in the serverless-runtime design; it is
-registered as an upstream ask in `UPSTREAM_REQS.md` (commit D). Until it is answered, the
+registered as an upstream ask in `UPSTREAM_REQS.md` §2.9. Until it is answered, the
 definition supplies `attemptId` as `"{invocationId}:{taskName}"` from the spec's `$workflow.id`
 and `$task.name` runtime arguments, and the envelope appends its own receipt ordinal to make the
 recorded value unique per receipt. Recording it is what lets an auditor join Orders' record to
@@ -881,7 +881,7 @@ about the instance the definition has established.
 
 Effect, in one transaction: resolve `seller_tenant_id` **inside Orders**, from the Lifecycle order
 record that the settled `admit-trigger` admission for `triggerEventId` read (`02 §3.6`
-`inst-at-read`), never from the task input (decision recorded by commit D as D-6x: the seller axis
+`inst-at-read`), never from the task input (decision D-76: the seller axis
 is resolved inside Orders and `admit-trigger`'s settled result carries it for `start-instance`);
 insert `owf_process_instance` (the partial unique index
 `UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates a race, not a prior read), insert
@@ -1254,8 +1254,7 @@ is by reference only.
 `parked` is a **distinct** state, not a flavour of `suspended`: a suspension is operator-initiated
 and resumable by an operator, a park is the fail-closed consequence of an unobtainable verdict or
 an exhausted lifetime ceiling and clears only when an operation records that it may. There is no
-`suspended → terminated` edge: every unwind from a hold passes `compensating` (decision recorded by
-commit D as D-6x: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
+`suspended → terminated` edge: every unwind from a hold passes `compensating` (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
 open; a parked instance is unwound only through the fence). No transition leaves `terminated`. **The projection never drives the definition**: no task reads `phase` to
 choose a branch; the definition's own state does that, and the projection exists so an operator
 read and an audit trail can say where the definition has taken the instance.
@@ -1594,7 +1593,7 @@ Each responsibility a retired table carried has a named new owner:
 - `cpt-cf-bss-orders-workflow-dbtable-dead-letter-record` (`owf_dead_letter_record`) — retired
   by ADR-0011 with ADR-0009 as amended. An inbound delivery that exhausts its cap is the platform
   event-trigger path's dead letter (`DESIGN.md:976`, *dead-letter handling*); its operator
-  visibility is the platform's, requested in `UPSTREAM_REQS.md` (commit D); the manual task
+  visibility is the platform's, requested in `UPSTREAM_REQS.md` §2.9; the manual task
   remains the inspectable object for a step failure (§4.8).
 
 #### Partitioning, retention and immutability
@@ -1650,8 +1649,7 @@ There is **no timer wake-up worker**: every timer is a definition `wait` execute
 There is **no dead-lease scan**: a dead lease on a dispatching step key is detected by
 `reconcile-intent`'s read of the intents that key wrote — driven by this roster's
 `next_sweep_at` schedule for every instance, and earlier by the definition's poll arm
-(`10 §3.6`) for a live one — and is settled by `settle-from-lookup` (decision recorded by commit D
-as D-6x: the sweep worker's candidate set is `next_sweep_at <= now` over every non-terminal intent,
+(`10 §3.6`) for a live one — and is settled by `settle-from-lookup` (decision D-71: the sweep worker's candidate set is `next_sweep_at <= now` over every non-terminal intent,
 aligning this roster with `05 §3.8`). There is no idempotency-window
 sweep: registry retention is the monthly partition drop, and an aged-out key needs no worker
 because §4.3 makes the *next* attempt a new key.
@@ -1746,7 +1744,7 @@ are declared on the definition and recorded here so an unset value is a visible 
 | Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
 | Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff, provably nested inside the 3 min wave-2 timeout |
 | Overdue window | definition (`wait` arm) | 24 h past expected fulfillment time | Fixed by the PRD as commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`) |
-| Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-4) |
+| Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 
 **The nesting invariant is normative and is enforced in two places.** Per-operation deadline
 **<** cumulative retry backoff **<** task timeout **<** overdue window **<** lifetime ceiling. The
@@ -1847,14 +1845,14 @@ policy is the plugin's; Orders exposes the per-dependency breaker state and the 
 rate (§3.8) so that the platform tenant quota (`TenantRuntimePolicy`,
 [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) can be set
 against measured load, and registers the absence of an aggregate retry cap on the platform side as
-an upstream ask (commit D).
+an upstream ask (`UPSTREAM_REQS.md` §2.9).
 
 **Deadline propagation**: the effective deadline of §3.3 step 4 **MUST** be propagated on every
 outbound call an operation makes rather than each hop timing out independently. Without it,
 Subscriptions continues working on a request this gear has already abandoned, which widens the
 window in which a late success creates a subscription nobody is waiting for (slice 06's fencing
 step 3). Whether the plugin propagates the task's remaining timeout on the HTTP `call` is not
-stated in the serverless-runtime design and is an upstream ask (commit D); until it is answered,
+stated in the serverless-runtime design and is an upstream ask (`UPSTREAM_REQS.md` §2.9); until it is answered,
 the operation's own `deadline_ms` is the effective deadline.
 
 ### 4.6 The process audit log is 100% complete with zero silent drops
@@ -2042,7 +2040,7 @@ record: this gear owns no dead-letter table (§3.7 *Retired tables*,
 `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` as amended by ADR-0011). A
 platform dead letter **MUST NOT** be an order state, **MUST NOT** be inferred as a process
 outcome, and **MUST** be visible to the fulfillment operator — that visibility is a platform
-surface and is requested in `UPSTREAM_REQS.md` (commit D), not built here.
+surface and is requested in `UPSTREAM_REQS.md` §2.9, not built here.
 
 **The step-level path is the manual task, by construction.** A step operation settles
 `retryable-failure` or `permanent-failure`; what follows is the definition's failure arm, whose
@@ -2162,8 +2160,7 @@ example — and they are stated once so no slice chooses them again.
 | `authority-withdrawn` | `09-read-and-authz` | `AUTHORITY_WITHDRAWN` | FailedPrecondition | 400 |
 
 The table registers **42** reasons: the engine's ten and 32 contributed by slices 02–09 — two by
-02, three by 03, eight by 04, five by 05, five by 06, four by 07 and five by 09 (decision recorded
-by commit D as D-6x: the twelve reasons the step-operation slices introduced —
+02, three by 03, eight by 04, five by 05, five by 06, four by 07 and five by 09 (decision D-77: the twelve reasons the step-operation slices introduced —
 `trigger-applicability-unverified`, `prior-instance-active`, `identity-party-unavailable`,
 `activation-precondition-unmet`, `intent-unresolved`, `fence-not-claimed`,
 `outcome-not-reportable`, `order-fenced`, `action-not-offered`, `override-unverified`,
@@ -2263,7 +2260,7 @@ rules stay stated here because the envelope depends on them: a line that cannot 
 the line in `deferred[]` with a `deferReason` and a `retryAfterMs` hint, never a
 `retryable-failure` — so the definition's deferral arm waits and calls again under the next
 dispatch round without consuming the task retry budget
-(`cpt-cf-bss-orders-workflow-fr-owf-backpressure`; decision recorded by commit D as D-6x: an
+(`cpt-cf-bss-orders-workflow-fr-owf-backpressure`; decision D-96: an
 admission deferral settles as success carrying `deferred[]` and `retryAfterMs`); and a
 throttle-induced delay inside an operation **MUST** stay inside the per-operation deadline — an
 operation never extends its own deadline, because the outer bound that would absorb the extension

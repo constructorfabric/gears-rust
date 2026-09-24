@@ -534,7 +534,7 @@ Does not call the billing chain and does not delay reporting for it
 failure. Does not publish to the bus directly. Does not re-check cancel authority: that is
 `authorize-cancel`'s apply-time re-check before the fence (slice 08); once every subscription has
 been removed, withholding the report would leave Lifecycle asserting subscriptions that no longer
-exist (decision recorded by commit D as D-6x: the apply-time re-check of an authorized cancel runs
+exist (decision D-84: the apply-time re-check of an authorized cancel runs
 once, in `authorize-cancel` before `run-cancellation-fence`, and `report-outcome` does not repeat
 it).
 
@@ -577,7 +577,7 @@ row for the version, which only a definition that bypassed the fence can cause) 
 `outcome-not-reportable` (`FailedPrecondition`, 400 — the fence has not verified that no active
 subscription remains, or slice 04's completion predicate does not hold for `completed`, or
 Lifecycle refused the evidence with `compensation-evidence-incomplete` or
-`acknowledgement-lines-incomplete`). (Decision recorded by commit D as D-6x: register
+`acknowledgement-lines-incomplete`). (Decision D-77: register
 `fence-not-claimed` and `outcome-not-reportable` under owner `06-saga-and-compensation` in the
 reason catalogue of `01 §4.9`.)
 
@@ -928,7 +928,7 @@ on `(seller_tenant_id, failure_reason)` for the manual-task queue. **Retention �
 matching the audit and manual-task stores: a compensation record is the evidence behind a
 `fulfillment_failed` or `cancelled` acknowledgement. Growth table — **monthly range partition on
 `created_at`**; the `retention-purge` worker of `01 §3.8` gains this table and
-`owf_cancellation_fence` at their windows (a roster amendment for commit D).
+`owf_cancellation_fence` at their windows (the retention-purge roster in `01 §3.8` covers both).
 
 **Example**:
 
@@ -966,7 +966,7 @@ matching the audit and manual-task stores: a compensation record is the evidence
 | `no_active_verified_at` | timestamp, nullable | Step 5 completion — every record `succeeded` |
 | `reported_at` / `reported_outcome` | timestamp / enum, nullable | Set by `report-outcome` when the outcome is recorded |
 | `absorbed_trigger_count` | integer | Later triggers absorbed against this run (§4.3); starts at 0 |
-| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) or `report-outcome` (`pre-submission`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted and no Lifecycle submission is made. Cleared when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3) (decision recorded by commit D as D-6x: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
+| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) or `report-outcome` (`pre-submission`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted and no Lifecycle submission is made. Cleared when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3) (decision D-84: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
 | `created_at` | timestamp | When the run was claimed |
 
 **PK**: `(order_id, order_version)`

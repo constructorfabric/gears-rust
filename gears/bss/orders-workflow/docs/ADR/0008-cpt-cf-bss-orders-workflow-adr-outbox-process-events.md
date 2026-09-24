@@ -124,8 +124,9 @@ D-58, and any relaxation of the number is a Product decision, not a silent widen
   cap, delivered-row purge, `dead_lettered_at` column or Workflow-owned dead-letter schema for
   outbound events. Platform migration families are not counted as Workflow tables; the engine
   owned seven tables at this decision — nine once D-59 added the two audit checkpoint tables —
-  and none of them is an outbox. `owf_dead_letter_record` remains the *inbound* store of ADR-0009
-  and gains no outbound role.
+  and none of them is an outbox. `owf_dead_letter_record` was the *inbound* store of ADR-0009 and
+  gained no outbound role; it is now retired, because inbound dead letters belong to the platform
+  trigger path (D-72).
 * **At-least-once delivery.** Consumers de-duplicate by the event envelope ID. Accepted,
   persisted and duplicate broker outcomes acknowledge the toolkit message. Broker idempotency is
   separate: managed Chained mode uses producer ID, predecessor and sequence within the
@@ -182,7 +183,7 @@ dead letter then advances it on `Reject`. Toolkit outbox rejects payloads above 
 4. duplicate-delivery tests proving consumers key on event ID;
 5. transient-failure tests proving queue-partition FIFO and recovery;
 6. permanent-rejection tests proving a dead letter is visible, process state is unchanged, no
-   `owf_dead_letter_record` row is written, and later events may proceed;
+   Orders dead-letter row is written (that table is retired, D-72), and later events may proceed;
 7. largest-envelope tests for `OrderFulfillmentCompleted` at the 200-line cap;
 8. readiness tests for absent Event Broker runtime, schema preparation failure, producer
    registration failure and broker-partition mismatch; and
@@ -269,5 +270,5 @@ This decision directly addresses the following requirements or design elements:
   alongside the local state mutation it commits, which is where the atomicity rule binds
 * `cpt-cf-bss-orders-workflow-component-approval-execution` (**approval gate manager**) and
   (**escalation timer owner**) — declare `OrderApprovalRequested` and `OrderApprovalEscalated`
-* `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` — `owf_dead_letter_record`
-  stays inbound-only; a platform dead letter is broker evidence, never a Workflow record
+* `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` — the former inbound-only
+  `owf_dead_letter_record` is retired (D-72); a platform dead letter is broker evidence, never a Workflow record

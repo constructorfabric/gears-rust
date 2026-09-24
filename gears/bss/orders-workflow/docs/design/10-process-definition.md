@@ -288,7 +288,7 @@ to termination on it; migration is out of scope (PRD §5.2); a version **MUST NO
 deleted while a binding names it, and the platform registry's `archived`/`deleted` transitions
 (`DESIGN.md:588`) are gated by that check in the validation hook. **Publish roles**: the
 platform operator today, through the registry's publish operation under platform authorization;
-a seller-scoped fragment role is registered as **Q-10** (`../DECISIONS.md`, commit D). **Audit of
+a seller-scoped fragment role is registered as **Q-10** (`../DECISIONS.md`). **Audit of
 publishes**: the registry is the platform's system of record for who published what and when;
 Orders copies `published_by` onto each binding at start (D-61 minimisation) so its own record
 answers the question for the instances it ran.
@@ -400,7 +400,7 @@ canonical definitions in this repository.
 
 It authors nothing and publishes nothing; it never changes a definition to make it pass. Whether
 the registry calls a gear-supplied hook before publish, rather than only the plugin's, is not
-stated in the serverless-runtime design and is an **upstream ask** (commit D); until it is
+stated in the serverless-runtime design and is an **upstream ask** (`UPSTREAM_REQS.md` §2.9); until it is
 answered the CI test is the enforcing check and a publish outside CI is an unvalidated publish
 this design does not permit.
 
@@ -452,7 +452,7 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 | Purpose | Platform endpoint | Reference | Orders' use |
 |---------|-------------------|-----------|-------------|
 | Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version; the validation hook of §3.2 runs inside "validate" and "publish"; `owf_definition_binding` blocks archive/delete of a bound version |
-| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders in normal operation — the event trigger starts the invocation; used by an operator re-drive of a dead invocation (`09`) with `Idempotency-Key = {tenant}:{orderId}:{orderVersion}:order-process` so a duplicate start is deduplicated by the platform |
+| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the event trigger starts every invocation. An operator re-drive of a dead invocation is `…:control` `retry` keeping `invocation_id` (D-86), never a second start; until the platform confirms that property, the instance is unwound and the order re-submitted, which starts through the trigger again |
 | Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The `reconciliation-sweep` worker's no-live-invocation metric (`01 §3.8`) and the progress read (`09`) |
 | Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` from `failed` by an operator re-drive only; `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension |
 | Plugin control (signals) | `POST …/invocations/{invocation_id}:plugin-control` | `DESIGN.md:869`, `DESIGN.md:893` | Delivery of `cancel-requested`, `reauthorize-requested`, `task-resolution-requested` and `unpark-requested` to the running invocation's `listen` arms |
@@ -473,7 +473,7 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 The platform states that the plugin "owns the verb set its backend supports" on
 `:plugin-control` (`DESIGN.md:893`) and that Temporal signals are native (ADR-0004 *Option A*);
 it does **not** state a verb or payload shape for delivering a named signal that a `listen` task
-consumes. **The exact plugin-control payload is an upstream ask** (`UPSTREAM_REQS.md`, commit D).
+consumes. **The exact plugin-control payload is an upstream ask** (`../UPSTREAM_REQS.md` §2.9).
 Until answered, the signal types are declared here as reference names —
 `gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.cancel_requested.v1~`,
 `…reauthorize_requested.v1~`, `…task_resolution_requested.v1~` and `…unpark_requested.v1~` — and
@@ -1331,8 +1331,7 @@ parked instance — including one parked at the lifetime ceiling — reaches an 
 this path and the fence (`parked → compensating`, `01 §3.7`). The terminal-event case
 (`OrderCancelled`, `OrderExpired`, `OrderRejected`) is the same unwind entered through
 `terminate-on-terminal-event` in fragment (f). `unpark-requested` has no origin route in this
-design set yet ([`09 §3.3`](./09-read-and-authz.md#33-api-contracts); decision recorded by commit
-D as D-6x: the origin routes and catalogue pairs for `reauthorize-requested` and
+design set yet ([`09 §3.3`](./09-read-and-authz.md#33-api-contracts); open question Q-13: the origin routes and catalogue pairs for `reauthorize-requested` and
 `unpark-requested`, or their removal from the canonical definition).
 
 #### (e) Hold and resume
@@ -1530,7 +1529,7 @@ fence; `start-instance` for the new version succeeds once the old instance's `te
 is set (`01 §3.7` partial unique index). The two consumers are separated by the role suffix of
 the admission key (`02 §2.1`), never by two deliveries to one consumer. Whether one broker event
 can both start a new invocation through a trigger and be consumed by a running invocation's
-`listen` is not stated in the serverless-runtime design and is an **upstream ask** (commit D).
+`listen` is not stated in the serverless-runtime design and is an **upstream ask** (`UPSTREAM_REQS.md` §2.9).
 
 **Description**: The fragment reproduces [`02 §3.6` *Terminal-event compensation, void, and
 audit*](./02-triggers-and-start.md#36-interactions--sequences) and `02 §4`'s void-on-superseded-
@@ -1662,7 +1661,7 @@ exactly the remainder `apply-resume` returned. The lifetime `wait` **MUST** be a
 competing arm outside every stage fork, and the barrier poll, the expected-fulfillment `wait` and
 the overdue `wait` **MUST** be in branches a hold arm does not cancel: outside the approval stage
 a hold is recorded and the stage loop continues (§3.6 (e)). **Q-11 is registered open**
-(`../DECISIONS.md`, commit D): whether the Serverless Workflow DSL 1.0.0, as the platform's plugin
+(`../DECISIONS.md`): whether the Serverless Workflow DSL 1.0.0, as the platform's plugin
 implements it, (i) accepts a runtime expression as a `wait` duration, so the remainder and the
 expected-fulfillment instant can be armed without a Function; (ii) surfaces the Problem body's
 `error_code` on `$error` so a `catch` can tell `idempotency-key-conflict` from `still-processing`
@@ -1675,7 +1674,7 @@ remainder Orders returns — natively, without a Function. Until Q-11 is answere
 to a registered Function that sleeps the remainder, (ii) is bounded by the retry budget, (iii) is
 settled as one `call` per wave carrying `lineRefs[]`, (iv) is covered by the poll arms and the
 re-entry of every stage loop, and (v) falls back to the same Function as (i) for the re-armed
-`wait` (decision recorded by commit D as D-6x: Q-11 carries the five sub-questions (i)–(v)).
+`wait` (open question Q-11: Q-11 carries the five sub-questions (i)–(v)).
 
 ### 4.6 Protected operations are never inside a swallowing `catch`
 

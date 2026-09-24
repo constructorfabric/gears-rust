@@ -220,7 +220,7 @@ with a different `orderId`, `orderVersion` or `triggerKind` fails the request fi
 key. The `correlationId` rides the registry row (`owf_idempotency_registry.correlation_id`) as the
 cross-reference that lets an absorbed duplicate say which instance it belongs to, and never
 participates in key equality. This key shape is an event-scoped form of ADR-0006's instance-scoped
-family (decision recorded by commit D as D-6x: the `trigger` key family
+family (decision D-74: the `trigger` key family
 `{tenant}:{eventId}:admit-trigger[:listen]` is added to ADR-0006 and to
 `owf_step_operation.key_family`).
 
@@ -292,7 +292,7 @@ mechanism (`DESIGN.md:808`). Two start bindings are needed, because Lifecycle pu
 `OrderSubmitted` for an amended version — an amendment returns the order to `submitted` and
 publishes `OrderAmended` only
 ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative)):
-one trigger on `OrderSubmitted` and one on `OrderAmended` (decision recorded by commit D as D-6x:
+one trigger on `OrderSubmitted` and one on `OrderAmended` (decision D-73:
 the start-trigger set is `{OrderSubmitted, OrderAmended}`, which amends `10 §2.2` rule 7 and the
 event-trigger row of `10 §3.3`). Whether one broker event can both start an invocation through a
 trigger and be delivered to a running invocation's `listen` is not stated by the platform and is
@@ -505,8 +505,8 @@ this gear.
 | `retry_class` | `retryable-on: transient` | `retryable-on: transient` |
 | `deadline` | 5 s, including one Lifecycle `order × read` under the propagated deadline | 5 s; no outbound call |
 
-Two reasons are new and are registered by commit D in the catalogue of `01 §4.9` (decision
-recorded by commit D as D-6x): `trigger-applicability-unverified` (owner `02-triggers-and-start`,
+Two reasons are new and are registered in the catalogue of `01 §4.9` (decision
+recorded as D-77): `trigger-applicability-unverified` (owner `02-triggers-and-start`,
 `TRIGGER_APPLICABILITY_UNVERIFIED`, ServiceUnavailable, 503) — the Lifecycle read failed or
 returned a version behind the event; and `prior-instance-active` (owner `02-triggers-and-start`,
 `PRIOR_INSTANCE_ACTIVE`, Aborted, 409) — a start for a new version while the prior version's
@@ -859,8 +859,7 @@ instance holds no provisioning intent and its unwind is gate cancellation plus t
 
 **Why unwinding first, not overlapping.** Letting the new version start while the prior one
 unwinds would put two instances on one order and two compensation ledgers in play at once —
-exactly what the single-active-instance principle forbids. (Decision recorded by commit D as
-D-6x: the atomic terminate-then-start supersession step of the pre-ADR-0011 design is replaced by
+exactly what the single-active-instance principle forbids. (Decision D-75: the atomic terminate-then-start supersession step of the pre-ADR-0011 design is replaced by
 unwind-then-start with the new invocation's admission held `open`; D-06 and D-07 stand.)
 
 ### 4.4 Inbound Subscriptions confirmations carry a version too

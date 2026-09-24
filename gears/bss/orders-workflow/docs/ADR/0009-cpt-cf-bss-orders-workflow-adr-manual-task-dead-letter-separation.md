@@ -83,8 +83,8 @@ classification), never on a silent retry loop and never as a fresh dead-letter e
 > delivery that the definition's `catch` around `admit-trigger` surfaces becomes a manual task
 > raised through `create-manual-task` with a catalogue reason, never a second object, and a
 > permanently failed step still reaches the manual task or the tracked incident and nothing else.
-> The fate of the `owf_dead_letter_record` table — retained for any callback that does not
-> traverse the platform trigger path, or retired — is a register entry, not a silent removal.
+> The `owf_dead_letter_record` table is retired by D-72: every inbound event reaches Orders through
+> the platform trigger path, so no callback remains for it to hold.
 
 ### Confirmation
 
@@ -136,5 +136,5 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` — fixes that a terminal failure the sweep discovers routes to the dead-letter path only when it is a delivery-exhaustion case, not a step-remediation case
 * `cpt-cf-bss-orders-workflow-component-manual-tasks` (**manual task creator**) — sole creator of the manual-task object under the remediation policy; fulfillment orchestration hands a permanently failed line to it and never writes the task itself
 * `cpt-cf-bss-orders-workflow-component-manual-tasks` (**incident recorder**) — creates the non-actionable tracked incident under fail-fast, the alternative object to the manual task and never a second one alongside it
-* `cpt-cf-bss-orders-workflow-component-foundation` (**step executor**) — sole writer of `owf_dead_letter_record`, on inbound-delivery or callback cap exhaustion only; the dead-letter store is engine-side and is not owned by any fulfillment or manual-task component
+* `cpt-cf-bss-orders-workflow-component-foundation` (**step executor**) — *retired by D-72; this was the pre-ADR-0011 role:* sole writer of `owf_dead_letter_record`, on inbound-delivery or callback cap exhaustion only; the dead-letter store is engine-side and is not owned by any fulfillment or manual-task component
 * `cpt-cf-bss-orders-workflow-component-manual-tasks` (**operator task queue**) — surfaces both object types to operators while keeping them visually and operationally distinguishable, which is the entry-condition separation made visible

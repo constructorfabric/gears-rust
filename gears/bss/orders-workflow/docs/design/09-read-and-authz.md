@@ -404,7 +404,7 @@ through `pep_prop`.
 | `gts.cf.bss.orders_workflow.process_step.v1~` | One registered step operation of `owf_step_operation` (`01 §3.7`), invoked for one instance | `execute` | `operation` (one value per registered operation, the table below); `resource_tenant_id` from the body, checked against the bound instance where one exists; resource id = `correlationId` (absent only on `admit-trigger` in the `start` role, whose instance does not exist yet). `seller_tenant_id` is **not** supplied: it does not cross the engine boundary (ADR-0013), and inside the operation every read narrows to the bound instance's axes (ADR-0010 as amended) |
 | `gts.cf.bss.orders_workflow.fulfillment_task.v1~` | `owf_fulfillment_task` and the frozen plan lines it projects | `read` | `resource_tenant_id`, `seller_tenant_id`; resource id = `order_id` (the plan projection is per order version) |
 | `gts.cf.bss.orders_workflow.manual_task.v1~` | `owf_manual_task` and the incident rows the queue projects | `read`, `resolve`, `override`, `assign`, `escalate`, `cancel` | `resource_tenant_id`, `seller_tenant_id`; resource id = `task_id`; `assignee` |
-| `gts.cf.bss.orders_workflow.dead_letter.v1~` | **Pending.** `owf_dead_letter_record` is retired (`01 §3.7` *Retired tables*); the label survives only for `owf_dead_letter_triage`, which slice 07 keeps *pending* the platform's answer on operator visibility of trigger-path dead letters (`01 §4.8`, `UPSTREAM_REQS.md`, commit D) | `read`, `redrive`, `discard` — **not registered** until that ask is answered | `resource_tenant_id`, `seller_tenant_id`; resource id = the triage row's id |
+| `gts.cf.bss.orders_workflow.dead_letter.v1~` | **Pending.** `owf_dead_letter_record` is retired (`01 §3.7` *Retired tables*); the label survives only for `owf_dead_letter_triage`, which slice 07 keeps *pending* the platform's answer on operator visibility of trigger-path dead letters (`01 §4.8`, `UPSTREAM_REQS.md` §2.9) | `read`, `redrive`, `discard` — **not registered** until that ask is answered | `resource_tenant_id`, `seller_tenant_id`; resource id = the triage row's id |
 | `gts.cf.bss.orders_workflow.approval_gate.v1~` | `owf_approval_gate` | `read_inbox`, `approve` (approve or reject; the submitting identity is barred server-side, D-56) | `resource_tenant_id`, `seller_tenant_id`; resource id = `gate_id`; `assigned_principal`; `order_id` |
 | `gts.cf.bss.orders_workflow.progress.v1~` | `owf_process_progress_view` — the read projection | `read` | `resource_tenant_id`, `seller_tenant_id`, `payer_tenant_id`; resource id = `order_id`; the set of `order_id` values carrying a gate whose `assigned_principal` is the caller, for the approver's `A*` path |
 
@@ -789,7 +789,7 @@ calls are `admit-trigger` and `start-instance`. No Orders route calls
 `POST /api/serverless-runtime/v1/invocations`. A re-drive of an invocation the platform reports
 `dead_lettered` is **not** offered: `start-instance` answers the existing binding to a second
 invocation and that invocation ends itself (`01 §3.3`), so a platform re-start cannot adopt a bound
-instance (decision recorded by commit D as D-6x: whether an operator re-drive of a
+instance (decision D-86: whether an operator re-drive of a
 `dead_lettered` invocation re-binds `owf_process_instance.invocation_id`, or the instance is
 unwound and the order re-submitted).
 
@@ -807,7 +807,7 @@ while `assign` and `escalate` apply in-process (`07 §3.3`).
 operator signals, `reauthorize-requested` (payment re-authorisation, slice 04) and
 `unpark-requested` (after a lifetime-ceiling park). Neither has a route in this design set, so
 neither can be delivered by an authorized control operation today, and §2.1's exhaustiveness rule
-forbids delivering one from anywhere else (decision recorded by commit D as D-6x: the origin
+forbids delivering one from anywhere else (open question Q-13: the origin
 routes and catalogue pairs for `reauthorize-requested` and `unpark-requested`, or their removal
 from the canonical definition).
 
@@ -1065,7 +1065,7 @@ per-action task routes of slice 07 deliver by the same sequence (`07 §3.6`).
 
 **Kept**: `owf_process_progress_view` (dead-letter columns out; `phase` and `invocation_id` in).
 **Added**: `owf_cancel_request`, the request record `10 §4.4` and `08 §3.3`'s `cancelRequestRef`
-require for a cancel (decision recorded by commit D as D-6x: the cancel request record is a table
+require for a cancel (decision D-85: the cancel request record is a table
 of slice 09; retry, override and task-cancel requests are slice 07's `owf_task_resolution_request`). **Lost**: none of this slice's own; the event-handler topic declarations of the conformance
 check are retired with the handlers.
 

@@ -866,7 +866,7 @@ sequenceDiagram
 4. [ ] - `p1` - **IF** `action ∈ {retry, override}` on a forward-reason task: re-check the fence and terminal conditions of §2.2 against `owf_cancellation_fence` and the instance in this transaction; on a hit mark the request `refused` with `order-fenced`, **RETURN** `refused` - `inst-rmt-fence`
 5. [ ] - `p1` - **IF** `action = retry`: invoke `retry-step`'s effect in-process (01: quarantine, next `attempt` for the step's key family); on `poison-step` mark the request `refused`, **RETURN** `refused`; for a `line` forward task move the line `failed → pending` (wave 1) or `failed → draft_created` (wave 2) through slice 04's transition function with the request's principal as `last_transition_actor`; resolve the task `retry` / `retry-dispatched`; **RETURN** `retry` with `attemptKey` and `resumeAt` — `barrier` (line), `plan` (plan scope: a new `attempt` of `construct-and-freeze-plan`), `compensation` (compensation reason: `compensate-order` again), `stage` (order scope: re-enter the stage whose operation failed) - `inst-rmt-retry`
 6. [ ] - `p1` - **IF** `action = override`: leave the request `requested` and the task `in_progress`; **RETURN** `override` — `verify-override` applies it - `inst-rmt-override`
-7. [ ] - `p1` - **IF** `action = cancel`: resolve the task `cancel` / `cancelled-by-seller-operator` with the request's principal and justification; **IF** it was the last open task of a `line` or `plan` subject that is still failed under a live order: **RETURN** `exhausted` (the Seller Operator's judgement that remediation is moot is the exhaustion of that subject; decision recorded by commit D as D-6x: cancelling the last open forward task of a still-failed subject declares remediation exhausted); **ELSE RETURN** `closed` - `inst-rmt-cancel`
+7. [ ] - `p1` - **IF** `action = cancel`: resolve the task `cancel` / `cancelled-by-seller-operator` with the request's principal and justification; **IF** it was the last open task of a `line` or `plan` subject that is still failed under a live order: **RETURN** `exhausted` (the Seller Operator's judgement that remediation is moot is the exhaustion of that subject; decision D-99: cancelling the last open forward task of a still-failed subject declares remediation exhausted); **ELSE RETURN** `closed` - `inst-rmt-cancel`
 8. [ ] - `p1` - Mark the request `applied`, write the `step-completion` entry with the request's principal and justification, settle the key, **RETURN** with `openTaskCount`, `slaRemaining`, `slaRound` - `inst-rmt-settle`
 
 **Description**: The control endpoint records and signals; the definition applies. That split is
@@ -1182,7 +1182,7 @@ transition the order. **Retention ≥ 400 days.** Growth table — **monthly ran
 **Status: pending.** `owf_dead_letter_record` is retired (`01 §3.7` *Retired tables*): an inbound
 delivery past its cap is the platform event-trigger path's dead letter (`01 §4.8`). This table
 remains **only if** the platform exposes its dead letters to operators with a stable identity and a
-re-drive; that exposure is the upstream ask of `01 §4.8` (`UPSTREAM_REQS.md`, commit D). Until it
+re-drive; that exposure is the upstream ask of `01 §4.8` (`../UPSTREAM_REQS.md` §2.9). Until it
 is answered the table is not created, the three dead-letter endpoints of §3.3 are not served, and
 operators see platform dead letters only through the platform's own surface. If the ask is
 declined, the table and the endpoints are retired rather than rebuilt on an Orders copy of the
@@ -1255,7 +1255,7 @@ where `class_window` is chosen by whether the stuck subject is **resource-affect
 | dead-letter triage (pending) | no — the delivery was not processed at all | **24 h** |
 
 These are working baselines proposed into the program-wide NFR workshop, not registered decisions
-(decision recorded by commit D as D-6x: the 4 h / 24 h SLA classes by resource-affecting subject).
+(decision D-98: the 4 h / 24 h SLA classes by resource-affecting subject).
 The 4 h window sits well inside the 24 h overdue window, so an SLA breach on a resource-affecting
 subject is visible before the order-level escalation fires; the 24 h window matches the overdue
 window.
@@ -1310,7 +1310,7 @@ state. It is answered as a derived property: a task with `assignment_state <> re
 remediation hold, and the queue projects it as `remediationHold: true`. Dispatch is stopped
 structurally by the definition's position in `awaitResolution` (04 §4.4), not by a column this
 slice writes; a sixth `assignment_state` member would conflate the operator's progress with the
-order's dispatch state (decision recorded by commit D as D-6x: the remediation hold is an open
+order's dispatch state (decision D-99: the remediation hold is an open
 forward task under `remediate`, projected as a flag, not an assignment state).
 
 ### 4.4 Resolution actions by reason, and the two operator roles (normative)
@@ -1363,13 +1363,13 @@ for the four operations; the per-action task routes of §3.3 are the resolution 
 `manual_task × escalate` and `assign` as in §4.4; `dead_letter × *` marked pending;
 (d) **slice 10** — `task-resolution-requested` joins the closed `listen` set and the signal table of
 §3.3; fragment (c) gains the SLA branch, the `exhaustedTaskRefs` and `exhausted` routing and the
-`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`, commit D) — five reasons owned by
+`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — five reasons owned by
 `07-manual-tasks`: `order-fenced` (`ORDER_FENCED`, FailedPrecondition, 400), `action-not-offered`
 (`ACTION_NOT_OFFERED`, FailedPrecondition, 400), `override-unverified` (`OVERRIDE_UNVERIFIED`,
 FailedPrecondition, 400), `lifetime-ceiling-reached` (`LIFETIME_CEILING_REACHED`,
 FailedPrecondition, 400), and `approval-reflection-refused` (owner `03-approval-execution`,
 `APPROVAL_REFLECTION_REFUSED`, FailedPrecondition, 400), with `intent-unresolved` as slice 05
-registers it (decision recorded by commit D as D-6x: the manual-task reason enum is the catalogue
+registers it (decision D-98: the manual-task reason enum is the catalogue
 subset of §3.7, covering plan-level, order-level and lifetime-ceiling subjects);
 (f) **platform** — operator visibility and re-drive of platform dead letters (§3.7), and the
 `:plugin-control` signal payload, shared with `10 §3.3`.
@@ -1379,8 +1379,8 @@ subset of §3.7, covering plan-level, order-level and lifetime-ceiling subjects)
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
 the fence of `10 §4.1` (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`);
-the items marked **alignment** are not yet expressed by the canonical fragments of `10 §3.6` and are
-to be brought into line (commit D):
+the items marked **alignment** are the ones folded into the canonical fragments of `10 §3.6`
+when the fragments were reconciled with the slice operations (D-80, D-81):
 
 1. [ ] - `p1` - **Creation before terminal.** On every failure path under `remediate`, and on the plan-level `topology-unavailable` path under either policy, `create-manual-task` **MUST** precede any `run-cancellation-fence`, `report-outcome` or `terminate-instance`; under `fail-fast` the definition **MUST NOT** call it for a forward line or `invalid-dependency-graph` subject - `inst-c7-create-first`
 2. [ ] - `p1` - **No swallowing.** `create-manual-task` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); its retry exhaustion fails the invocation, whose platform status the backstop sweep observes (`01 §3.8`) - `inst-c7-no-swallow`
@@ -1415,8 +1415,8 @@ definition input, not an Orders release) — the business default of 24 hours is
   (signals), §4.1 (the fence)
 - **Decisions**: `DECISIONS.md` D-29 (two compensation reasons), D-32 (one task by any route),
   D-33 (override rejected without verification), D-34 (overdue non-terminal), D-53 (lifetime
-  ceiling), D-55 (remediation exhausted); the D-6x entries named in §3.6, §4.1, §4.3 and §4.7 are
-  minted by commit D
+  ceiling), D-55 (remediation exhausted); D-98 (reason enum and SLA classes), D-99 (remediation hold, last-task
+  cancel) and D-100 (resolution requests and keys)
 - **Prior slices**: [01-foundation.md](./01-foundation.md) (envelope, `retry-step`,
   `terminate-instance`, reason catalogue, dead letters), [02-triggers-and-start.md](./02-triggers-and-start.md)
   (`trigger-applicability-unverified`), [03-approval-execution.md](./03-approval-execution.md)
@@ -1431,4 +1431,4 @@ definition input, not an Orders release) — the business default of 24 hours is
   "shares model with" relation to `cpt-cf-bss-orders-workflow-component-activation-barrier-timer-owner`
   (ADR-0011)
 - **Features**: none authored yet; feature decomposition follows this design set.
-- **Upstream asks**: `SUB-O11`–`SUB-O14` ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1) for the override verification read (`SUB-O13` status-read semantics); the platform dead-letter visibility and `:plugin-control` signal payload asks (commit D)
+- **Upstream asks**: `SUB-O11`–`SUB-O14` ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1) for the override verification read (`SUB-O13` status-read semantics); the platform dead-letter visibility and `:plugin-control` signal payload asks (`../UPSTREAM_REQS.md` §2.9)
