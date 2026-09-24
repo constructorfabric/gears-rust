@@ -22,6 +22,7 @@ use crate::domain::audit::{AuditEntry, AuditOperation, AuditOutcome, FileEvent};
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::RetentionScope;
 use crate::domain::ports::CleanupStore;
+use crate::domain::storage_layout;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::external_clients::{UsageDelta, UsageReporter};
 
@@ -129,9 +130,10 @@ impl CleanupEngine {
     /// Sweep order (each step is best-effort -- one failure does not abort the
     /// rest):
     /// 1. Abandoned pending versions (pre-registered but never finalised, past
-    ///    the orphan grace window) -- **except** a version still backing a
-    ///    live `in_progress` multipart session (`expires_at > now`), which is
-    ///    never selected regardless of age. Followed by a second phase,
+    ///    the orphan grace window) -- **except** a version still backing an
+    ///    active multipart session: a live `in_progress` one (`expires_at >
+    ///    now`), or any `completing` one (regardless of lease), neither of
+    ///    which is ever selected regardless of age. Followed by a second phase,
     ///    [`Self::sweep_versionless_files`], for `files` rows that never got a
     ///    version row in the first place (so the first phase's own
     ///    version-age query can never see them) -- e.g. a process crash
@@ -139,7 +141,8 @@ impl CleanupEngine {
     ///    `MultipartService::initiate_multipart_upload`'s
     ///    `insert_pending_version`, or a failed
     ///    `FileService::compensate_failed_multipart_initiate`.
-    /// 2. Expired multipart sessions (`expires_at < now`, still `in_progress`).
+    /// 2. Expired multipart sessions (`expires_at < now`, still `in_progress`,
+    ///    or `completing` with a lapsed lease).
     /// 3. Retention-policy expiry (age / inactivity / metadata rules, all scopes).
     /// 4. Expired idempotency-key rows (`expires_at <= now`). `audit_outbox`/
     ///    `events_outbox` rows are deliberately left untouched -- see the
@@ -610,30 +613,35 @@ impl CleanupEngine {
         }
     }
 
-    /// Whether `file_id` has a not-yet-expired multipart session that should
-    /// block orphan-file deletion.
+    /// Whether `file_id` has an active (`in_progress` or `completing`)
+    /// multipart session that should block orphan-file deletion.
     ///
     /// `sweep_abandoned_pending` keys only on a pending version's age, so a
-    /// multipart session that has legitimately not expired yet can still have
+    /// multipart session that is legitimately still active can still have
     /// its backing version aged past the orphan grace window and reclaimed
     /// earlier in the same sweep pass. If [`Self::orphan_candidate_file`]'s
     /// caller went on to delete the file here too, the `files` FK's
-    /// `ON DELETE CASCADE` would take the still-`in_progress`
+    /// `ON DELETE CASCADE` would take the still-active
     /// `multipart_uploads` row with it, destroying a live upload with no
-    /// error surfaced to the caller. Returning `true` leaves the file for a
+    /// error surfaced to the caller. `completing` blocks exactly like
+    /// `in_progress` here, and regardless of lease status: a session
+    /// mid-assembly under a live lease must not be destroyed out from under
+    /// its completer, and even a `completing` session whose lease has
+    /// expired is left alone -- reaping it is `sweep_expired_multipart`'s
+    /// job, not this guard's. Returning `true` leaves the file for a
     /// later sweep instead -- once the session is aborted/completed (by
     /// `sweep_expired_multipart` or the user), a subsequent pass will find
-    /// zero versions and no in-progress session, and finish reclaiming it
+    /// zero versions and no active session, and finish reclaiming it
     /// then. A lookup failure is treated as blocking (logged), erring toward
     /// not deleting.
     async fn has_blocking_multipart_session(&self, file_id: Uuid) -> bool {
-        match self.store.has_in_progress_multipart_for_file(file_id).await {
+        match self.store.has_active_multipart_for_file(file_id).await {
             Ok(blocking) => blocking,
             Err(e) => {
                 tracing::warn!(
                     error = ?e,
                     %file_id,
-                    "cleanup: failed to check in-progress multipart sessions while \
+                    "cleanup: failed to check active multipart sessions while \
                      checking for orphaned file"
                 );
                 true
@@ -686,10 +694,11 @@ impl CleanupEngine {
         // Read the parent `File` once, here, and thread it all the way down
         // through `cleanup_expired_session_version_with_file` to
         // `orphan_candidate_file`, instead of letting each of those three
-        // spots fetch it independently. `.ok().flatten()` folds a lookup
-        // error into "no file": the audit tenant then falls back to
-        // `Uuid::nil()` below rather than blocking the abort on a failed read.
-        let file = self.store.get_file(session.file_id).await.ok().flatten();
+        // spots fetch it independently. `load_file_for_audit` folds a lookup
+        // error into "no file" (logging a `warn!` first): the audit tenant
+        // then falls back to `Uuid::nil()` below rather than blocking the
+        // abort on a failed read.
+        let file = self.load_file_for_audit(session.file_id).await;
         let audit_tenant_id = file.as_ref().map_or_else(Uuid::nil, |file| file.tenant_id);
         let abort_audit = AuditEntry {
             tenant_id: audit_tenant_id,
@@ -755,16 +764,21 @@ impl CleanupEngine {
     ///
     /// The version row backing this session may already be gone by the time
     /// this runs: step 1 of the same sweep (`sweep_abandoned_pending`) only
-    /// excludes sessions with `expires_at > now` (still live), so an
-    /// *expired-but-still-`in_progress`* session's pending version can be
-    /// reclaimed by step 1 before step 2 (this method) ever sees it. When
+    /// excludes an `in_progress` session with `expires_at > now` (still live)
+    /// -- a `completing` session is excluded unconditionally instead, so this
+    /// race is specific to `in_progress`. An *expired-but-still-`in_progress`*
+    /// session's pending version can be reclaimed by step 1 before step 2
+    /// (this method) ever sees it. When
     /// that happens the backend multipart upload handle must still be
     /// aborted -- otherwise it leaks (e.g. an incomplete S3 multipart upload
     /// and its uploaded parts) -- so the backend abort is attempted
     /// regardless of whether the version row is still present, falling back
-    /// to the default backend and the deterministic `(file_id, version_id)`
-    /// path when it is not (mirrors `MultipartService::abort_multipart_upload`'s
-    /// own `version.is_none()` fallback for the same reason).
+    /// to the session's own stored `backend_id`/`backend_path`
+    /// (`m20260722_000001_multipart_auto_bind`) when it is not, and only
+    /// falling further back to the default backend and the recomputed
+    /// deterministic `(file_id, version_id)` path for a legacy session that
+    /// predates those columns -- see the implementation's own doc comment for
+    /// the full precedence.
     ///
     /// This method finishes with the same `maybe_delete_orphaned_file` check
     /// `delete_abandoned_pending_version` runs after its own version delete,
@@ -773,10 +787,10 @@ impl CleanupEngine {
     /// one to leave a file with zero versions and a `NULL` `content_id` also
     /// gets the chance to notice it. By the time this method runs,
     /// `abort_expired_multipart_session` has already won the session's own
-    /// CAS to `aborted`, so `has_in_progress_for_file` no longer blocks the
+    /// CAS to `aborted`, so `has_active_for_file` no longer blocks the
     /// reclaim -- unlike step 1's own attempt at the same file, which runs
-    /// earlier in the same `run_sweep` pass while the session still looks
-    /// `in_progress` and correctly declines.
+    /// earlier in the same `run_sweep` pass while the session still looked
+    /// `in_progress`/`completing` and correctly declined.
     ///
     /// This is a thin wrapper over
     /// [`Self::cleanup_expired_session_version_with_file`] with no prefetched
@@ -831,19 +845,35 @@ impl CleanupEngine {
             .flatten();
 
         // Best-effort: tell the backend to discard the in-progress upload.
-        // Resolve `(backend_id, backend_path)` from the version row when it
-        // is still there; otherwise fall back to the default backend and the
-        // deterministic path -- see the doc comment above for why this must
-        // not be skipped just because the version row is already reclaimed.
-        let (backend_id, backend_path) = ver.as_ref().map_or_else(
-            || {
-                (
-                    self.backends.default_id().to_owned(),
-                    expired_session_backend_path(session.file_id, session.version_id),
-                )
-            },
-            |v| (v.backend_id.clone(), v.backend_path.clone()),
-        );
+        // Resolve `(backend_id, backend_path)` with a three-way precedence --
+        // see the doc comment above for why the backend abort must not be
+        // skipped just because the version row is already reclaimed:
+        //   1. The version row, when it is still there -- the freshest
+        //      source (`migrate_backend` could in principle have moved it,
+        //      though never for a still-pending version in practice).
+        //   2. The session row's own `backend_id`/`backend_path`
+        //      (`m20260722_000001_multipart_auto_bind`), when the version is
+        //      already gone but the session was created after that migration
+        //      -- the exact pair the upload was actually initiated against,
+        //      whichever backend that was.
+        //   3. The default backend plus a freshly recomputed deterministic
+        //      path -- ONLY for a legacy session that predates both that
+        //      migration and its backfill (no version row, no stored pair on
+        //      the session either). Silently wrong for a legacy session whose
+        //      upload was never on the default backend, but there is no
+        //      surviving record of which backend it really was.
+        let (backend_id, backend_path) = if let Some(v) = ver.as_ref() {
+            (v.backend_id.clone(), v.backend_path.clone())
+        } else if let (Some(backend_id), Some(backend_path)) =
+            (session.backend_id.as_ref(), session.backend_path.as_ref())
+        {
+            (backend_id.clone(), backend_path.clone())
+        } else {
+            (
+                self.backends.default_id().to_owned(),
+                storage_layout::backend_path(session.file_id, session.version_id),
+            )
+        };
         self.backend_abort_multipart_best_effort(
             &backend_id,
             &backend_path,
@@ -864,7 +894,7 @@ impl CleanupEngine {
         // `maybe_delete_orphaned_file` below instead of read again there).
         let file = match prefetched_file {
             Some(file) => Some(file),
-            None => self.store.get_file(session.file_id).await.ok().flatten(),
+            None => self.load_file_for_audit(session.file_id).await,
         };
         let del_audit = orphan_reconcile_audit(
             session.file_id,
@@ -888,11 +918,11 @@ impl CleanupEngine {
         }
 
         // The session is now `aborted` (the caller only reaches this method
-        // after winning that CAS), so `has_in_progress_for_file` no longer
+        // after winning that CAS), so `has_active_for_file` no longer
         // blocks reclaiming a zero-version, NULL-content_id parent -- whether
         // the version was just deleted above, or already reclaimed earlier by
         // step 1's own path (which was correctly blocked while this session
-        // still looked in-progress). `file` (the same snapshot used for
+        // still looked active). `file` (the same snapshot used for
         // `del_audit`'s tenant_id above) is handed down so
         // `orphan_candidate_file` does not re-fetch it.
         self.maybe_delete_orphaned_file(
@@ -1235,19 +1265,6 @@ impl CleanupEngine {
 }
 
 // ── free helpers ──────────────────────────────────────────────────────────────
-
-/// Deterministic backend path for a `(file_id, version_id)` pair.
-///
-/// Mirrors `FileService::backend_path`/`MultipartService::backend_path` (both
-/// `format!("/{file_id}/{version_id}")`) -- duplicated here rather than
-/// reached into from another domain service, since it is a pure, stateless
-/// computation with no dependency on either service. Used only as a fallback
-/// by [`CleanupEngine::cleanup_expired_session_version`] when the version row
-/// backing an expired multipart session is already gone (reclaimed by step 1
-/// of the same sweep) and so cannot supply its own `backend_path` column.
-fn expired_session_backend_path(file_id: Uuid, version_id: Uuid) -> String {
-    format!("/{file_id}/{version_id}")
-}
 
 /// Build a system-actor `OrphanReconcile` audit entry.
 fn orphan_reconcile_audit(file_id: Uuid, tenant_id: Uuid, detail: serde_json::Value) -> AuditEntry {

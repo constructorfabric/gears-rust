@@ -180,14 +180,18 @@ pub trait CleanupStore: Send + Sync {
     /// Fetch a file by id (unscoped -- the sweep runs across all tenants).
     async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError>;
 
-    /// Whether `file_id` currently has at least one `in_progress` multipart
-    /// upload session (regardless of `expires_at`). Guards the P2 2.8
-    /// orphan-file delete against racing a not-yet-expired multipart session
-    /// whose pending version was just reclaimed by `sweep_abandoned_pending`
-    /// (keyed only on version age, not multipart session state) -- without
-    /// this check, deleting the file would `ON DELETE CASCADE` the still
-    /// live session out from under the upload.
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
+    /// Whether `file_id` currently has at least one *active* (`in_progress`
+    /// or `completing`) multipart upload session, regardless of
+    /// `expires_at`/`lease_until`. Guards the P2 2.8 orphan-file delete
+    /// against racing a not-yet-reaped multipart session whose pending
+    /// version was just reclaimed by `sweep_abandoned_pending` (keyed only on
+    /// version age, not multipart session state) -- without this check,
+    /// deleting the file would `ON DELETE CASCADE` the still-active session
+    /// out from under the upload. `completing` blocks unconditionally
+    /// (lease status is not consulted): a completer may be assembling the
+    /// final object right now, and only `sweep_expired_multipart`'s own CAS
+    /// gets to decide a stuck lease is actually abandoned.
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
 
     /// Delete a file row, optionally enqueue a file-event, and audit — all in
     /// one transaction. Returns `true` if a row was removed.
@@ -254,6 +258,10 @@ pub trait MultipartStore: Send + Sync {
     /// Create a multipart upload session row. `auto_bind` records whether
     /// `complete` should bind the finalized version itself (upload-flow
     /// redesign; only the merged `POST /files` create+plan path sets it).
+    /// `backend_id`/`backend_path` are the backend and object path the
+    /// pending version this session finalizes into was just given — always
+    /// `Some` from the real initiate flow; `None` only ever exercised by
+    /// tests reconstructing the pre-migration legacy row shape.
     #[allow(clippy::too_many_arguments)]
     async fn create_multipart_upload(
         &self,
@@ -261,6 +269,8 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
@@ -400,6 +410,18 @@ pub trait PolicyStore: Send + Sync {
     /// `Store::require_file`/`FileRepo` lookup, exposed through this narrower
     /// port too.
     async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError>;
+
+    /// Batched counterpart of [`Self::require_file`]: fetch every file in
+    /// `ids` that exists (and is visible under `scope`) in one query
+    /// (chunked against the backend's bind-parameter budget), instead of one
+    /// round trip per id. Used by `PolicyService::list_retention_rules`'s
+    /// non-admin path to resolve every distinct `File`-scope rule target on
+    /// a page in a single call.
+    async fn list_files_by_ids(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError>;
 
     /// Fetch the raw policy for a given `(policy_scope, scope_owner_id)` within
     /// a tenant. Returns `None` when none is configured.

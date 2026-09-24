@@ -43,6 +43,16 @@ use crate::infra::signed_url::{Claims, Op, UploadConstraints};
 /// `DomainError::backend` error, so a transient 5xx is not misreported as
 /// "never uploaded" and its root cause is not discarded.
 ///
+/// Takes its own `stat` immediately before calling `get_stream`, rather than
+/// trusting the caller's claimed size, and passes that observation through as
+/// `get_stream`'s `expected_len`: this is finalize's own defense against the
+/// same class of bug `get_stream`'s contract exists for elsewhere (a second,
+/// independent open racing a concurrent write) — see
+/// [`StorageBackend::get_stream`]'s doc comment. It is deliberately not the
+/// client's claimed `size`: this helper's whole purpose is to never trust
+/// that claim, and the actual-vs-claimed comparison still happens in the
+/// caller, after this returns.
+///
 /// Returns `(actual_size, actual_hash, mime_sniff_prefix)`.
 async fn read_back_and_hash_streaming(
     backend: &dyn StorageBackend,
@@ -55,7 +65,13 @@ async fn read_back_and_hash_streaming(
         )
     };
 
-    let mut stream = match backend.get_stream(backend_path).await {
+    let expected_len = match backend.stat(backend_path).await {
+        Ok(Some(len)) => len,
+        Ok(None) => return Err(no_content_err()),
+        Err(e) => return Err(e),
+    };
+
+    let mut stream = match backend.get_stream(backend_path, expected_len).await {
         Ok(stream) => stream,
         // Opening the read-back stream failed. Only a genuinely-absent object
         // (finalize raced ahead of a completed PUT) is the caller's fault and
@@ -611,21 +627,15 @@ impl FileService {
         //
         // The only case the re-read can't handle is the row disappearing
         // between the commit above and this read (a concurrent DELETE): the
-        // transfer itself is already committed (audit row, usage deltas), so
-        // answering with 404 would be wrong. Fall back to the pre-transfer
-        // snapshot with the owner fields patched in, same as before.
+        // transfer itself is already committed (audit row, usage deltas), but
+        // the resource it describes no longer exists. Returning a patched
+        // pre-transfer snapshot here would be indistinguishable from an
+        // ordinary, still-existing successful transfer, misleading callers
+        // (and anything that caches or audits the response) into treating a
+        // gone resource as current. Surface the same `FileNotFound` a fresh
+        // `GET`/transfer against this id would now give instead.
         let meta = self.store.list_metadata(file_id).await?;
-        let file = match self.store.require_file(&prefetch, file_id).await {
-            Ok(f) => f,
-            Err(DomainError::FileNotFound { .. }) => {
-                let mut fallback = file;
-                fallback.owner_kind = new_owner_kind;
-                fallback.owner_id = new_owner_id;
-                fallback.last_modified_at = now;
-                fallback
-            }
-            Err(e) => return Err(e),
-        };
+        let file = self.store.require_file(&prefetch, file_id).await?;
         Ok((file, meta))
     }
 
@@ -647,11 +657,19 @@ impl FileService {
     /// The actor in the audit row is recorded as `"sidecar"` with the `Uuid::nil`
     /// actor id, since no user identity is present in a sidecar callback.
     #[tracing::instrument(skip_all)]
-    /// Returns the auto-bind outcome (upload-flow redesign): `bound` is
-    /// `true` only when the token carried `bind_on_finalize` and the
+    /// Returns the bind outcome (upload-flow redesign): `bind_state` is
+    /// `Bound` only when the token carried `bind_on_finalize` and the
     /// `content_id IS NULL` CAS won (first content of a brand-new file);
     /// `etag` is the resulting content ETag in that case. The sidecar echoes
     /// both to the uploading client as `X-FS-Bound`/`ETag` response headers.
+    ///
+    /// Retries converge to the same success for BOTH bind modes: the sidecar
+    /// publishes every single-part upload through the same replay-safe
+    /// `publish_exclusive`, so a finalize that arrives for an
+    /// already-`Available` version (its own first response lost in transit)
+    /// never re-runs the finalize CAS — auto-bind or manual, matching
+    /// size/hash reports the state the original call already decided,
+    /// instead of a 409.
     pub async fn finalize_upload_by_token(
         &self,
         claims: &Claims,
@@ -688,28 +706,32 @@ impl FileService {
         // version. Converge to the same success the original got — never a
         // 409 on an honest retry — but only when the retry reported the same
         // bytes (size+hash match what was verified and stored); a mismatched
-        // replay stays rejected.
-        if version.status == file_storage_sdk::VersionStatus::Available && claims.bind_on_finalize {
+        // replay stays rejected. Applies to BOTH bind modes: the sidecar
+        // publishes every single-part upload through the same
+        // `publish_exclusive` replay-safe path regardless of
+        // `bind_on_finalize`, so a manual-bind token can retry into an
+        // already-`Available` version exactly like an auto-bind one.
+        if version.status == file_storage_sdk::VersionStatus::Available {
             if version.size != size || version.hash_value != hash_value {
                 return Err(DomainError::hash_mismatch(
                     hex::encode(&hash_value),
                     hex::encode(&version.hash_value),
                 ));
             }
-            // Bind already decided by the original finalize's atomic CAS —
-            // report the current state, run no new CAS.
-            return Ok(if file.content_id == Some(version_id) {
-                FinalizeByTokenOutcome {
-                    bind_state: Some(crate::domain::multipart::BindState::Bound),
-                    etag: Some(etag::content_etag(file_id, version_id)),
-                    current_etag: None,
-                }
-            } else {
-                FinalizeByTokenOutcome {
-                    bind_state: Some(crate::domain::multipart::BindState::Conflict),
-                    etag: None,
-                    current_etag: etag::etag_for(&file),
-                }
+            // Bind already decided (or never requested, for a manual token)
+            // by the original finalize — report the current state, run no
+            // new CAS. Same shared three-way model `MultipartService`'s
+            // `complete` retry path uses.
+            let (bind_state, etag, current_etag) = crate::domain::multipart::resolve_bind_state(
+                file_id,
+                file.content_id,
+                version_id,
+                claims.bind_on_finalize,
+            );
+            return Ok(FinalizeByTokenOutcome {
+                bind_state: Some(bind_state),
+                etag,
+                current_etag,
             });
         }
 

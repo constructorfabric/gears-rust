@@ -5,6 +5,7 @@ use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::storage_layout;
 use crate::infra::content::hash_mode::HashMode;
 
 /// State of a multipart upload session.
@@ -74,8 +75,50 @@ pub struct MultipartUploadSession {
     /// ([`StoredCompleteResult`]) once `state == Completed` — the idempotent
     /// re-complete replays it verbatim.
     pub complete_result: Option<String>,
+    /// The backend this session's upload actually targets, recorded once at
+    /// initiate time from the pending version's own `backend_id` — never
+    /// recomputed. `None` only for a session created before
+    /// `m20260722_000001_multipart_auto_bind` added this column (backfilled
+    /// from `file_versions` where a matching row still existed at migration
+    /// time; a legacy row with no matching version stays `None`).
+    pub backend_id: Option<String>,
+    /// The backend object path this session's upload actually targets, same
+    /// provenance as `backend_id`. Read by the expired-multipart-session
+    /// cleanup instead of recomputing the path when the `file_versions` row
+    /// is already gone — see [`Self::backend_path_or_default`].
+    pub backend_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+}
+
+impl MultipartUploadSession {
+    /// The backend object path for this session's upload: the persisted
+    /// value when present, otherwise the deterministic path recomputed from
+    /// `(file_id, version_id)` — only ever needed for a legacy session
+    /// created before `backend_path` was added to `multipart_uploads` (see
+    /// that field's doc comment).
+    #[must_use]
+    pub fn backend_path_or_default(&self) -> String {
+        self.backend_path
+            .clone()
+            .unwrap_or_else(|| storage_layout::backend_path(self.file_id, self.version_id))
+    }
+
+    /// The backend id this session's upload actually targets: the persisted
+    /// value when present, otherwise `default` — only ever needed for a
+    /// legacy session created before `backend_id` was added to
+    /// `multipart_uploads` (see that field's doc comment). Mirrors
+    /// [`Self::backend_path_or_default`] for the companion field: a caller
+    /// resolving the backend for an already-initiated session must prefer
+    /// the backend it actually initiated against over the registry's
+    /// current default, which can differ (and can also have changed since
+    /// initiate time).
+    #[must_use]
+    pub fn backend_id_or(&self, default: &str) -> String {
+        self.backend_id
+            .clone()
+            .unwrap_or_else(|| default.to_owned())
+    }
 }
 
 /// Outcome of `complete_multipart_upload` (upload-flow redesign): either the
@@ -110,6 +153,13 @@ impl MultipartCompleteOutcome {
 /// session row (`multipart_uploads.complete_result`) in the same transaction
 /// that flips the state to `completed` — the source of truth every
 /// idempotent re-complete replays.
+///
+/// Carries no `manifest` field: `version_hash_manifest` (written in the same
+/// transaction, see [`crate::infra::storage::repo::VersionRepo::insert_manifest`])
+/// is already the canonical, durable copy for a `multipart-composite-sha256`
+/// version, so duplicating its (up to ~1 MiB) text into this row too would
+/// only grow storage for no benefit. `replay_completed` re-reads the
+/// manifest from there instead of from this struct.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredCompleteResult {
     pub version_id: Uuid,
@@ -119,7 +169,6 @@ pub struct StoredCompleteResult {
     /// `HashMode::as_str` spelling.
     pub hash_mode: String,
     pub part_count: i32,
-    pub manifest: Option<String>,
     /// `BindState::as_str` spelling.
     pub bind_state: String,
     pub etag: Option<String>,
@@ -135,17 +184,19 @@ impl StoredCompleteResult {
             content_hash: hex::encode(&c.content_hash),
             hash_mode: c.hash_mode.as_str().to_owned(),
             part_count: c.part_count,
-            manifest: c.manifest.clone(),
             bind_state: c.bind_state.as_str().to_owned(),
             etag: c.etag.clone(),
             current_etag: c.current_etag.clone(),
         }
     }
 
-    /// Rebuild the response object; `None` when the stored JSON predates the
-    /// current schema (caller falls back to rebuilding from the version row).
+    /// Rebuild the response object, with `manifest` supplied by the caller
+    /// (re-read from `version_hash_manifest` -- this struct keeps no copy of
+    /// its own, see the struct doc comment). `None` when the stored JSON
+    /// predates the current schema (caller falls back to rebuilding from the
+    /// version row).
     #[must_use]
-    pub fn into_completed(self) -> Option<CompletedMultipartUpload> {
+    pub fn into_completed(self, manifest: Option<String>) -> Option<CompletedMultipartUpload> {
         let hash_mode = HashMode::parse(&self.hash_mode)?;
         let bind_state = match self.bind_state.as_str() {
             "bound" => BindState::Bound,
@@ -160,7 +211,7 @@ impl StoredCompleteResult {
             content_hash: hex::decode(&self.content_hash).ok()?,
             hash_mode,
             part_count: self.part_count,
-            manifest: self.manifest,
+            manifest,
             bind_state,
             etag: self.etag,
             current_etag: self.current_etag,
@@ -240,6 +291,40 @@ impl BindState {
             Self::Conflict => "conflict",
             Self::Manual => "manual",
         }
+    }
+}
+
+/// Derive the ONE shared bind-state model (see [`BindState`] above) from a
+/// file's current content pointer: bound to this version → `Bound` (+ its
+/// new content `ETag`); an auto-bind was requested but the CAS lost to a
+/// different pointer (or never won one) → `Conflict` (+ the CURRENT `ETag` a
+/// manual rebind's `If-Match` needs); no bind requested → `Manual`.
+///
+/// Shared by both upload paths' idempotent-retry convergence — multipart
+/// `complete` (`MultipartService::bind_state_for`) and single-part
+/// `finalize_upload_by_token` — so a retried request reports exactly the
+/// state the original call already decided, with no new CAS.
+#[must_use]
+pub fn resolve_bind_state(
+    file_id: Uuid,
+    content_id: Option<Uuid>,
+    version_id: Uuid,
+    auto_bind: bool,
+) -> (BindState, Option<String>, Option<String>) {
+    if content_id == Some(version_id) {
+        (
+            BindState::Bound,
+            Some(crate::domain::etag::content_etag(file_id, version_id)),
+            None,
+        )
+    } else if auto_bind {
+        (
+            BindState::Conflict,
+            None,
+            content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
+        )
+    } else {
+        (BindState::Manual, None, None)
     }
 }
 

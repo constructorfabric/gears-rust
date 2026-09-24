@@ -315,6 +315,48 @@ async fn update_metadata_merges_and_bumps_meta_version() {
     assert!(meta2.iter().all(|e| e.key != "color"), "color removed");
 }
 
+/// A patch listing the same key many times (nothing upstream guarantees a
+/// client can't) must still resolve to plain "last occurrence in the patch
+/// wins" semantics, whether that last occurrence is a `Some` (set) or a
+/// `None` (delete) -- `patch_metadata_atomic`'s dedup of the delete-side key
+/// list must not change that outcome.
+#[tokio::test]
+async fn update_metadata_with_duplicate_keys_last_occurrence_wins() {
+    let (svc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let patch = CustomMetadataPatch {
+        entries: vec![
+            ("tag".to_owned(), Some("first".to_owned())),
+            ("tag".to_owned(), Some("second".to_owned())),
+            ("color".to_owned(), Some("blue".to_owned())),
+            ("color".to_owned(), None), // last occurrence: delete
+            ("tag".to_owned(), Some("third".to_owned())), // last occurrence: set
+        ],
+    };
+    svc.update_metadata(&ctx, t.file_id, patch, None)
+        .await
+        .unwrap();
+
+    let (_f, meta) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
+    let map: std::collections::BTreeMap<_, _> =
+        meta.into_iter().map(|e| (e.key, e.value)).collect();
+    assert_eq!(
+        map.get("tag"),
+        Some(&"third".to_owned()),
+        "the last occurrence of a repeated key in one patch must win"
+    );
+    assert!(
+        !map.contains_key("color"),
+        "a key whose last occurrence in the patch is a delete must end up deleted, \
+         not left over from an earlier occurrence in the same patch"
+    );
+}
+
 #[tokio::test]
 async fn restore_prior_version_rebinds_pointer() {
     let (svc, dp) = build_service().await;

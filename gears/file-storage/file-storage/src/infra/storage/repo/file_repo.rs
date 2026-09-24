@@ -71,6 +71,52 @@ impl FileRepo {
         Ok(found.map(Into::into))
     }
 
+    /// Bind parameters reserved out of the backend's `max_bind_params_for`
+    /// budget for everything in `list_by_ids`'s `WHERE` clause besides the
+    /// `file_id IN (...)` list itself: whatever `SecureEntityExt::scope_with`
+    /// adds for the caller's `AccessScope`. Mirrors
+    /// `MetadataRepo::LIST_FOR_FILES_RESERVED_PARAMS`'s reasoning.
+    const LIST_BY_IDS_RESERVED_PARAMS: usize = 16;
+
+    /// Batched counterpart of [`Self::get`]: fetch every file in `ids` that
+    /// exists (and is visible under `scope`) in a handful of queries instead
+    /// of one `get`/`require_file` round trip per id. A `file_id` with no
+    /// matching (visible) row simply has no entry in the returned `Vec` --
+    /// callers that need to distinguish "absent" from "found" compare
+    /// against the id list they passed in.
+    ///
+    /// `ids` is chunked to `max_bind_params_for` minus
+    /// [`Self::LIST_BY_IDS_RESERVED_PARAMS`] before building each `IN (...)`
+    /// list, one `SELECT` per chunk -- same reasoning as
+    /// `MetadataRepo::list_for_files`'s chunking (t25): an unbounded caller-
+    /// supplied id list must not reach the driver's own bind-parameter
+    /// ceiling in one statement.
+    pub async fn list_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chunk_size = toolkit_db::secure::max_bind_params_for(conn)
+            .saturating_sub(Self::LIST_BY_IDS_RESERVED_PARAMS)
+            .max(1);
+        let mut files = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(chunk_size) {
+            let rows = Entity::find()
+                .filter(Column::FileId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .all(conn)
+                .await
+                .map_err(db_err)?;
+            files.extend(rows.into_iter().map(Into::into));
+        }
+        Ok(files)
+    }
+
     /// List files for a mandatory owner filter, newest first, offset-paginated.
     pub async fn list<C: DBRunner>(
         &self,

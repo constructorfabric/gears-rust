@@ -153,12 +153,22 @@ impl StorageBackend for InMemoryBackend {
     /// explicitly non-durable, in-process storage for tests/dev deployments,
     /// not a memory-DoS surface worth hardening — the override exists so the
     /// shared backend contract tests can run identically against every
-    /// backend, not just `LocalFsBackend`/`S3Backend`.
+    /// backend, not just `LocalFsBackend`/`S3Backend`. Still verifies
+    /// `expected_len` against the blob it actually reads under the lock, the
+    /// same contract every other backend enforces — see
+    /// [`StorageBackend::get_stream`]'s doc comment.
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {actual_len}"
+            )));
+        }
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 
@@ -168,13 +178,21 @@ impl StorageBackend for InMemoryBackend {
     /// one-chunk stream (via the trait's own `get_range` for the actual
     /// slicing) is enough to let the shared backend contract tests exercise
     /// `get_range_stream` against every backend, not just
-    /// `LocalFsBackend`/`S3Backend`.
+    /// `LocalFsBackend`/`S3Backend`. Still verifies `expected_len` against
+    /// the resolved range, mirroring `get_stream`'s check above.
     async fn get_range_stream(
         &self,
         path: &str,
         range: ByteRange,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get_range(path, range).await?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), resolved {actual_len}"
+            )));
+        }
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 

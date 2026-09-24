@@ -25,6 +25,26 @@
 //! `multipart_uploads` the same child-safe way `up()` does, so
 //! `multipart_upload_parts` rows and the `multipart_uploads_file_idx` /
 //! `multipart_uploads_expired_idx` indexes survive the round trip.
+//!
+//! Also adds `backend_id`/`backend_path` (both nullable text): the backend
+//! and object path a session's upload actually targets, fixed at initiate
+//! time. Before these columns existed, the expired-multipart-session cleanup
+//! (`CleanupEngine::cleanup_expired_session_version_with_file`) had no way to
+//! recover that pair once the `file_versions` row it normally reads them from
+//! was already reclaimed (a real race: step 1 of the same sweep can delete
+//! the pending version before step 2 ever looks at the session) — it fell
+//! back to the *default* backend and a freshly recomputed deterministic path,
+//! which silently aborts on the wrong backend for any session whose upload
+//! was never on the default backend, leaking the real backend-side
+//! multipart handle. Persisting the pair directly on the session row removes
+//! the need to reconstruct it from a row that may no longer exist.
+//!
+//! Existing rows are backfilled from their matching `file_versions` row
+//! (`(file_id, version_id)`, the same pair the session was created with) —
+//! a row whose version has already been reclaimed (or that was never given a
+//! version, an edge case only the abandoned-standalone-initiate path can
+//! leave behind) is left `NULL`, the legacy case cleanup's fallback still
+//! covers.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -47,6 +67,24 @@ ALTER TABLE multipart_uploads DROP CONSTRAINT IF EXISTS multipart_uploads_state_
 ALTER TABLE multipart_uploads
     ADD CONSTRAINT multipart_uploads_state_check
     CHECK (state IN ('in_progress', 'completing', 'completed', 'aborted'));
+
+-- The backend/path a session's upload actually targets (see the module doc
+-- for why cleanup needs this persisted rather than always reconstructed).
+ALTER TABLE multipart_uploads
+    ADD COLUMN IF NOT EXISTS backend_id text NULL;
+ALTER TABLE multipart_uploads
+    ADD COLUMN IF NOT EXISTS backend_path text NULL;
+-- Backfill existing rows (created by a pre-this-migration server) from their
+-- matching file_versions row. Only touches rows this migration itself just
+-- added the (NULL) columns to -- an already-populated row (a re-run, or a
+-- row this migration's own INSERT path already filled) is left untouched.
+UPDATE multipart_uploads
+SET backend_id = fv.backend_id,
+    backend_path = fv.backend_path
+FROM file_versions fv
+WHERE fv.file_id = multipart_uploads.file_id
+  AND fv.version_id = multipart_uploads.version_id
+  AND multipart_uploads.backend_id IS NULL;
 ";
 
 // SQLite cannot alter or drop a CHECK constraint — rebuild the table with the
@@ -88,18 +126,28 @@ CREATE TABLE multipart_uploads_new (
     lease_until            TIMESTAMP NULL,
     lease_owner            TEXT NULL,
     complete_result        TEXT NULL,
+    backend_id             TEXT NULL,
+    backend_path           TEXT NULL,
     created_at             TEXT  NOT NULL  DEFAULT CURRENT_TIMESTAMP,
     expires_at             TEXT  NOT NULL
 );
+-- Backfill backend_id/backend_path from the matching file_versions row (see
+-- the module doc) via a LEFT JOIN in the same copy -- a row with no matching
+-- version (already reclaimed, or never given one) simply gets NULLs from the
+-- unmatched join side, same as the Postgres backfill's fallback.
 INSERT INTO multipart_uploads_new (
     upload_id, file_id, version_id, backend_upload_handle, state,
     declared_mime, mime_validated, declared_size, part_size,
+    backend_id, backend_path,
     created_at, expires_at
 )
-SELECT upload_id, file_id, version_id, backend_upload_handle, state,
-       declared_mime, mime_validated, declared_size, part_size,
-       created_at, expires_at
-FROM multipart_uploads;
+SELECT mu.upload_id, mu.file_id, mu.version_id, mu.backend_upload_handle, mu.state,
+       mu.declared_mime, mu.mime_validated, mu.declared_size, mu.part_size,
+       fv.backend_id, fv.backend_path,
+       mu.created_at, mu.expires_at
+FROM multipart_uploads mu
+LEFT JOIN file_versions fv
+    ON fv.file_id = mu.file_id AND fv.version_id = mu.version_id;
 DROP TABLE multipart_uploads;
 ALTER TABLE multipart_uploads_new RENAME TO multipart_uploads;
 
@@ -133,6 +181,8 @@ ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS auto_bind;
 ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS lease_until;
 ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS lease_owner;
 ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS complete_result;
+ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS backend_id;
+ALTER TABLE multipart_uploads DROP COLUMN IF EXISTS backend_path;
 ";
 
 // SQLite down: same child-safe rebuild-and-rename pattern as `SQLITE_UP`,
@@ -168,6 +218,10 @@ SELECT upload_id, file_id, version_id, backend_upload_handle,
        declared_mime, mime_validated, declared_size, part_size,
        created_at, expires_at
 FROM multipart_uploads;
+-- backend_id/backend_path are dropped along with the other four columns this
+-- migration added -- `up()`'s copy is not mirrored in reverse (no rebuild
+-- reads them back out of file_versions); the round trip is
+-- schema-equivalence only, not data preservation of these two columns.
 DROP TABLE multipart_uploads;
 ALTER TABLE multipart_uploads_old RENAME TO multipart_uploads;
 

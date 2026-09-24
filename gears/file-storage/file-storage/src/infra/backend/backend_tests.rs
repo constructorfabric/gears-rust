@@ -23,7 +23,10 @@ fn unique_root() -> std::path::PathBuf {
 /// chunked override) must satisfy. Factored out of `assert_backend_contract`
 /// to keep that function's own cognitive complexity down.
 async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str, expected: &[u8]) {
-    let mut stream = backend.get_stream(path).await.unwrap();
+    let mut stream = backend
+        .get_stream(path, expected.len() as u64)
+        .await
+        .unwrap();
     let mut streamed = Vec::new();
     while let Some(chunk) = stream.next().await {
         streamed.extend_from_slice(&chunk.unwrap());
@@ -42,7 +45,10 @@ async fn assert_get_range_stream_matches_slice(
     range: ByteRange,
     expected: &[u8],
 ) {
-    let mut stream = backend.get_range_stream(path, range).await.unwrap();
+    let mut stream = backend
+        .get_range_stream(path, range, expected.len() as u64)
+        .await
+        .unwrap();
     let mut streamed = Vec::new();
     while let Some(chunk) = stream.next().await {
         streamed.extend_from_slice(&chunk.unwrap());
@@ -223,6 +229,7 @@ async fn assert_range_stream_contract(backend: &dyn StorageBackend) {
         .get_range_stream(
             "contract/range-stream",
             ByteRange::Inclusive { start: 20, end: 30 },
+            11,
         )
         .await;
     match range_result {
@@ -245,6 +252,50 @@ async fn in_memory_get_missing_errors() {
     let b = InMemoryBackend::new("mem");
     assert!(b.get("nope").await.is_err());
     assert!(!b.exists("nope").await.unwrap());
+}
+
+/// `InMemoryBackend` mirror of `local_fs_get_stream_errors_before_first_byte_when_*`:
+/// a caller that committed to a length no longer matching the stored blob
+/// must be refused before any byte is returned, not silently handed the
+/// blob's current (different) length.
+#[tokio::test]
+async fn in_memory_get_stream_errors_when_expected_len_disagrees_with_stored_blob() {
+    let b = InMemoryBackend::new("mem");
+    b.put("fid/vid", Bytes::from_static(b"twelve bytes"))
+        .await
+        .unwrap();
+
+    // Caller already committed to a length (e.g. 5) that disagrees with what
+    // is actually stored (12) -- as if the blob had been rewritten after the
+    // caller's own earlier observation.
+    let result = b.get_stream("fid/vid", 5).await;
+    match result {
+        Ok(_) => panic!("a length mismatch must be refused, not silently streamed"),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+}
+
+/// `get_range_stream` counterpart of the above: a resolved range whose
+/// length disagrees with what the caller already committed to must be
+/// refused before any byte is returned.
+#[tokio::test]
+async fn in_memory_get_range_stream_errors_when_expected_len_disagrees_with_resolved_range() {
+    let b = InMemoryBackend::new("mem");
+    b.put("fid/vid", Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+
+    // `Inclusive { start: 2, end: 4 }` resolves to 3 bytes; the caller
+    // claims it already committed to 10.
+    let result = b
+        .get_range_stream("fid/vid", ByteRange::Inclusive { start: 2, end: 4 }, 10)
+        .await;
+    match result {
+        Ok(_) => panic!("a resolved-length mismatch must be refused, not silently streamed"),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
 }
 
 #[tokio::test]
@@ -444,7 +495,7 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
         .await
         .unwrap();
 
-    let mut stream = b.get_stream("fid/vid").await.unwrap();
+    let mut stream = b.get_stream("fid/vid", payload.len() as u64).await.unwrap();
     let mut collected = Vec::new();
     let mut chunk_count = 0u32;
     while let Some(chunk) = stream.next().await {
@@ -464,7 +515,7 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
 async fn local_fs_get_stream_missing_errors() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    assert!(b.get_stream("nope/nope").await.is_err());
+    assert!(b.get_stream("nope/nope", 0).await.is_err());
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
@@ -638,8 +689,10 @@ async fn local_fs_get_stream_errors_on_truncation_after_open() {
 
     b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
 
-    // Open the stream: this observes the current (100-byte) length.
-    let mut stream = b.get_stream("fid/vid").await.unwrap();
+    // Open the stream: the caller already committed to the 100-byte length
+    // it observed itself (e.g. via an earlier `stat`), which matches the
+    // file's length at open time, so the open-time check passes.
+    let mut stream = b.get_stream("fid/vid", 100).await.unwrap();
 
     // Truncate the underlying file via a separate handle, after the stream
     // was opened but before anything is read from it.
@@ -672,6 +725,114 @@ async fn local_fs_get_stream_errors_on_truncation_after_open() {
         10,
         "bytes actually readable before the truncated end must still be yielded"
     );
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// The race `get_stream`'s `expected_len` parameter closes: a file truncated
+/// **before** `get_stream` is even called (i.e. strictly between the
+/// caller's own earlier `stat`/observation and this call's `open`) must be
+/// refused up front -- no stream is ever returned, no byte is ever yielded --
+/// rather than silently streamed at its new, shorter length. Distinct from
+/// `local_fs_get_stream_errors_on_truncation_after_open` above, which covers
+/// a change landing *after* `get_stream` has already opened the file.
+#[tokio::test]
+async fn local_fs_get_stream_errors_before_first_byte_when_truncated_before_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+
+    // The caller already observed 100 bytes (e.g. via an earlier `stat`) and
+    // committed to that length -- but by the time `get_stream` is actually
+    // called, a concurrent writer has truncated the file to 10 bytes.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(10).unwrap();
+    drop(file);
+
+    let result = b.get_stream("fid/vid", 100).await;
+    match result {
+        Ok(_) => panic!(
+            "a file that changed size before get_stream opened it must be refused, not streamed"
+        ),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// Same guarantee as the truncation case above, but for a file that *grew*
+/// before `get_stream` opened it -- both directions of "changed size" must
+/// be caught, not just a shrink.
+#[tokio::test]
+async fn local_fs_get_stream_errors_before_first_byte_when_grown_before_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+
+    // A concurrent writer appends to the file before get_stream opens it, so
+    // by open time it is 150 bytes -- larger than the 100 the caller already
+    // committed to.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(150).unwrap();
+    drop(file);
+
+    let result = b.get_stream("fid/vid", 100).await;
+    match result {
+        Ok(_) => {
+            panic!("a file that grew before get_stream opened it must be refused, not streamed")
+        }
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// The `get_range_stream` mirror of the whole-object pre-open checks above:
+/// a file that changed size before `get_range_stream` re-resolves `range`
+/// against it must be refused up front when that re-resolution yields a
+/// different length than the caller already committed to, rather than
+/// silently streaming a range of the wrong length.
+#[tokio::test]
+async fn local_fs_get_range_stream_errors_before_first_byte_when_resolved_length_changes() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    // 100 bytes; the caller resolves `OpenEnded { start: 0 }` against this
+    // length and commits to a 100-byte `Content-Length`.
+    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+
+    // Grown to 150 bytes before get_range_stream re-resolves the same
+    // OpenEnded range -- it would now resolve to a 150-byte range, not 100.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(150).unwrap();
+    drop(file);
+
+    let result = b
+        .get_range_stream("fid/vid", ByteRange::OpenEnded { start: 0 }, 100)
+        .await;
+    match result {
+        Ok(_) => panic!(
+            "a range whose resolved length changed before get_range_stream read it must be refused"
+        ),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }

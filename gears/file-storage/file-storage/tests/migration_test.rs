@@ -146,14 +146,24 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         before.is_ok(),
         "auto_bind must exist after the full up(): {before:?}"
     );
+    let backend_cols_before = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_before.is_ok(),
+        "backend_id/backend_path must exist after the full up(): {backend_cols_before:?}"
+    );
 
-    // Roll back only the two most-recently-registered migrations
-    // (index_hardening, then multipart_auto_bind) rather than the whole
-    // history, so this test is independent of how many migrations precede
-    // multipart_auto_bind.
-    Migrator::down(&db, Some(2))
+    // Roll back only the three most-recently-registered migrations
+    // (part_count_floor, index_hardening, then multipart_auto_bind) rather
+    // than the whole history, so this test is independent of how many
+    // migrations precede multipart_auto_bind.
+    Migrator::down(&db, Some(3))
         .await
-        .expect("roll back index_hardening and multipart_auto_bind");
+        .expect("roll back part_count_floor, index_hardening, and multipart_auto_bind");
 
     let after_down = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
@@ -162,16 +172,139 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         after_down.is_err(),
         "auto_bind must be gone after a real (non-no-op) down(): {after_down:?}"
     );
+    let backend_cols_after_down = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_after_down.is_err(),
+        "backend_id/backend_path must be gone after a real (non-no-op) down(): \
+         {backend_cols_after_down:?}"
+    );
 
-    Migrator::up(&db, Some(2))
+    Migrator::up(&db, Some(3))
         .await
-        .expect("re-apply multipart_auto_bind and index_hardening");
+        .expect("re-apply multipart_auto_bind, index_hardening, and part_count_floor");
     let after_up = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
         .await;
     assert!(
         after_up.is_ok(),
         "auto_bind must exist again after re-up(): {after_up:?}"
+    );
+    let backend_cols_after_up = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_after_up.is_ok(),
+        "backend_id/backend_path must exist again after re-up(): {backend_cols_after_up:?}"
+    );
+}
+
+// ── multipart_auto_bind: backend_id/backend_path backfill ───────────────────
+
+/// A second upload id, distinct from `UPLOAD` above, used only by the
+/// backend_id/backend_path backfill test below for the session with no
+/// matching `file_versions` row.
+const UPLOAD_NO_VERSION: &str = "00000000-0000-0000-0000-0000000000f3";
+/// A version id that is deliberately never inserted into `file_versions` --
+/// models a session whose version was already reclaimed (or one from the
+/// standalone initiate path that never got one) by the time this migration's
+/// backfill runs.
+const ORPHAN_VERSION: &str = "00000000-0000-0000-0000-0000000000f4";
+
+/// A session whose `(file_id, version_id)` matches an existing
+/// `file_versions` row must have `backend_id`/`backend_path` backfilled from
+/// it; a session with no matching version must be left `NULL` (the legacy
+/// case cleanup's own fallback still covers -- see
+/// `CleanupEngine::cleanup_expired_session_version_with_file`).
+#[tokio::test]
+async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    // Every migration up to (not including) multipart_auto_bind -- the "old"
+    // schema, before backend_id/backend_path existed on multipart_uploads.
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) multipart_auto_bind");
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 1).await;
+
+    // A session whose version_id matches the file_versions row just
+    // inserted -- must be backfilled from it.
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', 'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session with a matching version, before the backfill migration");
+
+    // A second session whose version_id has NO matching file_versions row --
+    // must stay NULL after the backfill.
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD_NO_VERSION}', '{FILE}', '{ORPHAN_VERSION}', 'handle-2', \
+             'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session with no matching version, before the backfill migration");
+
+    Migrator::up(&db, None).await.expect(
+        "apply the remaining migrations (multipart_auto_bind, index_hardening, part_count_floor)",
+    );
+
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            format!(
+                "SELECT backend_id AS bid, backend_path AS bpath FROM multipart_uploads \
+                 WHERE upload_id = '{UPLOAD}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("one row");
+    assert_eq!(
+        row.try_get::<String>("", "bid").expect("backend_id"),
+        "local",
+        "backend_id must be backfilled from the matching file_versions row"
+    );
+    assert_eq!(
+        row.try_get::<String>("", "bpath").expect("backend_path"),
+        format!("/{FILE}/{VERSION}"),
+        "backend_path must be backfilled from the matching file_versions row"
+    );
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD_NO_VERSION}' \
+                 AND backend_id IS NULL AND backend_path IS NULL"
+            )
+        )
+        .await,
+        1,
+        "a session with no matching version must be left NULL, not backfilled"
     );
 }
 
@@ -205,11 +338,11 @@ async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
 /// either.
 ///
 /// This test applies every migration up to (but not including)
-/// `multipart_auto_bind` — the 8th of 9 registered migrations, so `Some(7)`
+/// `multipart_auto_bind` — the 8th of 10 registered migrations, so `Some(7)`
 /// pending migrations — inserts a file, a multipart session, and two parts
-/// referencing it, then applies the remaining migrations (`multipart_auto_bind`
-/// and `index_hardening`) and asserts the parts and the session are both
-/// still there, and both indexes exist.
+/// referencing it, then applies the remaining migrations (`multipart_auto_bind`,
+/// `index_hardening`, and `part_count_floor`) and asserts the parts and the
+/// session are both still there, and both indexes exist.
 #[tokio::test]
 async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
     let db = Database::connect("sqlite::memory:")
@@ -282,7 +415,7 @@ async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
 
 // ── index_hardening ───────────────────────────────────────────────────────────
 
-/// Both new covering indexes from `m20260902_000001_index_hardening` must
+/// All three covering indexes from `m20260902_000001_index_hardening` must
 /// exist after a full `up()`.
 #[tokio::test]
 async fn index_hardening_indexes_exist_after_up() {
@@ -294,6 +427,10 @@ async fn index_hardening_indexes_exist_after_up() {
     assert!(
         index_exists(&db, "multipart_uploads_sweep_idx").await,
         "multipart_uploads_sweep_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "files_versionless_sweep_idx").await,
+        "files_versionless_sweep_idx must exist after up()"
     );
 }
 
@@ -1095,5 +1232,137 @@ async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
     assert!(
         res.is_err(),
         "hash_algorithm CHECK must still reject any non-SHA-256 value"
+    );
+}
+
+// ── part_count_floor ─────────────────────────────────────────────────────────
+
+/// Before `m20260923_000001_part_count_floor` runs, the presence CHECK
+/// `m20260707` shipped only enforces presence, not the `>= 2` floor — a
+/// `multipart-composite-sha256` row with `part_count = 1` is accepted on that
+/// "old" schema. Applying `m20260923` on top then rejects the same shape for
+/// any *new* write, without needing to touch the row already there. This is
+/// the regression the floor must guard against for an already-migrated
+/// database (`m20260707` cannot be edited in place — see that migration's
+/// module doc — so the floor has to come from a later migration that
+/// actually runs against such a database).
+#[tokio::test]
+async fn part_count_floor_rejects_single_part_only_after_its_migration_applies() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    // Every migration up to and including `index_hardening` (9 of the 10
+    // registered migrations) — the "old" schema, one migration short of
+    // `part_count_floor`.
+    Migrator::up(&db, Some(9))
+        .await
+        .expect("apply every migration through index_hardening");
+    insert_file(&db, FILE).await;
+
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d5', 'text/plain', 0, \
+             X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect(
+        "part_count = 1 must still be accepted on the pre-part_count_floor schema \
+         (the presence CHECK alone does not pin the floor)",
+    );
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (part_count_floor)");
+
+    let res = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO file_versions \
+                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+                  status, is_current, backend_id, backend_path) \
+                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d6', 'text/plain', 0, \
+                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+            ),
+        ))
+        .await;
+    assert!(
+        res.is_err(),
+        "part_count = 1 must be rejected once part_count_floor has applied: {res:?}"
+    );
+}
+
+/// `part_count_floor`'s `down()` must be a real rollback -- not a `SELECT 1`
+/// no-op -- on both dialects: after rolling it back, a `part_count = 1`
+/// composite row must be accepted again (the pre-floor presence-only CHECK on
+/// Postgres, no floor triggers on SQLite), and re-applying `up()` must reject
+/// it again.
+#[tokio::test]
+async fn part_count_floor_down_actually_restores_the_permissive_check() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+
+    let before_down = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO file_versions \
+                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+                  status, is_current, backend_id, backend_path) \
+                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d7', 'text/plain', 0, \
+                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+            ),
+        ))
+        .await;
+    assert!(
+        before_down.is_err(),
+        "sanity: part_count = 1 must be rejected on the fully-migrated schema: {before_down:?}"
+    );
+
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back only part_count_floor");
+
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d8', 'text/plain', 0, \
+             X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("part_count = 1 must be accepted again after a real (non-no-op) down()");
+
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("re-apply part_count_floor");
+
+    let after_up = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO file_versions \
+                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+                  status, is_current, backend_id, backend_path) \
+                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d9', 'text/plain', 0, \
+                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+            ),
+        ))
+        .await;
+    assert!(
+        after_up.is_err(),
+        "part_count = 1 must be rejected again after re-up(): {after_up:?}"
     );
 }

@@ -85,9 +85,10 @@ impl StorageBackend for CountingBackend {
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_stream(path).await
+        self.inner.get_stream(path, expected_len).await
     }
     // Not counted: a bounded range read is not a "whole-object read" (see the
     // struct doc comment above) -- unlike `get`/`get_stream`, it never
@@ -486,4 +487,82 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
         Some(&manifest),
     )
     .expect("destination copy must still verify against the manifest");
+}
+
+// ── t28: complete_result carries no duplicate manifest copy ───────────────
+
+/// `StoredCompleteResult` (`domain/multipart.rs`) keeps no `manifest` field
+/// of its own -- `version_hash_manifest` is already the canonical, durable
+/// copy for a `multipart-composite-sha256` version, so persisting the same
+/// (up to ~1 MiB) text a second time into `multipart_uploads.complete_result`
+/// on every completion would only grow storage for no benefit.
+///
+/// Proves both sides of that: the persisted `complete_result` JSON contains
+/// no `manifest` key, AND an idempotent re-complete (`replay_completed`)
+/// still returns the correct manifest text, re-read from
+/// `version_hash_manifest` rather than from the snapshot.
+#[tokio::test]
+async fn complete_result_snapshot_omits_manifest_but_replay_still_returns_it() {
+    let (db, dsn) = build_db_with_dsn().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let (svc, msvc, store) = services(&db, backends);
+    let ctx = ctx(Uuid::now_v7());
+
+    let (file_id, version_id, upload_id, _plan, _full) =
+        drive_multipart(&svc, &msvc, &store, &backend, &ctx).await;
+
+    let first = msvc
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
+        .await
+        .unwrap()
+        .unwrap_completed();
+    assert!(
+        first.manifest.is_some(),
+        "a multipart-composite completion must return a manifest"
+    );
+    let canonical_manifest = store
+        .get_version_manifest(version_id)
+        .await
+        .unwrap()
+        .expect("version_hash_manifest row must exist for a composite version");
+    assert_eq!(
+        first.manifest.as_deref(),
+        Some(canonical_manifest.as_str()),
+        "the completion response's manifest must match the canonical version_hash_manifest row"
+    );
+
+    // Raw-SQL check of the persisted snapshot -- bypasses the domain layer,
+    // which never deserializes an unknown `manifest` key back out, so this
+    // is the only way to see it really is not written. `drive_multipart`
+    // creates exactly one multipart session, so no upload_id filter is
+    // needed.
+    let conn = Database::connect(&dsn).await.expect("raw connect");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT complete_result FROM multipart_uploads".to_owned(),
+        ))
+        .await
+        .expect("query complete_result")
+        .expect("exactly one multipart_uploads row");
+    let complete_result_json: String = row
+        .try_get("", "complete_result")
+        .expect("complete_result column must be non-NULL after a successful complete");
+    assert!(
+        !complete_result_json.contains("manifest"),
+        "persisted complete_result JSON must not contain a manifest field: {complete_result_json}"
+    );
+
+    // Idempotent re-complete: must still return the correct manifest, even
+    // though the persisted snapshot it replays from carries none.
+    let replay = msvc
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
+        .await
+        .expect("re-complete of a completed session must be idempotent")
+        .unwrap_completed();
+    assert_eq!(
+        replay.manifest, first.manifest,
+        "replay must return the same manifest as the original completion"
+    );
 }

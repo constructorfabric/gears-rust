@@ -9,6 +9,31 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use toolkit_utils::SecretString;
 
+/// Upper bound (seconds) accepted for `finalize_token_grace_secs`: 7 days.
+///
+/// `gear.rs` converts the field to `i64` via a saturating
+/// `unwrap_or(i64::MAX)`, so without a ceiling here an oversized (or
+/// corrupted/malicious) config value would silently become `i64::MAX`
+/// seconds of grace, making the s2s finalize/report-part callbacks' `exp`
+/// check a de-facto no-op. `validate()` rejects anything above this well
+/// before that conversion runs.
+pub const MAX_FINALIZE_TOKEN_GRACE_SECS: u64 = 7 * 24 * 3600;
+
+/// Absolute ceiling accepted for `max_page_size`, independent of whatever an
+/// operator configures.
+///
+/// `max_page_size` is the only practical bound on the batch reads a page of
+/// listing results drives (`MetadataRepo::list_for_files`,
+/// `VersionRepo::get_manifests`) -- both now chunk themselves against the
+/// backend's own bind-parameter budget, so an oversized `max_page_size` no
+/// longer risks a hard driver failure, but it still directly inflates a
+/// single request's row count, chunk count, response size, and latency with
+/// no cap of its own. `validate()` rejects anything above this regardless of
+/// what an operator sets, the same way `MAX_FINALIZE_TOKEN_GRACE_SECS`
+/// bounds `finalize_token_grace_secs`. `default_max_page_size` (1000) sits
+/// exactly at this ceiling, so the shipped default is never itself rejected.
+pub const MAX_PAGE_SIZE_CEILING: u64 = 1000;
+
 /// Configuration for the `file-storage` gear.
 ///
 /// `Debug` is implemented manually so the `signing_key_seed` private key is never
@@ -47,7 +72,10 @@ pub struct FileStorageConfig {
     /// token check the sidecar performs at the start of a PUT/GET request or
     /// a part upload. `0` disables it, restoring the previous strict
     /// behaviour where `exp` is enforced with no slack. Default: 3600 (1
-    /// hour).
+    /// hour). Capped at `MAX_FINALIZE_TOKEN_GRACE_SECS` (7 days) by
+    /// `validate()` -- gear.rs's `i64::try_from(..).unwrap_or(i64::MAX)`
+    /// conversion would otherwise silently saturate an oversized value to
+    /// `i64::MAX` seconds of grace, making the `exp` check a de-facto no-op.
     #[serde(default = "default_finalize_token_grace_secs")]
     pub finalize_token_grace_secs: u64,
 
@@ -307,6 +335,19 @@ impl FileStorageConfig {
                  require_finalize_internal_secret: false to allow the token-only trust model)"
             );
         }
+        // `gear.rs` converts `finalize_token_grace_secs` to `i64` via a
+        // saturating `unwrap_or(i64::MAX)`; without an upper bound here an
+        // oversized value would silently become `i64::MAX` seconds of grace,
+        // making the s2s finalize/report-part callbacks' `exp` check a
+        // de-facto no-op. Reject it up front instead.
+        if self.finalize_token_grace_secs > MAX_FINALIZE_TOKEN_GRACE_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: finalize_token_grace_secs ({}) must not exceed \
+                 MAX_FINALIZE_TOKEN_GRACE_SECS ({})",
+                self.finalize_token_grace_secs,
+                MAX_FINALIZE_TOKEN_GRACE_SECS
+            );
+        }
         // `default_url_ttl_secs` is what every mint uses absent a caller
         // override, so it must itself respect the ceiling the control plane
         // is supposed to enforce -- otherwise the very first signed URL
@@ -328,6 +369,19 @@ impl FileStorageConfig {
                  max_page_size ({})",
                 self.default_page_size,
                 self.max_page_size
+            );
+        }
+        // `max_page_size` otherwise has no ceiling of its own -- an operator
+        // could configure it arbitrarily large, directly inflating the row
+        // count, chunk count, response size, and latency of every listing
+        // request. Reject it up front, the same way MAX_FINALIZE_TOKEN_GRACE_SECS
+        // bounds finalize_token_grace_secs above.
+        if self.max_page_size > MAX_PAGE_SIZE_CEILING {
+            anyhow::bail!(
+                "invalid file-storage config: max_page_size ({}) must not exceed \
+                 MAX_PAGE_SIZE_CEILING ({})",
+                self.max_page_size,
+                MAX_PAGE_SIZE_CEILING
             );
         }
         // The live-multipart-session guard (retention-cleanup.md §"Live-Multipart-

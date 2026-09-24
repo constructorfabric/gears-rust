@@ -106,8 +106,8 @@ impl CleanupStore for Store {
         Store::get_file(self, &toolkit_security::AccessScope::allow_all(), file_id).await
     }
 
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        Store::has_in_progress_multipart_for_file(self, file_id).await
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        Store::has_active_multipart_for_file(self, file_id).await
     }
 
     async fn delete_file_with_event(
@@ -184,6 +184,8 @@ impl MultipartStore for Store {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
@@ -197,6 +199,8 @@ impl MultipartStore for Store {
             file_id,
             version_id,
             backend_upload_handle,
+            backend_id,
+            backend_path,
             declared_mime,
             declared_size,
             part_size,
@@ -341,6 +345,14 @@ impl crate::domain::ports::PolicyStore for Store {
         file_id: Uuid,
     ) -> Result<File, DomainError> {
         Store::require_file(self, scope, file_id).await
+    }
+
+    async fn list_files_by_ids(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        Store::list_files_by_ids(self, scope, ids).await
     }
 
     async fn get_policy(

@@ -2,7 +2,7 @@
 //! - `acquire_complete_lease`'s `expires_at > now` fencing.
 //! - `upsert_part`'s single-statement on-conflict upsert plus its
 //!   same-transaction "parent still `in_progress`" guard.
-//! - `has_in_progress_for_file`'s `LIMIT 1` existence check.
+//! - `has_active_for_file`'s `LIMIT 1` existence check.
 //!
 //! Mirrors `tests/version_repo_test.rs`: a real SQLite DB with the full
 //! migration applied, `DBProvider::conn()` for a `DBRunner`, and
@@ -91,6 +91,8 @@ async fn seed_session<C: toolkit_db::secure::DBRunner>(
             file_id,
             version_id,
             "backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id}/{version_id}")),
             "application/octet-stream",
             100,
             50,
@@ -294,12 +296,12 @@ async fn upsert_part_rejects_when_parent_not_in_progress() {
     );
 }
 
-// -- has_in_progress_for_file: LIMIT 1 existence check ----------------------
+// -- has_active_for_file: LIMIT 1 existence check ---------------------------
 
-/// `has_in_progress_for_file` reports `true` while a session for the file is
+/// `has_active_for_file` reports `true` while a session for the file is
 /// still `in_progress`.
 #[tokio::test]
-async fn has_in_progress_for_file_true_when_live_session_exists() {
+async fn has_active_for_file_true_when_live_session_exists() {
     let db = db().await;
     let conn = db.conn().expect("conn");
     let multipart = MultipartRepo::new();
@@ -308,17 +310,17 @@ async fn has_in_progress_for_file_true_when_live_session_exists() {
 
     let (file_id, _upload_id) = seed_session(&conn, &multipart, expires_at, now).await;
 
-    let has_in_progress = multipart
-        .has_in_progress_for_file(&conn, file_id)
+    let has_active = multipart
+        .has_active_for_file(&conn, file_id)
         .await
-        .expect("has_in_progress_for_file must not error");
-    assert!(has_in_progress);
+        .expect("has_active_for_file must not error");
+    assert!(has_active);
 }
 
-/// `has_in_progress_for_file` reports `false` for a file with no multipart
+/// `has_active_for_file` reports `false` for a file with no multipart
 /// sessions at all.
 #[tokio::test]
-async fn has_in_progress_for_file_false_when_no_session_exists() {
+async fn has_active_for_file_false_when_no_session_exists() {
     let db = db().await;
     let conn = db.conn().expect("conn");
     let multipart = MultipartRepo::new();
@@ -331,18 +333,18 @@ async fn has_in_progress_for_file_false_when_no_session_exists() {
         .await
         .expect("create parent file");
 
-    let has_in_progress = multipart
-        .has_in_progress_for_file(&conn, file_id)
+    let has_active = multipart
+        .has_active_for_file(&conn, file_id)
         .await
-        .expect("has_in_progress_for_file must not error");
-    assert!(!has_in_progress);
+        .expect("has_active_for_file must not error");
+    assert!(!has_active);
 }
 
-/// `has_in_progress_for_file` reports `false` once the file's only session
+/// `has_active_for_file` reports `false` once the file's only session
 /// has moved to a terminal state (`completed`), even though the row itself
 /// still exists.
 #[tokio::test]
-async fn has_in_progress_for_file_false_when_session_is_terminal() {
+async fn has_active_for_file_false_when_session_is_terminal() {
     let db = db().await;
     let conn = db.conn().expect("conn");
     let multipart = MultipartRepo::new();
@@ -368,12 +370,91 @@ async fn has_in_progress_for_file_false_when_session_is_terminal() {
         .expect("finish_complete must not error");
     assert!(finished, "setup: session must reach completed");
 
-    let has_in_progress = multipart
-        .has_in_progress_for_file(&conn, file_id)
+    let has_active = multipart
+        .has_active_for_file(&conn, file_id)
         .await
-        .expect("has_in_progress_for_file must not error");
+        .expect("has_active_for_file must not error");
+    assert!(!has_active, "a completed session must not count as active");
+}
+
+/// `has_active_for_file` reports `true` while a session is `completing`
+/// under a live lease -- the exact window the P2 2.8 orphan-file guard
+/// exists to protect (a completer is assembling the final object right now).
+#[tokio::test]
+async fn has_active_for_file_true_when_completing_with_live_lease() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let multipart = MultipartRepo::new();
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+
+    let (file_id, upload_id) = seed_session(&conn, &multipart, expires_at, now).await;
+
+    let acquired = multipart
+        .acquire_complete_lease(
+            &conn,
+            upload_id,
+            "completer-a",
+            now + time::Duration::minutes(5),
+            now,
+        )
+        .await
+        .expect("acquire_complete_lease must not error");
+    assert!(acquired, "setup: must acquire the lease before completing");
+
+    let has_active = multipart
+        .has_active_for_file(&conn, file_id)
+        .await
+        .expect("has_active_for_file must not error");
     assert!(
-        !has_in_progress,
-        "a completed session must not count as in_progress"
+        has_active,
+        "a completing session under a live lease must count as active"
+    );
+}
+
+/// `has_active_for_file` reports `true` for a `completing` session even once
+/// its lease has lapsed -- reaping a stuck lease is `sweep_expired_multipart`'s
+/// job, not this guard's, so it must keep blocking until that CAS lands.
+#[tokio::test]
+async fn has_active_for_file_true_when_completing_with_expired_lease() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as UploadColumn, Entity as UploadEntity,
+    };
+
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let multipart = MultipartRepo::new();
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+
+    let (file_id, upload_id) = seed_session(&conn, &multipart, expires_at, now).await;
+
+    let past = now - time::Duration::hours(1);
+    UploadEntity::update_many()
+        .col_expr(UploadColumn::State, Expr::value("completing"))
+        .col_expr(UploadColumn::LeaseUntil, Expr::value(Some(past)))
+        .col_expr(
+            UploadColumn::LeaseOwner,
+            Expr::value(Some("stale-completer".to_owned())),
+        )
+        .filter(UploadColumn::UploadId.eq(upload_id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate session into expired-lease completing state");
+
+    let has_active = multipart
+        .has_active_for_file(&conn, file_id)
+        .await
+        .expect("has_active_for_file must not error");
+    assert!(
+        has_active,
+        "a completing session with an expired lease still counts as active \
+         until sweep_expired_multipart reaps it"
     );
 }

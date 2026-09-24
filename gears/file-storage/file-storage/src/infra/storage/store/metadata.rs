@@ -1,6 +1,6 @@
 //! Custom-metadata queries and the atomic patch operation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
@@ -123,7 +123,7 @@ impl Store {
                 // violate the primary key and fail the whole patch. The
                 // dedup below (last write in iteration order survives)
                 // preserves the exact old semantics before batching.
-                let all_keys: Vec<String> = patch.entries.iter().map(|(k, _)| k.clone()).collect();
+                let all_keys = dedup_patch_keys(&patch.entries);
                 metadata
                     .delete_keys(tx, &AccessScope::allow_all(), file_id, &all_keys)
                     .await?;
@@ -161,5 +161,69 @@ impl Store {
             })
         })
         .await
+    }
+}
+
+/// Deduplicates every key touched by a metadata patch (both the ones being
+/// replaced and the ones being removed) before it is handed to
+/// `MetadataRepo::delete_keys`, mirroring the same-key-repeated-in-one-patch
+/// dedup the insert side already performs via its own `HashMap` a few lines
+/// down in `patch_metadata_atomic`. Nothing upstream guarantees a client
+/// can't send the same key many times in one request; without this, a
+/// duplicate-heavy patch would hand `delete_keys` a `DELETE ... IN (...)`
+/// list padded with duplicates, consuming more of its bind-parameter budget
+/// and more chunk iterations than the actual distinct-key count warrants.
+/// Order is irrelevant here -- `delete_keys`'s `IN (...)` list doesn't care
+/// about it -- only distinctness does.
+fn dedup_patch_keys(entries: &[(String, Option<String>)]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_patch_keys;
+
+    #[test]
+    fn dedup_patch_keys_collapses_repeated_keys() {
+        let entries = vec![
+            ("a".to_owned(), Some("1".to_owned())),
+            ("b".to_owned(), Some("2".to_owned())),
+            ("a".to_owned(), Some("3".to_owned())),
+            ("a".to_owned(), None),
+            ("c".to_owned(), Some("4".to_owned())),
+            ("b".to_owned(), None),
+        ];
+        let keys = dedup_patch_keys(&entries);
+        assert_eq!(
+            keys.len(),
+            3,
+            "6 entries over 3 distinct keys ('a', 'b', 'c') must dedup to 3, not the \
+             pre-dedup entry count"
+        );
+        let mut sorted = keys;
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    }
+
+    #[test]
+    fn dedup_patch_keys_keeps_distinct_keys_untouched() {
+        let entries = vec![
+            ("a".to_owned(), Some("1".to_owned())),
+            ("b".to_owned(), None),
+            ("c".to_owned(), Some("3".to_owned())),
+        ];
+        let mut keys = dedup_patch_keys(&entries);
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    }
+
+    #[test]
+    fn dedup_patch_keys_empty_patch_yields_no_keys() {
+        assert!(dedup_patch_keys(&[]).is_empty());
     }
 }

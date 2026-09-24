@@ -8,6 +8,7 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::ports::DataPlanePort;
 use crate::domain::service::FileService;
+use crate::domain::storage_layout;
 use crate::infra::backend::BackendCapabilities;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
@@ -116,7 +117,7 @@ impl FileService {
         Store::verify_content_hash(&bytes, hash_mode, &version.hash_value, manifest.as_deref())?;
 
         // Write to the destination at the canonical path.
-        let dest_path = Self::backend_path(file_id, version.version_id);
+        let dest_path = storage_layout::backend_path(file_id, version.version_id);
         dest.put(&dest_path, bytes).await?;
 
         // Transactionally update the version row and emit the audit row. The

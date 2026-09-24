@@ -141,6 +141,18 @@ fn ctx(tenant: Uuid, subject: Uuid) -> SecurityContext {
         .expect("ctx")
 }
 
+/// Like `ctx`, but with an explicit `subject_type` (e.g. `"app"`), so
+/// `FileService::actor_kind` resolves to something other than the default
+/// `"user"` fallback.
+fn ctx_with_type(tenant: Uuid, subject: Uuid, subject_type: &str) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(subject)
+        .subject_tenant_id(tenant)
+        .subject_type(subject_type)
+        .build()
+        .expect("ctx")
+}
+
 fn new_file(owner_id: Uuid) -> NewFile {
     NewFile {
         owner_kind: OwnerKind::User,
@@ -207,6 +219,80 @@ async fn list_files_self_owner_is_allowed() {
         .await
         .expect("self-owner list should succeed");
     assert!(found.iter().any(|f| f.file_id == ticket.file_id));
+}
+
+/// `owner_id` alone matching the caller is not enough: `owner_kind` picks
+/// between two disjoint owner spaces (`OwnerKind::User` / `OwnerKind::App`).
+/// A caller whose own subject id happens to equal some app's id must still
+/// require `ADMIN_POLICY` to list under `owner_kind: app`, since that's not
+/// their own `user`-space identity.
+#[tokio::test]
+async fn list_files_owner_kind_mismatch_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    // `ctx_a` is a plain user (actor_kind == "user"), but the filter claims
+    // `owner_kind: app` with the same id.
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h
+        .file_svc
+        .list_files(
+            &ctx_a,
+            OwnerFilter {
+                owner_kind: OwnerKind::App,
+                owner_id: user_a,
+            },
+            Some(10),
+            0,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+}
+
+/// Positive control mirroring the mismatch case above: a genuine `app`
+/// subject listing under `owner_kind: app` with its own id is still the
+/// self-service fast path (no `ADMIN_POLICY` required).
+#[tokio::test]
+async fn list_files_owner_kind_match_without_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let app_id = Uuid::now_v7();
+    let ctx_app = ctx_with_type(tenant, app_id, "app");
+
+    let ticket = h
+        .file_svc
+        .create_file_bare(
+            &ctx_app,
+            NewFile {
+                owner_kind: OwnerKind::App,
+                owner_id: app_id,
+                name: "app-owned.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                custom_metadata: vec![],
+            },
+        )
+        .await
+        .expect("app creates its own file");
+
+    let found = h
+        .file_svc
+        .list_files(
+            &ctx_app,
+            OwnerFilter {
+                owner_kind: OwnerKind::App,
+                owner_id: app_id,
+            },
+            Some(10),
+            0,
+        )
+        .await
+        .expect("self-service app listing should succeed without ADMIN_POLICY");
+    assert!(found.iter().any(|f| f.file_id == ticket));
 }
 
 /// An `ADMIN_POLICY`-authorized caller may list another user's files.

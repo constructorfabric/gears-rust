@@ -265,6 +265,17 @@ pub trait StorageBackend: Send + Sync {
     /// fix) so a `GET` without a `Range` header streams straight into the
     /// HTTP response body instead of first landing in a `Bytes` buffer.
     ///
+    /// `expected_len` is the length the caller already committed to
+    /// elsewhere (the sidecar's already-set `Content-Length`, from an earlier
+    /// `stat`; `finalize_upload`'s own immediately-preceding `stat`) before
+    /// this call was ever made. Every implementation must verify the object
+    /// it actually opens still has this exact length **before yielding any
+    /// byte**, and fail rather than stream a body that would disagree with
+    /// what the caller already promised — the caller's earlier observation
+    /// and this call's own independent read of the object are two separate
+    /// observations a concurrent write can invalidate in between (see
+    /// [`LocalFsBackend::get_stream`] for the concrete race this closes).
+    ///
     /// Declared `BoxStream<'static, _>` rather than borrowing `&self`'s
     /// lifetime: every implementation below (and the default here) moves
     /// fully-owned data into the returned stream (an owned file handle, an
@@ -282,12 +293,22 @@ pub trait StorageBackend: Send + Sync {
     /// not memory-bounded — so every backend that hasn't been upgraded to a
     /// true streaming read stays correct; backends for which unbounded memory
     /// use during a read-back is a real concern (e.g. `LocalFsBackend`,
-    /// `S3Backend`) should override this method.
+    /// `S3Backend`) should override this method. It still enforces the
+    /// `expected_len` contract above: a mismatch is a
+    /// [`DomainError::conflict`], surfaced before the single chunk is ever
+    /// handed back.
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {actual_len}"
+            )));
+        }
         let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
             Box::pin(futures::stream::once(async move { Ok(bytes) }));
         Ok(stream)
@@ -331,17 +352,38 @@ pub trait StorageBackend: Send + Sync {
     /// `self`, so declaring it `'static` costs nothing and is what lets the
     /// sidecar hand it straight to `axum::body::Body::from_stream`.
     ///
+    /// `expected_len` mirrors [`Self::get_stream`]'s own parameter, but for a
+    /// range read it is the resolved *range's* length — what the caller has
+    /// already put in its `Content-Length` (the sidecar resolves `range`
+    /// itself first to build `Content-Range`/`Content-Length`, then passes
+    /// this call the range it already committed to). Every implementation
+    /// must verify that re-resolving `range` against the object it actually
+    /// opens still yields a range of this exact length before yielding any
+    /// byte, and fail rather than stream a body whose length would disagree
+    /// with what the caller already promised — see
+    /// [`LocalFsBackend::get_range_stream`] for the concrete race this closes.
+    ///
     /// The default implementation falls back to `get_range`, yielding the
     /// whole resolved range as a single chunk — still correct, just not
     /// memory-bounded — so any backend that hasn't been upgraded to a true
     /// streaming range read stays correct; `local-fs`, `s3`, and `in-memory`
-    /// all override this natively (see their own doc comments).
+    /// all override this natively (see their own doc comments). It still
+    /// enforces the `expected_len` contract above: a mismatch is a
+    /// [`DomainError::conflict`], surfaced before the single chunk is ever
+    /// handed back.
     async fn get_range_stream(
         &self,
         path: &str,
         range: ByteRange,
+        expected_len: u64,
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get_range(path, range).await?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), resolved {actual_len}"
+            )));
+        }
         let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
             Box::pin(futures::stream::once(async move { Ok(bytes) }));
         Ok(stream)

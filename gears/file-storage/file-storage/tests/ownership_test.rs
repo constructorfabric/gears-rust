@@ -10,12 +10,16 @@
 //! 5. A `file.deleted` event is enqueued when a file is deleted.
 //! 6. A `file.content_updated` event is enqueued when content is bound.
 //! 7. Transferring a non-existent file returns `FileNotFound`.
+//! 8. A file deleted between the transfer's commit and its post-commit
+//!    re-read surfaces `FileNotFound`, not a stale patched pre-transfer
+//!    snapshot.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sea_orm::{ConnectionTrait, Database};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -529,4 +533,94 @@ async fn transfer_ownership_response_reflects_committed_swap() {
         "test setup must have written metadata"
     );
     assert_eq!(updated_meta, stored_meta);
+}
+
+// ── 12. transfer_ownership must not return stale data for a file deleted ───────
+//        mid-transfer ──────────────────────────────────────────────────────────
+
+/// Regression test for a verifier finding: if a concurrent `DELETE` removes
+/// the file row between `transfer_ownership_atomic`'s commit and
+/// `transfer_ownership`'s subsequent re-read, the transfer is already
+/// committed (audit row, usage deltas) but the resource it describes no
+/// longer exists. The prior implementation's fallback patched the
+/// pre-transfer in-memory snapshot (owner fields swapped) and returned it as
+/// an ordinary success — indistinguishable from a genuine, still-existing
+/// transfer.
+///
+/// This simulates the race deterministically (rather than via a flaky
+/// wall-clock/thread race) with a `SQLite` trigger that deletes the file row
+/// as part of the very same `UPDATE ... SET owner_id = ...` statement
+/// `transfer_ownership_atomic` issues: by the time that statement's
+/// transaction commits, the row is already gone, exactly as a genuinely
+/// concurrent `DELETE` racing the commit would leave it. `AFTER UPDATE OF
+/// owner_id` only fires for the ownership-transfer `UPDATE`, not the file's
+/// initial `INSERT` (`create_file` above).
+#[tokio::test]
+async fn transfer_ownership_returns_not_found_when_file_deleted_mid_transfer() {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "cf-fs-ownership-race-test-{}.db",
+        Uuid::now_v7().simple()
+    ));
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("migrations");
+    let db = Arc::new(DBProvider::new(db));
+
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer = Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store, backends, issuer, authorizer, cfg, None, None,
+    ));
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let original_owner = Uuid::now_v7();
+    let new_owner = Uuid::now_v7();
+
+    let ticket = svc
+        .create_file(&ctx, new_file_for(original_owner), None, false)
+        .await
+        .unwrap();
+    let file_id = ticket.file_id;
+
+    // A separate raw connection to the same database file, used only to
+    // install the race-simulating trigger -- the service itself keeps using
+    // its own pooled connection (`db`/`store` above).
+    let conn = Database::connect(&dsn).await.expect("raw connect");
+    conn.execute_unprepared(
+        "CREATE TRIGGER trg_delete_after_owner_transfer \
+         AFTER UPDATE OF owner_id ON files \
+         FOR EACH ROW \
+         BEGIN DELETE FROM files WHERE file_id = NEW.file_id; END;",
+    )
+    .await
+    .expect("install race-simulating trigger");
+
+    let result = svc
+        .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::FileNotFound { .. })),
+        "a file deleted between the transfer's commit and its post-commit re-read must \
+         surface FileNotFound, not a patched stale success: {result:?}"
+    );
 }

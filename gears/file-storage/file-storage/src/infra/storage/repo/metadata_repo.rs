@@ -45,13 +45,31 @@ impl MetadataRepo {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Bind parameters reserved out of the backend's [`max_bind_params_for`]
+    /// budget for everything in `list_for_files`'s `WHERE` clause besides the
+    /// `file_id IN (...)` list itself: whatever [`SecureEntityExt::scope_with`]
+    /// adds for the caller's [`AccessScope`] (tenant/owner columns and the
+    /// like). Mirrors [`Self::DELETE_KEYS_RESERVED_PARAMS`]'s reasoning.
+    const LIST_FOR_FILES_RESERVED_PARAMS: usize = 16;
+
     /// Batched counterpart of `list`: fetch custom-metadata entries for many
-    /// files in a single `IN (...)` query, grouped by `file_id`. Used by
-    /// `GET /files` listing so that rendering a page of `N` files' metadata
-    /// costs one query instead of `N` (see `Store::list_metadata_for_files`).
-    /// A `file_id` with no custom metadata simply has no entry in the
-    /// returned map (never an empty `Vec` — callers should treat "absent" and
-    /// "empty" the same way, e.g. via `.get(&id).cloned().unwrap_or_default()`).
+    /// files, grouped by `file_id`. Used by `GET /files` listing so that
+    /// rendering a page of `N` files' metadata costs a handful of queries
+    /// instead of `N` (see `Store::list_metadata_for_files`). A `file_id`
+    /// with no custom metadata simply has no entry in the returned map (never
+    /// an empty `Vec` — callers should treat "absent" and "empty" the same
+    /// way, e.g. via `.get(&id).cloned().unwrap_or_default()`).
+    ///
+    /// `file_ids` is chunked to [`max_bind_params_for`] minus
+    /// [`Self::LIST_FOR_FILES_RESERVED_PARAMS`] before building each `IN
+    /// (...)` list, one `SELECT` per chunk, same as [`Self::delete_keys`].
+    /// Without this, `max_page_size` (operator-configurable, see
+    /// `FileStorageConfig::validate`) directly bounds how many bind
+    /// parameters a single listing request's metadata query uses -- an
+    /// unusually large page size would otherwise reach the driver's own
+    /// bind-parameter ceiling (65535 on `PostgreSQL`, 32766 on `SQLite`) and
+    /// fail the whole listing outright instead of degrading gracefully into
+    /// a few extra round trips.
     pub async fn list_for_files<C: DBRunner>(
         &self,
         conn: &C,
@@ -61,23 +79,28 @@ impl MetadataRepo {
         if file_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows = Entity::find()
-            .filter(Column::FileId.is_in(file_ids.iter().copied()))
-            .order_by_asc(Column::Key)
-            .secure()
-            .scope_with(scope)
-            .all(conn)
-            .await
-            .map_err(db_err)?;
+        let chunk_size = max_bind_params_for(conn)
+            .saturating_sub(Self::LIST_FOR_FILES_RESERVED_PARAMS)
+            .max(1);
         let mut grouped: HashMap<Uuid, Vec<CustomMetadataEntry>> = HashMap::new();
-        for row in rows {
-            grouped
-                .entry(row.file_id)
-                .or_default()
-                .push(CustomMetadataEntry {
-                    key: row.key,
-                    value: row.value,
-                });
+        for chunk in file_ids.chunks(chunk_size) {
+            let rows = Entity::find()
+                .filter(Column::FileId.is_in(chunk.iter().copied()))
+                .order_by_asc(Column::Key)
+                .secure()
+                .scope_with(scope)
+                .all(conn)
+                .await
+                .map_err(db_err)?;
+            for row in rows {
+                grouped
+                    .entry(row.file_id)
+                    .or_default()
+                    .push(CustomMetadataEntry {
+                        key: row.key,
+                        value: row.value,
+                    });
+            }
         }
         Ok(grouped)
     }

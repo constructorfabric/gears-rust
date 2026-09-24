@@ -39,6 +39,7 @@ use crate::domain::multipart::{
 const COMPLETE_POLL_RETRY_SECS: u64 = 2;
 use crate::domain::policy::{PolicyResolver, PolicyScope};
 use crate::domain::ports::{AutoBindOnFinalize, FileStorageMetricsPort, MultipartStore};
+use crate::domain::storage_layout;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::content::mime::{
     MIME_SNIFF_PREFIX_BYTES, enforce_size_ceiling_for_validated_mime, validate_and_resolve_mime,
@@ -230,10 +231,6 @@ impl MultipartService {
 
     fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
         AccessScope::for_tenant(ctx.subject_tenant_id())
-    }
-
-    fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
     }
 
     fn actor_kind(ctx: &SecurityContext) -> &'static str {
@@ -515,7 +512,7 @@ impl MultipartService {
         let now = OffsetDateTime::now_utc();
         let upload_id = Uuid::now_v7();
         let version_id = Uuid::now_v7();
-        let backend_path = Self::backend_path(file_id, version_id);
+        let backend_path = storage_layout::backend_path(file_id, version_id);
         let backend_id = backend.id().to_owned();
 
         // Compute the server-authoritative parts plan (FEATURE §3).
@@ -560,6 +557,8 @@ impl MultipartService {
                 file_id,
                 version_id,
                 &backend_handle,
+                Some(&backend_id),
+                Some(&backend_path),
                 declared_mime,
                 declared_size,
                 chosen_part_size,
@@ -956,6 +955,11 @@ impl MultipartService {
 
     /// Rebuild the response for an already-`completed` session: prefer the
     /// persisted snapshot; fall back to the version row (pre-snapshot rows).
+    ///
+    /// `StoredCompleteResult` carries no `manifest` of its own (see its doc
+    /// comment) — the persisted-snapshot branch re-reads it from
+    /// `version_hash_manifest` the same way the version-row fallback below
+    /// always has, via `get_version_manifest`.
     async fn replay_completed(
         &self,
         file_id: Uuid,
@@ -963,9 +967,11 @@ impl MultipartService {
     ) -> Result<CompletedMultipartUpload, DomainError> {
         if let Some(json) = &session.complete_result
             && let Ok(stored) = serde_json::from_str::<StoredCompleteResult>(json)
-            && let Some(completed) = stored.into_completed()
         {
-            return Ok(completed);
+            let manifest = self.store.get_version_manifest(stored.version_id).await?;
+            if let Some(completed) = stored.into_completed(manifest) {
+                return Ok(completed);
+            }
         }
         // Fallback: rebuild from the version row. Re-read the file for a
         // fresh content pointer (the caller's snapshot may be stale).
@@ -1017,17 +1023,12 @@ impl MultipartService {
         session: &MultipartUploadSession,
         version_id: Uuid,
     ) -> (BindState, Option<String>, Option<String>) {
-        if file.content_id == Some(version_id) {
-            (
-                BindState::Bound,
-                Some(etag::content_etag(file.file_id, version_id)),
-                None,
-            )
-        } else if session.auto_bind {
-            (BindState::Conflict, None, etag::etag_for(file))
-        } else {
-            (BindState::Manual, None, None)
-        }
+        crate::domain::multipart::resolve_bind_state(
+            file.file_id,
+            file.content_id,
+            version_id,
+            session.auto_bind,
+        )
     }
 
     /// The lease-holder's assembly + finish path (upload-flow redesign) —
@@ -1092,14 +1093,20 @@ impl MultipartService {
 
         let parts = self.store.list_multipart_parts(upload_id).await?;
 
-        // Fetch the backend from the version row.
+        // Fetch the backend from the version row, falling back to the
+        // session's own recorded `backend_id` (never the registry's current
+        // default) when the version is already gone — symmetric with
+        // `backend_path` just below, and with `backend_id`'s equivalent
+        // fallback in `cleanup.rs`. Only a legacy session with neither a
+        // version nor a stored `backend_id` falls all the way through to the
+        // default.
         let version = self.store.get_version(file_id, session.version_id).await?;
         let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
+            || session.backend_id_or(self.backends.default_id()),
             |v| v.backend_id.clone(),
         );
         let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
+        let backend_path = session.backend_path_or_default();
 
         // Reject with the specific missing part numbers before falling through
         // to the coarser residual size check below (item 3.3) — a caller
@@ -1575,7 +1582,14 @@ impl MultipartService {
         // entirely, mirroring the `can_resume`-gated cost elsewhere below.
         let backend_id = if can_resume {
             let version = self.store.get_version(file_id, session.version_id).await?;
-            version.map_or_else(|| self.backends.default_id().to_owned(), |v| v.backend_id)
+            // Same version-then-session-then-default fallback as
+            // `assemble_and_finish_inner`/`abort_multipart_upload` — never
+            // the registry's current default ahead of the session's own
+            // recorded backend.
+            version.map_or_else(
+                || session.backend_id_or(self.backends.default_id()),
+                |v| v.backend_id,
+            )
         } else {
             String::new()
         };
@@ -1591,7 +1605,7 @@ impl MultipartService {
         let url_ttl_cap = now + time::Duration::seconds(self.url_ttl_secs.max(1));
         let exp = session.expires_at.min(url_ttl_cap).unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
-        let backend_path = Self::backend_path(file_id, session.version_id);
+        let backend_path = session.backend_path_or_default();
 
         let mut missing = Vec::with_capacity(missing_numbers.len());
         for part_number in missing_numbers {
@@ -1682,14 +1696,16 @@ impl MultipartService {
 
         // Fetch the backend from the version row. Pure reads, no side
         // effects yet -- safe to do before the CAS below regardless of who
-        // wins it.
+        // wins it. Falls back to the session's own recorded `backend_id`
+        // (never the registry's current default) when the version is
+        // already gone -- symmetric with `backend_path` just below.
         let version = self.store.get_version(file_id, session.version_id).await?;
         let backend_id = version.as_ref().map_or_else(
-            || self.backends.default_id().to_owned(),
+            || session.backend_id_or(self.backends.default_id()),
             |v| v.backend_id.clone(),
         );
         let backend = self.backends.get(&backend_id)?;
-        let backend_path = Self::backend_path(file_id, session.version_id);
+        let backend_path = session.backend_path_or_default();
 
         let audit = Self::audit_ok(
             ctx,

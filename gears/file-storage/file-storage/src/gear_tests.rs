@@ -21,20 +21,26 @@ fn gear_provides_p1_and_p2_migrations() {
     //   8. Upload-flow redesign: multipart_uploads.auto_bind + the completion
     //      lease/state-machine columns (lease_until/lease_owner/complete_result)
     //   9. Index hardening: idempotency_keys(file_id) covering the cascade
-    //      from files, and multipart_uploads(state, expires_at, lease_until)
-    //      covering the sweep's full `list_expired` OR predicate
+    //      from files, multipart_uploads(state, expires_at, lease_until)
+    //      covering the sweep's full `list_expired` OR predicate, and
+    //      files(created_at, file_id) WHERE content_id IS NULL covering the
+    //      versionless-orphan-file cleanup sweep
+    //   10. part_count floor: tightens file_versions_part_count_presence_check
+    //       (from migration 7) to also require part_count >= 2 whenever it is
+    //       present, as its own migration rather than an edit to migration 7's
+    //       already-shipped SQL
     // (init()/register_rest() need a live GearCtx — those seams are covered by
     // the E2E suite, not here.)
     let gear = FileStorageGear::default();
     assert_eq!(
         gear.migrations().len(),
-        9,
+        10,
         "gear must provide the P1, P2 initial, P2 multipart plan columns, P2 \
          remediation 0.10 idempotency subject_id, P2 remediation 2.1 \
          idempotency request_hash, P2 remediation 2.4 policies unique \
-         scope, ADR-0006 content-hash-modes, upload-flow-redesign, and \
-         index-hardening \
-         (auto_bind + completion lease) migrations"
+         scope, ADR-0006 content-hash-modes, upload-flow-redesign, \
+         index-hardening (auto_bind + completion lease + versionless sweep), \
+         and part-count-floor migrations"
     );
 }
 

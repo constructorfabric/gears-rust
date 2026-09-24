@@ -122,6 +122,52 @@ async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, DataPlaneS
     build_service_with_config(86400).await
 }
 
+/// Same topology as `build_service_with_config`, but also hands back the
+/// concrete `Store` -- needed by tests that read the raw session row
+/// (`store.get_multipart_upload`) rather than only what the service-level
+/// API surfaces.
+async fn build_service_with_store() -> (
+    Arc<FileService>,
+    Arc<MultipartService>,
+    DataPlaneService,
+    Store,
+) {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store.clone()) as Arc<dyn MultipartStore>,
+        backends,
+        Arc::clone(&authorizer),
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    (svc, msvc, dp, store)
+}
+
 /// Build a `FileService` alone (no `MultipartService`) plus the raw SQLite
 /// DSN, for the idempotency-replay body-mismatch tests (P2 remediation 2.1)
 /// below.
@@ -1148,6 +1194,58 @@ async fn initiate_returns_coherent_parts_plan() {
     assert_eq!(
         total, declared_size,
         "sum of part sizes must equal declared_size"
+    );
+}
+
+/// `initiate_multipart_upload` must persist the actual backend/path the
+/// upload was initiated against on the session row itself
+/// (`m20260722_000001_multipart_auto_bind`'s `backend_id`/`backend_path`
+/// columns) -- not leave cleanup/`MultipartService` to reconstruct them from
+/// the `file_versions` row later, which is unavailable once that row is
+/// reclaimed. Both must be `Some` and agree with the pending version's own
+/// values.
+#[tokio::test]
+async fn initiate_multipart_upload_persists_backend_id_and_path_on_the_session() {
+    let (svc, msvc, _dp, store) = build_service_with_store().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            1024,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let session = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let version = store
+        .get_version(ticket.file_id, plan.version_id)
+        .await
+        .unwrap()
+        .expect("pending version must exist");
+
+    assert_eq!(
+        session.backend_id.as_deref(),
+        Some(version.backend_id.as_str()),
+        "session.backend_id must match the pending version's own backend_id"
+    );
+    assert_eq!(
+        session.backend_path.as_deref(),
+        Some(version.backend_path.as_str()),
+        "session.backend_path must match the pending version's own backend_path"
     );
 }
 
@@ -2463,8 +2561,9 @@ impl StorageBackend for CompleteCallCountingBackend {
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        self.inner.get_stream(path).await
+        self.inner.get_stream(path, expected_len).await
     }
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
         self.inner.get_range(path, range).await
@@ -4202,4 +4301,120 @@ async fn resume_missing_part_then_complete() {
         .unwrap()
         .expect("file");
     assert_eq!(file.content_id, Some(completed.version_id));
+}
+
+/// Regression: `abort_multipart_upload` must resolve the backend to abort
+/// on the same version-then-session-then-default precedence
+/// `assemble_and_finish_inner`/`introspect_multipart_upload` and
+/// `cleanup.rs`'s expired-session sweep already apply for `backend_path` --
+/// see `MultipartUploadSession::backend_id_or`'s doc comment. Before that
+/// symmetry fix, a session whose `file_versions` row is already gone (e.g. a
+/// racing sweep step reclaimed it) but whose upload was never on the
+/// registry's *default* backend would have `abort_multipart_upload` resolve
+/// `backend_id` to the default anyway, harmlessly no-op'ing the backend-side
+/// abort against the WRONG backend and leaking the real handle on the
+/// backend the upload actually used. Mirrors
+/// `cleanup_aborts_on_the_sessions_own_backend_when_version_is_already_gone`
+/// in `tests/cleanup_test.rs`, but for the direct-abort path instead of the
+/// sweep.
+#[tokio::test]
+async fn abort_multipart_upload_uses_the_sessions_own_backend_when_version_is_already_gone() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        ServiceConfig {
+            default_url_ttl_secs: 3600,
+            sidecar_base_url: "http://sidecar.test".to_owned(),
+            default_page_size: 50,
+            max_page_size: 1000,
+            idempotency_ttl_secs: 86400,
+        },
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store.clone()) as Arc<dyn MultipartStore>,
+        backends,
+        Arc::clone(&authorizer),
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // A real in-progress multipart upload against the NON-default "alt"
+    // backend -- the actual backend-side handle this test proves gets
+    // aborted (or leaked, on the old code).
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = alt_backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate on the alt backend");
+
+    // No `file_versions` row is ever inserted for this `version_id` -- models
+    // the version having already been reclaimed by a racing sweep step by
+    // the time abort is called. The session row itself carries its own
+    // `backend_id`, exactly as `initiate_multipart_upload` persists it.
+    let now = time::OffsetDateTime::now_utc();
+    let upload_id = Uuid::now_v7();
+    store
+        .create_multipart_upload(
+            upload_id,
+            file_id,
+            version_id,
+            &backend_handle,
+            Some("alt"),
+            Some(&backend_path),
+            "application/octet-stream",
+            0,
+            0,
+            false,
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("insert session row");
+
+    msvc.abort_multipart_upload(&ctx, file_id, upload_id)
+        .await
+        .expect("abort_multipart_upload");
+
+    // Prove the abort landed on "alt", not "mem": a still-live handle would
+    // accept another `upload_part` call; an aborted one reports "handle not
+    // found". On the old (buggy) fallback, this call would have SUCCEEDED --
+    // the abort would have silently no-op'd against "mem" instead.
+    let after_abort = alt_backend
+        .upload_part(
+            &backend_path,
+            &backend_handle,
+            1,
+            0,
+            Bytes::from_static(b"x"),
+        )
+        .await;
+    assert!(
+        after_abort.is_err(),
+        "the multipart handle on the session's OWN backend (\"alt\") must have been \
+         aborted, but it is still live: {after_abort:?}"
+    );
 }
