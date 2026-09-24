@@ -61,6 +61,28 @@ impl TryFrom<OperationItemStatus> for TerminalStatus {
     }
 }
 
+/// Outbox delivery outcome, counted for stall alerts: `retried` climbing is
+/// repeated delivery without progress.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// A transient failure, or a terminalization that did not land; the message
+    /// goes back to the queue.
+    Retried,
+    /// The envelope named no operation, so it is dead-lettered for an operator.
+    DeadLettered,
+}
+
+impl DeliveryOutcome {
+    /// Stable snake-case label value, independent of `Debug`.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Retried => "retried",
+            Self::DeadLettered => "dead_lettered",
+        }
+    }
+}
+
 /// Required per-candidate labels (T20, `plan.md` P16 rule 2).
 /// No default: callers must explicitly distinguish dry runs and operation kinds.
 #[domain_model]
@@ -116,6 +138,12 @@ pub trait AdmissionMetrics: std::fmt::Debug + Send + Sync {
 
     /// `types_registry_operation_duration_seconds` — one admission pass, wall-clock.
     fn observe_operation_duration(&self, elapsed: Duration);
+
+    /// `types_registry_admission_deliveries_total{outcome}` — one increment per
+    /// delivery that did not succeed as a transport. A delivery that terminalizes
+    /// its operation, a system failure included, did succeed and is covered by the
+    /// per-candidate and duration instruments.
+    fn admission_delivery(&self, outcome: DeliveryOutcome);
 }
 
 /// Instruments that count nothing, for a caller with no meter to inject.
@@ -137,4 +165,6 @@ impl AdmissionMetrics for NoopMetrics {
     fn observe_activation_write_set(&self, _refreshed: usize, _labels: PassLabels) {}
 
     fn observe_operation_duration(&self, _elapsed: Duration) {}
+
+    fn admission_delivery(&self, _outcome: DeliveryOutcome) {}
 }

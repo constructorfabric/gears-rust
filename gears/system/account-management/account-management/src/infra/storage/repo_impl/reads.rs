@@ -261,6 +261,24 @@ pub(super) async fn find_by_id(
     }
 }
 
+pub(super) async fn find_platform_root(
+    repo: &TenantRepoImpl,
+    scope: &AccessScope,
+) -> Result<Option<TenantModel>, DomainError> {
+    let conn = repo.db.conn()?;
+    let row = tenants::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(tenants::Column::ParentId.is_null()))
+        .one(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    match row {
+        Some(row) => Ok(Some(entity_to_model(row)?)),
+        None => Ok(None),
+    }
+}
+
 /// Load the opaque plugin-private metadata blob AM stamped at
 /// `activate_tenant` time. Returns `None` when no row exists for
 /// `tenant_id`, or when the row's `metadata` column is SQL NULL

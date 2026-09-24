@@ -169,6 +169,55 @@ fn default_wiring_is_local() {
     assert!(matches!(w, ClientWiring::Local));
 }
 
+/// `rest_only_knobs_set` names exactly the pool/concurrency knobs that were
+/// explicitly set — this is what the runtime warns on when a `grpc` transport
+/// carries a REST-only knob that would silently go nowhere.
+#[test]
+fn rest_only_knobs_set_reports_which_were_set() {
+    // None set on a bare grpc wiring -> empty.
+    let w = parse(r#"{"transport": "grpc", "endpoint": "http://x:50051"}"#).unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert!(tuning.rest_only_knobs_set().is_empty());
+
+    // A subset set -> only those names, in declaration order.
+    let w = parse(
+        r#"{"transport": "grpc", "endpoint": "http://x:50051", "max_concurrent_requests": 10}"#,
+    )
+    .unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert_eq!(
+        tuning.rest_only_knobs_set(),
+        vec!["max_concurrent_requests"]
+    );
+
+    // All three set -> all three names.
+    let w = parse(
+        r#"{
+            "transport": "grpc",
+            "endpoint": "http://x:50051",
+            "pool_max_idle_per_host": 256,
+            "pool_idle_timeout": "30s",
+            "max_concurrent_requests": 500
+        }"#,
+    )
+    .unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert_eq!(
+        tuning.rest_only_knobs_set(),
+        vec![
+            "pool_max_idle_per_host",
+            "pool_idle_timeout",
+            "max_concurrent_requests"
+        ]
+    );
+}
+
 #[cfg(feature = "runtime-client")]
 mod runtime_conversion {
     use super::*;
@@ -225,5 +274,53 @@ mod runtime_conversion {
         let cfg = tuning.apply_to(endpoint);
         assert_eq!(cfg.timeout, Duration::from_secs(30));
         assert_eq!(cfg.retry.max_attempts, 3);
+        assert_eq!(cfg.pool_max_idle_per_host, 128);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(cfg.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn tuning_apply_overrides_pool_and_concurrency() {
+        let w = parse(
+            r#"{
+                "transport": "rest",
+                "endpoint": "https://x",
+                "pool_max_idle_per_host": 512,
+                "pool_idle_timeout": "5m",
+                "max_concurrent_requests": 1000
+            }"#,
+        )
+        .unwrap();
+        let ClientWiring::Rest { endpoint, tuning } = w else {
+            unreachable!()
+        };
+        let cfg: ClientConfig = tuning.apply_to(endpoint);
+        assert_eq!(cfg.pool_max_idle_per_host, 512);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_mins(5)));
+        assert_eq!(cfg.max_concurrent_requests, Some(1000));
+    }
+
+    /// A `0` for either knob is accepted by `apply_to` and forwarded verbatim
+    /// onto the `ClientConfig` — this test pins only that forwarding. Making a
+    /// `0` cap safe is the transport's job (clamped to 1 in `toolkit-http`'s
+    /// builder), proven behaviourally in the `concurrency_limit` integration
+    /// test, not here.
+    #[test]
+    fn tuning_apply_accepts_zero_and_forwards_verbatim() {
+        let w = parse(
+            r#"{
+                "transport": "rest",
+                "endpoint": "https://x",
+                "pool_max_idle_per_host": 0,
+                "max_concurrent_requests": 0
+            }"#,
+        )
+        .unwrap();
+        let ClientWiring::Rest { endpoint, tuning } = w else {
+            unreachable!()
+        };
+        let cfg: ClientConfig = tuning.apply_to(endpoint);
+        assert_eq!(cfg.pool_max_idle_per_host, 0);
+        assert_eq!(cfg.max_concurrent_requests, Some(0));
     }
 }

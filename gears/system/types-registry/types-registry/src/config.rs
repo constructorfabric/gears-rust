@@ -10,6 +10,12 @@ use crate::domain::policy::{PolicyConfigError, RegistrationPolicy};
 use crate::infra::cache::{CacheConfig, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL};
 pub use crate::policy_config::PolicyEntry;
 
+/// Lease time reserved after admission.
+pub const LEASE_HEADROOM: Duration = Duration::from_secs(2);
+
+/// Largest attempt budget that fits the outbox's signed counter.
+const MAX_DELIVERY_ATTEMPTS: u32 = i16::MAX as u32 - 1;
+
 /// Configuration for the Types Registry gear.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -29,11 +35,7 @@ pub struct TypesRegistryConfig {
     #[serde(default)]
     pub entities: Vec<serde_json::Value>,
 
-    /// Tuning for the in-process [`TypesRegistryLocalClient`](crate::domain::local_client::TypesRegistryLocalClient).
-    ///
-    /// Currently only carries cache settings, but lives under its own
-    /// section so future local-client knobs (resolver pools, retry
-    /// policies, etc.) don't crowd the top level.
+    /// In-process client tuning.
     #[serde(default)]
     pub local_client: LocalClientSettings,
 
@@ -47,14 +49,7 @@ pub struct TypesRegistryConfig {
     #[serde(default)]
     pub limits: Limits,
 
-    /// Deployment allowlist for **new logical entities**, keyed by GTS
-    /// Identifier Region (DESIGN §3.2).
-    ///
-    /// Closed by default — an empty map admits only the implicit global `cf`
-    /// allowance. Keys are validated at startup by
-    /// [`TypesRegistryConfig::validate`]; an unparsable one fails the boot
-    /// rather than being skipped, because a skipped region reads as a closed
-    /// one and an operator would see a refusal with no cause.
+    /// New-entity allowlist by GTS region; `cf` is always allowed.
     #[serde(default)]
     pub registration_policy: BTreeMap<String, PolicyEntry>,
 
@@ -89,19 +84,11 @@ impl MetricsConfig {
     }
 }
 
-/// Bounds on one request's work and on one document's size.
-///
-/// Every value is a refusal threshold rather than a truncation point: a
-/// silently truncated closure or page would answer a question the caller did
-/// not ask.
+/// Request-work and document-size refusal thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
-    /// Largest authored document accepted at admission.
-    ///
-    /// **Enforced** — acceptance step 8, on the canonical bytes rather than on the
-    /// request body, because the canonical form is what gets stored and
-    /// fingerprinted (`AcceptanceError::AuthoredDocumentTooLarge`).
+    /// Maximum canonical size of an authored document.
     pub authored_document: ByteSize,
     /// Largest resolved document the registry will materialize (§3.2).
     /// Enforced on the canonical bytes of each effective artifact at admission and refresh.
@@ -110,9 +97,7 @@ pub struct Limits {
     /// Enforced before resolution, per candidate or refreshed schema, including its own document.
     /// Distinct documents count once; unrelated documents in a shared store do not count.
     pub resolution_closure: usize,
-    /// Largest number of candidates in one batch.
-    ///
-    /// **Enforced** — acceptance step 1 (`AcceptanceError::BatchTooLarge`).
+    /// Maximum batch size.
     pub batch_candidates: usize,
     /// Maximum dependents reached by one revision; also caps CTE depth (SPEC §4).
     pub activation_write_set: usize,
@@ -140,11 +125,15 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerSettings {
-    /// Wall-clock admission bound; accepted but not enforced in P0.
+    /// Positive wall-clock admission budget. Expiry causes redelivery.
+    /// This does not guarantee spawned work finishes before gear shutdown.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub operation_timeout: Duration,
     /// Revalidation attempts before failure; `1` allows no retry.
     pub max_revalidation_attempts: u32,
+    /// Admission attempts before remaining items are terminalized as `system_failure`
+    /// and the operation completes; `1` disables retries.
+    pub max_delivery_attempts: u32,
 }
 
 impl Default for WorkerSettings {
@@ -152,18 +141,12 @@ impl Default for WorkerSettings {
         Self {
             operation_timeout: Duration::from_mins(5),
             max_revalidation_attempts: 8,
+            max_delivery_attempts: 8,
         }
     }
 }
 
-/// A byte count, written either as an integer or with a unit suffix.
-///
-/// SPEC §10.3 spells these `256KB` and `1MB`, so the config accepts that form.
-/// There is no byte-size crate in the workspace and adding a dependency for one
-/// parse would be out of proportion, so the parse lives here with its own tests.
-/// Suffixes are **binary multiples** — `KB` is 1024 — which is the convention
-/// for document limits; `KiB` / `MiB` / `GiB` are accepted as explicit spellings
-/// of the same thing. A bare integer is bytes.
+/// Binary byte count such as `256KB`, `1MB` or `1MiB`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteSize(usize);
 
@@ -197,9 +180,7 @@ impl ByteSize {
         if digits.is_empty() {
             return Err(format!("'{trimmed}' does not start with a number"));
         }
-        // `digits` is non-empty and all-ASCII-digit by construction, so the only
-        // reachable failure is an overflow — hence the cause: it names which of
-        // the two it was instead of leaving the operator to guess.
+        // Preserve numeric overflow as the parse error.
         let value: usize = digits
             .parse()
             .map_err(|e| format!("'{digits}' is not a byte count: {e}"))?;
@@ -319,12 +300,7 @@ impl Default for TypesRegistryConfig {
 }
 
 impl TypesRegistryConfig {
-    /// Startup validation. Compiles the registration policy and checks the
-    /// limits that constrain each other.
-    ///
-    /// Returns the compiled [`RegistrationPolicy`] rather than `()` so the boot
-    /// path validates and the acceptance path consults **one** compilation, not
-    /// two that could disagree.
+    /// Validate limits and compile the registration policy once.
     ///
     /// # Errors
     /// [`ConfigError::Policy`] for an unparsable region or vendor list, and
@@ -342,10 +318,7 @@ impl TypesRegistryConfig {
                 "limits.page_size_default and limits.page_size_max must be positive".to_owned(),
             ));
         }
-        // The enforced admission limits, held to the same standard as the page sizes: a
-        // zero here is a deployment that boots and then refuses every request it
-        // receives — `BatchTooLarge` for any batch, `AuthoredDocumentTooLarge` for any
-        // document — which is worse than a boot that says why.
+        // Zero would reject every batch or document.
         if self.limits.batch_candidates == 0 {
             return Err(ConfigError::Limits(
                 "limits.batch_candidates must be positive: 0 refuses every request".to_owned(),
@@ -382,6 +355,28 @@ impl TypesRegistryConfig {
                     .to_owned(),
             ));
         }
+        if self.worker.operation_timeout.is_zero() {
+            return Err(ConfigError::Worker(
+                "worker.operation_timeout must be positive: 0 cannot provide a leased worker budget"
+                    .to_owned(),
+            ));
+        }
+        if self.worker.max_delivery_attempts == 0 {
+            return Err(ConfigError::Worker(
+                "worker.max_delivery_attempts must be positive: 0 terminalizes every \
+                 operation's items as system_failure without attempting them"
+                    .to_owned(),
+            ));
+        }
+        if self.worker.max_delivery_attempts > MAX_DELIVERY_ATTEMPTS {
+            return Err(ConfigError::Worker(format!(
+                "worker.max_delivery_attempts ({}) must not exceed {MAX_DELIVERY_ATTEMPTS}: the \
+                 outbox stores the attempt count in an i16 and the handler sees the value from \
+                 before its own delivery's increment, so a larger budget is one no delivery can \
+                 reach",
+                self.worker.max_delivery_attempts,
+            )));
+        }
         Ok(RegistrationPolicy::compile(&self.registration_policy)?)
     }
 
@@ -389,16 +384,12 @@ impl TypesRegistryConfig {
     #[must_use]
     pub fn inert_limit_keys(&self) -> Vec<&'static str> {
         let limits = Limits::default();
-        let worker = WorkerSettings::default();
         let mut keys = Vec::new();
         if self.limits.page_size_default != limits.page_size_default {
             keys.push("limits.page_size_default");
         }
         if self.limits.page_size_max != limits.page_size_max {
             keys.push("limits.page_size_max");
-        }
-        if self.worker.operation_timeout != worker.operation_timeout {
-            keys.push("worker.operation_timeout");
         }
         keys
     }
@@ -413,11 +404,7 @@ impl TypesRegistryConfig {
     }
 }
 
-/// Why a configuration cannot be started on.
-///
-/// Startup fails rather than degrading: a region that could not be parsed reads
-/// exactly like a closed one at admission time, so an operator would see
-/// refusals with no cause to fix.
+/// Startup configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("invalid registration_policy: {0}")]

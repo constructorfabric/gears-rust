@@ -122,6 +122,21 @@ impl From<DomainError> for CanonicalError {
                 CanonicalError::internal(message).create()
             }
 
+            DomainError::Outbox(e) => {
+                use crate::domain::repos::OutboxError;
+                let message = format!("{e}");
+                match e {
+                    // Caller-driven oversize is a bad request.
+                    OutboxError::PayloadTooLarge { .. } => MiniChatChatError::invalid_argument()
+                        .with_format(message)
+                        .create(),
+                    OutboxError::Serialize { .. } | OutboxError::Enqueue { .. } => {
+                        tracing::error!(error_message = %message, "mini-chat outbox error");
+                        CanonicalError::internal(message).create()
+                    }
+                }
+            }
+
             DomainError::WebSearchDisabled => MiniChatChatError::failed_precondition()
                 .with_precondition_violation(
                     "web_search",

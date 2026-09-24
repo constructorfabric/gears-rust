@@ -1,9 +1,5 @@
 //! Test hooks over real persistence with shared port forwarding.
-//! [`PauseHooks`] pauses calls, [`ClaimHooks`] signals claim entry/return, and
-//! [`CasMissHooks`] refuses a CAS. Extend [`PausePoint`] for timing or
-//! [`StoreHooks`] for inspection and overrides.
 //!
-//! `async_trait` may allocate for no-op hooks, though they do not yield.
 
 use std::sync::Arc;
 
@@ -27,9 +23,9 @@ use uuid::Uuid;
 
 use super::stores;
 
-/// Hook locations in the commit transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
+    OperationRead,
     /// Before the commit's first statement claims `entity_write_order`.
     BeforeEntityWriteOrderClaim,
     /// After the claim succeeds.
@@ -41,195 +37,352 @@ pub enum PausePoint {
     RevisionEntityRead,
 }
 
-/// Port-call hooks with no-op defaults.
-#[async_trait]
-pub trait StoreHooks: Send + Sync {
-    /// Runs at each reached [`PausePoint`]; may hold the transaction open.
-    async fn at(&self, _point: PausePoint) {}
-
-    /// Return `true` to simulate a schema CAS miss without a database write.
-    fn refuse_schema_cas(&self, _entity_id: i64) -> bool {
-        false
-    }
-
-    /// Called before each entity-state write or write-order claim; allows by default.
-    /// No-write tests reject attempts, since final-state equality also permits rollback.
-    fn entity_write(&self, _call: &'static str) -> Result<(), ScopeError> {
-        Ok(())
-    }
-
-    /// Return `true` to fail the operation's completion write, which is how the
-    /// atomicity of publication is put under test.
-    fn fail_mark_completed(&self) -> bool {
-        false
-    }
-
-    /// Return `true` to simulate a deletion losing its race: the entity read
-    /// inside the commit saw `ACTIVE` at the expected version, and the write
-    /// then matched nothing. Both preconditions live in the statement's
-    /// `WHERE`, so this is the only way to reach that arm without a second
-    /// writer that ignores the `entity_write_order` claim — and there is none.
-    fn refuse_deletion(&self, _entity_id: i64) -> bool {
-        false
-    }
+#[derive(Default)]
+pub struct Hooks {
+    pause: Option<Arc<Pause>>,
+    claim: Option<ClaimSignals>,
+    entity_writes: Option<EntityWrites>,
+    refuse_schema_cas_for: Option<i64>,
+    refuse_deletion_for: Option<i64>,
+    stale_find_items: parking_lot::Mutex<Option<Vec<OperationItemRow>>>,
+    fail: std::collections::BTreeSet<FailingCall>,
+    transient_mark_running: Option<TransientFailures>,
+    pub stall_find_by_id: Option<std::time::Duration>,
+    pub stall_mark_system_failed: Option<std::time::Duration>,
+    pub stall_mark_running: Option<std::time::Duration>,
+    injected_cause: Option<&'static str>,
 }
 
-/// Pauses one matching call until the test resumes it.
-pub struct PauseHooks {
+struct Pause {
     at: PausePoint,
     /// Matching call to pause, starting at 1.
     nth: usize,
     seen: std::sync::atomic::AtomicUsize,
+    target: Option<parking_lot::Mutex<GateTarget>>,
     reached: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     resume: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
-#[async_trait]
-impl StoreHooks for PauseHooks {
-    /// Signal and pause only the selected occurrence.
-    async fn at(&self, point: PausePoint) {
-        if point != self.at {
-            return;
-        }
-        if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 != self.nth {
-            return;
-        }
-        let reached = self.reached.lock().await.take();
-        let resume = self.resume.lock().await.take();
-        if let Some(reached) = reached {
-            // Ignore a receiver dropped by an aborted test.
-            reached.send(()).ok();
-        }
-        if let Some(resume) = resume {
-            resume.await.expect("the test must always resume the pass");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateTarget {
+    Disarmed,
+    Armed,
+    Holding(Uuid),
+}
+
+impl Pause {
+    fn attributes(&self, operation_id: Option<Uuid>) -> bool {
+        let Some(target) = &self.target else {
+            return true;
+        };
+        let Some(operation_id) = operation_id else {
+            return false;
+        };
+        let mut target = target.lock();
+        match *target {
+            GateTarget::Disarmed => false,
+            GateTarget::Armed => {
+                *target = GateTarget::Holding(operation_id);
+                true
+            }
+            GateTarget::Holding(held) => held == operation_id,
         }
     }
 }
 
-/// Signals claim entry and successful return. A lock wait must be verified
-/// separately; see `assert_backend_reports_a_blocked_claim` in the backend tests.
-pub struct ClaimHooks {
+struct ClaimSignals {
     entered: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     returned: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
-#[async_trait]
-impl StoreHooks for ClaimHooks {
-    async fn at(&self, point: PausePoint) {
-        let slot = match point {
-            PausePoint::BeforeEntityWriteOrderClaim => &self.entered,
-            PausePoint::AfterEntityWriteOrderClaim => &self.returned,
-            _ => return,
-        };
-        if let Some(signal) = slot.lock().await.take() {
-            // Ignore a receiver dropped by an aborted test.
-            signal.send(()).ok();
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FailingCall {
+    MarkCompleted,
+    MarkItemSucceeded,
+    MarkRunning,
+    FindById,
+    MarkSystemFailed,
 }
 
-/// Refuses every schema CAS for one entity, including retries, to test rollback.
-pub struct CasMissHooks {
-    refuse_for_entity_id: i64,
+#[derive(Default)]
+struct TransientFailures {
+    remaining: std::sync::atomic::AtomicUsize,
+    issued: std::sync::atomic::AtomicUsize,
 }
 
-impl StoreHooks for CasMissHooks {
-    fn refuse_schema_cas(&self, entity_id: i64) -> bool {
-        entity_id == self.refuse_for_entity_id
-    }
-}
-
-/// Refuses every `mark_deleted` for one entity, so the deletion commit sees the
-/// row move between its read and its write.
-pub struct DeletionMissHooks {
-    refuse_for_entity_id: i64,
-}
-
-impl StoreHooks for DeletionMissHooks {
-    fn refuse_deletion(&self, entity_id: i64) -> bool {
-        entity_id == self.refuse_for_entity_id
-    }
-}
-
-/// Records every entity-state write attempt, and optionally refuses it.
 ///
 /// Refusing rather than only recording is deliberate: a pass that writes and
 /// rolls back leaves the same tables behind as one that never wrote, so an
-/// assertion on the tables cannot tell them apart. This one fails the attempt.
 #[derive(Default)]
-pub struct EntityWriteSpy {
-    attempts: std::sync::Mutex<Vec<&'static str>>,
+struct EntityWrites {
+    attempts: parking_lot::Mutex<Vec<&'static str>>,
     forbid: bool,
 }
 
-impl StoreHooks for EntityWriteSpy {
+impl Hooks {
+    async fn at(&self, point: PausePoint) {
+        self.hold(point, None).await;
+    }
+
+    async fn at_operation(&self, point: PausePoint, operation_id: Uuid) {
+        self.hold(point, Some(operation_id)).await;
+    }
+
+    async fn hold(&self, point: PausePoint, operation_id: Option<Uuid>) {
+        if let Some(claim) = &self.claim {
+            let slot = match point {
+                PausePoint::BeforeEntityWriteOrderClaim => Some(&claim.entered),
+                PausePoint::AfterEntityWriteOrderClaim => Some(&claim.returned),
+                _ => None,
+            };
+            if let Some(slot) = slot
+                && let Some(signal) = slot.lock().await.take()
+            {
+                signal.send(()).ok();
+            }
+        }
+
+        if let Some(pause) = &self.pause
+            && pause.at == point
+            && pause.attributes(operation_id)
+            && pause.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == pause.nth
+        {
+            let reached = pause.reached.lock().await.take();
+            let resume = pause.resume.lock().await.take();
+            if let Some(reached) = reached {
+                reached.send(()).ok();
+            }
+            if let Some(resume) = resume {
+                resume.await.expect("the test must always resume the pass");
+            }
+        }
+    }
+
     fn entity_write(&self, call: &'static str) -> Result<(), ScopeError> {
-        self.attempts
-            .lock()
-            .expect("the spy's record is never poisoned")
-            .push(call);
-        if self.forbid {
+        let Some(writes) = &self.entity_writes else {
+            return Ok(());
+        };
+        writes.attempts.lock().push(call);
+        if writes.forbid {
             return Err(ScopeError::Invalid(
                 "this pass must issue no entity-state write",
             ));
         }
         Ok(())
     }
-}
 
-impl TestStores<EntityWriteSpy> {
-    /// Ports that refuse — and record — every entity-state write and the
-    /// write-order claim, while serving every read from real storage.
-    #[must_use]
-    pub fn forbidding_entity_writes() -> Arc<Self> {
-        Arc::new(Self {
-            inner: stores(),
-            hooks: EntityWriteSpy {
-                attempts: std::sync::Mutex::new(Vec::new()),
-                forbid: true,
-            },
-        })
+    fn refuses_schema_cas(&self, entity_id: i64) -> bool {
+        self.refuse_schema_cas_for == Some(entity_id)
     }
 
-    /// Every entity-state write attempted so far, in call order.
+    fn refuses_deletion(&self, entity_id: i64) -> bool {
+        self.refuse_deletion_for == Some(entity_id)
+    }
+
+    fn fails(&self, call: FailingCall) -> bool {
+        self.fail.contains(&call)
+    }
+
+    fn cause(&self, own: &'static str) -> &'static str {
+        self.injected_cause.unwrap_or(own)
+    }
+
+    fn takes_transient_mark_running_failure(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(failures) = &self.transient_mark_running else {
+            return false;
+        };
+        let taken = failures
+            .remaining
+            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .is_ok();
+        if taken {
+            failures.issued.fetch_add(1, SeqCst);
+        }
+        taken
+    }
+
+    fn take_stale_find_items_snapshot(&self) -> Option<Vec<OperationItemRow>> {
+        self.stale_find_items.lock().take()
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedPause(Arc<Pause>);
+
+impl SharedPause {
+    #[must_use]
+    pub fn reached(&self) -> usize {
+        self.0.seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn arm(&self) {
+        let target = self
+            .0
+            .target
+            .as_ref()
+            .expect("only a filtered gate attributes arrivals to one operation");
+        let mut target = target.lock();
+        assert_eq!(
+            *target,
+            GateTarget::Disarmed,
+            "a gate attributes one operation, and this one already has its own",
+        );
+        *target = GateTarget::Armed;
+    }
+
+    #[must_use]
+    pub fn held_operation(&self) -> Option<Uuid> {
+        match *self.0.target.as_ref()?.lock() {
+            GateTarget::Holding(operation_id) => Some(operation_id),
+            GateTarget::Armed | GateTarget::Disarmed => None,
+        }
+    }
+}
+
+pub struct TestStores {
+    inner: Arc<dyn Stores>,
+    hooks: Hooks,
+}
+
+#[derive(Default)]
+#[must_use]
+pub struct TestStoresBuilder {
+    hooks: Hooks,
+}
+
+impl TestStores {
+    pub fn builder() -> TestStoresBuilder {
+        TestStoresBuilder::default()
+    }
+
+    #[must_use]
+    pub fn transient_failures_issued(&self) -> usize {
+        self.hooks
+            .transient_mark_running
+            .as_ref()
+            .map_or(0, |failures| {
+                failures.issued.load(std::sync::atomic::Ordering::SeqCst)
+            })
+    }
+
+    #[must_use]
+    pub fn failing_running_transiently(times: usize) -> Arc<Self> {
+        Self::builder()
+            .failing_mark_running_transiently(times)
+            .build()
+    }
+
     #[must_use]
     pub fn entity_write_attempts(&self) -> Vec<&'static str> {
         self.hooks
-            .attempts
-            .lock()
-            .expect("the spy's record is never poisoned")
-            .clone()
+            .entity_writes
+            .as_ref()
+            .map(|writes| writes.attempts.lock().clone())
+            .unwrap_or_default()
     }
 }
 
-/// Fails the operation's completion write and nothing else.
-pub struct CompletionFailureHooks;
-
-impl StoreHooks for CompletionFailureHooks {
-    fn fail_mark_completed(&self) -> bool {
-        true
+impl TestStoresBuilder {
+    pub fn pausing_at(
+        self,
+        at: PausePoint,
+        nth: usize,
+        reached: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) -> Self {
+        self.pausing_with(&SharedPause(Arc::new(Pause {
+            at,
+            nth,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+            target: None,
+            reached: tokio::sync::Mutex::new(Some(reached)),
+            resume: tokio::sync::Mutex::new(Some(resume)),
+        })))
     }
-}
 
-impl TestStores<CompletionFailureHooks> {
-    /// Ports whose `mark_completed` always fails, so a publication that includes
-    /// it must leave every item write behind with it.
-    #[must_use]
-    pub fn failing_completion() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn pausing_with(mut self, gate: &SharedPause) -> Self {
+        self.hooks.pause = Some(Arc::clone(&gate.0));
+        self
+    }
+
+    pub fn signalling_claim(
+        mut self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        returned: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        self.hooks.claim = Some(ClaimSignals {
+            entered: tokio::sync::Mutex::new(Some(entered)),
+            returned: tokio::sync::Mutex::new(Some(returned)),
+        });
+        self
+    }
+
+    pub fn recording_entity_writes(mut self, forbid: bool) -> Self {
+        self.hooks.entity_writes = Some(EntityWrites {
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            forbid,
+        });
+        self
+    }
+
+    pub fn refusing_schema_cas(mut self, entity_id: i64) -> Self {
+        self.hooks.refuse_schema_cas_for = Some(entity_id);
+        self
+    }
+
+    pub fn refusing_deletion(mut self, entity_id: i64) -> Self {
+        self.hooks.refuse_deletion_for = Some(entity_id);
+        self
+    }
+
+    pub fn stale_find_items(mut self, snapshot: Vec<OperationItemRow>) -> Self {
+        self.hooks.stale_find_items = parking_lot::Mutex::new(Some(snapshot));
+        self
+    }
+
+    pub fn failing(mut self, call: FailingCall) -> Self {
+        self.hooks.fail.insert(call);
+        self
+    }
+
+    pub fn failing_mark_running_transiently(mut self, times: usize) -> Self {
+        self.hooks.transient_mark_running = Some(TransientFailures {
+            remaining: std::sync::atomic::AtomicUsize::new(times),
+            issued: std::sync::atomic::AtomicUsize::new(0),
+        });
+        self
+    }
+
+    pub fn stalling_find_by_id(mut self, delay: std::time::Duration) -> Self {
+        self.hooks.stall_find_by_id = Some(delay);
+        self
+    }
+
+    pub fn stalling_mark_system_failed(mut self, delay: std::time::Duration) -> Self {
+        self.hooks.stall_mark_system_failed = Some(delay);
+        self
+    }
+
+    pub fn stalling_mark_running(mut self, delay: std::time::Duration) -> Self {
+        self.hooks.stall_mark_running = Some(delay);
+        self
+    }
+
+    pub fn with_injected_cause(mut self, text: &'static str) -> Self {
+        self.hooks.injected_cause = Some(text);
+        self
+    }
+
+    pub fn build(self) -> Arc<TestStores> {
+        Arc::new(TestStores {
             inner: stores(),
-            hooks: CompletionFailureHooks,
+            hooks: self.hooks,
         })
     }
 }
 
-/// Real persistence adapter decorated with `H`'s hooks.
-pub struct TestStores<H> {
-    inner: Arc<dyn Stores>,
-    hooks: H,
-}
-
-impl TestStores<PauseHooks> {
+impl TestStores {
     /// Returns decorated ports, a pause notification, and a resume sender.
     #[must_use]
     pub fn pausing(
@@ -254,21 +407,40 @@ impl TestStores<PauseHooks> {
     ) {
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        let decorated = Arc::new(Self {
-            inner: stores(),
-            hooks: PauseHooks {
-                at,
-                nth,
-                seen: std::sync::atomic::AtomicUsize::new(0),
-                reached: tokio::sync::Mutex::new(Some(reached_tx)),
-                resume: tokio::sync::Mutex::new(Some(resume_rx)),
-            },
-        });
+        let decorated = Self::builder()
+            .pausing_at(at, nth, reached_tx, resume_rx)
+            .build();
         (decorated, reached_rx, resume_tx)
     }
-}
 
-impl TestStores<ClaimHooks> {
+    #[must_use]
+    pub fn pausing_shared_for_one_operation(
+        at: PausePoint,
+    ) -> (
+        Arc<Self>,
+        SharedPause,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let gate = SharedPause(Arc::new(Pause {
+            at,
+            nth: 1,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+            target: Some(parking_lot::Mutex::new(GateTarget::Disarmed)),
+            reached: tokio::sync::Mutex::new(Some(reached_tx)),
+            resume: tokio::sync::Mutex::new(Some(resume_rx)),
+        }));
+        let decorated = Self::builder().pausing_with(&gate).build();
+        (decorated, gate, reached_rx, resume_tx)
+    }
+
+    #[must_use]
+    pub fn sharing_pause(gate: &SharedPause) -> Arc<Self> {
+        Self::builder().pausing_with(gate).build()
+    }
+
     /// Returns decorated ports and notifications for claim entry and success.
     #[must_use]
     pub fn claim_signalling() -> (
@@ -278,50 +450,101 @@ impl TestStores<ClaimHooks> {
     ) {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (returned_tx, returned_rx) = tokio::sync::oneshot::channel();
-        (
-            Arc::new(Self {
-                inner: stores(),
-                hooks: ClaimHooks {
-                    entered: tokio::sync::Mutex::new(Some(entered_tx)),
-                    returned: tokio::sync::Mutex::new(Some(returned_tx)),
-                },
-            }),
-            entered_rx,
-            returned_rx,
-        )
+        let decorated = Self::builder()
+            .signalling_claim(entered_tx, returned_tx)
+            .build();
+        (decorated, entered_rx, returned_rx)
     }
-}
 
-impl TestStores<CasMissHooks> {
     /// Refuse `refuse_for_entity_id`'s current-schema compare-and-swap.
     #[must_use]
     pub fn cas_miss(refuse_for_entity_id: i64) -> Arc<Self> {
-        Arc::new(Self {
-            inner: stores(),
-            hooks: CasMissHooks {
-                refuse_for_entity_id,
-            },
-        })
+        Self::builder()
+            .refusing_schema_cas(refuse_for_entity_id)
+            .build()
     }
-}
 
-impl TestStores<DeletionMissHooks> {
     /// Refuse `refuse_for_entity_id`'s lifecycle transition to `DELETED`.
     #[must_use]
     pub fn deletion_miss(refuse_for_entity_id: i64) -> Arc<Self> {
-        Arc::new(Self {
-            inner: stores(),
-            hooks: DeletionMissHooks {
-                refuse_for_entity_id,
-            },
-        })
+        Self::builder()
+            .refusing_deletion(refuse_for_entity_id)
+            .build()
+    }
+
+    #[must_use]
+    pub fn forbidding_entity_writes() -> Arc<Self> {
+        Self::builder().recording_entity_writes(true).build()
+    }
+
+    #[must_use]
+    pub fn failing_completion() -> Arc<Self> {
+        Self::builder().failing(FailingCall::MarkCompleted).build()
+    }
+
+    #[must_use]
+    pub fn failing_running() -> Arc<Self> {
+        Self::builder().failing(FailingCall::MarkRunning).build()
+    }
+
+    #[must_use]
+    pub fn failing_item_success() -> Arc<Self> {
+        Self::builder()
+            .failing(FailingCall::MarkItemSucceeded)
+            .build()
+    }
+
+    #[must_use]
+    pub fn failing_operation_read() -> Arc<Self> {
+        Self::builder().failing(FailingCall::FindById).build()
+    }
+
+    #[must_use]
+    pub fn stalling_status_path(delay: std::time::Duration) -> Arc<Self> {
+        Self::builder()
+            .stalling_find_by_id(delay)
+            .stalling_mark_system_failed(delay)
+            .build()
+    }
+
+    #[must_use]
+    pub fn slow_admission_then_stalled_failure_write(
+        admit: std::time::Duration,
+        write: std::time::Duration,
+    ) -> Arc<Self> {
+        Self::builder()
+            .stalling_mark_running(admit)
+            .failing(FailingCall::MarkRunning)
+            .stalling_mark_system_failed(write)
+            .build()
+    }
+
+    #[must_use]
+    pub fn failing_running_and_failure_write() -> Arc<Self> {
+        Self::builder()
+            .failing(FailingCall::MarkRunning)
+            .failing(FailingCall::MarkSystemFailed)
+            .build()
+    }
+
+    #[must_use]
+    pub fn failing_item_success_saying(text: &'static str) -> Arc<Self> {
+        Self::builder()
+            .failing(FailingCall::MarkItemSucceeded)
+            .with_injected_cause(text)
+            .build()
+    }
+
+    #[must_use]
+    pub fn with_stale_snapshot(snapshot: Vec<OperationItemRow>) -> Arc<Self> {
+        Self::builder().stale_find_items(snapshot).build()
     }
 }
 
 // Port implementations.
 
 #[async_trait]
-impl<H: StoreHooks> EntityWriteOrderStore for TestStores<H> {
+impl EntityWriteOrderStore for TestStores {
     async fn claim_entity_write_order(
         &self,
         tx: &DbTx<'_>,
@@ -337,7 +560,7 @@ impl<H: StoreHooks> EntityWriteOrderStore for TestStores<H> {
 }
 
 #[async_trait]
-impl<H: StoreHooks> VersionFamilyStore for TestStores<H> {
+impl VersionFamilyStore for TestStores {
     async fn find_family_by_key(
         &self,
         tx: &DbTx<'_>,
@@ -367,7 +590,7 @@ impl<H: StoreHooks> VersionFamilyStore for TestStores<H> {
 }
 
 #[async_trait]
-impl<H: StoreHooks> EntityStore for TestStores<H> {
+impl EntityStore for TestStores {
     async fn find_by_gts_id(
         &self,
         tx: &DbTx<'_>,
@@ -403,6 +626,15 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
         gts_uuid: Uuid,
     ) -> Result<Option<EntityRow>, ScopeError> {
         self.inner.find_by_gts_uuid(tx, scope, gts_uuid).await
+    }
+
+    async fn find_by_gts_uuids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
     async fn kind_in_family(
@@ -447,7 +679,7 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
         now: OffsetDateTime,
     ) -> Result<Option<i64>, ScopeError> {
         self.hooks.entity_write("mark_deleted")?;
-        if self.hooks.refuse_deletion(entity_id) {
+        if self.hooks.refuses_deletion(entity_id) {
             // Simulate the row moving after the commit read it.
             return Ok(None);
         }
@@ -458,7 +690,7 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
 }
 
 #[async_trait]
-impl<H: StoreHooks> TypeSchemaStore for TestStores<H> {
+impl TypeSchemaStore for TestStores {
     async fn current_documents(
         &self,
         tx: &DbTx<'_>,
@@ -518,7 +750,7 @@ impl<H: StoreHooks> TypeSchemaStore for TestStores<H> {
         expected: CurrentSchemaCas,
     ) -> Result<bool, ScopeError> {
         self.hooks.entity_write("update_current_schema")?;
-        if self.hooks.refuse_schema_cas(new.entity_id) {
+        if self.hooks.refuses_schema_cas(new.entity_id) {
             // Simulate the projection moving after its token was captured.
             return Ok(false);
         }
@@ -529,7 +761,7 @@ impl<H: StoreHooks> TypeSchemaStore for TestStores<H> {
 }
 
 #[async_trait]
-impl<H: StoreHooks> InstanceStore for TestStores<H> {
+impl InstanceStore for TestStores {
     async fn current_values(
         &self,
         tx: &DbTx<'_>,
@@ -580,7 +812,7 @@ impl<H: StoreHooks> InstanceStore for TestStores<H> {
 }
 
 #[async_trait]
-impl<H: StoreHooks> OperationStore for TestStores<H> {
+impl OperationStore for TestStores {
     async fn find_by_idempotency(
         &self,
         tx: &DbTx<'_>,
@@ -599,6 +831,15 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         scope: &AccessScope,
         id: Uuid,
     ) -> Result<Option<OperationRow>, ScopeError> {
+        if self.hooks.fails(FailingCall::FindById) {
+            return Err(ScopeError::Invalid(
+                "this operation's status read is under failure injection",
+            ));
+        }
+        self.hooks.at_operation(PausePoint::OperationRead, id).await;
+        if let Some(delay) = self.hooks.stall_find_by_id {
+            tokio::time::sleep(delay).await;
+        }
         self.inner.find_by_id(tx, scope, id).await
     }
 
@@ -627,6 +868,9 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         scope: &AccessScope,
         operation_id: Uuid,
     ) -> Result<Vec<OperationItemRow>, ScopeError> {
+        if let Some(snapshot) = self.hooks.take_stale_find_items_snapshot() {
+            return Ok(snapshot);
+        }
         self.inner.find_items(tx, scope, operation_id).await
     }
 
@@ -637,6 +881,19 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         id: Uuid,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
+        if let Some(delay) = self.hooks.stall_mark_running {
+            tokio::time::sleep(delay).await;
+        }
+        if self.hooks.fails(FailingCall::MarkRunning) {
+            return Err(ScopeError::Invalid(
+                "this operation's running move is under failure injection",
+            ));
+        }
+        if self.hooks.takes_transient_mark_running_failure() {
+            return Err(ScopeError::Db(sea_orm::DbErr::Custom(
+                "this operation's running move is under temporary failure injection".to_owned(),
+            )));
+        }
         self.inner.mark_running(tx, scope, id, now).await
     }
 
@@ -647,12 +904,37 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         id: Uuid,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
-        if self.hooks.fail_mark_completed() {
-            return Err(ScopeError::Invalid(
-                "this pass's operation completion is under failure injection",
-            ));
+        if self.hooks.fails(FailingCall::MarkCompleted) {
+            return Err(ScopeError::Db(sea_orm::DbErr::Query(
+                sea_orm::RuntimeErr::Internal(
+                    "(code: 5) database is locked: operation completion failure injection"
+                        .to_owned(),
+                ),
+            )));
         }
         self.inner.mark_completed(tx, scope, id, now).await
+    }
+
+    async fn mark_system_failed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        if let Some(delay) = self.hooks.stall_mark_system_failed {
+            tokio::time::sleep(delay).await;
+        }
+        if self.hooks.fails(FailingCall::MarkSystemFailed) {
+            return Err(ScopeError::Db(sea_orm::DbErr::Query(
+                sea_orm::RuntimeErr::Internal(
+                    self.hooks
+                        .cause("(code: 5) database is locked: system-failure write injection")
+                        .to_owned(),
+                ),
+            )));
+        }
+        self.inner.mark_system_failed(tx, scope, id, now).await
     }
 
     async fn mark_item_succeeded(
@@ -663,6 +945,15 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         outcome: ItemSuccess,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
+        if self.hooks.fails(FailingCall::MarkItemSucceeded) {
+            return Err(ScopeError::Db(sea_orm::DbErr::Query(
+                sea_orm::RuntimeErr::Internal(
+                    self.hooks
+                        .cause("(code: 5) database is locked: item success failure injection")
+                        .to_owned(),
+                ),
+            )));
+        }
         self.inner
             .mark_item_succeeded(tx, scope, item_id, outcome, now)
             .await
@@ -693,10 +984,23 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
             .mark_item_failed(tx, scope, item_id, error_payload, now)
             .await
     }
+
+    async fn fail_nonterminal_items(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        operation_id: Uuid,
+        error_payload: String,
+        now: OffsetDateTime,
+    ) -> Result<u64, ScopeError> {
+        self.inner
+            .fail_nonterminal_items(tx, scope, operation_id, error_payload, now)
+            .await
+    }
 }
 
 #[async_trait]
-impl<H: StoreHooks> DependencyStore for TestStores<H> {
+impl DependencyStore for TestStores {
     async fn has_live_direct_instances(
         &self,
         tx: &DbTx<'_>,

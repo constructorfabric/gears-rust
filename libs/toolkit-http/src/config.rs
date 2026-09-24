@@ -302,10 +302,18 @@ impl RetryConfig {
     }
 }
 
-/// Rate limiting / concurrency limit configuration
+/// Concurrency-limit configuration.
+///
+/// Despite the name, this is a *concurrency* cap (max in-flight requests), not a
+/// requests-per-second rate limit. Installed by
+/// [`HttpClientBuilder::concurrency_limit`](crate::builder::HttpClientBuilder::concurrency_limit);
+/// see there for the load-shedding behaviour.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Maximum concurrent requests (default: 100)
+    /// Maximum in-flight requests at once. Defaults to 100
+    /// ([`RateLimitConfig::default`]). `usize::MAX` disables the limiter
+    /// entirely (the layer is skipped in `build`); `0` is clamped to `1` at
+    /// `build` time so the client can never wedge shedding every request.
     pub max_concurrent_requests: usize,
 }
 

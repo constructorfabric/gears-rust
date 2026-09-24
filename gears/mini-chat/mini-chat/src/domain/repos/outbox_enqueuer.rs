@@ -5,8 +5,40 @@ use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
 use crate::domain::model::audit_envelope::AuditEnvelope;
+
+/// Why an outbox enqueue failed.
+///
+/// The port's own typed error, so it names no `toolkit_db` error and no
+/// catch-all `DomainError`; the transport maps the underlying failure into one
+/// of these, and `DomainError: From<OutboxError>` lets a service surface it with
+/// `?` (payload-too-large as a client validation error, the rest as internal).
+#[derive(Debug, thiserror::Error)]
+pub enum OutboxError {
+    /// The event could not be serialized to its JSON wire form.
+    #[error("failed to serialize {event}")]
+    Serialize {
+        event: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The event payload exceeds the outbox column limit — caller-driven, so a
+    /// client (4xx) fault rather than a server one.
+    #[error("outbox payload is {size} bytes, over the {max}-byte limit")]
+    PayloadTooLarge { size: usize, max: usize },
+    /// The outbox operation (record build or the transactional insert) failed.
+    #[error("outbox enqueue failed: {message}")]
+    Enqueue { message: String },
+}
+
+impl OutboxError {
+    /// Build an [`Enqueue`](Self::Enqueue) from anything printable.
+    pub fn enqueue(message: impl Into<String>) -> Self {
+        Self::Enqueue {
+            message: message.into(),
+        }
+    }
+}
 
 /// Coordinates needed to issue a provider-specific `DELETE` against a
 /// secondary upload.
@@ -111,6 +143,55 @@ pub struct ThreadSummaryTaskPayload {
     pub frozen_target_message_id: Uuid,
 }
 
+/// Domain-owned handle to the outbox wake performed *after* the enclosing
+/// transaction commits.
+///
+/// A thin passthrough over the infra wake token: the caller accumulates the
+/// handles of a unit of work with `+=`, then calls [`fire`](Self::fire) once
+/// the transaction has committed (or drops it on rollback). Keeping this type
+/// domain-owned lets the [`OutboxEnqueuer`] port
+/// speak only domain types; the actual wake protocol lives in `toolkit-db`,
+/// behind this newtype.
+#[derive(Debug)]
+#[must_use = "a Wake wakes no sequencer until fired; call .fire() after the transaction commits"]
+pub struct Wake(toolkit_db::outbox::Wake);
+
+impl Wake {
+    /// A handle that carries no work: the accumulation seed and the value a
+    /// zero-enqueue path returns. [`fire`](Self::fire) is then a no-op.
+    pub fn empty() -> Self {
+        Self(toolkit_db::outbox::Wake::empty())
+    }
+
+    /// Wrap a freshly produced infra wake token. Crate-private: only the infra
+    /// implementation of [`OutboxEnqueuer`] builds one from a real handle.
+    pub(crate) fn from_wake(handle: toolkit_db::outbox::Wake) -> Self {
+        Self(handle)
+    }
+
+    /// Wake the sequencers for the accumulated work. Call only after the
+    /// transaction that produced this handle has committed. On rollback, drop
+    /// the handle (or return [`empty`](Self::empty)) instead.
+    pub fn fire(self) {
+        self.0.fire();
+    }
+}
+
+impl std::ops::AddAssign for Wake {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl std::ops::Add for Wake {
+    type Output = Self;
+
+    fn add(mut self, rhs: Self) -> Self {
+        self += rhs;
+        self
+    }
+}
+
 /// Domain-layer abstraction for enqueuing outbox events within a transaction.
 ///
 /// The finalization service calls this trait to insert outbox rows atomically
@@ -124,14 +205,18 @@ pub struct ThreadSummaryTaskPayload {
 /// - Accepts typed events (from `mini-chat-sdk`; serialized by the implementation)
 /// - Resolves the queue name and partition from tenant context
 /// - Participates in the caller's transaction via `&dyn DBRunner`
-/// - Returns domain errors, not infra-level `OutboxError`
+/// - Returns the domain-owned [`OutboxError`] (not `toolkit_db`'s), and a
+///   domain-owned [`Wake`] rather than the infra wake token, so the port names
+///   no `toolkit_db` error type
 ///
 /// # Implementation note
 ///
 /// The infra implementation (`InfraOutboxEnqueuer`) holds an
 /// `Arc<toolkit_db::outbox::Outbox>` and calls `outbox.enqueue(runner, ...)`
-/// within the finalization transaction. The `Outbox::flush()` notification
-/// is sent after the transaction commits (by the finalization service).
+/// within the finalization transaction. Each enqueue returns a [`Wake`];
+/// the caller accumulates the handles of a unit of work (with `+=`) and calls
+/// `.fire()` on the combined handle *after* the transaction commits, which
+/// marks the written partitions dirty and wakes the sequencers.
 #[async_trait::async_trait]
 pub trait OutboxEnqueuer: Send + Sync {
     /// Enqueue a usage event within the caller's transaction.
@@ -145,12 +230,13 @@ pub trait OutboxEnqueuer: Send + Sync {
     /// Duplicate prevention is handled by the CAS guard in the finalization
     /// transaction — the outbox enqueue is only reached by the CAS winner.
     ///
-    /// Returns `Ok(())` on success. Returns `Err` on database error.
+    /// Returns a [`Wake`] the caller fires after
+    /// the transaction commits. Returns `Err` on database error.
     async fn enqueue_usage_event(
         &self,
         runner: &(dyn DBRunner + Sync),
         event: UsageEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<Wake, OutboxError>;
 
     /// Enqueue an attachment cleanup event within the caller's transaction.
     ///
@@ -160,7 +246,7 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<Wake, OutboxError>;
 
     /// Enqueue a chat-deletion cleanup event within the caller's transaction.
     ///
@@ -171,7 +257,7 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), DomainError>;
+    ) -> Result<Wake, OutboxError>;
 
     /// Enqueue an audit event within the caller's transaction.
     ///
@@ -181,12 +267,13 @@ pub trait OutboxEnqueuer: Send + Sync {
     /// - Use `queue = "mini-chat.audit"`
     /// - Derive the partition from the envelope's `tenant_id`
     ///
-    /// Returns `Ok(())` on success. Returns `Err` on database error.
+    /// Returns a [`Wake`] the caller fires after
+    /// the transaction commits. Returns `Err` on database error.
     async fn enqueue_audit_event(
         &self,
         runner: &(dyn DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), DomainError>;
+    ) -> Result<Wake, OutboxError>;
 
     /// Enqueue a thread summary task within the caller's transaction.
     ///
@@ -196,15 +283,5 @@ pub trait OutboxEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         payload: ThreadSummaryTaskPayload,
-    ) -> Result<(), DomainError>;
-
-    /// Notify the outbox sequencer that new events are available.
-    ///
-    /// Called after the transaction that contains enqueue calls commits.
-    /// Multiple flush calls coalesce — calling flush 10 times results in at most
-    /// one sequencer wakeup.
-    ///
-    /// This is outbox-wide: it wakes the sequencer for ALL registered queues,
-    /// so a single flush call suffices regardless of which queue was written to.
-    fn flush(&self);
+    ) -> Result<Wake, OutboxError>;
 }

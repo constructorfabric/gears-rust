@@ -17,26 +17,26 @@ mod batch;
 mod bounds;
 mod deletion;
 mod drift;
+pub mod dry_run;
 mod errors;
 mod reasons;
 mod unchanged;
 
 pub mod fingerprint;
 mod graph;
-mod publish;
+mod outcome;
 pub mod refresh;
 pub mod revision;
-pub mod simulate;
 mod tuning;
 pub mod unit;
 pub mod vector;
-pub mod view;
 pub mod worker;
 
-pub use reasons::AdmissionFailureReason;
+pub use reasons::{AdmissionFailureReason, DeliveryFailure};
 
 use serde_json::Value;
 use toolkit_db::DbTx;
+use toolkit_db::outbox::Wake;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -109,7 +109,13 @@ impl Precondition {
 pub struct SubmitRequest {
     /// Mandatory. Absence is a synchronous refusal, not a generated key: a
     /// generated one would make every retry a fresh operation.
-    pub idempotency_key: String,
+    ///
+    /// `Option` rather than an empty-string sentinel: a transport that has no
+    /// key to report says `None` in the type, and the one place that decides
+    /// what absence means is [`acceptance::validate`]. After it,
+    /// [`Validated::idempotency_key`] is a plain `String`, because by then the
+    /// key exists and is non-empty.
+    pub idempotency_key: Option<String>,
     pub kind: OperationKind,
     pub dry_run: bool,
     pub candidates: Vec<Candidate>,
@@ -124,8 +130,7 @@ pub struct Accepted {
     /// under its `Idempotency-Key` with a matching fingerprint.
     pub replayed: bool,
     /// The operation's status as of this call's return — `pending` for a fresh
-    /// acceptance, the stored value for a replay, and `completed` once inline
-    /// admission has run (T21 removes that last case along with inline admission).
+    /// acceptance, the stored value for a replay.
     ///
     /// Carried rather than left to the caller to look up: the REST layer needs it for
     /// the receipt, and re-reading the row it has just written cost a second snapshot
@@ -135,13 +140,32 @@ pub struct Accepted {
 
 impl Accepted {
     /// `true` when the operation will not change again. The REST layer answers `200`
-    /// for a terminal replay and `202` otherwise (SPEC §8.1), and inline admission is
-    /// skipped for one — derived from [`Self::status`] rather than stored beside it,
-    /// so the two cannot disagree.
+    /// for a terminal replay and `202` otherwise (SPEC §8.1) — derived from
+    /// [`Self::status`] rather than stored beside it, so the two cannot disagree.
     #[must_use]
     pub fn terminal(&self) -> bool {
         self.status == OperationStatus::Completed
     }
+}
+
+/// Errors from the admission outbox port: starting the pipeline, binding a
+/// started pipeline to the dispatch, or enqueuing within a transaction.
+///
+/// The port lives in the domain, so its error type does too; the outbox
+/// transport ([`OperationDispatch`]'s implementation) maps the underlying
+/// `toolkit_db` failure into [`Backend`](Self::Backend).
+#[derive(Debug, thiserror::Error)]
+pub enum OutboxError {
+    /// The underlying outbox operation failed — starting it, building the record,
+    /// or the transactional enqueue.
+    #[error("the admission outbox operation failed: {0}")]
+    Backend(#[from] toolkit_db::outbox::OutboxError),
+    /// A pipeline is already attached to the dispatch.
+    #[error("the admission dispatch is already bound to a running pipeline")]
+    AlreadyBound,
+    /// `enqueue` was called before the pipeline was bound, or after it stopped.
+    #[error("the admission outbox is not running")]
+    NotRunning,
 }
 
 /// How an accepted operation reaches the admission worker.
@@ -158,30 +182,17 @@ impl Accepted {
 /// so there is no second executor to be generic over.
 #[async_trait::async_trait]
 pub trait OperationDispatch: Send + Sync {
-    /// Enqueue one operation UUID.
+    /// Enqueue one operation UUID, returning the [`Wake`] for its rows.
     ///
     /// The payload carries the UUID and nothing else — candidate content must
     /// never enter an outbox or dead-letter payload (SPEC T21).
     ///
+    /// The wake must be fired only *after* the acceptance transaction commits;
+    /// acceptance holds it across the commit and fires it, or drops it unfired on
+    /// rollback. The dispatch parks nothing across the commit boundary.
+    ///
     /// # Errors
-    /// Whatever the transport fails with; acceptance turns it into a refusal and
-    /// the transaction rolls back, so nothing is half-accepted.
-    async fn enqueue(&self, tx: &DbTx<'_>, operation_id: Uuid) -> anyhow::Result<()>;
-}
-
-/// A dispatcher that enqueues nothing.
-///
-/// Used by the two paths that admit **inline**: seeding, which SPEC §8.1 makes
-/// permanent (*"types-registry accepts and admits it itself, inline, with no
-/// outbox"*), and API traffic until T21 starts the outbox worker. The dispatch call
-/// still happens inside the acceptance transaction, so the shape T21 needs is
-/// already in place and swapping the implementation is the whole change.
-#[domain_model]
-pub struct NullDispatch;
-
-#[async_trait::async_trait]
-impl OperationDispatch for NullDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// [`OutboxError`] if the transport cannot enqueue; acceptance turns it into a
+    /// refusal and the transaction rolls back, so nothing is half-accepted.
+    async fn enqueue(&self, tx: &DbTx<'_>, operation_id: Uuid) -> Result<Wake, OutboxError>;
 }

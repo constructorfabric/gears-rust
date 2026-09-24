@@ -7,7 +7,7 @@ use toolkit_db::DbTx;
 use toolkit_db::secure::AccessScope;
 use toolkit_macros::domain_model;
 
-use super::bounds::{check_closure, materialize_bounded};
+use super::bounds::{check_resolution_inputs, materialize_bounded};
 use super::errors::{ItemFailure, WorkerError};
 use super::vector::VectorDrift;
 use crate::config::Limits;
@@ -114,7 +114,7 @@ pub async fn refresh_dependents(
     let recomputed = tokio::task::spawn_blocking(move || {
         let mut artifacts = Vec::with_capacity(blocking_subjects.len());
         for (entity_id, gts_id) in blocking_subjects {
-            check_closure(store.store_mut(), &gts_id, limits.resolution_closure)
+            check_resolution_inputs(store.store_mut(), &gts_id, limits.resolution_closure)
                 .map_err(RefreshRefusal::Budget)?;
             let resolved = store.store_mut().validate_schema(&gts_id);
             let resolved = match resolved {

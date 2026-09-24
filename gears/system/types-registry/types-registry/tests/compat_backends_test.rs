@@ -1,5 +1,3 @@
-//! T17/T18 admission behavior on PostgreSQL and MySQL.
-
 #![cfg(feature = "integration")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -57,8 +55,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -120,7 +122,7 @@ async fn admit(
         },
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {

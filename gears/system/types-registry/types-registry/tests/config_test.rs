@@ -63,6 +63,7 @@ fn the_defaults_are_the_ones_the_spec_documents() {
     assert_eq!(cfg.limits.page_size_max, 1000);
     assert_eq!(cfg.worker.operation_timeout, Duration::from_mins(5));
     assert_eq!(cfg.worker.max_revalidation_attempts, 8);
+    assert_eq!(cfg.worker.max_delivery_attempts, 8);
 }
 
 /// The existing keys are retained (SPEC §10.3), so an existing deployment's
@@ -337,10 +338,9 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
 
     let worker = json!({ "operation_timeout": "30s" });
     let cfg = parse(json!({ "worker": worker }));
-    assert_eq!(
-        cfg.inert_limit_keys(),
-        vec!["worker.operation_timeout"],
-        "setting {worker} must be reported as inert",
+    assert!(
+        cfg.inert_limit_keys().is_empty(),
+        "operation_timeout is enforced by the admission outbox lease",
     );
 }
 
@@ -370,8 +370,59 @@ fn the_enforced_limits_are_never_reported_as_inert() {
     );
 }
 
-/// A configuration that sets several of them is reported once, in full: an operator
-/// fixing one key should not have to reboot to discover the next.
+#[test]
+fn a_delivery_budget_above_the_outbox_counter_is_rejected() {
+    let error = serde_json::from_value::<TypesRegistryConfig>(json!({
+        "worker": { "max_delivery_attempts": 40000 }
+    }))
+    .expect("deserialize config")
+    .validate()
+    .expect_err("a budget the i16 attempt counter cannot reach must fail the boot");
+
+    assert!(
+        error.to_string().contains("max_delivery_attempts"),
+        "got: {error}"
+    );
+
+    serde_json::from_value::<TypesRegistryConfig>(json!({
+        "worker": { "max_delivery_attempts": 32767 }
+    }))
+    .expect("deserialize config")
+    .validate()
+    .expect_err("no delivery can reach a budget of 32767, so it must fail the boot");
+
+    serde_json::from_value::<TypesRegistryConfig>(json!({
+        "worker": { "max_delivery_attempts": 32766 }
+    }))
+    .expect("deserialize config")
+    .validate()
+    .expect("the largest reachable budget must be accepted");
+}
+
+#[test]
+fn zero_delivery_attempts_is_rejected() {
+    let error = serde_json::from_value::<TypesRegistryConfig>(json!({
+        "worker": { "max_delivery_attempts": 0 }
+    }))
+    .expect("deserialize config")
+    .validate()
+    .expect_err("zero attempts would fail every operation unattempted");
+
+    assert!(error.to_string().contains("max_delivery_attempts"));
+}
+
+#[test]
+fn zero_operation_timeout_is_rejected() {
+    let error = serde_json::from_value::<TypesRegistryConfig>(json!({
+        "worker": { "operation_timeout": "0s" }
+    }))
+    .expect("deserialize config")
+    .validate()
+    .expect_err("zero timeout cannot provide a useful leased worker budget");
+
+    assert!(error.to_string().contains("operation_timeout"));
+}
+
 #[test]
 fn several_inert_keys_are_reported_together() {
     let cfg = parse(json!({
@@ -380,11 +431,7 @@ fn several_inert_keys_are_reported_together() {
     }));
     assert_eq!(
         cfg.inert_limit_keys(),
-        vec![
-            "limits.page_size_default",
-            "limits.page_size_max",
-            "worker.operation_timeout",
-        ],
+        vec!["limits.page_size_default", "limits.page_size_max"],
     );
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-keycloak-idp-plugin"
-version = "0.1.4"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -64,6 +64,8 @@ gts.workspace = true
 # The cert is never used over the wire — we only need a syntactically-valid
 # PEM so reqwest's `ClientBuilder::add_root_certificate` accepts it.
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
+# In-memory metric exporter for the histogram bucket-boundary test.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # The remaining direct test imports (account-management-sdk, credstore-sdk,
 # toolkit-security, toolkit-odata, openbao-credstore-gateway, reqwest,
 # async-trait, serde_json, uuid, url) are pulled in transitively via

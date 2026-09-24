@@ -1,7 +1,7 @@
 //! The `operation` / `operation_item` repository: acceptance, idempotency
 //! resolution, and the state moves the worker makes on the way to terminality.
 
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QueryOrder,
 };
@@ -123,18 +123,9 @@ impl OperationRepo {
             .transpose()
     }
 
-    /// Insert an accepted operation.
+    /// Insert acceptance; the idempotency constraint serializes duplicates.
     ///
-    /// A duplicate `(idempotency_scope_hash, idempotency_key)` surfaces as a unique
-    /// violation, which the caller reads as the serialization point between two
-    /// concurrent acceptances rather than as a fault — the same protocol
-    /// [`VersionFamilyRepo::create_or_get`] uses, and for the same reason.
-    ///
-    /// ponytail: ceiling C5 — no operation-retention sweep in P0, so terminal
-    /// operations accumulate here; rows are small and bounded by request volume.
-    /// Upgrade path: the DESIGN §3.2 sweep, which deletes a completed operation only
-    /// when no revision pins any of its items — `idx_tr_operation_status` exists for
-    /// exactly that query.
+    /// P0 retains terminal operations; DESIGN §3.2 defines later cleanup.
     ///
     /// # Errors
     /// Propagates the insert's failure, including the unique violation above.
@@ -230,12 +221,8 @@ impl OperationRepo {
             .collect()
     }
 
-    /// Move an operation from `pending` to `running`.
-    ///
-    /// `ck_tr_operation_state` requires `started_at` at `running`, so both move in
-    /// one statement. The `pending` precondition is in the `WHERE`, so a
-    /// redelivered message that finds the operation already running affects no row
-    /// and is reported as such rather than resetting the clock.
+    /// Move `pending` to `running` with `started_at` atomically (`ck_tr_operation_state`).
+    /// The `WHERE` guard reports no change on redelivery without resetting the clock.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -263,8 +250,49 @@ impl OperationRepo {
         Ok(result.rows_affected == 1)
     }
 
+    /// Terminalize a system failure from either non-terminal state.
+    /// Returns `false` if another writer already terminalized the operation.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database update failures.
+    pub async fn mark_system_failed(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        let result = operation::Entity::update_many()
+            .secure()
+            .col_expr(
+                operation::Column::Status,
+                Expr::value(OperationStatus::Completed),
+            )
+            .col_expr(operation::Column::CompletedAt, Expr::value(now))
+            // Pending rows need a start time; preserve it for rows that ran.
+            .col_expr(
+                operation::Column::StartedAt,
+                Expr::expr(Func::coalesce([
+                    Expr::col(operation::Column::StartedAt),
+                    Expr::value(now),
+                ])),
+            )
+            .filter(
+                Condition::all().add(operation::Column::Id.eq(id)).add(
+                    Condition::any()
+                        .add(operation::Column::Status.eq(OperationStatus::Pending))
+                        .add(operation::Column::Status.eq(OperationStatus::Running)),
+                ),
+            )
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     /// Move an operation to `completed`. `completed` means every item is terminal;
     /// outcomes stay on the items and are not aggregated here (`database.sql`).
+    ///
+    /// Complete only a running operation; a system failure may also move pending rows.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -292,12 +320,8 @@ impl OperationRepo {
         Ok(result.rows_affected == 1)
     }
 
-    /// Record a committed, changed registration on one item.
-    ///
-    /// Every column `ck_tr_operation_item_state` couples to `succeeded` moves in
-    /// one statement: the payload is dropped, both timestamps are set, and the
-    /// revision and resource version are recorded. Splitting them would leave a
-    /// row the CHECK rejects halfway.
+    /// Record changed registration atomically to satisfy `ck_tr_operation_item_state`:
+    /// set `succeeded`, drop payload, set both timestamps, revision and resource version.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -336,13 +360,9 @@ impl OperationRepo {
         Ok(result.rows_affected == 1)
     }
 
-    /// Record a committed registration that changed **nothing**.
-    ///
-    /// No `result_revision_no`, and that is the whole difference from
-    /// [`Self::mark_item_succeeded`]: an `unchanged` candidate allocates no revision
-    /// number (ADR-0005), and `ck_tr_operation_item_state` enforces that pairing.
-    /// The same CHECK requires `expected_resource_version >= 1`, so a creation
-    /// cannot reach this state.
+    /// Record `unchanged`: unlike [`Self::mark_item_succeeded`], no `result_revision_no`
+    /// is allocated (ADR-0005). `ck_tr_operation_item_state` enforces this and
+    /// `expected_resource_version >= 1`, excluding creations.
     ///
     /// # Errors
     /// Propagates the update's failure.
@@ -409,15 +429,55 @@ impl OperationRepo {
             .await?;
         Ok(result.rows_affected == 1)
     }
+
+    /// Fail all undecided items in one guarded statement.
+    /// Returns the number moved; decided outcomes remain unchanged.
+    ///
+    /// # Errors
+    /// Propagates the update's failure.
+    pub async fn fail_nonterminal_items(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        operation_id: Uuid,
+        error_payload: String,
+        now: OffsetDateTime,
+    ) -> Result<u64, ScopeError> {
+        let result = operation_item::Entity::update_many()
+            .secure()
+            .col_expr(
+                operation_item::Column::Status,
+                Expr::value(OperationItemStatus::Failed),
+            )
+            .col_expr(
+                operation_item::Column::RequestPayload,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                operation_item::Column::ErrorPayload,
+                Expr::value(Some(error_payload)),
+            )
+            .col_expr(operation_item::Column::StartedAt, Expr::value(now))
+            .col_expr(operation_item::Column::CompletedAt, Expr::value(now))
+            .filter(non_terminal_items_of(operation_id))
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected)
+    }
 }
 
-/// One item, and only while it is still non-terminal.
-///
-/// The status half is the guard: an item's outcome is written once and stands
-/// (`database.sql`). Two passes over one operation can overlap — at-least-once
-/// delivery (T21), or a retry under the same `Idempotency-Key` arriving mid-flight —
-/// and filtering on `id` alone would let the loser overwrite a `succeeded` item with
-/// `failed`. Both writers report `false` instead.
+/// Select undecided items for bulk failure.
+fn non_terminal_items_of(operation_id: Uuid) -> Condition {
+    Condition::all()
+        .add(operation_item::Column::OperationId.eq(operation_id))
+        .add(
+            Condition::any()
+                .add(operation_item::Column::Status.eq(OperationItemStatus::Pending))
+                .add(operation_item::Column::Status.eq(OperationItemStatus::Running)),
+        )
+}
+
+/// Guard non-terminal status so outcomes remain write-once.
 fn non_terminal(item_id: i64) -> Condition {
     Condition::all()
         .add(operation_item::Column::Id.eq(item_id))

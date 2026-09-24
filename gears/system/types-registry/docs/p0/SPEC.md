@@ -56,6 +56,7 @@ without re-registration.
 | Lifecycle `ACTIVE` / `DELETED`, tombstones retained | ADR-0008 |
 | Dry Run as a mode of registration and deletion | `fr-dry-run` |
 | New SDK trait + REST surface for the above | §3.3 |
+| SDK reconciliation of explicitly supplied documents; registry-side collection of linked inventory at startup | §3.3, P0 deviation D11 |
 | Three backends: SQLite, PostgreSQL, MySQL | `constraint-multi-backend` |
 
 ### Out — deferred, not redesigned
@@ -63,6 +64,7 @@ without re-registration.
 | Deferred | Why out |
 |---|---|
 | Tenant ownership, visibility, tenant plane | User decision. Columns are kept, never populated with scope=2 |
+| Per-gear inventory push, inventory `owning_gear` metadata and filtering (T22) | P1 [#4628](https://github.com/constructorfabric/gears-rust/issues/4628), alongside platform-plane authentication and client integration. P0 retains process-wide pull; explicit-document reconciliation stays in T23 (D11, C3, plan P18) |
 | `PlatformSecurityContext` in the contract, a separate platform listener, `PlatformIdentity` enforcement | User decision, and the platform does not offer either to an in-process gear yet (§8.4, C8). The platform-plane **API itself** — SDK trait, async REST, global-entity reads and writes — is **in** P0; only the identity and the listener are deferred |
 | PDP / `PolicyEnforcer`, read & write grants, declared permissions | Depends on the deferred identity-to-permission binding (§4 DESIGN) |
 | Federation: `source_claim`, the `routing` coordination state, Registry Source Plugins, Control-Plane Validator | Whole subsystem |
@@ -95,7 +97,7 @@ correctness core, not scope.
 | D8 | **`gts`, `gts-id` and `gts-macros` are pinned at 0.12.0 and move together** | A split pin puts the identifier crate and the semantics crate on different specifications. `gts-dylint` / `gts-macros-cli` must not lag either — see §7 |
 | D9 | **Use `toolkit-db/preview-outbox`** | Closes DESIGN §4's outbox sign-off for this gear |
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
-| D11 | **Registration moves from registry-side pull to per-gear push** | A gear's code must not depend on whether it runs in-process; pull silently loses the types of an out-of-process gear. types-registry seeds only what it owns; every other gear reconciles its own through one SDK helper that owns batching, idempotency and retry. Requires `owning_gear` on the inventory records. See `plan.md` P4 |
+| D11 | **P0 retains registry-side inventory pull; per-gear push moves to P1** | Supersedes the original P0 push decision (plan P4/P18). types-registry seeds all linked inventory plus `cfg.entities` through the outbox, requiring every seed item to be `succeeded` or `unchanged` before publishing its client. T23 reconciles explicitly supplied documents for existing registration callers; no per-gear inventory filter or new inventory startup calls in P0. C3 remains open until P1 integrates inventory attribution and push with the platform-plane client |
 | D12 | **`GET /entities` becomes a bounded content-free page with a cursor** | The current shape returns every match with its full `content`; with D3 that is *entity count* × up to 1 MB in one response, and the count is now every gear's declarations. DESIGN specifies this route as content-free discovery returning one page and a cursor. A `limit` without a cursor would bound the response by making the endpoint incomplete, so both land together (§10.2) |
 
 ---
@@ -170,7 +172,7 @@ store-build cache. Everything else comes from the workspace.
 |---|---|
 | GTS semantics | `gts` / `gts-id` / `gts-macros` **0.12.0** — **sole** source, no local approximation (`constraint-gts-implementation`). Upgrade from 0.11.0 is part of this task, §7 |
 | Persistence | SeaORM via `toolkit-db` `DBProvider`, `sea-orm-migration` |
-| Async dispatch | `toolkit-db` outbox, leased mode, table prefix `types_registry_outbox` |
+| Async dispatch | `toolkit-db` outbox, leased mode, table prefix `types_registry__outbox` |
 | REST | Axum via `OperationBuilder`, utoipa, RFC-9457 problem details |
 | Errors | `toolkit-canonical-errors` `CanonicalError`, one `From<DomainError>` ladder |
 | Shared state | none held between admissions — reads go to the database, the `gts-rust` store is transient per admission unit (§8.2, D2) |
@@ -363,38 +365,62 @@ Replay of a matching fingerprint under the same key returns the stored operation
 `202` while active, `200` when terminal. A different fingerprint under the same key
 returns `409`.
 
-**The worker is a plain function, not a task.** Its entry point takes
-`(operation_id, runner)` and performs one full pass; the outbox handler is a thin shell
-that calls it and maps the result to `Ok` / `Retry` / `Reject`. This is required by the
-testing rules of §13 — no test may poll — and it is what makes every concurrency case
-below reachable in a `#[tokio::test]` against SQLite `:memory:`.
+**The worker is a plain function:** `(operation_id, runner)` performs one pass;
+the outbox only maps its result to `Ok`, `Retry` or `Reject`. Domain tests call
+the worker directly (§13).
 
-**Where it runs.** The outbox worker is started at the end of types-registry's own `init()`,
-not in the stateful `start` entry, wired to `ctx.cancellation_token()` and stopped through the
-retained `OutboxHandle`. `init` of every gear precedes `start` of any, so a worker in `start`
-would leave operations submitted during a consumer's `init()` sitting `pending`. Startup order
-inside `init()` is: repositories → inline seeding → start worker → publish client. There is no
-snapshot step and no warm-up read: seeding builds its own transient store like any other
-admission (D2), and every later read goes to the database.
-Seeding precedes the worker start and enqueues nothing, so seed operations cannot be leased
-concurrently.
+**Admission and delivery failures.** Candidate problems, including missing external
+dependencies, become terminal item outcomes and acknowledge delivery. In-batch
+dependencies are ordered; cross-request dependencies require the caller to await the
+prerequisite.
 
-**Two seed sources, one inline pass.** Seeding covers (1) types-registry's own toolkit-gts
-inventory (base types and control-plane types it declares) and (2) the operator-configured
+Retry is reserved for failures that may clear. Permanent system failures and an
+exhausted attempt budget mark undecided items `system_failure` and acknowledge
+the message. Diagnostics contain only stable `error_code`, `operation_id` and
+allowlisted `cause_kind` values. If terminalization fails, redeliver — past the
+budget too, because nothing else re-drives a non-terminal operation. Dead-lettering
+is reserved for envelopes that name no operation.
+
+The default budget is eight admission attempts. `operation_timeout` bounds each leased
+handler, and delivery `N + 1` resolves stored status without running admission again.
+
+**Partitioning.** Eight persisted partitions route by the operation UUID's last two
+bytes modulo eight. Partitions run concurrently; `entity_write_order` still serializes
+entity commits. Retries block only their partition. Changing the count requires recreating
+the disposable dev/test outbox; live repartitioning is unsupported.
+
+**Where it runs.** Startup order is repositories → outbox worker → seeding → await
+the seed operations → client publication. The outbox starts first because acceptance
+enqueues inside its own transaction and there is nowhere to enqueue before it is
+bound. Terminal is not enough to publish: `system_failure` and a refused candidate
+are terminal too, so startup requires every seed item to be `succeeded` or
+`unchanged`, and any `failed` item fails boot. The stateful entry point stops the
+retained `OutboxHandle` on runtime cancellation. Starting during `init()` lets
+consumer initialization await results.
+
+**Two seed sources, one pass.** Seeding covers (1) all process-linked toolkit-gts
+inventory, including other gears' declarations, and (2) the operator-configured
 `cfg.entities` from the deployment YAML — identities whose GTS identifiers are
 deployment-specific and cannot be expressed as gear-owned inventory items (e.g. the
-platform-root tenant type whose identity is chosen by the operator). Both sources are admitted
-together in a single inline pass; an invalid or oversized combined seed set fails startup
-loudly. D11 governs (1): types-registry seeds only what it owns and every other gear reconciles
-its own through the SDK helper. `cfg.entities` is outside D11's scope — it is not owned by any
-gear and is not reconciled through the SDK; it is deployment configuration that the registry
-admits on behalf of the platform operator.
+platform-root tenant type whose identity is chosen by the operator). Both sources are submitted
+together in a single pass; an invalid or oversized combined seed set fails startup
+loudly. The combined set must fit `limits.batch_candidates` and the other admission limits;
+there is no silent truncation or split that could separate a candidate from its dependency.
+Admission orders the combined candidate graph. T24 verifies the real deployment inventory
+and the over-limit refusal before publishing the client. This startup set is collected from
+the binary, not by scanning the entity table; C4 remains closed.
+
+D11 retains process-wide collection until P1. Existing callers that explicitly register
+documents use T23's reconciliation helper after this bootstrap. `cfg.entities` remains
+deployment configuration admitted on behalf of the platform operator, outside per-gear
+inventory reconciliation. Repeated startup is idempotent; no ready-mode barrier is restored.
 
 Acceptance and admission therefore have different executors. Acceptance is always
 synchronous, in the caller's task, inside registry code: the REST handler for API traffic, or
-the local client for an in-process SDK caller. Admission is performed by exactly one outbox
-worker owned by types-registry — one in the system for a single-binary deployment. Seeding is
-the exception both ways: types-registry accepts and admits it itself, inline, with no outbox.
+the local client for an in-process SDK caller. Admission is performed by the types-registry
+outbox processors, with a database lease per partition shared across pods. Seeding takes
+the same path: an accepted operation always carries a durable message, so there is no
+composition in which one is committed with no driver.
 
 **Worker, per admission unit:**
 
@@ -708,7 +734,7 @@ Do not write `version_family`, `entity`, revision, current-pointer or `dependenc
 or claim `entity_write_order`: a prediction must not serialize real writers behind a batch.
 Verify this with an adapter that rejects write attempts; unchanged tables alone permit rollback.
 Operation, outcome, idempotency and dispatch records remain durable. Publish outcomes and
-completion atomically after releasing the snapshot, preserving payloads for recovery on failure.
+completion atomically after releasing the snapshot, preserving payloads for redelivery on failure.
 
 ### 8.2 Read path, and why no store is held between admissions
 
@@ -735,7 +761,8 @@ touched.
 **Why the process-local snapshot was rejected.** A snapshot rebuilt after each local
 admission unit cannot satisfy the multi-pod read criterion of §13 — *"two pods, commit on
 A, B's first post-commit read sees it"* (`nfr-multi-pod-correctness`). P0 has no
-invalidation channel between pods: no pub/sub, and the outbox is the committing pod's own.
+invalidation channel between pods: no pub/sub, and the shared admission outbox distributes
+work through partition leases rather than broadcasting commits to every pod.
 Pod B would serve its stale snapshot indefinitely. Admission is protected against exactly
 this by the commit-time revision-vector guard (D4, §8.1 step 4.3), which makes evaluation
 against possibly-stale data safe; **reads have no such guard**, so for them staleness is
@@ -920,9 +947,10 @@ for a gRPC adapter without adding domain methods — every REST handler is a map
 `all_inventory_type_schemas()` collects `inventory` records linked into *this* binary. A gear
 running out of process declares its `#[gts_type_schema]` types in *its* binary, where
 types-registry cannot see them. The pull model does not degrade under OoP — it silently
-loses those types entirely. Out-of-process operation is therefore **blocked on the push
-migration** — which is why D11 brings that migration into P0 rather than deferring it. Once
-T24 lands, this blocker is gone and ceiling C3 is struck.
+loses those types entirely. Automatic inventory registration for out-of-process gears is
+therefore **blocked on the push migration**, deferred to P1 by D11 and plan P18. T24 moves
+local inventory admission to the database but does not close C3. P1 integrates per-gear
+collection, the platform security context and client transport as one startup flow.
 
 Two smaller consequences:
 
@@ -1079,7 +1107,7 @@ Migration notes:
 - `coordination_state` in its own second migration, `m2026NNNN_000002_coordination_state.rs`,
   seeding `entity_write_order` at sequence zero with a migration timestamp; re-running it
   against a database that already has the table and row preserves both.
-- Outbox tables come from `outbox_migrations_with_prefix("types_registry_outbox")`,
+- Outbox tables come from `outbox_migrations_with_prefix("types_registry__outbox")`,
   not from this migration.
 - `routing` is not seeded, because federation has not landed: its migration will seed
   the `routing` row together with `source_claim`.
@@ -1091,14 +1119,14 @@ the content-model classification, so completed P0 honours `principle-fail-closed
 compatibility rather than deviating from it (§7). C9 records the implementation window before
 that final state and must be struck before the database path is exposed.
 
-C1, C3 and C4 are **struck** — resolved in P0 rather than deferred. The rows are kept
-because other documents cite the numbers.
+C1 and C4 are **struck** — resolved in P0 rather than deferred. C3 is restored by D11/P18
+and remains open until P1. The rows are kept because other documents cite the numbers.
 
 | # | Ceiling | Upgrade path |
 |---|---|---|
 | C1 | **Struck by D2.** Was: the whole entity set held in process memory, so entity count becomes a memory bound | Resolved in P0 — the store is transient per admission unit and bounded by the unit's dependency closure (§8.2) |
 | C2 | `idempotency_scope_hash` digests three constants, so the key namespace is **global**: two unrelated callers reusing one key collide with `409` | Real scope arrives with planes and principals at P1 |
-| C3 | **Struck by D11.** Was: the inventory pull model is in-process-only (§8.4) and `owning_gear` a hardcoded constant, which **blocks** out-of-process gears rather than degrading them | Resolved in P0 — `owning_gear` lands on the inventory records (T22) and every gear pushes its own (T23–T25) |
+| C3 | **Process-wide inventory pull and placeholder attribution.** P0 only collects declarations linked into the registry process (§8.4); `owning_gear = "types-registry"` is a compatibility placeholder for all admissions, not the actual declaring gear and never authority | P1 #4628: T22 metadata/filtering, per-gear startup push through the platform client, and correction of existing attribution even when authored content is unchanged. `cfg.entities` keeps explicit operator/bootstrap attribution; no owner is inferred from a GTS namespace |
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8) | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
@@ -1172,6 +1200,15 @@ pub trait TypesRegistryEntities: Send + Sync {
     ) -> Result<RegistrationOperation, CanonicalError> { /* … */ }
 }
 ```
+
+**Reconciliation takes explicitly supplied desired documents in P0 (T23).** It batch-reads
+their identifiers, skips equal authored content, supplies the read `resource_version` for
+updates, and returns `UpToDate` without submitting if nothing differs. Otherwise it submits
+bounded batches and polls to terminal outcomes, with bounded retries for missing dependencies
+and a deadline. It never discovers inventory or deletes records absent from the supplied set.
+`register_and_await` is the submit/poll primitive; reconciliation adds read/compare above it.
+Per-gear inventory selection moves to P1 (D11), while existing explicit registration callers
+migrate to this helper in T25/T26. Caller labels in diagnostics are not identity or authority.
 
 **Convenience read helpers are provided methods** over `batch_get_entities` and
 `list_entities`, keeping the trait object-safe while preserving the call shapes consumers
@@ -1340,8 +1377,15 @@ gears:
         page_size_max: 1000
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
-        operation_timeout: 5m          # accepted, not enforced until T21
+        operation_timeout: 5m          # T21 lease-handler budget; must be > 0. Not
+                                       # bounded by stop_timeout: the host hard-stops
+                                       # at 35s, so a long pass outlives the drain
         max_revalidation_attempts: 8   # the revalidation loop's bound, §8.1 step 4.3
+        max_delivery_attempts: 8       # T21: failed deliveries before the operation
+                                       # is terminalized as `system_failure`.
+                                       # >0 and <= 32766: the outbox's i16 counter
+                                       # less the increment the handler's own
+                                       # delivery has already spent
       local_client:
         cache:
           freshness_window: 30s        # DESIGN §3.3; `0s` disables the window
@@ -1609,13 +1653,22 @@ property that makes the deviation safe to hold.
 
 ## 13. Testing strategy
 
-Conventions from `12_unit_testing.md`, which override anything implied elsewhere:
+Follow `12_unit_testing.md`, with one exception for real outbox-delivery tests:
 
-- **No `sleep`, no `timeout`, no `tokio::time::*`, no polling, no retries.** Whole suite
-  under 5 s. This has a direct design consequence for D1: **the admission worker must be
-  invocable directly** as a function of `(operation_id, runner)`, so tests drive it
-  synchronously instead of enqueuing and waiting on the outbox. Outbox *wiring* is
-  exercised once, in E2E. Any test that polls an operation is wrong by construction.
+- **No timers, polling or retries in worker, domain or compatibility tests.** Invoke the
+  admission worker directly with `(operation_id, runner)`.
+- **Real outbox delivery may wait.** `toolkit-db` exposes no single-pass driver;
+  `Outbox::push_dirty()` marks a partition and wakes a sequencer, and `Outbox::flush()`
+  wakes one without naming a partition — neither waits for delivery. This exception has
+  four bounds:
+  1. Use only `tests/common/mod.rs::await_delivery`; no ad-hoc waits.
+  2. Read immediately, then use capped exponential backoff under one deadline covering
+     reads and waits. Expiry fails the test.
+  3. Retry only `pending`/`running` observations, never submissions, assertions or test cases.
+     Other responses must be handled immediately.
+  4. Use the helper only when delivery is the subject, including outbox-backed router tests.
+     Test the handler shell directly without waiting.
+- **Whole passing suite under 5 s.** Per-wait failure deadlines do not replace this budget.
 - Each test builds its own **SQLite `:memory:`** database and fresh service instances; no
   shared state, parallel-safe. `make test-types-registry-db` on PostgreSQL and MySQL covers the
   backend-specific lock, CAS and range-bound paths.
@@ -1724,10 +1777,9 @@ identifier profile refusals, topological order, baseline selection.
 | Deleted entity | exact read returns it as deleted; list excludes it |
 
 **E2E** (`testing/e2e/`, pytest) — register → poll → read → re-register unchanged →
-delete, over REST, plus the `Idempotency-Key` replay and `409` paths. This is the **only**
-place the real outbox dispatch loop is exercised, and the only place polling is allowed,
-because it is the only layer where waiting is the behaviour under test rather than an
-accident of the harness.
+delete, plus idempotency replay and `409`, against a real server and HTTP client.
+E2E tests verify deployment; Rust outbox tests verify wiring. Only these two test groups
+may wait; Rust tests must use the shared helper above.
 
 **Compatibility fixture** — pin representative `GTS Identifier → UUID` mappings, per
 `constraint-single-installation`, so a `gts-rust` upgrade cannot silently move
@@ -1759,8 +1811,7 @@ references.
 
 - Any change to `database.sql` — it is the normative P1 target, and a P0 deviation from
   it costs a migration later.
-- Adding a dependency, or enabling a `preview-` feature beyond the approved
-  `toolkit-db/preview-outbox` (D9).
+- Adding a dependency, or enabling any `preview-` feature.
 - Deviating from the migration order for `TypesRegistryClient`: the new trait must exist and
   be tested before the first consumer moves (D6).
 - Widening scope into anything listed Out in §2.
@@ -1788,8 +1839,9 @@ references.
 - Collapse `CompatibilityVerdict::Unknown` into `Incompatible` — they are separate
   outcomes with separate reasons.
 - Write raw SQL in a handler, service or repository.
-- Add `sleep`, polling or a retry loop to a unit or integration test (§13). If a test
-  needs to wait, the code under test is shaped wrong.
+- Add `sleep`, a timer, polling or a retry loop to a unit or integration test, outside
+  §13's shared outbox-delivery helper. If a test needs to wait for anything the code could
+  have been called for directly, the code under test is shaped wrong.
 - Introduce `rstest` or fixture-based setup.
 
 ---

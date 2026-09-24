@@ -44,7 +44,7 @@ use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::ParamSpec;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_security::SecurityContext;
@@ -79,24 +79,13 @@ pub struct TaxDisplayPolicyView {
 }
 
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory precondition (RFC 9110), and section 5's `ETag` cell for this row. Send \
-             the opaque tag the `GET` returned, verbatim. A tenant that has never configured \
-             anything is answered `200` with the fail-closed default and carries a tag, so a \
-             first `PUT` asserts it like any other. A tag that no longer describes the policy is \
-             `409` `STALE_VERSION`; an absent or malformed one is `400`."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory precondition (RFC 9110), and section 5's `ETag` cell for this row. Send \
+         the opaque tag the `GET` returned, verbatim. A tenant that has never configured \
+         anything is answered `200` with the fail-closed default and carries a tag, so a \
+         first `PUT` asserts it like any other. A tag that no longer describes the policy is \
+         `409` `STALE_VERSION`; an absent or malformed one is `400`.",
+    )
 }
 
 /// Build the Axum router for the two policy operations and register them.

@@ -191,6 +191,33 @@ impl EntityRepo {
             .map(row))
     }
 
+    /// Batch exact read by Registry Reference, chunked like
+    /// [`Self::find_by_gts_ids`]. References with no row are simply absent, which
+    /// is what lets the caller report the first unresolved target in request order.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures from any chunk.
+    pub async fn find_by_gts_uuids(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        gts_uuids: &[Uuid],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        let mut out = Vec::new();
+        for chunk in gts_uuids.chunks(IN_CHUNK) {
+            out.extend(
+                entity::Entity::find()
+                    .filter(entity::Column::GtsUuid.is_in(chunk.iter().copied()))
+                    .secure()
+                    .scope_with(scope)
+                    .all(runner)
+                    .await?
+                    .into_iter()
+                    .map(row),
+            );
+        }
+        Ok(out)
+    }
+
     /// Batch read by surrogate id, chunked. Used by the closure walk, which
     /// discovers ids rather than identifiers.
     ///

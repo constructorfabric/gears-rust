@@ -720,7 +720,8 @@ async fn outbox_producer_drains_queue_to_mock_broker() -> TestResult {
     producer_handle
         .outbox()
         .enqueue(&conn, order_created())
-        .await?;
+        .await?
+        .fire();
 
     wait_for_stored(&handle, ORDERS_TOPIC, TENANT_PARTITION, 1).await;
     producer_handle.stop().await;
@@ -780,11 +781,13 @@ async fn single_outbox_queue_can_carry_multiple_topics() -> TestResult {
     producer_handle
         .outbox()
         .enqueue(&conn, order_created())
-        .await?;
+        .await?
+        .fire();
     producer_handle
         .outbox()
         .enqueue(&conn, billing_charged())
-        .await?;
+        .await?
+        .fire();
 
     wait_for_stored(&handle, ORDERS_TOPIC, TENANT_PARTITION, 1).await;
     wait_for_stored(&handle, BILLING_TOPIC, TENANT_PARTITION, 1).await;

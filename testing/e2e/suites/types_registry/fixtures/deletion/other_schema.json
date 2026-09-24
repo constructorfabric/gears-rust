@@ -1,0 +1,12 @@
+{
+  "gts_id": "gts.cf.e2e.deletion.other.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.deletion.other.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "label": { "type": "string" }
+    },
+    "required": ["label"]
+  }
+}

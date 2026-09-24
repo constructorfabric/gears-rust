@@ -8,7 +8,7 @@ refs:
 ---
 
 Created:  2026-08-17 by Virtuozzo International GmbH
-Updated:  2026-08-17 by Virtuozzo International GmbH
+Updated:  2026-09-16 by Virtuozzo International GmbH
 
 # Technical Design — Keycloak IdP Plugin
 
@@ -626,6 +626,21 @@ The wire-side suffix is baked into the name (`_total` for monotonic counters, a 
 Note the label key is `realm` on the two refresh counters and `realm_name` on `realms_bound`. The two spellings are historical, both are subject to the same cardinality budget, and a dashboard selector must use the exact key for the instrument it queries.
 
 Both refresh counters are emitted from the token-acquisition slow path in `src/domain/kc/factory.rs` — every credential resolution for a `(realm, client_id)` pair, including first acquisition, not only rotations. Only `kc_admin_request_duration_seconds` is reserved: it is declared without emitters so the follow-up PR wiring the Keycloak HTTP layer does not have to reshape dependency injection. `endpoint_class` is a sealed newtype for the same reason — new endpoint families are added as `pub const`s alongside their emitting call sites, and no free-`&str` constructor exists, which is what keeps the cardinality surface closed.
+
+#### Histogram bucket layouts
+
+All four duration histograms record **seconds**, and each declares its bucket boundaries explicitly through `with_boundaries(...)` in `src/infra/metrics.rs`. The layouts are part of the metric contract: anything built on `histogram_quantile()` reads these bucket edges, so changing a set reshapes every downstream percentile and alert threshold derived from it.
+
+Declaring them is not decoration. The OTel SDK's default explicit-bucket boundaries (`5, 10, 25, ... 10000`) are scaled for **milliseconds**. Applied to seconds-valued observations the first finite boundary means five *seconds*, so every realistic sample lands in that one bucket, `histogram_quantile()` degenerates into linear interpolation inside it, and p95 pins to a constant `4.75` whatever the real latency is — a flat, misleading latency panel rather than a missing one.
+
+| Boundary set | Seconds | Instruments |
+|---|---|---|
+| `OP_DURATION_BOUNDARIES_SECS` | `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0` | `user_op_duration_seconds`, `sa_op_duration_seconds`, `kc_admin_request_duration_seconds` |
+| `PROVISION_TENANT_BOUNDARIES_SECS` | `0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0` | `provision_tenant_duration_seconds` |
+
+`provision_tenant` carries the taller set because a single call cascades many KC Admin requests end to end, and its top boundary is the default `provision_timeout_ms` (`30_000`). A provision that exceeds that budget is still sampled: the in-saga record call is cancelled together with the saga future, so `provision_tenant_inner` records the elapsed time in its timeout arm instead. Without that emission no timeout would ever reach the histogram, the `le=30` bucket could never differ from `+Inf`, and every percentile would be survivor-biased over the provisions that happened to finish.
+
+Known ceiling on the op-level set: `user_op_duration_seconds` and `sa_op_duration_seconds` measure whole operations, which fan out to several KC Admin calls, each with its own `http_request_timeout_ms` budget and `http_retry_policy` retries, and neither is wrapped in an overall timeout. Their top boundary is `5.0`, so a degraded-provider tail beyond five seconds collapses into `+Inf` and percentiles saturate there. Read a saturated p95 on those two as "at least 5s", not as 5s.
 
 #### `keycloak_idp_plugin_failure_total` label vocabularies
 

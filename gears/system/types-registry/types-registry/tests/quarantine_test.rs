@@ -67,8 +67,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -135,7 +139,7 @@ async fn admit_at(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -370,26 +374,18 @@ async fn a_new_minor_may_not_change_the_dialect_of_its_major() {
     refused_for_dialect(&outcome, DRAFT_2020, DRAFT_07);
 }
 
-/// The pin accepts equivalent Draft-07 spellings, but `compare_documents`
-/// returns `Unknown`, yielding `compatibility_undecidable`. Keep this distinct
-/// from `dialect_changed`; see gts-rust#120, linked in `compat::dialect_pin`.
+/// Equivalent Draft-07 spellings (`…/schema#` vs `…/schema`) name one dialect.
+/// The pin has always accepted them; since gts-rust 0.12.1 `compare_documents`
+/// agrees, so it returns a verdict instead of `Unknown` and admission succeeds.
+/// Until that release this recorded the opposite — a `compatibility_undecidable`
+/// refusal from the library, not from the pin; see gts-rust#120, fixed by #121.
 #[tokio::test]
-async fn a_respelled_dialect_is_refused_downstream_and_not_by_the_pin() {
+async fn a_respelled_dialect_is_accepted_by_the_pin_and_the_library() {
     let db = test_db().await;
     succeeded(&admit(&db, "first", REVISED, schema(REVISED)).await);
     common::restate_stored_dialect(&db, REVISED, "http://json-schema.org/draft-07/schema").await;
 
-    let outcome = admit_at(&db, "second", REVISED, schema(REVISED), Some(1)).await;
-    let item = &outcome.items[0];
-    assert_eq!(
-        (item.status, item.failure.as_ref().map(|f| f.reason.clone())),
-        (
-            domain_enums::OperationItemStatus::Failed,
-            Some(AdmissionFailureReason::CompatibilityUndecidable)
-        ),
-        "the respelling is gts-rust's refusal, not the pin's: {:?}",
-        item.failure,
-    );
+    succeeded(&admit_at(&db, "second", REVISED, schema(REVISED), Some(1)).await);
 }
 
 /// Dialect drift names both dialects and prevents comparison.

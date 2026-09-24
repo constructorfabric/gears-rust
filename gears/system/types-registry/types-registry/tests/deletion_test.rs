@@ -24,7 +24,10 @@ use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::{LifecycleStatus, OperationItemStatus, OperationKind};
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::EntityRow;
-use types_registry::infra::storage::repo::{CoordinationStateRepo, EntityRepo, PageRequest};
+use types_registry::domain::ports::OperationItemRow;
+use types_registry::infra::storage::repo::{
+    CoordinationStateRepo, EntityRepo, OperationRepo, PageRequest,
+};
 
 mod common;
 use common::{allow_all, stores, test_db};
@@ -44,8 +47,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -102,7 +109,7 @@ async fn submit(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind,
             dry_run: false,
             candidates,
@@ -178,6 +185,14 @@ async fn entity_of(db: &Provider, gts_id: &str) -> Option<EntityRow> {
     EntityRepo::find_by_gts_id(&conn, &allow_all(), gts_id)
         .await
         .expect("read")
+}
+
+async fn items_of(db: &Provider, operation_id: Uuid) -> Vec<OperationItemRow> {
+    let provider = worker(db);
+    let conn = provider.conn().expect("conn");
+    OperationRepo::find_items(&conn, &allow_all(), operation_id)
+        .await
+        .expect("read the operation items")
 }
 
 async fn listed_ids(db: &Provider) -> Vec<String> {
@@ -451,7 +466,7 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
     let request = |dry_run: bool| SubmitRequest {
-        idempotency_key: "one-key".to_owned(),
+        idempotency_key: Some("one-key".to_owned()),
         kind: domain_enums::OperationKind::Deletion,
         dry_run,
         candidates: vec![Candidate {
@@ -681,6 +696,117 @@ async fn a_deletion_whose_write_matches_no_row_is_refused_not_reported_as_done()
         entity_of(&db, TARGET).await.expect("row").lifecycle_status,
         LifecycleStatus::Active,
         "nothing was written",
+    );
+}
+
+#[tokio::test]
+async fn deletion_rolls_back_when_its_item_outcome_cannot_be_written() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+
+    let op = submit(
+        &db,
+        "del-atomic",
+        OperationKind::Deletion,
+        vec![Candidate {
+            gts_id: TARGET.to_owned(),
+            content: None,
+            expected_resource_version: Some(1),
+            force: false,
+        }],
+    )
+    .await
+    .expect("accepted");
+    let hooked: Arc<dyn types_registry::domain::ports::Stores> =
+        common::TestStores::failing_item_success();
+
+    let result = run_operation(
+        &hooked,
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        op,
+        LATER,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(WorkerError::Storage(_))),
+        "the injected item write must surface as the storage failure it is: {result:?}",
+    );
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "the entity mutation must roll back with the item outcome",
+    );
+    let items = items_of(&db, op).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].status,
+        OperationItemStatus::Pending,
+        "a rolled-back commit must leave the item for the next delivery",
+    );
+}
+
+#[tokio::test]
+async fn deletion_rolls_back_tombstone_when_item_cas_loses() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+
+    let op = submit(
+        &db,
+        "del-cas-miss",
+        OperationKind::Deletion,
+        vec![Candidate {
+            gts_id: TARGET.to_owned(),
+            content: None,
+            expected_resource_version: Some(1),
+            force: false,
+        }],
+    )
+    .await
+    .expect("accepted");
+
+    let pending_items = items_of(&db, op).await;
+    assert_eq!(pending_items[0].status, OperationItemStatus::Pending);
+    let item_id = pending_items[0].id;
+
+    let prior_payload = r#"{"reason":"prior_pass_terminated"}"#.to_owned();
+    let conn = db.conn().expect("conn");
+    OperationRepo::mark_item_failed(&conn, &allow_all(), item_id, prior_payload.clone(), NOW)
+        .await
+        .expect("terminalize item as Failed before this pass runs");
+
+    let hooked: Arc<dyn types_registry::domain::ports::Stores> =
+        common::TestStores::with_stale_snapshot(pending_items);
+
+    let outcome = run_with(&db, &hooked, op).await;
+
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "tombstone must roll back when the item CAS loses (pre-fix: entity would be Tombstoned)",
+    );
+    let items = items_of(&db, op).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].status,
+        OperationItemStatus::Failed,
+        "the prior pass's Failed outcome must be preserved verbatim",
+    );
+    assert_eq!(
+        items[0].error_payload.as_deref(),
+        Some(prior_payload.as_str()),
+        "the stored payload must be the prior pass's reason, not a new one from this pass",
+    );
+    assert_eq!(
+        outcome.items[0].status,
+        OperationItemStatus::Failed,
+        "run_operation must surface the stored Failed outcome, not a fresh write",
     );
 }
 

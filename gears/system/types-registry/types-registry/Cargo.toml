@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -20,7 +20,7 @@ doctest = false
 
 [dependencies]
 # SDK - public API, models, and errors
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.8", path = "../types-registry-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.9", path = "../types-registry-sdk" }
 
 # GTS types (from git dependency)
 gts = { workspace = true }
@@ -29,6 +29,8 @@ gts = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# Runtime cancellation for the stateful worker.
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 # Admission metrics use ToolKit's global meter provider.
 opentelemetry = { workspace = true }
@@ -76,9 +78,15 @@ heck = { workspace = true }
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
-# In-memory SQLite for the schema-level migration tests.
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# Deterministic Tokio time for lease tests.
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "test-util",
+] }
+# SQLite and transaction observation for dispatch tests.
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --
 # `[dev-dependencies]` cannot be -- but every reference is behind
 # `#![cfg(feature = "integration")]`, so a default `cargo test` needs no Docker.
@@ -97,3 +105,5 @@ tracing-test = { workspace = true }
 # Captures admission spans in integration tests.
 tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
+# Builds test `OutboxMessage` timestamps.
+chrono = { workspace = true }

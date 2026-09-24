@@ -31,16 +31,12 @@ fn deserialize_overrides() {
 }
 
 #[test]
-fn validate_default_rejects_nil_identifiers() {
-    // An empty TOML table deserialises to `Default::default()`,
-    // which carries `Uuid::nil()` for `root_id` and an empty
-    // `root_tenant_type`. The validator MUST reject this so
-    // `strict = true` deployments cannot insert a nil-id root
-    // and break idempotency on the next restart.
+fn validate_default_rejects_nil_root_id() {
+    // Root-type validation belongs to the independent RootTypeConfig. The
+    // bootstrap validator still prevents a nil durable tenant identity.
     let cfg = BootstrapConfig::default();
-    let err = cfg.validate().expect_err("nil ids must reject");
+    let err = cfg.validate().expect_err("nil root id must reject");
     assert!(err.contains("root_id"), "got: {err}");
-    assert!(err.contains("root_tenant_type"), "got: {err}");
 }
 
 #[test]
@@ -48,9 +44,10 @@ fn validate_accepts_fully_specified_config() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+        root_tenant_type: Some(gts::GtsTypeId::new(gts_id!(
             "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        )),
+        ))),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::from_mins(5),
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -65,9 +62,10 @@ fn validate_rejects_zero_idp_wait_timeout() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+        root_tenant_type: Some(gts::GtsTypeId::new(gts_id!(
             "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        )),
+        ))),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::ZERO,
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -86,9 +84,10 @@ fn validate_rejects_idp_wait_timeout_above_cap() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+        root_tenant_type: Some(gts::GtsTypeId::new(gts_id!(
             "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        )),
+        ))),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         // One past the documented cap; with no upper bound the
         // deadline math `Instant::now() + idp_wait_timeout` and the
@@ -110,9 +109,10 @@ fn validate_accepts_idp_wait_timeout_at_cap() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+        root_tenant_type: Some(gts::GtsTypeId::new(gts_id!(
             "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        )),
+        ))),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         idp_wait_timeout: MAX_IDP_WAIT_TIMEOUT,
         idp_retry_backoff_initial: Duration::from_secs(2),
@@ -127,9 +127,10 @@ fn validate_rejects_inverted_backoff_envelope() {
     let cfg = BootstrapConfig {
         root_id: Uuid::from_u128(0xAA),
         root_name: "platform-root".into(),
-        root_tenant_type: gts::GtsTypeId::new(gts_id!(
+        root_tenant_type: Some(gts::GtsTypeId::new(gts_id!(
             "cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        )),
+        ))),
+        root_tenant_type_idp_provisioning: Some(false),
         root_tenant_metadata: None,
         idp_wait_timeout: Duration::from_mins(5),
         idp_retry_backoff_initial: Duration::from_mins(1),

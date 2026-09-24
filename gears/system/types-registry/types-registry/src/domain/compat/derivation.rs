@@ -124,9 +124,10 @@ impl DialectDrift {
 /// stored baselines may come from builds with a different admissible set.
 ///
 /// Run before comparison to report `dialect_changed` rather than the library's
-/// `Unknown` verdict. The library still rejects equivalent Draft-07 spellings:
-/// <https://github.com/GlobalTypeSystem/gts-rust/issues/120>.
-/// `tests/quarantine_test.rs` records that limitation.
+/// `Unknown` verdict. Equivalent Draft-07 spellings are accepted here, and since
+/// gts-rust 0.12.1 the library accepts them too
+/// (<https://github.com/GlobalTypeSystem/gts-rust/issues/120>), so they no longer
+/// surface as `compatibility_undecidable`. `tests/quarantine_test.rs` covers this.
 ///
 /// # Errors
 /// [`DialectDrift`] carrying both declared values.

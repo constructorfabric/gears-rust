@@ -150,11 +150,24 @@ pub struct ProducerOutbox {
 }
 
 impl ProducerOutbox {
+    /// Enqueue one typed event within the caller's transaction.
+    ///
+    /// The producer outbox row is written atomically with `runner`'s
+    /// transaction, but the write does **not** wake the sequencer on its own.
+    /// Call [`Wake::fire`](toolkit_db::outbox::Wake::fire) on
+    /// the returned handle once that transaction has committed; on rollback,
+    /// drop the handle instead. Until it is fired the event is durable but
+    /// stays unpublished until the outbox's cold reconciler discovers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event fails producer validation, the envelope
+    /// cannot be serialized, or the database rejects the write.
     pub async fn enqueue<E: crate::typed_event::TypedEvent>(
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         event: E,
-    ) -> Result<toolkit_db::outbox::OutboxMessageId, EventBrokerError> {
+    ) -> Result<toolkit_db::outbox::Wake, EventBrokerError> {
         let (partition, envelope) = self
             .producer
             .outbox_envelope(event, self.partitions)
@@ -172,11 +185,24 @@ impl ProducerOutbox {
             .map_err(|err| EventBrokerError::Internal(format!("producer outbox enqueue: {err}")))
     }
 
+    /// Enqueue several typed events for this producer in one batch.
+    ///
+    /// The whole batch is written atomically with `runner`'s transaction and,
+    /// like [`enqueue`](Self::enqueue), does not wake the sequencer on its own.
+    /// Call [`Wake::fire`](toolkit_db::outbox::Wake::fire) on
+    /// the returned handle once that transaction has committed; on rollback,
+    /// drop the handle instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any event fails producer validation, an envelope
+    /// cannot be serialized, or the database rejects the write. A batch is
+    /// all-or-nothing: one rejected event writes none.
     pub async fn enqueue_batch<E: crate::typed_event::TypedEvent>(
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         events: impl IntoIterator<Item = E>,
-    ) -> Result<Vec<toolkit_db::outbox::OutboxMessageId>, EventBrokerError> {
+    ) -> Result<toolkit_db::outbox::Wake, EventBrokerError> {
         // Every event in the batch shares the queue and the payload type, so
         // the batch states them once. No trace is attached: a produced event
         // is already identified by its own id and `trace_parent`, and giving

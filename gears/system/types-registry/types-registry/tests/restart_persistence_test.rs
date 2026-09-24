@@ -22,14 +22,10 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 
 use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::admission::{
-    Candidate, NullDispatch, OperationDispatch, SubmitRequest,
-};
+use types_registry::domain::admission::{Accepted, Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums::{OperationKind, OperationStatus};
 use types_registry::domain::policy::RegistrationPolicy;
-use types_registry::domain::registry_service::{
-    AdmissionMode, EntityKey, RegistryService, ServiceError,
-};
+use types_registry::domain::registry_service::{EntityKey, RegistryService, ServiceError};
 use types_registry::infra::storage::entity::enums as storage_enums;
 use types_registry::infra::storage::entity::{
     entity, instance, instance_revision, operation, operation_item, type_schema,
@@ -55,31 +51,33 @@ fn schema(gts_id: &str) -> Value {
     })
 }
 
-/// The same database-backed dependencies and interim inline setting that `init()`
-/// selects until T21. This constructs the service directly; it does not exercise
-/// the gear's boot sequence.
+/// The database-backed dependencies, with no dispatch: this test drives
+/// admission itself so it can also reproduce an acceptance that was never
+/// admitted. It constructs the service directly and does not exercise the gear's
+/// boot sequence.
 fn service(db: &Arc<DBProvider<DbError>>) -> RegistryService {
-    service_with(db, true)
-}
-
-/// The same service with the inline-admission switch exposed. `false` is how a
-/// committed acceptance whose process stopped before admission is reproduced:
-/// acceptance commits, while no worker runs.
-fn service_with(db: &Arc<DBProvider<DbError>>, admit_inline: bool) -> RegistryService {
-    let dispatch: Arc<dyn OperationDispatch> = Arc::new(NullDispatch);
+    let dispatch: Arc<dyn OperationDispatch> = Arc::new(common::NoDispatch);
     RegistryService::new(
         db.db(),
         stores(),
         RegistrationPolicy::default(),
         TypesRegistryConfig::default(),
         dispatch,
-        if admit_inline {
-            AdmissionMode::Inline
-        } else {
-            AdmissionMode::Outbox
-        },
         common::metrics(),
     )
+}
+
+/// Accept and admit in one step, as a delivered outbox message would.
+async fn submit_admitted(
+    svc: &RegistryService,
+    request: &SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, ServiceError> {
+    let accepted = svc.submit(request, now).await?;
+    if !accepted.terminal() {
+        svc.admit(accepted.operation_id, now).await?;
+    }
+    Ok(accepted)
 }
 
 /// All durable state written by the Type Schema and Instance submissions. Whole
@@ -164,7 +162,7 @@ async fn read_durable_state(db: &Arc<DBProvider<DbError>>) -> DurableState {
 
 fn submission(key: &str, gts_id: &str, content: Value) -> SubmitRequest {
     SubmitRequest {
-        idempotency_key: key.to_owned(),
+        idempotency_key: Some(key.to_owned()),
         kind: OperationKind::Registration,
         dry_run: false,
         candidates: vec![Candidate {
@@ -187,20 +185,20 @@ async fn a_schema_and_instance_survive_database_reopen() {
     let (before, schema_operation_id, instance_operation_id) = {
         let db = test_db_file(&path).await;
         let svc = service(&db);
-        let accepted_schema = svc
-            .submit(
-                &submission("reopen-schema", CF_TYPE, authored_schema.clone()),
-                BOOT,
-            )
-            .await
-            .expect("schema accepted");
-        let accepted_instance = svc
-            .submit(
-                &submission("reopen-instance", CF_INSTANCE, authored_instance.clone()),
-                BOOT,
-            )
-            .await
-            .expect("instance accepted");
+        let accepted_schema = submit_admitted(
+            &svc,
+            &submission("reopen-schema", CF_TYPE, authored_schema.clone()),
+            BOOT,
+        )
+        .await
+        .expect("schema accepted");
+        let accepted_instance = submit_admitted(
+            &svc,
+            &submission("reopen-instance", CF_INSTANCE, authored_instance.clone()),
+            BOOT,
+        )
+        .await
+        .expect("instance accepted");
 
         for operation_id in [accepted_schema.operation_id, accepted_instance.operation_id] {
             let op = svc
@@ -323,10 +321,13 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
     // The idempotency record is durable too. Comparing all eight tables proves
     // that a terminal replay after reopen neither inserts nor updates anything.
-    let replay = svc
-        .submit(&submission("reopen-schema", CF_TYPE, authored_schema), BOOT)
-        .await
-        .expect("the stored operation is replayable");
+    let replay = submit_admitted(
+        &svc,
+        &submission("reopen-schema", CF_TYPE, authored_schema),
+        BOOT,
+    )
+    .await
+    .expect("the stored operation is replayable");
     assert!(replay.replayed);
     assert!(replay.terminal());
     assert_eq!(replay.operation_id, schema_operation_id);
@@ -336,20 +337,20 @@ async fn a_schema_and_instance_survive_database_reopen() {
     drop(db);
 }
 
-/// Before T21, a process that dies between acceptance and inline admission leaves
-/// an operation that only a retry under the same `Idempotency-Key` can drive. The
-/// first phase manufactures exactly that committed database state; the second
-/// phase proves a fresh service resumes it because the gate is `terminal`, not
-/// `replayed`.
+/// A process that dies between acceptance and admission leaves a committed,
+/// non-terminal operation. The first phase manufactures exactly that state; the
+/// second proves it survives a reopen, that the same key still resolves to it
+/// rather than accepting a second one, and that admitting it completes it — which
+/// is what a redelivered outbox message does in production.
 #[tokio::test]
-async fn a_nonterminal_replay_resumes_inline_admission_before_t21() {
+async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     let dir = TestDir::new("tr-reopen-resume");
     let path = dir.path().join("registry.db");
 
     let authored = schema(CF_TYPE);
     let accepted_id = {
         let db = test_db_file(&path).await;
-        let accepted = service_with(&db, false)
+        let accepted = service(&db)
             .submit(&submission("resume-key", CF_TYPE, authored.clone()), BOOT)
             .await
             .expect("accepted");
@@ -386,24 +387,28 @@ async fn a_nonterminal_replay_resumes_inline_admission_before_t21() {
         "the same key resolves to the same operation"
     );
     assert_eq!(replay.operation_id, accepted_id);
+    assert!(
+        !replay.terminal(),
+        "a replay reports stored status; it must not admit on the caller's behalf",
+    );
+
+    svc.admit(accepted_id, BOOT)
+        .await
+        .expect("a redelivery admits the operation acceptance left behind");
 
     let op = svc
         .operation(accepted_id)
         .await
         .expect("read operation")
         .expect("the operation exists");
-    assert_eq!(
-        op.status,
-        OperationStatus::Completed,
-        "the retry drove the admission that the first pass never reached",
-    );
+    assert_eq!(op.status, OperationStatus::Completed);
     assert_eq!(op.items[0].resource_version, Some(1));
 
     let entity = svc
         .entity(&EntityKey::parse(CF_TYPE))
         .await
         .expect("read")
-        .expect("the retry registered the entity");
+        .expect("admission registered the entity");
     assert_eq!(entity.resource_version, 1);
 
     drop(svc);
@@ -414,13 +419,15 @@ async fn a_nonterminal_replay_resumes_inline_admission_before_t21() {
 async fn an_entity_without_its_current_state_is_reported_as_corrupt() {
     let db = test_db().await;
     let svc = service(&db);
-    svc.submit(
+    submit_admitted(
+        &svc,
         &submission("corrupt-schema", CF_TYPE, schema(CF_TYPE)),
         BOOT,
     )
     .await
     .expect("schema accepted");
-    svc.submit(
+    submit_admitted(
+        &svc,
         &submission(
             "corrupt-instance",
             CF_INSTANCE,
