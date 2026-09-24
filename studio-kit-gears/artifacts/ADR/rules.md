@@ -46,6 +46,7 @@
 ### IDs and Structure
 - [ ] Generate the Table of Contents with `cfs toc <path>` once the final headings are in place
 - [ ] Link affected PRD, DESIGN, FEATURE, or UPSTREAM_REQS IDs when known
+- [ ] Reference the new ADR ID from the Key ADRs section of the gear's `DESIGN.md` in the same change; `cfs validate --artifact` rejects an ADR that DESIGN does not reference (`ref-missing-from-kind`)
 - [ ] Preserve accepted ADR history; supersede with a new ADR instead of silently rewriting a final decision
 
 ---

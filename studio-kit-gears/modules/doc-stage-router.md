@@ -89,17 +89,23 @@ UNIT GearsDocStageRoute
 PURPOSE: Hand the stage to the Studio thin skill that owns it.
 DO:
   RUN GearsDocSupplyPhaseArtifacts WHEN GEARS_STAGE == author
-  LOAD {cf-studio-path}/.core/workflows/documenting-gen.md WHEN GEARS_STAGE == author
-  LOAD {cf-studio-path}/.core/workflows/documenting-ci.md WHEN GEARS_STAGE == validate
-  LOAD {cf-studio-path}/.core/workflows/documenting-review.md WHEN GEARS_STAGE == review
-  LOAD {cf-studio-path}/.core/workflows/documenting-fix.md WHEN GEARS_STAGE == fix
+  LOAD the Studio workflow documenting-gen.md, documenting-ci.md, documenting-review.md, or documenting-fix.md from {cf-studio-path}/.core/workflows/ WHEN GEARS_STAGE is author, validate, review, or fix respectively
+  RUN GearsDocPinNextStage WHEN GEARS_STAGE != close
+  RUN GearsDocAnnounceStage WHEN GEARS_STAGE != close
   CONTINUE the entry unit of the loaded workflow (DocumentingGenBootstrap, DocumentingCiPreset, DocumentingReviewPreset, or DocumentingFixBootstrap) WHEN GEARS_STAGE != close
   CONTINUE GearsDocClose WHEN GEARS_STAGE == close
 RULES:
   ALWAYS forward GEARS_FORWARD_PAYLOAD unchanged as NEXT_ACTION_PAYLOAD to the loaded workflow, so review findings and approvals reach cf-documenting-fix
-  ALWAYS RUN GearsDocPinNextStage immediately before the loaded workflow's NextActionsOffer, replacing any cf-documenting-* pin it set
+  ALWAYS RUN GearsDocPinNextStage again immediately before the loaded workflow's NextActionsOffer, so the pin reflects the stage outcome and replaces any cf-documenting-* pin it set
   NEVER override the loaded workflow's gates, verdicts, or STOP_TURN points
   ALWAYS end every routed stage through the loaded workflow's completion unit and its NextActionsOffer menu with the pinned GEARS_DOC_SKILL next stage marked (suggested); NEVER end a stage with free prose instead of that menu
+```
+
+```pdsl
+UNIT GearsDocAnnounceStage
+PURPOSE: Make the pinned next stage visible before the Studio skill takes over.
+DO:
+  EMIT "Stage <GEARS_STAGE> of <GEARS_DOC_SKILL> for <GEARS_TARGET_PATH>; this stage ends with a next-actions menu whose suggested action is <GEARS_DOC_SKILL> — <GEARS_NEXT_STAGE>."
 ```
 
 ```pdsl

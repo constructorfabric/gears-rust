@@ -60,15 +60,14 @@ PURPOSE: Hand the stage to the Studio coding skill that owns it.
 DO:
   RUN GearsCodeSupplyPhaseArtifacts WHEN GEARS_STAGE == tests OR GEARS_STAGE == author
   RUN GearsCodeDispatchContext WHEN GEARS_STAGE != close
-  LOAD {cf-studio-path}/.core/workflows/coding-tests.md WHEN GEARS_STAGE == tests
-  LOAD {cf-studio-path}/.core/workflows/coding-gen.md WHEN GEARS_STAGE == author
-  LOAD the Studio workflow coding-ci.md, coding-review.md, or coding-fix.md from {cf-studio-path}/.core/workflows/ WHEN GEARS_STAGE is validate, review, or fix respectively
+  LOAD the Studio workflow coding-tests.md, coding-gen.md, coding-ci.md, coding-review.md, or coding-fix.md from {cf-studio-path}/.core/workflows/ WHEN GEARS_STAGE is tests, author, validate, review, or fix respectively
+  RUN GearsCodePinNextStage WHEN GEARS_STAGE != close
   CONTINUE the entry unit of the loaded workflow (CodingTestsPreset, CodingGenBootstrap, CodingCiEntry, CodingReviewEntry, or CodingFixBootstrap) WHEN GEARS_STAGE != close
   CONTINUE GearsCodeClose WHEN GEARS_STAGE == close
 RULES:
   ALWAYS forward GEARS_FORWARD_PAYLOAD unchanged as NEXT_ACTION_PAYLOAD to the loaded workflow, so review findings and approvals reach cf-coding-fix
   ALWAYS use `make gear-ci GEAR=<GEARS_GEAR>` and `make dylint`, plus `cfs validate` when GEARS_CODE_MODE == feature-led, as the remembered project gate commands for cf-coding-ci
-  ALWAYS RUN GearsCodePinNextStage immediately before the loaded workflow's NextActionsOffer, replacing any cf-coding-* pin it set
+  ALWAYS RUN GearsCodePinNextStage again immediately before the loaded workflow's NextActionsOffer, so the pin reflects the stage outcome and replaces any cf-coding-* pin it set
   ALWAYS end every routed stage through the loaded workflow's completion unit and its NextActionsOffer menu with the pinned GEARS_CODE_SKILL next stage marked (suggested); NEVER end a stage with free prose instead of that menu
 ```
 
