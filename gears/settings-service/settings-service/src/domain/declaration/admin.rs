@@ -111,7 +111,9 @@ pub fn etag_of(declaration: &Declaration) -> ETag {
     ETag::new(declaration.updated_at.unix_timestamp_nanos().to_string())
 }
 
-/// An empty value of the type: the only default a secret setting may carry.
+/// An empty value: the first half of the only default a secret setting may
+/// carry — the other half, that it is a value of the declared type, is the
+/// Type Validator's to decide. Shared by both declaration paths.
 #[must_use]
 pub fn is_empty_placeholder(value: &Value) -> bool {
     match value {
@@ -412,21 +414,22 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
-        if derived.has_secret_trait {
-            if !is_empty_placeholder(&request.default_value) {
-                return Err(validation(
-                    "default_value",
-                    field::SECRET_DEFAULT_NOT_EMPTY,
-                    "a secret setting has no secret default: the placeholder is an empty value \
-                     of the type, and the credential is set as a value at a scope",
-                ));
-            }
-        } else {
-            self.validator
-                .validate_value(&request.value_type_id, &request.default_value)
-                .await?
-                .into_result()?;
+        if derived.has_secret_trait && !is_empty_placeholder(&request.default_value) {
+            return Err(validation(
+                "default_value",
+                field::SECRET_DEFAULT_NOT_EMPTY,
+                "a secret setting has no secret default: the placeholder is an empty value \
+                 of the type, and the credential is set as a value at a scope",
+            ));
         }
+        // Every default is a value of its type — a secret's placeholder too:
+        // empty is not enough, `[]` is no string and `null` only fits a type
+        // that admits it (DESIGN §4.2). The contribution path applies the same
+        // rule.
+        self.validator
+            .validate_value(&request.value_type_id, &request.default_value)
+            .await?
+            .into_result()?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11

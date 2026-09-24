@@ -1146,3 +1146,19 @@ async fn an_upgrade_that_fails_at_its_last_step_leaves_the_predecessor_active_an
         "no event for a transaction that rolled back"
     );
 }
+
+#[tokio::test]
+async fn a_secret_placeholder_must_be_an_instance_of_the_type_on_contribution_too() {
+    // The same rule as the admin path: empty, and a value of the type. An empty
+    // array for a string-shaped secret is empty but refused by the schema.
+    let h = Harness::new().await;
+    let result = h
+        .register(vec![ContributedDeclaration::new(
+            key("security", "array_token", 1),
+            SECRET.to_owned(),
+            json!([]),
+            ScopeClass::Cascading,
+        )])
+        .await;
+    assert_eq!(codes(&result), vec![reason::DEFAULT_INVALID]);
+}

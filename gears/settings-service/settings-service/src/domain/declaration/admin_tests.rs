@@ -1101,3 +1101,34 @@ async fn a_descriptive_patch_leaves_the_definition_recency_alone_and_a_reclassif
     );
     assert!(reclassified.updated_at > renamed.updated_at);
 }
+
+#[tokio::test]
+async fn a_secret_placeholder_must_be_an_instance_of_the_type_as_well_as_empty() {
+    // DESIGN §4.2: the placeholder is an empty value *of the declared type* —
+    // `""` for a string-shaped secret, `null` only for a type admitting it. An
+    // empty array or `null` for a string type is empty, but not the type.
+    let h = Harness::new().await;
+    for (name, default) in [
+        ("as_array", json!([])),
+        ("as_null", json!(null)),
+        ("as_object", json!({})),
+    ] {
+        let mut request = h.request(name);
+        request.value_type_id = SECRET.to_owned();
+        request.default_value = default.clone();
+        let err = h
+            .create(request, &admin_actor())
+            .await
+            .expect_err("not an instance of a string type");
+        assert!(
+            matches!(&err, DomainError::Validation { field, .. } if field != "value_type_id"),
+            "{default}: {err:?}"
+        );
+    }
+    let mut request = h.request("as_empty_string");
+    request.value_type_id = SECRET.to_owned();
+    request.default_value = json!("");
+    h.create(request, &admin_actor())
+        .await
+        .expect("the empty string is both empty and a string");
+}

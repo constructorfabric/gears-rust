@@ -311,7 +311,7 @@ Removing, reverting or superseding a row that carries a reference **MUST** delet
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-placeholder`
 
-A `secret`-trait declaration **MUST** carry an empty placeholder default, refused otherwise where declarations are registered, and a scope with no row **MUST** resolve to that placeholder on every administrative surface while the machine path **MUST** answer that no credential is configured instead of handing the placeholder out as plaintext.
+A `secret`-trait declaration **MUST** carry an empty placeholder default that is also a value of its type (`""` for a string-shaped secret, `null` only where the type admits it), refused otherwise on every path declarations are registered through, and a scope with no row **MUST** resolve to that placeholder on every administrative surface while the machine path **MUST** answer that no credential is configured instead of handing the placeholder out as plaintext.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-resolve`

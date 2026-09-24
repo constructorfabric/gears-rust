@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::{SettingTypeRegistrar, reason};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
+use crate::domain::declaration::admin::is_empty_placeholder;
 use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
@@ -121,10 +122,6 @@ fn scope_class_name(class: ScopeClass) -> &'static str {
         ScopeClass::Cascading => "cascading",
         ScopeClass::Local => "local",
     }
-}
-
-fn is_empty_placeholder(value: &Value) -> bool {
-    matches!(value, Value::Null) || value.as_str().is_some_and(str::is_empty)
 }
 
 fn major_of(declaration: &Declaration) -> Option<u32> {
