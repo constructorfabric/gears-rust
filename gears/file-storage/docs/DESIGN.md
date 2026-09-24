@@ -189,7 +189,7 @@ graph LR
     SCGW -.->|HTTP POST finalize<br/>token-authenticated (fs-token)| BIND
     SUI -.->|mint signed token| SCGW
     AZ -->|PolicyEnforcer| AuthZ[Authorization Service]
-    S3D -.->|HTTPS| S3[(S3 / MinIO)]
+    S3D -.->|HTTPS| S3[(S3-compatible store)]
     LFS -.->|fs| Disk[(Local Disk)]
 ```
 
@@ -718,7 +718,8 @@ Versioning is **not** a backend capability — FileStorage versions via distinct
 - Backend types shipped: `local-filesystem` (default; `tokio::fs` reads/writes under a configured root directory,
   native Range via `seek + take`), an opt-in in-memory backend (`enable_in_memory_backend` — test/dev only,
   non-durable, content lost on restart), and `s3-compatible` (opt-in via `s3_backends` config; `rusty-s3` +
-  `quick-xml` executed over the crate's `reqwest` stack, works against AWS S3, MinIO, Backblaze B2, Wasabi, etc.;
+  `quick-xml` executed over the crate's `reqwest` stack, works against AWS S3, Backblaze B2, Wasabi, etc. (and
+  `s3s-fs`, this gear's own test double);
   native Range via the backend `GetObject` Range header; native multipart). GCS/Azure Blob and DB-resident
   runtime-configured backends (`admin-config`) remain deferred to P3
 - Reject any operation that depends on a capability the configured backend has not declared (`409 Conflict` /
@@ -951,7 +952,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 - **Local Filesystem**
   - **Purpose**: P1 reference driver and test fixture; serves files from a configured root
   - **Interaction**: `tokio::fs` async file I/O; native range reads via `AsyncSeekExt::seek` + `AsyncReadExt::take`
-- **S3-Compatible Object Storage** (AWS S3, MinIO, Backblaze B2, Wasabi, etc.)
+- **S3-Compatible Object Storage** (AWS S3, Backblaze B2, Wasabi, etc.; `s3s-fs` in this gear's own tests)
   - **Purpose**: opt-in production backend (`s3_backends` config), gated by ADR-0005's security-review status before
     use in a production release path
   - **Interaction**: `rusty-s3` + `quick-xml`, executed over the crate's `reqwest` stack (ADR-0005); native
@@ -1936,12 +1937,12 @@ The control plane and the data-plane sidecar are implemented under `gears/file-s
 
 ### 4.9 Testing
 
-**Deviation from the unit/E2E testing guide** (pattern:
-[`resource-group`'s `db-behavior-audit.md`](../../system/resource-group/docs/db-behavior-audit.md) §"Deviation from
-the unit/E2E testing guide"). `testing/e2e/suites/file_storage/` is split into three pytest packages, not the single
+**Deviation from the unit/E2E testing guide**, recorded here as the
+[DB-behavior testing guide](../../../docs/toolkit_unified_system/14_db_behavior_testing.md) §"Where to keep which test"
+asks each gear to do. `testing/e2e/suites/file_storage/` is split into three pytest packages, not the single
 file the [E2E guide](../../../docs/toolkit_unified_system/13_e2e_testing.md) §"File Layout" prefers:
 `test_file_storage_seams.py` (route/AuthN smoke, shared SQLite-backed CI server), `lifecycle/` (LocalFs byte-level
-lifecycle, own server+sidecar, bytes verified on disk) and `lifecycle_s3/` (same, against MinIO/`s3s-fs`) — the
+lifecycle, own server+sidecar, bytes verified on disk) and `lifecycle_s3/` (same, against `s3s-fs`) — the
 shared server has no hook to verify bytes on a filesystem or bucket, so a byte-level test needs its own pinned
 server+sidecar, same reason `resource-group` runs its PostgreSQL suite outside pytest.
 
