@@ -505,19 +505,20 @@ the blocked leg reaches `succeeded`, by operator retry or by a verified override
 completes. There is no path by which the report is made with a live subscription outstanding, and
 no path by which the process lives forever waiting.
 
-*Publishing.* `OrderFulfillmentAborted` is **enqueued into `owf_event_outbox` in the same local
-transaction that records the reported outcome**, not published after the cross-gear Lifecycle call
-returns. A synchronous Lifecycle acknowledgement cannot share a transaction with this gear's state
-mutation, so "publish after the report" has a crash window in which the order is reported aborted
-and the event is lost permanently. The outbox drain delivers it afterwards, at-least-once, per
-`cpt-cf-bss-orders-workflow-adr-outbox-process-events`.
+*Publishing.* `OrderFulfillmentAborted` is **enqueued through the bound platform producer outbox
+(`toolkit_db::outbox`) in the same local transaction that records the reported outcome**, not
+published after the cross-gear Lifecycle call returns. A synchronous Lifecycle acknowledgement
+cannot share a transaction with this gear's state mutation, so "publish after the report" has a
+crash window in which the order is reported aborted and the event is lost permanently. The
+platform outbox workers publish it afterwards, at-least-once, per
+`cpt-cf-bss-orders-workflow-adr-outbox-process-events` (`01-foundation.md` §3.6, §4.7).
 
 ##### Responsibility boundaries
 
 Does not call the billing chain and does not delay reporting for it
 (`cpt-cf-bss-orders-workflow-constraint-no-billing-wait`). Does not decide compensation success or
 failure itself — it reports what the Compensation-Execution Component determined. Does not publish
-`OrderFulfillmentAborted` directly to the bus — it enqueues, the outbox drains.
+`OrderFulfillmentAborted` directly to the bus — it enqueues, the platform producer outbox publishes.
 
 ##### Related components (by ID)
 
@@ -552,7 +553,7 @@ failure itself — it reports what the Compensation-Execution Component determin
 |--------|------|-------------|-----------|
 | `ACK` | `in_fulfillment -> fulfillment_failed` | Acknowledgement carrying compensation evidence, for a fulfillment failure | unstable |
 | `COMMAND` | `workflow-mediated cancel` | Cancel submission carrying compensation evidence, for an authorized cancellation (order -> `cancelled`) | unstable |
-| `EVENT` | `OrderFulfillmentAborted` | Enqueued to `owf_event_outbox` in the same transaction as the reported outcome; drained afterwards | unstable |
+| `EVENT` | `OrderFulfillmentAborted` | Enqueued through the platform producer outbox in the same transaction as the reported outcome; published afterwards by platform workers | unstable |
 
 Both compensation-evidence-carrying operations are marked `unstable` deliberately: the
 activated-cancel leg's cancellation-reason value is unspecifiable until `SUB-O1` lands (§4), so the
@@ -637,7 +638,7 @@ sequenceDiagram
         CF ->> CF: set no_active_verified_at
         CF ->> OR: fencing complete, compensation evidence ready
         OR ->> LC: acknowledge in_fulfillment -> fulfillment_failed (compensation evidence)
-        OR ->> OR: enqueue OrderFulfillmentAborted to owf_event_outbox in the same transaction
+        OR ->> OR: enqueue OrderFulfillmentAborted through the platform producer outbox in the same transaction
     else any record failed-pending-escalation or blocked-upstream
         OR ->> OR: refuse the report; order stays non-terminal under the escalated manual task
     end
@@ -677,7 +678,7 @@ sequenceDiagram
     CE -->> CF: every subject has a settled record; verify none active
     CF ->> OR: fencing complete, compensation evidence ready
     OR ->> LC: workflow-mediated cancel with compensation evidence (order -> cancelled)
-    OR ->> OR: enqueue OrderFulfillmentAborted to owf_event_outbox in the same transaction
+    OR ->> OR: enqueue OrderFulfillmentAborted through the platform producer outbox in the same transaction
 ```
 
 **Description**: An authorized cancellation is gated by the five-step fencing sequence before

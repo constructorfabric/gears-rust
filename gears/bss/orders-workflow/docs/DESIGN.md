@@ -45,7 +45,7 @@ Orders Workflow is the **process orchestration engine** for commercially initiat
 
 Two structural mechanisms carry the bulk of the correctness burden. First, a two-wave activation barrier sequences fulfillment as draft-create (wave 1, not resource-affecting) followed by activation (wave 2, only after every create succeeds and the expected fulfillment time is reached), so that mixed-date order lines never stagger live activations and a pre-activation collision or market-divergence check can still abort cheaply. Second, a compensable-only saga with no intra-saga pivot gives every completed wave a named compensating action — draft-void or activated-cancel — dispatched through Subscriptions under the same idempotency contract as the forward path, so a permanent failure or an authorized cancellation always resolves to either a fully compensated order or an explicit, escalated manual task; it never leaves a stranded resource silently unaccounted for.
 
-The remaining architecture responds directly to the process's distributed nature: every outbound call carries a composed idempotency key so retries under a durable-execution substrate cannot double-provision; unresolved outcomes are recovered by a read-only reconciliation sweep rather than by inferring success from silence; unavailability of the approval-requirement verdict source fails closed — the order stays `submitted`, the process parks, and escalation happens before the Lifecycle `submitted` TTL elapses — rather than failing open to `approved`, while transient unavailability of Lifecycle, Subscriptions or Payments is a structurally distinct mechanism that retries inside the affected step's own budget and escalates to a manual task on exhaustion, never one code path branching on which dependency is down; and every process-execution transition is recorded in this gear's own audit/outbox trail, independent of whatever execution-engine history an underlying substrate might retain internally (no engine product is selected — `DECISIONS.md` Q-01). This is how the architecture satisfies the PRD's zero-lost-workflow, zero-duplicate-effect, and 100%-failure-visibility requirements simultaneously, while staying strictly additive to the BSS boundary: no order state is stored here, no price is computed here, and no OSS call is ever made directly.
+The remaining architecture responds directly to the process's distributed nature: every outbound call carries a composed idempotency key so retries under a durable-execution substrate cannot double-provision; unresolved outcomes are recovered by a read-only reconciliation sweep rather than by inferring success from silence; unavailability of the approval-requirement verdict source fails closed — the order stays `submitted`, the process parks, and escalation happens before the Lifecycle `submitted` TTL elapses — rather than failing open to `approved`, while transient unavailability of Lifecycle, Subscriptions or Payments is a structurally distinct mechanism that retries inside the affected step's own budget and escalates to a manual task on exhaustion, never one code path branching on which dependency is down; and every process-execution transition is recorded in this gear's own audit trail — with its process event, where one is declared, enqueued through the platform producer outbox in the same transaction — independent of whatever execution-engine history an underlying substrate might retain internally (no engine product is selected — `DECISIONS.md` Q-01). This is how the architecture satisfies the PRD's zero-lost-workflow, zero-duplicate-effect, and 100%-failure-visibility requirements simultaneously, while staying strictly additive to the BSS boundary: no order state is stored here, no price is computed here, and no OSS call is ever made directly.
 
 ### 1.2 Architecture Drivers
 
@@ -80,7 +80,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-fr-owf-manual-task` | The manual-task factory creates exactly one actionable task per permanently failed line under the remediation policy (or a tracked incident under fail-fast) before any terminal outcome is declared, guaranteeing the 100%-visibility contract. |
 | `cpt-cf-bss-orders-workflow-fr-owf-override-semantics` | The override-resolution handler verifies the referenced subscription is active and matches the order line via Subscriptions before accepting the override, rejecting any override lacking a verified subscription and recording operator identity and justification in the audit log. |
 | `cpt-cf-bss-orders-workflow-fr-owf-boundary-binding` | Every architectural component is designed to the Lifecycle R1–R5 seam by construction: state reads/writes proxy through Lifecycle (R1), approval-requirement computation is never duplicated here (R2), all provisioning routes only through Subscriptions (R3), no price arithmetic exists in this gear (R4), and the downstream transition-request id is stored only as a correlation column (R5). |
-| `cpt-cf-bss-orders-workflow-fr-owf-process-events` | An outbox-backed process-event publisher emits the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` — with at-least-once delivery and consumer-side de-duplication by event ID, structurally separated from Lifecycle's order-state event set so no consumer sees dual publication of the same semantic change. |
+| `cpt-cf-bss-orders-workflow-fr-owf-process-events` | A platform event producer adapter (`event-broker-sdk::DbProducer` over `toolkit_db::outbox`) emits the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` — with at-least-once delivery and consumer-side de-duplication by event ID, structurally separated from Lifecycle's order-state event set so no consumer sees dual publication of the same semantic change. |
 | `cpt-cf-bss-orders-workflow-fr-owf-authorization` | A per-actor authorization guard, evaluated ahead of every operation (approve/reject, task resolution, workflow cancel, system callbacks), enforces role and seller/gate scope and rejects any attempt by a system actor to drive order state directly. |
 
 #### NFR Allocation
@@ -92,7 +92,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome (standard orders, no manual intervention, no future-dated wait) | Fulfillment-orchestration slice, concurrency governor | The two-wave activation barrier dispatches all eligible activation intents concurrently up to the configured per-order cap, and the reconciliation sweep's escalating schedule bounds worst-case discovery latency for lost confirmations | Load test measuring p95 activation-eligibility-to-terminal-outcome latency for standard orders at production sizing |
 | `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per gate; default 72 h; accuracy ± 5 min | Durable timer subsystem | Escalation timers are scheduled on the same durable-timer mechanism used for the overdue-fulfillment deadline, persisted before acknowledgement, and re-armed with remaining window on hold-resume | Timer-accuracy test asserting fired-time within ± 5 min of configured window across a restart boundary |
 | `cpt-cf-bss-orders-workflow-nfr-owf-manual-task-sla` | 100% manual-task creation for permanently failed lines; SLA countdown visible before breach | Manual-task factory, task-queue read projection | The manual-task factory is the single entry point for any `failed` transition under the remediation policy, called synchronously before any terminal outcome is declared, and the task-queue projection surfaces the SLA deadline computed at task-creation time | Structural test asserting every code path reaching `failed` invokes the manual-task factory; UI/API test asserting SLA countdown is visible ahead of breach |
-| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Process-event outbox publisher | Process events are enqueued in the same transaction as the internal state change and drained by an outbox publisher independent of the request path, matching the platform's asynchronous delivery budget | Outbox-drain benchmark measuring p95 enqueue-to-delivery latency at production event volume |
+| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | Process events are enqueued through the platform producer outbox in the same transaction as the internal state change and published by platform workers independent of the request path; commit success alone is not evidence of the target | Producer-queue lag (platform metric) measuring p95 enqueue-to-broker-acceptance at production event volume, with backlog and retries present |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% coverage in process audit log | Gear-owned process audit log | Every process-state transition (step start/completion, retry, timeout, sweep action, escalation, compensation, dead-letter) writes an audit row as part of the same unit of work as the transition, independent of durable-execution-engine history | Structural test that every named transition class writes an audit row; negative test that a failed audit append aborts the transition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-api-latency` | Command acceptance p95 < 1 s; progress reads p95 < 200 ms | Control-plane API surface, progress-read projection | Control commands (start, resolve task, retry step, cancel) are accepted and durably queued without waiting on downstream completion; progress reads are served from a denormalized process-progress projection rather than reconstructing state from the saga log | Latency benchmark for command acceptance and progress-read endpoints at production request rates |
 | `cpt-cf-bss-orders-workflow-nfr-owf-availability` | 99.9% control-plane availability (working baseline) | Control-plane deployment topology | The control plane is deployed with redundancy per the platform BSS availability baseline; in-flight processes are recoverable from durable state independent of control-plane restarts, per the durability NFR | Availability monitoring against the 99.9% baseline; chaos test restarting the control plane while workflows are in flight |
@@ -109,7 +109,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot` | Classifies both fulfillment waves as compensable with no intra-saga pivot this phase, so every completed step has exactly one named, idempotent compensating action. |
 | `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Fixes the idempotency-key composition (order/version/line/wave for intents; order/version/gate for approval requests), distinct from the process `correlationId`, as the mechanism preventing duplicate durable effects under retry. |
 | `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | Establishes that unavailability of the approval-requirement verdict source parks the process with the order remaining `submitted` rather than failing open to `approved`. |
-| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Establishes the transactional-outbox pattern for publishing the six named process events (`OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted`), decoupling event delivery latency from the internal state-change transaction. |
+| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Publishes the six named process events (`OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted`) through the platform producer outbox, as Orders Lifecycle does; Workflow owns no outbox table, drain or re-drive, and event delivery latency is decoupled from the internal state-change transaction. |
 | `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | Keeps the manual-task/incident path (fulfillment-step failure) structurally separate from the dead-letter path (poisoned inbound delivery), so a failing compensation or line escalates via the existing task path rather than growing a second inspectable object. |
 
 ### 1.3 Architecture Layers
@@ -135,7 +135,7 @@ flowchart TB
     subgraph Infrastructure
         Durable[Gear-owned durable process state]
         AuditStore[Process Audit / Saga Log Store]
-        Outbox[Process-Event Outbox]
+        Outbox[Platform producer outbox]
         Sweep[Reconciliation Sweep]
     end
 
@@ -158,7 +158,7 @@ flowchart TB
     Approval -->|verdict / requests| GenericApproval[(Generic Approval)]
     Trigger -->|state reads / transitions| Lifecycle[(Orders Lifecycle)]
     Fulfillment -->|authorization check| Payments[(Payments)]
-    Outbox -->|process events| EventsAudit[(Events / Audit)]
+    Outbox -->|process events, published by platform workers| EventsAudit[(Event Broker)]
 ```
 
 | Layer | Responsibility | Technology |
@@ -166,7 +166,7 @@ flowchart TB
 | Presentation | Control-plane API (start, cancel-with-compensation, resolve manual task, retry step, progress read) behind the inbound gateway; Approver Inbox and Fulfillment Operator Task Queue read surfaces, each scoped by actor role and tenancy | Rust, REST/OpenAPI, inbound API gateway |
 | Application | The nine capability slices of `cpt-cf-bss-orders-workflow-adr-slice-decomposition` — foundation (shared engine), triggers-and-start, approval-execution, fulfillment-plan, provisioning-intents, saga-and-compensation, manual-tasks, hold-and-cancel, read-and-authz — each owning its own guard logic and machine-readable failure reasons | Rust modules in the `orders-workflow` gear |
 | Domain | Process state model: `FulfillmentTask` and `OrderApprovalRequest` state machines, saga/compensation registry, idempotency-key composition, correlation and definition-version tracking — all non-authoritative for commercial order semantics | Rust domain structs; GTS for cross-gear contract surfaces with Lifecycle, Subscriptions, and the Generic Approval service |
-| Infrastructure | Gear-owned durable process state for restart-safe checkpointing; append-only, hash-chained process audit store; process-event transactional outbox; durable timer subsystem; background reconciliation sweep | PostgreSQL (`toolkit-db`), SecureORM, coordination lease library. The execution-engine product underneath, if any, is **unselected** — `DECISIONS.md` Q-01 — and its internal history is never a citable record |
+| Infrastructure | Gear-owned durable process state for restart-safe checkpointing; append-only, hash-chained process audit store; platform producer outbox for process events; durable timer subsystem; background reconciliation sweep | PostgreSQL (`toolkit-db` plus `outbox`), SecureORM, coordination lease library, `event-broker-sdk`. The execution-engine product underneath, if any, is **unselected** — `DECISIONS.md` Q-01 — and its internal history is never a citable record |
 
 ## 2. Principles & Constraints
 
@@ -280,7 +280,8 @@ column only, carrying no state meaning of its own.
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-regulatory-residency`
 
 For residency-bound tenants every gear-owned store — process tables, progress projection, audit,
-idempotency registry, outbox, timer store and their backups — is pinned to an in-jurisdiction
+idempotency registry, timer store and their backups, together with the platform producer-outbox
+tables that share the same database — is pinned to an in-jurisdiction
 deployment cell with **zero cross-boundary replication**, stated in the same terms as the sibling
 gear. Two regulatory obligations bind through that: the process audit trail is a compliance-grade
 record and its ≥ 400-day floor is a retention obligation, not a convenience; and the trail carries
@@ -377,7 +378,7 @@ exists to close. The table below names which slice declares what, without repeat
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-foundation`
 
-  the shared process engine: process-instance aggregate, step executor, idempotency registry, retry/backoff controller, durable timer service, audit writer, event outbox, concurrency governor. Realized by [`design/01-foundation.md`](./design/01-foundation.md).
+  the shared process engine: process-instance aggregate, step executor, idempotency registry, retry/backoff controller, durable timer service, audit writer, platform event producer adapter, concurrency governor. Realized by [`design/01-foundation.md`](./design/01-foundation.md).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-triggers-and-start`
 
@@ -426,7 +427,7 @@ graph TB
     end
     ENGINE[01 foundation - shared process engine]
     AUDIT[(owf_audit_entry)]
-    OUTBOX[owf_event_outbox]
+    OUTBOX[platform producer outbox - toolkit_db::outbox]
 
     S02 --> ENGINE
     S03 --> ENGINE
@@ -442,7 +443,7 @@ graph TB
 
 | Slice | Specified in | Components declared there |
 |-------|--------------|---------------------------|
-| Foundation — shared process engine | `01 §3.2` | **step executor**, **durable timer service**, **idempotency registry**, **retry backoff controller**, **concurrency backpressure controller**, **audit writer**, **event outbox**, **reason catalogue**, **handler extension boundary** |
+| Foundation — shared process engine | `01 §3.2` | **step executor**, **durable timer service**, **idempotency registry**, **retry backoff controller**, **concurrency backpressure controller**, **audit writer**, **platform event producer adapter**, **reason catalogue**, **handler extension boundary** |
 | Triggers and start | `02 §3.2` | **trigger intake**, **termination and compensation** |
 | Approval execution | `03 §3.2` | **verdict gateway**, **approval gate manager**, **escalation timer owner**, **decision reflector**, **approver inbox projection** |
 | Fulfillment plan | `04 §3.2` | **payment auth gate**, **plan constructor**, **plan freeze store**, **progress tracker** |
@@ -534,7 +535,9 @@ reason without string-matching `detail`.
 | Generic Approval (or the §9.2 stand-in) | Contract client over `cpt-cf-bss-orders-workflow-contract-owf-approval-contract` | Submit `OrderApprovalRequest`, receive `OrderApprovalDecision`, query the approval-requirement verdict |
 | Payments | Contract client (read-only authorization outcome) | Begin-fulfillment payment-authorization precondition |
 | Catalog | Contract client (read-only topology/dependency read) | Resolve per-line provisioning dependencies at plan-construction time (`design/04-fulfillment-plan.md` §3.4); a partial or unavailable read fails plan construction closed rather than freezing an under-constrained graph |
-| Platform Events / Audit bus | SDK client | Deliver the six named process events published by the outbox drain — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` |
+| `toolkit-db` | Runtime-scoped database access plus `outbox` | Transactional persistence for the Workflow stores of §3.7 and the platform-managed producer queue `bss-orders-workflow-events` |
+| `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication of the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` |
+| `types-registry` | SDK client | Register and resolve the process-event GTS types of `design/01-foundation.md` §4.7 before readiness; registration failure prevents startup |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies.
@@ -563,17 +566,25 @@ model, which carries it as an open third-party risk.
 - **Contract**: platform ToolKit database contract
 
 Backs the gear-owned process audit/saga log, approval-request store, manual-task and dead-letter
-stores, and the process-event outbox — independent of whatever storage the durable-execution
-substrate uses internally for its own checkpoints.
+stores — independent of whatever storage the durable-execution substrate uses internally for its
+own checkpoints — and hosts the platform `toolkit_db::outbox` tables for the producer queue, which
+are library-migrated and not Workflow tables (`design/01-foundation.md` §3.7 *Platform-managed
+producer persistence*).
 
 #### Platform Events / Audit Bus
 
 - **Contract**: `cpt-cf-bss-orders-workflow-contract-owf-process-events`
+- **Dependency**: `event-broker` through `EventBrokerApi` from `event-broker-sdk`
 
-Receives the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` — from the
-outbox drain with at-least-once delivery and consumer-side de-duplication by event ID. The set is
-closed: `owf_event_outbox.event_type` admits no other value, and no Lifecycle order-state event
-type is legal in it by construction.
+Receives the six named GTS-typed process events — `OrderApprovalRequested`,
+`OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`,
+`OrderFulfillmentCompleted`, `OrderFulfillmentAborted` — published by the platform producer
+outbox with at-least-once delivery and consumer-side de-duplication by event ID. Event types and
+managed producer registration are prepared before readiness; a step transaction only enqueues
+locally and never calls the broker. The set is closed: the producer adapter constructs only the
+six registered types, and no Lifecycle order-state event type is among them. Runtime availability
+is a release gate because `docs/GEARS.md` currently records the implementation crate as TODO
+(`UPSTREAM_REQS.md` §2.7, co-signing Lifecycle's `…-upreq-event-broker-runtime`).
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies.
@@ -602,7 +613,7 @@ sequenceDiagram
     GenericApproval -->> ApprovalExecution: verdict (required)
     ApprovalExecution ->> Lifecycle: reflect submitted -> pending_approval
     ApprovalExecution ->> GenericApproval: submit OrderApprovalRequest
-    ApprovalExecution -->> Outbox: publish OrderApprovalRequested
+    ApprovalExecution -->> Outbox: enqueue via platform producer outbox: OrderApprovalRequested
     ApprovalExecution ->> DurableTimer: start escalation timer (72h)
     Approver ->> GenericApproval: approve
     GenericApproval -->> ApprovalExecution: OrderApprovalDecision(approved)
@@ -625,7 +636,7 @@ fulfillment-orchestration.
 ```mermaid
 sequenceDiagram
     FulfillmentOrchestration ->> Lifecycle: begin-fulfillment (approved -> in_fulfillment)
-    FulfillmentOrchestration -->> Outbox: publish OrderFulfillmentStarted
+    FulfillmentOrchestration -->> Outbox: enqueue via platform producer outbox: OrderFulfillmentStarted
     FulfillmentOrchestration ->> Subscriptions: draft-create (line1, wave1)
     FulfillmentOrchestration ->> Subscriptions: draft-create (line2, wave1)
     Subscriptions -->> FulfillmentOrchestration: create confirmations
@@ -633,9 +644,9 @@ sequenceDiagram
     FulfillmentOrchestration ->> Subscriptions: activate (line1, wave2)
     FulfillmentOrchestration ->> Subscriptions: activate (line2, wave2)
     Subscriptions -->> FulfillmentOrchestration: activation confirmations
-    FulfillmentOrchestration -->> Outbox: publish OrderFulfillmentStepCompleted x2
+    FulfillmentOrchestration -->> Outbox: enqueue via platform producer outbox: OrderFulfillmentStepCompleted x2
     FulfillmentOrchestration ->> Lifecycle: acknowledge in_fulfillment -> completed
-    FulfillmentOrchestration -->> Outbox: publish OrderFulfillmentCompleted
+    FulfillmentOrchestration -->> Outbox: enqueue via platform producer outbox: OrderFulfillmentCompleted
 ```
 
 **Description**: The two-wave barrier holds all activation intents until every draft-create has
@@ -653,7 +664,7 @@ succeeded and the expected fulfillment time is reached, preventing mixed-date st
 sequenceDiagram
     FulfillmentOrchestration ->> Subscriptions: activate (line2, wave2)
     Subscriptions -->> FulfillmentOrchestration: permanent failure
-    FulfillmentOrchestration -->> Outbox: publish OrderFulfillmentStepCompleted (failed)
+    FulfillmentOrchestration -->> Outbox: enqueue via platform producer outbox: OrderFulfillmentStepCompleted (failed)
     FulfillmentOrchestration ->> ManualTaskDeadLetter: create manual task (line2, SLA)
     FulfillmentOperator ->> ManualTaskDeadLetter: resolve (retry)
     ManualTaskDeadLetter ->> FulfillmentOrchestration: resume line2 (wave2)
@@ -683,7 +694,7 @@ sequenceDiagram
     SagaCompensation ->> Subscriptions: activated-cancel (late-success line)
     SagaCompensation ->> SagaCompensation: verify no active subscription remains
     SagaCompensation ->> Lifecycle: in_fulfillment -> cancelled (compensation evidence)
-    SagaCompensation -->> Outbox: publish OrderFulfillmentAborted
+    SagaCompensation -->> Outbox: enqueue via platform producer outbox: OrderFulfillmentAborted
 ```
 
 **Description**: The cancellation-fencing sequence — stop dispatch, identify in-flight, reconcile
@@ -701,7 +712,7 @@ or remediation path. **Column-level definitions, keys, constraints, indexes and 
 specified normatively in the slice named in the "Specified in" column, and are not restated here.**
 A schema stated twice is a schema that will disagree with itself, which is exactly what this
 registry exists to prevent. Mutability is declared **per table** rather than globally, because
-twelve of the twenty-three are deliberately mutable.
+eighteen of the twenty-four are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
 
 Every table carries `resource_tenant_id` NOT NULL; tables backing an operator- or seller-scoped
 surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
@@ -715,7 +726,6 @@ surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-
 | `owf_retry_state` | `01 §3.7` | foundation — retry/backoff controller | **mutable** — attempt counters and next-attempt instant advance |
 | `owf_durable_timer` | `01 §3.7` | foundation — durable timer service | **mutable** — armed / paused / fired / cancelled |
 | `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, no UPDATE/DELETE grant |
-| `owf_event_outbox` | `01 §3.7` | foundation — event outbox | **mutable** — delivery bookkeeping; delivered rows purged per retention |
 | `owf_dead_letter_record` | `01 §3.7` | foundation — step executor, on delivery-cap exhaustion | **mutable** — only to record redrive or resolution; an entry is never deleted |
 | `owf_approval_verdict_cache` | `03 §3.7` | approval-execution — verdict gateway | append-only — one row per order version, authoritative once present |
 | `owf_approval_gate` | `03 §3.7` | approval-execution — approval gate manager | **mutable** — gate state settles through `open / approved / rejected / cancelled` |
@@ -747,17 +757,20 @@ spellings are retired in favour of the `owf_*` names the slices declare. There i
 |---|---|
 | `owf_audit_entry`, `owf_compensation_record`, `owf_manual_task`, `owf_incident` | ≥ 400 days |
 | `owf_dead_letter_record` | ≥ 400 days |
-| `owf_event_outbox` | delivered rows purged at 30 days |
 | `owf_step_log`, `owf_retry_state` | 90 days |
 | `owf_idempotency_registry` | 30 days — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume |
 
-Every growth table — step log, audit, outbox, dead-letter, manual tasks, provisioning intents and
+Every growth table — step log, audit, dead-letter, manual tasks, provisioning intents and
 compensation records — is a monthly range partition on `created_at`, and a declared retention
 window with no worker behind it is an unbounded store, so the retention purge sweep in §3.8 is a
-condition of these numbers rather than a convenience.
+condition of these numbers rather than a convenience. The platform `toolkit_db::outbox` tables
+behind the producer queue are outside this register: the library owns their retention and vacuum,
+and they are not counted here (`design/01-foundation.md` §3.7 *Platform-managed producer
+persistence*).
 
 **Migration and schema versioning.** Migrations are ordered by the build-order map in
-[`design/README.md`](./design/README.md): the engine's eight tables land in phase 0/1 before any
+[`design/README.md`](./design/README.md): the engine's seven tables and the platform outbox
+migrations land in phase 0/1 before any
 slice, and each slice's own tables land with it. Append-only tables need no backfill because a
 correction is a new row. The gear exposes migrations and the runtime applies them, so the schema
 version is the migration set the deployed gear carries, and a rollback is a forward-only
@@ -779,11 +792,16 @@ recoverable from durable state independent of control-plane restarts
 
 - The **reconciliation sweep** (**reconciliation sweep**) on an escalating schedule.
 - The **durable timer drain** firing escalation and overdue-fulfillment deadlines.
-- The **process-event outbox drain**. Its lease granularity — singleton versus one lease per `orderId` hash shard — and the ordering column the per-order ordering guarantee depends on are specified in [`design/01-foundation`](./design/01-foundation.md) §3.7 and §3.8, and this index does not restate them; the two statements must agree there, in one place.
 - A **dead-letter delivery-count sweep** promoting exhausted deliveries to dead-letter records.
 - A **retention purge sweep**, singleton-leased on a daily cadence with a bounded batch per store,
   executing the per-store windows of §3.7. A declared retention with no worker behind it is an
   unbounded store, which is why it is named here rather than assumed.
+
+There is no Workflow-owned process-event drain. The gear starts and gracefully stops the platform
+`toolkit_db::outbox` handle for the `bss-orders-workflow-events` producer queue, whose sequencer,
+leased processors and vacuum are library-managed workers and are not counted as Workflow-owned
+coordination jobs ([`design/01-foundation`](./design/01-foundation.md) §3.8). The platform
+producer outbox is the only asynchronous egress.
 
 **Read path**: progress reads are served from the `owf_process_progress_view` projection rather
 than reconstructing state from the saga log, matching the API-latency NFR budget.
@@ -821,8 +839,8 @@ a workshop that disagrees has something specific to change.
 | Provisioning intents dispatched | **~30 / second sustained** | Sustained rate × p50 lines × 2 waves (5 × 3 × 2) |
 | Aggregate in-flight intent cap | **2,000**, per-order parallel-line cap **8** | The concurrency governor's two caps; the aggregate cap is ~1 second of dispatch at peak, which is what makes back-pressure bind before the downstream does |
 | Process-event rate | **~40 / second sustained, ~400 / second peak** | Roughly `2 + 2 × lines` events per order (started, per-line step-completed, completed/aborted) at p50 lines |
-| Outbox drain throughput | **≥ 500 events / second** | Must exceed peak emission; at a 2-second poll and a batch of 200 that is five drain workers, which is why the drain's lease granularity (§3.8) is load-bearing rather than cosmetic |
-| Row growth | **~`4 + 3N` rows per order** (`N` = lines), plus one audit row per transition | One instance, one plan, one progress-view row, one outbox row per event; per line one task and two intents |
+| Producer-queue throughput | **≥ 500 events / second** | Must exceed peak emission; the `bss-orders-workflow-events` queue runs `Partitions::of(16)` under the toolkit high-throughput profile, and the platform workers' measured throughput at that configuration is the evidence, not a Workflow drain sizing |
+| Row growth | **~`4 + 3N` rows per order** (`N` = lines), plus one audit row per transition | One instance, one plan, one progress-view row; per line one task and two intents. One platform outbox message per event lands in the library-owned `toolkit_db::outbox` tables, outside the Workflow inventory |
 | Durable timers live | **~2 per in-flight process, plus one per open gate** | Overdue-fulfillment deadline and activation barrier per process; one escalation timer per gate |
 | Manual-task arrival | **≤ 1 % of lines**, alert at 5 % over 15 minutes | A permanent line failure is the exception path; above this the remediate policy is absorbing a systemic downstream fault, not individual failures |
 | Page size, all list operations | default **50**, maximum **200**, keyset cursor | The `p95 < 200 ms` read budget is per page |
@@ -942,8 +960,9 @@ arises, because no surface returns another tenant's data.
 TLS on every hop, keys in the platform KMS with no key material held here.
 
 **Residency.** For residency-bound tenants every gear-owned store — process tables, the progress
-projection, the audit store, the idempotency registry, the outbox, the timer store and their
-backups — is pinned to an in-jurisdiction deployment cell with **zero cross-boundary
+projection, the audit store, the idempotency registry, the timer store and their backups, together
+with the platform producer-outbox tables in the same database — is pinned to an in-jurisdiction
+deployment cell with **zero cross-boundary
 replication**, matching the sibling gear's constraint in the same terms. Two consequences are
 specific to this gear and are stated rather than inherited. First, a recovery standby must be a
 second failure domain inside the jurisdiction rather than a second region, so availability and
@@ -979,7 +998,7 @@ arrival nobody pages on:
 | Signal | Threshold |
 |--------|-----------|
 | Escalation-timer drift | any fire outside ± 5 minutes of the configured window |
-| Outbox drain lag | p95 enqueue-to-delivery beyond the 30-second budget, sustained 5 minutes |
+| Producer-queue lag (platform metric) | p95 enqueue-to-broker-acceptance on `bss-orders-workflow-events` beyond the 30-second budget, sustained 5 minutes; any pending platform dead letter pages at low severity |
 | **Dead-letter arrival rate** | any arrival pages at low severity; **> 5 records in 15 minutes, or > 20 in 24 hours**, pages at high severity — a dead-lettered start trigger leaves an order in `submitted` with no instance, no timer and no manual task, so the row is the only signal that exists |
 | **Dead-letter backlog** | any record unresolved past **24 hours**; the redrive operation is the intended response and an ageing backlog means it is not being run |
 | **Overdue-window breach** | any process past its configured overdue window pages; **> 1 % of in-flight processes breaching over 1 hour** escalates, since a single breach is an order and a rate is a systemic fulfillment stall |
@@ -999,11 +1018,26 @@ durable-execution-engine retention (`cpt-cf-bss-orders-workflow-nfr-owf-durabili
 dependency calls (Lifecycle, Subscriptions, Payments) retry within the affected step's own retry
 budget and escalate to a manual task on budget exhaustion; Generic Approval unavailability is
 explicitly excluded from that retry path and instead follows the fail-closed park-and-escalate
-posture (`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`). Process-event outbox delivery
-is at-least-once with consumer-side de-duplication by event ID; a repeatedly failing entry is
-parked as an inspectable dead-letter record with an operator alert rather than dropped or retried
-indefinitely, and a parked event never represents an order state
-(`cpt-cf-bss-orders-workflow-adr-outbox-process-events`).
+posture (`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`). An infrastructure fault
+aborts the step transaction, so a failed audit append or platform outbox enqueue leaves no state
+change behind.
+
+Process-event delivery is at-least-once with consumer-side de-duplication by event ID. Broker
+idempotency instead uses managed Chained producer metadata (`producer_id`, `previous`,
+`sequence`), not `event.id`; the SDK owns sequence assignment and cursor recovery as specified in
+[`design/01-foundation`](./design/01-foundation.md) §4.7. The Event Broker SDK retries transport
+and rate-limit failures without a Workflow attempt cap; `toolkit_db::outbox` retains the whole
+queue-partition cursor while such a retry is pending. The SDK permanently rejects invalid data,
+unrecoverable producer identity and persistent chain divergence; toolkit-db parks an inspectable
+dead letter and advances the partition cursor, so later notifications may proceed and a permanent
+reject may create a gap (Lifecycle D-87). A platform dead letter is broker evidence, never a
+process outcome, never an order state and never an `owf_dead_letter_record`. Operations use the
+shared operator interface and SDK republication that Lifecycle requests as
+`cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` and this gear co-signs in
+[`UPSTREAM_REQS.md §2.7`](./UPSTREAM_REQS.md#27-event-broker); both remain open production
+release prerequisites. There is no Workflow re-drive endpoint. Process events publish under
+explicit platform-root tenancy per the Lifecycle D-95 precedent, with `orderId` as the partition
+key (`cpt-cf-bss-orders-workflow-adr-outbox-process-events`).
 
 **Cold start is throttled, and recovery has a target.** On restart every in-flight step is
 eligible to retry and every overdue timer is eligible to fire at once, so resumption runs behind
@@ -1073,7 +1107,7 @@ gear's four asks against the Subscriptions PRD's canonical `SUB-O1`–`SUB-O6` s
 ### 4.8 Configuration and secret management
 
 Every tunable this design names — the retry attempt count and per-attempt timeout, the step
-deadlines, the sweep ladders and floor, the outbox poll and batch, the timer wake-up scan, the
+deadlines, the sweep ladders and floor, the producer-queue partition count and profile, the timer wake-up scan, the
 clock-skew tolerance, the circuit-breaker thresholds, the concurrency caps and queue depth, the
 escalation window default, the overdue window, `max_process_lifetime`, the idempotency-key
 lifetime, the manual-task SLAs and the remediate/fail-fast policy election — is **gear

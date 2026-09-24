@@ -211,7 +211,26 @@ table (§3.3), which is exactly what the read-before-act rule already requires, 
 long-delayed redelivery to `ignored-superseded` or `ignored-terminated` rather than to a second
 start.
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
+**Applicability is verified against authority, and an unavailable read is not staleness.** Orders
+Lifecycle publishes through the platform producer outbox, whose ordering is per broker partition
+and whose permanent rejection may leave a gap (Lifecycle
+[`ADR-0006`](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md),
+D-87). Lifecycle `01 §4.4` therefore imposes one rule on every consumer of its stream, and this
+slice is bound by it: de-duplicate by event id (the registry above); before acting, verify the
+event's `orderVersion` and the resulting state through the authenticated, PDP-authorized Lifecycle
+`order × read` scoped to the target order (the read-before-act gate below, §4); and treat a
+timeout, 503 or authorization/configuration failure on that read as **retryable, never as
+evidence of staleness** — the trigger is negatively acknowledged onto the delivery ladder with no
+effect performed, exactly as the lag branch of §4 already does, and is never classified
+`ignored-superseded` or `ignored-terminated` on the strength of a failed read. Each trigger names
+its applicability rule: a superseded version resolves to `ignored-superseded` (or to
+termination-and-void where an instance is still active for it), and a state that differs from the
+one the trigger implies follows the per-trigger rule of the trigger-to-outcome table (§3.3) rather
+than a blanket "different state means obsolete". Root broker access grants none of this: the read
+uses the Lifecycle SDK under this gear's service principal and its explicit `order × read` grant.
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`,
+`cpt-cf-bss-orders-workflow-adr-outbox-process-events`
 
 #### Ground truth is read before acting
 
@@ -626,6 +645,12 @@ of the primary is dead-lettered under the rule below, because at that point the 
 longer lag but a genuine divergence between the event stream and the system of record, and this
 gear is not the component that can adjudicate it.
 
+The same negative-acknowledge-and-redeliver path is taken when the Lifecycle read itself fails —
+timeout, 503, or an authorization or configuration refusal. A failed read proves nothing about the
+trigger's freshness (§2.1, *Applicability is verified against authority*): no branch of the table
+above is taken, no effect is performed, and the trigger stays on the delivery ladder under the
+same cap, dead-lettering with the redrive-and-incident treatment below if the read never recovers.
+
 **Atomic supersession on `OrderAmended`.** Terminate-then-start is **one step with one commit
 boundary**, not two steps. The supersession step runs under the idempotency key
 `resource_tenant_id + orderId + newOrderVersion + supersede`, and inside a single database
@@ -715,7 +740,7 @@ only decides *when* a process starts, advances, or terminates, and hands off to 
   [`../ADR/0005-cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot.md`](../ADR/0005-cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot.md),
   [`../ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md`](../ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md)
 - **Engine**: [`01-foundation.md`](./01-foundation.md) — step-executor API, idempotency registry,
-  durable timer service, audit log, event outbox this slice runs on
+  durable timer service, audit log, platform event producer adapter this slice runs on
 - **Boundary reference (by-reference, not restated)**: [`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
   §3.3 (the five seam operations), §4.1–§4.6 (normative R1–R5 consequences)
 - **Consumers**: `03-approval-execution.md` (approval start on `OrderSubmitted`),

@@ -15,6 +15,7 @@
   - [2.4 Orders Lifecycle](#24-orders-lifecycle)
   - [2.5 Catalog](#25-catalog)
   - [2.6 Privacy and data classification](#26-privacy-and-data-classification)
+  - [2.7 Event Broker](#27-event-broker)
 - [3. Priorities](#3-priorities)
 - [4. Required PRD Amendments](#4-required-prd-amendments)
 - [5. Traceability](#5-traceability)
@@ -61,6 +62,7 @@ plan is constructed from, a dependency this register did not previously name at 
 | Generic Approval service | No canonical specification; PRD §9.2 expectations contract is the normative interface until one exists | Approval-requirement verdict acquisition, routing, multi-party gates, and escalation are executed against this contract via a phase-1 stand-in that returns `approval not required` (audited), pending the real service. |
 | Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. |
 | Catalog | UNASKED (never registered; not a PRD-registered actor either) | Every fulfillment plan is constructed from Catalog's dependency topology and frozen against it; the plan cannot be built, validated for cycles, or ordered for compensation without a read contract. |
+| Event Broker (`gears/system/event-broker`) | REGISTERED by Orders Lifecycle (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7), open; co-signed here | Process events publish through the platform producer outbox (`ADR/0008`, D-58); the runtime, cursor/retry semantics, dead-letter recovery, root tenancy and delivery observability are platform prerequisites this gear cannot report ready without. |
 | PRD owner (privacy / data classification) | UNASKED | The PRD's "Privacy / PII: not applicable" exclusion does not survive contact with a 400-day audit trail carrying actor, operator and approver identities; the ruling is a PRD amendment, not a design change. |
 
 ## 2. Requirements
@@ -467,11 +469,58 @@ erasure request.
 - **Source**: PRD §8 (out-of-scope / privacy exclusion); `DECISIONS.md` D-50, D-38;
   `design/01-foundation.md` §3.7 (`owf_audit_entry`).
 
+### 2.7 Event Broker
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-event-broker-shared-prerequisites`
+
+Orders Workflow publishes its six process events through the platform producer outbox
+(`event-broker-sdk::DbProducer` over `toolkit_db::outbox`, `ADR/0008`, `DECISIONS.md` D-58),
+exactly as Orders Lifecycle does. The platform prerequisites that decision depends on are already
+registered, in full, by the sibling gear in
+[`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7](../../orders-lifecycle/docs/UPSTREAM_REQS.md#27-event-broker),
+and this gear **co-signs them by reference rather than restating them**:
+
+- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-runtime` — a production `EventBrokerApi`
+  runtime through `ClientHub` supporting the managed chained producer protocol, with the deployed
+  topic partition count published;
+- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-cursor-retry` — SDK cursor-recovery and retry
+  semantics for the managed chained producer;
+- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` — a shared operator
+  interface and SDK republication that preserves event ID and business payload, so no gear needs
+  a REST re-drive wrapper;
+- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-root-tenancy` — the authoritative
+  platform-root tenant UUID source and broker authorization behaviour for root-tagged events;
+- `cpt-cf-bss-orders-lifecycle-upreq-event-delivery-observability` — producer-queue depth, age,
+  lag and dead-letter measurements exposed per queue.
+
+Each of those asks **MUST** be satisfied for the `bss-orders-workflow-events` producer queue and
+the `gts.cf.bss.orders_workflow.*` event family on the same terms as for Lifecycle's queue; this
+gear raises no divergent requirement and accepts whatever resolution the sibling register
+records.
+
+- **Owning upstream gear**: `event-broker` (`gears/system/event-broker`) and the platform SDK/GTS
+  guideline maintainers, as named in the Lifecycle register.
+- **Why this gear cannot satisfy it alone**: the runtime, the SDK recovery path, the operator
+  tooling, the root-tenant identity source and the queue metrics are platform capabilities;
+  building any of them here would recreate the gear-owned outbox D-58 removed.
+- **Consequence if they do not land**: until the runtime lands, this gear **MUST NOT** report
+  ready for event-producing traffic (`DESIGN.md` §3.5) and can test only against an
+  `EventBrokerApi` double. Until dead-letter recovery lands, a platform dead letter on the
+  Workflow queue has no supported republication path and the gap it leaves is permanent for that
+  event. Until root tenancy is confirmed, the envelope `tenant_id` contract of
+  `design/01-foundation.md` §4.7 is stated but unverified. Until delivery observability lands,
+  the p95 < 30 s target (`cpt-cf-bss-orders-workflow-nfr-owf-event-latency`) has no producer-queue
+  lag metric to be measured by and Q-07's resolution is unevidenced.
+- **Agreement status**: **REGISTERED by Lifecycle, open**; this gear adds a co-signature, not a
+  new ask.
+- **Source**: `ADR/0008` (`cpt-cf-bss-orders-workflow-adr-outbox-process-events`); `DECISIONS.md`
+  D-58, Q-07; `design/01-foundation.md` §3.6, §3.7, §4.7; `DESIGN.md` §3.5, §4.4, §4.5.
+
 ## 3. Priorities
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling` |
+| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites` |
 | `p2` (important) | `…-upreq-correlation-propagation` |
 
 ## 4. Required PRD Amendments
@@ -525,5 +574,6 @@ erasure request.
   register in this repository, and the privacy ask has no named owner; §2.2, §2.5 and §2.6 are
   recorded here for whichever specification or owner eventually takes them.
 - **Design and decision sources for the new asks**: `ADR/0007` (Lifecycle `submitted` TTL);
+  `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask)

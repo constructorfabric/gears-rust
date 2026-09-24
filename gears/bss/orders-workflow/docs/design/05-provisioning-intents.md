@@ -146,7 +146,25 @@ void notification, which Subscriptions is not obligated to emit for every voidin
 platform TTL, or any other). The same re-read discipline underlies the reconciliation sweep: it
 is a periodic re-read, not a passive listener.
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`
+**A confirmation is applied only after it is verified against authority.** Subscriptions
+confirmations and failures (`ProvisioningIntentConfirmed`, `ProvisioningIntentFailed`, §3.3)
+arrive at-least-once and without a global ordering guarantee, so this slice carries the consumer
+obligation Lifecycle `01 §4.4` states for every event consumer in this system (Lifecycle
+[`ADR-0006`](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md),
+D-87; the same rule this gear applies to Lifecycle triggers in
+[`02 §2.1`](./02-triggers-and-start.md#21-design-principles)): de-duplicate by event id; before
+advancing any task, match the echoed identity envelope (`SUB-O16`) against the
+`owf_provisioning_intent` row it names and verify the intent's current `status` through the
+non-terminal status read (§3.5) rather than trusting the confirmation's claim; and treat a
+timeout, 503 or authorization failure on that read as retryable, never as evidence that the
+confirmation is stale or already applied — the confirmation is retained on the delivery ladder
+with no effect performed. A confirmation whose `orderVersion` is superseded routes as a late
+success per `02 §4`; a confirmation that matches no intent row is **rejected as unattributable**
+under `SUB-O16` and dead-lettered with the redrive-and-incident treatment, never applied to a
+guessed task and never silently discarded.
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`,
+`cpt-cf-bss-orders-workflow-adr-outbox-process-events`
 
 ### 2.2 Constraints
 

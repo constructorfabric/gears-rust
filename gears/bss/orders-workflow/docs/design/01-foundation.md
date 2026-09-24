@@ -52,7 +52,8 @@ This slice is the shared engine every other Orders Workflow slice executes throu
 process-instance aggregate correlated to `orderId` + `orderVersion`, definition-version pinning
 for the lifetime of an instance, the durable step log, the idempotency registry for outbound
 calls, the retry/backoff controller enforcing four distinct bounds, the durable timer service,
-the process audit log, the event outbox, and the registry of machine-readable process reasons. It
+the process audit log, the platform event producer adapter, and the registry of machine-readable
+process reasons. It
 owns **no commercial policy**: it cannot evaluate whether an approval gate applies, does not know
 what a provisioning wave means commercially, and never decides fulfillment eligibility — those
 are handler concerns layered on top by slices 02 through 09
@@ -112,7 +113,7 @@ recorded.
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts; zero loss for committed process state | Step executor + audit writer | Every committed step writes its durable record before the executor reports completion; restart resumes from the last durably recorded checkpoint without re-running committed steps | Restart/kill test asserting no re-execution of a committed step and full resumption of pending steps |
 | `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Zero duplicate durable effects from retried outbound calls | Idempotency registry | Every outbound call carries an idempotency key recorded before dispatch; a retried call reuses the same key and the registry's stored outcome absorbs a duplicate response | Parallel-retry test asserting one durable effect per key; replay test asserting a stored outcome is returned rather than re-dispatched |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% of process state transitions recorded, zero silent drops, engine history not the audit SoR | Audit writer | Every step start, completion, retry, timeout, sweep action, escalation, compensation step and dead-letter event is written to the gear-owned audit log independently of substrate history, each entry hash-chained to its predecessor so the trail is tamper-**evident** and not merely write-protected (§3.7) | Structural test asserting every step-executor code path writes an audit entry; chain-verification test asserting an out-of-band edit or deletion is detected; substrate-history-purge test asserting the gear-owned audit log is unaffected |
-| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Event outbox | The outbox row is written alongside the audit entry when a step commits and is drained asynchronously to the platform event bus | Latency measurement on the drain path from outbox-row write to bus delivery |
+| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | The typed event is enqueued through the bound platform producer outbox (`toolkit_db::outbox`) in the same transaction as the audit entry when a step commits; platform workers publish it asynchronously to Event Broker | Producer-queue lag (platform metric) measured from enqueue to broker acceptance at expected load; commit success alone is not evidence |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome | Step executor + retry/backoff controller | Bounded per-attempt timeouts and step deadlines keep a stalled attempt from silently consuming the SLA window; concurrency limits keep the provisioning path from saturating under load | Load test measuring wave-to-terminal latency at p95 under configured concurrency caps |
 | `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per-gate window, default 72 h, accuracy ± 5 min | Durable timer service | Timers are durable records with a scheduled fire instant, recovered on restart from the persisted record rather than an in-memory scheduler | Timer-accuracy test across a restart mid-window; configuration test per approval gate |
 | `cpt-cf-bss-orders-workflow-nfr-owf-availability` | 99.9% control-plane availability; in-flight processes unaffected by restarts | Step executor + durable timer service | Control-plane restart resumes from durable state without operator intervention; no in-memory-only component holds execution-critical state | Chaos test restarting the control plane under active in-flight processes |
@@ -126,7 +127,7 @@ recorded.
 | `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative` | Process execution state is never presented as authoritative commercial order state; Orders Lifecycle remains the sole read path for order state |
 | `cpt-cf-bss-orders-workflow-adr-slice-decomposition` | A foundation slice plus eight handler slices, so the engine has an independent review boundary from any commercial policy |
 | `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Idempotency keys are structurally distinct from the process `correlationId` and from downstream transition-request identifiers |
-| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Process events publish asynchronously from an outbox written alongside the audit entry |
+| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Process events are enqueued through the platform producer outbox in the step's transaction and published asynchronously by platform workers; Workflow owns no outbox table, drain or re-drive |
 | `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | The dead-letter record and the manual-task record are distinct inspectable objects with distinct triggers, never merged into one |
 
 ### 1.3 Architecture Layers
@@ -144,7 +145,7 @@ Step executor          step dispatch · durable checkpointing · compensation in
        ▼
 Engine components       durable timer service · idempotency registry · retry/backoff
                         controller · concurrency/back-pressure controller · audit writer ·
-                        event outbox · reason catalogue
+                        platform event producer adapter · reason catalogue
        │
        ▼
 Durable-execution      hosts step executor and timer scheduling; its run history is not
@@ -160,7 +161,7 @@ Persistence            process-instance aggregate · step log · dead-letter sto
 | Presentation | Not owned by this slice; process control and read surfaces are registered by [`09-read-and-authz`](./09-read-and-authz.md) | — |
 | Application | The step executor, the retry/backoff controller, and the concurrency/back-pressure controller | Rust module in the `orders-workflow` gear, hosted on the durable-execution substrate (ADR 0001) |
 | Domain | Process-instance aggregate invariants, definition-version pinning, step log semantics, reason catalogue | Rust domain structs; GTS for cross-gear contract types (specified in a later section of this slice) |
-| Infrastructure | Durable timer service, idempotency registry, audit writer, event outbox, dead-letter store | Durable-execution substrate, PostgreSQL via SecureORM, coordination lease library |
+| Infrastructure | Durable timer service, idempotency registry, audit writer, platform event producer adapter, dead-letter store | Durable-execution substrate, PostgreSQL via SecureORM, coordination lease library, `event-broker-sdk` over `toolkit_db::outbox` |
 
 ## 2. Principles & Constraints
 
@@ -379,17 +380,18 @@ source of record.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-outbox-entry`
 
-One row per process event a committed step declares, holding the event identity, type, `orderId`,
-the tenant axes, the process `correlationId`, a **monotonic per-correlation ordinal** that makes
-the drain's ordering guarantee expressible, the payload and its schema version, and delivery
-bookkeeping for the asynchronous drain to the platform event bus.
+One typed event per process event a committed step declares, enqueued through the bound platform
+producer outbox in the step's transaction: the event identity, its GTS type, `orderId` (the
+partition key), the tenant axes, the process `correlationId` and the `data` payload of §4.7.
+Local sequence, delivery bookkeeping and retry state are platform-owned
+(`toolkit_db::outbox`); this gear persists no ordinal of its own.
 
 **Relationships**:
 - `Process instance` → `Step log entry`: one-to-many, append-only; every step attempt against the instance is a new entry.
 - `Process instance` → `Retry state`: one-to-many, one active record per in-progress step; consumed budget and bound deadlines travel with the step, not the instance.
 - `Process instance` → `Durable timer`: one-to-many; escalation timers, sweep ticks and step-deadline watchdogs are all timers owned by the instance that scheduled them.
 - `Process instance` → `Audit entry`: one-to-many, append-only; the audit trail also carries the pinned definition version recorded at start.
-- `Process instance` → `Outbox entry`: one-to-many; one row per committed step that declares a process event.
+- `Process instance` → `Outbox entry`: one-to-many; one enqueued typed event per committed step that declares a process event.
 - `Dead-letter record` → `Process instance`: many-to-one via `orderId` + `orderVersion` + `correlationId`; a dead-letter record references the instance whose inbound payload it parked but is never itself part of the instance's step log.
 
 ### 3.2 Component Model
@@ -403,7 +405,7 @@ graph TB
     R[Retry/backoff controller]
     C[Concurrency and back-pressure controller]
     A[Audit writer]
-    X[Event outbox]
+    X[Platform event producer adapter]
     D[Reason catalogue]
     H -->|dispatches steps against| E
     E --> T
@@ -413,7 +415,7 @@ graph TB
     E --> A
     E --> X
     E --> D
-    X -->|drains| BUS[Platform event bus]
+    X -->|enqueues; platform workers publish| BUS[Event Broker]
     T -->|fires| E
 ```
 
@@ -602,27 +604,40 @@ writer's records. It never carries payment-card data.
 - `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
 - `cpt-cf-bss-orders-workflow-component-event-outbox` — shares model with
 
-#### Event outbox
+#### Platform event producer adapter
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-event-outbox`
 
 ##### Why this component exists
 
 Operator monitoring dashboards and downstream audit systems consume the six named process events
-asynchronously; writing the outbox row in the same durable commit as the audit entry is what
-guarantees an event is never emitted for a step that did not actually commit.
+asynchronously. Publishing inside the step transaction would put an external dependency in the
+commit path, while a Workflow-owned outbox would duplicate platform sequencing, leasing, retry and
+dead-letter capabilities. The adapter binds Workflow's events to the supported platform path, as
+the sibling gear's adapter does
+([Lifecycle `01 §3.2`](../../../orders-lifecycle/docs/design/01-foundation.md#32-component-model)).
+Enqueuing in the same durable commit as the audit entry is what guarantees an event is never
+emitted for a step that did not actually commit.
 
 ##### Responsibility scope
 
-Writing one outbox row per committed step that declares a process event, alongside that step's
-audit entry; draining rows asynchronously to the platform event bus under at-least-once delivery;
-and carrying the process `correlationId` on every emitted event for consumer-side correlation.
+Constructing the six `TypedEvent` values of §4.7; preparing their GTS schemas before readiness;
+configuring `event_broker_sdk::DbProducer` with managed `ProducerMode::Chained` and the gear's
+gateway-issued service `SecurityContext`; binding one `ProducerOutboxQueue`
+(`bss-orders-workflow-events`, 16 toolkit partitions, high-throughput profile) to
+`toolkit_db::outbox`; and enqueuing through that bound handle using the step's transaction
+runner, so the enqueue commits with the audit entry and the idempotency settlement. Every event
+carries the process `correlationId` for consumer-side correlation; `orderId` is the event type's
+broker partition key.
 
 ##### Responsibility boundaries
 
-It does not guarantee event ordering across different process instances, only within the
-correlation key it drains by. It does not decide which handler steps declare an event — that
-declaration is made by the handler slice registering the step.
+Workflow owns event meaning and payload construction, but does not own an outbox table, lease
+acquisition, sequence assignment, retry classification, dead-letter lifecycle, vacuuming or a
+re-drive API. Those are platform library responsibilities. Publication failure never alters
+process state. It does not guarantee event ordering across orders, only per broker partition
+(§4.7). It does not decide which handler steps declare an event — that declaration is made by the
+handler slice registering the step.
 
 ##### Related components (by ID)
 
@@ -700,7 +715,8 @@ controller.
 
 **What the engine guarantees around a step invocation**: the idempotency key is resolved before
 the handler closure runs; the closure's outcome is durably recorded — audit entry and, where the
-step declares one, an outbox row — in the same unit of work that settles the idempotency record;
+step declares one, a typed event enqueued through the bound platform producer outbox with the same
+transaction runner — in the same unit of work that settles the idempotency record;
 a step that raises inside the closure is caught and mapped to a retryable or permanent outcome
 per the registered retry policy, never left unrecorded; and the process instance's checkpoint
 advances only after that unit of work commits, so a crash between closure return and checkpoint
@@ -769,8 +785,10 @@ settled permanent failure may do so
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
 | `orders-lifecycle` | Versioned contract / SDK client | Reading current order state and order document content as a guard input before dispatching a step; this gear never writes the order aggregate directly |
-| `toolkit-db` | Runtime-scoped database access | The durable step log, idempotency registry, audit log, outbox, and durable-timer tables |
-| Coordination lease library | SDK client | Singleton coordination for the durable timer sweep, the reconciliation sweep, the outbox drain, and the idempotency-window sweep |
+| `toolkit-db` | Runtime-scoped database access plus `outbox` | The durable step log, idempotency registry, audit log and durable-timer tables; toolkit outbox migrations and the managed producer queue |
+| `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication of the six process events |
+| `types-registry` | SDK client | Resolving and registering the GTS event and subject types of §4.7 before readiness; a type that fails to register fails the boot |
+| Coordination lease library | SDK client | Singleton coordination for the durable timer sweep, the reconciliation sweep, and the idempotency-window sweep; toolkit manages its own outbox workers |
 | Platform durable-execution substrate | SDK client per `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` | Hosting step scheduling and crash recovery; its own run history is explicitly not the audit source of record (§1.1) |
 
 **Dependency Rules** (per project conventions):
@@ -786,8 +804,11 @@ This engine slice **calls** no external dependency itself. Every outbound call �
 for provisioning, to Payments for authorization outcomes, to the Generic Approval service for gate
 decisions — is made by the handler slice that registers the step, through that slice's own port,
 under the retry/backoff controller and idempotency registry this engine provides. The engine only
-provides the envelope (idempotency, retry, audit, timers, outbox) that makes a handler's outbound
-call safe to retry.
+provides the envelope (idempotency, retry, audit, timers, producer enqueue) that makes a handler's
+outbound call safe to retry. The one platform egress the engine binds itself is the Event Broker,
+through `EventBrokerApi` obtained from `ClientHub`; only the toolkit outbox worker calls it, never
+a step transaction, and type preparation plus managed producer registration happen before the
+instance becomes ready.
 
 It is nonetheless **not** dependency-free, and the table below is not decoration: the engine owns
 the idempotency, retry, circuit-breaker and sweep semantics for the Subscriptions provisioning
@@ -826,7 +847,7 @@ sequenceDiagram
     participant SE as Step executor
     participant IR as Idempotency registry
     participant AW as Audit writer
-    participant OB as Event outbox
+    participant OB as Bound platform producer outbox
     H ->> SE: execute step (key K)
     SE ->> IR: resolve K
     IR -->> SE: none
@@ -834,7 +855,7 @@ sequenceDiagram
     SE ->> H: invoke closure
     H -->> SE: success
     SE ->> AW: append step-completion entry (actor, key K, correlationId)
-    SE ->> OB: enqueue OrderFulfillmentStepCompleted
+    SE ->> OB: enqueue typed OrderFulfillmentStepCompleted (same transaction runner)
     SE ->> IR: settle K = success
     SE -->> H: settled success
     H ->> SE: execute step (key K) - client-side timeout retry
@@ -845,7 +866,9 @@ sequenceDiagram
 
 **Description**: A client-side timeout of the first call never causes a second durable effect —
 the handler retries with the same key and the registry absorbs the duplicate, per the caller-side
-duplicate protocol (§4).
+duplicate protocol (§4). The enqueue is a write into the platform `toolkit_db::outbox` tables
+under the step's own transaction runner; it commits or rolls back with the audit entry and the
+idempotency settlement, and no Event Broker call happens inside the transaction.
 
 #### Overdue escalation via the durable timer service
 
@@ -872,14 +895,50 @@ sequenceDiagram
 restart reloads it from the durable store and it fires on schedule regardless of whether any
 other message arrives in the interim.
 
-**No outbox row is written on this path.** An overdue-fulfillment escalation is an *operational*
-escalation, not one of the six named process events, and `owf_event_outbox.event_type` is
-constrained to those six by construction (§3.7, §4.7) — an enqueue here would either fail the
-audit/outbox unit of work or publish a seventh event type the PRD's enumeration forbids. The
-approval-gate escalation timer is a **different timer of a different kind** with a different
-consequence: it does publish `OrderApprovalEscalated`, and that path belongs to
+**No process event is enqueued on this path.** An overdue-fulfillment escalation is an
+*operational* escalation, not one of the six named process events, and the producer adapter
+constructs only the six registered `TypedEvent`s of §4.7 — there is no seventh type to enqueue,
+and an attempt to publish one would fail GTS schema validation at enqueue rather than reach the
+broker. The approval-gate escalation timer is a **different timer of a different kind** with a
+different consequence: it does publish `OrderApprovalEscalated`, and that path belongs to
 [`03-approval-execution`](./03-approval-execution.md), not to the overdue window. The two are the
 distinct bounds §4.2 keeps apart and must never be drawn as one line.
+
+#### Platform producer-outbox publication
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-producer-outbox-publication`
+
+**Use cases**: `cpt-cf-bss-orders-workflow-fr-owf-process-events`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`
+
+**Algorithm: Process Producer Outbox Message**
+
+Input: the next toolkit outbox message in the `bss-orders-workflow-events` queue partition
+Output: acknowledged, retained for retry, or platform dead-lettered
+
+1. [ ] - `p1` - Let the `toolkit_db::outbox` leased processor select the next FIFO message for the queue partition; Workflow implements no selector, lease, drain or delivery-bookkeeping SQL - `inst-owf-acquire-queue-partition`
+2. [ ] - `p1` - Let the Event Broker SDK decode the producer envelope and publish through `EventBrokerApi` under its registered producer in managed `ProducerMode::Chained`: `meta.sequence` comes from `OutboxMessage.seq`, and `meta.previous` comes from the SDK-managed cursor for that producer/topic/broker partition. Event ID is not a broker de-duplication token - `inst-owf-try-publish`
+3. [ ] - `p1` - **IF** Event Broker returns accepted, persisted or duplicate: return `MessageResult::Ok`, allowing toolkit-db to advance the queue cursor - `inst-owf-mark-delivered`
+4. [ ] - `p1` - **IF** the SDK classifies the fault as transport or rate limiting: return `MessageResult::Retry`; toolkit-db retains the cursor and applies its retry cadence, so the entire toolkit queue partition remains FIFO-blocked until the message succeeds; Workflow imposes no attempt cap - `inst-owf-backoff-reschedule`
+5. [ ] - `p1` - **IF** the SDK classifies the fault as permanent — including invalid envelope/schema, unrecoverable producer identity or persistent chained-sequence divergence: return `MessageResult::Reject`; toolkit-db writes its dead-letter record and advances the queue-partition cursor; no `owf_dead_letter_record` row is written (§4.8) - `inst-owf-park-dead-letter`
+
+**Description**: This algorithm documents the behaviour Workflow relies on; its implementation is
+the platform `ProducerOutboxProcessor` and toolkit leased worker, exactly as
+[Lifecycle `01 §3.6` *Platform producer-outbox publication*](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences)
+documents for the sibling gear. There is no Workflow-owned drain. Transient retry is intentionally
+not capped: an Event Broker outage must not convert valid events into permanent rejects. Permanent
+faults are rejected immediately because retry cannot repair invalid data or producer state.
+
+`orderId` is the typed event's broker partition key, so the events of one order share a broker
+partition and preserve FIFO in ordinary operation; the toolkit queue maps `(topic, broker
+partition)` to one of its 16 partitions, so a transient retry blocks that whole toolkit partition,
+not merely one order. Once a permanent message is dead-lettered the cursor advances and later
+messages may proceed (Lifecycle D-87). Consumers tolerate that gap by de-duplicating on event ID
+and reconciling `orderVersion` and resulting state against the authoritative Lifecycle read
+(§4.7). A platform dead letter is operational evidence, not a process outcome and not an order
+state. Independent queue measurements expose depth, oldest-message age and pending dead letters;
+`DESIGN.md §4.4` alerts on them as platform metrics.
 
 ### 3.7 Database schemas & tables
 
@@ -1189,50 +1248,26 @@ retention** — nothing is purged, so a partition drop would have nothing to dro
 partitioning on `created_at` **may** still be applied for query-planner and vacuum cost as volume
 grows, and the chain is unaffected because no partition is ever dropped.
 
-#### Table: owf_event_outbox
+#### Platform-managed producer persistence
 
 **ID**: `cpt-cf-bss-orders-workflow-dbtable-event-outbox`
 
-**Schema**:
+Workflow defines no `owf_event_outbox` table. Service migrations run the
+`event_broker_sdk::producer_registration_migrations()` and the `toolkit_db::outbox` migrations;
+their registration, queue, body, partition and dead-letter tables are owned and migrated by those
+libraries and **MUST NOT** be forked into Workflow-specific DDL. They are operational
+infrastructure, are excluded from the Workflow-owned inventory in `DESIGN.md §3.7`, and are not
+counted among the engine's seven tables. This mirrors
+[Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables).
 
-| Column | Type | Description |
-|--------|------|-------------|
-| event_id | uuid | Consumer de-duplication token |
-| sequence | bigint, NOT NULL | **Monotonic ordinal from a database sequence**, allocated at insert; the drain's ordering guarantee is expressed over this column, never over `event_id` |
-| correlation_id | uuid | Owning process instance |
-| order_id, order_version | text, integer | Denormalized for the payload's order-summary block |
-| resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| seller_tenant_id | uuid, NOT NULL | Selling-party axis; carried on the envelope so a consumer can scope without a lookup |
-| event_type | enum | One of the six named process events (§4.7) |
-| schema_version | integer, NOT NULL | Payload schema version for this `event_type`; bumped only on an additive change (§4.7) |
-| payload | jsonb | The order-summary block plus the per-event delta, both enumerated in §4.7; sufficient for a consumer to act without fetching the order back, and carrying the catalogue reason where the event denotes a failure or escalation |
-| attempts | integer | Delivery attempts so far |
-| delivered_at | timestamptz, nullable | Set on successful publication |
-| dead_lettered_at | timestamptz, nullable | Set when the bounded attempt count is exhausted |
-| created_at | timestamptz | Enqueue instant |
-
-**PK**: event_id
-
-**Constraints**: `event_type` is constrained to the closed set of six values; no `order-state`
-event type and no operational-escalation type is a legal value in this table by construction
-(§4.7). `sequence` UNIQUE. **Indexed on `(sequence) WHERE delivered_at IS NULL AND
-dead_lettered_at IS NULL`** — the drain's own query, which would otherwise scan the full history
-under a 30-day retention; and on `(correlation_id, sequence)` for the per-correlation ordered
-read.
-
-**Ordering is per correlation key and needs an ordinal to exist.** A random-UUID primary key
-carries no order, so "per-`correlationId` ordering" was unimplementable as written: the drain had
-nothing to sort by. It now drains in `sequence` order within a correlation key. Ordering across
-different correlation keys is still not guaranteed, and no consumer may assume it.
-
-**Additional info**: **Ownership**: written only by the event outbox
-(`cpt-cf-bss-orders-workflow-component-event-outbox`). **Tenant axes**: `resource_tenant_id` and
-`seller_tenant_id`. Delivery is at-least-once; consumers de-duplicate by `event_id`. An
-**outbound** event that exhausts its delivery attempts is marked `dead_lettered_at` **here** — it
-does not write an `owf_dead_letter_record`, which is exclusively the inbound store (§4.8).
-**Retention**: delivered rows purged at **30 days**; **monthly range partition on `created_at`**,
-so the purge is a partition drop. Rows with `dead_lettered_at` set are exempt from the purge until
-an operator retires them.
+The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
+`OutboxProfile::high_throughput()`. Managed producer registration uses the stable key
+`bss-orders-workflow-events-v1`, `MissingProducerRegistration::RegisterNew` and
+`UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders-workflow`. The
+enqueue is the only Workflow write into these tables and it always rides the step's transaction
+runner (§3.6); no Workflow code reads, updates, purges or re-drives them. Delivery is
+at-least-once; consumers de-duplicate by the event envelope `id` (§4.7). An event the platform
+permanently rejects is a toolkit dead letter, never an `owf_dead_letter_record` (§4.8).
 
 #### Table: owf_dead_letter_record
 
@@ -1247,7 +1282,7 @@ an operator retires them.
 | order_id, order_version | text, integer | Order context |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 | seller_tenant_id | uuid, NOT NULL | Selling-party axis; the record is projected into the seller-scoped operator queue and would otherwise leak across sellers or be omitted from it entirely |
-| source | enum | The **kind** of parked payload: `lifecycle-trigger`, `subscriptions-callback`, `payments-callback`, `approval-callback`. Inbound only — an undeliverable outbound event is marked on `owf_event_outbox`, never parked here (§4.8) |
+| source | enum | The **kind** of parked payload: `lifecycle-trigger`, `subscriptions-callback`, `payments-callback`, `approval-callback`. Inbound only — an outbound process event the platform permanently rejects is a `toolkit_db::outbox` dead letter, never parked here (§4.8) |
 | source_event_id | text, NOT NULL | The id of the inbound event or callback that failed; the key the delivery counter accumulated against |
 | last_error | text | The last recorded error, **redacted** per §4.11: a catalogue reason plus a bounded, sanitised diagnostic — never raw downstream error text, credentials, tokens or payload echoes |
 | delivery_count | integer | The `owf_idempotency_registry.delivery_count` value at the instant of parking, copied here so the record is inspectable on its own |
@@ -1285,7 +1320,6 @@ three would either over-retain the scaffolding or under-retain the compliance ar
 |-------|-----------|--------------|
 | `owf_audit_entry` | ≥ 400 days; no DELETE grant to any role | Not partitioned for retention (nothing is purged); monthly range partition on `created_at` optional for query cost |
 | `owf_dead_letter_record` | ≥ 400 days | Monthly range partition on `created_at` |
-| `owf_event_outbox` | Delivered rows purged at 30 days; `dead_lettered_at` rows exempt until retired | Monthly range partition on `created_at` |
 | `owf_step_log` | 90 days | Monthly range partition on `started_at` |
 | `owf_retry_state` | 90 days | None — sized by in-flight step count |
 | `owf_idempotency_registry` | 30 days, aligned with the key lifetime | Monthly range partition on `created_at` |
@@ -1295,13 +1329,15 @@ three would either over-retain the scaffolding or under-retain the compliance ar
 Partitioning is monthly **range** partitioning so a purge is a partition drop rather than a bulk
 DELETE, which is the only shape that stays cheap as history grows — and the audit write sits on
 the hot path of every step, so a table that degrades under its own history degrades every step.
+The platform `toolkit_db::outbox` tables are outside this register: their retention, vacuum and
+indexing follow the library migrations (*Platform-managed producer persistence* above).
 
 **Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`
 (and no DELETE grant at all, per the chaining rule above), `owf_step_log`. Deliberately mutable:
 `owf_process_instance` (denormalized phase and checkpoint), `owf_idempotency_registry` (lease
-heartbeat and settlement), `owf_event_outbox` (delivery bookkeeping), `owf_retry_state` (attempt
-bookkeeping), `owf_durable_timer` (pause and fire bookkeeping). `owf_dead_letter_record` is
-append-only but carries a DELETE grant to the retention worker alone.
+heartbeat and settlement), `owf_retry_state` (attempt bookkeeping), `owf_durable_timer` (pause
+and fire bookkeeping). `owf_dead_letter_record` is append-only but carries a DELETE grant to the
+retention worker alone.
 
 ### 3.8 Deployment Topology
 
@@ -1311,7 +1347,10 @@ The engine is a library hosted inside the Orders Workflow gear process, layered 
 durable-execution substrate (`cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`); it is
 not a separate deployable. Background workers run under coordination leases so a multi-replica
 deployment cannot double-act: the durable timer wake-up scan, the intent reconciliation sweep
-(escalating schedule), the event outbox drain, and the idempotency-window sweep.
+(escalating schedule), and the idempotency-window sweep. In addition, the gear starts and
+gracefully stops the platform `toolkit_db::outbox` handle for the `bss-orders-workflow-events`
+queue, whose sequencer, leased processors and vacuum are library-managed workers and are not
+counted as Workflow-owned coordination jobs; Workflow adds no lock and no drain around them.
 
 **Observability owned here**: step outcome counts by outcome class; idempotency
 still-processing, **lease-expired**, **key-conflict** and aged-out counts; retry-budget-exhaustion
@@ -1319,8 +1358,9 @@ and step-deadline-exhaustion counts, tracked separately from overdue-window and 
 escalations; **crash-loop quarantine count** (§4.13, target zero); **circuit-breaker state and
 open-duration per dependency** (§4.5); **queue depth and shed count** against the bounded dispatch
 queue, and per-seller token-bucket rejection rate (§4.12); **measured clock offset against database
-time per replica** and lease-drop count (§4.15); outbox depth, drain lag, per-correlation ordering
-violations and dead-letter counts; audit-append failure count (target zero) and **audit
+time per replica** and lease-drop count (§4.15); producer-queue depth, oldest-message age and
+enqueue-to-acceptance lag plus pending platform dead letters for `bss-orders-workflow-events`
+(platform metrics, read rather than produced here); audit-append failure count (target zero) and **audit
 hash-chain verification failures** (target zero); **time to full resumption** and admission-ramp
 position after a restart (§4.16); and durable-timer fire-on-schedule adherence across a service
 restart.
@@ -1524,8 +1564,8 @@ This is the concrete mechanism behind §4.1 (`cpt-cf-bss-orders-workflow-nfr-owf
 
 This gear **MUST** publish exactly the six named process events —
 `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`,
-`OrderFulfillmentAborted`, `OrderApprovalRequested`, `OrderApprovalEscalated` — each with
-at-least-once delivery and consumer de-duplication by event id, and each payload carrying
+`OrderFulfillmentAborted`, `OrderApprovalRequested`, `OrderApprovalEscalated` — each through the
+platform producer outbox of §3.2 and §3.6 with at-least-once delivery, and each payload carrying
 sufficient data (the order-summary block plus the per-event delta) for a consumer to act without
 fetching the order back. This gear **MUST NOT** publish order-**state** events: the state-event
 set is owned and enumerated exclusively by the Lifecycle PRD. **Naming note**: Lifecycle's state
@@ -1537,12 +1577,66 @@ failure (`cpt-cf-bss-orders-workflow-fr-owf-process-events`,
 
 **There is no seventh event type, and an operational escalation is not one.** The process
 deadline's overdue escalation, a dependency-outage escalation and a manual-task escalation are
-routed to the fulfillment-operator queue, **not** to `owf_event_outbox`: `event_type` is
-constrained to the six values above by construction, so an enqueue of anything else either fails
-the audit/outbox unit of work or publishes an event the PRD's enumeration forbids (§3.6).
+routed to the fulfillment-operator queue, **not** to the producer outbox: the adapter constructs
+only the six registered `TypedEvent`s below, so there is nothing else to enqueue, and an
+unregistered type would fail GTS schema validation at enqueue rather than reach the broker (§3.6).
 
-**The payload: an order-summary block plus a per-event delta.** Both halves are enumerated here so
-neither term is left to a reader's inference.
+#### The event base type and its derived types
+
+**SDK source of truth.** The event envelope and closed trait vocabulary come from
+[`event-broker-sdk/src/gts.rs`](../../../../system/event-broker/event-broker-sdk/src/gts.rs),
+with publication mapping in
+[`producer/event_factory.rs`](../../../../system/event-broker/event-broker-sdk/src/producer/event_factory.rs).
+Where `guidelines/GTS.md` differs, these SDK declarations govern this contract; the shared
+documentation correction is tracked by Lifecycle in its `UPSTREAM_REQS.md §2.7` and co-signed in
+[`UPSTREAM_REQS.md §2.7`](../UPSTREAM_REQS.md#27-event-broker).
+
+**Identifier ownership.** This gear owns the namespace `orders_workflow` inside the `bss`
+package: `gts.cf.bss.orders_workflow.*`. Vendor `cf`, package `bss` and the version suffix follow
+the platform format; the `orders_workflow` namespace and every name under it are this gear's to
+allocate, and no other gear may define an identifier in it. Lifecycle's `orders` namespace is
+disjoint, which is what keeps the two event families structurally separate.
+
+The six events derive from the platform event base type through one abstract process-event base,
+mirroring
+[Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative),
+so a consumer can grant or restrict access to the whole family with a single wildcard:
+
+```text
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~                                                   -- abstract
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_started.v1~        -- final
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_step_completed.v1~ -- final
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_completed.v1~      -- final
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_aborted.v1~        -- final
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.approval_requested.v1~         -- final
+gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.approval_escalated.v1~         -- final
+```
+
+`cf.bss.orders_workflow.event.v1~` is **`x-gts-abstract`**: it is never instantiated, and it
+carries the common `data` fields invariant across all six — the order-summary block below. Each
+of the six concrete types is **`x-gts-final`**: they are the published contract and nothing
+derives further from them, so a consumer matching on one is matching on a closed shape.
+
+**Required envelope members.** Every published event carries the SDK envelope's `id`, `type`,
+`tenant_id`, `source`, `subject`, `subject_type` and `occurred_at`. `id` is the consumer's
+de-duplication token. `type` is the concrete GTS identifier above. `tenant_id` is the canonical
+platform-root tenant UUID, returned explicitly from `TypedEvent::tenant_id()` per the Lifecycle
+D-95 precedent; it **MUST NOT** fall back to the producer service's tenant, and `ROOT_TENANT_ID`
+names that identity here without asserting an exported constant — its authoritative source is
+the open Lifecycle ask `cpt-cf-bss-orders-lifecycle-upreq-event-broker-root-tenancy`, co-signed
+in `UPSTREAM_REQS.md §2.7`. `source` is `bss-orders-workflow`. `subject` is the canonical order
+UUID string and `subject_type` is Lifecycle's registered `gts.cf.bss.orders.order.v1~`; this gear
+registers no subject type of its own, because the subject of a process event is the order.
+`partition_key` resolves to `orderId` (`/subject`), so every version of one order — and
+Lifecycle's state events for it — routes to one broker partition. `resourceTenantId` and
+`sellerTenantId` are payload fields, not envelope tenancy.
+
+**`data` is the extension field.** The abstract process-event schema narrows the platform
+envelope's `properties.data` to the order-summary block; each concrete schema further narrows the
+same member with its per-event delta. Workflow schemas require `data` and the mandatory common and
+event-specific members. There is no wire member named `payload`; that word elsewhere denotes the
+business content. Both halves are enumerated here so neither term is left to a reader's
+inference.
 
 The **order-summary block** is identical on every one of the six events:
 
@@ -1550,8 +1644,8 @@ The **order-summary block** is identical on every one of the six events:
 |-------|--------|
 | `orderId`, `orderVersion` | The instance's order correlation |
 | `correlationId` | The process instance |
-| `resourceTenantId`, `sellerTenantId` | The tenant axes carried on the outbox row |
-| `occurredAt` | The committing transition's instant |
+| `resourceTenantId`, `sellerTenantId` | The tenant axes of the process instance |
+| `occurredAt` | The committing transition's instant (also the envelope `occurred_at`) |
 | `processDefinitionVersion` | The version pinned on the instance |
 
 The **per-event delta** carries only what that event adds:
@@ -1568,10 +1662,63 @@ The **per-event delta** carries only what that event adds:
 `reason` on any payload is always the **catalogue** value, never the free-text `justification`
 (§3.7 `owf_audit_entry`, §4.9), and no payload carries raw downstream error text (§4.11).
 
-**Versioning is additive-only.** Every outbox row carries `schema_version` for its `event_type`.
-A change **MUST** be additive — a new optional field, bumping `schema_version` — so an existing
-consumer keeps parsing. Removing a field, renaming one, narrowing an enum or changing a type is a
-**new event type**, not a version bump, because no additive-compatibility contract survives it.
+**Payload bound.** The serialized producer envelope **MUST** fit toolkit-db's 64 KiB payload
+limit. The largest payload is `OrderFulfillmentCompleted.lineOutcomes[]` at the 200-line cap; a
+capacity test at that cap is required evidence, not an assumption, and `OrderFulfillmentAborted`
+at the same cap is the second case.
+
+**Typed publication.** Each concrete Rust event implements `TypedEvent`; its GTS identifier and
+subject type are compile-time constants. Type/schema preparation and registration in
+`types-registry` occur before readiness (§3.4). At enqueue the SDK validates the serialized
+business data against the prepared schema, resolves the prepared partition-key pointer and
+serializes the standard producer envelope into toolkit-db's opaque payload. Workflow does not
+index or query event payloads in its database; Event Broker is the event query and replay
+surface.
+
+**Versioning is in the type identifier.** There is no `schema_version` member. A change **MUST**
+be additive — a new optional field under the same `v1` type — so an existing consumer keeps
+parsing. Removing a field, renaming one, narrowing an enum or changing a type is a **new type
+identifier**, not a bump, because no additive-compatibility contract survives it.
+
+#### Broker idempotency is not event-ID de-duplication
+
+Exactly one typed event **MUST** be enqueued through the bound `event_broker_sdk::ProducerOutbox`
+per committed step **that declares an event**, using the step's transaction runner (§3.3, §3.6).
+`DbProducer` uses managed `ProducerMode::Chained`; producer identity is broker-issued and persisted
+by the SDK, and toolkit `OutboxMessage.seq` is the local durable sequence. Workflow **MUST NOT**
+mint producer IDs, persist a last-sent cursor, allocate a per-correlation ordinal or implement
+outbox SQL.
+
+In Chained mode the broker uses `meta.producer_id`, `meta.previous` and `meta.sequence`, scoped to
+the topic/broker partition; it does **not** de-duplicate by `event.id`. The SDK supplies
+`meta.sequence` from the durable `OutboxMessage.seq` and recovers/manages `meta.previous` from the
+producer's broker cursor. `previous` is not `orderVersion`, a Workflow counter, or necessarily
+`sequence - 1`. A retry of the same queued message preserves its producer identity, outbox
+sequence and event ID; cursor refresh and reconciliation belong to the SDK. Workflow must not
+re-enqueue an ordinary timed-out publish as a new message or fall back to Stateless mode. This
+follows [`ProducerMode`](../../../../system/event-broker/event-broker-sdk/src/api.rs) and the
+[SDK outbox processor](../../../../system/event-broker/event-broker-sdk/src/producer/outbox.rs),
+as Lifecycle `01 §4.4` states for the sibling gear.
+
+Delivery is at-least-once. FIFO holds per broker partition during normal processing and transient
+retries; a permanently rejected event may be absent while later events proceed (§3.6, Lifecycle
+D-87). Recovery of a platform dead letter uses the shared operator interface and SDK
+republication requested in `UPSTREAM_REQS.md §2.7`; Workflow exposes no REST re-drive wrapper,
+and recovery preserves the original event ID and business payload. A dead letter **MUST NOT**
+alter process state.
+
+**Consumer obligation.** Consumers **MUST** de-duplicate by event `id` and **MUST** use
+`orderVersion` plus the resulting state together with an authoritative Lifecycle `order × read`
+to reject stale or inapplicable work. They **MUST NOT** reconstruct order or process state from
+the stream or assume every prior event was observed. A successful read proving that the
+particular intended action is obsolete retires that work without a business effect; a different
+state alone is insufficient, and each consumer declares its event/action-specific applicability
+rule. A timeout, 503 or authorization/configuration failure on that read is not evidence of stale
+work: retain the event in the consumer's durable retry mechanism, perform no effect, and escalate
+on its bounded retry budget. This is the obligation Lifecycle `01 §4.4` imposes on every consumer
+of its stream, including this gear ([`02 §2.1`](./02-triggers-and-start.md#21-design-principles),
+[`05 §2`](./05-provisioning-intents.md#2-principles--constraints)); it binds consumers of the six
+process events identically.
 
 ### 4.8 The dead-letter record is never an order state
 
@@ -1583,10 +1730,10 @@ inferred as a process outcome, and is distinct from the manual-task record slice
 **The path is delivery-level and inbound-only, by construction.** A **step**-level failure can
 never reach it: a step settles as `retryable-failure` or `permanent-failure` and its consequence is
 the handler's partial-failure policy, which is the manual-task path — which is why
-`owf_step_log.outcome` carries no `dead-lettered` member (§3.7). An **outbound** process event that
-exhausts its delivery attempts is marked `owf_event_outbox.dead_lettered_at` and writes no
-dead-letter record either; `owf_dead_letter_record.source` has no legal value for an outbound
-event. One fact, one store, in both directions.
+`owf_step_log.outcome` carries no `dead-lettered` member (§3.7). An **outbound** process event the
+platform permanently rejects is a `toolkit_db::outbox` dead letter owned by the platform (§3.6)
+and writes no dead-letter record either; `owf_dead_letter_record.source` has no legal value for an
+outbound event. One fact, one store, in both directions.
 
 **Delivery-count cap (working baseline)**: **5** deliveries before parking. Chosen to absorb
 ordinary at-least-once redelivery from the platform event bus without parking a payload that a
@@ -1618,8 +1765,8 @@ The wave discriminators are registered as distinct values rather than one generi
 `submission-failed`, because `PRD.md:372` requires a wave-1 create failure to be distinguishable in
 the manual-task reason from a wave-2 activation failure — an operator deciding whether a blind
 retry is safe needs to know whether anything was resource-affecting. Reason
-values **MUST** ride event payloads (§4.7, §3.7 `owf_event_outbox.payload`) so a downstream
-consumer keys on the reason rather than parsing free text.
+values **MUST** ride event payloads (§4.7 `data`) so a downstream consumer keys on the reason
+rather than parsing free text.
 
 **A catalogue reason is never a place to put free text.** Human-supplied text — an override
 justification, a cancellation reason — is recorded in `owf_audit_entry.justification`, a separate
@@ -1631,7 +1778,7 @@ requires both, both are written on the same audit entry.
 A capability handler **MAY** declare: a step's idempotency-key derivation, its declared event
 types, its compensation step where one exists, and its reason-catalogue entries. A capability
 handler **MAY NOT**: write the process-instance aggregate, the step log, the idempotency registry,
-the audit log, or the outbox directly; bypass the retry/backoff controller for an outbound call
+the audit log, or the producer outbox directly; bypass the retry/backoff controller for an outbound call
 made from a registered step; or own a write path that bypasses the engine. Every capability
 behavior lives in the handler slice that registers against the boundary; the engine contains no
 step logic and no commercial policy of its own.
@@ -1639,9 +1786,11 @@ step logic and no commercial policy of its own.
 ### 4.11 Data classification
 
 Every table in §3.7 is **tenant-scoped by a NOT NULL column**, not by convention: each carries
-`resource_tenant_id`, and `owf_process_instance`, `owf_audit_entry`, `owf_event_outbox` and
+`resource_tenant_id`, and `owf_process_instance`, `owf_audit_entry` and
 `owf_dead_letter_record` additionally carry `seller_tenant_id` because each backs an operator- or
-seller-scoped surface. Every read this gear exposes **MUST** carry the corresponding tenant
+seller-scoped surface. The platform `toolkit_db::outbox` tables are not Workflow tables and carry
+no Workflow tenant column; the tenant axes ride the event `data` (§4.7) and the envelope
+tenancy is platform-root. Every read this gear exposes **MUST** carry the corresponding tenant
 predicate, and the platform's SecureORM `#[secure(tenant_col = ...)]` isolation attaches to that
 column. Retention is **per store** (§3.7) rather than one global floor, is owned by this gear
 **independently of** the durable-execution substrate's own history — a substrate migration or an
@@ -1721,10 +1870,10 @@ durability boundary decides where each non-deterministic value is computed:
 
 | Value | Computed | Why |
 |-------|----------|-----|
-| The process `correlationId` | **Once, at process start, by the admission path, and persisted on `owf_process_instance` before any step runs** | Every audit entry, timer, retry-state row and outbox row is keyed on it. Regenerating it on replay orphans all of them and silently voids the 100 % audit-completeness claim of §4.6 — the entries still exist, under an identifier nothing points at any more. |
+| The process `correlationId` | **Once, at process start, by the admission path, and persisted on `owf_process_instance` before any step runs** | Every audit entry, timer, retry-state row and enqueued process event is keyed on it. Regenerating it on replay orphans all of them and silently voids the 100 % audit-completeness claim of §4.6 — the entries still exist, under an identifier nothing points at any more. |
 | The full-jitter delay draw (§4.5) | **Outside the workflow body**, by the retry/backoff controller, and persisted as `owf_retry_state.next_attempt_at` before the wait begins | A draw taken *inside* the replayed body produces a different value on replay and a history mismatch against the substrate. Persisting the resulting instant makes the replay read a value rather than re-draw one. |
 | Timestamps used in a decision | Read from **database time** (§4.15) and persisted with the step's record | Wall-clock reads inside a replayed body diverge across replicas and across replays. |
-| Identifiers a step mints (timer ids, outbox `event_id`) | Minted inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, that identifier **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object — a second gate, a second timer, a duplicate event. |
+| Identifiers a step mints (timer ids, the event envelope `id`) | Minted inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, that identifier **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object — a second gate, a second timer, a duplicate event. |
 
 The rule generalises: **anything drawn from a random source, a clock or an id generator is computed
 on the durable side of the boundary and read by the replayed side, never the reverse.**

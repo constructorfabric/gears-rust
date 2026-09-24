@@ -47,7 +47,7 @@ per configured gate party, own every escalation timer for those gates end to end
 eventual decision back into Lifecycle idempotently. Every one of these five responsibilities
 (request/gate, idempotency, escalation timer, decision reflection, inbox) is built against the
 engine primitives from `01-foundation.md` — the idempotency registry, the durable timer service,
-and the event outbox — rather than inventing parallel machinery.
+and the platform event producer adapter — rather than inventing parallel machinery.
 
 The central design tension this slice resolves is that **the policy dependency it calls does not
 exist yet**. Rather than blocking the slice on an unbuilt service, the design fixes a single
@@ -110,7 +110,7 @@ Orders Lifecycle event stream (OrderSubmitted, OrderAmended)
 | Presentation | Approver Inbox read/decision surface, scoped to assigned gates | REST read API + decision endpoint, per SDK-first conventions |
 | Application | Verdict retrieval, gate lifecycle, escalation ownership, decision reflection | Workflow step handlers registered against the engine's step-executor entry point |
 | Domain | `OrderApprovalRequest`, `ApprovalGate`, `EscalationTimer` value/entity model | Rust structs, no persistence logic of their own |
-| Infrastructure | Durable timer, idempotency registry, event outbox, audit writer (all inherited from `01-foundation.md`), Generic Approval SDK client (stand-in today) | Engine-owned tables + SDK client abstraction |
+| Infrastructure | Durable timer, idempotency registry, platform event producer adapter, audit writer (all inherited from `01-foundation.md`), Generic Approval SDK client (stand-in today) | Engine-owned tables + SDK client abstraction |
 
 ## 2. Principles & Constraints
 

@@ -16,7 +16,7 @@ This folder holds the Orders Workflow technical design as a **set of slice desig
 **process engine** (`01-foundation.md`) plus per-capability handler designs. Every slice runs on
 top of the Engine — the process-instance aggregate, definition-version pinning, the durable step
 log, the retry budget (per-attempt timeout and step deadline as distinct bounds), the dead-letter
-path, concurrency and back-pressure control, the process audit log, the event outbox, and the
+path, concurrency and back-pressure control, the process audit log, the platform event producer adapter, and the
 machine-readable reason catalogue. The Engine owns no fulfillment or approval policy; each slice
 is a handler that runs steps against the Engine's process API.
 
@@ -38,7 +38,7 @@ between them. Requirements (WHAT/WHY) live in
 - [`01-foundation.md`](./01-foundation.md) — **shared process engine**: process-instance
   aggregate, definition-version pinning, durable step log, retry budget with per-attempt timeout
   and step deadline as distinct bounds, dead-letter handling, concurrency and back-pressure
-  control, process audit log, event outbox, machine-readable reason catalogue.
+  control, process audit log, platform event producer adapter, machine-readable reason catalogue.
 - [`02-triggers-and-start.md`](./02-triggers-and-start.md) — process start: the events and
   conditions that spawn a process instance, definition selection and version pinning at start,
   idempotent start on duplicate triggers.

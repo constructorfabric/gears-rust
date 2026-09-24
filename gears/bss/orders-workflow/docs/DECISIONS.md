@@ -75,6 +75,7 @@
   - [D-55: "Remediation exhausted" is three failed attempts on the same task, or the manual-task SLA deadline elapsing](#d-55-remediation-exhausted-is-three-failed-attempts-on-the-same-task-or-the-manual-task-sla-deadline-elapsing)
   - [D-56: The submitting identity is refused at the approval-decision endpoint](#d-56-the-submitting-identity-is-refused-at-the-approval-decision-endpoint)
   - [D-57: `lifecycle_submitted_ttl` is mirrored as local configuration under a startup refusal, pending the upstream field](#d-57-lifecycle_submitted_ttl-is-mirrored-as-local-configuration-under-a-startup-refusal-pending-the-upstream-field)
+  - [D-58 (H) Process events use the platform producer outbox; Workflow owns no outbox table, drain or re-drive](#d-58-h-process-events-use-the-platform-producer-outbox-workflow-owns-no-outbox-table-drain-or-re-drive)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1174,6 +1175,50 @@ configuration values and the startup nesting check),
 
 **ADR**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`.
 
+### D-58 (H) Process events use the platform producer outbox; Workflow owns no outbox table, drain or re-drive
+
+**Accepted.** *(carries [`ADR/0008`](./ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md); mirrors Lifecycle D-17, D-87 and D-95)*
+
+**Decision**: the six named process events are published through
+`event-broker-sdk::DbProducer` with feature `outbox`, backed by `toolkit_db::outbox`, in managed
+`ProducerMode::Chained` — the same path Orders Lifecycle adopted in its
+[`ADR-0006`](../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md)
+and D-17. The producer queue is `bss-orders-workflow-events` with `Partitions::of(16)` and the
+high-throughput profile; `orderId` is the GTS event partition key; envelope tenancy is
+platform-root per the Lifecycle D-95 precedent, with the resource and seller axes as `data`
+fields. Workflow owns typed event construction and the transactional enqueue with the step's
+transaction runner, and nothing else: there is no `owf_event_outbox`, no per-correlation
+`sequence` ordinal, no `schema_version` column, no Workflow drain, lease, retry cap,
+`dead_lettered_at` marker, delivered-row purge or re-drive endpoint. The engine owns seven tables.
+Ordering follows platform partition semantics and a permanent reject may create a gap (Lifecycle
+D-87); consumers de-duplicate by event id and verify `orderVersion` and resulting state against an
+authoritative Lifecycle read, and this gear carries the same obligation as a consumer of Lifecycle
+triggers and Subscriptions confirmations. Event delivery observability, dead-letter recovery,
+root tenancy and the Event Broker runtime are shared platform prerequisites co-signed in
+`UPSTREAM_REQS.md` §2.7.
+
+**Rationale**: the previous revision of `ADR/0008` designed a Workflow-owned outbox table and
+drain "structurally parallel to" Lifecycle's; Lifecycle has since replaced its own with the
+platform producer outbox now present in the repository. Keeping a bespoke table, ordinal, lease
+and dead-letter column here would fork platform behaviour, leave the two Orders gears on different
+publication paths, and keep a second dead-letter surface beside `ADR/0009`'s inbound store. The
+per-correlation ordinal the old table minted is not what the broker orders by, so it bought no
+guarantee a consumer could rely on. The p95 < 30 s target is unaffected in principle and unproven
+by commit success: it is measured as producer-queue lag, which resolves Q-07. No earlier register
+entry recorded the gear-owned outbox — it was carried by `ADR/0008` and Q-07 only — so no `D-`
+entry is amended; Q-07 is resolved in place.
+
+**Propagated**: `ADR/0008` (rewritten); `ADR/0009` (outbound dead letter is a platform dead
+letter); `DESIGN.md` §1.1, §1.2, §1.3, §2.2, §3.2, §3.4, §3.5, §3.6, §3.7, §3.8, §4.1, §4.3,
+§4.4, §4.5, §4.8; `design/01-foundation.md` §1.1, §1.2, §1.3, §3.1, §3.2 *Platform event producer
+adapter*, §3.3, §3.4, §3.5, §3.6 *Platform producer-outbox publication*, §3.7 *Platform-managed
+producer persistence* and the retention/immutability register, §3.8, §4.7, §4.8, §4.9, §4.10,
+§4.11, §4.14; `design/02-triggers-and-start.md` §2.1, §4; `design/05-provisioning-intents.md`
+§2.1; `design/06-saga-and-compensation.md` §3.2, §3.3, §3.6; `design/README.md`;
+`UPSTREAM_REQS.md` §1.2, §2.7, §3; Q-07.
+
+**ADR**: `cpt-cf-bss-orders-workflow-adr-outbox-process-events`.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -1269,11 +1314,16 @@ visibility, and reversal-artifact open questions in the PRD are resolved.
 
 **Owner**: Architecture.
 
-**Blocked**: process events publish asynchronously from an outbox row written alongside the audit
-entry and drained to the platform event bus on a schedule this design does not yet fix; until the
-drain cadence and its own latency budget are specified, the p95 < 30 s delivery target is stated as
-a threshold this design must meet but has no committed mechanism yet shown to meet, which the
-durable-execution substrate decision (Q-01) and the NFR workshop (Q-02) both bear on.
+**Resolved by D-58** — drain cadence and profile are the platform producer outbox's
+(`bss-orders-workflow-events`, `Partitions::of(16)`, high-throughput profile); the p95 < 30 s
+target is measured as producer-queue lag from enqueue to broker acceptance (Lifecycle Q-16
+pattern), with `DESIGN.md` §4.4 alerting on it and `ADR/0008` *Confirmation* item 9 requiring the
+measurement at expected load. Commit success alone remains no evidence of the target; a relaxation
+of the number is a Product decision routed through the NFR workshop (Q-02), not a design change.
+
+*Superseded statement, retained for history:* process events published asynchronously from an
+outbox row written alongside the audit entry and drained on a schedule this design did not fix, so
+the target had no committed mechanism shown to meet it.
 
 ### Q-08: SUB-O5 (overlap-scope-key presence read) is unagreed, leaving the pre-activation overlap check unevaluable; SUB-O1 (compensation cancellation reason) is critical and unagreed, leaving the activated-cancel reason unspecifiable from this side
 
@@ -1330,6 +1380,7 @@ and that hand-check is the only guarantee this document offers.
 | D-55 | L Cross-cutting (remediation) | `design/07-manual-tasks.md` §3.6, `design/06-saga-and-compensation.md` §3.6 |
 | D-56 | L Cross-cutting (separation of duties) | `design/03-approval-execution.md` §3.3, `design/09-read-and-authz.md` §4.1 |
 | D-57 | K Tuning baselines (approval path) | `design/03-approval-execution.md` §4.2, `ADR/0007-cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park.md`, `UPSTREAM_REQS.md` (`…-upreq-submitted-ttl-visibility`) |
+| D-58 | L Cross-cutting (process events) | `ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md`, `design/01-foundation.md` §3.2, §3.6, §3.7, §4.7, `DESIGN.md` §3.4, §3.7, §3.8, §4.5, `design/02-triggers-and-start.md` §2.1, `design/05-provisioning-intents.md` §2.1, `UPSTREAM_REQS.md` §2.7 |
 
-Highest decision number used: **D-57**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-58**. Numbering is one continuous sequence across the whole
 register; there are no parts.
