@@ -171,6 +171,63 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
    via introspect; session `expires_at` (24 h) bounds actual progress loss (DESIGN §4.7 Phases B–C).
    A reload racing an in-flight `complete` re-issues it: `202` while the (disconnect-immune, §2.2 M4)
    detached task runs, then the recorded result.
+9. **`DELETE /files/{id}` vs a concurrent new version.** The version list used for the backend-blob
+   cleanup, the audit `version_count`, and the `file.deleted` event used to come from a plain
+   `list_versions` read taken well before the delete transaction opened — a version a concurrent
+   `presign_version`/`initiate_multipart_upload` committed after that read but before the delete's
+   commit was cascade-removed from the DB along with the file, but never appeared in that list: its
+   backend blob was never queued for cleanup, and once its row was gone the cleanup engine (which only
+   ever looks at rows still in the database) could never find it either — a permanent storage leak.
+   Fixed, strictly: `Store::delete_file_collecting_versions` locks the `files` row (`SELECT ... FOR
+   UPDATE`, `FileRepo::lock_for_update`) as the transaction's first statement, before it re-lists the
+   file's versions, immediately before the `DELETE`. A concurrent version insert takes `FOR KEY SHARE`
+   on the same row for its FK check, which conflicts with that lock: it either commits strictly before
+   the lock is granted (and is then necessarily visible to the version re-list, so it lands in the
+   caller's cleanup/audit/usage accounting) or blocks until this transaction ends and then fails its own
+   FK check against the now-deleted file — surfaced to that caller as `404 FileNotFound`, not a generic
+   `500`. There is no longer a window in which a version is inserted, committed, and silently
+   cascade-removed unaccounted-for; the client either sees its version-creation call fail with
+   `FileNotFound`, or sees it succeed and its version correctly appear in the delete's own accounting.
+10. **`DELETE /files/{id}/versions/{vid}` vs a concurrent new version.** Deleting a file's only version
+    is equivalent to deleting the whole file (PRD `cpt-cf-file-storage-fr-delete-file`; api.md). The
+    "is `vid` the file's only version?"
+    decision used to be made from the same kind of pre-transaction `list_versions` snapshot: a second
+    version committed after that snapshot but before the delete made the stale count wrongly say
+    "yes", so the whole file — and that brand-new, never-requested version — was deleted, even though
+    the caller only ever asked to remove `vid`. Fixed, strictly: `Store::delete_version_or_whole_file`
+    locks the `files` row first (same mechanism as #9), then re-lists the file's versions, then decides.
+    Client-visible outcome of the race: either the concurrent version's own `presign_version`/
+    `initiate_multipart_upload` call committed before this transaction's lock was granted — in which
+    case it is necessarily visible to the re-list that follows, so it is correctly treated as a second,
+    surviving version, and only `vid` is removed (`VersionRemoved`) — or it lost the row-lock race and,
+    once this transaction actually deletes the whole file (the lock-time re-list still showed `vid` as
+    the only version), fails its own FK check and surfaces `404 FileNotFound` to its own caller. Both
+    outcomes are exact, not merely "narrowed" — there is no third, silent-data-loss interleaving left.
+11. **Orphan-file reclaim vs a concurrent new version (or multipart session).** The cleanup sweep's
+    zero-version-orphan reclaim (`CleanupEngine::maybe_delete_orphaned_file` →
+    `Store::delete_orphan_file_with_event`) used to guard its `DELETE` with a single conditional
+    statement (`FileRepo::delete_if_orphan`'s `content_id IS NULL AND NOT EXISTS (... file_versions ...)`).
+    Evaluated alone, that guard is not airtight on `PostgreSQL`: under `READ COMMITTED` its `NOT EXISTS`
+    subquery is evaluated against the snapshot at the start of the statement, and a concurrent
+    `insert_pending_version` that commits *after* that snapshot but *before* the `DELETE` actually
+    resumes (it was only blocked, momentarily, by the FK's `FOR KEY SHARE` on the parent row) is invisible
+    to it — `PostgreSQL` does not re-evaluate a subquery inside a statement's own `WHERE` on resume (no
+    `EvalPlanQual` recheck there), so the stale verdict stands and `ON DELETE CASCADE` removes the
+    freshly-inserted version along with the file. Fixed, strictly: `Store::delete_orphan_file_with_event`
+    now locks the `files` row first, then re-checks `content_id IS NULL`, "zero versions", and "no active
+    (`in_progress`/`completing`) multipart session" fresh, all inside that same lock, before ever reaching
+    `delete_if_orphan`'s own conditional `DELETE` (kept as a redundant second line of defense, not the
+    sole guard). A racing insert either committed before the lock (visible to the fresh checks, correctly
+    aborting the reclaim) or blocks and then fails FK, surfacing `FileNotFound` to its own caller. The
+    invariant "a version that exists at the moment its file is reclaimed as an orphan is never silently
+    destroyed" now holds exactly, not just for a shrunken window.
+
+    Races #9–#11 above are only exercisable against real `PostgreSQL` (`tests/pg_concurrency_test.rs`,
+    `testcontainers`): on `SQLite`, `.lock(LockType::Update)` renders no `FOR UPDATE` at all (`sea-query`
+    has no row-lock support for that backend), but correctness holds anyway because `SQLite` has a single
+    writer — any write takes a database-level `RESERVED` lock that serializes every writer regardless of
+    what any `SELECT` asked for, so the dangerous interleaving these three entries describe cannot occur
+    there in the first place.
 
 ## 5. Invariants
 
