@@ -7,8 +7,6 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'guidelines/**'
-      - 'Makefile'
-      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 concurrency:
