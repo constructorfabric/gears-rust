@@ -38,7 +38,7 @@ pub struct Model {
     /// `POST /files` create+plan path with `bind: "auto"`). `FALSE` = the
     /// pre-redesign staged behaviour (client binds manually).
     ///
-    /// Added by `m20260722_000001_multipart_auto_bind`.
+    /// Added by `m20260924_000001_upload_flow_redesign`.
     #[sea_orm(default_value = false)]
     pub auto_bind: bool,
     /// Completion-lease expiry (`state = 'completing'` only) — a later
@@ -56,7 +56,7 @@ pub struct Model {
     pub complete_result: Option<String>,
     /// The backend this session's upload actually targets, set once at
     /// initiate time. `NULL` only for a session created before
-    /// `m20260722_000001_multipart_auto_bind` added this column (backfilled
+    /// `m20260924_000001_upload_flow_redesign` added this column (backfilled
     /// from `file_versions` where a matching row still existed).
     #[sea_orm(nullable)]
     pub backend_id: Option<String>,

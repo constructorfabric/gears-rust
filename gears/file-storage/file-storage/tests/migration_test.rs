@@ -95,7 +95,7 @@ async fn migration_up_down_up_roundtrip() {
     let db = migrated_db().await;
 
     // Sanity anchor for the redesign columns, checked *before* anything is
-    // rolled back. `m20260722_000001_multipart_auto_bind`'s `down()` used to
+    // rolled back. `m20260924_000001_upload_flow_redesign`'s `down()` used to
     // be a `SELECT 1` no-op on both dialects: a full `Migrator::down` rolled
     // back every other migration's schema while silently leaving
     // `multipart_uploads.auto_bind` (plus its three lease siblings and the
@@ -104,10 +104,10 @@ async fn migration_up_down_up_roundtrip() {
     // fix on its own -- `p2_initial::down()` drops `multipart_uploads`
     // outright, so "the column is gone afterwards" would hold even for a
     // no-op `down()`. That proof lives in
-    // `multipart_auto_bind_down_actually_drops_the_new_columns`, which rolls
-    // back only the last two migrations; all this assertion does is pin that
-    // the column exists on the fully-migrated schema the rest of the test
-    // starts from.
+    // `upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes`,
+    // which rolls back only the last migration; all this assertion does is
+    // pin that the column exists on the fully-migrated schema the rest of
+    // the test starts from.
     let auto_bind_before_down = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
         .await;
@@ -129,14 +129,17 @@ async fn migration_up_down_up_roundtrip() {
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
 }
 
-/// Directly exercises the `multipart_auto_bind` migration's own up/down/up
+/// Directly exercises the `upload_flow_redesign` migration's own up/down/up
 /// round trip (as opposed to the full-migrator roundtrip above, which
 /// dropped and recreated `multipart_uploads` from scratch via the other
 /// migrations' `down()`s and so could not tell a real column drop from a
-/// no-op). Asserts that `down()` actually removes `auto_bind` — i.e. is not
-/// the old `SELECT 1` no-op — and that a subsequent `up()` restores it.
+/// no-op). Asserts that a single `down()` actually removes `auto_bind` and
+/// the other new `multipart_uploads` columns — i.e. is not the old `SELECT
+/// 1` no-op — and reverses the index-hardening half too (drops the five new
+/// indexes, restores `files_owner_listing_idx`), and that a subsequent
+/// `up()` restores everything.
 #[tokio::test]
-async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
+async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() {
     let db = migrated_db().await;
 
     let before = db
@@ -156,14 +159,15 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         backend_cols_before.is_ok(),
         "backend_id/backend_path must exist after the full up(): {backend_cols_before:?}"
     );
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+    assert!(!index_exists(&db, "files_owner_listing_idx").await);
 
-    // Roll back only the two most-recently-registered migrations
-    // (index_hardening, then multipart_auto_bind) rather than the whole
+    // Roll back only the last-registered migration, rather than the whole
     // history, so this test is independent of how many migrations precede
-    // multipart_auto_bind.
-    Migrator::down(&db, Some(2))
+    // upload_flow_redesign.
+    Migrator::down(&db, Some(1))
         .await
-        .expect("roll back index_hardening and multipart_auto_bind");
+        .expect("roll back upload_flow_redesign");
 
     let after_down = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
@@ -183,10 +187,22 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         "backend_id/backend_path must be gone after a real (non-no-op) down(): \
          {backend_cols_after_down:?}"
     );
+    assert!(
+        !index_exists(&db, "files_owner_listing_v2_idx").await,
+        "files_owner_listing_v2_idx must be dropped by down()"
+    );
+    assert!(
+        index_exists(&db, "files_owner_listing_idx").await,
+        "files_owner_listing_idx must be recreated by down()"
+    );
+    assert!(!index_exists(&db, "idempotency_keys_file_idx").await);
+    assert!(!index_exists(&db, "multipart_uploads_sweep_idx").await);
+    assert!(!index_exists(&db, "files_versionless_sweep_idx").await);
+    assert!(!index_exists(&db, "file_versions_file_created_idx").await);
 
-    Migrator::up(&db, Some(2))
+    Migrator::up(&db, Some(1))
         .await
-        .expect("re-apply multipart_auto_bind and index_hardening");
+        .expect("re-apply upload_flow_redesign");
     let after_up = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
         .await;
@@ -204,9 +220,11 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         backend_cols_after_up.is_ok(),
         "backend_id/backend_path must exist again after re-up(): {backend_cols_after_up:?}"
     );
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+    assert!(!index_exists(&db, "files_owner_listing_idx").await);
 }
 
-// ── multipart_auto_bind: backend_id/backend_path backfill ───────────────────
+// ── upload_flow_redesign: backend_id/backend_path backfill ──────────────────
 
 /// A second upload id, distinct from `UPLOAD` above, used only by the
 /// backend_id/backend_path backfill test below for the session with no
@@ -224,7 +242,7 @@ const ORPHAN_VERSION: &str = "00000000-0000-0000-0000-0000000000f4";
 /// case cleanup's own fallback still covers -- see
 /// `CleanupEngine::cleanup_expired_session_version_with_file`).
 #[tokio::test]
-async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version() {
+async fn upload_flow_redesign_backfills_backend_id_and_path_from_matching_version() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
@@ -232,11 +250,11 @@ async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version
         .await
         .expect("enable foreign keys");
 
-    // Every migration up to (not including) multipart_auto_bind -- the "old"
+    // Every migration up to (not including) upload_flow_redesign -- the "old"
     // schema, before backend_id/backend_path existed on multipart_uploads.
     Migrator::up(&db, Some(7))
         .await
-        .expect("apply every migration up to (not including) multipart_auto_bind");
+        .expect("apply every migration up to (not including) upload_flow_redesign");
 
     insert_file(&db, FILE).await;
     insert_version(&db, FILE, VERSION, 1).await;
@@ -270,7 +288,7 @@ async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version
 
     Migrator::up(&db, None)
         .await
-        .expect("apply the remaining migrations (multipart_auto_bind, index_hardening)");
+        .expect("apply the remaining migration (upload_flow_redesign)");
 
     let row = db
         .query_one_raw(stmt(
@@ -308,9 +326,9 @@ async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version
     );
 }
 
-// ── multipart_auto_bind rebuild: child rows and indexes survive ──────────────
+// ── upload_flow_redesign rebuild: child rows and indexes survive ────────────
 
-/// Upload id used only by the `multipart_auto_bind` rebuild-survival test
+/// Upload id used only by the `upload_flow_redesign` rebuild-survival test
 /// below.
 const UPLOAD: &str = "00000000-0000-0000-0000-0000000000f1";
 
@@ -325,7 +343,7 @@ async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
         == 1
 }
 
-/// Reproduces the bug fixed in `m20260722_000001_multipart_auto_bind`'s
+/// Reproduces the bug fixed in `m20260924_000001_upload_flow_redesign`'s
 /// `SQLITE_UP`: that migration rebuilds `multipart_uploads` (SQLite cannot
 /// widen a `CHECK` constraint in place) by creating a new table, copying the
 /// parent rows, then `DROP TABLE multipart_uploads`. `multipart_upload_parts
@@ -338,13 +356,13 @@ async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
 /// either.
 ///
 /// This test applies every migration up to (but not including)
-/// `multipart_auto_bind` — the 8th of 9 registered migrations, so `Some(7)`
-/// pending migrations — inserts a file, a multipart session, and two parts
-/// referencing it, then applies the remaining migrations (`multipart_auto_bind`
-/// and `index_hardening`) and asserts the parts and the session are both
+/// `upload_flow_redesign` — the 8th and last of the 8 registered migrations,
+/// so `Some(7)` pending migrations — inserts a file, a multipart session,
+/// and two parts referencing it, then applies the remaining migration
+/// (`upload_flow_redesign`) and asserts the parts and the session are both
 /// still there, and both indexes exist.
 #[tokio::test]
-async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
+async fn upload_flow_redesign_data_and_indexes_survive_rebuild() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
@@ -354,7 +372,7 @@ async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
 
     Migrator::up(&db, Some(7))
         .await
-        .expect("apply every migration up to (not including) multipart_auto_bind");
+        .expect("apply every migration up to (not including) upload_flow_redesign");
 
     insert_file(&db, FILE).await;
     db.execute_raw(stmt(
@@ -381,7 +399,7 @@ async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
 
     Migrator::up(&db, None)
         .await
-        .expect("apply the remaining migrations (multipart_auto_bind, index_hardening)");
+        .expect("apply the remaining migration (upload_flow_redesign)");
 
     assert_eq!(
         count(
@@ -413,14 +431,18 @@ async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
     );
 }
 
-// ── index_hardening ───────────────────────────────────────────────────────────
+// ── upload_flow_redesign: index hardening ────────────────────────────────────
 
-/// All covering indexes from `m20260902_000001_index_hardening` must exist
-/// after a full `up()`, and the superseded `files_owner_listing_idx` (from
-/// `m20260624_000001_p1_initial`, replaced by `files_owner_listing_v2_idx`)
-/// must be gone.
+/// All covering indexes added by `m20260924_000001_upload_flow_redesign`'s
+/// index-hardening half must exist after a full `up()`, and the superseded
+/// `files_owner_listing_idx` (from `m20260624_000001_p1_initial`, replaced by
+/// `files_owner_listing_v2_idx`) must be gone. `down()`'s mirror-image
+/// assertions (indexes dropped, `files_owner_listing_idx` restored) live in
+/// `upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes`
+/// above, alongside the column-drop assertions -- one migration, one down()
+/// test.
 #[tokio::test]
-async fn index_hardening_indexes_exist_after_up() {
+async fn upload_flow_redesign_indexes_exist_after_up() {
     let db = migrated_db().await;
     assert!(
         index_exists(&db, "idempotency_keys_file_idx").await,
@@ -447,33 +469,6 @@ async fn index_hardening_indexes_exist_after_up() {
         "files_owner_listing_idx must be dropped after up() -- superseded by \
          files_owner_listing_v2_idx"
     );
-}
-
-/// `down()` must reverse exactly that: drop `files_owner_listing_v2_idx` and
-/// recreate the original `files_owner_listing_idx`, alongside dropping the
-/// other three indexes this migration added.
-#[tokio::test]
-async fn index_hardening_down_restores_the_original_owner_listing_index() {
-    let db = migrated_db().await;
-    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
-    assert!(!index_exists(&db, "files_owner_listing_idx").await);
-
-    Migrator::down(&db, Some(1))
-        .await
-        .expect("roll back index_hardening");
-
-    assert!(
-        !index_exists(&db, "files_owner_listing_v2_idx").await,
-        "files_owner_listing_v2_idx must be dropped by down()"
-    );
-    assert!(
-        index_exists(&db, "files_owner_listing_idx").await,
-        "files_owner_listing_idx must be recreated by down()"
-    );
-    assert!(!index_exists(&db, "idempotency_keys_file_idx").await);
-    assert!(!index_exists(&db, "multipart_uploads_sweep_idx").await);
-    assert!(!index_exists(&db, "files_versionless_sweep_idx").await);
-    assert!(!index_exists(&db, "file_versions_file_created_idx").await);
 }
 
 // ── files CHECK constraints ──────────────────────────────────────────────────

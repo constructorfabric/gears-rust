@@ -887,7 +887,7 @@ impl CleanupEngine {
     /// and its uploaded parts) -- so the backend abort is attempted
     /// regardless of whether the version row is still present, falling back
     /// to the session's own stored `backend_id`/`backend_path`
-    /// (`m20260722_000001_multipart_auto_bind`) when it is not, and only
+    /// (`m20260924_000001_upload_flow_redesign`) when it is not, and only
     /// falling further back to the default backend and the recomputed
     /// deterministic `(file_id, version_id)` path for a legacy session that
     /// predates those columns -- see the implementation's own doc comment for
@@ -965,7 +965,7 @@ impl CleanupEngine {
         //      source (`migrate_backend` could in principle have moved it,
         //      though never for a still-pending version in practice).
         //   2. The session row's own `backend_id`/`backend_path`
-        //      (`m20260722_000001_multipart_auto_bind`), when the version is
+        //      (`m20260924_000001_upload_flow_redesign`), when the version is
         //      already gone but the session was created after that migration
         //      -- the exact pair the upload was actually initiated against,
         //      whichever backend that was.

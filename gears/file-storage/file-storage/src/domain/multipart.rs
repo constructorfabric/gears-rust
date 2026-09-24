@@ -78,7 +78,7 @@ pub struct MultipartUploadSession {
     /// The backend this session's upload actually targets, recorded once at
     /// initiate time from the pending version's own `backend_id` — never
     /// recomputed. `None` only for a session created before
-    /// `m20260722_000001_multipart_auto_bind` added this column (backfilled
+    /// `m20260924_000001_upload_flow_redesign` added this column (backfilled
     /// from `file_versions` where a matching row still existed at migration
     /// time; a legacy row with no matching version stays `None`).
     pub backend_id: Option<String>,
