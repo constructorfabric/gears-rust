@@ -84,6 +84,7 @@ upgrades.
 | [KIT-012](#kit-012-bundled-sdlc-kit-and-pdsl-validator-gaps) | Bundled SDLC kit and PDSL validator gaps | upstream | medium | reported |
 | [KIT-013](#kit-013-cfs-validate-toc-exit-code-disagrees-with-its-json) | `cfs validate-toc` exit code disagrees with its JSON | upstream | medium | proposed |
 | [KIT-014](#kit-014-duplicate-writedocsreviewfixgate-unit-in-the-studio-core) | Duplicate `WriteDocsReviewFixGate` unit in the Studio core | upstream | low | proposed |
+| [KIT-015](#kit-015-merge-the-two-coding-presets) | Merge the two coding presets | kit | low | proposed |
 
 ## Items
 
@@ -272,6 +273,21 @@ upgrades.
   reachable. Reading either in isolation is misleading when extending the kit.
 - **Next step:** file an upstream Studio issue, or add it to the KIT-012 issue.
 - **Links:** —
+
+### KIT-015: Merge the two coding presets
+
+- **Status:** proposed
+- **Priority:** low
+- **Area:** kit
+- **Problem:** `cf-gears-implement` (FEATURE-led, `@cpt-*` traceability) and
+  `cf-gears-coding` (DESIGN-led) share one code stage router, phase plan, and
+  checklist, but remain two presets bound to two rules files. Keeping two
+  entry points and two rules files in step is extra surface for drift.
+- **Benefit:** One coding entry point with a traceability-mode parameter and
+  one rules file with mode-specific sections.
+- **Options:** keep both skill names as thin aliases for discoverability, or
+  replace them with a single preset.
+- **Links:** raised in review of constructorfabric/gears-rust#4930
 
 ## Item template
 
