@@ -428,7 +428,10 @@ impl RemoteEmbeddingProvider {
             if remaining.is_zero() {
                 return Err(EmbeddingProviderError::Deadline);
             }
-            let call = self.embed_chunk(chunk, AttemptWindow::for_attempt(remaining, self.config.timeout));
+            let call = self.embed_chunk(
+                chunk,
+                AttemptWindow::for_attempt(remaining, self.config.timeout),
+            );
             let outcome = tokio::select! {
                 () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
                 result = call => result,

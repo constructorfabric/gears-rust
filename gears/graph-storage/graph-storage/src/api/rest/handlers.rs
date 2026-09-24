@@ -400,9 +400,7 @@ pub async fn search(
     // The SDK owns both directions of this spelling, so a hand-rolled match
     // here cannot drift from the encoder or acquire a default arm.
     let mode: m::SearchMode = request.mode.parse().map_err(|unknown| {
-        DomainError::invalid(format!(
-            "{unknown}; expected lexical, vector or hybrid"
-        ))
+        DomainError::invalid(format!("{unknown}; expected lexical, vector or hybrid"))
     })?;
     let arm_limit = request.arm_limit.unwrap_or(20);
     let response = services

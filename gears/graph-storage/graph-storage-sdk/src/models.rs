@@ -1358,9 +1358,7 @@ pub fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => {
             serde_json::Value::Array(items.iter().map(canonical_json).collect())
         }
-        serde_json::Value::Number(number) => {
-            serde_json::Value::Number(canonical_number(number))
-        }
+        serde_json::Value::Number(number) => serde_json::Value::Number(canonical_number(number)),
         other => other.clone(),
     }
 }
@@ -1504,7 +1502,6 @@ mod embedding_space_tests {
 #[cfg(test)]
 mod closed_enum_tests {
     use super::*;
-
 
     /// Rule 3 of the Closed Enum Contract, held by a test rather than by each
     /// call site remembering it.
