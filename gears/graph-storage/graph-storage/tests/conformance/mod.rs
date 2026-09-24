@@ -4100,6 +4100,81 @@ pub async fn a_deleted_edge_is_revived_by_the_next_upsert(
     }
 }
 
+/// One node is tombstoned once, however many deletes race for it.
+///
+/// The delete read the row live and then wrote by id alone, so two deletes
+/// that both read before either committed both wrote: the second overwrote
+/// the first's `deleted_at` and audit envelope, and both answered
+/// `tombstoned_nodes: 1` for a single row. The count is what a producer
+/// reconciles against and the envelope is who the audit trail names, so both
+/// were wrong at once -- and the revision advanced twice for one change.
+///
+/// The write is now a compare-and-set on `deleted_at IS NULL`. A delete that
+/// finds the row already gone settles as the no-op rule 3 of the Soft Delete
+/// Contract calls for, rather than reporting a write it did not make: a
+/// producer retrying a delete whose response was lost cannot tell "already
+/// deleted" from "deleted by me", and must not be told the difference.
+pub async fn two_deletes_of_one_node_tombstone_it_once(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    for round in 0..16 {
+        let key = format!("deleted-twice-{round}");
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(vec![node(&key, "here")], Vec::new()),
+        )
+        .await
+        .expect("the node is created");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let deleter = |()| {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let key = key.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                store.soft_delete(&ctx, DeleteRequest::Node(key)).await
+            })
+        };
+        // Both spawned before either is awaited: awaiting the first leaves it
+        // at a barrier nobody else has reached.
+        let first = deleter(());
+        let second = deleter(());
+        let first = first
+            .await
+            .expect("the task does not panic")
+            .expect("a delete racing another is not a failure");
+        let second = second
+            .await
+            .expect("the task does not panic")
+            .expect("a delete racing another is not a failure");
+
+        assert_eq!(
+            first.tombstoned_nodes + second.tombstoned_nodes,
+            1,
+            "round {round}: one row, so one tombstone between the two deletes"
+        );
+        assert!(
+            matches!(
+                store.get_node(&reader, &key, 0).await,
+                Err(GraphStoreError::NotFound)
+            ),
+            "round {round}: the node is gone afterwards"
+        );
+    }
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a

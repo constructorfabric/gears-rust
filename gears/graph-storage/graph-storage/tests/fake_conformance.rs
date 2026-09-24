@@ -434,6 +434,19 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Run here too. This store serializes `soft_delete` under one lock, so the
+/// second delete reads the tombstone rather than racing the write -- what it
+/// proves here is that both routes answer with the same single tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_deletes_of_one_node_tombstone_it_once() {
+    conformance::two_deletes_of_one_node_tombstone_it_once(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// The edge half, here for the same reason: whether or not the window opens,
 /// both stores must revive a deleted edge rather than refuse it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

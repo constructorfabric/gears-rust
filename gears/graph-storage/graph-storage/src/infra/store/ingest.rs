@@ -1418,7 +1418,11 @@ pub async fn soft_delete(
                                     edge::Column::DeletedBySubjectType,
                                     Expr::value(subject.subject_type.clone()),
                                 )
-                                .filter(Condition::all().add(edge::Column::Id.eq(e.id)))
+                                .filter(
+                                    Condition::all()
+                                        .add(edge::Column::Id.eq(e.id))
+                                        .add(edge::Column::DeletedAt.is_null()),
+                                )
                                 .secure()
                                 .scope_with(&scope)
                                 .exec(tx)
@@ -1437,13 +1441,31 @@ pub async fn soft_delete(
                                 node::Column::DeletedBySubjectType,
                                 Expr::value(subject.subject_type.clone()),
                             )
-                            .filter(Condition::all().add(node::Column::Id.eq(model.id)))
+                            .filter(
+                                Condition::all()
+                                    .add(node::Column::Id.eq(model.id))
+                                    .add(node::Column::DeletedAt.is_null()),
+                            )
                             .secure()
                             .scope_with(&scope)
                             .exec(tx)
                             .await
                             .map_err(map_scope_err)?
                             .rows_affected;
+                        // The row was live when it was read and is not now:
+                        // another delete landed in between, or a scope
+                        // replacement purged it. Either way the caller's
+                        // intent already holds, and rule 3 of the Soft Delete
+                        // Contract says so -- deleting an already-deleted row
+                        // is a no-op, not a failure, because a producer
+                        // retrying a delete whose response was lost cannot
+                        // tell the two apart from outside. The no-op settle
+                        // is the same answer the pre-read takes, and it
+                        // leaves the revision where it was rather than
+                        // bumping it for a write that did not happen.
+                        if removed == 0 {
+                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
+                        }
                         (removed, edges)
                     }
                     DeleteRequest::Edge(key) => {
@@ -1485,13 +1507,21 @@ pub async fn soft_delete(
                                 edge::Column::DeletedBySubjectType,
                                 Expr::value(subject.subject_type.clone()),
                             )
-                            .filter(Condition::all().add(edge::Column::Id.eq(model.id)))
+                            .filter(
+                                Condition::all()
+                                    .add(edge::Column::Id.eq(model.id))
+                                    .add(edge::Column::DeletedAt.is_null()),
+                            )
                             .secure()
                             .scope_with(&scope)
                             .exec(tx)
                             .await
                             .map_err(map_scope_err)?
                             .rows_affected;
+                        // Same rule as the node above.
+                        if removed == 0 {
+                            return already_tombstoned_edge(&scope, tx, &key, epoch).await;
+                        }
                         (0u64, removed)
                     }
                 };

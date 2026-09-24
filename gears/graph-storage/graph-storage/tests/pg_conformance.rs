@@ -621,6 +621,20 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Against the store the window opens in: both deletes read the row live
+/// before either commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_deletes_of_one_node_tombstone_it_once() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_deletes_of_one_node_tombstone_it_once(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// The edge half of that race, against the store the window can actually
 /// open in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
