@@ -1,5 +1,5 @@
 <!-- CONFLUENCE_TITLE: [BSS]: Orders Lifecycle — Upstream Requirements -->
-<!-- Related: ./DESIGN.md, ./DECISIONS.md, ./design/ | Owners: BSS Orders team -->
+<!-- Related: ./DESIGN.md, ./DECISIONS.md, ./features/ | Owners: BSS Orders team -->
 
 # UPSTREAM_REQS — Orders Lifecycle
 
@@ -112,18 +112,18 @@ unregistered upstream. Without it an end-to-end acquisition trace stops at the s
 
 **Atomic enforcement of `overlapScopeKey` at the point a subscription commits to `active`.** The
 order axis of the overlap rule is closed inside this gear's transition transaction by
-`01 §3.7`'s partial unique index, but the **subscription** axis cannot be: the committing
+[01 §3.7](DESIGN.md#contract-01-3-7)'s partial unique index, but the **subscription** axis cannot be: the committing
 transaction belongs to Subscriptions, so no re-check performed here can be atomic with it. Two
 activation waves can therefore each pass this gear's re-check and jointly exceed
 `maxConcurrentActive`. Subscriptions **MUST** re-evaluate the key and commit `active` under one
-reservation or serialisation boundary. Until it does, **the gap is open and `03 §2.2` does not
+reservation or serialisation boundary. Until it does, **the gap is open and [03 §2.2](DESIGN.md#contract-03-2-2) does not
 bound it** — that section states why no timed validity window is assertable from this side, since
 nothing this design declares carries a deadline to the party that would have to honour it, and
 `spawn-signal` is event-less. What holds meanwhile is narrower: the re-check is an **early abort**
 with no admission guarantee. A collision found before `active` is a per-line rejection and a
 pre-activation abort; one appearing at or after `active` is a fulfillment failure carrying
 `overlap-collision` on the failure-acknowledgement path, whose compensation evidence must show no
-active subscription remains (`03 §2.2`, `DECISIONS.md` D-89). This is the same seam as `SUB-O5`, which supplies the *read*; this ask is
+active subscription remains ([03 §2.2](DESIGN.md#contract-03-2-2), `DECISIONS.md` D-89). This is the same seam as `SUB-O5`, which supplies the *read*; this ask is
 the *enforcement*, and the read alone does not make the rule hold.
 
 ### 2.2 Rating / price evaluation
@@ -138,7 +138,7 @@ and pin composition through the public SDK, preserving predicate identity, `Fail
 `NotEvaluable`, diagnostic detail and missing-input ownership. Orders normalizes these to its
 registered reasons; it must not import Pricing internals, recreate predicates, or substitute
 per-line latest-frontier calls. The required input/output contract and failure mapping are in
-`design/03-gate-and-pin.md` §§1.3, 4.1. Verify whole-basket (up to 200 lines) behavior, unavailable
+[03-gate-and-pin](DESIGN.md#contract-03-1-1) §§1.3, 4.1. Verify whole-basket (up to 200 lines) behavior, unavailable
 and absent frontier, noncommitted versions, unresolved composition, and deadline exhaustion.
 These SDK operations and shared circuit-breaker support remain open integration prerequisites;
 the 2.25 s submit / 2.5 s Preview resolution ceilings are baselines, not measured latency.
@@ -159,13 +159,13 @@ for the order-market predicate (D-124). A PEP denial must stay distinguishable f
 Orders can record an operator diagnostic; Orders maps it to `catalog-frontier-unavailable` (or the
 port's own unavailable reason) and never surfaces it to the buyer as 403. Until exposed, Orders
 uses `pin_frontier` only when the caller's tenant is the seller and otherwise refuses
-`catalog-frontier-unavailable` (`design/03-gate-and-pin.md` §2.2; [`DECISIONS.md`](./DECISIONS.md)
+`catalog-frontier-unavailable` ([03 §2.2](DESIGN.md#contract-03-2-2); [`DECISIONS.md`](./DECISIONS.md)
 D-122).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation`
 
 **A consumable Rating evaluation SDK.** No Rating SDK crate exists, so the price-evaluation
-contract the gate calls in `design/03-gate-and-pin.md` §3.6 *Run Gate and Submit* step 5 has no
+contract the gate calls in [03 §3.6](features/03-gate-and-pin.md#contract-03-3-6) *Run Gate and Submit* step 5 has no
 client. Rating owners must expose, through a public SDK resolvable from `ClientHub`, an ordinary
 batched evaluation of a whole basket (up to 200 lines) at an explicit committed catalog version of
 a named catalog tenant, returning the non-authoritative resolved total per line and per order — gross, net, discount
@@ -217,7 +217,7 @@ resolved total for price-list scopes that need subscription-level context. PRD �
 **required** for the `p1` price-evaluation dependency, and PRD §15 row 6 is the open question it
 closes. Until it exists, overlays requiring subscription-level context are **excluded** from the
 order-time total and the exclusion is stated on the read and Preview responses
-([`./design/03-gate-and-pin.md`](./design/03-gate-and-pin.md) §4.5) — a truthful interim, but one
+([03 §4.5](DESIGN.md#contract-03-4-5)) — a truthful interim, but one
 that becomes permanent by default while no ask is registered.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-tcv-with-annualisation`
@@ -274,7 +274,7 @@ owned by Contracts (§2.11).
 The profile **must also state the payer's commercial relationship with a named seller tenant**:
 whether the payer is in a commercial relationship with the order's `sellerTenantId`. An amendment
 that changes `payerTenantId` reads this answer to decide whether the change crosses seller scope
-(`design/04-versioning.md` §2.2), and refuses `payer-rebinding-requires-seller` unless the
+([04 §2.2](DESIGN.md#contract-04-2-2)), and refuses `payer-rebinding-requires-seller` unless the
 relationship is confirmed. No separate tenant-hierarchy operation is requested. See
 [`DECISIONS.md`](./DECISIONS.md) D-128.
 
@@ -294,7 +294,7 @@ explicitly **not** requested — see [`DECISIONS.md`](./DECISIONS.md) Q-08 for t
 The Payments contract must also provide an idempotent request identity and read-by-request
 outcome so Workflow can resume a `pending` authorization without submitting a new charge or
 losing the original attempt. Workflow owns bounded durable polling/escalation through its
-selected execution platform (`design/05-preconditions.md` §4.3); Orders does not add a Payments
+selected execution platform ([05 §4.3](features/05-preconditions.md#contract-05-4-3)); Orders does not add a Payments
 timer. Configuration, restart recovery and exhaustion tests are prerequisites, not delivered
 capabilities. Conclusive `failed` outcomes are sent to Lifecycle, the sole evaluator of its
 tolerate-failure policy; Workflow must not independently suppress that transition request.
@@ -308,11 +308,10 @@ The public Subscriptions/identity SDK contracts must supply those inputs; false 
 void wave-1 drafts and lead to failure acknowledgement, while unavailable inputs return `defer`:
 Workflow retries under `activation-recheck-retry-budget` (baseline 3 attempts over ≤ 60 s) and, once
 it is exhausted, acknowledges failure with the port's unevaluable reason; a held, terminal or
-superseded order returns `not-dispatchable` and is re-read, never acknowledged (`design/03-gate-and-pin.md`
-§3.6, D-127).
+superseded order returns `not-dispatchable` and is re-read, never acknowledged ([03 §3.6](features/03-gate-and-pin.md#contract-03-3-6), D-127).
 Lifecycle's own re-check inputs — each line's stored `overlap_scope_key` and the version's
 `market_currency`, `market_region` and `payer_tenant_id` — are carried by Lifecycle's composed
-order read as fulfillment inputs (`design/08-read-and-authz.md` §4.2, D-144); Workflow needs no
+order read as fulfillment inputs ([08 §4.2](DESIGN.md#contract-08-4-2), D-144); Workflow needs no
 further Lifecycle read.
 Subscriptions' batched overlap read must expose active occupancy and effective
 `maxConcurrentActive` with Catalog/Contract policy provenance; missing limits fail closed,
@@ -345,7 +344,7 @@ Workflow must obtain a committed `report-spawn-signal` before dispatching activa
 that result after ambiguous replies. This closes **order** direct cancellation before dispatch;
 it is not the Workflow task's potentially later unilateral-cancellation boundary. The Workflow
 PRD wording must be reconciled by its owner before release; this document does not claim that
-Product has approved the divergence. See `design/06-workflow-seam.md` §4.3.
+Product has approved the divergence. See [06 §4.3](features/06-workflow-seam.md#contract-06-4-3).
 
 ### 2.7 Event Broker
 
@@ -473,7 +472,7 @@ override API. `ROOT_TENANT_ID` is the conceptual identity, not an assumed export
 
 Event Broker **MUST** honor the explicit envelope tenant when the producer is authorized for it,
 independently of its service-context tenant, and enforce the service grants in
-[`design/08-read-and-authz.md §4.3`](./design/08-read-and-authz.md#43-the-permission-model-normative).
+[authorization contract](DESIGN.md#contract-08-4-3).
 The platform **MUST** reconcile the broker design's producer-supplied tenant contract with wording
 that describes recording the publisher-context tenant. Root-scoped events **MUST NOT** become
 readable merely because a principal has customer, partner or seller access to an Orders API.
@@ -561,7 +560,7 @@ request or approval is implied here.
 
 **Orders-specific responsibility**: configure a trusted service identity for scheduler transitions,
 derive the existing `system` actor class from that configured worker identity (the closed
-`system`/`service`/`user` class of `design/01-foundation.md` §3.7, D-115), and fail closed on
+`system`/`service`/`user` class of [01 §3.7](DESIGN.md#contract-01-3-7), D-115), and fail closed on
 missing identity. Do not borrow the order creator's identity, accept caller-supplied actor values,
 or store anonymous/nil IDs as real principals. Authenticated denials remain audited under D-98;
 unauthenticated traffic belongs to the authentication boundary.
@@ -585,7 +584,7 @@ and operate the PDP provider, provision policies and role assignments, and suppl
 delegation relationships those policies evaluate. Orders does not build a parallel evaluator or
 infer permission from successful registration of an `AuthzPermissionV1` instance.
 
-The authoritative Orders policy contract is `design/08-read-and-authz.md` §3.5 and §4.3: distinct
+The authoritative Orders policy contract is [08 §3.5](DESIGN.md#contract-08-3-5) and §4.3: distinct
 actions, resource/seller/current-payer access paths, complete alternative grants, payer-use authority,
 and existing/proposed arrangement checks. The bounded trusted-maintenance exception there remains
 separate; it does not exempt Workflow or public SDK/REST callers from PDP.
@@ -610,17 +609,17 @@ concrete ask:
 4. **Accepted proof reference (desired).** An allow response that names the proof reference the
    policy accepted, so the audit and access-log entry records verified rather than supplied
    evidence. Until then Orders records the supplied reference on any allowed request that carried
-   one, and the entry means "supplied", not "verified" (`design/08-read-and-authz.md` §4.4).
+   one, and the entry means "supplied", not "verified" ([08 §4.4](DESIGN.md#contract-08-4-4)).
 5. **Allowed-path marker (desired, D-140).** An allow response that says which authorization
    path it allowed — delegated or direct — so Orders can set `orders_order.sales_path` at create
    from the path itself. Until then Orders uses a proxy: `partner_placed` iff the allowed create
    request carried a delegation proof reference, otherwise `self_service`
-   (`design/01-foundation.md` §3.7), counting only the proof the PDP accepted once item 4 is
+   ([01 §3.7](DESIGN.md#contract-01-3-7)), counting only the proof the PDP accepted once item 4 is
    delivered. The proxy is imprecise in both directions (D-146): it over-classifies a caller who
    supplies a proof on its own-tenant create, and it cannot see delegation that begins after
    create, so Orders keys no acceptance control on `sales_path` alone — the submit-time automatic
    acceptance keys on the submit request's own facts and the recording-party bar also compares
-   stored version actors' tenants (`design/05-preconditions.md` §4.2). It is replaced
+   stored version actors' tenants ([05 §4.2](features/05-preconditions.md#contract-05-4-2)). It is replaced
    by the marker once this item is delivered. The marker is read for `sales_path` only; proof
    evaluation stays with policy (D-111).
 
@@ -638,8 +637,7 @@ and correct request/scope handling; platform owners own provider policy behavior
 
 Workflow and event-consumer read restrictions mean explicit finite order-ID grants in **every**
 alternative returned scope — for Workflow's execution operations and for the `order × read` grants
-of the Workflow, Subscriptions and Billing event-consumer principals (`design/08-read-and-authz.md`
-§4.3 *Event-consumer read path*) — enforced using the existing toolkit ID mapping/constraint representation. Verify how the
+of the Workflow, Subscriptions and Billing event-consumer principals ([08 §4.3](DESIGN.md#contract-08-4-3) *Event-consumer read path*) — enforced using the existing toolkit ID mapping/constraint representation. Verify how the
 selected provider provisions, updates and revokes these grants; an execution-correlation string
 alone proves no relationship and cannot grant access. Orders keeps three explicit tenant
 properties with `no_tenant`, not an invented designated owner. The platform-root broker tenant
@@ -668,7 +666,7 @@ must distinguish a line the registry maps to no key from an outage, so Orders ca
 This is the key Subscriptions binds its `overlapScopeKey` default
 `(payerTenantId, catalogSubscriptionProductKey)` to under **`SUB-G1`**, whose shape is being agreed on
 **PR #4177**; Orders adopts that shape and does not define its own. The submit gate resolves it at
-the run's fixed catalog version (`design/03-gate-and-pin.md` §3.6 *Run Gate and Submit* step 4),
+the run's fixed catalog version ([03 §3.6](features/03-gate-and-pin.md#contract-03-3-6) *Run Gate and Submit* step 4),
 persists it as `orders_order_line.overlap_scope_key`, and claims it for the payer under the
 in-flight index. Until the operation exists every submit or amendment refuses with
 `catalog-product-key-unavailable` (fail closed, ADR-0003), because an overlap key derived locally
@@ -688,7 +686,7 @@ already names (Contracts PRD §6.6 *Party eligibility predicate*, consumed by th
 Orders maps an inactive contract to `contract-not-active`, an ineligible party to
 `contract-party-ineligible`, and outage or an unimplemented operation to
 `contract-resolution-unavailable` (fail closed, ADR-0003). The gear has a PRD and no
-implementation or SDK today (`design/03-gate-and-pin.md` §3.5, §4.2 predicate 2).
+implementation or SDK today ([03 §3.5](DESIGN.md#contract-03-3-5), §4.2 predicate 2).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration`
 
@@ -698,7 +696,7 @@ services sold under that contract (`acceptance_required`). This is the declarati
 already requires the contract to carry (Contracts PRD §6.6 *Booking instant and acceptance*: the contract
 "**MUST** declare whether customer acceptance is required"). Orders reads it live — not snapshotted
 at submit — at the acceptance-recording and begin-fulfillment guards, where it outranks the seller
-and platform elections (`design/05-preconditions.md` §3.5, §4.1, D-107, D-132). Until the SDK
+and platform elections ([05 §3.5](DESIGN.md#contract-05-3-5), §4.1, D-107, D-132). Until the SDK
 exists, a contract-referenced order resolves `acceptance-requirement-unevaluable` (fail closed,
 ADR-0003) at both guards; it never falls back to an election.
 
@@ -722,7 +720,7 @@ mitigation exists.
 ## 4. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §13 dependencies, §15 open questions
-- **DESIGN**: [`./DESIGN.md`](./DESIGN.md) §3.5, §3.8; [`./design/01-foundation.md`](./design/01-foundation.md) §3.8, §4.4; [`./design/03-gate-and-pin.md`](./design/03-gate-and-pin.md) §2.2; [`./design/06-workflow-seam.md`](./design/06-workflow-seam.md) §4.2, §4.6
+- **DESIGN**: [`./DESIGN.md`](./DESIGN.md) §3.5, §3.8; [01 §3.8](DESIGN.md#contract-01-3-8), §4.4; [03 §2.2](DESIGN.md#contract-03-2-2); [06 §4.2](DESIGN.md#contract-06-4-2), §4.6
 - **Decisions**: [`./DECISIONS.md`](./DECISIONS.md) — D-32, D-56, D-108, D-111, D-122, D-124, Q-04, Q-05, Q-08
 - **ADRs**: [`./ADR/0003`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) — the fail-closed posture that makes `SUB-O5` a blocker rather than a degradation; [`./ADR/0006`](./ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) — the platform producer path and Event Broker readiness gate
 - **Upstream registers**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`…`SUB-O6`); the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/SEAMS.md` for the three Rating asks; `gears/bss/contracts/docs/PRD.md` §6.6 (*Party eligibility predicate*, *Booking instant and acceptance*) for the Contracts asks; `gears/bss/subscriptions/docs/SEAMS.md` `SUB-G1` (PR #4177) for the catalog-registry product key. Rating and the billing chain **are** specified in this repository — Rating carries a PRD, a DESIGN, ADRs and its own seam register, and the billing chain is specified as `gears/bss/ledger` — so both asks must be raised against those specifications rather than treated as unowned. **Payments alone has no specification and no register**, which is why that one ask is recorded here for whichever specification takes it; the same applies to a distinct tax owner, which `ledger` does not claim to be

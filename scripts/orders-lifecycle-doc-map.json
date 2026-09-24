@@ -1,0 +1,1679 @@
+{
+  "version": 1,
+  "description": "Canonical contract locations. Section keys retain source contract addresses for traceability and invariant checks; paths name current authoritative documents.",
+  "sections": [
+    {
+      "slice": "01-foundation",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-1-1",
+      "sha256": "c1fba9d61bb943fa29ed8975c7b42db8dd540b26440bb373c8b6a54867d967e8",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-1-2",
+      "sha256": "1ea329cc65881aba3a46efe8100fedc5fd7da635cef4d0d01e19c3f1e560b875",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-1-3",
+      "sha256": "c01ff34e21d1b250c6ee6a2303e31d48be7002ce787af17e117fa72251207780",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-tech-foundation-stack"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-2-1",
+      "sha256": "aa76d36d55038aed4d2c5f57d9a53ed9f8b0dcf789fd56d410a828f9b3cc443c",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-atomic-transition-commit",
+        "cpt-cf-bss-orders-lifecycle-principle-guard-declared-not-embedded",
+        "cpt-cf-bss-orders-lifecycle-principle-outcome-store-idempotency",
+        "cpt-cf-bss-orders-lifecycle-principle-append-only-history",
+        "cpt-cf-bss-orders-lifecycle-principle-absence-is-refusal"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-2-2",
+      "sha256": "94d775a29841b8c9db4e664a44975b904900a05a788303e926b3c8f9b419d5d8",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-single-writer",
+        "cpt-cf-bss-orders-lifecycle-constraint-idempotency-window",
+        "cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once",
+        "cpt-cf-bss-orders-lifecycle-constraint-guard-input-ports"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-1",
+      "sha256": "b2777e815c6eaa5aab99be7555dce0b7b8f3518d8b39b3625ef4471927e64b16",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-order-root",
+        "cpt-cf-bss-orders-lifecycle-entity-order-version-chain",
+        "cpt-cf-bss-orders-lifecycle-entity-order-line-identity",
+        "cpt-cf-bss-orders-lifecycle-entity-order-line",
+        "cpt-cf-bss-orders-lifecycle-entity-resolved-total",
+        "cpt-cf-bss-orders-lifecycle-entity-administrative-content",
+        "cpt-cf-bss-orders-lifecycle-entity-transition-record",
+        "cpt-cf-bss-orders-lifecycle-entity-idempotency-record",
+        "cpt-cf-bss-orders-lifecycle-entity-outbox-entry"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-2",
+      "sha256": "ed637042403a0daabeb9535c3971f84679ac5317f1d3da299076bc2a983d824c",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-transition-orchestrator",
+        "cpt-cf-bss-orders-lifecycle-component-guard-registry",
+        "cpt-cf-bss-orders-lifecycle-component-state-table",
+        "cpt-cf-bss-orders-lifecycle-component-idempotency-registry",
+        "cpt-cf-bss-orders-lifecycle-component-audit-store",
+        "cpt-cf-bss-orders-lifecycle-component-outbox-publisher",
+        "cpt-cf-bss-orders-lifecycle-component-reason-registry"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-3",
+      "sha256": "69a80c41903f5fcd93e69746ba788b4b5113611904639104f9f5976fb7d8b381",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-transition-api",
+        "cpt-cf-bss-orders-lifecycle-interface-guard-registration",
+        "cpt-cf-bss-orders-lifecycle-interface-order-read-model"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-4",
+      "sha256": "f85315ae3079da16f0a4db5d797471242709e74ac55464acd51c27432568ab9f",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-5",
+      "sha256": "72fe59707cc204310fc2b4404e6e2349eff39a849b189be5f5bf122e042b19e7",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/01-foundation.md",
+      "anchor": "contract-01-3-6",
+      "sha256": "a23951c4b9cf8c65d7d03c0ae04b3f54b80adb76e4842840f46cc0cd5d8afdaf",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-transition-commit",
+        "cpt-cf-bss-orders-lifecycle-seq-create-transition",
+        "cpt-cf-bss-orders-lifecycle-seq-idempotent-replay",
+        "cpt-cf-bss-orders-lifecycle-seq-outbox-drain"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-7",
+      "sha256": "ee5ed4c51fafc13a11682574e99f060c3213b51753f302ec06d4e4b80e9e8bf4",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-db-foundation-schema",
+        "cpt-cf-bss-orders-lifecycle-dbtable-event-outbox",
+        "cpt-cf-bss-orders-lifecycle-dbtable-order",
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-version",
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-line-identity",
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-line",
+        "cpt-cf-bss-orders-lifecycle-dbtable-inflight-overlap-claim",
+        "cpt-cf-bss-orders-lifecycle-dbtable-draft-content",
+        "cpt-cf-bss-orders-lifecycle-dbtable-administrative-content",
+        "cpt-cf-bss-orders-lifecycle-dbtable-resolved-total",
+        "cpt-cf-bss-orders-lifecycle-dbtable-transition-audit",
+        "cpt-cf-bss-orders-lifecycle-dbtable-audit-checkpoint",
+        "cpt-cf-bss-orders-lifecycle-dbtable-audit-checkpoint-member",
+        "cpt-cf-bss-orders-lifecycle-dbtable-idempotency",
+        "cpt-cf-bss-orders-lifecycle-dbtable-line-fulfillment",
+        "cpt-cf-bss-orders-lifecycle-dbtable-acceptance"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-3-8",
+      "sha256": "fdf37dae3303e6a36688be7c0579ec28ee6fd77e8e30b6172c9c3658aa75df83",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-topology-foundation-runtime"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.1",
+      "title": "The Transition Contract (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-1",
+      "sha256": "36641b891bb30bf970d7a181a68f76e47790122fac0b40d0dd120f5cba0cf49b",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.2",
+      "title": "Idempotency Semantics (normative)",
+      "target": "features/01-foundation.md",
+      "anchor": "contract-01-4-2",
+      "sha256": "269191be63dde3bc7217a58002efacba551871b289cc6d330b98038b012c5edd",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.3",
+      "title": "The State Machine (normative)",
+      "target": "features/01-foundation.md",
+      "anchor": "contract-01-4-3",
+      "sha256": "109cbd2673f0e7ba8b183dda9bcc77d3a373027e84ae4d1b445565ca0bf02043",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-state-order-lifecycle"
+      ]
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.4",
+      "title": "Events, Audit and the Outbox (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-4",
+      "sha256": "8feda64ec48ee24757b90f129c3341824411662e3ca6a15ca2b3f6f228a23e77",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.5",
+      "title": "What this slice deliberately does not own",
+      "target": "features/01-foundation.md",
+      "anchor": "contract-01-4-5",
+      "sha256": "503700820ea7f13d86f8c8240ddcc3f58d9bdc8bdfd53cb87a60b363f87776b2",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.6",
+      "title": "Extension points and stability (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-6",
+      "sha256": "2e4ddb83f8ec6c022da6e4b4eff18c6a2af60453fedf624dc59dccbadf03b751",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.7",
+      "title": "GTS types for the cross-gear contract surface (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-7",
+      "sha256": "502ccdd4cf6114f65facca1a5253bea45d8f2a8ee4eaa86f06dd3805a7176c5d",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.8",
+      "title": "What is deliberately not GTS",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-8",
+      "sha256": "dbefdcf4c75b9c56aba39a754d43e005c679383196aa786cb53f0e89c6ab5523",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "4.9",
+      "title": "What this section changed, and why it is recorded",
+      "target": "DESIGN.md",
+      "anchor": "contract-01-4-9",
+      "sha256": "c19797b86384ebfe93c0b27dd3ab33b6bbc7e7709184176f87c0c3b19ebae772",
+      "ids": []
+    },
+    {
+      "slice": "01-foundation",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/01-foundation.md",
+      "anchor": "contract-01-5",
+      "sha256": "2f5d92890dd33bf2f586649f758769c9c6592d99b2a12e49caadcdd770b46eec",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-1-1",
+      "sha256": "1b25529db99e047a80d3fd1e22bd6b6600c76d76cc86ce381ced3fac631f60e4",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-1-2",
+      "sha256": "3f27ff17b3a40303d9d63f333a4e7dd483e79ed3f400cb6af3fd51749025b620",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-1-3",
+      "sha256": "edfbb0d155814e3ddde92e1dfcbbd9aedcd65020e268358e2f40f62b995c5a15",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-2-1",
+      "sha256": "8d92b41aab2d46778dc415a1c13fd658293488c006c317dc952e6afdab1ef0dd",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-draft-is-unvalidated",
+        "cpt-cf-bss-orders-lifecycle-principle-line-identity-stable",
+        "cpt-cf-bss-orders-lifecycle-principle-field-class-declared"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-2-2",
+      "sha256": "46c1403dc5d51849f50ad9bc838a27ffe59177ede1929c6b8e03bb82e14a916b",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-single-currency-basket",
+        "cpt-cf-bss-orders-lifecycle-constraint-change-category-refused",
+        "cpt-cf-bss-orders-lifecycle-constraint-single-payer",
+        "cpt-cf-bss-orders-lifecycle-constraint-no-addon-selection"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-1",
+      "sha256": "dc6ace28f0500c980c1f072daa5ecf0619e7bb1b1beb21dcb03181e26cda8721",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-line-date-set"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-2",
+      "sha256": "9051b813b21c8f2255a57d772637a02365a7dda75c4e254cfd461b32bc214384",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-capture-line-model",
+        "cpt-cf-bss-orders-lifecycle-component-capture-field-classifier"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-3",
+      "sha256": "d8ccf1696918093602251508baa3f119d753d26141daec1511f2a2ad5dfb0e19",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-capture-ops"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-4",
+      "sha256": "a1ef026b9a703a92c826b7709958bd69fb788d9e2d09e190f03770a132f47368",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-5",
+      "sha256": "4f46e6aab3cb2e2d74c93cecd35239d4d00c691564fb0a586113570e506770fd",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/02-capture.md",
+      "anchor": "contract-02-3-6",
+      "sha256": "2f215b37378e3355a147a0d5e21f436205e58251632ad722499aaa18fc057d15",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-create-draft",
+        "cpt-cf-bss-orders-lifecycle-seq-author-line",
+        "cpt-cf-bss-orders-lifecycle-seq-edit-order",
+        "cpt-cf-bss-orders-lifecycle-seq-edit-or-remove-line"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-7",
+      "sha256": "315105041a227490d93fee9551c5083b233863a85f776d8cee7eb4c42033f5d3",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-date-policy"
+      ]
+    },
+    {
+      "slice": "02-capture",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-3-8",
+      "sha256": "c2d09eb505a2cb1c29f56f49c19ff88797ff59c8ae2ca558d0db0f0d6e8ba9d3",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "4.1",
+      "title": "What a draft may and may not hold (normative)",
+      "target": "features/02-capture.md",
+      "anchor": "contract-02-4-1",
+      "sha256": "9fb9b7ad39601a1c57002fc1a3b31b2760b7ad1ce067642f7640e1ef4390be59",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "4.2",
+      "title": "The date cascade (normative)",
+      "target": "features/02-capture.md",
+      "anchor": "contract-02-4-2",
+      "sha256": "57e0b182a5c78fdbf8a94ad43c414b1d4d43208195c20fe6b513c7c0219856dd",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "4.3",
+      "title": "Field classification (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-4-3",
+      "sha256": "5e41bc3f59bea2ac29b4ddc6180e7510f8e6d860fab122512328cdf281c2b203",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "4.4",
+      "title": "Line shapes that are one line (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-02-4-4",
+      "sha256": "55d6854c5dc842485146103b4190c6a7692d2695ed1f474c7b2eb7670e654956",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "4.5",
+      "title": "Draft abandonment",
+      "target": "features/02-capture.md",
+      "anchor": "contract-02-4-5",
+      "sha256": "3ba81eef818cf7fcdacd0d20886c35527616433efd78828605e8db7475b6be50",
+      "ids": []
+    },
+    {
+      "slice": "02-capture",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/02-capture.md",
+      "anchor": "contract-02-5",
+      "sha256": "1c477cac0fe1847f0ace3d971654f2588b06189ec98c460cae19612a01935818",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-1-1",
+      "sha256": "a91ffe77432bd4f4f633bb69d6ba84c6db682849c2596aabe8728cce8875133a",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-1-2",
+      "sha256": "ba743386e7c9d7db3eedcd1719903f88ab2936070b42f53517702dd1762d66d1",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-1-3",
+      "sha256": "df5f64c07ec06e6d72f5b61862052d2b33c9f18ac596b011660ea8ec40e59516",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-2-1",
+      "sha256": "fb1061ca0c58fe0302e528762cd6df4ebddf43b085bbf8ad84deca9b39be6320",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-adopt-not-fork-gate",
+        "cpt-cf-bss-orders-lifecycle-principle-pin-is-the-commit",
+        "cpt-cf-bss-orders-lifecycle-principle-resolve-outside-decide-inside",
+        "cpt-cf-bss-orders-lifecycle-principle-preview-shares-implementation"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-2-2",
+      "sha256": "704a9b00573d9d89858d4d5142c932b1a0a145aa610a2ea9b94d6f5a1f607b65",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-port-budgets",
+        "cpt-cf-bss-orders-lifecycle-constraint-partial-predicate-evaluability",
+        "cpt-cf-bss-orders-lifecycle-constraint-overlap-read-unagreed",
+        "cpt-cf-bss-orders-lifecycle-constraint-overlap-key-partner-collision",
+        "cpt-cf-bss-orders-lifecycle-constraint-total-excludes-subscription-overlays"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-1",
+      "sha256": "5c4c99d3846d9f766b34fbb033d8989101e662c16d8b4ac56bd37f4bc6632214",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-catalog-price-pin",
+        "cpt-cf-bss-orders-lifecycle-entity-order-market",
+        "cpt-cf-bss-orders-lifecycle-entity-gate-outcome"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-2",
+      "sha256": "109d56665f8517948130e78eaf7f958fc08196da53bd3547c3b8c4d24311fc17",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-gate-predicate-orchestrator",
+        "cpt-cf-bss-orders-lifecycle-component-gate-pin-capture",
+        "cpt-cf-bss-orders-lifecycle-component-gate-preview"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-3",
+      "sha256": "747b69b14770564c6947ee706f241585d41d86db870c80387679af37867cbf06",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-gate-ops",
+        "cpt-cf-bss-orders-lifecycle-interface-gate-ports"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-4",
+      "sha256": "7b1ac9304882382db629d939cc89902e4b8bae069d886cb01d5cb8c89437c14f",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-5",
+      "sha256": "1bdf7dfdf77c2a286b68dd8b03006d093276bbef13b12e24a871c2c9494e3e40",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/03-gate-and-pin.md",
+      "anchor": "contract-03-3-6",
+      "sha256": "caac9114aec390b9cd0c008b0288eeb5c8c7d5b7bad7cd6e4817e5117d973708",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-gate-submit",
+        "cpt-cf-bss-orders-lifecycle-seq-gate-preview",
+        "cpt-cf-bss-orders-lifecycle-seq-gate-fulfillment-recheck"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-7",
+      "sha256": "cc1c6d12830005e6263a80211034840711ebb683cfaca68097365c7916751acb",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-gate-outcome"
+      ]
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-3-8",
+      "sha256": "4e70cc9ee2ba12ab03c19878a6d10a37ab82912fba74973048d9c74fe444709d",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.1",
+      "title": "The adopted predicate set (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-4-1",
+      "sha256": "c21b2051f0f7633b5a9c41846fbede39d5124d0eb1d6d32f034e1a343daf4c7f",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.2",
+      "title": "The Orders delta (normative)",
+      "target": "features/03-gate-and-pin.md",
+      "anchor": "contract-03-4-2",
+      "sha256": "efce6f92523dfbd580b9e8716211c0b53b703c45818173e13ad256baa21d304e",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.3",
+      "title": "The catalog price pin (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-4-3",
+      "sha256": "4ded4f9331b8d1aa0a824e979fb03f8435ef2296c37ca9d4f6e44ed25a0fab1e",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.4",
+      "title": "The resolved total and TCV (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-4-4",
+      "sha256": "24cbbf0f473a742e2bff408f019e6823d3151961072d2b977b4c13c66b124347",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.5",
+      "title": "What the order-time total excludes (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-03-4-5",
+      "sha256": "8ab23ebe18718c794f2329888db6428f073a2925ecf93b4b7e64259add4c54f3",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "4.6",
+      "title": "Preview (normative)",
+      "target": "features/03-gate-and-pin.md",
+      "anchor": "contract-03-4-6",
+      "sha256": "97876caf5c5f505fcdd2e561d66c0ddf8fad8c1bf074d1ec74a7127664c8c137",
+      "ids": []
+    },
+    {
+      "slice": "03-gate-and-pin",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/03-gate-and-pin.md",
+      "anchor": "contract-03-5",
+      "sha256": "a598da707e503a83926cda1e72f18fe9d190057712c092de2536b541d2a72a4b",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-1-1",
+      "sha256": "2aa19b7040ab4ae5702b9d25d6ed8e593edef2067255c8dc5ea6df35118cb427",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-1-2",
+      "sha256": "4619a7632a28ea0bc7b76e3d02ea52a7ae3354cc2fac6ab7adedba4d82312105",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-1-3",
+      "sha256": "bd2d3b6757c31f31a846a63545018df42fe01b459ee87630a6105b58402b8252",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-2-1",
+      "sha256": "951e14bb201b6dd555f333c6cc70b93d8c4ce86279bc89207cc5d8616506ee7f",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-version-is-concurrency",
+        "cpt-cf-bss-orders-lifecycle-principle-amend-by-append",
+        "cpt-cf-bss-orders-lifecycle-principle-carry-forward-reresolve",
+        "cpt-cf-bss-orders-lifecycle-principle-amendment-not-state-first"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-2-2",
+      "sha256": "aa5af7b0a382e13eeb88aa9691cd7f8cb4a1fb559924798f4f7053a6741caffa",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-no-amendment-in-fulfillment",
+        "cpt-cf-bss-orders-lifecycle-constraint-reapproval-target-external",
+        "cpt-cf-bss-orders-lifecycle-constraint-paired-payer-seller-rebinding"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-1",
+      "sha256": "4075ddf6f77fd47f8db3ef25123aefe35641b290edb5bd654bc4b236d0bddf3d",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-amendment-request",
+        "cpt-cf-bss-orders-lifecycle-entity-administrative-edit"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-2",
+      "sha256": "fee3e8277102f1ee5cd5391214f50c323289a13c241f756b8151754dbfce7e83",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-versioning-appender",
+        "cpt-cf-bss-orders-lifecycle-component-versioning-reader"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-3",
+      "sha256": "99fc041380cd60be3b406a1a61d390f4ae1badf46d104f324d2e967f2ff5b515",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-versioning-ops"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-4",
+      "sha256": "2622077cdf5f35ac6cc8a1a52d9f9ef9fe88ea9b0457da0ab6ac4508b6193179",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-5",
+      "sha256": "5c371828f9054d2c86e1b85b9ac42cecdee121fffc266be65c0bbbdddc9075d5",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-3-6",
+      "sha256": "ffc7822f2bc6c6fca51a70bfdf7ea32f1f6cf90c24bbfe57a3d771b65faba004",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-amend-order",
+        "cpt-cf-bss-orders-lifecycle-seq-administrative-edit"
+      ]
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-7",
+      "sha256": "08caa17621bcbeced2c8486e1ca284ec4556dc7c908bdd12df7b9eb43cb92731",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-04-3-8",
+      "sha256": "34d4774c55cd9ba282035405989b2ad2d044086f7e33692b48c06fc879258f60",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.1",
+      "title": "Admissibility (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-1",
+      "sha256": "bf66a3985978ad46dd0127c0c97106a4b570671437ec5f45e436203743a68efc",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.2",
+      "title": "Carry forward and re-resolve (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-2",
+      "sha256": "adde2592c0da73c2d1e9be6a41bf4d12840d6503849ae3185db8608ad73a61db",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.3",
+      "title": "Re-approval is a two-step seam interaction (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-3",
+      "sha256": "f81e7d83b8db4da1108d304a89171c841b318a5612240ef84343f0e42ba842da",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.4",
+      "title": "Stale results (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-4",
+      "sha256": "47ff4444b6425733e180140e06749d104a882208e1db9df0cf5fb95ec1154751",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.5",
+      "title": "Version history (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-5",
+      "sha256": "e237b538b9ce071c90cdbbb884ff6b4022888ba70449af181d5dcad0fbf34919",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "4.6",
+      "title": "Administrative edits are last-write-wins (normative)",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-4-6",
+      "sha256": "ca8d13d08fef975495899607172880093dc9bc91f37ceeee433ed9583ccea517",
+      "ids": []
+    },
+    {
+      "slice": "04-versioning",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/04-versioning.md",
+      "anchor": "contract-04-5",
+      "sha256": "48c81f956fcd0ae0858a9cedc95b64ad03ce4651ef60632de34c986ce6457325",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-1-1",
+      "sha256": "70eabd19de909f2e31360feec23ea1b5526f6903ba257d5e6d71f59e556ce546",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-1-2",
+      "sha256": "3a7c0ff3914929e87102ee27f5e9913868e3b010472edf6a91c43155e9bf8ffe",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-1-3",
+      "sha256": "2882b2cd4f22f4c6808ae9a619f28188938aa83af8c1662be25197e15afca233",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-2-1",
+      "sha256": "9da64596e532896aab06532dc29490dc1bf4f41af83a7572e0f26b7939615ce3",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-acceptance-never-defaulted",
+        "cpt-cf-bss-orders-lifecycle-principle-agreement-not-delegation",
+        "cpt-cf-bss-orders-lifecycle-principle-authorization-read-not-owned"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-2-2",
+      "sha256": "57106b1ae10def4f51ad592be6d6a82628540bc338f9451413dc7d488f8df806",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-no-payment-pending-state",
+        "cpt-cf-bss-orders-lifecycle-constraint-declined-instrument-exit",
+        "cpt-cf-bss-orders-lifecycle-constraint-no-payment-collection"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-1",
+      "sha256": "7189bb107f5e124130523562b471dbe94a4ed7dafa74e3bd5dba91c23068b2f4",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-acceptance-record",
+        "cpt-cf-bss-orders-lifecycle-entity-authorization-outcome"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-2",
+      "sha256": "85a5792660e2790d536248e499e289d6924c4b251a723b24af950afce82d9949",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-preconditions-acceptance",
+        "cpt-cf-bss-orders-lifecycle-component-preconditions-money-gate"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-3",
+      "sha256": "1091d7f999f18b1e6da7dcafa40c6f667f76fdec60ad24dc68a9145773792d56",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-preconditions-ops"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-4",
+      "sha256": "0478d2a99887a94c5e012036a8acddef0a8a698433f5a817a79a4ae13a6ebf03",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-5",
+      "sha256": "3e236d74a4bf15b8f0933c4aa862322b1b801f2f534421e28df2126d00e6d7a9",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/05-preconditions.md",
+      "anchor": "contract-05-3-6",
+      "sha256": "61a451683db21ef82fc4f24db556736373f40da3ec8a485223cd0fe235674716",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-record-acceptance",
+        "cpt-cf-bss-orders-lifecycle-seq-self-service-acceptance",
+        "cpt-cf-bss-orders-lifecycle-seq-begin-fulfillment-guards"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-7",
+      "sha256": "60ace4507d19bead04ad9210df6f53c9ac82899e2909a06bee1e2e004848eac5",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-policy-election"
+      ]
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-3-8",
+      "sha256": "0337508b97e04ebce8c05bf5486db8f1eebe7156c49b4d8eea1fe537b6719628",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "4.1",
+      "title": "The acceptance-required election (normative)",
+      "target": "features/05-preconditions.md",
+      "anchor": "contract-05-4-1",
+      "sha256": "027382e3d59a6ad101ff2f2b5d496603f123a7e6766d38b12d7412c512c81a3a",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "4.2",
+      "title": "Acceptance on the two paths (normative)",
+      "target": "features/05-preconditions.md",
+      "anchor": "contract-05-4-2",
+      "sha256": "6e18e5e388fa7c2ab64a62857333664408a3acaec71c836e92d2a767da60735b",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "4.3",
+      "title": "Authorization as a guard input (normative)",
+      "target": "features/05-preconditions.md",
+      "anchor": "contract-05-4-3",
+      "sha256": "36320499472013b4908fd40bc78b9583d34e02fbd78d1d294e8a1eb589c7d230",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "4.4",
+      "title": "What this design cannot express (normative statement of limitation)",
+      "target": "DESIGN.md",
+      "anchor": "contract-05-4-4",
+      "sha256": "889019f76ce12eb4657e77760c1711ca7dcd5ddbe081dbd5cd528a9b8eb5f349",
+      "ids": []
+    },
+    {
+      "slice": "05-preconditions",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/05-preconditions.md",
+      "anchor": "contract-05-5",
+      "sha256": "e86f78855f0ada5336e6ad3f9d1dd974a02e371c253d30c9df7c45be7eba051d",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-1-1",
+      "sha256": "9dae13fa672c4d67d16c9b46584adde5dfdea0cdfdd06caca37012d537db26dd",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-1-2",
+      "sha256": "d437a6922b8e27daa3c23af449683dd8a634d4a5480da832410866ef7f7cda11",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-1-3",
+      "sha256": "6c7091ddec3ac677f37582d784dbb3445cca25310030cd87bc0a6eb0d4f8f55c",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-2-1",
+      "sha256": "d84076c52a45c5c51161db76818a8ede0aa98fa014c3c9938582b8a1450e9fab",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-workflow-is-ordinary-caller",
+        "cpt-cf-bss-orders-lifecycle-principle-store-verdict-not-reasoning",
+        "cpt-cf-bss-orders-lifecycle-principle-commit-anchor-before-risk",
+        "cpt-cf-bss-orders-lifecycle-principle-outcome-not-mirror"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-2-2",
+      "sha256": "79fc9049071ab82e143559b61eb8b878dcb0b11b6592f99fbe23b7e092fda610",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-approval-owner-absent",
+        "cpt-cf-bss-orders-lifecycle-constraint-compensation-reason-unagreed",
+        "cpt-cf-bss-orders-lifecycle-constraint-provenance-one-directional",
+        "cpt-cf-bss-orders-lifecycle-constraint-correlation-propagation-unagreed"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-1",
+      "sha256": "674a77b9b36c89537cf6f9c08f8688dcf2a3f15ca21e121fef5cd3dbc4c8f7f9",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-approval-reflection",
+        "cpt-cf-bss-orders-lifecycle-entity-spawn-signal",
+        "cpt-cf-bss-orders-lifecycle-entity-fulfillment-acknowledgement",
+        "cpt-cf-bss-orders-lifecycle-entity-line-fulfillment-projection"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-2",
+      "sha256": "d9226b258f5592952521e22c0cfc81807de2d1b965f23e1fd7d4c8e8aac72135",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-seam-verdict-reflector",
+        "cpt-cf-bss-orders-lifecycle-component-seam-fulfillment-coordinator",
+        "cpt-cf-bss-orders-lifecycle-component-seam-line-projection"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-3",
+      "sha256": "823d21c60bdb615d6648d0f0bc0e43cf26a33ee9ae3638154a17651d4956fc68",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-seam-ops"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-4",
+      "sha256": "953171a433eb6f8e9b6bae4be747e56550d7d8112a36dcfceb33ca9c95d3c1e2",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-5",
+      "sha256": "70cd17c4844ca67e4a7dd09ddea7074d60eb33b5f1bf08f32e265e47268abe78",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/06-workflow-seam.md",
+      "anchor": "contract-06-3-6",
+      "sha256": "8f0b13e1e88c4fd47b948d28bd5329c936ab54c4cb841a8199ec41a8da13ba04",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-reflect-verdict",
+        "cpt-cf-bss-orders-lifecycle-seq-begin-and-spawn",
+        "cpt-cf-bss-orders-lifecycle-seq-acknowledge-fulfillment",
+        "cpt-cf-bss-orders-lifecycle-seq-seam-cancel-guard",
+        "cpt-cf-bss-orders-lifecycle-seq-workflow-cancel"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-7",
+      "sha256": "f219c94872b4f7f566587f79c54cf1054362925ce3ed0b28debfec998a5cf2f0",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-approval-reflection"
+      ]
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-3-8",
+      "sha256": "e239ef8f109c72ea9bc9b34f5f92b54cb4deaf5fddc42e0c3e648081cf0a0a95",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.1",
+      "title": "The five operations are ordinary transitions (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-4-1",
+      "sha256": "028dc3ff9369ab5002af99d6fae8b0cd9c6086ead3afbbc6aa5c3bfd70e77256",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.2",
+      "title": "Verdicts and the deciding authority (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-4-2",
+      "sha256": "d2d25120c444f2077837f35bd875c6baba73cb4e1821c9e945ed45160cac1b60",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.3",
+      "title": "Begin fulfillment and the spawn signal (normative)",
+      "target": "features/06-workflow-seam.md",
+      "anchor": "contract-06-4-3",
+      "sha256": "0488b08848e7591a7ece4bd5a6466bad237ec80da7b503f8b92a5d457f4891cf",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.4",
+      "title": "Acknowledgement (normative)",
+      "target": "features/06-workflow-seam.md",
+      "anchor": "contract-06-4-4",
+      "sha256": "c92880f810d54222aaa1013ae984a5e6f0f601ef88b2de0c65b71d39e662adbc",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.5",
+      "title": "The per-line projection is not a state machine (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-4-5",
+      "sha256": "e156a386ebec9fb7d5844652a07dac893a814aba2482e688ddee1cc532bf8f2a",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "4.6",
+      "title": "The upstream asks this slice depends on",
+      "target": "DESIGN.md",
+      "anchor": "contract-06-4-6",
+      "sha256": "733c97e58a79dea16aa2373af2acb35530c0419eff6f47caa08984777db45e30",
+      "ids": []
+    },
+    {
+      "slice": "06-workflow-seam",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/06-workflow-seam.md",
+      "anchor": "contract-06-5",
+      "sha256": "c354cfba129e28914ed01db7791f81a8de22a015149de345a57d7bcded5f2ac9",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-1-1",
+      "sha256": "2d855d5ad4d3283cb8947cf0c27825afd7fe24f00c841723bdb491877d7feccb",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-1-2",
+      "sha256": "63c7d6929f846817bc81ced870dcd9a33c48c10c720c377ec5d27594f882ef3c",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-1-3",
+      "sha256": "9aa4357529e688250d01857e2266d64f84be267a3b0b153f8356aa8a3fcf5348",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-2-1",
+      "sha256": "8f9d49f22a68171c6ea1e1adc0d4adb9ab32046eaff0c39900f8001c15bef3c2",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-hold-changes-only-order",
+        "cpt-cf-bss-orders-lifecycle-principle-prehold-stored",
+        "cpt-cf-bss-orders-lifecycle-principle-exemptions-in-table",
+        "cpt-cf-bss-orders-lifecycle-principle-resume-is-capped",
+        "cpt-cf-bss-orders-lifecycle-principle-park-does-not-stop-clock"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-2-2",
+      "sha256": "c9e481a8a795a85d68d8f5b6df1d32b269ce9673a59484bad056df993f251a90",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-in-fulfillment-not-expirable",
+        "cpt-cf-bss-orders-lifecycle-constraint-hold-does-not-pause-draft-ttl",
+        "cpt-cf-bss-orders-lifecycle-constraint-ttl-values-unchosen"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-1",
+      "sha256": "9762dfda3a41602f38f78d0be3ba3f27329a0a0558190c8fd5c036fede4b574e",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-hold-record",
+        "cpt-cf-bss-orders-lifecycle-entity-state-ttl-policy",
+        "cpt-cf-bss-orders-lifecycle-entity-resume-cap"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-2",
+      "sha256": "ef85f7de2bc5ca85d7fe3dbe85b0fdb769eb0829d696c80d2f7c96375beb6e1b",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-hold-handler",
+        "cpt-cf-bss-orders-lifecycle-component-expiry-scheduler",
+        "cpt-cf-bss-orders-lifecycle-component-draft-sweep"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-3",
+      "sha256": "b90e677a1f26a5bbe05c81242115c99b8ce0090dbc4c63fa04504e4db4241f2f",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-hold-ops"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-4",
+      "sha256": "a420af4fae6c00fde2f202028680948e73a9f210b8bc2af33292fd98ab993e20",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-5",
+      "sha256": "a8c7aa1c87611391d57f08f3f0b6e7ca1ab1892313225978b9c6ef9eb3b5ce52",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-3-6",
+      "sha256": "ba3609e403fd3d5e69ca06294a22ce2cf8df07d120b32a7d4f50287d76e4f382",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-hold-resume",
+        "cpt-cf-bss-orders-lifecycle-seq-expiry-sweep",
+        "cpt-cf-bss-orders-lifecycle-seq-overdue-handoff"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-7",
+      "sha256": "b40a8b21ea2bc3b248787717856f05997266a0ea0b4c7e9b07bc8b0d407b0660",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-state-ttl-policy"
+      ]
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-3-8",
+      "sha256": "044a08f127d1b4ed011275a0a404400f9ed481f12d63c2cbaa2c76cd7fea20e9",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.1",
+      "title": "Hold and resume (normative)",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-4-1",
+      "sha256": "b46b018c764314897a807b9ca9d6f5403349407460e01cab21b768c934d79a52",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.2",
+      "title": "Bounded lifetime (normative)",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-4-2",
+      "sha256": "af389536c8b629646dc0c496bf59d882deb36e6f91264fb8c4c1e845817a2edd",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.3",
+      "title": "The `in_fulfillment` exemption (normative)",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-4-3",
+      "sha256": "116525e26ff52ebffbd7a2c03ae7417144457c1a22e2c8c6be4ccff323dc6556",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.4",
+      "title": "Draft abandonment (normative)",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-4-4",
+      "sha256": "b20509e1f8cfa3d5d410e7306f5e88dd84badb55a9d6caea7cb5b7e4e2e717dd",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.5",
+      "title": "Policy values (open)",
+      "target": "DESIGN.md",
+      "anchor": "contract-07-4-5",
+      "sha256": "9eb68ca0d3a240f4e2ec8a414b44ec4a9a6d052707b0250e045687d651e54180",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "4.6",
+      "title": "The ordinary cancel operation (normative)",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-4-6",
+      "sha256": "3f6bd1a9e94bb555d83060db5fc72cc4d7bc1d5191bf24ab076e0a622daf4b05",
+      "ids": []
+    },
+    {
+      "slice": "07-hold-and-expiry",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/07-hold-and-expiry.md",
+      "anchor": "contract-07-5",
+      "sha256": "0c7add2cc15150ed14f7426f7fbf054e5219ea0052dced76f96f7b5f9788f571",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "1.1",
+      "title": "Architectural Vision",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-1-1",
+      "sha256": "4246b96a040e33c67f04d9fb84d2a729bee097cc3e8170837a711b61349c1255",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "1.2",
+      "title": "Architecture Drivers",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-1-2",
+      "sha256": "cc74c5a4d87aaa33183c0729f56b937fc630b37db8aa580aba87c03e9d2be0cf",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "1.3",
+      "title": "Architecture Layers",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-1-3",
+      "sha256": "7ed6c0dafcd99e543c0fe9dd58215e682b69d253bdb5dc08709a79aebf003347",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "2.1",
+      "title": "Design Principles",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-2-1",
+      "sha256": "0f5da93159fbc20fd177629a0d06ea3db852c8a92f42b6230394eb1796b611f3",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-principle-read-row-not-chain",
+        "cpt-cf-bss-orders-lifecycle-principle-scope-by-relationship",
+        "cpt-cf-bss-orders-lifecycle-principle-no-internal-exposure",
+        "cpt-cf-bss-orders-lifecycle-principle-one-permission-model"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "2.2",
+      "title": "Constraints",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-2-2",
+      "sha256": "fa40e585abfca424c1632a81492eb739fade018cd1dbbb69f6fede0f05abfde4",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-constraint-read-fails-closed",
+        "cpt-cf-bss-orders-lifecycle-constraint-delegation-proof-required",
+        "cpt-cf-bss-orders-lifecycle-constraint-bounded-page-size"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.1",
+      "title": "Domain Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-1",
+      "sha256": "52ea95a912953f31df232179f97f8ae10f75afcacece365dade450866ad73d8f",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-entity-order-read-view",
+        "cpt-cf-bss-orders-lifecycle-entity-permission-declaration"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.2",
+      "title": "Component Model",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-2",
+      "sha256": "0ab10d4ad7c43ddde6f062b21a3becc1c37eb57da38f901fdda1e3e23bf62b8e",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-component-read-projection",
+        "cpt-cf-bss-orders-lifecycle-component-authz-declaration"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.3",
+      "title": "API Contracts",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-3",
+      "sha256": "a4cd382d4dea2cc4d96aaf16250913a341ee934b5155dd1fd625163250822cc1",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-interface-read-ops"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.4",
+      "title": "Internal Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-4",
+      "sha256": "2efe78c19e5df479eddf139ed35d14409f43a9bf949697727f9b4b02668b41f4",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.5",
+      "title": "External Dependencies",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-5",
+      "sha256": "d92d23f87c2facdb2c002fce607a77edccaa7141b35f2fdf11bc4065da701cc5",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.6",
+      "title": "Interactions and Sequences",
+      "target": "features/08-read-and-authz.md",
+      "anchor": "contract-08-3-6",
+      "sha256": "b8cada4a9196d45cc7c97b3a283441d776968ec2fe1e16c86a31b4a940fbf695",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-seq-scoped-read",
+        "cpt-cf-bss-orders-lifecycle-seq-list-orders",
+        "cpt-cf-bss-orders-lifecycle-seq-audit-read"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.7",
+      "title": "Database Schemas and Tables",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-7",
+      "sha256": "aff4069dd3b9d9fdf04d161dad59618dc3207ceb5bbdf4f4e3a8da06a664a4f6",
+      "ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-read-access-log"
+      ]
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "3.8",
+      "title": "Deployment Topology",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-3-8",
+      "sha256": "6397db6f46c2aa853ee9cf57abc3e178828a38c501512aba96d1e03c1c8b8aea",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "4.1",
+      "title": "The read projection (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-4-1",
+      "sha256": "64d68dd5c4d8faacba448ff817a5a4a440ebd4285620b07b9112d1e2474679e7",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "4.2",
+      "title": "What a read exposes (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-4-2",
+      "sha256": "6e1fa3004a655c3c63147947108973dd8cea7fe5631c57e0a74521401ccfa73b",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "4.3",
+      "title": "The permission model (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-4-3",
+      "sha256": "8d25280bceb2d54937fe5caca18281e6653564494f694cb580c89838ec5d9ed6",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "4.4",
+      "title": "Delegation proof (normative)",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-4-4",
+      "sha256": "f59a06b3bf275f5f783af56ddaba0c838e82e1894e1e3d6e786ab1f08a040227",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "4.5",
+      "title": "Policy values",
+      "target": "DESIGN.md",
+      "anchor": "contract-08-4-5",
+      "sha256": "c4f6e1f11c08754c01f81e0480f66ee2d6ce809ad3f20d1bfdcb4aa6d6444c11",
+      "ids": []
+    },
+    {
+      "slice": "08-read-and-authz",
+      "section": "5",
+      "title": "Traceability",
+      "target": "features/08-read-and-authz.md",
+      "anchor": "contract-08-5",
+      "sha256": "9629b3a5a3e6f1cbee2aa669577e8cf2416c473ddf41d182cc25eb1b8566ef8b",
+      "ids": []
+    }
+  ],
+  "root_ids": {
+    "01-foundation": "cpt-cf-bss-orders-lifecycle-design-foundation",
+    "02-capture": "cpt-cf-bss-orders-lifecycle-design-capture",
+    "03-gate-and-pin": "cpt-cf-bss-orders-lifecycle-design-gate-and-pin",
+    "04-versioning": "cpt-cf-bss-orders-lifecycle-design-versioning",
+    "05-preconditions": "cpt-cf-bss-orders-lifecycle-design-preconditions",
+    "06-workflow-seam": "cpt-cf-bss-orders-lifecycle-design-workflow-seam",
+    "07-hold-and-expiry": "cpt-cf-bss-orders-lifecycle-design-hold-and-expiry",
+    "08-read-and-authz": "cpt-cf-bss-orders-lifecycle-design-read-and-authz"
+  }
+}

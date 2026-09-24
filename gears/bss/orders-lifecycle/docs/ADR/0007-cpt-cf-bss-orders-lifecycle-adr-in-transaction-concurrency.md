@@ -17,7 +17,7 @@ decision-makers: BSS Orders team
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [A claim table with a partial unique index (chosen)](#a-claim-table-with-a-partial-unique-index-chosen)
   - [Application-level counting under the aggregate row lock](#application-level-counting-under-the-aggregate-row-lock)
-  - [`SERIALIZABLE` isolation for transitions touching an overlap key](#serializable-isolation-for-transitions-touching-an-overlap-key)
+  - [SERIALIZABLE isolation for transitions touching an overlap key](#serializable-isolation-for-transitions-touching-an-overlap-key)
   - [A PostgreSQL advisory lock on the hashed key](#a-postgresql-advisory-lock-on-the-hashed-key)
   - [An upstream reservation in Subscriptions](#an-upstream-reservation-in-subscriptions)
 - [More Information](#more-information)
@@ -68,13 +68,13 @@ registered `order-in-flight-for-key` refusal. The gate predicate remains as a **
 pre-check** that produces a readable refusal in the common case; it is explicitly **not** the
 enforcement.
 
-**How the collision is detected is a correctness requirement, not a detail, and `01 §3.6` now
+**How the collision is detected is a correctness requirement, not a detail, and [01 §3.6](../features/01-foundation.md#contract-01-3-6) now
 states it.** A raw unique violation in PostgreSQL puts the whole transaction into an aborted
 state: no further statement in it can succeed and only a rollback is accepted. But the refusal
 this decision needs is a *committed* outcome under `ADR/0005` — it has to append an audit entry
 and settle its idempotency record and commit, and those writes cannot happen in a transaction the
 violation has already aborted. Two things resolve it, both normative in
-[`../design/01-foundation.md`](../design/01-foundation.md) **§3.6** *Attempt Transition*
+[01-foundation architecture](../DESIGN.md#contract-01-1-1) **§3.6** *Attempt Transition*
 (`DECISIONS.md` D-86). The claim is acquired with `ON CONFLICT … DO NOTHING` and the collision
 detected as a **row shortfall** rather than raised as an error, so the transaction is never
 aborted and stays usable for the audit append and the settle. And acquisition is **step 17**,
@@ -92,7 +92,7 @@ constraint itself, and carries **no foreign key** to `orders_order_version` for 
 reason.
 
 A separate table is needed because the constraint's subject is mutable — `released_at` is set on a
-terminal transition, in `01 §3.6` sub-step **17.1**, which runs ahead of the acquisition branch
+terminal transition, in [01 §3.6](../features/01-foundation.md#contract-01-3-6) sub-step **17.1**, which runs ahead of the acquisition branch
 precisely because a terminal row carries no resolved keys and a release placed inside that branch
 would never run — while `orders_order_line`, where the key is resolved, is append-only and
 version-scoped. A partial unique index cannot be built over a state that lives on a different row.
@@ -115,7 +115,7 @@ it would make order submission depend on a second system's write availability.
 ### Consequences
 
 * **The enforcement is a constraint, so it cannot be bypassed by a code path.** This is the property the decision exists for: no slice, migration or admin surface can admit a second in-flight order on a key.
-* **The refusal is not free, and it is the sharp edge of this decision.** The collision is detected by the database mid-transaction, so it must be both *mapped* to `order-in-flight-for-key` and *observed without losing the transaction*. Two failures are possible and they are different: an unmapped violation surfaces as a 500 rather than one of the exhaustive outcomes, and a violation allowed to abort the transaction leaves the audit entry and the settled idempotency record unwritten — a silent drop of exactly the kind `ADR/0005` and the audit-completeness NFR forbid. `01 §3.6` *Attempt Transition* step 17 avoids both, by conflict-free insertion and by position.
+* **The refusal is not free, and it is the sharp edge of this decision.** The collision is detected by the database mid-transaction, so it must be both *mapped* to `order-in-flight-for-key` and *observed without losing the transaction*. Two failures are possible and they are different: an unmapped violation surfaces as a 500 rather than one of the exhaustive outcomes, and a violation allowed to abort the transaction leaves the audit entry and the settled idempotency record unwritten — a silent drop of exactly the kind `ADR/0005` and the audit-completeness NFR forbid. [01 §3.6](../features/01-foundation.md#contract-01-3-6) *Attempt Transition* step 17 avoids both, by conflict-free insertion and by position.
 * **The gate predicate must exclude the requesting order.** Partition full proposed `(payer_tenant_id, overlap_scope_key)` tuples against this order's held tuples. Retain matches, acquire missing tuples and only then release superseded tuples. An unchanged overlap key with a changed payer is a replacement, not a held match. A refused acquisition preserves old claims and releases only its returned provisional claim IDs under Foundation §3.7. Never release old claims first (D-86).
 * **Claims are never deleted, only released**, so the table grows with submit and amendment traffic and needs an index on `(order_id) WHERE released_at IS NULL` — the release path finds claims by order, and the unique index leads on `payer_tenant_id`.
 * **An order that never reaches a terminal state holds its key forever.** `in_fulfillment` is deliberately expiry-exempt, so a wedged fulfilment blocks that key indefinitely. The design's answer is an operational SLA raised by the sibling gear, which is a process answer to a data problem and is the sharpest residual cost of this decision.
@@ -126,7 +126,7 @@ it would make order submission depend on a second system's write availability.
 **This gear has no implementation and no runtime tests**, so the checks below are labelled either
 verifiable today or planned. Every behavioural check this decision needs is in the second group.
 
-**Verifiable today, by reading the design set.** `01 §3.7` declares the partial UNIQUE on
+**Verifiable today, by reading the design set.** [01 §3.7](../DESIGN.md#contract-01-3-7) declares the partial UNIQUE on
 `(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL` — a UNIQUE index expresses
 *exactly one*, which is what PRD §6.1(g) fixes — declares the `(order_id) WHERE released_at IS
 NULL` index the release path needs, states that claims are released and never deleted, and names
@@ -138,11 +138,11 @@ canonical table schema. No automated CI enforcement of that check is claimed her
 **Planned, not yet written.** A concurrency check issuing two identical submits simultaneously
 and asserting exactly one commits while the other returns `order-in-flight-for-key`; a check that
 an amendment of an order holding its own key is admitted; a check that the claim is released on
-every transition into the terminal set of `01 §4.3`, `rejected` included; and — the one this
+every transition into the terminal set of [01 §4.3](../features/01-foundation.md#contract-01-4-3), `rejected` included; and — the one this
 decision most needs — a check that a partial-unique collision surfaces as the registered refusal
 *with its audit entry and settled idempotency record committed*, rather than as an unmapped error
 or as an aborted transaction. None of the four is recorded yet as a verification approach in
-`01 §1.2`, which is their home, and the last cannot be written before `01 §3.6` specifies the
+[01 §1.2](../DESIGN.md#contract-01-1-2), which is their home, and the last cannot be written before [01 §3.6](../features/01-foundation.md#contract-01-3-6) specifies the
 transaction-preserving acquisition.
 
 ## Pros and Cons of the Options
@@ -191,7 +191,7 @@ no alternatives, which is precisely the shape a later author removes.
 ## Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1(f) and §6.1(g) the overlap rules, §16 risks
-- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.6 the transaction-preserving claim acquisition and release, §3.7 `orders_inflight_overlap_claim`; [`../design/03-gate-and-pin.md`](../design/03-gate-and-pin.md) §4.2 predicates 7 and 9
+- **DESIGN**: [01 §3.6](../features/01-foundation.md#contract-01-3-6) the transaction-preserving claim acquisition and release, §3.7 `orders_inflight_overlap_claim`; [03 §4.2](../features/03-gate-and-pin.md#contract-03-4-2) predicates 7 and 9
 
 This decision directly addresses the following requirements or design elements:
 

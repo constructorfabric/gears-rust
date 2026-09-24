@@ -207,7 +207,7 @@ posture.
 ## Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md) — §7.1 transition latency and audit completeness, §12 AC-17
-- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.6, §3.7
+- **DESIGN**: [01 §3.6](../features/01-foundation.md#contract-01-3-6), §3.7
   *Platform-managed producer persistence*, §3.8, §4.4
 
 This decision directly addresses:

@@ -54,7 +54,7 @@ the gate do with it?
 
 Chosen option: **fail closed**. An unevaluable input is a refusal carrying a reason that names
 which input was unevaluable, distinct from the reason for a predicate that was evaluated and
-failed. `design/03-gate-and-pin.md` **§4.1** is normative for this — it carries the rule ("The gate
+failed. [03-gate-and-pin](../DESIGN.md#contract-03-1-1) **§4.1** is normative for this — it carries the rule ("The gate
 **MUST NOT** treat unevaluable as passed under any configuration"); §2.1's design principles and
 §2.2's per-port deadlines are about a *slow* port, which is a different condition.
 
@@ -71,11 +71,11 @@ provisioning compensation, which is the path the two-phase fulfilment barrier ex
 
 ### Consequences
 
-* **No submit passes the gate until the missing upstream lanes land.** Three adopted predicates and half the overlap rule are unevaluable, so Phase 1 has no working submit path until `SUB-O5` and the three pricing lanes exist. This is the designed behaviour, not a defect, and `design/README.md`'s phase map must say so.
+* **No submit passes the gate until the missing upstream lanes land.** Three adopted predicates and half the overlap rule are unevaluable, so Phase 1 has no working submit path until `SUB-O5` and the three pricing lanes exist. This is the designed behaviour, not a defect, and `DECOMPOSITION.md`'s phase map must say so.
 * Operators see submits refused for predicates that are not yet implemented upstream, with a reason that distinguishes "not evaluable" from "evaluated and failed" — so the refusal is diagnosable rather than mysterious.
 * Every future late upstream inherits this posture by default. A capability that wants the other behaviour must argue for a tolerated-risk election explicitly, as payment authorization did.
 * The asymmetry with `05-preconditions` is deliberate and recorded here, so a later author does not "fix" one side into consistency with the other.
-* The gate's own availability becomes a dependency of order-taking: a pricing outage stops submits rather than degrading them. The per-port deadlines, breakers and bulkheads of `03 §2.2` bound how long that takes to surface, not whether it happens.
+* The gate's own availability becomes a dependency of order-taking: a pricing outage stops submits rather than degrading them. The per-port deadlines, breakers and bulkheads of [03 §2.2](../DESIGN.md#contract-03-2-2) bound how long that takes to surface, not whether it happens.
 
 ### Confirmation
 
@@ -85,8 +85,7 @@ verifiable today or planned.
 **Verifiable today, by reading the design set.** The reason registry contains exactly one
 unavailable reason for each of the nine operations — catalog predicates, catalog frontier,
 pin composition, catalog product key, identity, contract resolution, overlap presence, evaluation and
-indicative tax — in `design/03-gate-and-pin.md`
-§3.3; the gate algorithm collects unevaluable inputs into the same all-failures report as
+indicative tax — in [03 §3.3](../DESIGN.md#contract-03-3-3); the gate algorithm collects unevaluable inputs into the same all-failures report as
 evaluated failures (§3.6 *Run Gate and Submit* step 11); and §4.1 carries the normative
 prohibition on treating unevaluable as passed. Review must verify that each reason name has
 exactly one owning slice and that no second slice registers a competing spelling of the same
@@ -94,7 +93,7 @@ condition.
 
 **Planned, not yet written.** A runtime check asserting that an unresolvable port produces a
 refusal rather than an admission is the behavioural half of this decision, and there is nothing
-to run it against. It is not yet recorded as a verification approach in `03 §1.2`, which is its
+to run it against. It is not yet recorded as a verification approach in [03 §1.2](../DESIGN.md#contract-03-1-2), which is its
 home.
 
 ## Pros and Cons of the Options
@@ -123,7 +122,7 @@ home.
 
 ## More Information
 
-Superseded by nothing. The fail-closed posture is stated in `design/01-foundation.md` §2.1
+Superseded by nothing. The fail-closed posture is stated in [01 §2.1](../DESIGN.md#contract-01-2-1)
 ("absence is a refusal") for guard inputs generally; this ADR records the gate-specific decision
 and its cost, which the 2026-09-09 review found recorded in no register entry at all.
 
@@ -140,6 +139,6 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-component-gate-and-pin` — the buyer-visible consequence is a refusal naming the unevaluable input, distinct from an evaluated failure, so the case is diagnosable rather than mysterious
 * `cpt-cf-bss-orders-lifecycle-component-gate-and-pin` — the decision fixes the gate's posture for every future late upstream, not only the two that are late now
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1 submit gate, §13 dependencies, §16 risks
-- **DESIGN**: [`../design/03-gate-and-pin.md`](../design/03-gate-and-pin.md) §2.1, §2.2, §3.3, §4.2; [`../design/01-foundation.md`](../design/01-foundation.md) §2.1
+- **DESIGN**: [03 §2.1](../DESIGN.md#contract-03-2-1), §2.2, §3.3, §4.2; [01 §2.1](../DESIGN.md#contract-01-2-1)
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-72, Q-15
 - **Upstream**: [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — `…-upreq-overlap-presence-read`

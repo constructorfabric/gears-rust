@@ -69,10 +69,10 @@ machine.
 * Every state change enters through one operation and commits three durable effects in one database transaction: the state or version change, one audit entry (one per changed field for an administrative edit, D-117) and one settled idempotency record. An event-declaring row adds one platform producer-outbox message in that transaction.
 * The engine alone appends transition audit and writes aggregate, version, line, resolved-total and idempotency data. D-104 distinguishes the audit worker's append-only checkpoint tables, read paths' access log, and retention role's bounded expired-refusal DELETE. The verifier has SELECT only; none of these roles may repair transition evidence or business state. Producer delivery tables are mutated only by platform outbox code. Business data repair still requires a governed transition.
 * Guard inputs must be resolved **before** the transaction opens, so no outbound call sits in the commit path. Slices that need external data resolve it through ports and pass plain values. The idempotency registry is nonetheless probed *ahead* of that resolution, so a replay returns its stored outcome without re-invoking any port (D-65).
-* **A refusal is also a committed outcome.** Every refused transition — all seven classes enumerated in `01 §4.1`: unresolvable guard input, unauthorized, idempotency mismatch, still-processing, not-admissible, version conflict and slice-guard failure — appends an audit entry, settles its idempotency record where one exists, and commits. Two corollaries follow: a settled refusal *replays as that refusal* for the idempotency window, so a caller cannot convert a refusal into a success by retrying; and refusal auditing is a write-amplification vector, bounded by the 90-day refusal retention and the per-order refusal rate limit of D-49. Recorded in full as [`./0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](./0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md).
+* **A refusal is also a committed outcome.** Every refused transition — all seven classes enumerated in [01 §4.1](../DESIGN.md#contract-01-4-1): unresolvable guard input, unauthorized, idempotency mismatch, still-processing, not-admissible, version conflict and slice-guard failure — appends an audit entry, settles its idempotency record where one exists, and commits. Two corollaries follow: a settled refusal *replays as that refusal* for the idempotency window, so a caller cannot convert a refusal into a success by retrying; and refusal auditing is a write-amplification vector, bounded by the 90-day refusal retention and the per-order refusal rate limit of D-49. Recorded in full as [`./0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](./0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md).
 * **Identity removal is not an audit-store mutation**: actors are immutable opaque principal references, with identifying information managed separately by the identity platform. No erasure procedure updates audit rows or rewrites their hashes (D-96 supersedes D-44's exception; `../DESIGN.md` §4.3).
-* Any new capability requiring a state, an edge or an event type is an **engine change**, not a slice change. Slices may add guards, reasons, document contributions and policy rows without touching the engine. This boundary is recorded normatively in `design/01-foundation.md` §4.6.
-* Guard evaluation order is fixed and total, so two capabilities cannot disagree about precedence. Its one declared exception — for the workflow-trigger class the version check precedes state-table admissibility, so a stale Workflow result is refused `version-conflict` — is itself part of the fixed order (`design/01-foundation.md` §4.1, `DECISIONS.md` D-110).
+* Any new capability requiring a state, an edge or an event type is an **engine change**, not a slice change. Slices may add guards, reasons, document contributions and policy rows without touching the engine. This boundary is recorded normatively in [01 §4.6](../DESIGN.md#contract-01-4-6).
+* Guard evaluation order is fixed and total, so two capabilities cannot disagree about precedence. Its one declared exception — for the workflow-trigger class the version check precedes state-table admissibility, so a stale Workflow result is refused `version-conflict` — is itself part of the fixed order ([01 §4.1](../DESIGN.md#contract-01-4-1), `DECISIONS.md` D-110).
 * The state machine becomes data — a transition table — which makes edge coverage enumerable and lets normative exclusions (notably the absence of an `in_fulfillment → expired` row) be structural rather than conditional.
 
 ### Confirmation
@@ -82,14 +82,14 @@ into what is verifiable today by reading the design set, and what is *planned* a
 written. Nothing here cites an existing test of this gear's code.
 
 **Verifiable today, and stated at the scope the documents actually support.**
-`design/01-foundation.md` §4.1 makes the three-required-effects plus conditional-event effect rule and the total
+[01 §4.1](../DESIGN.md#contract-01-4-1) makes the three-required-effects plus conditional-event effect rule and the total
 guard-evaluation order normative, including its one declared workflow-trigger exception (D-110). §2.2's single-writer constraint names **six Orders table
 families** — aggregate, version, line, resolved-total, audit and idempotency — and bars any
 migration, repair script, administrative surface or slice from writing them outside a transition;
 platform outbox workers own producer delivery state. It is not a claim about all eighteen
 Orders-owned tables in the set, and two are deliberately outside it:
 `orders_draft_content` is declared mutable and is written by capture, and `orders_read_access_log`
-is written by the read surface (`08 §3.7`). Reading it as "every table" would be an overclaim, and
+is written by the read surface ([08 §3.7](../DESIGN.md#contract-08-3-7)). Reading it as "every table" would be an overclaim, and
 the six it does name are the ones the audit guarantee rests on. §3.6 *Attempt Transition* carries
 an audit append and a commit on **every branch that decides an attempt** — all seven refusal
 classes included; the one branch that commits without appending is the **replay** of a settled
@@ -100,7 +100,7 @@ engine call and that no §4.3 row expires from `in_fulfillment`. These document-
 not establish runtime behavior or imply an existing CI gate.
 
 **Planned, not yet written.** The runtime checks belong to the NFRs they serve and are recorded
-as the Verification Approach column of `01 §1.2`. From the **audit-completeness** row: a
+as the Verification Approach column of [01 §1.2](../DESIGN.md#contract-01-1-2). From the **audit-completeness** row: a
 structural check that every transition-table row writes an audit entry on both outcomes, a
 fault-injection check that a failed audit append aborts the transition, and a periodic
 chain-verification job. From the **idempotency** row: a parallel same-key concurrency check
@@ -109,7 +109,7 @@ failure, and a crash check asserting an expired lease is recoverable.
 
 **Planned, and not yet specified anywhere.** An **edge-coverage check** asserting no transition
 is admissible at runtime outside the twenty-seven rows of §4.3 has no home in the design set —
-no document states it and nothing implements it. Until `01 §1.2` records it alongside the other
+no document states it and nothing implements it. Until [01 §1.2](../DESIGN.md#contract-01-1-2) records it alongside the other
 verification approaches, the normative exclusions this decision makes structural — notably the
 absent `in_fulfillment → expired` row — rest on the transition table plus the single-writer grant
 at design level, and on the document review described above, not on any
@@ -160,5 +160,5 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-fr-order-authorization` — the shared platform PDP adapter runs as the engine's pre-guard, so no handler can widen its own scope
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — this decision is what makes that component the single writer; every other component reaches state through it
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1 state machine and idempotency, §6.4 R1, §7.1
-- **DESIGN**: [`../DESIGN.md`](../DESIGN.md) §1.1, §2.1; [`../design/01-foundation.md`](../design/01-foundation.md) §4.1
+- **DESIGN**: [`../DESIGN.md`](../DESIGN.md) §1.1, §2.1; [01 §4.1](../DESIGN.md#contract-01-4-1)
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-01
