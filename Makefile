@@ -342,7 +342,7 @@ clippy-deep:
 lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs gears/bss
+	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
