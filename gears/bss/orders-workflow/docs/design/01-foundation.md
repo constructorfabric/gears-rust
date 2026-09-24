@@ -38,6 +38,7 @@
   - [4.14 Determinism discipline for replayed execution](#414-determinism-discipline-for-replayed-execution)
   - [4.15 Clock-skew tolerance and evaluation against database time](#415-clock-skew-tolerance-and-evaluation-against-database-time)
   - [4.16 Recovery-rate target and the cold-start admission ramp](#416-recovery-rate-target-and-the-cold-start-admission-ramp)
+  - [4.17 The audit contract (normative)](#417-the-audit-contract-normative)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -112,7 +113,7 @@ recorded.
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts; zero loss for committed process state | Step executor + audit writer | Every committed step writes its durable record before the executor reports completion; restart resumes from the last durably recorded checkpoint without re-running committed steps | Restart/kill test asserting no re-execution of a committed step and full resumption of pending steps |
 | `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Zero duplicate durable effects from retried outbound calls | Idempotency registry | Every outbound call carries an idempotency key recorded before dispatch; a retried call reuses the same key and the registry's stored outcome absorbs a duplicate response | Parallel-retry test asserting one durable effect per key; replay test asserting a stored outcome is returned rather than re-dispatched |
-| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% of process state transitions recorded, zero silent drops, engine history not the audit SoR | Audit writer | Every step start, completion, retry, timeout, sweep action, escalation, compensation step and dead-letter event is written to the gear-owned audit log independently of substrate history, each entry hash-chained to its predecessor so the trail is tamper-**evident** and not merely write-protected (§3.7) | Structural test asserting every step-executor code path writes an audit entry; chain-verification test asserting an out-of-band edit or deletion is detected; substrate-history-purge test asserting the gear-owned audit log is unaffected |
+| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% of process state transitions recorded, zero silent drops, engine history not the audit SoR | Audit writer | Every instance start, step start, completion, retry, timeout, sweep action, escalation, compensation step, phase transition, termination and dead-letter event is written to the gear-owned audit log in the same transaction as the transition it records, independently of substrate history; each entry is hash-chained to its predecessor under the frozen byte contract of §4.17, and the store is trigger-protected against UPDATE and DELETE, so the trail is tamper-**evident** and not merely write-protected (§3.7) | Structural test asserting every step-executor code path writes an audit entry; frozen preimage/digest vectors for the §4.17 v1 encoding; every-field mutation test asserting the verifier detects an out-of-band edit or deletion; database trigger test asserting UPDATE and DELETE are rejected for every role; substrate-history-purge test asserting the gear-owned audit log is unaffected |
 | `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | The typed event is enqueued through the bound platform producer outbox (`toolkit_db::outbox`) in the same transaction as the audit entry when a step commits; platform workers publish it asynchronously to Event Broker | Producer-queue lag (platform metric) measured from enqueue to broker acceptance at expected load; commit success alone is not evidence |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome | Step executor + retry/backoff controller | Bounded per-attempt timeouts and step deadlines keep a stalled attempt from silently consuming the SLA window; concurrency limits keep the provisioning path from saturating under load | Load test measuring wave-to-terminal latency at p95 under configured concurrency caps |
 | `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per-gate window, default 72 h, accuracy ± 5 min | Durable timer service | Timers are durable records with a scheduled fire instant, recovered on restart from the persisted record rather than an in-memory scheduler | Timer-accuracy test across a restart mid-window; configuration test per approval gate |
@@ -161,7 +162,7 @@ Persistence            process-instance aggregate · step log · dead-letter sto
 | Presentation | Not owned by this slice; process control and read surfaces are registered by [`09-read-and-authz`](./09-read-and-authz.md) | — |
 | Application | The step executor, the retry/backoff controller, and the concurrency/back-pressure controller | Rust module in the `orders-workflow` gear, hosted on the durable-execution substrate (ADR 0001) |
 | Domain | Process-instance aggregate invariants, definition-version pinning, step log semantics, reason catalogue | Rust domain structs; GTS for cross-gear contract types (specified in a later section of this slice) |
-| Infrastructure | Durable timer service, idempotency registry, audit writer, platform event producer adapter, dead-letter store | Durable-execution substrate, PostgreSQL via SecureORM, coordination lease library, `event-broker-sdk` over `toolkit_db::outbox` |
+| Infrastructure | Durable timer service, idempotency registry, audit writer, platform event producer adapter, dead-letter store | Durable-execution substrate, PostgreSQL via SecureORM, toolkit-db session advisory locks (`Db::lock`) for the worker roster of §3.8, `event-broker-sdk` over `toolkit_db::outbox` |
 
 ## 2. Principles & Constraints
 
@@ -368,15 +369,19 @@ from an in-memory scheduler.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-audit-entry`
 
-One append-only process audit record per transition: step start, step completion, retry, timeout,
-sweep action, escalation, compensation step, or dead-letter event, with actor identity, timestamp,
-idempotency key, and the process `correlationId`. Each entry is **hash-chained** to its
-predecessor for the same instance, so a deletion or an edit anywhere in the trail is detectable
-rather than merely ungranted. It carries a catalogue `reason` — the machine-readable value that
-rides event payloads — and, separately, a free-text `justification` for the human-supplied text an
-override or a cancellation records; the two are never the same column. Written independently of
-whatever record the durable-execution substrate keeps of its own run, which is not the audit
-source of record.
+One append-only process audit record per transition: instance start, step start, step
+completion, retry, timeout, sweep action, sweep settlement, escalation, compensation step, phase
+transition, termination, or dead-letter event, with the actor's opaque subject identifier
+(D-61), timestamp, idempotency key, the process `correlationId`, and — where the transition has
+them — the step identifier, the attempt number and the pinned definition version as evidence
+fields. Each entry is **hash-chained** to its predecessor for the same instance under the frozen
+byte contract of §4.17, with its sequence allocated from the instance's transactional counter, so
+a deletion or an edit anywhere in the trail is detectable rather than merely ungranted. It carries
+a catalogue `reason` — the machine-readable value that rides event payloads — and, separately, a
+free-text `justification` for the human-supplied text an override or a cancellation records; the
+two are never the same column. Written independently of whatever record the durable-execution
+substrate keeps of its own run, which is not the audit source of record, and never read as the
+recovery record — that is `owf_step_log`'s job.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-outbox-entry`
 
@@ -588,16 +593,23 @@ substrate's own history, which this gear does not treat as its source of record.
 
 ##### Responsibility scope
 
-Recording every step start, completion, retry, timeout, sweep action, escalation, compensation
-step and dead-letter event with actor identity, timestamp, idempotency key and the process
-`correlationId`; also recording the pinned process-definition version at instance start; and
-retaining the record at audit grade independently of substrate history and of engine purges.
+Recording every instance start, step start, completion, retry, timeout, sweep action, sweep
+settlement, escalation, compensation step, phase transition, termination and dead-letter event
+with the actor's opaque subject identifier, timestamp, idempotency key and the process
+`correlationId`, in the same transaction as the transition it records; recording the pinned
+process-definition version on the instance-start entry; allocating each entry's `sequence` from
+the `owf_process_instance.audit_sequence` counter under the instance row lock and computing its
+`entry_hash` under the frozen byte contract of §4.17; retaining the record at audit grade
+independently of substrate history and of engine purges; and owning the checkpoint-append phase
+and the read-only verification pass of the `audit/<audit-tenant>` worker (§3.8, §4.17).
 
 ##### Responsibility boundaries
 
 It records commercial order context carried by process artifacts but never becomes a second
 source of commercial order state — a read of "what was ordered" never resolves against this
-writer's records. It never carries payment-card data.
+writer's records — and it never becomes the recovery record: replay resumes from `owf_step_log`
+and the substrate, never from the audit trail. It never carries payment-card data, and it never
+updates, deletes or re-hashes a committed entry — the verifier alerts and does not repair (D-59).
 
 ##### Related components (by ID)
 
@@ -788,7 +800,7 @@ settled permanent failure may do so
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | The durable step log, idempotency registry, audit log and durable-timer tables; toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication of the six process events |
 | `types-registry` | SDK client | Resolving and registering the GTS event and subject types of §4.7 before readiness; a type that fails to register fails the boot |
-| Coordination lease library | SDK client | Singleton coordination for the durable timer sweep, the reconciliation sweep, and the idempotency-window sweep; toolkit manages its own outbox workers |
+| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative Workflow worker roster in §3.8; toolkit owns outbox coordination |
 | Platform durable-execution substrate | SDK client per `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` | Hosting step scheduling and crash recovery; its own run history is explicitly not the audit source of record (§1.1) |
 
 **Dependency Rules** (per project conventions):
@@ -976,6 +988,7 @@ back-pressure key on `seller_tenant_id` (§4.12).
 | suspended | boolean | Set on `OrderHeld`, cleared on `OrderResumed`; redundant with `phase = suspended` and kept as the hold predicate the resume path reads |
 | last_checkpoint | text | The last durably completed step |
 | row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to callers as an ETag and required as `If-Match` on the mutating process operations |
+| audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id`, so the counter, the entry and the business mutation commit or roll back together (§4.17). The admission transaction that inserts this row also writes the `instance-start` entry at sequence 1 |
 | terminal_outcome | enum, nullable | `completed`, `aborted`, or NULL while non-terminal |
 | created_at, updated_at | timestamptz | Bookkeeping |
 
@@ -1011,9 +1024,13 @@ clears only when the verdict becomes obtainable. Collapsing them makes AC 0b's
 **Additional info**: **Ownership**: written only by the step executor
 (`cpt-cf-bss-orders-workflow-component-step-executor`). **Tenant axes**: `resource_tenant_id` and
 `seller_tenant_id` — the instance backs the seller-scoped process list and the operator console,
-so it carries both. **Optimistic concurrency**: a caller presenting a stale `row_version` is
+so it carries both; `resource_tenant_id` is fixed at admission and never rewritten, which is
+what lets it serve as the immutable audit namespace `owf_audit_entry.audit_tenant_id` copies.
+**Optimistic concurrency**: a caller presenting a stale `row_version` is
 refused with **409** in the RFC-9457 envelope, never silently overwritten; this is the concrete
-mechanism behind the PRD's "Optimistic workflow-version check REQUIRED". **Retention**: sized by
+mechanism behind the PRD's "Optimistic workflow-version check REQUIRED". **Audit counter**:
+`audit_sequence` is written only inside an audit-appending transaction and is never reset; a
+rollback does not consume a sequence. **Retention**: sized by
 order count, not by traffic; no partitioning at this phase.
 
 #### Table: owf_step_log
@@ -1201,52 +1218,129 @@ partitioning at this phase.
 | Column | Type | Description |
 |--------|------|-------------|
 | audit_id | uuid | Entry identity |
-| correlation_id | uuid | Owning process instance |
+| hash_version | smallint, NOT NULL | Audit encoding version; always `1`, the frozen v1 contract of §4.17 (D-60). A row carrying any other value fails verification explicitly |
+| audit_tenant_id | uuid, NOT NULL | Immutable chain namespace: the instance's `resource_tenant_id` at process start, copied on every entry and never rewritten; genesis and the roll-ups of §4.17 bind to it |
+| correlation_id | uuid, NOT NULL | Owning process instance and chain key. An instance-less inbound dead letter is audited by the delivery path under the synthetic `correlationId` the admission path derives — the UUIDv5 over (`resource_tenant_id`, `orderId`, `orderVersion`) of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) — so every entry belongs to exactly one chain |
 | order_id, order_version | text, integer | Denormalized for query without a join |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 | seller_tenant_id | uuid, NOT NULL | Selling-party axis; the audit read surface is seller-scoped |
-| sequence | bigint, NOT NULL | Per-instance audit counter, allocated under the `owf_process_instance` row lock; gapless within an instance |
-| prev_hash | bytea, nullable | Hash of the preceding entry for this instance; NULL on the first entry of an instance |
-| entry_hash | bytea, NOT NULL | Hash over this entry's content and `prev_hash` |
-| actor, actor_class | text, enum | Identity and class, including `system` for scheduler-driven entries |
-| event_kind | enum | `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `escalation`, `compensation`, `dead-letter` |
+| sequence | bigint, NOT NULL | Per-instance audit counter, allocated from `owf_process_instance.audit_sequence` under the instance row lock; starts at 1 and is gapless within a chain |
+| prev_hash | bytea, NOT NULL | The `entry_hash` of the preceding entry on the same `correlation_id`, or the chain genesis digest of §4.17 for sequence 1. Never NULL: this table has no unchained rows |
+| entry_hash | bytea, NOT NULL | 32-byte SHA-256 digest over every other column of this row under the v1 encoding of §4.17 |
+| event_kind | enum | `instance-start`, `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `sweep-settlement`, `escalation`, `compensation`, `phase-transition`, `termination`, `dead-letter` |
+| step_id | text, nullable | The step the entry records, where the transition belongs to a step; NULL on instance-level kinds |
+| attempt_number | integer, nullable | The step attempt the entry records, matching `owf_step_log.attempt_number`; NULL where no attempt applies |
+| definition_version | text, nullable | The pinned process-definition version, set on the `instance-start` entry; NULL elsewhere |
+| phase_from, phase_to | enum, nullable | The `owf_process_instance.phase` values a `phase-transition` or `termination` entry moves between; `phase_from` NULL on `instance-start`; both NULL on every other kind |
+| actor | text | Immutable SecurityContext subject UUID rendered as lowercase hyphenated text; no names, emails or caller-supplied labels (D-61); identity lifecycle per `../DESIGN.md` §4.3 |
+| actor_class | enum | `system`, `service` or `user`, derived from the authenticated context and configured identities only; `system` is the configured Workflow worker identity that runs the scans and sweeps of §3.8 |
 | idempotency_key | text, nullable | The key in force, where one applies |
 | reason | text, nullable | **Catalogue** value from `cpt-cf-bss-orders-workflow-component-reason-catalogue`; the only one of the two reason columns that rides an event payload |
 | justification | text, nullable | **Free text supplied by a human**: an override justification, a cancellation reason. Never a catalogue value, never machine-keyed on, never placed on an event payload |
-| created_at | timestamptz | Append instant |
+| created_at | timestamptz | Append instant, normalised to microsecond UTC before hashing and storage |
 
 **PK**: audit_id
 
-**Constraints**: append-only, **no UPDATE and no DELETE grant to any role**;
-`(correlation_id, sequence)` UNIQUE; indexed on `(correlation_id, sequence)` for per-process
-retrieval in chain order and on `(seller_tenant_id, created_at)` for the tenancy-scoped audit
-read.
+**Constraints**: append-only — **no UPDATE and no DELETE grant to any role**, including
+identity-erasure operators and the retention worker, **and** database triggers that reject every
+UPDATE and DELETE regardless of grant (the Pricing pattern D-59 adopts; both are required, neither
+substitutes for the other). `(correlation_id, sequence)` UNIQUE, which serves the chain and
+rejects a competing append: two transactions allocating the same sequence cannot both commit, and
+the loser rolls back without consuming a sequence. Indexed on `(correlation_id, sequence)` for
+per-process retrieval in chain order and on `(seller_tenant_id, created_at)` for the
+tenancy-scoped audit read. `event_kind`-shape CHECKs: `definition_version` non-null exactly on
+`instance-start`; `phase_to` non-null exactly on `instance-start`, `phase-transition` and
+`termination`; `hash_version = 1`.
 
-**The chaining rule.** `entry_hash = SHA-256(canonical(entry fields) || prev_hash)`, where
-`prev_hash` is the `entry_hash` of the entry with `sequence - 1` on the same `correlation_id` and
-the first entry of an instance carries a NULL `prev_hash`. Verification walks an instance's chain
-in `sequence` order and recomputes each hash. This is what makes the trail **tamper-evident**
-rather than merely tamper-*discouraged*: "append-only, no UPDATE or DELETE grant" is access
-control, and access control that is misconfigured, bypassed at the database, or simply changed
-leaves no trace. A chain does. The absent DELETE grant and the ≥ 400-day retention are what keep
-the chain whole — a deleted row would sever it and make routine retention indistinguishable from
-tampering, which is why this table is not partitioned for retention.
+**Chain allocation.** Every append runs in the transaction of the transition it records
+(§4.17 *Append rule*): the writer locks the instance row, increments `audit_sequence`, computes
+`entry_hash` over the fully constructed row and inserts it. Where no instance row exists yet — an
+instance-less inbound dead letter — the delivery path allocates the next sequence for the derived
+`correlation_id` from the chain's current head inside its own transaction, and the uniqueness
+constraint arbitrates a race. When such a correlation is later admitted, the admission
+transaction initialises `audit_sequence` from the existing head and writes `instance-start` at
+the next sequence rather than at 1; genesis covers the first entry of a correlation whichever
+kind it is. Sequence 1 is otherwise always `instance-start`, written by the admission transaction
+that inserts the instance row.
+
+**The chaining rule** is the v1 byte contract of §4.17 (D-60), stated once there: SHA-256 over
+a Workflow-specific row tag and the framed, ordered fields of the row, linking the preceding
+committed digest, with a genesis bound to `(audit_tenant_id, correlation_id)`. Verification walks
+an instance's chain in `sequence` order and recomputes each digest (§4.17 *Verifier*). This is
+what makes the trail **tamper-evident** rather than merely tamper-*discouraged*: "append-only, no
+UPDATE or DELETE grant" is access control, and access control that is misconfigured, bypassed at
+the database, or simply changed leaves no trace. A chain does; the triggers make the bypass
+louder; the roll-ups of `owf_audit_checkpoint` bound what a deleted tail can hide. The absent
+DELETE grant and the ≥ 400-day retention are what keep the chain whole — a deleted row would sever
+it and make routine retention indistinguishable from tampering, which is why this table is not
+partitioned for retention and why the retention worker has no grant on it.
 
 **Two reason columns, deliberately.** `reason` is a closed catalogue value and is what a consumer
 keys on (§4.7, §4.9). `justification` is whatever the human typed. Putting free text into `reason`
 would break every consumer that switches on it; putting the catalogue value in place of the
 justification would discard the only record of *why* an operator overrode a failed line. The PRD
 requires both to be recorded, and an override or a rejection writes both on the same entry.
+Both are hashed as their exact stored UTF-8 text; D-61 minimization precedes hashing, never
+follows it, and an erasure never rewrites either.
 
 **Additional info**: **Ownership**: written only by the audit writer
 (`cpt-cf-bss-orders-workflow-component-audit-writer`). **Tenant axes**: `resource_tenant_id` and
-`seller_tenant_id` — the audit trail backs a seller-scoped operator read. 100% of process state
+`seller_tenant_id` — the audit trail backs a seller-scoped operator read — plus the immutable
+`audit_tenant_id` namespace, which grants no read access of its own. 100% of process state
 transitions are recorded here with zero silent drops; this table, not `owf_step_log` and not the
 durable-execution substrate's run history, is the audit source of record (§4). **Retention**:
 **≥ 400 days**, enforced by this gear independently of substrate history; **not partitioned for
 retention** — nothing is purged, so a partition drop would have nothing to drop; monthly range
 partitioning on `created_at` **may** still be applied for query-planner and vacuum cost as volume
-grows, and the chain is unaffected because no partition is ever dropped.
+grows, and the chain is unaffected because no partition is ever dropped. **Verification and
+roll-ups**: the `audit/<audit-tenant>` worker of §3.8 under the contract of §4.17.
+
+#### Table: owf_audit_checkpoint
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-audit-checkpoint`
+
+A D-100-pattern roll-up, mirroring Lifecycle's `orders_audit_checkpoint` with the process
+instance as the member unit (D-59).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| audit_tenant_id | uuid | Immutable audit namespace whose committed process chains are summarised |
+| checkpoint_sequence | bigint | Positive per-namespace checkpoint counter, starting at 1 |
+| format_version | smallint | Roll-up encoding version, initially 1; separate from the audit-row `hash_version` |
+| captured_at | timestamptz | UTC microsecond snapshot-capture instant, not a transition commit watermark |
+| member_count | bigint | Number of chain heads in this snapshot |
+| prev_checkpoint_hash | bytea | 32-byte preceding roll-up digest, or the namespace genesis of §4.17 |
+| checkpoint_hash | bytea | 32-byte digest of the header and the sorted members (§4.17 *Roll-ups*) |
+
+**PK**: (audit_tenant_id, checkpoint_sequence)
+
+**Constraints**: append-only, INSERT/SELECT only to the checkpoint-append phase of the audit
+worker; no application or operational UPDATE/DELETE grant; triggers reject UPDATE/DELETE. Header
+and members commit in one transaction; a partial snapshot is never visible. The primary key
+rejects a competing checkpoint from a second replica and rolls back all its members.
+**Retention**: retained with the evidence it covers — never purged, never partitioned for
+retention; a storage-tier move must keep it verifiable. **Ownership**: the audit writer's
+checkpoint phase (`cpt-cf-bss-orders-workflow-component-audit-writer`). **Tenant axis**:
+`audit_tenant_id`, which is a `resource_tenant_id` value captured at process start.
+
+#### Table: owf_audit_checkpoint_member
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-audit-checkpoint-member`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| audit_tenant_id | uuid | Checkpoint namespace |
+| checkpoint_sequence | bigint | Owning checkpoint |
+| correlation_id | uuid | Expected chain identity; deliberately no FK to `owf_process_instance` |
+| audit_sequence | bigint | Positive committed head sequence observed in the snapshot |
+| entry_hash | bytea | Exact 32-byte digest at that sequence |
+
+**PK**: (audit_tenant_id, checkpoint_sequence, correlation_id)
+
+**Constraints**: FK to the checkpoint header, without cascading deletion. Same append-only grants
+and triggers as the header. No live-instance FK: loss of an instance row must leave its
+checkpoint evidence intact rather than delete it. Namespace and sequence must match the owning
+header. **Retention and ownership**: as the header.
 
 #### Platform-managed producer persistence
 
@@ -1257,7 +1351,7 @@ Workflow defines no `owf_event_outbox` table. Service migrations run the
 their registration, queue, body, partition and dead-letter tables are owned and migrated by those
 libraries and **MUST NOT** be forked into Workflow-specific DDL. They are operational
 infrastructure, are excluded from the Workflow-owned inventory in `DESIGN.md §3.7`, and are not
-counted among the engine's seven tables. This mirrors
+counted among the engine's nine tables. This mirrors
 [Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables).
 
 The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
@@ -1318,7 +1412,8 @@ three would either over-retain the scaffolding or under-retain the compliance ar
 
 | Store | Retention | Partitioning |
 |-------|-----------|--------------|
-| `owf_audit_entry` | ≥ 400 days; no DELETE grant to any role | Not partitioned for retention (nothing is purged); monthly range partition on `created_at` optional for query cost |
+| `owf_audit_entry` | ≥ 400 days; no UPDATE or DELETE grant to any role, triggers reject both; the retention worker never touches it | Not partitioned for retention (nothing is purged); monthly range partition on `created_at` optional for query cost |
+| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | Retained with the evidence they cover; never purged | Not partitioned for retention; sized by namespace count × checkpoint cadence |
 | `owf_dead_letter_record` | ≥ 400 days | Monthly range partition on `created_at` |
 | `owf_step_log` | 90 days | Monthly range partition on `started_at` |
 | `owf_retry_state` | 90 days | None — sized by in-flight step count |
@@ -1332,8 +1427,9 @@ the hot path of every step, so a table that degrades under its own history degra
 The platform `toolkit_db::outbox` tables are outside this register: their retention, vacuum and
 indexing follow the library migrations (*Platform-managed producer persistence* above).
 
-**Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`
-(and no DELETE grant at all, per the chaining rule above), `owf_step_log`. Deliberately mutable:
+**Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`,
+`owf_audit_checkpoint` and `owf_audit_checkpoint_member` (all three additionally
+trigger-protected, per D-59), `owf_step_log`. Deliberately mutable:
 `owf_process_instance` (denormalized phase and checkpoint), `owf_idempotency_registry` (lease
 heartbeat and settlement), `owf_retry_state` (attempt bookkeeping), `owf_durable_timer` (pause
 and fire bookkeeping). `owf_dead_letter_record` is append-only but carries a DELETE grant to the
@@ -1345,12 +1441,68 @@ retention worker alone.
 
 The engine is a library hosted inside the Orders Workflow gear process, layered on the platform
 durable-execution substrate (`cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`); it is
-not a separate deployable. Background workers run under coordination leases so a multi-replica
-deployment cannot double-act: the durable timer wake-up scan, the intent reconciliation sweep
-(escalating schedule), and the idempotency-window sweep. In addition, the gear starts and
-gracefully stops the platform `toolkit_db::outbox` handle for the `bss-orders-workflow-events`
-queue, whose sequencer, leased processors and vacuum are library-managed workers and are not
-counted as Workflow-owned coordination jobs; Workflow adds no lock and no drain around them.
+not a separate deployable. This is the authoritative roster and coordination contract for the
+**five Workflow-owned workers** (D-62), in the shape of
+[Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/design/01-foundation.md#38-deployment-topology):
+
+| Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
+|--------|-----------------------------------------------------------|-----------------------------------------------------|
+| Durable timer wake-up scan | `timer-wakeup` | Selects `fire_at <= now() AND fired_at IS NULL` (§3.7 `owf_durable_timer`), then rechecks `fire_at` and `fired_at IS NULL` under the timer row lock and fires through *execute step* with an idempotency key that is a UUIDv5 over `timer_id`, so a second firing of the same row is an absorbed duplicate (§4.3) |
+| Intent reconciliation sweep | `reconciliation-sweep` | Per-intent status read on the escalating ladder of `05 §4.2`; settlement only through the engine's **settle-from-lookup** operation, which rechecks the registry row's `status` and lease under its row lock before settling (§4.3 *Lease-expired*, `05 §3.6`) and writes the `sweep-settlement` audit entry in that transaction |
+| Dead-lease scan | `dead-lease-scan` | Selects `in_flight` registry rows with `lease_expires_at < now()` (§3.7 `owf_idempotency_registry`) and hands each to the reconciliation sweep; it writes nothing itself, so two overlapping scans hand over the same row twice and the sweep's transactional recheck settles it once |
+| Retention purge | `retention-purge` | Bounded conditional deletes — partition drops and `DELETE … WHERE` predicates re-evaluated inside the deleting transaction — over the stores whose §3.7 window has elapsed; never `owf_audit_entry`, `owf_audit_checkpoint` or `owf_audit_checkpoint_member`, on which it holds no grant |
+| Audit verification and checkpointing | `audit/<canonical audit-tenant UUID>` | SELECT-only verification of each chain (§4.17 *Verifier*); the checkpoint-append phase runs under its own INSERT grant, and the `(audit_tenant_id, checkpoint_sequence)` primary key rejects a competing checkpoint from a second replica |
+
+There is no idempotency-window sweep: registry retention is the monthly partition drop the
+retention purge performs, and an aged-out key needs no worker because §4.3 makes the *next*
+attempt a new key rather than a resumed one.
+
+**Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or bounded non-blocking acquisition
+through `Db::try_lock` with `LockConfig`, holding the `DbLockGuard` for one bounded pass and
+awaiting `release()` on normal completion
+([`toolkit-db/advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)). These
+are PostgreSQL session advisory locks, **not TTL leases**: no renewal, deadline or fencing token.
+The deployment constraint — every replica against the same authoritative database with identical
+gear/key names, the lock connection direct or session-pooled and never behind a transaction-pooling
+proxy, a cross-replica contention probe before workers are enabled, no silent substitution of file
+locks or another backend — and the **session loss is not fencing** rule — a lost session can
+release ownership while an old pass is still running, so holding the guard never proves
+ownership, and correctness rests on the table-level transactional recheck named per worker above
+even when two passes overlap — are Lifecycle `01 §3.8`'s, adopted by reference and not restated.
+Workflow adds one line per worker: the recheck in the third column is what keeps each worker
+correct when its session is lost, and a worker with no such recheck is not admitted to this
+roster. Stop scheduling further work on observed coordination or database failure, abandon the
+pass and reacquire before retrying.
+
+`cluster-sdk` is not selected, for the reason Lifecycle gives: its current guard has no fencing
+token and its critical-section contract forbids database writes, which every worker above
+performs. `gears/bss/libs/coord` — a DB-backed TTL lease with an in-transaction fence, used by
+Pricing — is a candidate for the same roster and is **not** chosen here: whether the two Orders
+gears and Pricing converge on session advisory locks or on the fenced lease is a decision for the
+three owners jointly, registered as `DECISIONS.md` Q-09. Until it is answered this roster runs on
+`Db::lock`, and the recheck column is what makes the answer swappable.
+
+**Required acceptance evidence (pending implementation).** Two replicas with identical keys: only
+one acquires each held lock while distinct worker and namespace keys progress. Kill the lock
+session mid-pass while the old worker keeps its data connection, acquire from a second replica
+and resume the old pass: no double timer fire, no double settlement, no out-of-policy purge, no
+checkpoint fork. Process crash, reconnect and reacquisition, explicit release, cancellation and an
+unsupported pooling configuration are each tested. Outbox takeover and sequencing are tested on
+the library-managed producer path separately; Workflow adds no lock around it.
+
+In addition, the gear starts and gracefully stops the platform `toolkit_db::outbox` handle for
+the `bss-orders-workflow-events` queue, whose sequencer, leased processors and vacuum are
+library-managed workers and are not counted as Workflow-owned coordination jobs; Workflow adds no
+lock and no drain around them.
+
+**The audit worker is the fifth Workflow-owned worker (D-59).** Its verification pass is per
+process instance, walked in a rolling pass with a full pass inside a **30-day** window; a mismatch
+**alerts and never repairs**, and the pass holds SELECT only. Its checkpoint phase rolls up each
+audit namespace at least once per **24 hours** and reconciles live instance counters and the
+previous checkpoint under one consistent snapshot (§4.17 *Roll-ups*). Alert when checkpoint age
+exceeds 24 hours or full verification exceeds 30 days; a missed deadline is degraded integrity
+coverage, not evidence that a check succeeded. Identity removal never changes what it verifies
+(D-61).
 
 **Observability owned here**: step outcome counts by outcome class; idempotency
 still-processing, **lease-expired**, **key-conflict** and aged-out counts; retry-budget-exhaustion
@@ -1358,10 +1510,11 @@ and step-deadline-exhaustion counts, tracked separately from overdue-window and 
 escalations; **crash-loop quarantine count** (§4.13, target zero); **circuit-breaker state and
 open-duration per dependency** (§4.5); **queue depth and shed count** against the bounded dispatch
 queue, and per-seller token-bucket rejection rate (§4.12); **measured clock offset against database
-time per replica** and lease-drop count (§4.15); producer-queue depth, oldest-message age and
+time per replica** and advisory-lock release-on-skew count (§4.15); producer-queue depth, oldest-message age and
 enqueue-to-acceptance lag plus pending platform dead letters for `bss-orders-workflow-events`
-(platform metrics, read rather than produced here); audit-append failure count (target zero) and **audit
-hash-chain verification failures** (target zero); **time to full resumption** and admission-ramp
+(platform metrics, read rather than produced here); audit-append failure count (target zero), **audit
+hash-chain verification failures** (target zero), verifier coverage age and last successful
+checkpoint age per audit namespace (§4.17); **time to full resumption** and admission-ramp
 position after a restart (§4.16); and durable-timer fire-on-schedule adherence across a service
 restart.
 
@@ -1551,12 +1704,14 @@ step 3).
 
 ### 4.6 The process audit log is 100% complete with zero silent drops
 
-Every process state transition — step start, step completion, retry, timeout, sweep, escalation,
-compensation, dead-letter — **MUST** be recorded in `owf_audit_entry` with actor identity,
-timestamp, idempotency key (where one applies), and process `correlationId`. Zero silent drops are
-permitted. Each entry is hash-chained to its predecessor, which is what makes the completeness
-claim *checkable* rather than merely asserted: a missing entry is a broken chain, not an absence
-nobody can see. The `dead-letter` entry kind here records a **delivery-level** parking of an
+Every process state transition — instance start, step start, step completion, retry, timeout,
+sweep, sweep settlement, escalation, compensation, phase transition, termination, dead-letter —
+**MUST** be recorded in `owf_audit_entry` with the actor's subject identifier, timestamp,
+idempotency key (where one applies), and process `correlationId`, **in the same transaction** as
+the transition; a failed append aborts that transaction (§4.17 *Append rule*). Zero silent drops
+are permitted. Each entry is hash-chained to its predecessor under the frozen contract of §4.17,
+which is what makes the completeness claim *checkable* rather than merely asserted: a missing
+entry is a broken chain or a counter the roll-up cannot reconcile, not an absence nobody can see. The `dead-letter` entry kind here records a **delivery-level** parking of an
 inbound trigger or callback — it is not a step outcome, and no step failure writes one (§4.8).
 This is the concrete mechanism behind §4.1 (`cpt-cf-bss-orders-workflow-nfr-owf-audit`).
 
@@ -1870,7 +2025,7 @@ durability boundary decides where each non-deterministic value is computed:
 
 | Value | Computed | Why |
 |-------|----------|-----|
-| The process `correlationId` | **Once, at process start, by the admission path, and persisted on `owf_process_instance` before any step runs** | Every audit entry, timer, retry-state row and enqueued process event is keyed on it. Regenerating it on replay orphans all of them and silently voids the 100 % audit-completeness claim of §4.6 — the entries still exist, under an identifier nothing points at any more. |
+| The process `correlationId` | **Once, at process start, by the admission path, and persisted on `owf_process_instance` before any step runs** | Every audit entry, timer, retry-state row and enqueued process event is keyed on it, and it is one of the two genesis inputs of the audit chain (§4.17). Regenerating it on replay orphans all of them and silently voids the 100 % audit-completeness claim of §4.6 — the entries still exist, under an identifier nothing points at any more. |
 | The full-jitter delay draw (§4.5) | **Outside the workflow body**, by the retry/backoff controller, and persisted as `owf_retry_state.next_attempt_at` before the wait begins | A draw taken *inside* the replayed body produces a different value on replay and a history mismatch against the substrate. Persisting the resulting instant makes the replay read a value rather than re-draw one. |
 | Timestamps used in a decision | Read from **database time** (§4.15) and persisted with the step's record | Wall-clock reads inside a replayed body diverge across replicas and across replays. |
 | Identifiers a step mints (timer ids, the event envelope `id`) | Minted inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, that identifier **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object — a second gate, a second timer, a duplicate event. |
@@ -1880,19 +2035,19 @@ on the durable side of the boundary and read by the replayed side, never the rev
 
 ### 4.15 Clock-skew tolerance and evaluation against database time
 
-Timer fire instants, lease expiry and every deadline comparison **MUST** be evaluated against
-**database time**, not against a worker replica's local clock. Background workers are
-lease-coordinated across replicas (§3.8), so a replica whose clock drifts forward fires an
-`expected-fulfillment-wait` timer early and activates a future-dated line ahead of its contracted
-date, and a replica whose clock drifts backward holds a lease the rest of the deployment believes
-is dead.
+Timer fire instants, registry lease expiry and every deadline comparison **MUST** be evaluated
+against **database time**, not against a worker replica's local clock. Background workers
+coordinate through session advisory locks across replicas (§3.8), so a replica whose clock drifts
+forward fires an `expected-fulfillment-wait` timer early and activates a future-dated line ahead
+of its contracted date, and a replica whose clock drifts backward heartbeats an in-flight
+registry lease the rest of the deployment believes is dead.
 
 Working baselines:
 
 | Value | Baseline | Derivation |
 |-------|----------|------------|
 | Clock-skew tolerance | **30 s** measured against database time | An order of magnitude inside the ± 5 min timer-accuracy NFR, so skew alone can never account for a miss. |
-| Skew response | A replica measuring its own offset beyond the tolerance **MUST drop its lease**, stop firing timers and stop heartbeating, and **MUST NOT** rejoin until it is back inside it | Continuing to act on a clock the deployment does not agree with is the failure mode the tolerance exists to detect. |
+| Skew response | A replica measuring its own offset beyond the tolerance **MUST release its advisory locks**, stop firing timers and stop heartbeating its in-flight registry leases, and **MUST NOT** rejoin until it is back inside it | Continuing to act on a clock the deployment does not agree with is the failure mode the tolerance exists to detect. |
 | Timer wake-up scan | **15 s** | ≤ 1/20 of the ± 5 min accuracy budget, so scan granularity is never the dominant term in a miss. |
 
 ### 4.16 Recovery-rate target and the cold-start admission ramp
@@ -1915,6 +2070,96 @@ The ramp applies to first attempts *and* retries, and it **MUST NOT** be bypasse
 deadline is close to expiry — a step that cannot be admitted within its deadline settles
 `permanent-failure` and is handled by its handler's policy, which is a recorded outcome, where
 bypassing the ramp is an unrecorded amplification.
+
+### 4.17 The audit contract (normative)
+
+Workflow retains its gear-owned transactional audit following Pricing and Orders Lifecycle
+(D-59) rather than an event-only replacement; D-60 freezes the byte contract below and D-61
+makes actor references immutable. Where a rule here is identical to Lifecycle's, it is cited
+from [Lifecycle `01 §4.4` *Audit*](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative)
+and not restated; only what is Workflow-specific is written out.
+
+**Append rule.** The audit entry **MUST** be appended in the transaction of the transition it
+records, on **every** path §4.6 enumerates — the admission transaction, the step executor's unit
+of work, the timer fire, the sweep settlement, the compensation step, the delivery path's
+dead-letter park — and a failed append or encoding failure **MUST** abort that unit of work. An
+unaudited transition is not a permitted outcome. The append takes the `owf_process_instance` row
+lock, increments `audit_sequence`, and inserts the entry; counter, entry and business mutation
+commit or roll back together, and no non-transactional database sequence is used. No read
+**MAY** derive process or order state from this table, and nothing recovers from it.
+
+**Canonical audit hash v1 (D-60).** This is the authoritative byte contract for
+`owf_audit_entry`; there is no v2 and no writer has shipped. Lifecycle D-99's framing rules apply
+by reference and are summarised in one line: SHA-256 through the platform-approved provider;
+every field framed as `0x00` for NULL, else `0x01 || u32_be(byte_length) || value_bytes`, NULL
+and empty distinct, over-long values rejected rather than truncated; UUIDs as their 16 binary
+bytes; `hash_version` as unsigned 16-bit big-endian; `sequence`, `order_version` and
+`attempt_number` as unsigned 64-bit big-endian, constrained positive; `created_at` as signed
+64-bit big-endian microseconds since the Unix epoch, UTC, normalised once before both hashing and
+storage; text and enum tokens as the exact persisted UTF-8 bytes with no trimming, folding or
+normalisation. `order_id` is `text` in this gear and hashes as text, not as a UUID.
+
+`entry_hash = SHA256(ROW_TAG || framed_fields)`, where `ROW_TAG` is the ASCII bytes
+`VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROW-v1` followed by the single byte `0x1f`. Fields are concatenated
+in exactly this order (commas and whitespace are notation, not bytes):
+
+```text
+hash_version, audit_id, audit_tenant_id, resource_tenant_id, seller_tenant_id,
+correlation_id, order_id, order_version, sequence, event_kind, step_id, attempt_number,
+definition_version, phase_from, phase_to, actor, actor_class, idempotency_key,
+reason, justification, created_at, prev_hash
+```
+
+Every column of §3.7 `owf_audit_entry` except `entry_hash` itself is covered. Genesis, for
+sequence 1 of a chain, is
+`prev_hash = SHA256(GENESIS_TAG || F(audit_tenant_id) || F(correlation_id))`, where `F` is the
+framing above and `GENESIS_TAG` is ASCII `VHP-BSS-ORDERS-WORKFLOW-AUDIT-GENESIS-v1` followed by
+`0x1f`; for sequence N > 1 it is the stored `entry_hash` of sequence N-1 on the same
+`correlation_id`. The namespace binding is frozen at the chain's first entry and **MUST** match
+on every later one. The writer **MUST** construct every value before hashing and insert those
+same values; the encoder is implemented over an exhaustively destructured record with no ignored
+fields, so a new evidence column cannot be silently omitted from coverage. A change to coverage,
+encoding or algorithm is a new `hash_version` with a documented rollout and old decoders
+retained, never a rehash of persisted rows (D-60).
+
+**Verifier.** The verification pass of the `audit/<audit-tenant>` worker (§3.8, D-59) walks one
+process chain at a time in a rolling pass with a full pass of every chain in the namespace inside
+**30 days**. It checks row shape, supported `hash_version`, digest lengths, genesis, sequence
+contiguity from 1 to the instance's `audit_sequence`, namespace binding, predecessor equality
+and each recomputed digest. It holds SELECT only; a mismatch **alerts and never repairs**. An
+unknown `hash_version` is an explicit unsupported-version failure, never a pass and never a
+fallback to v1. It hashes the stored opaque actor reference without identity resolution and no
+erasure record exempts a mismatch (D-61). A chain under dispute **MAY** additionally be verified
+on demand; that path is a read.
+
+**Roll-ups (D-100 pattern, per audit namespace).** The checkpoint phase of the same worker
+captures each `audit_tenant_id` at least once per **24 hours** into `owf_audit_checkpoint` and
+`owf_audit_checkpoint_member` (§3.7), following Lifecycle `01 §4.4` *Tenant roll-ups and
+completeness* by reference — one consistent snapshot under the namespace advisory lock, members
+streamed in ascending binary `correlation_id` order, header and members published atomically,
+reconciliation against every live instance's `audit_sequence` and against every member of the
+previous checkpoint before recording, no checkpoint blessing a detected discrepancy, and the
+stated limits: no completeness proof for a chain lost before its first checkpoint, for a suffix
+removed together with its counter before capture, or against a privileged rewrite of all local
+evidence. An instance-less dead-letter chain has no counter and is reconciled against its
+previous checkpoint member only. Workflow's tags are `VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROLLUP-v1`
+for the checkpoint digest and `VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROLLUP-GENESIS-v1` for the namespace
+genesis, each followed by `0x1f`; the framed field order is `format_version` (u16),
+`audit_tenant_id`, `checkpoint_sequence` (u64), `captured_at` (i64), `member_count` (u64),
+`prev_checkpoint_hash`, then each sorted member's `correlation_id`, `audit_sequence` (u64),
+`entry_hash`. External anchoring is optional hardening under Lifecycle's stated approval
+conditions and is not presumed available.
+
+**Acceptance evidence (implementation requirements, not claims).** Frozen preimage and digest
+vectors for genesis, `instance-start`, a later step entry, an instance-less `dead-letter` entry
+and a roll-up; every-field mutation tests over every covered column, including NULL/empty and
+adjacent-field boundaries; malformed length and version rejection; database timestamp round
+trips; concurrent same-instance appends that never fork and a rollback that never consumes a
+sequence; different instances sharing no lock; database rejection of every UPDATE and DELETE by
+every role; checkpoint fork rejection under two replicas; tail, middle and whole-chain removal
+detected against an intact counter or a prior checkpoint; and a simulated identity removal that
+leaves the store and its verification unchanged. None of these exists yet for Workflow; Lifecycle's
+and Pricing's tests are references for design, not evidence that these have run.
 
 ## 5. Traceability
 

@@ -459,12 +459,19 @@ erasure request.
   free-text justification on every override, and names the human `deciding_authority` who approved
   a commercial decision. That is personal data under any ordinary reading, held for over a year,
   under an append-only no-delete constraint this design deliberately hardened (`DECISIONS.md`
-  D-50).
+  D-50, D-59). The actor itself is an opaque `SecurityContext` subject UUID, never a name or an
+  email (D-61), and the identity-lifecycle guarantees that reference relies on — stability,
+  non-reuse, deletion across caches and backups — are the shared p2 platform follow-up Lifecycle
+  registered as `cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`
+  ([Lifecycle `UPSTREAM_REQS.md` §2.8](../../orders-lifecycle/docs/UPSTREAM_REQS.md#28-identity-platform)),
+  which this gear cites rather than duplicates; pseudonymisation is not anonymisation, so this
+  ruling is still required.
 - **Consequence if it does not land**: the gear's retention posture and its erasure posture are in
   unresolved conflict, and the conflict is discovered at the first erasure request rather than at
   design time. The append-only, hash-chained audit store has no compliant deletion path by
-  construction, so any answer that requires deleting rows would invalidate the design rather than
-  configure it.
+  construction — and no in-place rewrite path either, since erasure changes identity data held by
+  the identity platform, never the audit row (`DESIGN.md` §4.3, D-61) — so any answer that requires
+  deleting or rewriting rows would invalidate the design rather than configure it.
 - **Agreement status**: **UNASKED** — no privacy owner has been named and no ruling requested.
 - **Source**: PRD §8 (out-of-scope / privacy exclusion); `DECISIONS.md` D-50, D-38;
   `design/01-foundation.md` §3.7 (`owf_audit_entry`).

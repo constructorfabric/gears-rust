@@ -481,10 +481,12 @@ termination.
 database, the upsert runs **in the same transaction** as the change — the projection is never
 stale relative to a change this gear made, and a caller who just performed an operation reads its
 own write. Where the change is observed rather than made (an outbound event's delivered outcome,
-a sweep-confirmed terminal outcome), the upsert is driven by the outbox drain and is stale by at
-most **one drain interval plus one write, ≤ 5 s**, which the read surface states rather than
-hides. Invalidation is by upsert on `order_id`, not by TTL or by cache eviction: there is exactly
-one row per order and it is rewritten, never invalidated and re-derived.
+a sweep-confirmed terminal outcome), the upsert runs in the transaction that records the
+observation — the sweep's settle-from-lookup or the consuming handler's step — and is stale by at
+most **the observation's own landing latency plus one write, ≤ 5 s**, which the read surface
+states rather than hides. Invalidation is by upsert on `order_id`, not by TTL or by cache
+eviction: there is exactly one row per order and it is rewritten, never invalidated and
+re-derived.
 
 ##### Responsibility boundaries
 
@@ -955,7 +957,7 @@ NFR workshop, not as settled numbers.
   | Store | Retention |
   |---|---|
   | `owf_audit_entry`, `owf_compensation_record`, `owf_manual_task`, `owf_incident`, `owf_dead_letter_record` | ≥ 400 days |
-  | `owf_event_outbox` | delivered rows purged at 30 days |
+  | `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
   | `owf_step_log`, `owf_retry_state` | 90 days |
   | `owf_idempotency_registry` | 30 days |
   | `owf_process_progress_view` | lives as long as the process record it projects; never purged ahead of it |

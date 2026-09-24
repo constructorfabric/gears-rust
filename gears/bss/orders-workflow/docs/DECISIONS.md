@@ -76,6 +76,10 @@
   - [D-56: The submitting identity is refused at the approval-decision endpoint](#d-56-the-submitting-identity-is-refused-at-the-approval-decision-endpoint)
   - [D-57: `lifecycle_submitted_ttl` is mirrored as local configuration under a startup refusal, pending the upstream field](#d-57-lifecycle_submitted_ttl-is-mirrored-as-local-configuration-under-a-startup-refusal-pending-the-upstream-field)
   - [D-58 (H) Process events use the platform producer outbox; Workflow owns no outbox table, drain or re-drive](#d-58-h-process-events-use-the-platform-producer-outbox-workflow-owns-no-outbox-table-drain-or-re-drive)
+  - [D-59 (H) Retain gear-owned transactional audit following Pricing and Orders Lifecycle](#d-59-h-retain-gear-owned-transactional-audit-following-pricing-and-orders-lifecycle)
+  - [D-60 (H) Freeze the Workflow audit hash byte contract](#d-60-h-freeze-the-workflow-audit-hash-byte-contract)
+  - [D-61 (M) Audit actor references are immutable; erasure is not an in-place rewrite](#d-61-m-audit-actor-references-are-immutable-erasure-is-not-an-in-place-rewrite)
+  - [D-62 (M) Workflow-owned workers coordinate through toolkit-db session advisory locks under a named roster](#d-62-m-workflow-owned-workers-coordinate-through-toolkit-db-session-advisory-locks-under-a-named-roster)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -85,6 +89,7 @@
   - [Q-06: Payments has no specification and no register, so the payment-authorization ask has no owner; only "provision first, collect after" is expressible](#q-06-payments-has-no-specification-and-no-register-so-the-payment-authorization-ask-has-no-owner-only-provision-first-collect-after-is-expressible)
   - [Q-07: Tension between asynchronous outbox publication and the PRD's p95 < 30 s process-event delivery target](#q-07-tension-between-asynchronous-outbox-publication-and-the-prds-p95--30-s-process-event-delivery-target)
   - [Q-08: SUB-O5 (overlap-scope-key presence read) is unagreed, leaving the pre-activation overlap check unevaluable; SUB-O1 (compensation cancellation reason) is critical and unagreed, leaving the activated-cancel reason unspecifiable from this side](#q-08-sub-o5-overlap-scope-key-presence-read-is-unagreed-leaving-the-pre-activation-overlap-check-unevaluable-sub-o1-compensation-cancellation-reason-is-critical-and-unagreed-leaving-the-activated-cancel-reason-unspecifiable-from-this-side)
+  - [Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?](#q-09-do-the-orders-gears-and-pricing-converge-on-toolkit-db-session-advisory-locks-or-on-the-gearsbsslibscoord-fenced-lease-for-worker-coordination)
 - [What This Design Set Does Not Claim](#what-this-design-set-does-not-claim)
 - [Traceability](#traceability)
 
@@ -1219,6 +1224,140 @@ producer persistence* and the retention/immutability register, §3.8, §4.7, §4
 
 **ADR**: `cpt-cf-bss-orders-workflow-adr-outbox-process-events`.
 
+### D-59 (H) Retain gear-owned transactional audit following Pricing and Orders Lifecycle
+
+**Accepted.** *(mirrors Lifecycle D-97 and D-103; hardens D-50, which remains in force)*
+
+**Decision**: `owf_audit_entry` stays the authoritative process-audit record of this gear, written
+in the transaction of the transition it records on every path; a failed append aborts the step's
+unit of work. Each process instance carries a committed hash chain keyed on `correlation_id`,
+with `sequence` allocated from the new `owf_process_instance.audit_sequence` counter under the
+instance row lock and `(correlation_id, sequence)` uniqueness rejecting a competing append. The
+byte contract is frozen (D-60), actor references are immutable opaque subject UUIDs (D-61), the
+store carries no UPDATE or DELETE grant to any role **and** database triggers rejecting both, and
+a declared verifier — the fifth Workflow-owned worker, `audit/<audit-tenant>` — walks each chain
+in a rolling pass with a 30-day full pass, alerts and never repairs. Per-namespace roll-ups
+`owf_audit_checkpoint` / `owf_audit_checkpoint_member` follow Lifecycle D-100 by reference with
+the process instance as the member unit. The audit row gains `hash_version`, `audit_tenant_id`,
+`step_id`, `attempt_number`, `definition_version` and `phase_from`/`phase_to`; `event_kind` gains
+`instance-start`, `phase-transition`, `termination` and `sweep-settlement`; `correlation_id` and
+`prev_hash` become NOT NULL. The engine now owns nine tables (D-58's seven plus the two
+checkpoint tables). A future platform Audit Gear may receive copies under a separately specified
+integration; it is never this gear's authoritative store, and the platform producer outbox is
+event transport, not audit evidence.
+
+**Rationale**: Pricing Governance G4/D-14/D-135 and Orders Lifecycle D-97/D-103 are the verified
+precedent — local durable append in the business transaction, aggregate-segmented chains,
+append-only permissions plus triggers, a periodic verifier and per-tenant roll-ups. Lifecycle
+D-97 records the Pricing source it checked; this decision reuses that check rather than repeating
+it. The event-only replacement the sibling review proposed for this gear — enqueue the audit as
+process events for a future Audit Gear — was considered and is **declined for the same reasons
+Lifecycle declined it**: an enqueue is transport, not retained queryable evidence; at-least-once
+delivery with a permitted permanent-reject gap (D-58) cannot carry a 100 %-completeness claim; a
+gear whose evidence lives in a service that does not yet exist has no evidence; and it would
+leave the two Orders gears on different audit architectures while sharing one review boundary.
+Nothing here presumes reviewer or platform agreement; it records this gear's direction.
+
+| Concern | Lifecycle / Pricing baseline | Workflow alignment or explicit difference |
+|---------|------------------------------|--------------------------------------------|
+| Chain unit | Per order (`order_id`), per aggregate in Pricing | **Per process instance**, keyed on `correlation_id`; several instances for one order over its versions are several chains |
+| Row discriminator | Transition `trigger` with a closed reason token per trigger | **`event_kind`**, the closed process-event vocabulary of `01 §3.7`; `reason` remains the catalogue value and `justification` the human text (D-50) |
+| Refusals | Refused attempts are unchained rows with NULL `sequence`, a bounded retention DELETE grant and a partial purge index | **No refusal rows**: authorization refusals are the read/authz slice's concern (`09`), so `prev_hash` is NOT NULL, no role holds any DELETE grant, and the trigger rejects DELETE unconditionally as Pricing's does |
+| Evidence fields | State pair, version, delegation proof, administrative delta | **`step_id`, `attempt_number`, `definition_version`, `phase_from`/`phase_to`** as evidence; no delegation-proof or before/after columns |
+| Namespace | `audit_tenant_id` captured at create, distinct from an editable resource tenant | `audit_tenant_id` = the instance's `resource_tenant_id` at start, which this gear never rewrites; same immutability, no separate rebinding rule needed |
+| Subject tenant | Mandatory `subject_tenant_id` scoping unresolved refusals | **Not carried**: there are no unresolved rows to scope |
+| Retention | Commercial retention is Lifecycle's Q-07; Pricing's ≥ 7 years is not imported | ≥ 400 days per `cpt-cf-bss-orders-workflow-nfr-owf-retention`, unchanged; the privacy ruling stays open (`UPSTREAM_REQS.md` §2.6) |
+| Instance-less evidence | Unresolved refusals leave aggregate fields NULL | An instance-less inbound dead letter is audited under the derived `correlationId` (`02 §2.1`) so every entry has a chain; admission continues that chain rather than restarting it |
+
+**Propagated**: `design/01-foundation.md` §1.2, §3.1, §3.2 *Audit writer*, §3.7 (`owf_process_instance`,
+`owf_audit_entry`, the two checkpoint tables, the retention/immutability register), §3.8, §4.6,
+§4.17; `DESIGN.md` §3.7, §4.2 threat model, §4.3.
+
+### D-60 (H) Freeze the Workflow audit hash byte contract
+
+**Accepted.** *(mirrors Lifecycle D-99; v1 only, no v2)*
+
+**Decision**: `01 §4.17` defines audit encoding v1 for `owf_audit_entry`: SHA-256; Workflow's
+own row tag `VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROW-v1` and genesis tag
+`VHP-BSS-ORDERS-WORKFLOW-AUDIT-GENESIS-v1`, each followed by `0x1f`; Lifecycle D-99's framing
+rules by reference — NULL-safe length-prefixed fields, binary UUIDs, big-endian integers,
+microsecond UTC instants, exact persisted UTF-8 text — with a fixed field order covering every
+column except `entry_hash`; `hash_version` always 1; the first sequence is 1 and genesis binds
+`(audit_tenant_id, correlation_id)`. `order_id` hashes as text because it is text in this gear.
+Encoding failure aborts the append. An unsupported `hash_version` fails verification explicitly.
+New evidence fields or changed encoding require a new version with old decoders retained, never a
+rehash of persisted rows. There is no v2: no Workflow writer has shipped and no column has been
+added after the freeze, so the contract has one version and its vectors are frozen against it.
+
+**Rationale**: D-50's `SHA-256(canonical(entry fields) || prev_hash)` named no bytes, so two
+implementers would produce two incompatible chains and a verifier could not exist. Lifecycle
+D-99 settled the same gap with an explicit framing; reusing that discipline — not its tag, field
+set or private helper code — keeps the two Orders verifiers reviewable side by side without
+asserting wire-byte compatibility. Hash binding grants no access permission.
+
+**Acceptance**: frozen preimage/digest vectors, every-field mutation tests, NULL/empty and
+framing tests, timestamp round trips, genesis and namespace checks, and transactional concurrency
+tests — all to implement; this decision specifies the contract, not a running verifier.
+
+**Propagated**: `design/01-foundation.md` §3.7 (`hash_version`, `prev_hash`, *The chaining rule*),
+§4.17; `DESIGN.md` §4.2 threat model.
+
+### D-61 (M) Audit actor references are immutable; erasure is not an in-place rewrite
+
+**Accepted.** *(mirrors Lifecycle D-96 and D-103; supersedes the in-place pseudonymisation
+paragraph `DESIGN.md` §4.3 previously carried)*
+
+**Decision**: `owf_audit_entry.actor` stores the platform `SecurityContext.subject_id()` as
+lowercase hyphenated UUID text — an opaque, pseudonymous, immutable reference — never names,
+emails, credentials or caller-supplied labels; `actor_class` keeps the configured worker and
+service identities apart from users. Identifying attributes and any reference-to-person mapping
+belong to the identity platform. No identity-erasure UPDATE grant, historical actor replacement,
+chain recalculation or verifier exemption exists; the store's triggers reject the UPDATE an
+in-place pseudonymisation would need. Identity stability, non-reuse and deletion lifecycle are the
+shared p2 platform follow-up Lifecycle registered as
+`cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`
+([Lifecycle `UPSTREAM_REQS.md §2.8`](../../orders-lifecycle/docs/UPSTREAM_REQS.md#28-identity-platform));
+this gear references it and does not copy it. The privacy ruling of `UPSTREAM_REQS.md` §2.6 stays
+open and is not waived.
+
+**Rationale**: the previous erasure text made pseudonymisation "the single permitted mutation of
+the audit store", re-deriving the chain afterwards — which is a privileged chain-rewriting path,
+the exact capability a tamper-evident store must not have, and one that makes routine erasure
+indistinguishable from tampering. Separating identity data from evidence preserves the original
+bytes; pseudonymous references do not by themselves make evidence anonymous, so Privacy/Legal
+must still approve retained content, linkage risk and retention. Pricing and Lifecycle already
+hold this position; a third answer in the same domain would be a defect.
+
+**Propagated**: `DESIGN.md` §4.3 (authoritative identity and erasure contract), §4.2 threat
+model; `design/01-foundation.md` §3.1, §3.7 (`actor`), §4.17 *Verifier*; `UPSTREAM_REQS.md` §2.6.
+
+### D-62 (M) Workflow-owned workers coordinate through toolkit-db session advisory locks under a named roster
+
+**Accepted.** *(mirrors Lifecycle D-92's coordination clarification)*
+
+**Decision**: the previously unnamed "coordination lease library" is replaced by
+`toolkit_db::Db::lock` / `Db::try_lock` session advisory locks. `01 §3.8` is the authoritative
+roster for the five Workflow-owned workers in gear namespace `bss-orders-workflow` —
+`timer-wakeup`, `reconciliation-sweep`, `dead-lease-scan`, `retention-purge` and
+`audit/<audit-tenant UUID>` — each with the transactional recheck that keeps it correct when its
+lock session is lost, because a session advisory lock is not a TTL lease and not a fence.
+Lifecycle `01 §3.8`'s deployment constraint and *session loss is not fencing* rule apply by
+reference. There is no idempotency-window sweep (registry retention is a partition drop) and no
+dead-letter delivery-count sweep (the delivery path parks inline). `cluster-sdk` is not selected
+for the reason Lifecycle gives. `gears/bss/libs/coord` — Pricing's DB-backed TTL lease with an
+in-transaction fence — is a candidate for the same roster and is registered as Q-09 for the
+Lifecycle, Pricing and Workflow owners to decide jointly rather than chosen here. Toolkit owns
+outbox coordination (D-58).
+
+**Rationale**: a dependency that names no crate cannot be vetted, licensed or tested, and `01 §3.8`
+listed three workers while the schema already required a dead-lease scan and the audit contract
+requires a verifier. Adopting Lifecycle's primitive and table shape puts the two Orders gears on
+one coordination contract, and stating the recheck per worker makes the primitive swappable if
+Q-09 lands on the fenced lease.
+
+**Propagated**: `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15; `DESIGN.md` §1.3, §2.2,
+§3.4, §3.8, §4.1, §4.2 *Supply chain*, §4.5; Q-09.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -1336,6 +1475,20 @@ compensation leg has no cancellation-reason value to send, since reason values r
 consumers key on and adding one after Billing consumes the contract would be a breaking change;
 this design names the requirement and defers the value rather than inventing a placeholder.
 
+### Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?
+
+**Owner**: Architecture (joint decision of the Orders Lifecycle, Orders Workflow and Pricing
+owners).
+
+**Open**: D-62 selects `toolkit_db::Db::lock` for this gear's roster, as Lifecycle D-92 did, and
+both gears rest correctness on per-worker transactional rechecks because a session advisory lock
+is neither a TTL lease nor a fence. Pricing coordinates through `gears/bss/libs/coord`, a
+DB-backed TTL lease with an in-transaction fence. Two primitives for one job across three sibling
+gears is a maintenance and review cost, and the fenced lease would let a worker prove ownership
+inside its writing transaction, which the advisory lock cannot. Neither Orders gear should switch
+alone: the answer is one contract for all three, decided with the Pricing owner, and until it
+lands this gear's roster runs on `Db::lock` with its rechecks intact.
+
 ## What This Design Set Does Not Claim
 
 Following the sibling Orders Lifecycle design set's own precedent: the coherence of this design
@@ -1381,6 +1534,10 @@ and that hand-check is the only guarantee this document offers.
 | D-56 | L Cross-cutting (separation of duties) | `design/03-approval-execution.md` §3.3, `design/09-read-and-authz.md` §4.1 |
 | D-57 | K Tuning baselines (approval path) | `design/03-approval-execution.md` §4.2, `ADR/0007-cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park.md`, `UPSTREAM_REQS.md` (`…-upreq-submitted-ttl-visibility`) |
 | D-58 | L Cross-cutting (process events) | `ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md`, `design/01-foundation.md` §3.2, §3.6, §3.7, §4.7, `DESIGN.md` §3.4, §3.7, §3.8, §4.5, `design/02-triggers-and-start.md` §2.1, `design/05-provisioning-intents.md` §2.1, `UPSTREAM_REQS.md` §2.7 |
+| D-59 | L Cross-cutting (audit) | `design/01-foundation.md` §1.2, §3.1, §3.2, §3.7, §3.8, §4.6, §4.17, `DESIGN.md` §3.7, §4.2, §4.3 |
+| D-60 | L Cross-cutting (audit hash contract) | `design/01-foundation.md` §3.7, §4.17, `DESIGN.md` §4.2 |
+| D-61 | L Cross-cutting (audit identity) | `DESIGN.md` §4.3, §4.2, `design/01-foundation.md` §3.1, §3.7, §4.17, `UPSTREAM_REQS.md` §2.6 |
+| D-62 | L Cross-cutting (worker coordination) | `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15, `DESIGN.md` §1.3, §2.2, §3.4, §3.8, §4.1, §4.2, §4.5, Q-09 |
 
-Highest decision number used: **D-58**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-62**. Numbering is one continuous sequence across the whole
 register; there are no parts.

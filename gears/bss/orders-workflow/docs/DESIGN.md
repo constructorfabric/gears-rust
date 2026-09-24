@@ -166,7 +166,7 @@ flowchart TB
 | Presentation | Control-plane API (start, cancel-with-compensation, resolve manual task, retry step, progress read) behind the inbound gateway; Approver Inbox and Fulfillment Operator Task Queue read surfaces, each scoped by actor role and tenancy | Rust, REST/OpenAPI, inbound API gateway |
 | Application | The nine capability slices of `cpt-cf-bss-orders-workflow-adr-slice-decomposition` — foundation (shared engine), triggers-and-start, approval-execution, fulfillment-plan, provisioning-intents, saga-and-compensation, manual-tasks, hold-and-cancel, read-and-authz — each owning its own guard logic and machine-readable failure reasons | Rust modules in the `orders-workflow` gear |
 | Domain | Process state model: `FulfillmentTask` and `OrderApprovalRequest` state machines, saga/compensation registry, idempotency-key composition, correlation and definition-version tracking — all non-authoritative for commercial order semantics | Rust domain structs; GTS for cross-gear contract surfaces with Lifecycle, Subscriptions, and the Generic Approval service |
-| Infrastructure | Gear-owned durable process state for restart-safe checkpointing; append-only, hash-chained process audit store; platform producer outbox for process events; durable timer subsystem; background reconciliation sweep | PostgreSQL (`toolkit-db` plus `outbox`), SecureORM, coordination lease library, `event-broker-sdk`. The execution-engine product underneath, if any, is **unselected** — `DECISIONS.md` Q-01 — and its internal history is never a citable record |
+| Infrastructure | Gear-owned durable process state for restart-safe checkpointing; append-only, hash-chained process audit store; platform producer outbox for process events; durable timer subsystem; background reconciliation sweep | PostgreSQL (`toolkit-db` plus `outbox`), SecureORM, toolkit-db session advisory locks (`Db::lock`) for the worker roster of `design/01-foundation.md` §3.8, `event-broker-sdk`. The execution-engine product underneath, if any, is **unselected** — `DECISIONS.md` Q-01 — and its internal history is never a citable record |
 
 ## 2. Principles & Constraints
 
@@ -285,8 +285,8 @@ tables that share the same database — is pinned to an in-jurisdiction
 deployment cell with **zero cross-boundary replication**, stated in the same terms as the sibling
 gear. Two regulatory obligations bind through that: the process audit trail is a compliance-grade
 record and its ≥ 400-day floor is a retention obligation, not a convenience; and the trail carries
-actor and approver identifiers, so an erasure obligation is satisfied by in-place pseudonymisation
-(§4.3) rather than deletion. The constraint has a direct architectural consequence rather than
+opaque actor and approver subject identifiers, so an erasure obligation is met by the identity
+platform removing identifying data, never by deleting or rewriting audit rows (§4.3, D-61). The constraint has a direct architectural consequence rather than
 being a policy footnote: a recovery standby must be a second failure domain inside the
 jurisdiction rather than a second region, and **a durable-execution engine whose run history
 cannot be pinned in-jurisdiction is disqualified under Q-01 regardless of its operational
@@ -299,9 +299,10 @@ and holds no payment instrument; PCI DSS is not applicable for the same reason (
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-constraint-vendor-licensing`
 
-The gear introduces **no** third-party runtime dependency beyond the platform's own ToolKit,
-PostgreSQL and the coordination lease library, all already licensed and vetted platform-wide, and
-adds no crate outside the approved set. There is exactly one open vendor item, and it is stated
+The gear introduces **no** third-party runtime dependency beyond the platform's own ToolKit and
+PostgreSQL — worker coordination is toolkit-db's own session advisory locks (`Db::lock`), not a
+further library — all already licensed and vetted platform-wide, and it adds no crate outside the
+approved set. There is exactly one open vendor item, and it is stated
 rather than recorded as "not applicable": answering Q-01 in favour of a separate durable-execution
 engine product would introduce a vendor dependency with a licence, a support posture, a CVE
 history and a run cost, none of which have been reviewed. Selecting one is therefore a vendor
@@ -538,6 +539,7 @@ reason without string-matching `detail`.
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | Transactional persistence for the Workflow stores of §3.7 and the platform-managed producer queue `bss-orders-workflow-events` |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication of the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` |
 | `types-registry` | SDK client | Register and resolve the process-event GTS types of `design/01-foundation.md` §4.7 before readiness; registration failure prevents startup |
+| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative worker roster in `design/01-foundation.md` §3.8; toolkit owns outbox coordination |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies.
@@ -712,7 +714,7 @@ or remediation path. **Column-level definitions, keys, constraints, indexes and 
 specified normatively in the slice named in the "Specified in" column, and are not restated here.**
 A schema stated twice is a schema that will disagree with itself, which is exactly what this
 registry exists to prevent. Mutability is declared **per table** rather than globally, because
-eighteen of the twenty-four are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
+eighteen of the twenty-six are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
 
 Every table carries `resource_tenant_id` NOT NULL; tables backing an operator- or seller-scoped
 surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
@@ -725,7 +727,9 @@ surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-
 | `owf_idempotency_registry` | `01 §3.7` | foundation — idempotency registry | **mutable** — the marker settles; rows age out at the key lifetime |
 | `owf_retry_state` | `01 §3.7` | foundation — retry/backoff controller | **mutable** — attempt counters and next-attempt instant advance |
 | `owf_durable_timer` | `01 §3.7` | foundation — durable timer service | **mutable** — armed / paused / fired / cancelled |
-| `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, no UPDATE/DELETE grant |
+| `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, trigger-protected — no UPDATE/DELETE grant to any role and triggers rejecting both (D-59) |
+| `owf_audit_checkpoint` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — per-namespace roll-up headers chained under `01 §4.17` (D-59) |
+| `owf_audit_checkpoint_member` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — the chain heads a checkpoint captured |
 | `owf_dead_letter_record` | `01 §3.7` | foundation — step executor, on delivery-cap exhaustion | **mutable** — only to record redrive or resolution; an entry is never deleted |
 | `owf_approval_verdict_cache` | `03 §3.7` | approval-execution — verdict gateway | append-only — one row per order version, authoritative once present |
 | `owf_approval_gate` | `03 §3.7` | approval-execution — approval gate manager | **mutable** — gate state settles through `open / approved / rejected / cancelled` |
@@ -756,6 +760,7 @@ spellings are retired in favour of the `owf_*` names the slices declare. There i
 | Store | Retention |
 |---|---|
 | `owf_audit_entry`, `owf_compensation_record`, `owf_manual_task`, `owf_incident` | ≥ 400 days |
+| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
 | `owf_dead_letter_record` | ≥ 400 days |
 | `owf_step_log`, `owf_retry_state` | 90 days |
 | `owf_idempotency_registry` | 30 days — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume |
@@ -763,20 +768,23 @@ spellings are retired in favour of the `owf_*` names the slices declare. There i
 Every growth table — step log, audit, dead-letter, manual tasks, provisioning intents and
 compensation records — is a monthly range partition on `created_at`, and a declared retention
 window with no worker behind it is an unbounded store, so the retention purge sweep in §3.8 is a
-condition of these numbers rather than a convenience. The platform `toolkit_db::outbox` tables
+condition of these numbers rather than a convenience. The audit store and its checkpoints are the
+exception in kind, not in shape: nothing is ever purged from them, the purge worker holds no grant
+on them, and their partitioning, where applied, serves query cost only (`01 §3.7`). The platform `toolkit_db::outbox` tables
 behind the producer queue are outside this register: the library owns their retention and vacuum,
 and they are not counted here (`design/01-foundation.md` §3.7 *Platform-managed producer
 persistence*).
 
 **Migration and schema versioning.** Migrations are ordered by the build-order map in
-[`design/README.md`](./design/README.md): the engine's seven tables and the platform outbox
+[`design/README.md`](./design/README.md): the engine's nine tables and the platform outbox
 migrations land in phase 0/1 before any
 slice, and each slice's own tables land with it. Append-only tables need no backfill because a
 correction is a new row. The gear exposes migrations and the runtime applies them, so the schema
 version is the migration set the deployed gear carries, and a rollback is a forward-only
 compensating migration rather than a down-migration. Database privilege is runtime-owned; the
-audit role is granted INSERT and SELECT only, which is half of what makes the hash chain
-tamper-evident.
+audit role is granted INSERT and SELECT only and the audit migrations install triggers rejecting
+every UPDATE and DELETE, which together with the per-process hash chain and the checkpoints of
+`01 §4.17` is what makes the trail tamper-evident (D-59).
 
 ### 3.8 Deployment Topology
 
@@ -788,14 +796,29 @@ availability baseline (`cpt-cf-bss-orders-workflow-nfr-owf-availability`). In-fl
 recoverable from durable state independent of control-plane restarts
 (`cpt-cf-bss-orders-workflow-nfr-owf-durability`).
 
-**Background workers**, lease-coordinated so a multi-replica deployment cannot double-act:
+**Background workers** coordinate through toolkit-db session advisory locks (`Db::lock`) under
+the named roster of [`design/01-foundation`](./design/01-foundation.md) §3.8 (D-62), so a
+multi-replica deployment cannot double-act and every worker stays correct on a transactional
+recheck when its lock session is lost. The five Workflow-owned workers, in gear namespace
+`bss-orders-workflow`:
 
-- The **reconciliation sweep** (**reconciliation sweep**) on an escalating schedule.
-- The **durable timer drain** firing escalation and overdue-fulfillment deadlines.
-- A **dead-letter delivery-count sweep** promoting exhausted deliveries to dead-letter records.
-- A **retention purge sweep**, singleton-leased on a daily cadence with a bounded batch per store,
-  executing the per-store windows of §3.7. A declared retention with no worker behind it is an
-  unbounded store, which is why it is named here rather than assumed.
+- `timer-wakeup` — the **durable timer wake-up scan** firing escalation and overdue-fulfillment
+  deadlines through *execute step*.
+- `reconciliation-sweep` — the **intent reconciliation sweep** on its escalating schedule,
+  settling only through the engine's settle-from-lookup operation.
+- `dead-lease-scan` — the **dead-lease scan** handing expired in-flight registry rows to the
+  sweep; it writes nothing itself.
+- `retention-purge` — the **retention purge**, daily with a bounded batch per store, executing
+  the per-store windows of §3.7 and holding no grant on the audit store or its checkpoints. A
+  declared retention with no worker behind it is an unbounded store, which is why it is named here
+  rather than assumed.
+- `audit/<audit-tenant>` — the **audit verifier and checkpoint writer** of `01 §4.17`: SELECT-only
+  chain verification on a 30-day full pass and a 24-hour per-namespace roll-up.
+
+There is no dead-letter delivery-count sweep: the delivery path increments the count and parks
+the record inline at cap exhaustion (`01 §3.7`), so no worker is owed. `cluster-sdk` is not
+selected and `gears/bss/libs/coord` is a candidate to be decided jointly with Lifecycle and
+Pricing (`DECISIONS.md` Q-09).
 
 There is no Workflow-owned process-event drain. The gear starts and gracefully stops the platform
 `toolkit_db::outbox` handle for the `bss-orders-workflow-events` producer queue, whose sequencer,
@@ -808,7 +831,7 @@ than reconstructing state from the saga log, matching the API-latency NFR budget
 
 **Health reporting** distinguishes readiness from liveness. The gear exposes a platform-standard
 liveness endpoint (the process is up; no dependency checks) and a readiness endpoint that fails
-when the `toolkit-db` backend or the worker lease store is unavailable, so an instance stops
+when the `toolkit-db` backend or the advisory-lock session is unavailable, so an instance stops
 receiving traffic while remaining alive rather than being killed and restarted into the same
 unavailable store. Background workers report worker-level readiness separately from the API
 surface, because a healthy read path over a stalled sweep is the failure this gear's recovery
@@ -848,7 +871,7 @@ a workshop that disagrees has something specific to change.
 **Cost** is dominated by the shared `toolkit-db` backend and scales with retained process history
 rather than with process rate: the ≥ 400-day audit floor, not throughput, is the growth driver,
 which is why §3.7 partitions every growth table and names a purge worker for every declared
-window. The background workers are lease-coordinated and idle-cheap. One cost line is **not
+window. The background workers are advisory-lock-coordinated and idle-cheap. One cost line is **not
 estimable today**: if Q-01 is answered in favour of a separate durable-execution engine product,
 that product's licensing, run and operational cost is additive and unbudgeted here — which is a
 reason to price it as part of answering Q-01 rather than after.
@@ -921,15 +944,15 @@ The gear stores no cardholder data and holds no payment instrument — it consum
 | Self-approval | The submitting identity decides its own gate | Commercial-control boundary | The decision endpoint refuses the submitting identity, and the SoD clause is carried in the §9.2 expectations contract | Two colluding principals inside one seller tenant; out of scope for a technical control |
 | Callback impersonation | A forged decision or provisioning outcome arrives on the event transport | Service boundary | Broker-authenticated publisher identity plus a topic ACL, checked by the subscribing handler; gateway-asserted service principal on the REST path | A compromised broker or gateway; out of this gear's control |
 | Order state driven directly by a system actor | A service principal calls a state-affecting operation | BSS seam (R1) | `principal_kind = service` is refused on those operations, and no code path in this gear writes order state at all | A defect in Lifecycle's own guard; covered by that gear's evaluator |
-| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-process predecessor-hash chain verified periodically | A holder of the migration role can drop the grant; detectable via the chain and the grant audit |
+| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant to any role, database triggers rejecting both, a per-process predecessor-hash chain under the frozen contract of `01 §4.17`, the declared verifier alerting and never repairing, and per-namespace checkpoints reconciled against instance counters every 24 h (D-59, D-60) | Within D-100's stated limits: a holder of the migration role can drop grant and trigger and rewrite all local evidence including the latest checkpoint suffix; a chain lost before its first checkpoint, or a suffix removed with its counter before capture, is not independently evidenced. Independent anchoring is optional hardening, not presumed |
 | Commercial data resident in engine-side history | Resolved totals, approver identities and tenant axes appear in the execution substrate's own run history | Third-party / retention boundary | `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative` makes engine history non-citable and gear-owned audit independent of engine purge | **Open.** The substrate product is unselected (Q-01), so no isolation, retention or tenancy assessment of that history can be completed. Answering Q-01 must include one; this is the single largest unassessed third-party risk in the design |
 | Diagnostic leakage to operators | Raw downstream error text reaches the task queue via `owf_dead_letter_record.last_error` and event payloads | Wire boundary | The RFC 9457 envelope carries no internal diagnostics; stored downstream error text is sanitised to the reason catalogue before it reaches an operator surface, and the raw form is retained only where the audit role can read it | An unsanitised field added later; caught by the reason-catalogue structural test, not by the type system |
 | Event-payload over-exposure | Process events carry commercial context including resolved totals onto a shared bus | Data boundary | The event set is closed and its payload fields are declared per event type in `01 §4`; the bus's authorized consumer set is an upstream ask, not an assumption | Consumer-set definition is not owned by this gear and is registered upstream |
 | Manual-task or dead-letter flooding | A systemic downstream fault converts every line into an operator object | Availability boundary | Per-store retention with a purge worker, partitioning, and the manual-task arrival alert of §4.1 | A sustained downstream outage still produces a queue an operator cannot drain; that is a staffing question the alert surfaces rather than hides |
 
 **Supply chain.** The gear introduces no third-party runtime dependency beyond the platform's own
-ToolKit, PostgreSQL and the coordination lease library, all licensed and vetted platform-wide, and
-it adds no crate outside the approved set. Dependencies are pinned and resolved through the
+ToolKit and PostgreSQL — worker coordination is toolkit-db's session advisory locks, not a further
+library — all licensed and vetted platform-wide, and it adds no crate outside the approved set. Dependencies are pinned and resolved through the
 platform's audited registry, so a compromised transitive dependency is a platform-level event with
 a platform-level response rather than a gear-local one. The one supply-chain decision this gear
 would own is the durable-execution engine product, which is open (Q-01); a third-party engine
@@ -977,14 +1000,27 @@ window has the §3.8 purge worker behind it. Gear-owned audit retention is indep
 execution substrate's own run-history retention: an engine-side purge MUST NOT erase the gear's
 record (`cpt-cf-bss-orders-workflow-nfr-owf-retention`).
 
-**Erasure.** `owf_audit_entry` is append-only and hash-chained, so an erasure obligation is
-satisfied by **pseudonymising actor identifiers in place** — the single permitted mutation of the
-audit store, itself performed as an audited transition and recorded, so the chain is re-derived
-rather than broken. Commercial process content is not erased; it is a record retained under the
-program retention policy. The underlying question — whether a ≥ 400-day trail of actor identifiers
-sits inside or outside the PRD's "Privacy / PII: not applicable" exclusion — is a **PRD amendment,
-not a design change**, and is registered as an ask on the privacy owner in
-[`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) rather than answered here.
+**Erasure changes identity data, not audit history (D-61).** `owf_audit_entry.actor` stores the
+immutable, opaque `SecurityContext.subject_id()` as lowercase hyphenated UUID text — never a name,
+an email, a credential or a caller-supplied label — and the identity platform owns identifying
+attributes and any reference-to-person mapping. Erasure of identifying data is therefore the
+identity platform's act: it removes or restricts that data and its mappings under its documented
+lifecycle, and the audit row **never changes**. Workflow **MUST NOT** update audit actors,
+recalculate historical hashes, grant an erasure role UPDATE, or exempt a chain from verification
+because an identity was removed; there is no in-place pseudonymisation path, because the store's
+triggers reject the UPDATE it would need. Service and worker actors keep their configured service
+reference and actor class. Minimization covers the whole record: reasons are catalogue tokens,
+justifications are bounded free text reviewed for identifying content, and an opaque actor alone
+does not make the record anonymous. Commercial process content is not erased; it is a record
+retained under the program retention policy. Identity stability, non-reuse and deletion lifecycle
+are the shared p2 platform follow-up Lifecycle registered as
+`cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`
+([Lifecycle `UPSTREAM_REQS.md §2.8`](../../orders-lifecycle/docs/UPSTREAM_REQS.md#28-identity-platform)),
+referenced here and not copied. The underlying question — whether a ≥ 400-day trail of actor
+identifiers sits inside or outside the PRD's "Privacy / PII: not applicable" exclusion — stays a
+**PRD amendment, not a design change**, registered as an ask on the privacy owner in
+[`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) §2.6 rather than answered here; the ruling remains
+required, and this contract does not waive it.
 
 ### 4.4 Observability
 
@@ -1051,10 +1087,10 @@ asserts only that nothing is lost, never that anything resumes promptly.
 
 **Clocks are not trusted.** Durable-timer comparisons are evaluated against **database time**, not
 replica wall-clock, with a **30-second skew tolerance**: a replica whose clock drifts beyond it
-drops its lease rather than continuing to fire timers. The timer wake-up scan runs every
+releases its advisory locks rather than continuing to fire timers. The timer wake-up scan runs every
 **15 seconds**, at or under one twentieth of the ± 5-minute accuracy budget it has to hold. Both
 are working baselines proposed into the program-wide NFR workshop; both exist because a
-lease-coordinated multi-replica timer worker with no skew budget can fire an
+multi-replica timer worker with no skew budget can fire an
 `expected-fulfillment-wait` timer early and activate a future-dated line ahead of its contracted
 date.
 
