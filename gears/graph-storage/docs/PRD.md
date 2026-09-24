@@ -349,9 +349,18 @@ When an ingested edge references a node key that does not exist, the system **MU
 > by schema (`maxProperties: 0`, DESIGN § 3.1), so a phantom does not record
 > the referencing edge type in its payload; the edge that brought it into
 > being is visible through the phantom's adjacency, which is where a consumer
-> reads it. Concurrent creation of one phantom resolves as a unique-key
-> conflict (`aborted` / `CAS_CONFLICT`) for the later writer rather than as a
-> retry inside the gear.
+> reads it.
+>
+> **Concurrent creation of one phantom converges.** This first resolved as a
+> unique-key conflict (`aborted` / `CAS_CONFLICT`) for the later writer, and
+> that was the wrong answer to give a producer: a phantom is materialized
+> behind the caller's back, so two producers whose edges reference the same
+> not-yet-ingested node are both right and neither of them named that row in
+> its request. Failing one batch of edges over it is a refusal its author can
+> neither predict nor avoid, and a documented "retry the batch" protocol
+> would only move a thundering herd out of the gear and into every producer.
+> The insert does nothing on conflict and the loser reads the winner's row,
+> so both batches land and both edges hang off one endpoint.
 
 #### Edge Provenance and Analysis Preservation
 

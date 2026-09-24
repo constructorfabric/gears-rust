@@ -15,7 +15,7 @@ use graph_storage_sdk::models::{
     ReplaceScope, Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
@@ -1151,14 +1151,64 @@ async fn insert_phantom(
         deleted_by_subject_id: ActiveValue::Set(None),
         deleted_by_subject_type: ActiveValue::Set(None),
     };
-    let model = node::Entity::insert(active)
+    // A phantom is not the caller's write. The batch named an endpoint that
+    // did not exist and the gear materialized it, so two producers whose
+    // edges reference the same new node are both right and neither asked for
+    // this row. A plain insert made one of them lose a unique violation --
+    // reported as a conflict on a twenty-thousand-edge batch, over a node
+    // nothing in the request mentioned, with no way for the producer to
+    // predict or avoid it. `DO NOTHING` lets the loser converge on the
+    // winner's row instead, which is what a materialization that happens
+    // behind the caller's back has to do.
+    //
+    // `on_conflict_raw` because the clause updates nothing: there is no
+    // column list for the tenant-immutability check to validate, and the
+    // winner's row is kept exactly as it was written.
+    let inserted = node::Entity::insert(active)
         .secure()
         .scope_unchecked(scope)
         .map_err(map_scope_err)?
+        .on_conflict_raw(
+            OnConflict::columns([node::Column::TenantId, node::Column::NodeKey])
+                .do_nothing()
+                .to_owned(),
+        )
         .exec_with_returning(tx)
-        .await
-        .map_err(map_scope_err)?;
-    Ok(model.id)
+        .await;
+
+    match inserted {
+        Ok(model) => Ok(model.id),
+        // Nothing was inserted, so somebody else got there first. Read their
+        // row and use it -- the endpoint the edge names is that node.
+        // `DO NOTHING` returns no row, and SeaORM reports that from
+        // `exec_with_returning` as one of these two depending on the path it
+        // took -- neither of which is a failure here.
+        Err(toolkit_db::secure::ScopeError::Db(
+            sea_orm::DbErr::RecordNotInserted | sea_orm::DbErr::RecordNotFound(_),
+        )) => {
+            let settled = node::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
+                .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+                .one(tx)
+                .await
+                .map_err(map_scope_err)?;
+            // Unless what they wrote is already gone. A tombstoned key is not
+            // reusable before purge, and materializing an endpoint onto one
+            // would resurrect it by the back door.
+            settled
+                .map(|row| row.id)
+                .ok_or_else(|| GraphStoreError::Conflict {
+                    reason: format!(
+                        "node key `{key}` was created and tombstoned while this batch was \
+                     materializing it as an edge endpoint; it cannot be re-ingested \
+                     before purge"
+                    ),
+                })
+        }
+        Err(error) => Err(map_scope_err(error)),
+    }
 }
 
 async fn upsert_edge(

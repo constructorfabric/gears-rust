@@ -434,6 +434,18 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Run here too: whether or not the window opens, a phantom two batches
+/// both name must be materialized once and shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_batches_naming_one_new_endpoint_both_land() {
+    conformance::two_batches_naming_one_new_endpoint_both_land(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Run here too. This store serializes `soft_delete` under one lock, so the
 /// second delete reads the tombstone rather than racing the write -- what it
 /// proves here is that both routes answer with the same single tombstone.

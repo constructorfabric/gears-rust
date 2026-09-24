@@ -621,6 +621,20 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Against the store where two inserts can genuinely collide on the unique
+/// key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_batches_naming_one_new_endpoint_both_land() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_batches_naming_one_new_endpoint_both_land(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Against the store the window opens in: both deletes read the row live
 /// before either commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

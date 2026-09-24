@@ -4175,6 +4175,79 @@ pub async fn two_deletes_of_one_node_tombstone_it_once(
     }
 }
 
+/// Two batches that name the same new endpoint both land.
+///
+/// A phantom is materialized behind the caller's back: the batch named an
+/// endpoint that did not exist and the gear created it. So two producers
+/// whose edges reference the same not-yet-ingested node are both right, and
+/// neither of them asked for that row. A plain insert made one of them lose
+/// a unique violation, reported as a conflict on the whole batch -- which
+/// for an edge batch of any size means discarding thousands of valid edges
+/// over a node nothing in the request mentioned, with no way for the
+/// producer to predict the collision or avoid it.
+pub async fn two_batches_naming_one_new_endpoint_both_land(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    for round in 0..16 {
+        let shared = format!("shared-endpoint-{round}");
+        let sources = [format!("src-a-{round}"), format!("src-b-{round}")];
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(sources.iter().map(|k| node(k, k)).collect(), Vec::new()),
+        )
+        .await
+        .expect("the two source nodes exist");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let writers: Vec<_> = sources
+            .iter()
+            .map(|src| {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                let spec = edge(src, &shared);
+                tokio::spawn(async move {
+                    let scope = AccessScope::for_tenant(tenant);
+                    let ctx = ctx(tenant, &scope, None);
+                    gate.wait().await;
+                    ingest_batch(store.as_ref(), &ctx, batch(Vec::new(), vec![spec])).await
+                })
+            })
+            .collect();
+
+        for (index, writer) in writers.into_iter().enumerate() {
+            writer
+                .await
+                .expect("the writer task does not panic")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round}, writer {index}: an endpoint both batches name is \
+                         not a conflict either of them can act on: {error}"
+                    )
+                });
+        }
+
+        // One phantom, not two, and both edges hang off it.
+        let endpoint = store
+            .get_node(&reader, &shared, 10)
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: the phantom endpoint reads: {error}"));
+        assert_eq!(
+            endpoint.adjacency.len(),
+            2,
+            "round {round}: both edges name the one materialized endpoint"
+        );
+    }
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a
