@@ -352,6 +352,31 @@ fn a_blank_issuer_audience_or_assurance_entry_is_refused_at_construction() {
     AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config).expect("bound");
 }
 
+#[test]
+fn a_padded_issuer_or_audience_is_refused_at_construction() {
+    // `carries()` compares the claim exactly, so a pin with surrounding
+    // whitespace — a templating leftover — can never match a real token:
+    // the same refusal the assurance entries already get.
+    for config in [
+        StepUpConfig {
+            issuer: Some(" https://idp.example".to_owned()),
+            ..StepUpConfig::default()
+        },
+        StepUpConfig {
+            audience: Some("settings\n".to_owned()),
+            ..StepUpConfig::default()
+        },
+    ] {
+        let err = AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config)
+            .err()
+            .expect("a padded pin is refused");
+        assert!(
+            err.to_string().contains("step_up."),
+            "names the field: `{err}`"
+        );
+    }
+}
+
 /// A resolver that cannot answer, failing every call the way the test says.
 struct DownResolver(fn() -> AuthNResolverError);
 

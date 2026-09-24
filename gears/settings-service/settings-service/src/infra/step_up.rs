@@ -79,10 +79,11 @@ impl AuthnStepUpVerifier {
             ("step_up.issuer", config.issuer.as_deref()),
             ("step_up.audience", config.audience.as_deref()),
         ] {
-            if pinned.is_some_and(|p| p.trim().is_empty()) {
+            if pinned.is_some_and(|p| p.trim().is_empty() || p.trim() != p) {
                 anyhow::bail!(
-                    "{field} is blank: a pin no token can carry would refuse every step-up-gated \
-                     write; pin a value or leave the field out"
+                    "{field} is blank or padded with whitespace: the claim is compared exactly, so \
+                     a pin no token can carry would refuse every step-up-gated write; pin the \
+                     exact value or leave the field out"
                 );
             }
         }
