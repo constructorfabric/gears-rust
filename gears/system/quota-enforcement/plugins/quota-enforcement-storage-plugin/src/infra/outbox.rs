@@ -119,7 +119,15 @@ impl NotificationEnqueuer for QeOutbox {
             };
             batch = batch.push_with_type(partition, payload, event.kind.as_str());
         }
-        Ok(outbox.enqueue_batch(runner, batch.build()?).await?)
+        let wake = outbox.enqueue_batch(runner, batch.build()?).await?;
+        let ids = wake.ids().to_vec();
+        // A wake must be fired after the caller's transaction commits, and
+        // this call runs inside it. No handler consumes the queue yet, so the
+        // wake is dropped and the outbox reconciler picks the committed rows
+        // up later. Firing it on commit is part of the dispatcher's definition
+        // of done (notifications feature, `dod-dispatcher`).
+        wake.discard();
+        Ok(ids)
     }
 }
 

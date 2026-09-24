@@ -466,6 +466,7 @@ mod tests {
 /// form, whose name reaches callers as an `OpenAPI` component.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitEntityDto {
     /// The canonical GTS identifier. A non-canonical spelling is refused rather
     /// than normalized.
@@ -476,7 +477,10 @@ pub struct SubmitEntityDto {
     /// exist; a literal `0` is refused. A positive version names a content
     /// revision: the entity must exist at exactly that `resource_version`, and a
     /// mismatch fails the candidate terminally rather than rebasing it.
+    ///
+    /// Optional positive precondition; acceptance rejects zero and negatives.
     #[serde(default)]
+    #[schema(minimum = 1)]
     pub expected_resource_version: Option<i64>,
     /// ADR-0004: waive one cross-minor check when the deployment permits it.
     /// Intra-entity revisions are never waivable. The revision records the
@@ -494,6 +498,7 @@ pub struct SubmitEntityDto {
 /// shape.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitEntitiesRequest {
     #[schema(min_items = 1)]
     pub items: Vec<SubmitEntityDto>,
@@ -501,6 +506,46 @@ pub struct SubmitEntitiesRequest {
     /// Record outcomes without entity-state writes or reservations.
     ///
     /// Defaults to `false`; participates in the idempotency fingerprint.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// A batch deletion target, resolved like `GET /entities/{entity_key}`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteEntityDto {
+    /// A canonical GTS identifier or a Registry Reference UUID.
+    pub key: String,
+    /// Required positive version; optional internally for uniform validation errors.
+    #[serde(default)]
+    #[schema(required, value_type = i64, minimum = 1)]
+    pub expected_resource_version: Option<i64>,
+}
+
+/// A deletion batch. Unknown fields are rejected to prevent ignored safety options.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteEntitiesRequest {
+    /// Runtime configuration supplies the batch limit.
+    #[schema(min_items = 1)]
+    pub items: Vec<DeleteEntityDto>,
+    /// Predict without changing entities. Defaults to `false`; part of the idempotency fingerprint.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// Single-deletion parameters; the entity key is in the path.
+#[derive(Debug, Clone, Default)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteEntityQuery {
+    /// Required positive version, validated by acceptance as on the batch route.
+    /// Missing or non-numeric values return `400`.
+    #[serde(default)]
+    pub expected_resource_version: Option<i64>,
+    /// Predict without changing entities. Defaults to `false`.
     #[serde(default)]
     pub dry_run: Option<bool>,
 }
@@ -526,6 +571,7 @@ pub struct OperationItemDto {
     pub resource_version: Option<i64>,
     /// The refusal as `{reason, message}`, when this candidate failed.
     /// `reason` is a stable machine-readable code; `message` is an explanation for humans.
+    /// Structured candidate or system-failure details.
     /// Compatibility messages include causes and schema locations where available.
     /// Clients must not parse `message` or depend on its wording.
     pub error: Option<serde_json::Value>,

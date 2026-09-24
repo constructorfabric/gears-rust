@@ -50,8 +50,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -137,7 +141,7 @@ async fn submit(db: &Provider, key: &str, candidates: Vec<Candidate>) -> Uuid {
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates,
@@ -351,7 +355,11 @@ async fn an_independent_branch_commits_while_another_candidate_fails() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     succeeded(&outcome, STANDALONE);
     no_entity(&db, BROKEN).await;
 }
@@ -369,7 +377,11 @@ async fn a_dependent_of_a_failed_candidate_is_blocked_by_dependency() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     failed_with(
         &outcome,
         REFERRER,
@@ -394,7 +406,11 @@ async fn blocking_reaches_the_whole_downstream_of_one_failure() {
     )
     .await;
 
-    failed_with(&outcome, BROKEN, &AdmissionFailureReason::InvalidSchema);
+    failed_with(
+        &outcome,
+        BROKEN,
+        &AdmissionFailureReason::DependencyNotFound,
+    );
     failed_with(
         &outcome,
         MIDDLE,
@@ -421,7 +437,7 @@ async fn a_later_minor_whose_predecessor_failed_is_blocked_by_predecessor() {
     )
     .await;
 
-    failed_with(&outcome, V1_0, &AdmissionFailureReason::InvalidSchema);
+    failed_with(&outcome, V1_0, &AdmissionFailureReason::DependencyNotFound);
     failed_with(
         &outcome,
         V1_1,

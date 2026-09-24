@@ -405,6 +405,13 @@ pub enum DomainError {
     IntegrityCheckLeaseLost,
 
     // ---- Internal (HTTP 500) ----
+    /// The durable platform-root row disagrees with the configured root ID or
+    /// tenant-type UUID. This is a startup invariant failure rather than an
+    /// ordinary bootstrap-saga failure: lifecycle wiring MUST propagate it
+    /// regardless of `bootstrap.strict`.
+    #[error("platform root binding mismatch: {detail}")]
+    RootBindingMismatch { detail: String },
+
     /// Unclassified internal failure. The `diagnostic` field is
     /// recorded in the audit trail but **MUST NOT** be leaked through
     /// any public `Problem` body. `cause` carries the upstream error

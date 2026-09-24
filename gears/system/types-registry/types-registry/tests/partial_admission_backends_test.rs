@@ -1,4 +1,3 @@
-//! PostgreSQL/MySQL partial admission (T19): per-candidate transactions must
 //! preserve independent successes and leave no state for blocked candidates.
 
 #![cfg(feature = "integration")]
@@ -51,8 +50,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -101,7 +104,7 @@ async fn admit_batch(
         },
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: OperationKind::Registration,
             dry_run: false,
             candidates,
@@ -206,7 +209,7 @@ async fn assert_partial_commit(db: &Arc<DBProvider<DbError>>, backend: &str) {
     assert_refused(
         &outcome,
         BROKEN,
-        &AdmissionFailureReason::InvalidSchema,
+        &AdmissionFailureReason::DependencyNotFound,
         backend,
     );
     assert_succeeded(&outcome, STANDALONE, backend);
@@ -226,7 +229,7 @@ async fn assert_blocked_dependency(db: &Arc<DBProvider<DbError>>, backend: &str)
     assert_refused(
         &outcome,
         DANGLING,
-        &AdmissionFailureReason::InvalidSchema,
+        &AdmissionFailureReason::DependencyNotFound,
         backend,
     );
     assert_refused(
@@ -251,7 +254,7 @@ async fn assert_blocked_predecessor(db: &Arc<DBProvider<DbError>>, backend: &str
     assert_refused(
         &outcome,
         V1_0,
-        &AdmissionFailureReason::InvalidSchema,
+        &AdmissionFailureReason::DependencyNotFound,
         backend,
     );
     assert_refused(

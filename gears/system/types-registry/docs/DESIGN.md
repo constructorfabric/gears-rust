@@ -254,7 +254,7 @@ Reverse-impact queries use a repository-owned recursive CTE over `dependency`, b
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-constraint-boot-path`
 
-Because every other gear may depend on it, anything Types Registry waits for during startup is something the platform waits for. It publishes ready when its own storage is ready, has no notion of an expected registration set, and never blocks on a registrant. Registrants retry and gate their own readiness.
+Because every other gear may depend on it, anything Types Registry waits for during startup is something the platform waits for. It publishes ready when its own storage is ready and its own seed set has been admitted, has no notion of an expected registration set, and never blocks on a registrant. Registrants retry and gate their own readiness.
 
 **ADRs**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
 
@@ -422,6 +422,8 @@ The pipeline is the sole writer of entity state. It owns request identity, opera
 
 The endpoint has one successful acceptance shape: `202 Accepted` with an operation UUID, never an inline result. Admission is asynchronous because dependent revalidation is intentionally unbounded; P2 hooks may add further long-running work. For registration, the caller first batch-reads its identifiers, omits equal authored content, and submits missing entities without `expected_resource_version` and updates with the version it observed. Deletion always supplies the positive version observed for the existing entity. Tenant ownership comes from `SecurityContext`; global registration uses `PlatformSecurityContext`.
 
+Separate operations, including requests accepted in sequence, have no execution or completion ordering guarantee. Dependency ordering applies within one batch. Callers needing a dependency across requests must await and inspect the prerequisite operation's results before submitting the dependent request.
+
 Acceptance reads no registry entity state. It decides only from the request, plane, and startup configuration, so the following failures are synchronous:
 
 1. **Envelope and batch size** — refuses more than 100 candidates.
@@ -450,9 +452,18 @@ Authored-content equality is established once by the worker per candidate. The h
 
 ##### Dispatch and the outbox
 
-The leased ToolKit outbox owns multi-pod claiming, lease expiry, retry, and dead letters. Delivery is at least once, so admission-unit commits are idempotent and guarded by operation-item identity, authored equality, unique revisions, and compare-and-swap; outbox lease state is not duplicated in `operation`. The operation status index only terminalizes work abandoned after outbox retries and is not a second dispatcher.
+The leased ToolKit outbox owns multi-pod claiming, lease expiry, retry, and dead letters. Delivery is at least once, so admission-unit commits are idempotent and guarded by operation-item identity, authored equality, unique revisions, and compare-and-swap; outbox lease state is not duplicated in `operation`. The outbox is the only dispatcher: leases redeliver across pods, so no second index re-drives non-terminal work.
 
-Candidate rejection is a successful dispatch outcome. Transient database or infrastructure failure returns `Retry`; `Reject` is reserved for a permanently invalid internal message. Long-running P2 hooks split into bounded durable stages rather than retaining one lease. P1 use of the `toolkit-db/preview-outbox` feature requires the §4 sign-off.
+Candidate rejection, including a missing dependency, is acknowledged and stored with
+structured details. In-batch dependencies are ordered; cross-request dependencies require
+the caller to await the prerequisite.
+
+Only failures that may clear are retried, within `worker.max_delivery_attempts`. Permanent or
+exhausted delivery terminalizes undecided items as `system_failure` and acknowledges the
+message; a terminalization that does not land is redelivered instead, past the budget too.
+A valid admission message is therefore never removed while its operation is
+non-terminal, and dead-lettering is reserved for envelopes that name no operation.
+Diagnostics contain stable codes and operation IDs, never raw infrastructure or candidate data.
 
 The end-to-end flow this pipeline drives — read, reconcile, submit, dispatch, admit, poll — is `cpt-cf-types-registry-seq-batch-admission` in §3.6.
 
@@ -1902,7 +1913,7 @@ Registry Source Plugins are registered as well-known GTS Instances and resolved 
 
 #### Platform database
 
-The single authoritative store of §3.7, served by many pods, on SQLite, PostgreSQL, or MySQL. Durable dispatch uses the `toolkit-db` outbox with the `types_registry_outbox` table prefix, currently gated by the experimental `toolkit-db/preview-outbox` feature. `cpt-cf-types-registry-constraint-multi-backend` governs how portability is preserved across the three backends.
+The single authoritative store of §3.7, served by many pods, on SQLite, PostgreSQL, or MySQL. Durable dispatch uses the `toolkit-db` outbox with the `types_registry__outbox` table prefix, unconditionally supported and behind no feature gate (SPEC §4). `cpt-cf-types-registry-constraint-multi-backend` governs how portability is preserved across the three backends.
 
 #### External Registry Sources
 
@@ -2212,7 +2223,7 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 ### Implementation prerequisites
 
-Six prerequisites block implementation: the benchmark profile above, two external confirmations, and three protocol/contract/schema alignments below.
+Five prerequisites block implementation: the benchmark profile above, one external confirmation, and three protocol/contract/schema alignments below.
 
 No ADR-0015 quarantine preflight is needed because the release introducing the check is also the first to persist Managed Entities. The rule must not be enabled over data admitted by a build that had storage but lacked the check.
 
@@ -2233,7 +2244,7 @@ No ADR-0015 quarantine preflight is needed because the release introducing the c
 7. **Registration-policy matching properties**: trailing wildcard includes its root; a prefixed wildcard requires a suffix; trailing wildcard ignores the type marker; major-only pattern includes its minors. These are pinned in `gts-id` `GtsIdPattern::matches_views` tests `test_trailing_chain_wildcard_matches_empty_suffix`, `test_prefixed_chain_wildcard_requires_a_suffix`, and `test_trailing_wildcard_ignores_type_marker`.
 8. **Pattern containment** for Source Claim overlap. Rooted grammar provides anchoring, and ADR-0011 prevents claims slicing into a chain.
 
-**Approve reliance on `toolkit-db/preview-outbox`.** P1 will reuse its leased outbox rather than implement another. `ledger`, `file-storage`, and `chat-engine` already use it; Types Registry needs the same sign-off.
+**`toolkit-db` outbox reliance — no longer a prerequisite.** P1 reuses `toolkit-db`'s leased outbox rather than implementing another, as `ledger`, `file-storage`, and `chat-engine` do. This needed a sign-off while the outbox was an experimental feature; `toolkit-db` 0.12.0 made it unconditional, so no approval is outstanding (SPEC §4).
 
 ## 5. Traceability
 

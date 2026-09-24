@@ -75,6 +75,14 @@ pub trait TenantRepo: Send + Sync {
         id: Uuid,
     ) -> Result<Option<TenantModel>, DomainError>;
 
+    /// Load the platform root independently of its configured id. This is used
+    /// during startup to detect `root_id` or root-type contract drift before a
+    /// create attempt reaches the single-root database constraint.
+    async fn find_platform_root(
+        &self,
+        scope: &AccessScope,
+    ) -> Result<Option<TenantModel>, DomainError>;
+
     /// Batch sibling of [`Self::find_by_id`]: return every row whose id
     /// is in `ids` and that is visible under the supplied `scope`. The
     /// caller-supplied id slice is deduplicated by the implementation;

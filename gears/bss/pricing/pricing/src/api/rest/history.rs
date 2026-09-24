@@ -72,7 +72,7 @@ use bss_pricing_sdk::odata::HistoryFilterField;
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
-use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -193,42 +193,20 @@ fn history_entry_view(entry: &HistoryEntry) -> HistoryEntryView {
 /// about it. This surface was the first D-125 walk to declare its parameters at
 /// all, which is why the spelling lives here.
 pub(crate) fn limit_param() -> ParamSpec {
-    ParamSpec {
-        name: "limit".to_owned(),
-        location: ParamLocation::Query,
-        required: false,
-        description: Some(
-            "Page size. Absent takes the server default; a value above the cap is clamped \
-             rather than refused, the cap being a server limit and the page size the export \
-             SLO is stated per (D-125). Zero is refused: a page of zero rows never advances."
-                .to_owned(),
-        ),
-        param_type: "integer".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::query("limit").param_type("integer").description(
+        "Page size. Absent takes the server default; a value above the cap is clamped \
+         rather than refused, the cap being a server limit and the page size the export \
+         SLO is stated per (D-125). Zero is refused: a page of zero rows never advances.",
+    )
 }
 
 /// D-125's opaque page token, declared once — [`limit_param`]'s note.
 pub(crate) fn cursor_param() -> ParamSpec {
-    ParamSpec {
-        name: "cursor".to_owned(),
-        location: ParamLocation::Query,
-        required: false,
-        description: Some(
-            "The opaque token this same operation returned as `next_cursor`. GET history and \
-             GET audit mint an OData CursorV1; POST history/export mints the history-engine \
-             token. The two encodings are not interchangeable."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::query("cursor").description(
+        "The opaque token this same operation returned as `next_cursor`. GET history and \
+         GET audit mint an OData CursorV1; POST history/export mints the history-engine \
+         token. The two encodings are not interchangeable.",
+    )
 }
 
 /// Build the Axum router for the price-history surface.

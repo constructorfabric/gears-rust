@@ -135,8 +135,21 @@ impl<S> HandlerSlot<S> for Present {
 
 pub use state::{AuthNotSet, AuthSet, LicenseNotSet, LicenseSet, Missing, Present};
 
-/// Parameter specification for API operations
+/// Parameter specification built with location constructors and fluent setters.
+/// `#[non_exhaustive]` allows new schema keywords without changing call sites.
+///
+/// ```
+/// # use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+/// let version = ParamSpec::query("expected_resource_version")
+///     .required(true)
+///     .param_type("integer")
+///     .format("int64")
+///     .minimum(1.0);
+/// assert_eq!(version.location, ParamLocation::Query);
+/// assert_eq!(version.format.as_deref(), Some("int64"));
+/// ```
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ParamSpec {
     pub name: String,
     pub location: ParamLocation,
@@ -148,25 +161,91 @@ pub struct ParamSpec {
     /// `style: form, explode: true` — i.e. `?tag=a&tag=b`, which is how the
     /// generated REST client encodes a `Vec<T>` query field.
     pub array: bool,
+    /// Optional JSON Schema format token, kept independent of `utoipa` types.
+    pub format: Option<String>,
+    /// Optional JSON Schema `minimum`.
+    pub minimum: Option<f64>,
 }
 
 impl ParamSpec {
-    /// A single-valued parameter of `param_type`.
-    fn scalar(
-        name: String,
-        location: ParamLocation,
-        required: bool,
-        description: Option<String>,
-        param_type: String,
-    ) -> Self {
+    /// A required path parameter — `string` unless [`Self::param_type`] says
+    /// otherwise.
+    #[must_use]
+    pub fn path(name: impl Into<String>) -> Self {
+        Self::new(name, ParamLocation::Path, true)
+    }
+
+    /// An optional query parameter.
+    #[must_use]
+    pub fn query(name: impl Into<String>) -> Self {
+        Self::new(name, ParamLocation::Query, false)
+    }
+
+    /// An optional header parameter.
+    #[must_use]
+    pub fn header(name: impl Into<String>) -> Self {
+        Self::new(name, ParamLocation::Header, false)
+    }
+
+    /// An optional cookie parameter.
+    #[must_use]
+    pub fn cookie(name: impl Into<String>) -> Self {
+        Self::new(name, ParamLocation::Cookie, false)
+    }
+
+    fn new(name: impl Into<String>, location: ParamLocation, required: bool) -> Self {
         Self {
-            name,
+            name: name.into(),
             location,
             required,
-            description,
-            param_type,
+            description: None,
+            param_type: "string".to_owned(),
             array: false,
+            format: None,
+            minimum: None,
         }
+    }
+
+    /// Whether the caller must send this parameter; path parameters are always required.
+    #[must_use]
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+
+    /// The description a generated client's documentation carries.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// JSON Schema type, or item type for arrays.
+    #[must_use]
+    pub fn param_type(mut self, param_type: impl Into<String>) -> Self {
+        self.param_type = param_type.into();
+        self
+    }
+
+    /// Whether the parameter repeats — see [`Self::array`](#structfield.array).
+    #[must_use]
+    pub fn array(mut self, array: bool) -> Self {
+        self.array = array;
+        self
+    }
+
+    /// The JSON Schema `format` token, e.g. `int64`.
+    #[must_use]
+    pub fn format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    /// The JSON Schema `minimum`.
+    #[must_use]
+    pub fn minimum(mut self, minimum: f64) -> Self {
+        self.minimum = Some(minimum);
+        self
     }
 }
 
@@ -534,25 +613,17 @@ where
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));
             filter.allowed_fields.insert(name.clone(), ops);
         }
-        self.spec.params.push(ParamSpec::scalar(
-            "$filter".to_owned(),
-            ParamLocation::Query,
-            false,
-            Some(description),
-            "string".to_owned(),
-        ));
+        self.spec
+            .params
+            .push(ParamSpec::query("$filter").description(description));
         self.spec.vendor_extensions.x_odata_filter = Some(filter);
         self
     }
 
     fn with_odata_select(mut self) -> Self {
-        self.spec.params.push(ParamSpec::scalar(
-            "$select".to_owned(),
-            ParamLocation::Query,
-            false,
-            Some("OData v4 select expression".to_owned()),
-            "string".to_owned(),
-        ));
+        self.spec
+            .params
+            .push(ParamSpec::query("$select").description("OData v4 select expression"));
         self
     }
 
@@ -582,13 +653,9 @@ where
                 order_by.allowed_fields.push(desc);
             }
         }
-        self.spec.params.push(ParamSpec::scalar(
-            "$orderby".to_owned(),
-            ParamLocation::Query,
-            false,
-            Some(description),
-            "string".to_owned(),
-        ));
+        self.spec
+            .params
+            .push(ParamSpec::query("$orderby").description(description));
         self.spec.vendor_extensions.x_odata_orderby = Some(order_by);
         self
     }
@@ -749,13 +816,9 @@ where
 
     /// Add a path parameter with type inference (defaults to string)
     pub fn path_param(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
-        self.spec.params.push(ParamSpec::scalar(
-            name.into(),
-            ParamLocation::Path,
-            true,
-            Some(description.into()),
-            "string".to_owned(),
-        ));
+        self.spec
+            .params
+            .push(ParamSpec::path(name).description(description));
         self
     }
 
@@ -766,13 +829,11 @@ where
         required: bool,
         description: impl Into<String>,
     ) -> Self {
-        self.spec.params.push(ParamSpec::scalar(
-            name.into(),
-            ParamLocation::Query,
-            required,
-            Some(description.into()),
-            "string".to_owned(),
-        ));
+        self.spec.params.push(
+            ParamSpec::query(name)
+                .required(required)
+                .description(description),
+        );
         self
     }
 
@@ -784,13 +845,12 @@ where
         description: impl Into<String>,
         param_type: impl Into<String>,
     ) -> Self {
-        self.spec.params.push(ParamSpec::scalar(
-            name.into(),
-            ParamLocation::Query,
-            required,
-            Some(description.into()),
-            param_type.into(),
-        ));
+        self.spec.params.push(
+            ParamSpec::query(name)
+                .required(required)
+                .description(description)
+                .param_type(param_type),
+        );
         self
     }
 
@@ -802,14 +862,12 @@ where
     /// `style: form, explode: true` arrays.
     pub fn query_params_from<T: toolkit_contract::query::QueryParams>(mut self) -> Self {
         for p in T::openapi_params() {
-            self.spec.params.push(ParamSpec {
-                name: p.name.to_owned(),
-                location: ParamLocation::Query,
-                required: p.required,
-                description: None,
-                param_type: p.openapi_type.to_owned(),
-                array: p.array,
-            });
+            self.spec.params.push(
+                ParamSpec::query(p.name)
+                    .required(p.required)
+                    .param_type(p.openapi_type)
+                    .array(p.array),
+            );
         }
         self
     }
@@ -827,14 +885,13 @@ where
         description: impl Into<String>,
         item_type: impl Into<String>,
     ) -> Self {
-        self.spec.params.push(ParamSpec {
-            name: name.into(),
-            location: ParamLocation::Query,
-            required,
-            description: Some(description.into()),
-            param_type: item_type.into(),
-            array: true,
-        });
+        self.spec.params.push(
+            ParamSpec::query(name)
+                .required(required)
+                .description(description)
+                .param_type(item_type)
+                .array(true),
+        );
         self
     }
 

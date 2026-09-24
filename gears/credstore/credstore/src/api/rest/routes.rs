@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use toolkit::api::{OpenApiRegistry, OperationBuilder, ParamLocation, ParamSpec};
+use toolkit::api::{OpenApiRegistry, OperationBuilder, ParamSpec};
 
 use super::dto::{CreateSecretRequestDto, GetSecretResponseDto, UpdateSecretRequestDto};
 use super::handlers::{self, ConcreteService};
@@ -18,21 +18,13 @@ const TAG: &str = "Credential Store";
 /// `409 OPTIMISTIC_LOCK_FAILURE`. A missing header is a
 /// `400 IF_MATCH_REQUIRED`.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory optimistic-concurrency precondition (RFC 7232). `*` requires the \
-             secret to exist (explicit last-writer-wins overwrite); a quoted \
-             `\"<id>.<version>\"` ETag requires the current version to match, otherwise \
-             the request fails with `409 OPTIMISTIC_LOCK_FAILURE`. A missing header is a \
-             `400 IF_MATCH_REQUIRED`."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory optimistic-concurrency precondition (RFC 7232). `*` requires the \
+         secret to exist (explicit last-writer-wins overwrite); a quoted \
+         `\"<id>.<version>\"` ETag requires the current version to match, otherwise \
+         the request fails with `409 OPTIMISTIC_LOCK_FAILURE`. A missing header is a \
+         `400 IF_MATCH_REQUIRED`.",
+    )
 }
 
 /// Register all REST routes for the credstore module.

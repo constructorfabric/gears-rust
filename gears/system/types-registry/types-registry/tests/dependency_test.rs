@@ -45,8 +45,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -94,7 +98,7 @@ async fn submit(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -428,7 +432,7 @@ async fn a_ref_naming_no_entity_fails_the_candidate() {
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().map(|f| f.reason.clone()),
-        Some(AdmissionFailureReason::InvalidSchema),
+        Some(AdmissionFailureReason::DependencyNotFound),
     );
 
     let provider = worker(&db);

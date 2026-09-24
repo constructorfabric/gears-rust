@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use sea_orm::{
@@ -16,6 +16,7 @@ use super::store::OutboxStore;
 use super::subscription::{Mailbox, TraceRegistry, TraceSubscription, TraceWatch};
 use super::trace::{TraceOutcome, TraceState};
 use super::types::{OutboxConfig, OutboxError, OutboxMessageId};
+use super::wake::Wake;
 use crate::Db;
 use crate::secure::SeaOrmRunner;
 
@@ -36,8 +37,9 @@ pub struct Outbox {
     /// Flattened, sorted, deduplicated snapshot of all partition IDs.
     /// Rebuilt on each `register_queue` call.
     all_partition_ids: RwLock<Vec<i64>>,
-    /// Shared prioritizer for dirty partition tracking. Set during `start()`.
-    pub(crate) prioritizer: RwLock<Option<Arc<SharedPrioritizer>>>,
+    /// Shared prioritizer for dirty partition tracking. Set once during
+    /// `start()`; `None` until then. Set-once, so no lock on the enqueue path.
+    pub(crate) prioritizer: OnceLock<Arc<SharedPrioritizer>>,
     /// Per-partition notify map for direct signaling from sequencer to processors.
     /// Set once during `start()` after all processors are spawned.
     partition_notify: RwLock<Option<PartitionNotifyMap>>,
@@ -96,7 +98,7 @@ impl Outbox {
             partitions: DashMap::new(),
             partition_to_queue: DashMap::new(),
             all_partition_ids: RwLock::new(Vec::new()),
-            prioritizer: RwLock::new(None),
+            prioritizer: OnceLock::new(),
             partition_notify: RwLock::new(None),
         }
     }
@@ -439,6 +441,10 @@ impl Outbox {
     /// [`Record`] was built, so the only rejections left are an unregistered
     /// queue, a partition out of range, and the database itself.
     ///
+    /// Returns a [`Wake`]: the write does not wake the sequencers on its
+    /// own. Call [`Wake::flush`] once the enclosing transaction has
+    /// committed so the partition is marked dirty against durable rows.
+    ///
     /// # Errors
     ///
     /// Returns an error if the queue is not registered, the partition is out of
@@ -447,7 +453,7 @@ impl Outbox {
         &self,
         db: &(impl crate::secure::DBRunner + Sync + ?Sized),
         msg: Record<'_>,
-    ) -> Result<OutboxMessageId, OutboxError> {
+    ) -> Result<Wake, OutboxError> {
         let (queue, item, trace) = msg.into_parts();
         let partition_id = self.resolve_partition(queue, item.partition)?;
 
@@ -465,9 +471,11 @@ impl Outbox {
         )
         .await?;
 
-        self.push_dirty(partition_id);
-
-        Ok(OutboxMessageId(incoming_id))
+        Ok(Wake::new(
+            vec![OutboxMessageId(incoming_id)],
+            vec![partition_id],
+            self.prioritizer.get().cloned(),
+        ))
     }
 
     /// Enqueue a batch of entities for a single queue.
@@ -475,6 +483,11 @@ impl Outbox {
     /// All partitions are resolved before any DB write - one unresolvable
     /// entity rejects the whole batch, matching the validation the
     /// [`Records`] already performed as a whole.
+    ///
+    /// Returns a [`Wake`] like [`enqueue`](Self::enqueue): the write does
+    /// not wake the sequencers on its own. Call [`Wake::flush`] once the
+    /// enclosing transaction has committed so the partitions are marked dirty
+    /// against durable rows.
     ///
     /// # Errors
     ///
@@ -484,7 +497,7 @@ impl Outbox {
         &self,
         db: &(impl crate::secure::DBRunner + Sync + ?Sized),
         batch: Records<'_>,
-    ) -> Result<Vec<OutboxMessageId>, OutboxError> {
+    ) -> Result<Wake, OutboxError> {
         let (queue, items, trace) = batch.into_parts();
 
         let mut resolved = Vec::with_capacity(items.len());
@@ -507,12 +520,12 @@ impl Outbox {
         }
         let ids = Self::insert_batch(&runner, self.statements(), &resolved, &items, trace).await?;
 
-        // Push dirty for each distinct partition_id in the batch
-        for &pid in &resolved {
-            self.push_dirty(pid);
-        }
+        // Distinct partitions touched by the batch, to be marked dirty on flush.
+        let mut partitions = resolved;
+        partitions.sort_unstable();
+        partitions.dedup();
 
-        Ok(ids)
+        Ok(Wake::new(ids, partitions, self.prioritizer.get().cloned()))
     }
 
     /// Insert a batch of body + incoming rows using multi-row INSERTs.
@@ -728,18 +741,9 @@ impl Outbox {
     }
 
     /// Install the shared prioritizer. Called once during `start()`.
-    pub(crate) async fn set_prioritizer(&self, prioritizer: Arc<SharedPrioritizer>) {
-        *self.prioritizer.write().await = Some(prioritizer);
-    }
-
-    /// Push a partition into the prioritizer (dirty signal).
-    /// No-op if the prioritizer is not yet installed (before `start()`).
-    fn push_dirty(&self, partition_id: i64) {
-        if let Some(guard) = self.prioritizer.try_read().ok()
-            && let Some(p) = guard.as_ref()
-        {
-            p.push_dirty(partition_id);
-        }
+    pub(crate) fn set_prioritizer(&self, prioritizer: Arc<SharedPrioritizer>) {
+        // Set-once; a redundant call returns Err and is intentionally ignored.
+        self.prioritizer.set(prioritizer).ok();
     }
 
     /// Install the per-partition notify map. Called once during `start()`.
@@ -755,35 +759,6 @@ impl Outbox {
         {
             notify.notify_one();
         }
-    }
-
-    /// Notify the sequencer that new items are available.
-    /// Multiple flushes coalesce into a single wakeup.
-    /// No-op before `set_prioritizer()` (during startup).
-    pub fn flush(&self) {
-        if let Ok(guard) = self.prioritizer.try_read()
-            && let Some(p) = guard.as_ref()
-        {
-            p.wake_sequencers();
-        }
-    }
-
-    /// Execute a closure inside a database transaction, then auto-flush
-    /// the sequencer notification channel on success.
-    pub async fn transaction<F, T>(&self, db: Db, f: F) -> (Db, anyhow::Result<T>)
-    where
-        F: for<'a> FnOnce(
-                &'a crate::DbTx<'a>,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>,
-            > + Send,
-        T: Send + 'static,
-    {
-        let (db, result) = db.transaction(f).await;
-        if result.is_ok() {
-            self.flush();
-        }
-        (db, result)
     }
 
     /// Returns all registered partition IDs in deterministic order (sorted by PK).
@@ -1011,43 +986,6 @@ mod tests {
 
         let err = outbox.resolve_partition("q", 5).unwrap_err();
         assert!(matches!(err, OutboxError::PartitionOutOfRange { .. }));
-    }
-
-    // -- flush tests --
-
-    #[tokio::test]
-    async fn flush_triggers_notify() {
-        use crate::outbox::prioritizer::SharedPrioritizer;
-        let prioritizer = Arc::new(SharedPrioritizer::new());
-        let notifier = prioritizer.notifier();
-        let outbox = Arc::new(Outbox::new(OutboxConfig::default()));
-        outbox.set_prioritizer(Arc::clone(&prioritizer)).await;
-
-        outbox.flush();
-        // Notify was signaled via prioritizer — notified() resolves immediately
-        tokio::time::timeout(std::time::Duration::from_millis(50), notifier.notified())
-            .await
-            .expect("notify should fire");
-    }
-
-    #[tokio::test]
-    async fn flush_before_prioritizer_is_noop() {
-        let outbox = Arc::new(Outbox::new(OutboxConfig::default()));
-        // flush() before set_prioritizer() — should not panic
-        outbox.flush();
-        outbox.flush();
-    }
-
-    #[tokio::test]
-    async fn flush_does_not_block() {
-        use crate::outbox::prioritizer::SharedPrioritizer;
-        let prioritizer = Arc::new(SharedPrioritizer::new());
-        let outbox = Arc::new(Outbox::new(OutboxConfig::default()));
-        outbox.set_prioritizer(prioritizer).await;
-        // Multiple flushes should not block or panic
-        outbox.flush();
-        outbox.flush();
-        outbox.flush();
     }
 
     // -- config defaults test --

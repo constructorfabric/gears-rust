@@ -40,6 +40,8 @@ pub mod policy;
 pub mod ports;
 // The database-backed domain surface every transport adapter calls (SPEC §8.4).
 pub mod registry_service;
+// Whether redelivering an admission can reach a different answer (T21).
+pub mod retry;
 
 // ---------------------------------------------------------------------------
 // Shared by both paths

@@ -180,3 +180,86 @@ fn every_port_method_runs_against_noop_meter_without_panic() {
     adapter.sa_op_duration(SaOp::Revoke, 0.05);
     adapter.sa_op_duration(SaOp::List, 0.03);
 }
+
+// ---- histogram bucket boundaries ----
+
+#[test]
+fn duration_histograms_use_second_scale_bucket_boundaries() {
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    use crate::domain::metrics::{
+        KEYCLOAK_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION,
+        KEYCLOAK_IDP_PLUGIN_PROVISION_TENANT_DURATION, KEYCLOAK_IDP_PLUGIN_SA_OP_DURATION,
+        KEYCLOAK_IDP_PLUGIN_USER_OP_DURATION,
+    };
+
+    // Expected boundaries are spelled out as literals rather than read back from
+    // the constants under test. Asserting a constant against itself only proves
+    // `with_boundaries` was called at all, and would still pass if the values
+    // regressed to the millisecond-scale SDK defaults this test exists to catch.
+    let expected_op_bounds = vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    ];
+    let expected_provision_bounds =
+        vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0];
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    let adapter = KeycloakIdpPluginMetricsAdapter::new(
+        &provider.meter("keycloak-idp-plugin"),
+        DEFAULT_PREFIX,
+        /*realm_label_cap=*/ 0,
+    );
+
+    // Record a sample so each histogram exports a data point.
+    adapter.provision_tenant_duration(RealmBinding::Shared, 0.42);
+    adapter.user_op_duration(UserOp::ProvisionUser, 0.01);
+    adapter.kc_admin_request_duration(EndpointClass::UNKNOWN, 0.01);
+    adapter.sa_op_duration(SaOp::Create, 0.01);
+    provider.force_flush().expect("provider should flush");
+
+    // One snapshot for every assertion below: `get_finished_metrics` deep-clones
+    // the whole accumulated batch on each call, and the periodic reader can
+    // append another batch between two reads.
+    let snapshot = exporter
+        .get_finished_metrics()
+        .expect("in-memory exporter should be readable");
+
+    let bounds = |name: &str| -> Vec<f64> {
+        for resource_metrics in &snapshot {
+            for scope_metrics in resource_metrics.scope_metrics() {
+                for metric in scope_metrics.metrics() {
+                    if metric.name() == name
+                        && let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data()
+                        && let Some(dp) = hist.data_points().next()
+                    {
+                        return dp.bounds().collect();
+                    }
+                }
+            }
+        }
+        panic!("{name} should export a histogram data point");
+    };
+
+    for name in [
+        KEYCLOAK_IDP_PLUGIN_USER_OP_DURATION,
+        KEYCLOAK_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION,
+        KEYCLOAK_IDP_PLUGIN_SA_OP_DURATION,
+    ] {
+        assert_eq!(
+            bounds(name),
+            expected_op_bounds,
+            "{name} records seconds and must use second-scale bucket boundaries"
+        );
+    }
+
+    assert_eq!(
+        bounds(KEYCLOAK_IDP_PLUGIN_PROVISION_TENANT_DURATION),
+        expected_provision_bounds,
+        "provision_tenant cascades many KC Admin calls and needs the taller set"
+    );
+}

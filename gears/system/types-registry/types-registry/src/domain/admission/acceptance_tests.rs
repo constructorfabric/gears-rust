@@ -41,7 +41,7 @@ fn candidate(gts_id: &str) -> Candidate {
 
 fn request(candidates: Vec<Candidate>) -> SubmitRequest {
     SubmitRequest {
-        idempotency_key: "key-1".to_owned(),
+        idempotency_key: Some("key-1".to_owned()),
         kind: OperationKind::Registration,
         dry_run: false,
         candidates,
@@ -136,13 +136,16 @@ fn items_are_numbered_in_submission_order() {
 #[test]
 fn a_missing_idempotency_key_is_refused_synchronously() {
     let pair = closed();
-    for key in ["", "   "] {
+    for key in [None, Some(""), Some("   ")] {
         let mut req = request(vec![candidate(CF_TYPE)]);
-        req.idempotency_key = key.to_owned();
-        assert!(matches!(
-            run(&pair, &req),
-            Err(AcceptanceError::MissingIdempotencyKey)
-        ));
+        req.idempotency_key = key.map(str::to_owned);
+        assert!(
+            matches!(
+                run(&pair, &req),
+                Err(AcceptanceError::MissingIdempotencyKey)
+            ),
+            "key {key:?} must be refused as missing",
+        );
     }
 }
 
@@ -152,7 +155,7 @@ fn a_missing_idempotency_key_is_refused_synchronously() {
 fn an_over_long_idempotency_key_is_refused_before_the_database_sees_it() {
     let pair = closed();
     let mut req = request(vec![candidate(CF_TYPE)]);
-    req.idempotency_key = "k".repeat(256);
+    req.idempotency_key = Some("k".repeat(256));
     assert!(matches!(
         run(&pair, &req),
         Err(AcceptanceError::IdempotencyKeyTooLong { length: 256 })
@@ -699,7 +702,7 @@ fn deletion(gts_id: &str, expected_resource_version: Option<i64>) -> Candidate {
 
 fn deletion_request(candidates: Vec<Candidate>) -> SubmitRequest {
     SubmitRequest {
-        idempotency_key: "del-1".to_owned(),
+        idempotency_key: Some("del-1".to_owned()),
         kind: OperationKind::Deletion,
         dry_run: false,
         candidates,

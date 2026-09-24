@@ -76,6 +76,13 @@ impl TenantRepo for TenantRepoImpl {
         reads::find_by_id(self, scope, id).await
     }
 
+    async fn find_platform_root(
+        &self,
+        scope: &AccessScope,
+    ) -> Result<Option<TenantModel>, DomainError> {
+        reads::find_platform_root(self, scope).await
+    }
+
     async fn find_many(
         &self,
         scope: &AccessScope,

@@ -64,12 +64,19 @@ impl RecordingDispatch {
 
 #[async_trait::async_trait]
 impl OperationDispatch for RecordingDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, operation_id: Uuid) -> anyhow::Result<()> {
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
         self.calls.lock().expect("dispatch lock").push(operation_id);
         if self.fail {
-            anyhow::bail!("the transport refused this message");
+            // Simulate a transport failure; acceptance maps any OutboxError to a
+            // Dispatch refusal and rolls the whole acceptance back.
+            return Err(types_registry::domain::admission::OutboxError::NotRunning);
         }
-        Ok(())
+        // The wake is returned to acceptance, which fires it after the commit.
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -83,7 +90,7 @@ fn schema(gts_id: &str) -> Value {
 
 fn request(key: &str, content: Value) -> SubmitRequest {
     SubmitRequest {
-        idempotency_key: key.to_owned(),
+        idempotency_key: Some(key.to_owned()),
         kind: domain_enums::OperationKind::Registration,
         dry_run: false,
         candidates: vec![Candidate {
@@ -108,7 +115,7 @@ fn batch_request(key: &str, count: usize) -> SubmitRequest {
         })
         .collect();
     SubmitRequest {
-        idempotency_key: key.to_owned(),
+        idempotency_key: Some(key.to_owned()),
         kind: domain_enums::OperationKind::Registration,
         dry_run: false,
         candidates,
@@ -243,7 +250,8 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
     let provider = provider(&db);
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
-    let dispatch: Arc<dyn OperationDispatch> = Arc::new(RecordingDispatch::failing());
+    let recorder = Arc::new(RecordingDispatch::failing());
+    let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
 
     let err = accept(
         &stores(),
@@ -257,6 +265,8 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
     .await
     .expect_err("a dispatch failure must fail the acceptance");
     assert!(matches!(err, AcceptanceError::Dispatch(_)), "got {err}");
+    // The rollback leaves no operation (asserted below); no wake escapes the
+    // closure on the error path, so no consumer is woken.
 
     let conn = provider.conn().expect("conn");
     assert!(

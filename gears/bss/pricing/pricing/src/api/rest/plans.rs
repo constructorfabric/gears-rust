@@ -41,7 +41,7 @@ use bss_pricing_sdk::odata::{PlanFilterField, PlanOrderField};
 
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
-use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_odata::Page;
@@ -125,24 +125,13 @@ pub const CLONE_SOURCE_NOT_FOUND: &str = "CLONE_SOURCE_NOT_FOUND";
 /// this header makes a caller polling for a fresh precondition re-download the whole
 /// representation every time to obtain one.
 pub(crate) fn if_none_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-None-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: false,
-        description: Some(
-            "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last \
-             answered; if it still names the current representation the answer is `304` with the \
-             tag and no body. The wildcard `*` and a comma-separated list are both accepted, and \
-             comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this \
-             gear's `If-Match`, where a wildcard would be an unconditional write."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::header("If-None-Match").description(
+        "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last \
+         answered; if it still names the current representation the answer is `304` with the \
+         tag and no body. The wildcard `*` and a comma-separated list are both accepted, and \
+         comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this \
+         gear's `If-Match`, where a wildcard would be an unconditional write.",
+    )
 }
 
 /// The `If-Match` header, declared so a generated client knows it is mandatory.
@@ -154,46 +143,29 @@ pub(crate) fn if_none_match_param() -> ParamSpec {
 /// verb, and learns of it from a 400. The same discipline this gear already
 /// applies to responses, applied to requests.
 pub(crate) fn if_match_param(subject: &str) -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(format!(
+    ParamSpec::header("If-Match")
+        .required(true)
+        .description(format!(
             "Mandatory optimistic-concurrency precondition (RFC 9110), and D-141's rule that \
-             every mutating verb on a draft presents its `ETag`. {subject} A mismatch is `409` \
-             `STALE_VERSION`; an absent or malformed header is `400`. Weak validators, the \
-             wildcard `*` and tag lists are all refused - a wildcard is an unconditional \
-             mutation, which is what the precondition exists to prevent."
-        )),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+         every mutating verb on a draft presents its `ETag`. {subject} A mismatch is `409` \
+         `STALE_VERSION`; an absent or malformed header is `400`. Weak validators, the \
+         wildcard `*` and tag lists are all refused - a wildcard is an unconditional \
+         mutation, which is what the precondition exists to prevent."
+        ))
 }
 
 /// The `Idempotency-Key` header, likewise.
 pub(crate) fn idempotency_key_param() -> ParamSpec {
-    ParamSpec {
-        name: "Idempotency-Key".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
+    ParamSpec::header("Idempotency-Key")
+        .required(true)
+        .description(
             "Mandatory client idempotency key (S2/S3 API surface, foundation step 1). Bounded \
-             at 255 printable-ASCII characters. The key is claimed in the same transaction as \
-             the mutation it guards, so a retry carrying the same key and body is answered the \
-             recorded response verbatim, and one carrying the same key with a different body \
-             is `409` `IDEMPOTENCY_PAYLOAD_MISMATCH`. An absent header is `400`: an unguarded \
-             create on a governed authoring plane is the retry hazard the gate exists for."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+         at 255 printable-ASCII characters. The key is claimed in the same transaction as \
+         the mutation it guards, so a retry carrying the same key and body is answered the \
+         recorded response verbatim, and one carrying the same key with a different body \
+         is `409` `IDEMPOTENCY_PAYLOAD_MISMATCH`. An absent header is `400`: an unguarded \
+         create on a governed authoring plane is the retry hazard the gate exists for.",
+        )
 }
 
 // ---------------------------------------------------------------------------

@@ -97,9 +97,9 @@ CREATE TABLE types_registry__operation (
     )
 );
 
--- Supports terminal-operation retention and stalled-operation recovery. Retention
--- is measured from completed_at and may remove an operation only when no revision
--- references one of its items; item status alone does not establish that condition.
+-- Supports terminal-operation retention, which is measured from completed_at and
+-- may remove an operation only when no revision references one of its items; item
+-- status alone does not establish that condition.
 CREATE INDEX idx_tr_operation_status
     ON types_registry__operation (status, completed_at, id);
 

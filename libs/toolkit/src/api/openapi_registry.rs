@@ -159,6 +159,25 @@ fn operation_vendor_extensions(
     ext
 }
 
+/// Build a scalar parameter schema, preserving its format and minimum.
+///
+/// `format` is the token as the document carries it. `SchemaFormat::Custom`
+/// serializes it verbatim, which is what a `KnownFormat` serializes to as well
+/// — `"int64"` here and `SchemaFormat::KnownFormat(KnownFormat::Int64)` build
+/// the same document — so a declaration site states the token and takes no
+/// `utoipa` dependency for it.
+fn param_schema_object(
+    schema_type: SchemaType,
+    format: Option<&str>,
+    minimum: Option<f64>,
+) -> utoipa::openapi::schema::Object {
+    ObjectBuilder::new()
+        .schema_type(schema_type)
+        .format(format.map(|format| SchemaFormat::Custom(format.to_owned())))
+        .minimum(minimum)
+        .build()
+}
+
 /// Implementation of `OpenAPI` registry with lock-free data structures
 pub struct OpenApiRegistryImpl {
     /// Store operation specs keyed by "METHOD:path"
@@ -232,7 +251,7 @@ impl OpenApiRegistryImpl {
                     "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
                     _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
                 };
-                let item_object = ObjectBuilder::new().schema_type(schema_type).build();
+                let item_object = param_schema_object(schema_type, p.format.as_deref(), p.minimum);
 
                 let mut builder = ParameterBuilder::new()
                     .name(&p.name)
@@ -658,8 +677,8 @@ fn collect_refs_from_json(value: &serde_json::Value, refs: &mut HashSet<String>)
 mod tests {
     use super::*;
     use crate::api::operation_builder::{
-        OperationSpec, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
-        ResponseSchema, ResponseSpec, VendorExtensions,
+        OperationSpec, ParamSpec, ResponseHeaderSpec, ResponseHeaderType, ResponseSchema,
+        ResponseSpec, VendorExtensions,
     };
     use http::Method;
 
@@ -749,6 +768,52 @@ mod tests {
         let registry = OpenApiRegistryImpl::new();
         assert_eq!(registry.operation_specs.len(), 0);
         assert_eq!(registry.components_registry.load().len(), 0);
+    }
+
+    #[test]
+    fn parameter_formats_are_preserved_in_scalar_and_array_schemas() {
+        use serde_json::json;
+
+        // `int64` is a format `utoipa` knows and `resource-version` is not:
+        // both reach the document as the token the declaration spelled, which
+        // is what lets `ParamSpec::format` be a plain string.
+        for (format, param_type, expected) in [
+            (
+                Some("int64"),
+                "integer",
+                json!({"type": "integer", "format": "int64", "minimum": 1}),
+            ),
+            (
+                Some("resource-version"),
+                "integer",
+                json!({"type": "integer", "format": "resource-version", "minimum": 1}),
+            ),
+            (None, "integer", json!({"type": "integer", "minimum": 1})),
+        ] {
+            for array in [false, true] {
+                let registry = OpenApiRegistryImpl::new();
+                let mut spec = spec_with_response("/test", "get_test", None);
+                let mut param = ParamSpec::query("version")
+                    .required(true)
+                    .param_type(param_type)
+                    .array(array)
+                    .minimum(1.0);
+                if let Some(format) = format {
+                    param = param.format(format);
+                }
+                spec.params.push(param);
+                registry.register_operation(&spec);
+                let doc = registry.build_openapi(&test_info()).expect("build OpenAPI");
+                let json = serde_json::to_value(doc).expect("serialize OpenAPI");
+                let schema = &json["paths"]["/test"]["get"]["parameters"][0]["schema"];
+                let expected_schema = if array {
+                    json!({"type": "array", "items": expected})
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(schema, &expected_schema, "format={format:?}, array={array}");
+            }
+        }
     }
 
     #[test]
@@ -927,14 +992,7 @@ mod tests {
             summary: Some("Get user by ID".to_owned()),
             description: Some("Retrieves a user by their ID".to_owned()),
             tags: vec!["users".to_owned()],
-            params: vec![ParamSpec {
-                name: "id".to_owned(),
-                location: ParamLocation::Path,
-                required: true,
-                description: Some("User ID".to_owned()),
-                param_type: "string".to_owned(),
-                array: false,
-            }],
+            params: vec![ParamSpec::path("id").description("User ID")],
             request_body: None,
             responses: vec![ResponseSpec {
                 status: 200,

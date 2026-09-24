@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::StreamFraming;
-use crate::runtime::config::ReconnectConfig;
+use crate::runtime::config::{ClientConfig, ReconnectConfig};
 use crate::runtime::http::{
     body_to_byte_stream, map_http_error, parse_retry_after, read_error_body_prefix,
 };
@@ -55,7 +55,7 @@ where
 {
     let builder = build()?;
     let op = async move {
-        let response = builder.send().await.map_err(TransportError::network)?;
+        let response = builder.send().await.map_err(map_send_error)?;
         let status = response.status();
         if status.is_success() {
             // `HttpResponse::bytes` does NOT enforce status check; we already did.
@@ -85,14 +85,44 @@ where
     }
 }
 
+/// Shared transport-construction chain for both cfg variants of
+/// [`build_default_http_client`] — in one place so a knob can't be added to one
+/// arm and forgotten in the other.
+///
+/// Reads only transport-construction fields; call-time fields (`retry`,
+/// streaming, `internal_token_provider`) are applied per call and must not be
+/// wired here. `timeout` is wired on purpose: the SDK also enforces it per call,
+/// and matching the transport's `TimeoutLayer` to it stops a `config.timeout`
+/// above toolkit-http's 30s default being silently capped at 30s.
+fn transport_builder(config: &ClientConfig) -> toolkit_http::HttpClientBuilder {
+    toolkit_http::HttpClient::builder()
+        .retry(None)
+        .transport(transport_security(config.require_tls))
+        .timeout(config.timeout)
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .concurrency_limit(
+            config
+                .max_concurrent_requests
+                .map(|max_concurrent_requests| toolkit_http::RateLimitConfig {
+                    max_concurrent_requests,
+                }),
+        )
+}
+
 /// Build the default `toolkit-http` client used by macro-generated REST clients.
 ///
 /// Transport-layer retry is **disabled** — the SDK runs its own retry loop in
 /// [`retry_with_backoff`](crate::runtime::retry::retry_with_backoff).
 ///
-/// `require_tls` selects the transport security mode: `false` (the default
-/// via [`ClientConfig::new`](crate::runtime::config::ClientConfig::new))
-/// allows plaintext `http://`, preserving the platform's existing in-mesh
+/// Only the *transport-construction* fields of `config` are read — TLS mode,
+/// the connection-pool and concurrency knobs, and the per-attempt `timeout`;
+/// call-time fields (`retry`, the streaming knobs, `internal_token_provider`)
+/// are applied per call by the generated client, not on the transport. In
+/// particular `config.require_tls` selects the transport security mode: `false`
+/// (the default via
+/// [`ClientConfig::new`](crate::runtime::config::ClientConfig::new)) allows
+/// plaintext `http://`, preserving the platform's existing in-mesh
 /// service-to-service convention; `true`
 /// ([`ClientConfig::with_require_tls`](crate::runtime::config::ClientConfig::with_require_tls))
 /// switches to `toolkit_http::TransportSecurity::TlsOnly`, rejecting
@@ -119,11 +149,9 @@ where
 #[cfg(feature = "otel")]
 pub fn build_default_http_client(
     client_type: &str,
-    require_tls: bool,
+    config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
-    toolkit_http::HttpClient::builder()
-        .retry(None)
-        .transport(transport_security(require_tls))
+    transport_builder(config)
         .with_otel()
         .with_metrics(client_type)
         .build()
@@ -143,13 +171,9 @@ pub fn build_default_http_client(
 #[cfg(not(feature = "otel"))]
 pub fn build_default_http_client(
     _client_type: &str,
-    require_tls: bool,
+    config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
-    toolkit_http::HttpClient::builder()
-        .retry(None)
-        .transport(transport_security(require_tls))
-        .with_otel()
-        .build()
+    transport_builder(config).with_otel().build()
 }
 
 fn transport_security(require_tls: bool) -> toolkit_http::TransportSecurity {
@@ -157,6 +181,26 @@ fn transport_security(require_tls: bool) -> toolkit_http::TransportSecurity {
         toolkit_http::TransportSecurity::TlsOnly
     } else {
         toolkit_http::TransportSecurity::AllowInsecureHttp
+    }
+}
+
+/// Map a `toolkit-http` send error to a [`TransportError`]. Two kinds get a
+/// dedicated variant instead of the generic [`TransportError::Network`]:
+///
+/// - `Overloaded`: the concurrency limiter shed the request before it was sent
+///   → [`TransportError::Overloaded`] (non-transient), so the retry loop can
+///   tell a locally-shed request from a network failure.
+/// - `Timeout` / `DeadlineExceeded`: the transport timeout layer fired. It is
+///   set to `config.timeout`, which the SDK also enforces per call, so either
+///   timer can win; both map to [`TransportError::Timeout`] to keep the
+///   classification stable.
+fn map_send_error(err: toolkit_http::HttpError) -> TransportError {
+    match err {
+        toolkit_http::HttpError::Overloaded => TransportError::Overloaded,
+        toolkit_http::HttpError::Timeout(d) | toolkit_http::HttpError::DeadlineExceeded(d) => {
+            TransportError::Timeout(d)
+        }
+        other => TransportError::network(other),
     }
 }
 
@@ -308,9 +352,12 @@ async fn send_open_request(
         },
         None => send_fut.await,
     };
-    // Pre-flight failures (DNS, connect refused) are network-class — eligible
-    // for reconnect.
-    sent.map_err(|e| OpenFailure::Retryable(TransportError::network(e)))
+    // Pre-flight failures are reconnect-eligible, except a concurrency-limiter
+    // shed (`Overloaded`), which is fail-fast: bubble it up as `Fatal`.
+    sent.map_err(|e| match map_send_error(e) {
+        overloaded @ TransportError::Overloaded => OpenFailure::Fatal(overloaded),
+        other => OpenFailure::Retryable(other),
+    })
 }
 
 /// Read and classify a non-success open response.

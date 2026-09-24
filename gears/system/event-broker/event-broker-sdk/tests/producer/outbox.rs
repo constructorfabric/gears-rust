@@ -480,7 +480,11 @@ async fn service_owned_lifecycle_registers_extra_queue_and_binds_producer_outbox
     let producer_outbox = event_outbox.bind(&handle);
     let conn = db.conn().unwrap();
 
-    let id = producer_outbox.enqueue(&conn, order(None)).await.unwrap();
+    let id = producer_outbox
+        .enqueue(&conn, order(None))
+        .await
+        .unwrap()
+        .ids()[0];
 
     assert!(id.0 > 0);
     handle.stop().await;
@@ -503,8 +507,38 @@ async fn convenience_start_drains_enqueued_event_to_broker() {
         .outbox()
         .enqueue(&conn, order(None))
         .await
-        .unwrap();
+        .unwrap()
+        .fire();
     wait_for_stored(&handle, TOPIC, TENANT_PARTITION, 1).await;
+
+    producer_handle.stop().await;
+}
+
+#[tokio::test]
+async fn enqueue_batch_drains_every_event_to_broker() {
+    let (db, broker, handle) = fixture_with_handle().await;
+    let producer = stateless_producer(db.clone(), broker).await;
+    let event_outbox = producer
+        .outbox_queue(QUEUE, toolkit_db::outbox::Partitions::of(4))
+        .unwrap();
+    let producer_handle = event_outbox
+        .start(toolkit_db::outbox::Outbox::builder(db.clone()))
+        .await
+        .unwrap();
+    let conn = db.conn().unwrap();
+
+    // One batch, one flush: every event in it must reach the broker. All three
+    // orders share a tenant, so they land in the one tenant partition.
+    let events = vec![order(None), order(None), order(None)];
+    let wake = producer_handle
+        .outbox()
+        .enqueue_batch(&conn, events)
+        .await
+        .unwrap();
+    assert_eq!(wake.ids().len(), 3);
+    wake.fire();
+
+    wait_for_stored(&handle, TOPIC, TENANT_PARTITION, 3).await;
 
     producer_handle.stop().await;
 }
@@ -612,7 +646,8 @@ async fn outbox_processor_rotates_future_registration_when_broker_forgot_produce
         .outbox()
         .enqueue(&conn, order(None))
         .await
-        .unwrap();
+        .unwrap()
+        .fire();
     let after =
         wait_for_rotated_registration(&producer, before["producer_id"].as_str().unwrap()).await;
 

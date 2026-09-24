@@ -784,7 +784,7 @@ async fn up_down_up_roundtrip_leaves_a_usable_schema() {
 // ---------------------------------------------------------------------------
 
 /// A representative outbox table under the gear's configured prefix.
-const OUTBOX_TABLE: &str = "types_registry_outbox_outgoing";
+const OUTBOX_TABLE: &str = "types_registry__outbox_outgoing";
 
 #[tokio::test]
 async fn the_initial_migration_alone_creates_no_outbox_table() {

@@ -653,9 +653,7 @@ impl OutboxBuilder {
         let notify_map = Arc::new(notify_map);
         outbox.set_partition_notify(notify_map).await;
 
-        outbox
-            .set_prioritizer(Arc::clone(&shared_prioritizer))
-            .await;
+        outbox.set_prioritizer(Arc::clone(&shared_prioritizer));
 
         // 6. Eager reconciliation at startup
         super::workers::reconciler::reconcile_dirty(&outbox, &self.db, &shared_prioritizer).await;

@@ -320,38 +320,37 @@ mod tests {
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: mini_chat_sdk::UsageEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_attachment_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_chat_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::ChatCleanupEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::model::audit_envelope::AuditEnvelope,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_thread_summary(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
-        fn flush(&self) {}
     }
 
     // ── orphan_input_from_turn ──

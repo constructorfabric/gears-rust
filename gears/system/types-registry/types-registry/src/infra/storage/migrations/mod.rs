@@ -5,7 +5,7 @@
 //! `source_claim` and `routing` (SPEC §9).
 //!
 //! Outbox tables are **not** created here. They come from
-//! `toolkit_db::outbox::outbox_migrations_with_prefix("types_registry_outbox")`,
+//! `toolkit_db::outbox::outbox_migrations_with_prefix("types_registry__outbox")`,
 //! which the gear's `DatabaseCapability::migrations()` appends.
 
 use sea_orm_migration::MigratorTrait;

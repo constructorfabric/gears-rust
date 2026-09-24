@@ -110,7 +110,12 @@ impl std::fmt::Debug for InternalTokenProvider {
 }
 
 /// Base configuration for a generated REST client.
+///
+/// `#[non_exhaustive]`: construct via [`ClientConfig::new`] and the `with_*`
+/// chain rather than a struct literal, so future transport knobs can be added
+/// without a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Base URL prefix (e.g., `https://billing.internal`).
     /// Combined with the base path declared in the projection trait.
@@ -163,12 +168,48 @@ pub struct ClientConfig {
     /// requires TLS (`toolkit_http::TransportSecurity::TlsOnly`) for every
     /// request — including the bearer-carrying `Authorization` header, which
     /// otherwise would ride whatever scheme `base_url` uses. Defaults to
-    /// `false`, preserving the platform's existing in-mesh
-    /// service-to-service convention where plaintext HTTP inside a secured
-    /// network boundary is an accepted, deliberate choice (see
+    /// `false`, preserving the platform's existing in-mesh service-to-service
+    /// convention where plaintext HTTP inside a secured network boundary is an
+    /// accepted, deliberate choice (see
     /// [`build_default_http_client`](crate::runtime::client::build_default_http_client)).
-    /// Set this when a resolved endpoint may cross an untrusted network.
+    /// Set this when a resolved endpoint may cross an untrusted network. Read by
+    /// both the REST and gRPC transports.
     pub require_tls: bool,
+    /// Maximum *idle* keep-alive connections retained **per upstream host**
+    /// (active in-flight requests are not capped). Defaults to 128; raise via
+    /// [`ClientTuning`](crate::wiring::ClientTuning) for higher concurrency.
+    /// **REST transport only.**
+    ///
+    /// Keep it at or above the expected per-upstream concurrency: below that,
+    /// hyper closes excess connections as they idle and reopens them per
+    /// request, producing a `connect(2)` storm that dominates CPU. The 128
+    /// default clears the ~100-concurrent gear-to-gear traffic that motivated it
+    /// (the old `toolkit-http` default of 32 did not).
+    pub pool_max_idle_per_host: usize,
+    /// How long an idle keep-alive connection is retained before it is closed —
+    /// the companion of [`pool_max_idle_per_host`](Self::pool_max_idle_per_host)
+    /// (which bounds *how many*). Keep it above the gap between bursts to an
+    /// upstream so connections stay warm. Defaults to 90s. **REST transport only.**
+    ///
+    /// `None` does **not** mean "kept indefinitely": it leaves the hyper-util
+    /// setter unset, so hyper-util's own default (~90s) applies. The default is
+    /// an explicit `Some(90s)` for that reason.
+    pub pool_idle_timeout: Option<Duration>,
+    /// Maximum in-flight requests through this client at once (across all
+    /// upstream hosts). `None` disables the limiter; `Some(n)` caps at `n`, with
+    /// `Some(0)` clamped to 1 by the transport so the client can't wedge
+    /// shedding everything. Defaults to `Some(128)`, aligned with
+    /// [`pool_max_idle_per_host`](Self::pool_max_idle_per_host) so the idle pool
+    /// is fully reusable before load is shed. **REST transport only.**
+    ///
+    /// The cap bounds requests *waiting on response headers* — the tower permit
+    /// is released once headers arrive, so a long-lived SSE/multipart body holds
+    /// no slot while it streams; size it against in-flight requests, not open
+    /// streams. A shed request surfaces as
+    /// [`TransportError::Overloaded`](crate::runtime::transport_error::TransportError::Overloaded),
+    /// which is **not** transient, so a saturated client fails fast rather than
+    /// retrying into its own overload.
+    pub max_concurrent_requests: Option<usize>,
     /// Source of the platform-plane internal credential attached to methods
     /// whose plane marker is `PlatformSecurityContext` (carried as
     /// `X-ToolKit-Internal-Token`). `None` (the default) attaches nothing —
@@ -191,6 +232,11 @@ impl ClientConfig {
             retry: RetryConfig::default(),
             stream_reconnect: ReconnectConfig::default(),
             require_tls: false,
+            // `build_default_http_client` always sets these on the builder, so
+            // toolkit-http's own defaults (32/90s/100) never apply here.
+            pool_max_idle_per_host: 128,
+            pool_idle_timeout: Some(Duration::from_secs(90)),
+            max_concurrent_requests: Some(128),
             internal_token_provider: None,
         }
     }
@@ -232,6 +278,30 @@ impl ClientConfig {
     #[must_use]
     pub fn with_require_tls(mut self, require_tls: bool) -> Self {
         self.require_tls = require_tls;
+        self
+    }
+
+    /// Override the max idle keep-alive connections per upstream host. See
+    /// [`Self::pool_max_idle_per_host`].
+    #[must_use]
+    pub fn with_pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.pool_max_idle_per_host = max;
+        self
+    }
+
+    /// Override how long idle keep-alive connections are retained (`None` uses
+    /// hyper-util's default). See [`Self::pool_idle_timeout`].
+    #[must_use]
+    pub fn with_pool_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.pool_idle_timeout = timeout;
+        self
+    }
+
+    /// Override the max concurrent in-flight requests (`None` disables the
+    /// limiter). See [`Self::max_concurrent_requests`].
+    #[must_use]
+    pub fn with_max_concurrent_requests(mut self, max: Option<usize>) -> Self {
+        self.max_concurrent_requests = max;
         self
     }
 

@@ -9,9 +9,7 @@ mod test_stores;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use test_stores::{
-    CasMissHooks, ClaimHooks, DeletionMissHooks, PauseHooks, PausePoint, StoreHooks, TestStores,
-};
+pub use test_stores::{FailingCall, Hooks, PausePoint, SharedPause, TestStores, TestStoresBuilder};
 
 use gts::GtsConfig;
 use types_registry::{
@@ -118,6 +116,60 @@ fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
     types_registry::infra::storage::Migrator::migrations()
 }
 
+pub async fn test_db_with_outbox() -> Arc<DBProvider<DbError>> {
+    let name = format!("tr-outbox-{}", uuid::Uuid::new_v4());
+    provider_for_with_outbox(&format!("sqlite:file:{name}?mode=memory&cache=shared"), 4).await
+}
+
+pub async fn provider_for_with_outbox(dsn: &str, max_conns: u32) -> Arc<DBProvider<DbError>> {
+    let opts = ConnectOpts {
+        max_conns: Some(max_conns),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let dsn_scheme = dsn.split(':').next().unwrap_or("database");
+    let db = connect_db(dsn, opts)
+        .await
+        .unwrap_or_else(|e| panic!("connect {dsn_scheme} test database: {e}"));
+    let mut all = migrations();
+    all.extend(
+        toolkit_db::outbox::outbox_migrations_with_prefix(
+            types_registry::infra::outbox::TABLE_PREFIX,
+        )
+        .expect("outbox migration prefix"),
+    );
+    run_migrations_for_testing(&db, all)
+        .await
+        .expect("run migrations");
+    Arc::new(DBProvider::new(db))
+}
+
+pub async fn await_delivery<T, F, Fut>(what: &str, read: F) -> T
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(2);
+    const FIRST_BACKOFF: Duration = Duration::from_millis(10);
+    const MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        if let Some(value) = read().await {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() + backoff < deadline,
+            "{what}: the outbox did not deliver within {DEADLINE:?}"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
 /// The database-backed persistence ports, as the gear wires them. Tests that
 /// drive `accept` / `run_operation` / `RegistryService` pass this: the domain names
 /// only its ports, so the adapter is chosen here exactly as `init()` chooses it.
@@ -137,6 +189,146 @@ pub fn allow_all() -> AccessScope {
 #[must_use]
 pub fn metrics() -> std::sync::Arc<dyn types_registry::domain::ports::metrics::AdmissionMetrics> {
     std::sync::Arc::new(types_registry::domain::ports::metrics::NoopMetrics)
+}
+
+/// In-memory `tracing` capture for a binary's one global subscriber: a
+/// per-future subscriber is not isolated from concurrent tests.
+#[derive(Clone, Default)]
+pub struct CapturedLog(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    /// Install as the process-wide subscriber. Call once per test binary.
+    pub fn install_global() -> Self {
+        let captured = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this binary installs exactly one subscriber");
+        captured
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().clear();
+    }
+
+    /// Whether `needle` appears anywhere: a leak outside the operation's span
+    /// is still a leak.
+    #[must_use]
+    pub fn contains(&self, needle: &str) -> bool {
+        String::from_utf8_lossy(&self.0.lock()).contains(needle)
+    }
+
+    /// Only the lines naming `operation_id`, so a concurrent test cannot
+    /// satisfy or break an assertion.
+    #[must_use]
+    pub fn lines_for(&self, operation_id: uuid::Uuid) -> String {
+        let needle = operation_id.to_string();
+        String::from_utf8_lossy(&self.0.lock())
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Enqueues nothing, for tests that drive `admit` themselves. Test-only: a
+/// production composition must never commit an operation with no message.
+#[derive(Debug, Default)]
+pub struct NoDispatch;
+
+#[async_trait::async_trait]
+impl types_registry::domain::admission::OperationDispatch for NoDispatch {
+    async fn enqueue(
+        &self,
+        _tx: &toolkit_db::DbTx<'_>,
+        _operation_id: uuid::Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
+    }
+}
+
+#[must_use]
+pub fn no_dispatch() -> Arc<dyn types_registry::domain::admission::OperationDispatch> {
+    Arc::new(NoDispatch)
+}
+
+#[derive(Debug, Default)]
+pub struct RecordingDeliveryMetrics {
+    outcomes: parking_lot::Mutex<Vec<types_registry::domain::ports::metrics::DeliveryOutcome>>,
+}
+
+impl RecordingDeliveryMetrics {
+    #[must_use]
+    pub fn outcomes(&self) -> Vec<types_registry::domain::ports::metrics::DeliveryOutcome> {
+        self.outcomes.lock().clone()
+    }
+}
+
+impl types_registry::domain::ports::metrics::AdmissionMetrics for RecordingDeliveryMetrics {
+    fn unchanged_probe(&self, _hit: bool) {}
+
+    fn candidate_terminalized(
+        &self,
+        _status: types_registry::domain::ports::metrics::TerminalStatus,
+        _labels: types_registry::domain::ports::metrics::PassLabels,
+    ) {
+    }
+
+    fn refused(
+        &self,
+        _stage: types_registry::domain::ports::metrics::RefusalStage,
+        _reason: &'static str,
+        _labels: types_registry::domain::ports::metrics::PassLabels,
+    ) {
+    }
+
+    fn compat_verdict(
+        &self,
+        _verdict: gts::CompatibilityVerdict,
+        _forced: bool,
+        _labels: types_registry::domain::ports::metrics::PassLabels,
+    ) {
+    }
+
+    fn revalidation_retried(
+        &self,
+        _drift: &types_registry::domain::admission::vector::VectorDrift,
+    ) {
+    }
+
+    fn observe_activation_write_set(
+        &self,
+        _refreshed: usize,
+        _labels: types_registry::domain::ports::metrics::PassLabels,
+    ) {
+    }
+
+    fn observe_operation_duration(&self, _elapsed: std::time::Duration) {}
+
+    fn admission_delivery(&self, outcome: types_registry::domain::ports::metrics::DeliveryOutcome) {
+        self.outcomes.lock().push(outcome);
+    }
 }
 
 pub fn limits() -> types_registry::config::Limits {

@@ -239,8 +239,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -326,7 +330,7 @@ async fn submit_via(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates,
@@ -362,7 +366,7 @@ async fn submit_forced(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -648,8 +652,13 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
     struct FailingDispatch;
     #[async_trait::async_trait]
     impl OperationDispatch for FailingDispatch {
-        async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!("observability-dispatch-outage"))
+        async fn enqueue(
+            &self,
+            _tx: &DbTx<'_>,
+            _operation_id: Uuid,
+        ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError>
+        {
+            Err(types_registry::domain::admission::OutboxError::NotRunning)
         }
     }
 
@@ -699,7 +708,7 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
     );
     // Absence proves the dispatch error was not logged by `accept`.
     assert!(
-        !captured_log().contains("observability-dispatch-outage"),
+        !captured_log().contains("the admission outbox is not running"),
         "an infrastructure arm must not be logged as a refusal; captured:\n{}",
         captured_log()
     );
@@ -1451,7 +1460,7 @@ async fn one_pass(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind,
             dry_run,
             candidates: vec![candidate],
@@ -1788,5 +1797,116 @@ async fn a_blocked_deletion_puts_the_dependant_count_on_its_span_and_no_identiti
     assert!(
         refusal.contains(r#"kind="deletion""#),
         "the span still carries the operation kind: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_deletion_batch_is_refused_before_it_reads_and_counted_as_a_deletion() {
+    use types_registry::config::TypesRegistryConfig;
+    use types_registry::domain::policy::RegistrationPolicy;
+    use types_registry::domain::registry_service::{
+        DeleteRequest, DeleteTarget, EntityKey, RegistryService, ServiceError,
+    };
+
+    const LIMIT: usize = 2;
+
+    let _serial = SERIAL.lock().await;
+
+    let db = common::test_db().await;
+    let mut config = TypesRegistryConfig::default();
+    config.limits.batch_candidates = LIMIT;
+    let registry = RegistryService::new(
+        db.db(),
+        common::stores(),
+        RegistrationPolicy::default(),
+        config,
+        std::sync::Arc::new(common::NoDispatch),
+        std::sync::Arc::clone(metrics()),
+    );
+
+    flush();
+    let before = counter_sum_where(
+        "types_registry_refusals_total",
+        &[("reason", "batch_too_large"), ("kind", "deletion")],
+    );
+
+    let targets: Vec<DeleteTarget> = (0..=LIMIT)
+        .map(|_| DeleteTarget {
+            key: EntityKey::Uuid(uuid::Uuid::new_v4()),
+            expected_resource_version: Some(1),
+        })
+        .collect();
+    let refused = registry
+        .delete(
+            &DeleteRequest {
+                idempotency_key: Some("over-the-limit".to_owned()),
+                dry_run: false,
+                targets,
+            },
+            NOW,
+        )
+        .await;
+
+    match refused {
+        Err(ServiceError::Acceptance(error)) => {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&(LIMIT + 1).to_string())
+                    && rendered.contains(&LIMIT.to_string()),
+                "the refusal names both numbers so an operator can size the batch: {rendered}",
+            );
+        }
+        Err(ServiceError::UnresolvedReference { .. }) => panic!(
+            "the bound must be checked before `resolve_targets`: reaching the lookup means an \
+             oversized batch became an unbounded read",
+        ),
+        other => panic!("an over-limit deletion batch must be refused synchronously: {other:?}"),
+    }
+
+    flush();
+    assert_eq!(
+        counter_sum_where(
+            "types_registry_refusals_total",
+            &[("reason", "batch_too_large"), ("kind", "deletion")],
+        ),
+        before + 1,
+        "the series must not depend on which of the two checks fired, so this one \
+         counts the refusal it raises itself",
+    );
+}
+
+#[tokio::test]
+async fn the_delivery_outcome_labels_are_exactly_retried_and_dead_lettered() {
+    use types_registry::domain::ports::metrics::DeliveryOutcome;
+
+    const NAME: &str = "types_registry_admission_deliveries_total";
+
+    let _serial = SERIAL.lock().await;
+
+    flush();
+    let before_retried = counter_sum_where(NAME, &[("outcome", "retried")]);
+    let before_dead = counter_sum_where(NAME, &[("outcome", "dead_lettered")]);
+
+    metrics().admission_delivery(DeliveryOutcome::Retried);
+    metrics().admission_delivery(DeliveryOutcome::DeadLettered);
+
+    flush();
+    assert_eq!(
+        counter_sum_where(NAME, &[("outcome", "retried")]),
+        before_retried + 1,
+    );
+    assert_eq!(
+        counter_sum_where(NAME, &[("outcome", "dead_lettered")]),
+        before_dead + 1,
+    );
+
+    let mut vocabulary = label_values_of(NAME, "outcome");
+    vocabulary.dedup();
+    assert_eq!(
+        vocabulary,
+        vec!["dead_lettered".to_owned(), "retried".to_owned()],
+        "the alert's series must be bounded to these two values: a delivery that \
+         terminalizes its operation succeeded as a transport and is counted by the \
+         per-candidate instruments, not here",
     );
 }

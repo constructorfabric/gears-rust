@@ -5,7 +5,14 @@
 //! Four-stage pipeline: **incoming → sequencer → outgoing → processor**.
 //!
 //! 1. **Enqueue** - messages are written atomically within business transactions
-//!    to the `incoming` table via [`Outbox::enqueue()`].
+//!    to the `incoming` table via [`Outbox::enqueue()`]. The write returns a
+//!    [`Wake`] and does not wake the sequencer on its own; the wake is
+//!    fired after the transaction commits, which marks the partitions dirty
+//!    against durable rows. [`in_transaction`] owns that commit-then-flush
+//!    contract; a call site driving its own transaction calls
+//!    [`Wake::fire`] on the commit path and [`Wake::discard`] on
+//!    rollback. An unflushed handle is not lost - the cold reconciler eventually
+//!    rediscovers the pending partition - only delayed.
 //! 2. **Sequencer** - a background task claims incoming rows, assigns
 //!    per-partition sequence numbers, and writes to the `outgoing` table.
 //! 3. **Processor** - one long-lived task per partition reads from `outgoing`,
@@ -218,8 +225,10 @@ mod tables;
 #[doc(hidden)]
 pub mod taskward;
 mod trace;
+mod transaction;
 mod types;
 pub(crate) mod validation;
+mod wake;
 mod workers;
 
 #[cfg(test)]
@@ -240,8 +249,10 @@ pub use migrations::{outbox_migrations, outbox_migrations_with_prefix};
 pub use record::{Record, RecordBuilder, RecordTarget, Records, RecordsBuilder, RecordsTarget};
 pub use subscription::{TraceSubscription, TraceWatch};
 pub use trace::{TraceOutcome, TraceState, TraceStatus};
+pub use transaction::in_transaction;
 pub use types::{
     LeaseConfig, OutboxError, OutboxMessageId, OutboxProfile, Partitions, WorkerTuning,
 };
+pub use wake::Wake;
 
 // Internal re-exports for tests and internal gears

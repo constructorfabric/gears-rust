@@ -230,6 +230,10 @@ The system **MUST** implement the `NotificationDispatcher` as the sole caller of
 fan-out with a per-sink timeout, per-sink failure isolation, `Retry` on transient outcomes below the
 operator-configured `OutboxMessage.attempts` maximum (duplicates permitted), `Reject` on any `Permanent` outcome or at
 that maximum, and ack only when every sink succeeded — all under the dispatcher's system-level `SecurityContext`.
+Before delivery is enabled, every mutating transaction that enqueues events **MUST** hand the outbox `Wake` of its
+enqueues back to the store, which fires it only after the transaction commits and discards it on rollback or when a
+retry abandons the attempt. Until that wiring exists the enqueuer discards the wake: events stay persisted atomically
+(I11) and the outbox reconciler picks them up later instead of at once.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-dispatcher-singleton`

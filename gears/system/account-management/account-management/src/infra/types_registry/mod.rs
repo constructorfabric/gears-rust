@@ -15,6 +15,7 @@
 
 pub(crate) mod checker;
 pub(crate) mod metadata_schema_registry;
+pub(crate) mod root_type;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -25,3 +26,4 @@ pub(crate) mod test_helpers;
 // consumers go through `account-management-sdk`.
 pub(crate) use checker::GtsTenantTypeChecker;
 pub(crate) use metadata_schema_registry::GtsMetadataSchemaRegistry;
+pub(crate) use root_type::register_root_type;

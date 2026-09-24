@@ -42,8 +42,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -73,7 +77,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -237,14 +241,11 @@ async fn a_value_violating_its_schema_is_refused_on_its_merits() {
     );
 }
 
-/// An Instance whose conforming type has no committed revision fails **retryably**.
-/// Until T21 there is no outbox, so it is asserted as the `WorkerError` it is.
 #[tokio::test]
-async fn an_instance_without_its_type_fails_retryably() {
+async fn an_instance_without_its_type_fails_with_dependency_diagnostics() {
     let db = test_db().await;
     let op = submit(&db, "k1", INSTANCE_ID, json!({ "name": "orphan" })).await;
-
-    let err = run_operation(
+    run_operation(
         &stores(),
         &worker(&db),
         &allow_all(),
@@ -258,18 +259,18 @@ async fn an_instance_without_its_type_fails_retryably() {
         LATER,
     )
     .await
-    .expect_err("an absent conforming type is retryable, so it surfaces as an error");
-
-    match err {
-        WorkerError::ConformingTypeAbsent { gts_id, type_id } => {
-            assert_eq!(gts_id, INSTANCE_ID);
-            assert_eq!(
-                type_id, TYPE_ID,
-                "the type named is the identifier's prefix"
-            );
-        }
-        other => panic!("expected ConformingTypeAbsent, got {other:?}"),
-    }
+    .expect("candidate refusal is a completed admission");
+    let conn = db.conn().expect("connection");
+    let items =
+        types_registry::infra::storage::repo::OperationRepo::find_items(&conn, &allow_all(), op)
+            .await
+            .expect("read items");
+    let error: serde_json::Value =
+        serde_json::from_str(items[0].error_payload.as_deref().expect("refusal payload"))
+            .expect("JSON");
+    assert_eq!(error["reason"], "dependency_not_found");
+    assert_eq!(error["dependency_id"], TYPE_ID);
+    assert_eq!(error["dependency_kind"], "conforming_type");
 }
 
 /// **A family holds one kind.** `family_key` drops the trailing `~`, so `…thing.v1~`
