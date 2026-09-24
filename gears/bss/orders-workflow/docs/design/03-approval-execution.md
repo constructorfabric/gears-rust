@@ -1,5 +1,5 @@
 <!-- CONFLUENCE_TITLE: [BSS]: Orders Workflow — Approval Execution (Slice 3) -->
-<!-- Related: ../DESIGN.md, ../PRD.md, ./01-foundation.md, ./02-triggers-and-start.md, ./README.md | Owners: BSS Orders team -->
+<!-- Related: ../DESIGN.md, ../PRD.md, ./01-foundation.md, ./02-triggers-and-start.md, ./10-process-definition.md, ./README.md | Owners: BSS Orders team -->
 
 # DESIGN — Approval Execution (Slice 3)
 
@@ -24,8 +24,10 @@
 - [4. Additional context](#4-additional-context)
   - [4.0 Detecting a Generic Approval outage](#40-detecting-a-generic-approval-outage)
   - [4.1 The fail-closed park](#41-the-fail-closed-park)
-  - [4.2 The outage threshold, the TTL lead time, and the pause record](#42-the-outage-threshold-the-ttl-lead-time-and-the-pause-record)
+  - [4.2 The outage threshold, the TTL lead time, and the paused window](#42-the-outage-threshold-the-ttl-lead-time-and-the-paused-window)
   - [4.3 Multi-party routing is sequential-capable, and sequence is a column](#43-multi-party-routing-is-sequential-capable-and-sequence-is-a-column)
+  - [4.4 Operation rules](#44-operation-rules)
+  - [4.5 Constraints this slice places on the definition](#45-constraints-this-slice-places-on-the-definition)
   - [Disclosure 1 — the whole capability is inert in phase 1](#disclosure-1--the-whole-capability-is-inert-in-phase-1)
   - [Disclosure 2 — open PRD gap on re-obtaining the verdict after OrderAmended](#disclosure-2--open-prd-gap-on-re-obtaining-the-verdict-after-orderamended)
 - [5. Traceability](#5-traceability)
@@ -38,16 +40,28 @@
 
 ### 1.1 Architectural Vision
 
-This slice executes the approval gate that sits between `submitted` and `approved` in the Orders
-Lifecycle state machine. Orders Workflow does not decide whether an order requires approval, and
-it does not decide who must approve it — both are policy questions owned by the Generic Approval
-service. Workflow's job is narrower and mechanical: obtain the requirement verdict for a specific
-order version, reflect it into Lifecycle exactly once, open one durable `OrderApprovalRequest`
-per configured gate party, own every escalation timer for those gates end to end, and reflect the
-eventual decision back into Lifecycle idempotently. Every one of these five responsibilities
-(request/gate, idempotency, escalation timer, decision reflection, inbox) is built against the
-engine primitives from `01-foundation.md` — the idempotency registry, the durable timer service,
-and the platform event producer adapter — rather than inventing parallel machinery.
+This slice provides the **step operations** of the approval stage that sits between `submitted`
+and `approved` in the Orders Lifecycle state machine, and the approval **record** those
+operations write: `obtain-verdict` and `reflect-verdict` (both `protected`), `open-gates`,
+`record-decision` (`protected`), `arm-park-escalation` and `escalate-gate`. The stage is
+**sequenced by the definition fragment** of
+[`10 §3.6` (a) *Start and approval*](./10-process-definition.md#a-start-and-approval)
+(`cpt-cf-bss-orders-workflow-seq-def-start-and-approval`): its `obtainVerdict`, `onVerdict`,
+`parkForVerdict`, `reflectVerdict`, `afterReflect`, `openGates`, `gateLoop` and `afterGateLoop`
+tasks call these operations in order, and its `wait` arms are the escalation and park clocks.
+**This slice sequences nothing itself** — it owns no timer, no retry loop, no event intake and no
+"next step"; each operation reads the approval record and the commercial order context inside
+Orders under the PDP, performs one effect through the step envelope of
+[`01 §3.3`](./01-foundation.md#33-api-contracts), writes the record in the envelope's settlement
+transaction and returns references and small enums the definition branches on
+([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)).
+
+Orders Workflow does not decide whether an order requires approval, and it does not decide who
+must approve it — both are policy questions owned by the Generic Approval service. The operations
+are narrower and mechanical: obtain the requirement verdict for a specific order version,
+reflect it into Lifecycle exactly once, open one durable `OrderApprovalRequest` per configured
+gate party, record every arm, pause and fire of a gate's escalation window, and reflect the
+eventual decision back into Lifecycle idempotently.
 
 The central design tension this slice resolves is that **the policy dependency it calls does not
 exist yet**. Rather than blocking the slice on an unbuilt service, the design fixes a single
@@ -56,8 +70,9 @@ always answers "approval not required." This keeps the request/gate, idempotency
 inbox machinery fully specified and buildable now, while making unmistakably explicit that none of
 that machinery executes a single real gate until the Generic Approval service is built. The second
 governing decision is the fail-closed posture: every unavailability path (verdict source down,
-approval service down mid-gate) parks or pauses rather than assumes success, and escalates to a
-human queue before the Lifecycle `submitted` TTL can expire the order out from under it.
+approval service down mid-gate) answers a verdict class or a service state the definition routes
+to a park or a pause rather than to success, and the escalation reaches a human queue before the
+Lifecycle `submitted` TTL can expire the order out from under it.
 
 ### 1.2 Architecture Drivers
 
@@ -65,52 +80,57 @@ human queue before the Lifecycle `submitted` TTL can expire the order out from u
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-request` | §3.2 Verdict Gateway + Approval Gate Manager components; §3.6 verdict-and-gate-open sequence; verdict cached per `orderId`+`orderVersion`, stale disagreement never re-reflected |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-idempotency` | §3.1 `OrderApprovalRequest` entity with idempotency key `orderId`+`orderVersion`+`gateId`, submitted through the engine idempotency registry (`01-foundation.md` §4.3) |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` | §3.2 Escalation Timer Owner component built on `cpt-cf-bss-orders-workflow-interface-timer-api`; §3.6 escalation-fires and outage-pause sequences |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-decision` | §3.2 Decision Reflector component; §3.6 decision-reflection sequence, idempotent Lifecycle call |
-| `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox` | §3.2 Approver Inbox Projection component; §3.3 inbox read API scoped to assigned gates |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-request` | §3.3 `obtain-verdict`, `reflect-verdict`, `open-gates`; verdict cached per `orderId`+`orderVersion`, authoritative once present, reflected from the stored row and never re-reflected |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-idempotency` | §3.1 `OrderApprovalRequest` with idempotency key `orderId`+`orderVersion`+`gateId`, submitted through the envelope's idempotency registry ([`01 §4.3`](./01-foundation.md#43-the-idempotency-registrys-non-success-outcomes-are-exhaustive)) inside `open-gates` |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` | The escalation window is the definition's `wait` in the `gateLoop` fork (`10 §3.6` (a)); `open-gates` arms it, `escalate-gate` fires and probes it, slice 08's `apply-hold`/`apply-resume` pause and re-arm it through this slice's gate-window port (§3.2); the remainder is recorded on `owf_approval_gate` |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-decision` | §3.3 `record-decision` (`protected`) then `reflect-verdict` with `stage = gate-outcome`; idempotent Lifecycle call on the `approval-reflection` seam |
+| `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox` | §3.2 Approver Inbox Projection; §3.3 inbox read and decision endpoints scoped to assigned gates |
 
 #### NFR Allocation
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Escalation timers configurable per gate, default 72h, ±5 min accuracy, durable across restarts | Escalation Timer Owner, on `cpt-cf-bss-orders-workflow-interface-timer-api` | One `owf_durable_timer` row per open gate, `timer_kind = approval-escalation` (the engine's enum value; this slice coins no timer kind of its own) discriminated by `subject_ref`, reloaded from durable storage on service start (engine guarantee, `01-foundation.md` §3.7); pause/resume rearms at `resume_time + remaining_window` rather than restarting the window from zero | Timer-fire latency measured against the stored fire time in the escalation test suite; restart-recovery test asserts no timer is lost or re-fired; pause/resume test asserts the stored remaining window is honoured, not reset; two-party test asserts each gate's timer is independently cancellable |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Escalation timers configurable per gate, default 72h, ±5 min accuracy, durable across restarts | The definition's escalation `wait` (plugin durable timer, `10 §2`); `open-gates`, `escalate-gate` and the gate-window port for the record | The fire instant is the plugin's durable timer, which survives worker restart by the plugin's own history ([`01 §4.4`](./01-foundation.md#44-timers-and-retry-policy-are-the-definitions)); the window, the remainder at pause and the arm instant are columns on `owf_approval_gate`, so every re-arm after a hold or an outage uses `window_remaining_ms` rather than restarting the window from zero | Timer-fire latency measured against `window_armed_at + window_remaining_ms` in the escalation suite; worker-kill test asserts no escalation is lost or recorded twice (the second `escalate-gate` under the same key is absorbed); pause/resume test asserts the returned remainder is honoured, not reset; two-party test asserts each gate's window is recorded independently |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | Verdict-source unavailability parks the process in `submitted`; never fail-open to `approved`; park must not suspend the Lifecycle `submitted` TTL, so escalation to the operator queue must fire before that TTL elapses |
+| `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | Verdict-source unavailability parks the process in `submitted`; never fail-open to `approved`; park must not suspend the Lifecycle `submitted` TTL, so escalation to the operator queue must fire before that TTL elapses. As amended by ADR-0011: the park is a definition arm and this slice records it |
 | `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Idempotency keys for approval requests are `orderId` + `orderVersion` + `gateId`; never the process `correlationId` (per [`02-triggers-and-start.md`](./02-triggers-and-start.md) §2.1, `correlationId` is a whole-instance identifier, not a per-request dedup key) |
+| `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | The approval stage's ordering, waits and branches are the definition of `10 §3.6` (a); this slice provides the operations and the record |
+| `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | `obtain-verdict`, `reflect-verdict` and `record-decision` are `protected`: ordered by the definition, never omitted, never inside a swallowing `catch` |
+| `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | The resolved total, approver identities and the deciding authority stay in this slice's tables; only a verdict class, gate references, positions and durations cross to the definition |
 
 ### 1.3 Architecture Layers
 
 ```
-Orders Lifecycle event stream (OrderSubmitted, OrderAmended)
-        │
+Platform: serverless-runtime Temporal plugin executing 10 §3.6 (a)
+        │  call: POST /bss-orders-workflow/v1/steps/{operation}
         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Application: Verdict Gateway → Approval Gate Manager →       │
-│              Escalation Timer Owner → Decision Reflector     │
+│ Application (step operations): obtain-verdict,               │
+│   reflect-verdict, open-gates, record-decision,              │
+│   arm-park-escalation, escalate-gate                         │
 ├─────────────────────────────────────────────────────────────┤
-│ Domain: OrderApprovalRequest, ApprovalGate, EscalationTimer  │
+│ Domain: OrderApprovalRequest, ApprovalGate, ApprovalPark,    │
+│         ApprovalVerdictCache                                 │
 ├─────────────────────────────────────────────────────────────┤
-│ Infrastructure: Step Executor / Idempotency Registry /       │
-│   Durable Timer Service / Event Outbox (all engine-owned,    │
-│   01-foundation.md §3.3-3.7) / Generic Approval SDK client   │
-│   (stand-in in phase 1)                                      │
+│ Infrastructure: step envelope / idempotency registry /       │
+│   audit writer / producer adapter (01-foundation §3.2),      │
+│   Lifecycle seam client (approval-reflection),               │
+│   Generic Approval SDK client (stand-in in phase 1)          │
 ├─────────────────────────────────────────────────────────────┤
-│ Presentation: Approver Inbox read API (p2)                   │
+│ Presentation: Approver Inbox read + decision API (p2)        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
 | Presentation | Approver Inbox read/decision surface, scoped to assigned gates | REST read API + decision endpoint, per SDK-first conventions |
-| Application | Verdict retrieval, gate lifecycle, escalation ownership, decision reflection | Workflow step handlers registered against the engine's step-executor entry point |
-| Domain | `OrderApprovalRequest`, `ApprovalGate`, `EscalationTimer` value/entity model | Rust structs, no persistence logic of their own |
-| Infrastructure | Durable timer, idempotency registry, platform event producer adapter, audit writer (all inherited from `01-foundation.md`), Generic Approval SDK client (stand-in today) | Engine-owned tables + SDK client abstraction |
+| Application | The six step operations of §3.3; each one effect, one settlement | Operations registered against the operation registration boundary of [`01 §3.2`](./01-foundation.md#32-component-model) |
+| Domain | `OrderApprovalRequest`, `ApprovalGate`, `ApprovalPark`, `ApprovalVerdictCache` | Rust structs, no persistence logic of their own |
+| Infrastructure | Envelope, idempotency registry, audit writer, producer adapter (inherited from `01`), Lifecycle `approval-reflection` seam client, Generic Approval SDK client (stand-in today) | Slice-owned tables of §3.7 + SDK client abstractions |
 
 ## 2. Principles & Constraints
 
@@ -131,42 +151,52 @@ the boundary, never persisted with a blank or inferred authority.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-principle-timer-ownership-undivided`
 
-Escalation timers are scheduled, persisted, and fired exclusively by this gear, on the engine's
-durable timer service. The Generic Approval service (once it exists) supplies configuration
-(window length, escalation path) and receives the escalation command; it never stores timer state
-and is never queried for "has this timer fired." Splitting timer ownership across two services is
-the exact failure mode this principle forecloses — a partial outage would otherwise leave neither
-side certain which one owns the clock.
+An escalation clock has exactly one executor and exactly one record. The executor is the
+definition's `wait` task on the platform plugin (`10 §2`); the record — window, remainder at
+pause, arm instant, fire — is `owf_approval_gate` (or `owf_approval_park`), written only by the
+operations of this slice and by the gate-window port slice 08's operations call. The Generic
+Approval service (once it exists) supplies configuration (window length, escalation path) read by
+`open-gates`, and receives the escalation command from `escalate-gate`; it never stores timer
+state and is never queried for "has this timer fired." The definition never computes a window:
+every duration its `wait` arms is a value an operation returned from the record. Splitting timer
+ownership across two services — or between the definition's arithmetic and Orders' record — is
+the failure mode this principle forecloses: a partial outage would otherwise leave neither side
+certain which one owns the clock.
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`
 
 #### Fail-closed, never fail-open, never auto-reject
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-principle-fail-closed-never-open`
 
 Every unavailability path in this slice — verdict source down, approval service down mid-gate,
-outage exceeding the configured pause threshold — resolves to parking, pausing, or escalating to a
+outage exceeding the configured threshold — resolves to parking, pausing, or escalating to a
 human operator queue. None of these paths ever resolves an order to `approved` by default, and
-none of them ever auto-rejects an open gate. The only two ways a gate closes are an explicit
-decision from the (stand-in or real) approval authority, or an explicit cancellation on
-supersession by `OrderAmended`.
+none of them ever auto-rejects an open gate. A gate closes by exactly three routes: an explicit
+decision from the (stand-in or real) approval authority recorded by `record-decision`, the
+cancellation of its siblings when one gate at any position is rejected (`record-decision`), or
+the closure of every open gate when the instance is superseded, cancelled or voided by a terminal
+order event (the closure port of §3.2, called inside `run-cancellation-fence`, slice 06).
 
 "Parking" is a **state with a row**, not a figure of speech: the park is the
-`owf_process_instance.phase = parked` value and its `owf_approval_park` record, specified in §4.1.
-An unavailability posture that has no persisted state is indistinguishable at recovery from a
-process that simply stalled.
+`owf_process_instance.phase = parked` projection written by the foundation's `park` operation
+([`01 §3.3`](./01-foundation.md#park-and-unpark)) and its `owf_approval_park` record written by
+`obtain-verdict`, specified in §4.1. An unavailability posture that has no persisted state is
+indistinguishable at recovery from a process that simply stalled.
 
-**There is no un-park authority, and that absence is deliberate.** This slice exposes no
-force-approve, no force-verdict and no manual un-park operation. A parked process leaves `parked`
-by exactly two routes: the verdict becomes obtainable and the retry succeeds, or a terminal
-Lifecycle event (typically `OrderExpired` at the `submitted` TTL) terminates the instance through
-slice 02. Granting an operator an in-band override here would make this gear the deciding
-authority for a policy question §2.1 says it never decides. The absence is stated rather than left
-implicit because an undocumented absence does not remove the pressure — it relocates it to an
-out-of-band database write, which lands outside the permission evaluator and outside
-`owf_audit_entry`.
+**There is no un-park authority, and that absence is deliberate.** This slice registers no
+force-approve, no force-verdict and no manual un-park operation, and `unpark` on the verdict path
+is legal only after `obtain-verdict` has returned a verdict (§4.5). A parked process leaves
+`parked` by exactly three routes: the verdict becomes obtainable and the retry succeeds, a
+terminal Lifecycle event (typically `OrderExpired` at the `submitted` TTL) terminates the
+instance, or a workflow-mediated cancel (`authorize-cancel`, slice 08) takes the cancel path.
+Granting an operator an in-band override here would make this gear the deciding authority for a
+policy question §2.1 says it never decides. The absence is stated rather than left implicit
+because an undocumented absence does not remove the pressure — it relocates it to an out-of-band
+database write or a definition version with an extra branch, which lands outside the permission
+evaluator and outside `owf_audit_entry`; the second is refused by the validation hook (§4.5).
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`
 
 ### 2.2 Constraints
 
@@ -192,17 +222,21 @@ idempotency key because a single process instance can open multiple concurrent g
 and can re-open gates across versions (amendment); an idempotency key built from `correlationId`
 alone would collide across gates or fail to distinguish versions. The approval-request idempotency
 key is `orderId` + `orderVersion` + `gateId` exclusively, prefixed with `resource_tenant_id` so the
-key is tenant-namespaced (`01-foundation.md` §4.5) and a caller-supplied key can never name another
-tenant's order.
+key is tenant-namespaced (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`)
+and a caller-supplied key can never name another tenant's order. The **step-operation** keys of
+§3.3 are a different family — instance-scoped, `{tenant}:{correlationId}:{operation}:…` per
+[`01 §3.3`](./01-foundation.md#the-step-operation-contract) — and key the step, not the
+downstream submission; the two never substitute for each other.
 
 **`gateId` is derived, not minted.** It is a UUIDv5 over (`orderId`, `orderVersion`, `party`),
 computed from the routing configuration before any row is written. A `uuid` minted by this gear at
 gate-open time would defeat the very key it composes: a crash between submitting the request to
 Generic Approval and committing the gate row mints a *different* uuid on replay, which composes a
 *different* idempotency key, which the registry reads as a first call — and the order acquires a
-second gate for the same party with its own 72-hour timer. Derivation makes the replay re-derive
-the key it already used, so the registry absorbs it. The same rule is what lets the Gate Manager
-address a gate before it has been persisted.
+second gate for the same party with its own 72-hour window. Derivation makes the platform's
+replay of `open-gates` re-derive the key it already used, so the registry absorbs it. The same
+rule is what lets `open-gates` address a gate before it has been persisted, and it is why
+`gateRef` is safe to cross to the definition: it names a row, never a party or a principal.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
 
@@ -225,50 +259,54 @@ address a gate before it has been persisted.
 
 | Entity | Description | Schema |
 |--------|-------------|--------|
-| `OrderApprovalRequest` | One durable request per gate party, keyed by an idempotency key derived from `resource_tenant_id` + `orderId` + `orderVersion` + `gateId`; carries order context, the requesting party, the resolved order total (§3.7), and the process `correlationId` for cross-referencing (never for dedup) | [db table `owf_approval_request`](#37-database-schemas--tables) |
-| `ApprovalGate` | One gate per approval party for a given order version; carries the state set `open \| approved \| rejected \| cancelled`, the sequence position that orders sequential routing, the catalogue decision reason, and the deciding authority once decided | [db table `owf_approval_gate`](#37-database-schemas--tables) |
-| `EscalationTimerRecord` | One durable timer per open gate, riding the engine's `owf_durable_timer` table as a `timer_kind = approval-escalation` row discriminated by `subject_ref`; the window remaining at pause is the stored datum across pause/resume cycles, never an accrued-elapsed counter | engine-owned `owf_durable_timer` (see `01-foundation.md` §3.7); no new table |
-| `ApprovalVerdictCache` | The cached approval-requirement verdict for a given `orderId` + `orderVersion`, with its named deciding authority and its reflection state | [db table `owf_approval_verdict_cache`](#37-database-schemas--tables) |
-| `ApprovalPark` | The "verdict unobtainable" record for one order version: when the park began, why, whether it has been escalated, and how it ended. Distinct from the verdict cache, which by construction cannot hold it (§4.1) | [db table `owf_approval_park`](#37-database-schemas--tables) |
-| `ApprovalOutagePause` | The record of one escalation timer paused by a Generic Approval outage, carrying the window remaining at pause. Not a table of its own: it is an `owf_timer_pause` row with `pause_reason = 'approval-outage'` and a null `suspension_id`, because no hold occurred (§4.2) | engine-shared `owf_timer_pause` (`08-hold-and-cancel.md` §3.7); no new table |
+| `OrderApprovalRequest` | One durable request per gate party, keyed by an idempotency key derived from `resource_tenant_id` + `orderId` + `orderVersion` + `gateId`; carries order context, the requesting party, the resolved order total (§3.7), the submitting subject for the separation-of-duties check, and the process `correlationId` for cross-referencing (never for dedup) | [db table `owf_approval_request`](#37-database-schemas--tables) |
+| `ApprovalGate` | One gate per approval party for a given order version; carries the state set `planned \| open \| approved \| rejected \| cancelled`, the sequence position that orders sequential routing, the escalation window and its recorded remainder, the catalogue decision reason, and the deciding authority once decided | [db table `owf_approval_gate`](#37-database-schemas--tables) |
+| `EscalationTimerRecord` | **Retired by ADR-0011; responsibility now**: the escalation clock is the definition's `wait` in the `gateLoop` fork (`10 §3.6` (a)); its record is the window columns of `owf_approval_gate` (`escalation_window_ms`, `window_remaining_ms`, `window_armed_at`, `pause_causes`, `escalated_at`) | columns of `owf_approval_gate`; `owf_durable_timer` is retired ([`01 §3.7`](./01-foundation.md#retired-tables)) |
+| `ApprovalVerdictCache` | The cached approval-requirement verdict for a given `orderId` + `orderVersion`, with its named deciding authority, its reflection state, and the reflected gate outcome | [db table `owf_approval_verdict_cache`](#37-database-schemas--tables) |
+| `ApprovalPark` | The "verdict unobtainable" record for one order version: when the park began, why, when it must escalate, whether it has, and how it ended. Distinct from the verdict cache, which by construction cannot hold it (§4.1) | [db table `owf_approval_park`](#37-database-schemas--tables) |
+| `ApprovalOutagePause` | **Retired by ADR-0011; responsibility now**: an outage pause is the `approval-outage` member of `owf_approval_gate.pause_causes`, set and cleared by `escalate-gate` in `probe` mode, with the remainder captured in `window_remaining_ms` (§4.2). `owf_timer_pause` is retired with slice 08's pause table | column of `owf_approval_gate`; no table |
 
 **Relationships**:
 - `OrderApprovalRequest` → `ApprovalGate`: one gate is satisfied by exactly one accepted request's
   decision; the request is the durable submission record, the gate is the state-tracking record.
-- `ApprovalGate` → `EscalationTimerRecord`: one open gate owns exactly one active escalation timer;
-  a gate in `approved`, `rejected` or `cancelled` has no active timer.
+- `ApprovalGate` → escalation window: one `open` gate has exactly one recorded window; a gate in
+  `planned` has none yet, and a gate in `approved`, `rejected` or `cancelled` has none any more.
 - `ApprovalGate` → `ApprovalGate`: a gate at sequence position *n* opens only once every gate at a
-  position below *n* is `approved`; gates sharing a position open together (§4.3).
+  position below *n* is `approved`; gates sharing a position open together (§4.3). Every gate of
+  the routing plan is persisted at the first `open-gates` call, later positions as `planned`.
 - `ApprovalVerdictCache` → `ApprovalGate`: a verdict of "approval required" for a given order
   version produces the gate set for that version, per the routing configuration; a verdict of
   "approval not required" produces no gates.
-- `ApprovalVerdictCache` → `ApprovalPark`: mutually exclusive for a given `orderId` +
-  `orderVersion`. A park exists precisely when no verdict could be obtained, so there is no cache
-  row to carry it.
+- `ApprovalVerdictCache` → `ApprovalPark`: a park exists precisely while no verdict could be
+  obtained for the version; once a cache row is written the open park closes with
+  `resolution = verdict-obtained` in the same transaction, so the two are never both open.
 
 ### 3.2 Component Model
 
-This slice adds five components to the Orders Workflow process. Four of them — Verdict Gateway,
-Approval Gate Manager, Escalation Timer Owner, Decision Reflector — are invoked as step handlers
-through the engine's single step-executor entry point (`01-foundation.md` §3.3). The fifth,
-Approver Inbox Projection, is a read-and-capture surface rather than a step handler, and is called
-by an approver rather than by the engine. None of the five writes engine-owned tables directly.
+This slice's components are the **owners of its operations**. Three of them — Verdict Gateway,
+Approval Gate Manager, Decision Reflector — own the six step operations of §3.3, each run through
+the step envelope of `01 §3.2` on a `call` from the definition. The fourth, Approver Inbox
+Projection, is a read-and-capture surface called by an approver, not by the definition. None of
+them writes an engine-owned table directly; the phase projection is written by the foundation's
+`park`/`unpark` and the envelope writes the step log, the registry and the audit entry.
 
 ```mermaid
 graph LR
-    L[Orders Lifecycle event stream] -->|OrderSubmitted, OrderAmended| VG[Verdict Gateway]
-    VG -->|verdict required| AGM[Approval Gate Manager]
-    VG -->|reflect verdict| LC[Lifecycle Seam Client]
-    VG -->|verdict unobtainable| PARK[(owf_approval_park + phase = parked)]
-    PARK --> ETO
-    ETO -->|park / outage escalation| OPQ[Fulfillment-operator queue]
-    AGM -->|open request| GAS[Generic Approval SDK client / stand-in]
-    AGM --> ETO[Escalation Timer Owner]
-    ETO -->|timer fire / pause / resume| TIMER[(cpt-cf-bss-orders-workflow-interface-timer-api)]
-    GAS -->|OrderApprovalDecision| DR[Decision Reflector]
-    DR -->|reflect decision| LC
-    AGM -->|assigned gates| INBOX[Approver Inbox Projection]
-    INBOX -->|approve/reject + reason| GAS
+    DEF[Definition 10 §3.6 a<br/>serverless-runtime plugin] -->|obtain-verdict, reflect-verdict, arm-park-escalation| VG[Verdict Gateway]
+    DEF -->|open-gates, escalate-gate| AGM[Approval Gate Manager]
+    DEF -->|listen approval decision, then record-decision| DR[Decision Reflector]
+    VG -->|approval-reflection seam, expected_version| LC[Lifecycle seam client]
+    VG -->|verdict query| GAS[Generic Approval SDK client / stand-in]
+    VG --> PARK[(owf_approval_park)]
+    VG --> CACHE[(owf_approval_verdict_cache)]
+    AGM -->|request submission, escalation command, liveness probe| GAS
+    AGM --> GATE[(owf_approval_gate + owf_approval_request)]
+    DR -->|decision record read| GAS
+    DR --> GATE
+    H08[apply-hold / apply-resume, slice 08] -->|gate-window port| AGM
+    F06[run-cancellation-fence, slice 06] -->|closure port| AGM
+    INBOX[Approver Inbox Projection] -->|approve/reject + reason| GAS
+    INBOX --> GATE
 ```
 
 #### Verdict Gateway
@@ -277,50 +315,59 @@ graph LR
 
 ##### Why this component exists
 
-`OrderSubmitted` must be answered with a `submitted → pending_approval` or `submitted → approved`
+`submitted` must be answered with a `submitted → pending_approval` or `submitted → approved`
 reflection, and that answer must come from the policy owner, not from this gear. The Verdict
-Gateway is the single call site for that query and the single call site for the Lifecycle
-reflection it drives.
+Gateway is the single owner of the operation that asks (`obtain-verdict`), the operation that
+reflects (`reflect-verdict`), and the park record an unanswered question leaves behind.
 
 ##### Responsibility scope
 
-Queries the approval-requirement verdict keyed on `orderId` + `orderVersion`; caches the answer
-against that version in `ApprovalVerdictCache` together with the named deciding authority; refuses
-to persist any verdict lacking a named authority; reflects the verdict into Lifecycle exactly once
-per version; on repeat query for an already-**reflected** version, returns the cached verdict and
-never re-reflects, even if the repeat query disagrees with what was already reflected (treated as
-stale). On `OrderAmended`, re-queries the verdict for the new version from scratch — it never
-derives the new version's verdict from the version it superseded. When no verdict can be obtained,
-parks the process rather than assuming either answer (§4.1).
+Owns `obtain-verdict`, `reflect-verdict` and `arm-park-escalation` (§3.3). `obtain-verdict`
+queries the approval-requirement verdict keyed on `orderId` + `orderVersion`, forwarding order
+context it reads from Lifecycle under R4; caches the answer in `ApprovalVerdictCache` with the
+named deciding authority; refuses to persist any verdict lacking a named authority; and, when no
+verdict can be obtained, writes the park record and answers the verdict class `unobtainable`
+rather than assuming either answer (§4.1). **The cache is authoritative once present**: a call
+for a version that already has a cache row returns the stored verdict without querying again,
+whether or not it has been reflected, so a later disagreeing answer from the authority is never
+even requested. `reflect-verdict` reflects into Lifecycle **from the stored row**, exactly once
+per version and stage, on the `approval-reflection` seam with the expected version; a row whose
+reflection is already stamped answers the stored result and never calls Lifecycle again.
+`arm-park-escalation` computes, from the park row and the configured policy of §4.2, the duration
+the definition's park-escalation `wait` arms.
 
 **Store and reflect are two states of one row, in that order, and the never-re-reflect rule keys
-on the second.** The cache row is written when the verdict is obtained, with `reflected_at` NULL;
-the Lifecycle reflection is then called under the idempotency key
-`resource_tenant_id + orderId + orderVersion + <transitionName>`; `reflected_at` is stamped only
-after that call returns success. The naive ordering — write the row, then reflect, and treat the
-row's existence as "already reflected" — strands the order permanently on a crash in between: the
-row says reflected, the order is still `submitted`, and the never-re-reflect rule suppresses the
-retry that would fix it, forever. Splitting the row into two states makes the window recoverable:
-a row with `reflected_at IS NULL` is an unfinished reflection, it is re-driven by the
-reconciliation sweep (`01-foundation.md` §4.3), and the re-drive is absorbed by the idempotency
-registry if the original call in fact landed.
+on the second.** The cache row is written by `obtain-verdict` with `reflected_at` NULL; the
+Lifecycle reflection is made by `reflect-verdict`; `reflected_at` is stamped only in the
+settlement transaction of a successful seam answer. The naive ordering — treat the row's existence
+as "already reflected" — strands the order permanently on a crash in between: the row says
+reflected, the order is still `submitted`, and the never-re-reflect rule suppresses the retry that
+would fix it. Splitting the row into two states makes the window recoverable, and recovery is the
+**definition's own retry** of `reflect-verdict` under the same key (the platform replays the task
+after a worker crash): the call finds `reflected_at IS NULL`, reflects from the stored row, and
+the Lifecycle seam's idempotency key absorbs the re-drive if the original call in fact landed.
+There is no Orders-side sweep of unreflected rows.
+
+On `OrderAmended` the prior instance is terminated and a new invocation starts for the new
+version (slice 02, `10 §3.6` (f)); its `obtain-verdict` has no cache row for the new version and
+queries from scratch — it never derives the new version's verdict from the version it superseded.
 
 ##### Responsibility boundaries
 
 Does not evaluate any threshold, TCV figure, or policy rule itself — it forwards order context to
-the verdict source and persists the answer verbatim. Does not open approval gates itself; on a
-"required" verdict it hands off to the Approval Gate Manager. Does not decide what happens on
-verdict-source unavailability beyond writing the park record and arming its escalation timer — the
-operator queue path is delegated to the Escalation Timer Owner's operator-queue lane described
-below. Does not offer any operation that resolves a park by fiat (§2.1).
+the verdict source and persists the answer verbatim. Does not open approval gates; `open-gates`
+does, when the definition calls it after a `pending_approval` reflection. Does not write the phase
+projection — `park`/`unpark` (01) do. Does not wait, retry or escalate: the park's retry cadence and
+its escalation clock are the definition's `parkLoop` (`10 §3.6` (a)), and the operator incident
+is raised by `raise-overdue-escalation` (slice 07). Does not offer any operation that resolves a
+park by fiat (§2.1).
 
 ##### Related components (by ID)
 
-- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — hands off to on a "required"
-  verdict
-- `cpt-cf-bss-orders-workflow-component-termination-and-compensation` (slice 02) — invoked when an
-  `OrderAmended` trigger is observed for a version this gateway has an outstanding verdict query
-  or reflection in flight for, per the void-on-superseded-version rule
+- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — reads the stored verdict and the
+  routing configuration it produced
+- `cpt-cf-bss-orders-workflow-component-termination-and-compensation` (slice 02) — terminates the
+  instance of a superseded version; the new version's `obtain-verdict` runs in the new instance
 
 #### Approval Gate Manager
 
@@ -330,45 +377,72 @@ below. Does not offer any operation that resolves a park by fiat (§2.1).
 
 A "required" verdict can fan out into multiple gates per the routing configuration (sequential or
 parallel, multi-party). This component owns the fan-out, the per-gate idempotent request
-submission, and the all-gates-satisfied aggregation that ultimately allows `pending_approval →
-approved`.
+submission, the record of every gate's escalation window, and the only code that may change that
+record.
 
 ##### Responsibility scope
 
-Reads the routing configuration from the Generic Approval service (or, in phase 1, receives none,
-since the stand-in never returns "required"); derives each `gateId` from that configuration
-(§2.2); creates one `OrderApprovalRequest` per gate party with idempotency key
-`resource_tenant_id` + `orderId` + `orderVersion` + `gateId`, submitted through the engine
-idempotency registry so a retried submission is absorbed as a duplicate rather than opening a
-second gate; **opens gates in sequence position order** (§4.3); tracks each gate's
-`open | approved | rejected | cancelled` state; declares the order approved only once every gate
-for that version is `approved`; on `OrderAmended`, cancels every open gate for the prior version
-before any new gate for the new version is opened.
+Owns `open-gates` and `escalate-gate` (§3.3), and two in-process ports other slices' operations
+call inside their own unit of work.
+
+`open-gates` reads the routing configuration from the Generic Approval service (or, in phase 1,
+receives none, since the stand-in never returns "required"); on the first call for a version
+**persists the whole routing plan** — every gate row, those at position 0 as `open`, those at later
+positions as `planned` — deriving each `gateId` from that configuration (§2.2); submits one
+`OrderApprovalRequest` per gate at the requested position with idempotency key
+`resource_tenant_id` + `orderId` + `orderVersion` + `gateId`, through the envelope's registry, so a
+replayed submission is absorbed rather than opening a second gate; records each opened gate's
+window (`escalation_window_ms` from configuration, `window_remaining_ms` = the window,
+`window_armed_at` = database time); enqueues `OrderApprovalRequested` per opened gate; and returns
+the gate references and the duration the definition's escalation `wait` arms.
+
+`escalate-gate` has two modes. In `fire` mode it escalates every `open` gate at the position whose
+recorded window has elapsed against database time — enqueues `OrderApprovalEscalated`, issues the
+escalation command to the configured escalation path, stamps `escalated_at`, re-arms the window
+for re-escalation — and never resolves the gate; if the approval service is in outage it does
+**not** issue the command, and the definition's outage arm owns the operator escalation. In
+`probe` mode it runs the liveness probe of §4.2 through the breaker and records an outage pause or
+its end on every open gate at the position (§4.2).
+
+**The gate-window port.** Slice 08's `apply-hold` and `apply-resume` pause and re-arm the escalation
+window by calling `pause_windows(correlationId, gateRefs, cause)` and
+`rearm_windows(correlationId, gateRefs, cause)` inside their own settlement transaction; the port
+is the only writer of the window columns besides this component's own operations, and it returns
+the remainder the definition re-arms (`01 §4.4`). A pause adds its cause to `pause_causes` and, if
+the window was armed, captures `window_remaining_ms = window_remaining_ms − (now − window_armed_at)`
+and clears `window_armed_at`; a pause on an already-paused window adds the cause and captures
+nothing. A re-arm removes its cause and sets `window_armed_at = now` only when `pause_causes`
+becomes empty. This is what makes a hold and an outage overlapping on one gate one record and one
+remainder.
+
+**The closure port.** `close_open_approvals(correlationId, reason)` sets every `planned` or `open`
+gate of the instance to `cancelled` and closes an open park with `resolution = order-terminated`;
+it is called by `run-cancellation-fence` (slice 06) in fencing step 1 on the supersede, cancel and
+terminal-event paths, inside that operation's unit of work.
 
 **Request payload contents.** The §9.2 expectations contract requires the request to carry enough
 for the approval authority to decide without fetching the order back, and requires the submission
 to be idempotent at the receiving end too. The payload therefore carries, in addition to order and
 party context: the **resolved order total (TCV)** with its currency, read non-authoritatively from
-Orders Lifecycle per seam R4 and passed through without computation or adjustment by this gear;
-and the **request idempotency key** itself, so the receiving service can absorb a redelivery on the
-same key rather than relying on this gear's registry alone. A request missing either is refused
-before submission rather than submitted incomplete — an approval authority asked to approve an
-order whose value it cannot see is not making the decision the contract describes.
+Orders Lifecycle per seam R4 inside `open-gates` and passed through without computation or
+adjustment by this gear; and the **request idempotency key** itself, so the receiving service can
+absorb a redelivery on the same key rather than relying on this gear's registry alone. A request
+missing either is refused before submission rather than submitted incomplete. Neither the total
+nor the party nor the assigned principal is ever returned to the definition (ADR-0013).
 
 ##### Responsibility boundaries
 
 Does not decide the routing configuration (sequential vs. parallel, which parties) — that is
-Generic Approval service policy, consumed as configuration; this component owns only the
-*execution* of the ordering that configuration expresses. Does not evaluate any individual
-gate's decision — that is the Decision Reflector's job once a decision arrives. Does not own
-escalation timers directly — delegates each gate's timer lifecycle to the Escalation Timer Owner.
+Generic Approval service policy, consumed as configuration; this component owns only the *record*
+of the ordering that configuration expresses, and the definition executes it by calling
+`open-gates` again with the next position. Does not evaluate any individual gate's decision —
+`record-decision` does. Does not own a clock: it records the window and returns durations, and the
+`wait` that runs them is the definition's.
 
 ##### Related components (by ID)
 
-- `cpt-cf-bss-orders-workflow-component-escalation-timer-owner` — owns the timer for each gate
-  this component opens
-- `cpt-cf-bss-orders-workflow-component-decision-reflector` — consumes this component's gate
-  records to determine all-gates-satisfied
+- `cpt-cf-bss-orders-workflow-component-decision-reflector` — decides gates this component opened
+  and reads the persisted plan to compute the next position
 - `cpt-cf-bss-orders-workflow-component-approver-inbox-projection` — reads this component's gate
   records, scoped to the requesting approver
 
@@ -376,46 +450,13 @@ escalation timers directly — delegates each gate's timer lifecycle to the Esca
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-escalation-timer-owner`
 
-##### Why this component exists
-
-Escalation timers must survive restarts, must not burn during a hold or during an approval-service
-outage on an already-open gate, and must never resolve to "approved" or "rejected" by themselves.
-A single owning component prevents the timer state from ever being asked about, or written by, the
-Generic Approval service.
-
-##### Responsibility scope
-
-Schedules one durable timer per open gate on `cpt-cf-bss-orders-workflow-interface-timer-api`,
-`timer_kind = approval-escalation` discriminated by `subject_ref`, default window 72 hours,
-configurable per gate; persists timer state so it survives service restarts (engine guarantee,
-`01-foundation.md` §3.7); **runs the gate-open liveness probe** that makes an outage detectable
-(§4.2); pauses a gate's timer on hold (the hold window is never counted against the escalation
-window) and on an outage of the Generic Approval service while that gate is already open, writing
-an `owf_timer_pause` row with `pause_reason = 'approval-outage'` for the second case; rearms the timer at
-`resume_time + remaining_window`, never restarting the full window, once the hold or outage ends;
-on expiry without a decision, publishes `OrderApprovalEscalated` and issues the escalation command
-to the Generic Approval service's configured escalation path; if a pause exceeds the outage
-escalation threshold (§4.2), escalates to the operator queue directly, without issuing the
-escalation command through the unavailable service, and without resolving the gate to approved or
-rejected. Also owns the park escalation timer for a parked process (§4.1), which is the same timer
-kind with `subject_ref = park_id`, since a park has no gate to name.
-
-##### Responsibility boundaries
-
-Does not decide when a hold begins or ends — that is the hold/cancel slice's ([`08-hold-and-cancel.md`](./08-hold-and-cancel.md))
-responsibility; this component only reacts to the pause/resume signal it receives, and does not
-write slice 08's `owf_timer_pause`. Does not decide the escalation window value or the escalation
-path — those are Generic Approval service configuration, read at gate-open time; the outage
-threshold and the TTL lead time are this design's (§4.2), because they are bounded by a Lifecycle
-value rather than by approval policy. Does not evaluate the gate's decision — the gate remains
-open after escalation, per PRD AC 2.
-
-##### Related components (by ID)
-
-- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — the owner of each gate whose
-  timer this component schedules
-- `cpt-cf-bss-orders-workflow-component-termination-and-compensation` (slice 02) — cancels this
-  component's timers when a gate is cancelled on supersession or terminal-event void
+**Retired by ADR-0011; responsibility now**: the escalation and park clocks are the definition's
+`wait` arms in the `gateLoop` and `parkLoop` forks of `10 §3.6` (a), executed by the plugin's
+durable timers; the hold pause is the hold-arm pattern of `10 §3.6` (e) recorded through the
+gate-window port; the outage pause is the probe arm of §4.2 recorded by `escalate-gate` in `probe`
+mode; the fire is `escalate-gate` in `fire` mode (gates) and `raise-overdue-escalation` with
+`escalationKind: park` (park, slice 07); the park duration is `arm-park-escalation`. There is no
+Orders timer owner, scheduler or probe loop.
 
 #### Decision Reflector
 
@@ -423,68 +464,58 @@ open after escalation, per PRD AC 2.
 
 ##### Why this component exists
 
-An `OrderApprovalDecision` arriving from the Generic Approval service must be reflected into
-Lifecycle idempotently and exactly once per gate, and the aggregate all-gates-satisfied outcome
-must drive the order onward to fulfillment or terminate it, without this component computing
-anything the approval authority already decided.
+An approval decision arriving from the Generic Approval service must be recorded exactly once per
+gate, guarded against a gate that has since closed and against the submitter deciding their own
+order, and turned into the one aggregate fact the definition branches on — without this component
+computing anything the approval authority already decided.
 
 ##### Responsibility scope
 
-On `OrderApprovalDecision(approved)` for a gate, records the decision with its named deciding
-authority and its catalogue reason, cancels that gate's escalation timer, opens the next sequence
-position if one exists (§4.3), and checks the Approval Gate Manager's aggregate state; once every
-gate for the version is `approved`, calls Orders Lifecycle idempotently to reflect
-`pending_approval → approved`. On `OrderApprovalDecision(rejected)` for any gate, calls Orders
-Lifecycle idempotently to reflect `pending_approval → rejected`, records the rejection reason,
-cancels any other still-open gates for that version, and terminates the process.
+Owns `record-decision` (§3.3). The definition's `gateLoop` consumes the approval decision event
+through `listen` and calls `record-decision` with the gate reference, the decision event id and
+the outcome enum. The operation reads the decision record — outcome, catalogue reason, deciding
+authority, deciding subject — from the Generic Approval service by `decisionEventId` through the
+§9.2 client, so none of those cross the engine boundary; applies the guards of §4.4; and on an
+applied decision records it with its named deciding authority and catalogue reason, clears the
+gate's window, and computes the aggregate over the persisted plan: every gate `approved` →
+`gateState = approved`; any gate `rejected` → cancel every other `planned` or `open` gate of the
+version and answer `rejected`; every gate at the current position `approved` and a `planned`
+position remaining → answer `next-position` with that position; otherwise `pending`.
 
-**State guard, before anything else.** An inbound decision is applied only to a gate whose `state`
-is `open`. A decision naming a gate in `cancelled`, `approved` or `rejected` is refused, recorded
-in `owf_audit_entry` with the refusal reason, and produces no state change and no Lifecycle call.
-Without the guard a decision that was in flight when `OrderAmended` cancelled its gate — or simply
-redelivered late — applies to a superseded version and drives a `pending_approval → approved`
-reflection for an order the amendment already moved on from. The column exists; this is the rule
-that reads it.
+**State guard, before anything else.** A decision is applied only to a gate whose `state` is
+`open`. A decision naming a gate in `planned`, `cancelled`, `approved` or `rejected` is refused,
+recorded in `owf_audit_entry` with `gate-not-open`, and produces no state change; the operation
+answers success with `applied: false` and `gateState: pending`, so a late or redelivered decision
+returns the definition to its loop rather than to its failure arm. Without the guard a decision
+that was in flight when an amendment cancelled its gate — or simply redelivered late — would apply
+to a superseded version.
 
-**Dedup key for the inbound decision.** Decisions arrive at-least-once like every other inbound
-message, and the guard above is not a dedup mechanism: a redelivered *approval* for a still-open
-gate passes the guard cleanly and would be applied twice. The decision is entered in the engine
-idempotency registry under `operation = 'approval-decision'`, key
-`resource_tenant_id + gateId + decisionEventId`, so a redelivery resolves as an absorbed duplicate
-and returns the settled outcome.
+**Dedup key for the inbound decision.** The platform delivers a matching event to the `listen`
+at-least-once, and the guard above is not a dedup mechanism: a redelivered *approval* for a
+still-open gate passes the guard cleanly. The step key
+`{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` makes a redelivery resolve
+as an absorbed duplicate that returns the settled outcome.
 
-**The fulfillment handoff is not this component's.** This component's terminal act on the approved
-path is the Lifecycle reflection. It does **not** call slice 04 in-process. Orders Lifecycle
-publishes `OrderApproved` as a consequence of that reflection, and `OrderApproved` is a start/advance
-trigger in slice 02's closed vocabulary, which is the single path into fulfillment. An in-process
-handoff alongside that event would give fulfillment two independent entry points for the same
-order — one racing the other, with only slice 04's own idempotency between the order and two
-fulfillment plans — and would also make the approval-not-required path (which produces
-`OrderApproved` and no decision at all) behave differently from the approved-gate path. One
-trigger, one entry point.
-
-**A permanently refused reflection is not retried forever.** If Orders Lifecycle refuses a
-reflection permanently — invalid transition, typically because the order reached a terminal state
-while the decision was in flight — the call is not retried under a new key and the refusal is not
-inferred as success. The gate is left as decided, the refusal is recorded against the process with
-its Lifecycle reason, and an incident is raised to the operator queue (`07-manual-tasks.md`)
-carrying both the gate's recorded decision and the order's current Lifecycle state, because the
-disagreement between them is a commercial fact this gear cannot resolve on its own. The process
-then follows the order: the terminal Lifecycle event that caused the refusal is itself one of
-slice 02's nine triggers and terminates the instance.
+**The fulfillment handoff is not this component's.** On the approved path the definition calls
+`reflect-verdict` with `stage = gate-outcome` (`pending_approval → approved`) and then enters its
+fulfillment stage in the same invocation (`10 §3.6` (a) *Description*); `OrderApproved`, which
+Lifecycle publishes as a consequence of that reflection, reaches `admit-trigger` only as an
+absorbed duplicate for the live instance (slice 02). The approval-not-required path takes the same
+route from `afterReflect`, so both paths enter fulfillment identically. No operation of this slice
+calls slice 04.
 
 ##### Responsibility boundaries
 
-Does not evaluate whether a decision should have been approved or rejected — it reflects the
-decision it received. Does not retry a Lifecycle call non-idempotently — every reflection call
-uses the engine's idempotency-registry envelope, so a retried reflection is absorbed rather than
-double-applied.
+Does not evaluate whether a decision should have been approved or rejected — it records the
+decision it read. Does not call Lifecycle — `reflect-verdict` does, under its own key. Does not
+open the next position — it returns it, and the definition calls `open-gates`.
 
 ##### Related components (by ID)
 
-- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — supplies the aggregate
-  all-gates-satisfied state this component checks
-- `cpt-cf-bss-orders-workflow-component-escalation-timer-owner` — timer cancellation on decision
+- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — supplies the persisted plan the
+  aggregate reads
+- `cpt-cf-bss-orders-workflow-component-verdict-gateway` — reflects the aggregate this component
+  answers
 
 #### Approver Inbox Projection
 
@@ -500,17 +531,18 @@ until the Generic Approval service exists, since no real gate ever opens under t
 
 Projects `OrderApprovalRequest` / `ApprovalGate` records into a read view scoped strictly to the
 requesting approver's assigned gates, surfacing order context, requesting party, gate identifier,
-and the escalation SLA countdown computed from the Escalation Timer Owner's current timer state;
-accepts an approve or reject decision with a mandatory catalogue reason and an optional free-text
-justification, and forwards it to the Generic Approval service (or, in phase 1, is unreachable in
-practice, since no gate ever opens).
+and the escalation SLA countdown computed from the gate's recorded window
+(`window_remaining_ms − (now − window_armed_at)` while armed; `window_remaining_ms`, flagged paused,
+while `pause_causes` is non-empty); accepts an approve or reject decision with a mandatory
+catalogue reason and an optional free-text justification, and forwards it to the Generic Approval
+service (or, in phase 1, is unreachable in practice, since no gate ever opens).
 
 **Scope is the assignment, and the assignment is a column.** The filter is
 `owf_approval_gate.assigned_principal = <the SecurityContext principal>`, not a match on the
 gate's `party`. `party_ref` names a *role or body* in the routing configuration — "finance" — and
 filtering on it returns every finance gate for every order of every seller, which is precisely the
 cross-scope disclosure the inbox exists to prevent. `assigned_principal` is populated from the
-routing configuration at gate-open time; a gate that carries none is **not listed to anyone** and
+routing configuration by `open-gates`; a gate that carries none is **not listed to anyone** and
 is surfaced instead through the operator queue, because an unassigned gate is a routing-configuration
 defect, not a gate belonging to whoever asks first.
 
@@ -518,9 +550,11 @@ defect, not a gate belonging to whoever asks first.
 refused at `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` — `submitter-barred`
 (403, `PermissionDenied`), a distinct `error_code` from the out-of-scope refusal, which is
 `not-found` (404) because a gate outside the caller's assignment is not readable by them
-(`09 §4.4`), so the two are separable in the audit trail. The
-submitting identity is read from the order context the request was opened with, never from the
-decision request body. Accepted as a settled control (`DECISIONS.md` D-56): `PRD.md:137` permits an
+(`09 §4.4`), so the two are separable in the audit trail. The submitting identity is
+`owf_approval_request.submitter_subject_id`, captured by `open-gates` from the Lifecycle order read,
+never from the decision request body. `record-decision` applies the same check to the deciding
+subject of the decision record, so a decision captured outside this inbox is held to the same
+control. Accepted as a settled control (`DECISIONS.md` D-56): `PRD.md:134` permits an
 Approver to be a seller operator, so without this refusal one actor can submit an order and
 approve its gate with every other stated control passing. Routing remains Generic Approval's
 policy; this is a local refusal on the surface this gear owns, and the corresponding expectation
@@ -530,17 +564,48 @@ belongs in the §9.2 contract as a clause on the approval service.
 
 Never surfaces a gate outside the requesting approver's scope — scope filtering happens at the
 query boundary, not the presentation layer. Does not itself record the decision as final — it
-forwards to the Generic Approval service and awaits the `OrderApprovalDecision` the Decision
-Reflector consumes, so the inbox's "capture" step and the process's "reflect" step are not the
-same write.
+forwards to the Generic Approval service, and the decision is recorded only when the definition's
+`listen` consumes the resulting event and calls `record-decision`, so the inbox's "capture" step
+and the process's "record" step are not the same write.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — source of the approver's assigned
-  gates
-- `cpt-cf-bss-orders-workflow-component-escalation-timer-owner` — source of the SLA countdown
+  gates and of the recorded window the countdown reads
 
 ### 3.3 API Contracts
+
+#### Step operations
+
+The six operations below are registered against the operation registration boundary
+([`01 §3.2`](./01-foundation.md#32-component-model)) with the contract fields of
+[`01 §3.3` *The step-operation contract*](./01-foundation.md#the-step-operation-contract), are
+mirrored into `owf_step_operation`, and are reachable only as
+`POST /bss-orders-workflow/v1/steps/{operation}` by the serverless-runtime service principal under
+PDP resource `gts.cf.bss.orders_workflow.process_step.v1~` × `execute`. Every input carries the
+reference tuple of `10 §3.6` — `correlationId`, `orderId`, `orderVersion`, `resourceTenantId`,
+`invocationId`, `attemptId` — written **ref** below; every other member is a reference or a small
+enum. Every operation resolves `correlationId` to this slice's rows and reads commercial order
+context from Lifecycle inside Orders, under the instance's `resource_tenant_id` and
+`seller_tenant_id` (ADR-0013). Every operation answers `permanent-failure` with `version-mismatch`
+on a terminal instance (`01 §3.3` `terminate-instance`). Deadlines follow the working baselines of
+[`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners): 10 s for an operation that
+calls a downstream, 5 s for a record-only one.
+
+| `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
+|--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
+| `obtain-verdict` | `protected` | ref | `verdict` ∈ `required` · `not-required` · `unobtainable`; `parkRef` and `parkReason` (the §3.7 enum) only on `unobtainable` | instance-scoped `{tenant}:{correlationId}:obtain-verdict:{orderVersion}`; an `unobtainable` answer leaves the registry record `open` (§4.4) | none | none | `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
+| `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome` | `reflected` ∈ `pending_approval` · `approved` · `rejected` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}` with `trigger` one of the four `reflect-approval-*` (§4.4) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `version-mismatch`, `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
+| `open-gates` | `composable` | ref + `position` (0 on first entry, else `record-decision`'s `nextPosition`) | `gateRefs[]`, `position`, `escalationWindow` (duration), `escalationRound = 0` | step: instance-scoped `{tenant}:{correlationId}:open-gates:{orderVersion}:{position}`; downstream: approval-request `{tenant}:{orderId}:{orderVersion}:{gateId}` per gate | `OrderApprovalRequested`, one per gate opened in the settlement transaction | none — gates are closed by the closure port, not by an undo | `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
+| `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred` (both recorded refusals, §4.4), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
+| `arm-park-escalation` | `composable` | ref + `parkRef` | `escalateAfter` (duration, or null once the park has escalated) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
+| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `fire`: `escalationRemaining` (duration), `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `escalationRemaining` (duration, on the transition back to `available`), `outageThresholdRemaining` (duration, on `outage`), `probeRound` | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `circuit-breaker-open` (`fire` in outage), `per-attempt-timeout`, `version-mismatch` | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
+
+`arm-park-escalation` and `escalate-gate` are `composable`: a definition version may reposition
+them inside the verdict stage, but the constraints of §4.5 still bind any version that contains
+the arms they serve.
+
+#### Approver inbox and decision endpoints
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-interface-approver-inbox-api`
 
@@ -553,26 +618,29 @@ same write.
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
 | `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `subject_id` — the PDP constraint `assigned_principal = subject_id`, compiled to the `AccessScope` the query runs under (`09 §3.1`); keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
-| `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`; `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision `UPDATE`, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (separation of duties, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
+| `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`. **`Idempotency-Key` is REQUIRED**, recomposed server-side as `{tenant}:{gateId}:decision:{subject_id}` (`idempotency-key-mismatch` otherwise); `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision statement, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (`owf_approval_request.submitter_subject_id`, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
 
-| `EVENT` | `OrderApprovalDecision` — the Generic Approval decision-callback topic | Consumed by the Decision Reflector; authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check; matched to `owf_approval_gate` by `gate_id`, idempotent by the request key (PRD §9.2 (e)); an envelope naming no open gate is refused `gate-not-open`. This is the handler `09 §3.2` maps and the startup assertion of `09 §4.1` requires a declared topic for | unstable |
+| `EVENT` | The Generic Approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`UPSTREAM_REQS.md`, commit D) | unstable |
 
 Both endpoints follow the platform's canonical OperationBuilder registration and RFC-9457 Problem
 error envelope conventions; the one gear-level deviation — 404 for a target outside the caller's
 scope — is declared in [`../DESIGN.md`](../DESIGN.md) §2.2 and `ADR/0010`, not introduced here.
 
 The decision request carries **two** reason fields because they are two different things and
-conflating them loses one of them. `reason` is a closed catalogue value — it is what rides the
-process event payload and what a downstream consumer can branch on. `justification` is
-human-written free text, and it is written to `owf_audit_entry.justification`, never onto an event
-payload and never into the catalogue column. A decision submitted without `reason` is refused;
-`justification` is optional on approve and expected on reject.
+conflating them loses one of them. `reason` is a closed catalogue value — it is what the gate's
+`decision_reason` stores and what the `reflect-approval-denied` seam call carries as the denial
+reason. `justification` is human-written free text, and it is written to
+`owf_audit_entry.justification`, never onto an event payload, never to the definition and never
+into the catalogue column. A decision submitted without `reason` is refused; `justification` is
+optional on approve and expected on reject.
 
 ### 3.4 Internal Dependencies
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| orders-lifecycle | `TransitionRequest` seam client (per `06-workflow-seam.md` §3.3, bound by reference per `02-triggers-and-start.md` §2.2) | Reflect `submitted → pending_approval`, `submitted → approved`, `pending_approval → approved`, `pending_approval → rejected` |
+| orders-lifecycle | `POST /bss-orders-lifecycle/v1/orders/{orderId}/approval-reflection` ([Lifecycle `06 §3.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#33-api-contracts)) with idempotency key, expected version and correlation identifier; the order read (R4) | `reflect-verdict`: triggers `reflect-approval-required`, `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`; `obtain-verdict` / `open-gates`: order context, resolved total, submitting subject |
+| orders-workflow foundation (`01`) | Step envelope, `park`/`unpark`, reason catalogue | Every operation of §3.3 runs inside the envelope; the phase projection |
+| serverless-runtime | None called; it calls this slice's operations | The definition of `10 §3.6` (a) |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -590,7 +658,7 @@ payload and never into the catalogue column. A decision submitted without `reaso
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| generic-approval (unbuilt; stand-in client today) | Expectations-contract SDK client | Approval-requirement verdict query, multi-party gate submission, escalation command delivery, decision receipt |
+| generic-approval (unbuilt; stand-in client today) | Expectations-contract SDK client, called only from inside this slice's operations (R2) | Approval-requirement verdict query (`obtain-verdict`), routing configuration and multi-party gate submission (`open-gates`), escalation command delivery and liveness probe (`escalate-gate`), decision record read by `decisionEventId` (`record-decision`) |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -603,10 +671,14 @@ payload and never into the catalogue column. A decision submitted without `reaso
 named stand-in implementation, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval` (recorded as
 the deciding authority by name on every verdict it answers), which always returns "approval not
 required" for the verdict query and is never asked to route a gate, accept an escalation command,
-or return a decision, since no gate is ever opened under that verdict. See §4 for the full
-disclosure.
+answer a probe or return a decision, since no gate is ever opened under that verdict. See §4 for
+the full disclosure.
 
 ### 3.6 Interactions & Sequences
+
+Each sequence below is **definition task → operation → record**. The tasks are those of
+[`10 §3.6` (a)](./10-process-definition.md#a-start-and-approval), which is the canonical YAML and is
+not repeated here; the CDSL blocks specify what happens **inside** the operation.
 
 #### Verdict retrieval and reflection on OrderSubmitted
 
@@ -619,37 +691,58 @@ disclosure.
 
 ```mermaid
 sequenceDiagram
-    Lifecycle ->> Verdict Gateway: OrderSubmitted (orderId, orderVersion)
-    Verdict Gateway ->> Verdict Cache: lookup(orderId, orderVersion)
-    alt cached and reflected_at set
-        Verdict Cache -->> Verdict Gateway: cached verdict + authority (no re-reflection)
-    else not cached, or reflected_at NULL
-        Verdict Gateway ->> Generic Approval (or stand-in): query verdict(orderId, orderVersion)
-        alt verdict returned
-            Generic Approval (or stand-in) -->> Verdict Gateway: verdict + named authority
-            Verdict Gateway ->> Verdict Cache: store(verdict, authority, reflected_at = NULL)
-            alt required
-                Verdict Gateway ->> Lifecycle: reflect submitted -> pending_approval (idempotent)
-                Verdict Gateway ->> Verdict Cache: stamp reflected_at
-                Verdict Gateway ->> Approval Gate Manager: open gates at sequence position 0
-            else not required
-                Verdict Gateway ->> Lifecycle: reflect submitted -> approved (idempotent)
-                Verdict Gateway ->> Verdict Cache: stamp reflected_at
-            end
-        else verdict unobtainable (breaker open / retries exhausted)
-            Verdict Gateway ->> Approval Park: write park record, phase = parked
-            Verdict Gateway ->> Escalation Timer Owner: arm park escalation timer
-            Note over Verdict Gateway: no Lifecycle reflection, order stays submitted
+    participant D as Definition (10 §3.6 a)
+    participant OV as obtain-verdict
+    participant RV as reflect-verdict
+    participant R as Record (cache, park)
+    D ->> OV: obtainVerdict (ref)
+    OV ->> R: cache row for (orderId, orderVersion)?
+    alt cache row present
+        R -->> OV: stored verdict (authoritative, no query)
+    else absent
+        OV ->> OV: query Generic Approval (or stand-in) via breaker
+        alt verdict with named authority
+            OV ->> R: insert cache row, reflected_at NULL; close open park verdict-obtained
+        else unobtainable
+            OV ->> R: insert or reuse open park row (reason, parked_at, escalation_due_at)
         end
+    end
+    OV -->> D: verdict ∈ required | not-required | unobtainable (+ parkRef)
+    alt unobtainable
+        D ->> D: parkForVerdict: park (01), arm-park-escalation, parkLoop (§4.1)
+    else obtained
+        D ->> RV: reflectVerdict (ref, stage requirement)
+        RV ->> R: read cache row
+        alt reflected_at set
+            R -->> RV: stored result, no Lifecycle call
+        else reflected_at NULL
+            RV ->> RV: approval-reflection (reflect-approval-required | -not-required, expected_version)
+            RV ->> R: stamp reflected_at in the settlement transaction
+        end
+        RV -->> D: reflected ∈ pending_approval | approved
     end
 ```
 
-**Description**: A repeat query for a version whose verdict has already been **reflected** (a cache
-row with `reflected_at` set) returns the cached answer and never re-reflects, even if the repeat
-query result disagrees — the disagreeing result is discarded as stale. A cache row with
-`reflected_at` NULL is an unfinished reflection, not a reflected one, and is re-driven; that
-distinction is what keeps a crash between the store and the reflection recoverable (§3.2). The
-unobtainable branch is specified in §4.1; note that it writes no verdict-cache row at all.
+**Algorithm: `obtain-verdict`**
+
+1. [ ] - `p1` - Resolve `correlationId` to the instance and read `(order_id, order_version)`; refuse `version-mismatch` if the body's `orderVersion` differs or the instance is terminal - `inst-ov-resolve`
+2. [ ] - `p1` - **IF** a `owf_approval_verdict_cache` row exists for the version **RETURN** its `verdict` without querying — the stored row is authoritative once present - `inst-ov-cached`
+3. [ ] - `p1` - Read order context from Lifecycle (R4) and query the verdict through the approval client behind the breaker of §4.0, inside the effective deadline - `inst-ov-query`
+4. [ ] - `p1` - **IF** the answer names a deciding authority: insert the cache row with `reflected_at` NULL, close any open park for the version with `resolution = verdict-obtained`, **RETURN** the verdict - `inst-ov-store`
+5. [ ] - `p1` - **ELSE** (breaker open, query refused, bounded query attempts exhausted inside the deadline, or authority unnamed): insert the park row — or reuse the open one under the partial unique index — with `park_reason`, `parked_at` and `escalation_due_at` per §4.2, leave the registry record `open`, **RETURN** `unobtainable` with `parkRef` and `parkReason` - `inst-ov-park`
+
+**Algorithm: `reflect-verdict`**
+
+1. [ ] - `p1` - Resolve the instance and the cache row; refuse `version-mismatch` if absent or the instance is terminal - `inst-rv3-resolve`
+2. [ ] - `p1` - **IF** `stage = requirement`: **IF** `reflected_at` is set **RETURN** the stored result; else map `required` → `reflect-approval-required`, `not_required` → `reflect-approval-not-required` - `inst-rv3-requirement`
+3. [ ] - `p1` - **IF** `stage = gate-outcome`: **IF** `gate_outcome_reflected_at` is set **RETURN** the stored result; else compute the aggregate from `owf_approval_gate` — all `approved` → `reflect-approval-granted` with the deciding authorities; any `rejected` → `reflect-approval-denied` with the rejecting gate's `decision_reason` as the denial reason; otherwise refuse `gate-not-open` - `inst-rv3-gate-outcome`
+4. [ ] - `p1` - Call `approval-reflection` with the trigger, `deciding_authority`, `expected_version = orderVersion`, the lifecycle-transition key and `correlation_id`, propagating the effective deadline - `inst-rv3-call`
+5. [ ] - `p1` - On success stamp `reflected_at` (or `gate_outcome` and `gate_outcome_reflected_at`) in the settlement transaction and **RETURN** `reflected`; on Lifecycle `version-conflict` or a refused transition answer `permanent-failure` with `version-mismatch` carrying the Lifecycle reason in `owf_step_log.result`; on a transport or 5xx failure answer `retryable-failure` - `inst-rv3-settle`
+
+**Description**: A repeat call for a version that already has a cache row never queries the
+authority again, so a disagreeing later answer is never even obtained; a row with `reflected_at`
+NULL is an unfinished reflection, and the definition's own retry of `reflect-verdict` completes it
+from the stored row. The unobtainable branch is §4.1; it writes no verdict-cache row at all.
 
 #### Multi-party gate open with idempotent submission
 
@@ -661,24 +754,38 @@ unobtainable branch is specified in §4.1; note that it writes no verdict-cache 
 
 ```mermaid
 sequenceDiagram
-    Approval Gate Manager ->> Approval Gate Manager: derive gateId = uuidv5(orderId, orderVersion, party)
-    Approval Gate Manager ->> Idempotency Registry: submit(key = tenant+orderId+orderVersion+gateId)
-    alt first call
-        Idempotency Registry -->> Approval Gate Manager: proceed
-        Approval Gate Manager ->> Generic Approval: OrderApprovalRequest(gateId, resolved total, key)
-        Approval Gate Manager ->> Event Outbox: OrderApprovalRequested
-        Approval Gate Manager ->> Escalation Timer Owner: start timer(subject_ref = gateId, 72h default)
-    else absorbed duplicate
-        Idempotency Registry -->> Approval Gate Manager: settled result, no re-submit
+    participant D as Definition (10 §3.6 a)
+    participant OG as open-gates
+    participant GA as Generic Approval
+    participant R as Record (gate, request)
+    D ->> OG: openGates (ref, position)
+    alt first call for the version
+        OG ->> GA: read routing configuration
+        OG ->> R: persist plan: position 0 open, later positions planned (gateId = uuidv5)
     end
+    loop each gate at position
+        OG ->> GA: OrderApprovalRequest(gateId, resolved total, request key)
+        OG ->> R: request row; gate open; window recorded (armed now)
+    end
+    OG ->> OG: enqueue OrderApprovalRequested per gate (settlement transaction)
+    OG -->> D: gateRefs[], position, escalationWindow, escalationRound 0
+    D ->> D: gateLoop fork: decision listen × escalation wait × probe × hold × amendment × cancel
 ```
 
-**Description**: Repeated for every gate at the same sequence position, which open together; a gate
-at a later position is not submitted until every earlier position is `approved` (§4.3), so its
-72-hour window starts when its own gate opens rather than at verdict time. The order is considered
-approved only once every gate opened for that version has an approved decision recorded. Because
-`gateId` is derived rather than minted, a crash anywhere in this sequence replays onto the same key
-and the registry absorbs it — the failure mode this shape exists to exclude is a replay that mints
+**Algorithm: `open-gates`**
+
+1. [ ] - `p1` - Resolve the instance and require a cache row with `verdict = required` whose `reflected_at` is set; refuse `version-mismatch` otherwise - `inst-og-resolve`
+2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal` and `escalation_window_ms` from configuration - `inst-og-plan`
+3. [ ] - `p1` - Require every gate at a position below `position` to be `approved` and the gates at `position` to be `planned` or `open`; refuse `version-mismatch` otherwise - `inst-og-position`
+4. [ ] - `p1` - **FOR EACH** gate at `position`: read the resolved total and currency (R4) and the submitting subject; submit the request under the approval-request key; insert the request row; set `state = open`, `opened_at`, `window_remaining_ms = escalation_window_ms`, `window_armed_at = now` - `inst-og-submit`
+5. [ ] - `p1` - Enqueue one `OrderApprovalRequested` per opened gate and **RETURN** the gate references, `position`, the smallest `window_remaining_ms` as `escalationWindow` and `escalationRound = 0` - `inst-og-return`
+
+**Description**: Repeated by the definition for every sequence position, each call naming the
+position `record-decision` returned; a gate at a later position is not submitted until every
+earlier position is `approved` (§4.3), so its 72-hour window starts when its own gate opens rather
+than at verdict time. Because `gateId` is derived rather than minted and the step key names the
+position, a platform replay of `open-gates` lands on the same step key and the same request keys,
+and the registry absorbs it — the failure mode this shape exists to exclude is a replay that opens
 a second gate for the same party.
 
 #### Escalation timer fire and approval-service outage pause
@@ -692,33 +799,40 @@ a second gate for the same party.
 
 ```mermaid
 sequenceDiagram
-    loop every 30 s while any gate is open
-        Escalation Timer Owner ->> Generic Approval: liveness probe
-        Generic Approval -->> Escalation Timer Owner: ok / failure (feeds the breaker)
-    end
-    alt breaker opens (outage detected, gate still open)
-        Escalation Timer Owner ->> Approval Outage Pause: write(gate_id, remaining_window)
-        Escalation Timer Owner ->> Timer Service: pause(subject_ref)
-        alt outage exceeds the outage escalation threshold
-            Escalation Timer Owner ->> Operator Queue: escalate directly
-            Note over Escalation Timer Owner: never approved, never auto-rejected
+    participant D as Definition gateLoop
+    participant EG as escalate-gate
+    participant R as Record (gate windows)
+    par escalation branch
+        D ->> D: wait escalationRemaining
+        D ->> EG: escalate-gate (fire, position, escalationRound)
+        EG ->> R: gates whose window elapsed: escalated_at, re-arm window
+        EG ->> EG: OrderApprovalEscalated per gate; escalation command (not in outage)
+        EG -->> D: escalationRemaining, escalationRound + 1
+    and probe branch
+        loop every 30 s
+            D ->> EG: escalate-gate (probe, position, probeRound)
+            EG ->> EG: liveness probe through the breaker
+            EG -->> D: serviceState available (no change)
         end
-        Escalation Timer Owner ->> Timer Service: rearm at resume_time + remaining_window
+        EG ->> R: breaker open: add approval-outage to pause_causes, capture remainder
+        EG -->> D: serviceState outage, outageThresholdRemaining
     end
-    Timer Service ->> Escalation Timer Owner: fire(subject_ref)
-    alt no decision, service reachable
-        Escalation Timer Owner ->> Event Outbox: OrderApprovalEscalated
-        Escalation Timer Owner ->> Generic Approval: escalation command
-        Note over Escalation Timer Owner: gate remains open
-    end
+    D ->> D: outage arm: probe until available × wait threshold → raise-overdue-escalation (approval-outage) × hold × cancel
+    D ->> EG: escalate-gate (probe) finds available
+    EG ->> R: remove approval-outage; re-arm if no cause remains
+    EG -->> D: escalationRemaining (the recorded remainder)
+    D ->> D: re-enter gateLoop with that remainder
 ```
 
-**Description**: The outage is detected by the probe loop, not by the timer fire — that ordering is
-the point of the sequence and is argued in §4.2. Pause is the same *mechanism* and the same
-*record* as a hold pause: it writes `owf_timer_pause` with `pause_reason = 'approval-outage'` and a
-null `suspension_id`, because no hold occurred (§4.2). On resume the timer is rearmed at
-`resume_time + remaining_window`; the stored datum is the window remaining, never an accrued-elapsed
-counter.
+**Description**: The outage is detected by the probe branch, not by the escalation fire — that
+ordering is the point of the sequence and is argued in §4.2. The probe branch competes with the
+escalation branch in the same `fork`, so when it wins with `serviceState = outage` the escalation
+`wait` is cancelled exactly as a hold cancels it; `escalate-gate` has already captured the
+remainder, and the definition re-arms that value when the service returns. This is the hold-signal
+pattern of [`10 §3.6` (e)](./10-process-definition.md#e-hold-and-resume) applied to a signal Orders
+itself observes. Both pauses write the same columns through the same rule, so a hold during an
+outage adds a second cause to one record rather than a second remainder (§4.2). The fire never
+resolves the gate (PRD AC 2).
 
 #### Decision reflection
 
@@ -731,41 +845,56 @@ counter.
 
 ```mermaid
 sequenceDiagram
-    Generic Approval ->> Decision Reflector: OrderApprovalDecision(gateId, decisionEventId, outcome, reason)
-    Decision Reflector ->> Idempotency Registry: submit(key = tenant+gateId+decisionEventId)
-    alt absorbed duplicate
-        Idempotency Registry -->> Decision Reflector: settled result, no re-apply
-    else first call
-        Decision Reflector ->> Approval Gate: read state
-        alt gate state is not open
-            Decision Reflector ->> Audit: refuse decision (gate cancelled / already decided)
-        else gate state is open
-            Decision Reflector ->> Escalation Timer Owner: cancel timer(subject_ref)
-            alt approved and all gates satisfied
-                Decision Reflector ->> Lifecycle: pending_approval -> approved (idempotent)
-                Note over Decision Reflector: no in-process fulfillment call; Lifecycle emits OrderApproved
-            else approved, later sequence position pending
-                Decision Reflector ->> Approval Gate Manager: open next sequence position
-            else rejected
-                Decision Reflector ->> Lifecycle: pending_approval -> rejected (idempotent)
-                Decision Reflector ->> Approval Gate Manager: cancel remaining open gates
-                Note over Decision Reflector: process terminates, catalogue reason recorded
-            end
-        end
+    participant D as Definition gateLoop
+    participant RD as record-decision
+    participant RV as reflect-verdict
+    participant R as Record (gate)
+    D ->> D: listen approval decision (correlated orderId, orderVersion)
+    D ->> RD: record-decision (ref, gateRef, decisionEventId, outcome)
+    RD ->> RD: registry: absorbed duplicate returns the settled answer
+    RD ->> RD: read decision record by decisionEventId (reason, authority, subject)
+    alt gate not open, or deciding subject is the submitter
+        RD ->> R: audit refusal (gate-not-open | submitter-barred), no state change
+        RD -->> D: applied false, gateState pending
+    else applied
+        RD ->> R: decide gate, clear window; on reject cancel siblings
+        RD -->> D: gateState approved | rejected | next-position (+ nextPosition) | pending
+    end
+    alt approved or rejected
+        D ->> RV: reflect-verdict (stage gate-outcome)
+        RV -->> D: reflected approved | rejected
+    else next-position
+        D ->> D: open-gates (nextPosition)
     end
 ```
 
-**Description**: Every Lifecycle call in this sequence rides the engine idempotency envelope, so a
-retried reflection is absorbed rather than re-applied. Three guards sit in front of the reflection
-and each catches something the others do not: the registry catches a redelivered decision, the
-state read catches a decision for a gate that has since been cancelled or decided, and the
-aggregate check catches a decision that satisfies one gate but not the version. The approved path
-ends at the Lifecycle reflection — fulfillment is entered through slice 02's `OrderApproved`
-trigger and nowhere else (§3.2).
+**Algorithm: `record-decision`**
+
+1. [ ] - `p1` - Resolve `gateRef` to a gate of this instance and version; **IF** none **RETURN** `permanent-failure` with `not-found` — a reference the definition could not have obtained from this instance - `inst-rd-resolve`
+2. [ ] - `p1` - Read the decision record by `decisionEventId` through the approval client; the record's outcome, reason, authority and subject are authoritative over the body's `outcome` - `inst-rd-read`
+3. [ ] - `p1` - **IF** the gate is not `open`: audit the refusal with `gate-not-open` and **RETURN** `applied: false`, `gateState: pending` - `inst-rd-guard-open`
+4. [ ] - `p1` - **IF** the deciding subject equals `owf_approval_request.submitter_subject_id`: audit the refusal with `submitter-barred` and **RETURN** `applied: false`, `gateState: pending`; the gate stays open and its window keeps running - `inst-rd-guard-sod`
+5. [ ] - `p1` - Set the gate's `state`, `decision_reason`, `deciding_authority`, `decided_at`; clear `window_armed_at` and `pause_causes` - `inst-rd-apply`
+6. [ ] - `p1` - **IF** rejected: set every other `planned` or `open` gate of the version to `cancelled` and **RETURN** `rejected` - `inst-rd-reject`
+7. [ ] - `p1` - **IF** every gate of the version is `approved` **RETURN** `approved`; **ELSE IF** every gate at the decided gate's position is `approved` and a `planned` position remains **RETURN** `next-position` with the lowest such position; **ELSE RETURN** `pending` - `inst-rd-aggregate`
+
+**Description**: Three guards sit in front of any change and each catches something the others do
+not: the registry catches a redelivered decision, the state read catches a decision for a gate
+that has since been cancelled or decided, and the separation-of-duties check catches the
+submitter deciding their own order. The aggregate is computed from the plan persisted at the first
+`open-gates` call, never from routing configuration re-read at decision time, which is what makes
+"all gates satisfied" evaluable from Orders' record alone. The approved path ends at
+`reflect-verdict`; fulfillment is the definition's next stage (§3.2).
 
 ### 3.7 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-db-approval`
+
+**Tables kept**: the four below. **Tables lost**: none of this slice's own; the slice no longer
+writes `owf_durable_timer` (`approval-escalation` rows for gates and parks) or `owf_timer_pause`
+(`approval-outage` rows), both retired by ADR-0011. **Platform attempt identity** is not a column
+here: every call that writes these rows is recorded on `owf_step_log` with its `attempt_id`
+([`01 §3.7`](./01-foundation.md#table-owf_step_log)), and `correlation_id` on each row joins to it.
 
 #### Table: owf_approval_verdict_cache
 
@@ -777,28 +906,34 @@ trigger and nowhere else (§3.2).
 |--------|------|--------------|
 | resource_tenant_id | uuid | Resource recipient; the tenant isolation axis for this table |
 | seller_tenant_id | uuid | Selling party; carried because the verdict is visible on seller-scoped operator surfaces |
+| correlation_id | uuid | Owning process instance; the join to `owf_step_log` |
 | order_id | uuid | Order identifier |
 | order_version | int | Order version the verdict was decided against |
 | verdict | enum | `required` or `not_required` |
 | deciding_authority | text | Named authority (stand-in name or real service identity); never null |
 | obtained_at | timestamptz | When the verdict was returned by the authority |
-| reflected_at | timestamptz, nullable | When the verdict was reflected into Lifecycle; NULL means the reflection is unfinished, not that it is absent |
+| reflected_at | timestamptz, nullable | When `reflect-verdict` (`stage = requirement`) settled; NULL means the reflection is unfinished, not that it is absent |
+| gate_outcome | enum, nullable | `granted` or `denied`, set by `reflect-verdict` (`stage = gate-outcome`); NULL on a `not_required` verdict |
+| gate_outcome_reflected_at | timestamptz, nullable | When the gate outcome reflection settled |
 | created_at | timestamptz | Bookkeeping |
 
 **PK**: (`order_id`, `order_version`)
 
 **Constraints**: `deciding_authority` NOT NULL — a reflection lacking a named authority is refused
 before this row is written. `resource_tenant_id` NOT NULL. `verdict` constrained to the two-value
-enum.
+enum. `gate_outcome` NOT NULL whenever `gate_outcome_reflected_at` is set, and NULL whenever
+`verdict = not_required`.
 
-**Additional info**: **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`
-(operator-surface scoping). One row per order version; a later disagreeing query for the same key
-is never written here — the stored row is authoritative once present. `reflected_at` is what the
-never-re-reflect rule reads, not row existence (§3.2). **This table cannot hold a park**:
-`deciding_authority` is NOT NULL and a park is by definition the case where no authority answered,
-so the park has its own table below rather than a third `verdict` value. **Retention**: ≥ 400 days,
-alongside `owf_audit_entry` — the row is the evidence of who exempted a commercial decision from
-approval.
+**Additional info**: **Ownership**: inserted only by `obtain-verdict`; `reflected_at`,
+`gate_outcome` and `gate_outcome_reflected_at` written only by `reflect-verdict`; each through the
+envelope. **Mutability**: insert, then two write-once stamps; no other update. **Tenant axis**:
+`resource_tenant_id` (isolation), `seller_tenant_id` (operator-surface scoping). One row per order
+version; a later disagreeing query for the same key is never made — the stored row is
+authoritative once present. `reflected_at` is what the never-re-reflect rule reads, not row
+existence (§3.2). **This table cannot hold a park**: `deciding_authority` is NOT NULL and a park is
+by definition the case where no authority answered, so the park has its own table below rather
+than a third `verdict` value. **Retention**: ≥ 400 days, alongside `owf_audit_entry` — the row is
+the evidence of who exempted a commercial decision from approval.
 
 **Example**:
 
@@ -814,41 +949,55 @@ approval.
 
 | Column | Type | Description |
 |--------|------|--------------|
-| gate_id | uuid | Gate identifier, one per approval party — UUIDv5 over (`order_id`, `order_version`, `party_ref`), derived and never minted (§2.2) |
+| gate_id | uuid | Gate identifier, one per approval party — UUIDv5 over (`order_id`, `order_version`, `party_ref`), derived and never minted (§2.2); the `gateRef` the definition carries |
 | resource_tenant_id | uuid | Resource recipient; the tenant isolation axis for this table |
 | seller_tenant_id | uuid | Selling party; the axis the approver inbox and the operator queue scope on |
+| correlation_id | uuid | Owning process instance |
 | order_id | uuid | Order identifier |
 | order_version | int | Order version this gate was opened for |
 | party_ref | text | The approving party this gate represents, as identified by the routing configuration — a role or body, not a person |
-| assigned_principal | text, nullable | The `SecurityContext` principal this gate is assigned to; the inbox filters on this column, never on `party_ref` (§3.2) |
+| assigned_principal | text, nullable | The `SecurityContext` principal this gate is assigned to; the inbox filters on this column, never on `party_ref` (§3.2). Never crosses to the definition |
 | sequence_index | int | Routing position, default 0. Gates sharing a value open together; a gate opens only once every lower value is `approved` (§4.3) |
-| state | enum | `open`, `approved`, `rejected`, `cancelled` — the complete set; `decided` is not a value |
+| state | enum | `planned`, `open`, `approved`, `rejected`, `cancelled` — the complete set; `decided` is not a value |
+| escalation_window_ms | bigint | The configured window for this gate, from routing configuration at plan time (default 72 h) |
+| window_remaining_ms | bigint, nullable | The window remaining as of `window_armed_at` (while armed) or as captured at the first pause (while paused); NULL while `planned` |
+| window_armed_at | timestamptz, nullable | Database time the window was last armed; NULL while paused, `planned` or decided |
+| pause_causes | text[], NOT NULL, DEFAULT `{}` | Open pause causes, members of `hold` · `approval-outage`; the window re-arms only when this becomes empty |
+| escalated_at | timestamptz, nullable | Last escalation fire recorded by `escalate-gate` |
 | decision_reason | text, nullable | Closed-catalogue reason for the decision; NOT NULL once `state` is `approved` or `rejected` |
 | deciding_authority | text, nullable | Named authority once decided; null while open |
-| idempotency_key | text | `resource_tenant_id` + `orderId` + `orderVersion` + `gateId` |
-| opened_at, decided_at | timestamptz, timestamptz nullable | Bookkeeping; `opened_at` is when the window starts, which for a sequenced gate is later than the verdict |
+| idempotency_key | text | The approval-request key `resource_tenant_id` + `orderId` + `orderVersion` + `gateId` |
+| opened_at, decided_at | timestamptz nullable, timestamptz nullable | Bookkeeping; `opened_at` is when the window starts, which for a sequenced gate is later than the verdict |
 | created_at | timestamptz | Partition key |
 
 **PK**: `gate_id`
 
-**Constraints**: `idempotency_key` UNIQUE; `state` NOT NULL and constrained to the four-value enum;
+**Constraints**: `idempotency_key` UNIQUE; `state` NOT NULL and constrained to the five-value enum;
 `resource_tenant_id` NOT NULL; `decision_reason` and `deciding_authority` NOT NULL whenever `state`
-is `approved` or `rejected`, enforced as a check constraint rather than by handler discipline.
-Permitted transitions: `open → approved | rejected | cancelled`; no transition out of a terminal
-state, which is the constraint the Decision Reflector's state guard reads (§3.2).
+is `approved` or `rejected`, enforced as a check constraint rather than by operation discipline;
+`window_remaining_ms` and `opened_at` NOT NULL whenever `state = open`; `window_armed_at` NULL
+whenever `pause_causes` is non-empty. Permitted transitions: `planned → open | cancelled`;
+`open → approved | rejected | cancelled`; no transition out of a terminal state, which is the
+constraint `record-decision`'s state guard reads (§3.2).
 
-**Additional info**: **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`
-(operator- and approver-surface scoping). Cancelled on `OrderAmended` supersession or terminal-event
-void, per slice 02's Termination and Compensation component. `decision_reason` is a catalogue value
-and is the only reason field that rides an event payload; human free text goes to
+**Additional info**: **Ownership**: inserted and opened only by `open-gates`; decided and sibling-
+cancelled only by `record-decision`; `escalated_at` and the window re-arm on fire by
+`escalate-gate` (`fire`); `pause_causes` member `approval-outage` by `escalate-gate` (`probe`);
+member `hold` only through the gate-window port by slice 08's `apply-hold`/`apply-resume`;
+`cancelled` on supersession, cancel or terminal-event void only through the closure port by
+slice 06's `run-cancellation-fence`. **Mutability**: deliberately mutable (state and window
+record). **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id` (operator- and
+approver-surface scoping). `decision_reason` is a catalogue value and is what the
+`reflect-approval-denied` seam call carries; human free text goes to
 `owf_audit_entry.justification` instead. **Retention**: ≥ 400 days; monthly range partition on
 `created_at`.
 
 **Example**:
 
-| gate_id | resource_tenant_id | order_id | order_version | party_ref | sequence_index | state | decision_reason |
-|--------|--------|--------|--------|--------|--------|--------|--------|
-| gate-1 | tnt-001 | ord-123 | 2 | finance | 0 | open | null |
+| gate_id | resource_tenant_id | order_id | order_version | party_ref | sequence_index | state | window_remaining_ms | pause_causes |
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|
+| gate-1 | tnt-001 | ord-123 | 2 | finance | 0 | open | 259200000 | {} |
+| gate-2 | tnt-001 | ord-123 | 2 | legal | 1 | planned | null | {} |
 
 #### Table: owf_approval_request
 
@@ -864,21 +1013,23 @@ and is the only reason field that rides an event payload; human free text goes t
 | correlation_id | uuid | The process correlation id, for cross-reference only, not dedup |
 | resolved_total | numeric | The order's resolved total (TCV) as read from Orders Lifecycle, carried verbatim; this gear performs no price computation (seam R4) |
 | currency | text | Currency of `resolved_total`; a figure without one is not a figure |
+| submitter_subject_id | uuid | Opaque subject id of the identity that submitted the order, from the Lifecycle order read; the separation-of-duties comparand of §3.2 (D-61 minimisation: no name, no email) |
 | submitted_at | timestamptz | Submission time |
 | request_payload | jsonb | Order context, requesting party, gate identifier, and the request idempotency key echoed for the receiver's own dedup |
 
 **PK**: `gate_id`
 
 **Constraints**: `gate_id` foreign key to `owf_approval_gate`; `resource_tenant_id` NOT NULL;
-`resolved_total` and `currency` NOT NULL — the §9.2 contract requires the approval authority to see
-the order's value, so a request cannot be submitted without it.
+`resolved_total`, `currency` and `submitter_subject_id` NOT NULL — the §9.2 contract requires the
+approval authority to see the order's value, so a request cannot be submitted without it.
 
-**Additional info**: **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`.
-One request row per gate; the idempotency key that guarantees single submission lives on
-`owf_approval_gate` and is echoed into `request_payload` for the receiving service, not stored
-twice as a column here. `resolved_total` is non-authoritative: it is a snapshot for the approver's
-benefit, and Orders Lifecycle remains the system of record for price. **Retention**: ≥ 400 days;
-monthly range partition on `submitted_at`.
+**Additional info**: **Ownership**: inserted only by `open-gates`. **Mutability**: append-only; no
+UPDATE grant. **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`. One request row
+per gate; the idempotency key that guarantees single submission lives on `owf_approval_gate` and is
+echoed into `request_payload` for the receiving service, not stored twice as a column here.
+`resolved_total` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
+Lifecycle remains the system of record for price; it never crosses to the definition (ADR-0013).
+**Retention**: ≥ 400 days; monthly range partition on `submitted_at`.
 
 **Example**:
 
@@ -894,15 +1045,15 @@ monthly range partition on `submitted_at`.
 
 | Column | Type | Description |
 |--------|------|--------------|
-| park_id | uuid | Park identity |
+| park_id | uuid | Park identity; the `parkRef` the definition carries |
 | resource_tenant_id | uuid | Resource recipient; the tenant isolation axis for this table |
 | seller_tenant_id | uuid | Selling party; the axis the operator queue scopes on |
 | correlation_id | uuid | Owning process instance |
 | order_id | uuid | Order identifier |
 | order_version | int | Order version whose verdict could not be obtained |
 | park_reason | enum | `verdict-source-unavailable`, `verdict-authority-unnamed`, `verdict-query-refused` |
-| parked_at | timestamptz | When the process entered `parked` |
-| escalation_due_at | timestamptz | When the operator-queue escalation must fire; derived from the TTL lead time (§4.2) |
+| parked_at | timestamptz | When `obtain-verdict` first answered `unobtainable` for the version |
+| escalation_due_at | timestamptz | When the operator-queue escalation must fire: `min(parked_at + outage_escalation_threshold, submitted_at + lifecycle_submitted_ttl − escalation_lead_time)` (§4.2), fixed at insert |
 | escalated_at | timestamptz, nullable | When the operator-queue incident was raised |
 | resolved_at | timestamptz, nullable | When the park ended |
 | resolution | enum, nullable | `verdict-obtained` or `order-terminated`; there is no operator-override value (§2.1) |
@@ -911,29 +1062,36 @@ monthly range partition on `submitted_at`.
 
 **Constraints**: `resource_tenant_id`, `correlation_id`, `park_reason`, `parked_at` and
 `escalation_due_at` NOT NULL; UNIQUE (`order_id`, `order_version`) WHERE `resolved_at IS NULL` — one
-open park per order version, so a retry storm cannot accumulate parks.
+open park per order version, so the park loop's repeated `obtain-verdict` calls cannot accumulate
+parks.
 
-**Additional info**: **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`
-(operator-queue scoping). This is the "verdict unobtainable" state
-`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` requires as distinct from
-`pending_approval`; it pairs with `owf_process_instance.phase = parked`. The `resolution` enum has
-no override value by construction — the absence is the design (§2.1), and adding a value here is
-the shape a future force-approve would take, so its absence is the thing to review. **Retention**:
-≥ 400 days.
+**Additional info**: **Ownership**: inserted and closed with `verdict-obtained` only by
+`obtain-verdict`; read by `arm-park-escalation`; `escalated_at` stamped only by
+`raise-overdue-escalation` (slice 07) with `escalationKind: park`, through this slice's park port
+inside that operation's transaction; closed with `order-terminated` only through the closure port by
+`run-cancellation-fence` (slice 06). **Mutability**: deliberately mutable (the three stamps).
+**Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id` (operator-queue scoping).
+This is the "verdict unobtainable" state `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
+requires as distinct from `pending_approval`; it pairs with `owf_process_instance.phase = parked`,
+which `park` (01) writes. The `resolution` enum has no override value by construction — the
+absence is the design (§2.1), and adding a value here is the shape a future force-approve would
+take, so its absence is the thing to review. **Retention**: ≥ 400 days.
 
 **Example**:
 
 | park_id | resource_tenant_id | order_id | order_version | park_reason | escalation_due_at | resolved_at |
 |--------|--------|--------|--------|--------|--------|--------|
-| park-9 | tnt-001 | ord-123 | 1 | verdict-source-unavailable | 2026-09-12T04:00:00Z | null |
+| park-9 | tnt-001 | ord-123 | 1 | verdict-source-unavailable | 2026-09-10T10:30:00Z | null |
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-topology-approval-execution`
 
-No dedicated deployment unit — this slice's components run in-process as Orders Workflow step
-handlers on the same runtime as the rest of the gear, per `01-foundation.md` §3.8. No new
-infrastructure is introduced.
+No dedicated deployment unit and no worker — this slice's operations run in-process on the
+internal step surface of the Orders Workflow gear, per [`01 §3.8`](./01-foundation.md#38-deployment-topology),
+and the probe, the escalation clock and the park clock are definition tasks on the platform's
+plugin workers. The slice adds nothing to the three-worker roster. No new infrastructure is
+introduced.
 
 ## 4. Additional context
 
@@ -944,78 +1102,89 @@ this gear *notices* an outage, and how long it *waits* before making one a human
 first is an engineering value, fixed below. The second is bounded by a Lifecycle value and is set
 in §4.2.
 
-**Outage detection.** The approval dependency **MUST** be called through a circuit breaker: open on
-a **50 % failure rate over a sliding window of 20 calls** (a narrower window than the common
-100-call default, because verdict-query volume per gate is low and a 100-call window would not open
-until long after the dependency was plainly unavailable), hold open for **60 s**, then probe
-half-open with **3** permitted calls before closing. The window is counted in calls, not in elapsed
-seconds, which matters because the gate-open probe in §4.2 is deliberately sparse. These values
-carry no commercial consequence: they determine only how quickly this gear notices, not what it
-does about it.
+**Outage detection.** The approval dependency **MUST** be called through a circuit breaker inside
+the operations that call it — the circuit-breaker rule of `01 §4.5`: open on a **50 % failure
+rate over a sliding window of 20 calls** (a narrower window than the common 100-call default,
+because verdict-query volume per gate is low and a 100-call window would not open until long after
+the dependency was plainly unavailable), hold open for **60 s**, then probe half-open with **3**
+permitted calls before closing. The window is counted in calls, not in elapsed seconds, which
+matters because the gate-open probe in §4.2 is deliberately sparse. These values carry no
+commercial consequence: they determine only how quickly this gear notices, not what it does about
+it. The breaker's state is per gear replica and per dependency; it is not definition state and
+never crosses to the definition except as the `verdict` class or `serviceState` an operation
+answers.
 
-The breaker covers both call directions this slice makes to the approval dependency — the verdict
-query and the gate-open submission — and its open state is the signal both the park (§4.1) and the
-outage pause (§4.2) read. A breaker scoped to the verdict query alone would be blind for the entire
-duration of an open gate.
+The breaker covers every call direction this slice makes to the approval dependency — the verdict
+query, the gate-open submission, the escalation command, the decision-record read and the probe —
+and its open state is what `obtain-verdict` (§4.1) and `escalate-gate` in `probe` mode (§4.2) read.
+A breaker scoped to the verdict query alone would be blind for the entire duration of an open gate.
 
 ### 4.1 The fail-closed park
 
 `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` requires a persisted "verdict
-unobtainable" state distinct from `pending_approval`. This is that state, specified end to end.
+unobtainable" state distinct from `pending_approval`. This is that state, specified end to end, as
+the definition's `parkForVerdict` arm (`10 §3.6` (a)) over this slice's operations.
 
-**When it is entered.** The Verdict Gateway cannot obtain a verdict for an order version: the
-breaker is open, or the retry budget for the query is exhausted, or the authority answered without
-naming itself (which §2.1 refuses to persist). The process does **not** reflect anything into
-Lifecycle — the order stays `submitted`, which is the whole point of failing closed. Reflecting
+**When it is entered.** `obtain-verdict` cannot obtain a verdict for an order version: the breaker
+is open, the query is refused, the operation's bounded query attempts are exhausted inside its
+deadline, or the authority answered without naming itself (which §2.1 refuses to persist). The
+operation answers `unobtainable` — a **success** answer carrying the verdict class, not a failure
+the definition's retry policy would spend its budget on — and nothing is reflected into Lifecycle:
+the order stays `submitted`, which is the whole point of failing closed. Reflecting
 `submitted → pending_approval` to "hold" the order would be a fabricated verdict.
 
-**The state, and where it lives.** Two writes, in one transaction: `owf_process_instance.phase` is
-set to `parked` — the engine's phase enum value for exactly this case — and one row is inserted in
-`owf_approval_park` (§3.7) carrying the reason, the park instant and the escalation deadline. The
-park is **not** representable in `owf_approval_verdict_cache`: that table's `deciding_authority` is
-NOT NULL and a park is precisely the case where no authority answered, so a third `verdict` value
-there would need a null authority and would defeat the one control §2.1 rests on. The phase alone
-is also insufficient — it says the process is parked, not why, not since when, and not whether the
-escalation has fired.
+**The state, and where it lives.** `obtain-verdict` inserts one `owf_approval_park` row (§3.7)
+carrying the reason, the park instant and the escalation deadline; the definition then calls
+`park` (01), which writes `owf_process_instance.phase = parked`. The park is **not** representable
+in `owf_approval_verdict_cache`: that table's `deciding_authority` is NOT NULL and a park is
+precisely the case where no authority answered. The phase alone is also insufficient — it says the
+process is parked, not why, not since when, and not whether the escalation has fired.
 
-**Its timer.** One `owf_durable_timer` row, `timer_kind = approval-escalation` (this slice coins no
-new kind), carrying `subject_ref = park_id` — a park has no gate to name, and the engine's
-one-live-timer-per-(instance, kind, subject) constraint needs a subject to be meaningful. It
-fires at `escalation_due_at`, computed
-from the lead time in §4.2. The park timer is **not** pausable: a hold does not stop the Lifecycle
-TTL, so pausing the thing that races it would be an escalation that arrives after the order has
-already expired.
+**Its clock.** `arm-park-escalation` returns `escalateAfter = escalation_due_at − now` from the
+park row, and the definition's `waitTtlMargin` arms exactly that. The park clock is **not**
+pausable: the `parkLoop` fork contains no hold arm that could cancel it, because a hold does not
+stop the Lifecycle TTL, and pausing the thing that races it would be an escalation that arrives
+after the order has already expired (§4.5). There is no park timer row any more — the retired
+`owf_durable_timer` `approval-escalation` row with `subject_ref = park_id` was exactly the
+discriminator a hold-by-kind could not see.
 
-**Its escalation path.** At fire, the Escalation Timer Owner raises an incident on the
-fulfillment-operator queue (`07-manual-tasks.md`), scoped by `seller_tenant_id`, carrying the order,
-the version, the park reason and the time remaining before the Lifecycle `submitted` TTL. It stamps
-`escalated_at`. It does **not** approve, reject, or reflect anything. The process stays `parked`.
+**Its escalation path.** When the wait completes, the definition calls `raise-overdue-escalation`
+(slice 07) with `escalationKind: park`, which raises an incident on the fulfillment-operator queue
+scoped by `seller_tenant_id`, carrying the order, the version, the park reason and the time
+remaining before the Lifecycle `submitted` TTL, and stamps `escalated_at` through this slice's park
+port. It does **not** approve, reject, or reflect anything. The process stays `parked`, and
+`arm-park-escalation` answers `escalateAfter: null` for a park that has escalated, so the park
+escalates once.
 
 **What happens at the Lifecycle `submitted` TTL.** Nothing this slice does suspends that TTL — the
 ADR is explicit that the park must not, and this design does not attempt to. So the TTL elapses on
-schedule, Orders Lifecycle expires the order and publishes `OrderExpired`, which is one of slice
-02's nine triggers and routes to `terminate`. The parked instance terminates with
-`terminal_outcome = aborted`, and the park row closes with `resolution = order-terminated`. This is
-the designed worst case, not an unhandled one: the order fails closed and visibly, and the
-escalation that fired at `escalation_due_at` is what gave an operator the chance to intervene
-upstream first. The lead time in §4.2 exists solely to make that window real rather than nominal.
+schedule, Orders Lifecycle expires the order and publishes `OrderExpired`, which the definition
+consumes on its terminal-event arm (`10 §3.6` (f)); `terminate-on-terminal-event` and the
+cancellation fence run, the closure port closes the park row with `resolution = order-terminated`,
+and `terminate-instance` ends the instance `aborted`. This is the designed worst case, not an
+unhandled one: the order fails closed and visibly, and the escalation that fired at
+`escalation_due_at` is what gave an operator the chance to intervene upstream first. The lead time
+in §4.2 exists solely to make that window real rather than nominal.
 
-**How a park ends otherwise.** The verdict query is retried on the engine's retry ladder for as long
-as the process lives. A retry that returns a verdict with a named authority closes the park with
-`resolution = verdict-obtained`, writes the cache row, and resumes the ordinary reflect path (§3.2).
-There is no third exit; see §2.1 on the deliberate absence of an un-park authority.
+**How a park ends otherwise.** The definition's `retryVerdict` branch calls `obtain-verdict` again
+every 5 minutes for as long as the instance lives; because `unobtainable` leaves the registry
+record `open` (§4.4), each call re-runs under the same step key. A call that returns a verdict with
+a named authority writes the cache row and closes the park with `resolution = verdict-obtained` in
+the same transaction; the definition calls `unpark` and then `reflect-verdict`. A workflow-mediated
+cancel takes the `cancel` branch to the cancel path (slice 08). There is no fourth exit; see §2.1
+on the deliberate absence of an un-park authority.
 
-### 4.2 The outage threshold, the TTL lead time, and the pause record
+### 4.2 The outage threshold, the TTL lead time, and the paused window
 
-**The values.** The PRD assigns these to Design (`PRD.md:300`, "a configurable threshold (value is a
+**The values.** The PRD assigns these to Design (`PRD.md:297`, "a configurable threshold (value is a
 Design concern)"), so they are set here rather than routed onward. Both are expressed relationally
 against a configured `lifecycle_submitted_ttl`, because an absolute number on this side would
 silently assume a TTL this gear does not own:
 
 | Value | Setting | Derivation |
 |-------|---------|------------|
-| Generic-Approval outage escalation threshold | `min(30 min, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | How long a pause may persist before the operator queue is raised directly. 30 min is short enough that an operator still has the whole window to act, and the TTL-relative arm keeps it sane if the platform ever configures a short TTL |
-| Escalation lead time before `submitted` TTL | `max(4 h, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | The margin `ADR/0007:70` requires escalation to fire with. 4 h is a floor for "actionable by a human in a staffed queue"; the TTL-relative arm scales it up rather than leaving a 72 h TTL escalated 4 h before expiry |
+| Generic-Approval outage escalation threshold | `min(30 min, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | How long the verdict may stay unobtainable before the **parked process** becomes an operator-visible incident (ADR-0007 *Consequences*, `ADR/0007:72`), **and** how long a gate-open outage may persist before the operator queue is raised directly. One threshold governs both clocks: `escalation_due_at` on the park and `outageThresholdRemaining` from `escalate-gate` (`probe`) are both measured from the instant the dependency was first observed unavailable (decision recorded by commit D as D-6x: the outage threshold governs the park clock as well as the gate pause, and the park escalates at `min(parked_at + threshold, TTL margin)`) |
+| Escalation lead time before `submitted` TTL | `max(4 h, 0.25 × lifecycle_submitted_ttl)` — **Accepted** | The margin ADR-0007 requires escalation to fire with; the cap on `escalation_due_at`. 4 h is a floor for "actionable by a human in a staffed queue"; the TTL-relative arm scales it up rather than leaving a 72 h TTL escalated 4 h before expiry |
 
 **`lifecycle_submitted_ttl` is a deliberately mirrored constant.** It is **read from
 configuration**, never guessed and never hard-coded into a build. Orders Lifecycle owns the real
@@ -1036,15 +1205,22 @@ here as a deliberate interim posture rather than left as an unexamined assumptio
   does, below — is the mirror being absent, zero, negative, or ordered wrongly, which are the
   failure modes that would otherwise make the escalation silently inert.
 
-**Migration.** When Lifecycle exposes the per-order expiry instant, `submitted_expires_at` on the
-order supersedes the mirrored constant and `escalation_due_at` is computed as
-`submitted_expires_at − escalation_lead_time`. Only the **source of the deadline** changes; the
-threshold, the lead time, the assertion and the escalation path are unaffected. The mirror is
-therefore a substitution point, not a design this gear would have to unpick.
+**Where the values live.** They are configuration of **this gear's operations**, not of the
+definition: `obtain-verdict` computes `escalation_due_at`, `arm-park-escalation` turns it into a
+duration, and `escalate-gate` computes `outageThresholdRemaining`. The definition arms whatever
+duration it is given (`10 §4.5`), so a definition version cannot shorten or lengthen the
+fail-closed bound, and a change to either value is an Orders configuration change, not a
+definition publish.
 
-**The startup assertion.** Following the nesting-invariant pattern `01-foundation.md` §4.2
-establishes for the four execution bounds, these values are **asserted at configuration load** and a
-violating configuration is **refused at startup**:
+**Migration.** When Lifecycle exposes the per-order expiry instant, `submitted_expires_at` on the
+order supersedes the mirrored constant and the TTL-margin arm is computed as
+`submitted_expires_at − escalation_lead_time`. Only the **source of the deadline** changes; the
+threshold, the lead time, the assertion and the escalation path are unaffected.
+
+**The startup assertion.** Following the nesting-invariant pattern
+[`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners) establishes for the five bounds,
+these values are **asserted at configuration load** and a violating configuration is **refused at
+startup**:
 
     lifecycle_submitted_ttl      IS PRESENT AND > 0
     outage_escalation_threshold  <  escalation_lead_time  <  lifecycle_submitted_ttl
@@ -1053,82 +1229,148 @@ The presence check is first and is not a formality. A missing or zero `lifecycle
 makes both inequalities unevaluable, and an unevaluable assertion that is allowed to pass leaves
 the gear running with an escalation that is configured but can never fire — a parked order would
 then reach expiry with no human ever alerted, which is the precise outcome the fail-closed park
-exists to prevent, arrived at from the other direction. **An absent or non-positive value is
-therefore a startup refusal, never a default and never a warning.**
+exists to prevent. **An absent or non-positive value is therefore a startup refusal, never a
+default and never a warning.**
 
 Both inequalities are load-bearing and neither fails loudly on its own. If the lead time is not
-strictly less than the TTL, the escalation is scheduled after the order has already expired and the
-park's only human signal never fires — the failure is a silent absence, exactly the class §4.2 of
-the foundation refuses to accept at runtime. If the outage threshold is not less than the lead time,
-the direct operator escalation is dominated by the park escalation and the outage path contributes
-nothing. `escalation_due_at` is computed as
-`submitted_at + lifecycle_submitted_ttl − escalation_lead_time` and stored on the park row, so a
-later configuration change does not silently move the deadline of a park already in flight.
+strictly less than the TTL, the TTL-margin cap lands after the order has already expired. If the
+outage threshold is not less than the lead time, then for an order parked shortly after
+submission the threshold arm of `escalation_due_at` could fall inside the lead-time margin and the
+operator would be alerted with less than the margin ADR-0007 guarantees; with the inequality, the
+threshold arm always fires first for any park entered at submission, and the TTL-margin cap binds
+only for a park entered late in the TTL. `escalation_due_at` is stored on the park row at insert,
+so a later configuration change does not silently move the deadline of a park already in flight.
 
-**Making the outage detectable before the window burns.** AC 2a requires a gate's escalation timer
-to pause during an outage. As written elsewhere that is unimplementable: the only detector is the
-breaker, the breaker only sees calls, and **while a gate is open this gear makes no calls to Generic
-Approval at all** — it is waiting for a decision to arrive. Nothing trips the breaker, so the pause
-branch is only ever evaluated when the timer fires at 72 hours, by which point the window it was
-supposed to protect has fully burned.
+**Making the outage detectable before the window burns.** AC 2a requires a gate's escalation
+window to pause during an outage. The only detector is the breaker, the breaker only sees calls,
+and **while a gate is open no operation calls Generic Approval** — the definition is waiting on a
+`listen`. Nothing trips the breaker, so without help the outage would be noticed only when the
+escalation fires at 72 hours, by which point the window it was supposed to protect has fully
+burned.
 
-The fix is to give the breaker something to see. While **any** gate is open, the Escalation Timer
-Owner runs a **liveness probe against the Generic Approval service every 30 s** — one cheap call,
-not per gate but per service, its result fed into the same breaker as the real calls. The interval
-is derived rather than chosen: the breaker's window is 20 calls, so a total outage fills it and
-opens the breaker in **≤ 10 minutes**, comfortably inside the 30-minute outage threshold above and
-negligible against a 72-hour window. A slower probe would leave the breaker unable to open before
-the threshold it gates; a faster one buys nothing, since the threshold is the binding constraint.
-On breaker open, every open gate's timer pauses immediately; on breaker close, every paused timer
-rearms. **No commercial sign-off was required here**: the probe interval is an
-engineering value with no commercial consequence, like the breaker settings in §4.0.
+The fix is to give the breaker something to see, and the place for a periodic call is the
+definition, not an Orders loop. The `gateLoop` fork carries a **probe branch** — `wait 30 s`, then
+`escalate-gate` with `mode: probe` — whose call is one cheap liveness probe fed into the same
+breaker as the real calls. The interval is derived rather than chosen: the breaker's window is 20
+calls, so a total outage fills it and opens the breaker in **≤ 10 minutes**, comfortably inside the
+30-minute outage threshold above and negligible against a 72-hour window. A slower probe would
+leave the breaker unable to open before the threshold it gates; a faster one buys nothing, since the
+threshold is the binding constraint. **No commercial sign-off was required here**: the probe
+interval is an engineering value with no commercial consequence, like the breaker settings in §4.0.
+On a probe that finds the breaker open, `escalate-gate` adds `approval-outage` to `pause_causes` on
+every open gate at the position and captures the remainder, and answers `outage`; on the first
+probe that finds it closed again, it removes the cause, re-arms where no cause remains and answers
+`available` with the remainder (decision recorded by commit D as D-6x: the gate-open outage pause
+is a definition probe arm over `escalate-gate` in `probe` mode, replacing the Orders-side probe
+loop and the `owf_timer_pause` `approval-outage` row).
 
-**The pause record.** The outage pause reuses the hold pause's *mechanism* but cannot reuse its
-*record*. An earlier draft of this slice declared a separate table on the reasoning that
-`owf_timer_pause.suspension_id` was NOT NULL with a foreign key to `owf_process_suspension`, so an
-outage pause had no parent to point at and a synthetic suspension would make the order appear held
-to every reader of that table. Slice 08 has since made `suspension_id` nullable behind a
-`pause_reason` discriminator (`hold | approval-outage`), which removes that obstacle — so the
-outage pause writes `owf_timer_pause` with `pause_reason = 'approval-outage'` and a null
-`suspension_id`. One clock has one record.
+**The paused window is one record.** The window is recorded as a **remaining window**, never as
+accrued elapsed time: `window_remaining_ms` as of `window_armed_at`. A pause — hold or outage —
+captures `window_remaining_ms − (now − window_armed_at)` and clears `window_armed_at`; a re-arm sets
+`window_armed_at = now`. Remaining window is the representation the re-arm arithmetic needs
+directly (the definition arms exactly the returned value); accrued-elapsed requires the full window
+to be re-derived from a constant at every resume, which silently breaks any gate whose window was
+configured away from the 72-hour default. This column is the single authority for the remainder
+([`01 §4.4`](./01-foundation.md#44-timers-and-retry-policy-are-the-definitions) names `apply-hold`
+as the operation that computes it; it does so through the gate-window port, from these columns).
 
-The two tables are reconciled on the one thing that must not differ: **both record the remaining
-window**, and neither records accrued elapsed time. Remaining window is the representation slice 08
-already uses and the one the rearm arithmetic needs directly
-(`rearm_at = resume_time + remaining_window`); accrued-elapsed requires the full window to be
-re-derived from a constant at every resume, which silently breaks any gate whose window was
-configured away from the 72-hour default. Recording is not authority: the remainder the timer
-service actually rearms from is `owf_durable_timer.remaining_window_ms`, which `01-foundation.md`
-§3.7 declares the sole authority. The pause rows on either side are the audit trail of *why* and
-*when* a timer was paused, not a second copy competing to be believed.
-
-A timer can be under both pauses at once — a gate open during an outage on an order that is then
-held. The rule is reference-counted, not last-writer-wins: `remaining_window` is captured by the
-**first** pause to take effect and is not re-captured by the second; the timer rearms only when no
-open pause row of either kind remains, at `now + remaining_window`. This keeps
+A window can be under both pauses at once — a gate open during an outage on an order that is then
+held. The rule is reference-counted in one column, not last-writer-wins and not two rows: the
+**first** pause to take effect captures the remainder, a second pause only adds its cause, and the
+window re-arms only when `pause_causes` becomes empty, at `now + window_remaining_ms`. This keeps
 `cpt-cf-bss-orders-workflow-constraint-timer-remaining-window` true under overlap, where a
-last-writer rule would credit the order with the outage window twice.
+last-writer rule would credit the order with the outage window twice. When `apply-resume` removes
+`hold` while `approval-outage` remains, the port re-arms nothing and returns the captured
+remainder; the definition re-enters `gateLoop`, whose probe branch re-observes the outage within one
+interval and the operation keeps the window paused, so at most one probe interval of an outage can
+elapse against the window after a resume.
 
 ### 4.3 Multi-party routing is sequential-capable, and sequence is a column
 
-`PRD.md:280` permits sequential or parallel approvals. A fan-out that submits every party's request
+`PRD.md:277` permits sequential or parallel approvals. A fan-out that submits every party's request
 at once implements only the second, and does so while claiming to support both: every gate's
-72-hour timer starts simultaneously, so a "sequential" second-stage approver's window is largely
+72-hour window starts simultaneously, so a "sequential" second-stage approver's window is largely
 consumed before the first stage has answered, and the escalation that fires against them is for a
 gate they could not yet have acted on.
 
-`owf_approval_gate.sequence_index` carries the ordering. The rule is small: gates sharing a
-`sequence_index` are submitted together; a gate at position *n* is not submitted, and has no timer,
-until every gate at a position below *n* is `approved`; its window starts at its own `opened_at`,
-not at verdict time. A `rejected` gate at any position cancels every gate at every other position
-and terminates the process, so no later stage is ever asked about an order an earlier stage refused.
-Purely parallel routing is the degenerate case where every gate carries `sequence_index = 0`, which
-is also the default — so a routing configuration that says nothing about ordering behaves exactly as
-it does today.
+`owf_approval_gate.sequence_index` carries the ordering, and the **whole plan is persisted at the
+first `open-gates` call** — later positions as `planned` — so every later decision is evaluated
+against Orders' own record rather than against routing configuration re-read at decision time. The
+rule is small: gates sharing a `sequence_index` are submitted together; a gate at position *n* is
+not submitted, and has no window, until every gate at a position below *n* is `approved`; its
+window starts at its own `opened_at`, not at verdict time. A `rejected` gate at any position
+cancels every gate at every other position, and the definition reflects the denial and terminates,
+so no later stage is ever asked about an order an earlier stage refused. Purely parallel routing is
+the degenerate case where every gate carries `sequence_index = 0`, which is also the default — so a
+routing configuration that says nothing about ordering behaves exactly as it does today (decision
+recorded by commit D as D-6x: the routing plan is persisted at the first `open-gates` with the
+`planned` gate state).
 
-The Gate Manager owns executing this ordering; it does not decide it. Which parties, in which order,
-remains Generic Approval's configuration (§3.2), and in phase 1 there is no configuration at all,
-since the stand-in never returns "required".
+The Gate Manager records this ordering; it does not decide it, and it does not execute it — the
+definition does, by calling `open-gates` with the `nextPosition` `record-decision` returns. Which
+parties, in which order, remains Generic Approval's configuration (§3.2), and in phase 1 there is no
+configuration at all, since the stand-in never returns "required".
+
+### 4.4 Operation rules
+
+**Guards.** `record-decision` **MUST** apply, in order, the registry resolution, the gate-state
+guard (`open` only) and the separation-of-duties guard (the decision record's deciding subject
+**MUST NOT** equal `owf_approval_request.submitter_subject_id`) before any change; a refused
+decision **MUST** be audited with `gate-not-open` or `submitter-barred` and **MUST** answer
+success with `applied: false`, never `permanent-failure`, so a stale or barred decision returns the
+definition to its loop rather than to its failure arm. A `gateRef` not belonging to the instance
+**MUST** answer `permanent-failure` with `not-found`, per the existence-oracle rule of `09 §4.4`.
+`reflect-verdict` **MUST NOT** call Lifecycle for a stage whose reflection is already stamped, and
+**MUST** refuse `stage = gate-outcome` with `gate-not-open` while the aggregate is neither all
+`approved` nor any `rejected`. `open-gates` **MUST** refuse a position whose lower positions are not
+all `approved`.
+
+**Keys.** Every step key is instance-scoped and tenant-prefixed and **MUST** be recomposable from
+the body (`01 §3.3` step 3). The Lifecycle seam key is the lifecycle-transition family
+`{tenant}:{orderId}:{orderVersion}:{trigger}` with the trigger resolved by `reflect-verdict` from
+the record, never supplied by the definition; the approval-request key is
+`{tenant}:{orderId}:{orderVersion}:{gateId}`; neither contains `correlationId` (§2.2).
+`obtain-verdict` **MUST** leave its registry record `open` on an `unobtainable` answer and settle it
+only when a verdict is cached, so the park loop's repeated calls re-run under one key and a verdict
+obtained on any of them is the one absorbed thereafter. `escalate-gate` keys include the `round`
+the previous call returned, so each fire and each probe is one settled record and a platform
+replay of either is absorbed.
+
+**Expected version and refusals from Lifecycle.** Every `approval-reflection` call **MUST** carry
+`expected_version = orderVersion` and the process `correlationId`. A Lifecycle `version-conflict`
+or a refused transition — the order moved on while the reflection was in flight — **MUST** settle
+`permanent-failure` with `version-mismatch` and the Lifecycle reason in `owf_step_log.result`, and
+**MUST NOT** be retried under a new key or inferred as success; a transport failure or a 5xx
+**MUST** settle `retryable-failure`.
+
+**Refusal codes** this slice may raise are the registered `submitter-barred` and `gate-not-open`
+([`01 §4.9`](./01-foundation.md#49-the-machine-readable-reason-catalogue)) plus the engine and
+`09` reasons named per operation in §3.3; the park reasons are a column enumeration, not refusal
+reasons. This slice registers no new reason.
+
+### 4.5 Constraints this slice places on the definition
+
+These are inputs to the validation rules of
+[`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
+the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); a definition version
+that violates any of them **MUST** be refused.
+
+1. [ ] - `p1` - **Order.** `obtain-verdict` **<** `reflect-verdict` (`stage = requirement`) **<** `open-gates`; `record-decision` **<** `reflect-verdict` (`stage = gate-outcome`) on the decision path; `reflect-verdict` (`gate-outcome`) **<** `terminate-instance` on the rejected path and **<** the fulfillment stage on the approved path - `inst-c3-order`
+2. [ ] - `p1` - **Fail-closed routing.** The verdict class `unobtainable` **MUST** route only to the park arm (`park`, `arm-park-escalation`, the park loop); no branch **MAY** route it to `reflect-verdict`, `open-gates` or the fulfillment stage, and `unpark` on the verdict path **MUST** be reachable only after an `obtain-verdict` that answered `required` or `not-required` - `inst-c3-fail-closed`
+3. [ ] - `p1` - **No swallowing.** `obtain-verdict`, `reflect-verdict` and `record-decision` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); a `permanent-failure` of `reflect-verdict` **MUST** reach `create-manual-task` (slice 07) and then an arm that waits on the amendment, terminal-event and cancel `listen`s, because the order state that refused the reflection is a commercial fact only a human or a Lifecycle event resolves - `inst-c3-no-swallow`
+4. [ ] - `p1` - **The escalation fork.** The escalation `wait` **MUST** be a branch of a competing `fork` that also contains the decision `listen`, the probe branch, the hold arm, the amendment arm and the cancel arm; its duration **MUST** be the value last returned by `open-gates`, `escalate-gate` or `apply-resume`, never a literal and never the definition's own arithmetic - `inst-c3-escalation-fork`
+5. [ ] - `p1` - **The probe branch.** The `gateLoop` fork **MUST** carry a probe branch calling `escalate-gate` with `mode: probe` at an interval no longer than 30 s; on `serviceState = outage` the definition **MUST** enter an outage arm that competes a probe loop (until `available`), a `wait` of `outageThresholdRemaining` followed by `raise-overdue-escalation` with `escalationKind: approval-outage`, the hold arm and the cancel arm, and on `available` **MUST** re-enter `gateLoop` with the returned `escalationRemaining` - `inst-c3-probe`
+6. [ ] - `p1` - **The park clock.** The park-escalation `wait` **MUST** arm `arm-park-escalation`'s `escalateAfter`, **MUST NOT** be inside a fork that contains a hold arm, and **MUST NOT** be re-armed after `raise-overdue-escalation` has recorded the park escalation — a re-entry to the park loop after `escalated` runs only the verdict retry, cancel and terminal-event arms - `inst-c3-park-clock`
+7. [ ] - `p1` - **Positions and rounds.** `open-gates` **MUST** be called with `position = 0` first and thereafter only with `record-decision`'s `nextPosition`; `escalate-gate` **MUST** carry the `escalationRound` or `probeRound` the previous call returned. These are re-keyed references, not computed values (`01 §4.14`) - `inst-c3-positions`
+8. [ ] - `p1` - **Signals handled.** This slice's stage consumes the approval decision event (`listen`, correlated on `orderId` and `orderVersion`); it is paused by `OrderHeld` / `OrderResumed` through `apply-hold` / `apply-resume` (slice 08), which call the gate-window port with the `gateRefs` `open-gates` returned; it is left by `cancel-requested`, `OrderAmended` and the terminal order events, whose paths close its records through the closure port inside `run-cancellation-fence` (slice 06) - `inst-c3-signals`
+
+`10 §3.6` (a) as committed with ADR-0011 shows the escalation branch, the hold, amendment and
+cancel arms and the park loop; items 4 to 7 are the parts of this contract its fragment does not yet
+show — the probe branch and outage arm, the `position` and `round` members, and the no-re-arm rule
+after a park escalation — and the canonical YAML is to carry them before the validation hook
+enforces this list. Items 4 and 6 depend on the runtime-expression `wait` of Q-11 (i)
+(`10 §4.5`); until it is answered, the fallback that section names applies.
 
 ### Disclosure 1 — the whole capability is inert in phase 1
 
@@ -1143,18 +1385,21 @@ ever asked about — recording the authority by name is the entire audit value o
 
 **The park is the exception, and it is live today.** Everything else below is inert, but §4.1 is
 not: the stand-in can fail to resolve, can be misconfigured, and can answer without naming itself,
-and each of those is a verdict this gear could not obtain. The park state, its row, its timer and
-its operator escalation are therefore built and exercised in phase 1 — which is consistent with the
-park being the one approval acceptance criterion that applies before the Generic Approval service
-exists, while the gate criteria are deferred behind the stand-in.
+and each of those is a verdict this gear could not obtain. `obtain-verdict`'s `unobtainable`
+answer, the park row, `arm-park-escalation` and the park loop are therefore built and exercised in
+phase 1 — which is consistent with the park being the one approval acceptance criterion that applies
+before the Generic Approval service exists, while the gate criteria are deferred behind the
+stand-in. In phase 1 the live operations are `obtain-verdict`, `reflect-verdict` (`stage =
+requirement`) and `arm-park-escalation`.
 
-A direct consequence: while the stand-in is in place, no gate is ever opened, so multi-party gates,
-escalation timers, the approver inbox, and the `OrderApprovalRequested` / `OrderApprovalEscalated`
-events never fire. All the machinery in §3.2-§3.6 for those paths is fully specified and buildable
-now, but exercises zero real gates until the Generic Approval service is built. The Generic
-Approval service has no canonical specification anywhere in this repository today (PRD §9.2, §15,
-§16); this slice depends on it only through the expectations contract, and this design does not
-speculate about that service's own internal design.
+A direct consequence: while the stand-in is in place, no gate is ever opened, so `open-gates`,
+`record-decision`, `escalate-gate`, `reflect-verdict` with `stage = gate-outcome`, the approver
+inbox, and the `OrderApprovalRequested` / `OrderApprovalEscalated` events never execute. All of
+that is fully specified and buildable now, and the definition's gate stage is present in every
+published version, but exercises zero real gates until the Generic Approval service is built. The
+Generic Approval service has no canonical specification anywhere in this repository today (PRD
+§9.2, §15, §16); this slice depends on it only through the expectations contract, and this design
+does not speculate about that service's own internal design.
 
 The two disclosures above are load-bearing for this slice: they are why the acceptance criteria in
 PRD §12 mark ACs 1 through 4a (including 2a) as deferred, and only ACs 0, 0a, 0b apply until the
@@ -1172,9 +1417,9 @@ This gap is narrow, not a rewrite: closing it is a one- or two-sentence PRD amen
 `OrderAmended` re-triggers the same verdict-retrieval-and-reflect sequence as `OrderSubmitted`,
 scoped to the new `orderVersion`.
 
-This design nonetheless implements the stricter behavior — the Verdict Gateway re-queries the
-verdict for the new version from scratch on every `OrderAmended`, per §3.2, and never derives it
-from the superseded version's cached verdict — because the sibling Orders Lifecycle design
+This design nonetheless implements the stricter behavior — the amendment terminates the prior
+instance and the new version's invocation runs `obtain-verdict` from scratch, with no cache row to
+inherit, per §3.2 — because the sibling Orders Lifecycle design
 (`06-workflow-seam.md` §4.2) already states the rule normatively for the Lifecycle side of the
 seam and frames it as an upstream ask on this gear: *"On consuming that event the sibling gear
 MUST obtain the requirement verdict for the new version and reflect the order onward via
@@ -1199,9 +1444,27 @@ the requirement is not left to be inferred solely from the sibling Lifecycle des
   `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox`), §9.2
   (`cpt-cf-bss-orders-workflow-contract-owf-approval-contract`), §7
   (`cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer`), §12 (acceptance criteria 0-4a)
-- **ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`,
-  `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
+- **ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` (as amended by ADR-0011),
+  `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`,
+  [`ADR/0011`](../ADR/0011-cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition.md)
+  `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`,
+  [`ADR/0012`](../ADR/0012-cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps.md)
+  `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`,
+  [`ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)
+  `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
+- **Definition**: [10-process-definition.md](./10-process-definition.md) §3.6 (a)
+  `cpt-cf-bss-orders-workflow-seq-def-start-and-approval` (the fragment that sequences these
+  operations), §3.6 (e) (the hold pattern the gate-window port serves), §4.1 (the fence), §4.5
+  (Q-11)
 - **Upstream design**: [orders-lifecycle 06-workflow-seam.md](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
-  §4.2 (deciding-authority requirement, re-approval-after-amendment rule)
-- **Prior slices**: [01-foundation.md](./01-foundation.md) (engine primitives),
-  [02-triggers-and-start.md](./02-triggers-and-start.md) (correlation model, termination path)
+  §3.3 (`approval-reflection`, the four `reflect-approval-*` triggers, expected version), §4.2
+  (deciding-authority requirement, re-approval-after-amendment rule)
+- **Prior slices**: [01-foundation.md](./01-foundation.md) (envelope, `park`/`unpark`, step-operation
+  contract, reason catalogue), [02-triggers-and-start.md](./02-triggers-and-start.md) (correlation
+  model, supersession), [06-saga-and-compensation.md](./06-saga-and-compensation.md) (closure port
+  caller), [07-manual-tasks.md](./07-manual-tasks.md) (`raise-overdue-escalation`,
+  `create-manual-task`), [08-hold-and-cancel.md](./08-hold-and-cancel.md) (gate-window port caller)
+- **Retired here**: `cpt-cf-bss-orders-workflow-component-escalation-timer-owner`,
+  `cpt-cf-bss-orders-workflow-entity-escalation-timer-record`,
+  `cpt-cf-bss-orders-workflow-entity-approval-outage-pause` (ADR-0011); the former dependency on
+  `cpt-cf-bss-orders-workflow-interface-timer-api` is retired with that interface (`01 §3.3`)
