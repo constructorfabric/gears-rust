@@ -172,9 +172,13 @@ registration plus scoped `ClientHub` resolution, the same pattern already used b
 Binding on any registered `StoragePlacementResolver` — this restates and consolidates the Decision Drivers above
 rather than duplicating them:
 
-* The returned path **must** include `version_id`; the gear validates every plugin result before use, and a result
-  missing `version_id` **must** be rejected — create-exclusive publish and per-version immutability both depend on
-  this.
+* The returned path **must** contain `version_id` as a whole path segment — delimited by `/` on both sides or
+  ending the key — not merely as a substring; the gear validates every plugin result before use, and a result
+  without such a segment **must** be rejected. A substring match could pass by accident and let two versions share a
+  key, and create-exclusive publish and per-version immutability both depend on the key being unique per version.
+* A plugin-produced path **must not** start with `/`: S3 consoles show a leading slash as an empty-named folder at
+  the bucket root. The fixed `/{file_id}/{version_id}` layout keeps its leading slash, because objects already written
+  under it cannot be renamed; the rule applies to layouts a plugin introduces, so they start clean.
 * The returned `backend_id` **must** refer to a backend configured in this deployment; a result naming an
   unconfigured backend **must** be rejected.
 * Placement **must** be computed exactly once — at version creation for `create`, at session creation for
@@ -182,8 +186,14 @@ rather than duplicating them:
   respectively. Nothing downstream may recompute it; per ADR-0003, the sidecar and cleanup only ever read the
   stored value.
 * The resolver's input **must** be limited to trusted, server-controlled attributes — tenant, owner, `file_id`,
-  `version_id`, `gts_file_type`, `created_at` — and **must not** include user-supplied values (declared file name,
-  MIME type, `custom_metadata`).
+  `version_id`, `gts_file_type`, `created_at`, and the **target `backend_id`** the placement is being computed for
+  (the default backend for `create`/`initiate`, the destination for `migrate_backend`) — and **must not** include
+  user-supplied values (declared file name, MIME type, `custom_metadata`).
+* A plugin **may** call trusted platform services to enrich those attributes — first of all `tenant-resolver`, to
+  resolve a tenant's ancestors (for example project → workspace → organization, when a project is a tenant). Such a
+  call is part of placement and falls under the same rules as the plugin itself: it runs under the placement timeout,
+  and its failure fails the `create`/`initiate`/`migrate_backend` call instead of falling back to the default
+  placement. It **must not** call services that return user-supplied data.
 * A plugin error or timeout **must** be treated as a hard failure of the `create`/`initiate` call, with a clear
   error returned to the caller; it **must not** silently fall back to the default placement, since a silent fallback
   would place a file somewhere the caller did not ask for.
@@ -214,7 +224,10 @@ rather than duplicating them:
   at `initiate`, with no recomputation fallback left in expired-session cleanup.
 * A test asserting the no-plugin-registered path reproduces exactly today's `default_backend_id` +
   `/{file_id}/{version_id}`.
-* A test asserting a plugin result missing `version_id` is rejected before it reaches storage.
+* A test asserting a plugin result without `version_id` as a whole path segment (including one that contains it only
+  as a substring) is rejected before it reaches storage, and that a plugin path with a leading `/` is rejected.
+* A test asserting the resolver receives the target `backend_id`, and a different one for `migrate_backend`'s
+  destination than for the source.
 * A test asserting a plugin error or timeout produces a `create`/`initiate` failure, not a silent fallback to the
   default placement.
 * An integration test asserting `migrate_backend` evaluates the **destination** backend's resolver (not a copy of
@@ -300,8 +313,9 @@ not a rule an operator retunes repeatedly.
 
 Flagged honestly, not resolved by this `proposed` ADR:
 
-1. **Where a plugin gets per-tenant data.** Its own plugin-local config, or a lookup against `credstore` for
-   private-backend credentials — not decided here.
+1. **Where a plugin gets per-tenant data.** Tenant hierarchy comes from `tenant-resolver` (allowed by the Plugin
+   contract); other per-tenant data from the plugin's own config, and private-backend credentials from `credstore` —
+   which of these a given plugin needs, and the placement timeout's value, are not decided here.
 2. **`migrate_backend` interaction, precisely.** The Plugin contract above already requires evaluating the
    destination backend's resolver for new migrations; how that interacts with objects placed before any plugin
    existed needs to be threaded through the backend-migration feature doc's own definition-of-done — flagged here,

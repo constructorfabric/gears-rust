@@ -116,7 +116,7 @@ COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumpe
 -- sorts ORDER BY created_at DESC, file_id DESC). Supersedes
 -- files_owner_listing_idx (created_at DESC only, m20260624_000001_p1_initial),
 -- dropped in the same migration that adds this one (shipped,
--- m20260902_000001_index_hardening).
+-- m20260924_000001_upload_flow_redesign).
 CREATE INDEX files_owner_listing_v2_idx
     ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 
@@ -126,7 +126,7 @@ CREATE INDEX files_tenant_gts_idx
 
 -- Covers the cleanup engine's versionless-orphan-file sweep
 -- (FileRepo::list_versionless_orphan_files: content_id IS NULL AND created_at <
--- cutoff, ordered by (created_at, file_id)) (shipped, m20260902_000001_index_hardening).
+-- cutoff, ordered by (created_at, file_id)) (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX files_versionless_sweep_idx
     ON file_storage.files (created_at, file_id)
     WHERE content_id IS NULL;
@@ -225,7 +225,7 @@ CREATE INDEX file_versions_backend_idx
 -- created_at DESC. The composite PK (file_id, version_id) serves the filter
 -- but not the sort, and versions are never pruned in P1/P2, so this was a
 -- full per-file scan + sort with no supporting index (shipped,
--- m20260902_000001_index_hardening).
+-- m20260924_000001_upload_flow_redesign).
 CREATE INDEX file_versions_file_created_idx
     ON file_storage.file_versions (file_id, created_at, version_id);
 
@@ -326,7 +326,7 @@ CREATE TABLE file_storage.multipart_uploads (
     part_size        bigint       NOT NULL  DEFAULT 0,
 
     -- Bind mode, fixed at session creation (shipped,
-    -- m20260722_000001_multipart_auto_bind): `POST /files` can open the session
+    -- m20260924_000001_upload_flow_redesign): `POST /files` can open the session
     -- directly with `bind: "auto"`, in which case `complete` performs the
     -- content bind itself, in the same transaction as the version finalize and
     -- under the same CAS a manual `POST /files/{id}/bind` would use. Sessions
@@ -367,7 +367,7 @@ CREATE INDEX multipart_uploads_file_idx ON file_storage.multipart_uploads (file_
 CREATE INDEX multipart_uploads_expired_idx
     ON file_storage.multipart_uploads (expires_at)
     WHERE state = 'in_progress';
--- Sweep index (shipped, m20260902_000001_index_hardening). The sweep filters
+-- Sweep index (shipped, m20260924_000001_upload_flow_redesign). The sweep filters
 -- `expires_at < now AND (state = 'in_progress' OR (state = 'completing' AND
 -- lease_until < now))`; the partial index above serves only the first branch,
 -- so this one is deliberately non-partial and leads with `state` to cover both.
@@ -452,7 +452,7 @@ CREATE INDEX idempotency_keys_expired_idx ON file_storage.idempotency_keys (expi
 -- `file_id` carries ON DELETE CASCADE but is not part of the primary key, so
 -- without this index every `DELETE FROM files` seq-scans the whole table to
 -- find its cascade victims while already holding the row locks on `files`
--- (shipped, m20260902_000001_index_hardening).
+-- (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX idempotency_keys_file_idx ON file_storage.idempotency_keys (file_id);
 
 

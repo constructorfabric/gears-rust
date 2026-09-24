@@ -1297,7 +1297,7 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
   (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
   `OFFSET`-paginated pages from skipping or repeating a row when they share a `created_at` instant).
-  `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260902_000001_index_hardening`,
+  `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260924_000001_upload_flow_redesign`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
   (`m20260624_000001_p1_initial`), dropped in the same migration
 - `(tenant_id, gts_file_type)` — supports per-type queries
@@ -1339,7 +1339,7 @@ and is immutable.
 - `(file_id, created_at, version_id)` — covers `GET /files/{id}/versions`'s `file_id = ?` filter plus its
   `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
   pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx` in
-  migration.sql, shipped in `m20260902_000001_index_hardening`
+  migration.sql, shipped in `m20260924_000001_upload_flow_redesign`
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from
