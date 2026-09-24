@@ -54,6 +54,24 @@ Chosen option: **two-wave barrier**, because it is the only option under which m
 * A wave-1 draft auto-voided before its activation intent (hold, platform TTL, or any other cause) forces a wave-1 rebuild for that line before the barrier can be re-evaluated, since the barrier's precondition is "every line currently in `draft`," not "every line was once in `draft`."
 * Future extensibility to per-line SLA reporting must be layered on top of the barrier as an observability concern (progress-read operation), not as a relaxation of the barrier itself — the barrier's atomicity is the property this decision protects.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the barrier is now a **definition pattern**, not a timer this gear arms. In the platform
+> definition, wave 1 is a `fork` of `dispatch-wave1-create` per fulfillment task whose join
+> completes when every task's Subscriptions confirmation has been received (`listen`); the
+> expected-fulfillment instant is a `wait` armed from the value `construct-and-freeze-plan`
+> returns; `dispatch-wave2-activate` follows both. `owf_durable_timer` and the activation-barrier
+> timer are removed; the plugin's native timers execute the wait (serverless-runtime DESIGN.md
+> line 632). The **conjunction rule** — no activation intent until every line is `draft_created`
+> **and** the timer has elapsed — becomes ADR-0012 validation rule 1: a definition in which
+> `dispatch-wave2-activate` does not follow both the wave-1 join and the expected-fulfillment
+> `wait` is not publishable, and `dispatch-wave2-activate` (`protected`) additionally refuses at
+> run time unless this gear's record shows every task at `draft_created` and the wait's instant
+> passed. The rebuild path is unchanged: a voided draft found by `reread-draft-liveness` routes to
+> `rebuild-wave1`, after which the join must complete again before wave 2 (D-23, D-24). The
+> "hold suspension" clause of the second consequence is superseded by ADR-0011's signal pattern:
+> the barrier wait is at the top level of the definition and does **not** pause on hold (D-35,
+> D-53); only approval-escalation waits do.
+
 ### Confirmation
 
 Confirmed by a scenario test with three lines carrying distinct service-activation dates (past, near-future, far-future) asserting no activation intent is dispatched until all three reach `draft_created` and the timer for the latest date has elapsed; by a test asserting a wave-1 permanent failure on one line prevents any activation intent for the order's other lines; and by a test asserting a wave-1 draft auto-voided during the date wait triggers a rebuild rather than a stale activation intent.

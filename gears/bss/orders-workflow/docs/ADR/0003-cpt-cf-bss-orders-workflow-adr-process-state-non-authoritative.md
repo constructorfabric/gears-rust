@@ -55,6 +55,18 @@ Chosen option: **a shared read-through port**, because it is the only option und
 * A slice may still hold a short-lived, request-scoped copy of an order-state read obtained through the port, but may not persist it as an independent order-state cache that outlives the request that read it; if a longer-lived cache is later needed for latency, it must be owned by the port, not by an individual slice.
 * This decision does not relax the zero-loss durability requirement on process-execution state (ADR-0001); it only forbids that state from being presented or consulted as commercial order truth.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the engine history this rule excludes is now named. It is the **Temporal history** the
+> serverless-runtime Temporal plugin keeps for the invocation that runs the order process —
+> the plugin-owned invocation record, timeline and internal execution state
+> ([serverless-runtime DESIGN.md §1.4.2](../../../../serverless-runtime/docs/DESIGN.md#142-plugin-model)
+> line 174), exposed through the platform's timeline, debug and trace endpoints (§3.3 lines
+> 1061–1063). No slice reads it as order state, and no slice reads it as process state either:
+> order state comes through the shared read-through port from Orders Lifecycle, process state
+> from this gear's own record (ADR-0001 as rewritten). By ADR-0013 that history is reference-only,
+> so there is nothing in it to be tempted by. The structural test in Confirmation gains a second
+> clause: no slice module holds a dependency on the platform invocation-timeline path.
+
 ### Confirmation
 
 Confirmed by a structural test (or lint rule) asserting no slice module holds a direct dependency on Lifecycle's order-state read path other than through the shared port, and a scenario test replaying an out-of-order trigger for a superseded `orderVersion` and asserting it is ignored because the port's live read, not a cached value, determines applicability (R1). A second check asserts every operator-facing or audit surface that renders process-execution fields carries a label distinguishing them from order state (R5).

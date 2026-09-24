@@ -70,6 +70,22 @@ classification), never on a silent retry loop and never as a fresh dead-letter e
 * The dead-letter store is **inbound only in both directions of the rule**: an *outbound* process event the platform permanently rejects becomes a `toolkit_db::outbox` dead letter owned by the platform producer outbox (ADR-0008) and alerted as a platform metric, never written to `owf_dead_letter_record`, whose `source` column has no legal value for a publication this gear originated. ADR-0008 states the same boundary from the producer side; the two ADRs agree that there is one dead-letter store and it holds only failed deliveries *into* this gear.
 * Operator tooling can rely on object type alone to route: manual task and tracked incident surfaces go to the fulfillment-operator remediation queue; dead-letter surfaces go to the same queue but as a delivery-poisoning alert, not a remediation task — the two must remain visually and operationally distinguishable.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the two-object rule holds; the owner of the inbound dead letter changes. Inbound Lifecycle
+> triggers and the Subscriptions and approval callbacks now reach the process through the
+> platform event-trigger path and the definition's `listen` arms, and **dead-lettering of a
+> poisoned inbound trigger belongs to that path**: retry and dead-letter handling of
+> event-driven invocation are the platform Event Trigger Engine's semantics
+> ([serverless-runtime DESIGN.md §3.2](../../../../serverless-runtime/docs/DESIGN.md#32-component-model)
+> line 808), as outbound dead-lettering already belongs to the platform producer outbox
+> (ADR-0008). This gear no longer owns a delivery-count cap for platform-delivered events and
+> writes no `owf_dead_letter_record` row for one. **Orders keeps the manual task**: a poisoned
+> delivery that the definition's `catch` around `admit-trigger` surfaces becomes a manual task
+> raised through `create-manual-task` with a catalogue reason, never a second object, and a
+> permanently failed step still reaches the manual task or the tracked incident and nothing else.
+> The fate of the `owf_dead_letter_record` table — retained for any callback that does not
+> traverse the platform trigger path, or retired — is a register entry, not a silent removal.
+
 ### Confirmation
 
 Verified by a test asserting no code path creates both a manual task/incident and a dead-letter

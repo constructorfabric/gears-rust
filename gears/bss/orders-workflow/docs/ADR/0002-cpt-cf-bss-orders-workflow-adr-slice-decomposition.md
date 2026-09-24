@@ -56,6 +56,31 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 * `design/README.md` and any other document that lists these nine slices must cite the numbers and titles from this ADR rather than re-deriving them, so a future renumbering is a single-ADR change rather than a multi-document hunt.
 * The numbering communicates build sequence, not review priority or PRD traceability; a reader who wants requirement traceability must still consult the PRD IDs cited in each slice, not infer them from the slice number.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the decomposition is now **foundation + process definition + seven step-operation slices + the
+> read/control slice**. `design/10-process-definition.md` is added and holds the platform workflow
+> definition — grammar subset, canonical versions, validation rules (ADR-0012) and the binding
+> contract; slices `02`–`08` each declare their step operations in §3.3 instead of handlers and
+> timers; `09` declares no step operations — its control operations map to the platform
+> invocation API (`POST /api/serverless-runtime/v1/invocations`, `…:control`) plus this gear's own
+> reads. File names and ids are unchanged; `10` is numbered by availability, not by build order,
+> and the number is historical. The rule "a slice depends only on an earlier-numbered slice" is
+> restated as "a slice depends only on a slice earlier in the build order below". The build order
+> `design/README.md` cites is:
+
+| Build order | Doc | Role after ADR-0011 | Depends on |
+|---|---|---|---|
+| 1 | `10-process-definition` | the definition: protected path, grammar subset, canonical versions, validation rules, binding | — (fixes what every operation slice implements against) |
+| 2 | `01-foundation` | the process record, `owf_step_operation` registry, `owf_definition_binding`, foundation operations (`start-instance`, `settle-from-lookup`, `retry-step`, `park`, `unpark`, `terminate-instance`), the three workers | 10 |
+| 3 | `02-triggers-and-start` | `admit-trigger`, `terminate-on-terminal-event` | 10, 01 |
+| 4 | `03-approval-execution` | `obtain-verdict`, `reflect-verdict`, `open-gates`, `record-decision`, `arm-park-escalation`, `escalate-gate` | 10, 01, 02 |
+| 5 | `04-fulfillment-plan` | `construct-and-freeze-plan`, `evaluate-payment-auth-eligibility`, `re-check-pre-activation`, `evaluate-activation-eligibility`, `begin-fulfillment` | 10, 01, 02, 03 |
+| 6 | `05-provisioning-intents` | `dispatch-wave1-create`, `dispatch-wave2-activate`, `reread-draft-liveness`, `rebuild-wave1`, `reconcile-intent`, `report-spawn-signal` | 10, 01, 04 |
+| 7 | `06-saga-and-compensation` | `run-cancellation-fence`, `compensate-order`, `report-outcome` | 10, 01, 05 |
+| 8 | `07-manual-tasks` | `create-manual-task`, `resolve-manual-task`, `verify-override`, `raise-overdue-escalation` | 10, 01, 05, 06 |
+| 9 | `08-hold-and-cancel` | `apply-hold`, `apply-resume`, `authorize-cancel` | 10, 01, 02, 03, 05, 06 |
+| 10 | `09-read-and-authz` | reads, the PDP catalogue including `process_step × execute`, control operations over the platform invocation API; no step operations | 10, 01–08 |
+
 ### Confirmation
 
 Confirmed by a documentation-structure check that `design/README.md`'s slice table matches this ADR's nine slugs and order exactly, and by a dependency-direction review confirming no slice document declares a dependency on a higher-numbered slice.

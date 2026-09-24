@@ -77,6 +77,23 @@ must not fail-open to `approved` or auto-reject the gate.
 * There is deliberately **no in-band un-park authority**: no operator surface force-approves a parked order, because that would be the fail-open this decision refuses, reintroduced through an endpoint. A park is left only by a verdict arriving, by the Lifecycle TTL expiring, or by a workflow-mediated cancel. The absence is recorded here so it reads as a decision rather than an omission.
 * No new "approved-without-verdict" or "auto-rejected-without-verdict" order state is ever introduced, which keeps Lifecycle's state machine exactly as documented in its own PRD.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the park is now a **definition `wait` with an escalation arm**, and this gear records it through
+> two operations. `obtain-verdict` (`protected`) returns the verdict class `unobtainable` instead
+> of a verdict; the definition then calls `park`, which records phase `parked` in this gear, and
+> enters an arm that re-calls `obtain-verdict` on the platform's retry schedule while a `wait`
+> for the outage escalation threshold (`min(30 min, 0.25 × lifecycle_submitted_ttl)`) runs; on
+> expiry the arm calls `arm-park-escalation`/`escalate-gate` so the operator queue is reached
+> with the lead time this ADR fixes. The arm has exactly the exits this ADR allows — a verdict
+> arriving (`unpark`, then `reflect-verdict`), the Lifecycle `submitted` TTL expiring
+> (`OrderExpired` on `listen`, then `terminate-on-terminal-event`), or a workflow-mediated cancel
+> (`authorize-cancel`) — and ADR-0012 rule 6 forbids a `catch` that continues the forward path
+> around `obtain-verdict`, so no definition can add an in-band un-park. The gate-open outage
+> pause keeps its D-11 semantics as a definition pattern: the escalation `wait` sits inside the
+> arm a hold or outage signal cancels and a resume re-arms with the remaining window this gear
+> returns; `owf_timer_pause` is removed. The `lifecycle_submitted_ttl` startup assertion and the
+> stand-in's audited role are unchanged.
+
 ### Confirmation
 
 Verified by a design/code review confirming the pre-gate park state is distinct from

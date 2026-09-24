@@ -101,6 +101,21 @@ derived from, the process `correlationId`.
 * `gateId` becomes a derived value, not a generated one: nothing may insert an approval gate with a randomly minted identifier, and the derivation inputs (`orderId`, `orderVersion`, `party`) must be resolved before the gate row is written.
 * Every key-minting call site must have `resource_tenant_id` in hand, which makes tenant resolution a precondition of intent construction rather than a later enrichment step.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> retries are now the platform's, and the key composition is what makes that safe. A platform
+> task retry — the plugin's per-task `RetryPolicy` (serverless-runtime DESIGN.md lines 354–366)
+> or the `retry` control action, which re-runs "with same parameters" (line 888) — **re-invokes
+> the step operation with the same inputs**, and because every key family is a deterministic
+> composition over those inputs (`orderId`, `orderVersion`, the line or gate resolved from
+> `taskRef`/`gateRef`, wave, kind), the same inputs derive the **same key**: the re-invocation is
+> an absorbed duplicate or a still-processing conflict (D-03), never a second effect.
+> `owf_retry_state` is removed; `owf_step_log` records the platform `attempt_id` per row instead,
+> and each operation declares a `retry_class` the platform policy is validated against. The
+> `attempt` component is unchanged in meaning and is now **minted only by `rebuild-wave1`**: a
+> platform retry never increments `wave_attempt`, because a retry is the same logical submit; a
+> rebuild is a new one. The static check in Confirmation gains a clause: no operation derives any
+> key component from `attempt_id`, `invocation_id` or any other platform-supplied value.
+
 ### Confirmation
 
 Confirmed by a test that submits a wave-1 draft-create, retries it under a client-side timeout with the same idempotency key, and asserts Subscriptions returns the original outcome rather than creating a second subscription; by a test that amends the order to a new `orderVersion` before wave-1 completes and asserts the new version's draft-create intent carries a different idempotency key than the superseded version's, so it is not rejected as an in-flight duplicate; by a test asserting draft-create and activation for the same line and same order version carry different idempotency keys; by a test asserting a `draft_void` for a line carries a different idempotency key than the `draft_create` it reverses, and an `activated_cancel` a different key than the `activation` it reverses, so neither compensating submit is absorbed as a duplicate of its forward submit; by a test asserting a wave-1 rebuild increments `wave_attempt` and produces a key distinct from every prior attempt's; by a test asserting a `gateId` re-derived after a simulated crash equals the one derived before it; and by a static/schema check asserting no code path assigns the same value to both the idempotency-key field and the correlationId field on an outbound intent, and that no key is minted without a tenant prefix.

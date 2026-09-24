@@ -67,6 +67,23 @@ The distinction matters where a create is accepted **after** an activation, whic
   * Because neither step is irreversible, the no-pivot claim holds over the whole registered step set and not merely over the two waves.
 * This decision forecloses building a forward-recovery-only path for activation failures in this phase; a future phase that needs one would require a new ADR, not a silent extension of this one.
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the **structure** of compensation moves into the platform definition; the **ordinal** and the
+> reverse walk stay in this gear. The forward path is wrapped in `try`; its `catch` — and the
+> authorized-cancel arm — call, in this order, `run-cancellation-fence`, `compensate-order` and
+> `report-outcome`, all `protected`, and ADR-0012 rule 1 makes that order a publish condition.
+> `compensate-order` is **one** operation: the whole descending walk over the persisted
+> forward-execution ordinal (`owf_compensation_record.compensation_sequence`) happens inside it,
+> because the ordinal is this gear's record and a definition holds no view of it — a definition
+> that tried to express the walk as per-line tasks could only order by wave, which is exactly the
+> second formulation this ADR refuses. An incompletable compensating action is still a manual task
+> with a leg-specific reason and a non-terminal order; the operation returns a `terminal` outcome
+> class to the definition and the manual task carries the detail (ADR-0013). Whether the
+> platform's function-level `on_failure`/`on_cancel` safety net (serverless-runtime DESIGN.md
+> lines 402–409), which takes a registered GTS function reference, can target this gear's
+> `compensate-order` route is an upstream ask; until it can, the safety net for an invocation that
+> ends without `report-outcome` is the reconciliation sweep's `settle-from-lookup`.
+
 ### Confirmation
 
 Confirmed by a saga test that provisions three lines (two activated, one still draft, the draft created *after* both activations via a wave-1 rebuild), fails the order, and asserts the walk follows descending `execution_seq` — so the later-created draft is voided *before* the two activated lines are cancelled, and a dependent is never left behind its dependency; by a second test on a plain order (no rebuild) asserting the same rule yields the wave-grouped sequence, activated set first; by a test asserting the compensation scan reads a persisted `execution_seq` rather than deriving order from a timestamp or from row order; by a test asserting `evaluate-payment-auth-eligibility` dispatches no compensating action and `begin-fulfillment` compensates through the terminal-outcome report; by a test asserting a failed activated-cancel produces a manual task with a cancel-specific reason and leaves the order non-terminal rather than reporting `fulfillment_failed`; and by a test asserting a failed draft-void produces a distinct void-specific manual-task reason.

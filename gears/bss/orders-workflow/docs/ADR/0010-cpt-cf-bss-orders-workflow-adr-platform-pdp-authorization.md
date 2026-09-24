@@ -140,6 +140,26 @@ already taken, so the two Orders gears share one authorization contract. Concret
 * Provisioning of roles, the approver grant and the service-principal grants, and their verification against the deployed provider, are release prerequisites owned by the platform policy owner (`UPSTREAM_REQS.md` §2.8).
 * Three Workflow controls the local evaluator carried are kept as local guards, because the PDP has no input for them: separation of duties at the decision endpoint (D-56), the gateway's pre-PDP refusal of a service `subject_type` on a human-actor arm and of a human subject on a service arm (`design/09-read-and-authz.md` §3.6), and the rule that no service principal drives an order state transition (the R1 seam, enforced by the catalogue: no `(resource, action)` pair a service principal holds writes order state).
 
+> **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
+> the step operations join the catalogue. A new resource type
+> `gts.cf.bss.orders_workflow.process_step.v1~` with the single action `execute` covers every
+> route under `POST /bss-orders-workflow/v1/steps/{operation}`; the operation name is supplied to
+> the PDP as a resource property, and the only principal that may hold the pair is the
+> **serverless-runtime service principal** (`subject_type` service, `token_scopes` naming this
+> gear), refused pre-PDP for any human subject exactly as the existing service arms are. The
+> caller supplies references (ADR-0013), never authority: inside the operation, seam reads and
+> writes run under the configured authority the step executor held, narrowed to the bound
+> instance's tenant axes — the bounded exception above now names the step operations as the step
+> executor's REST-invoked form, and still never extends to human-actor REST, SDK or event paths.
+> The R1 rule is preserved by the same argument: `process_step × execute` writes process state;
+> the order state transitions it triggers are made by this gear's seam calls under this gear's
+> authority, not by the caller's grant. The platform's own APIs — definition publish on the
+> Function Registry, invocation start and `:control`/`:plugin-control` — are **authorized
+> platform-side** (serverless-runtime DESIGN.md line 847); this gear's control operations that
+> map onto them (`09 §3.3`) authorize the operator here first and then call the platform as
+> this gear's service principal. The conformance test's route count grows by one per registered
+> operation and the worker exception's roster shrinks to the three workers of D-62 as amended.
+
 ### Confirmation
 
 Verified by: a startup test asserting the service refuses to start without a resolvable
