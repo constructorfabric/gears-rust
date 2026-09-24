@@ -82,6 +82,44 @@
   - [D-62 (M) Workflow-owned workers coordinate through toolkit-db session advisory locks under a named roster](#d-62-m-workflow-owned-workers-coordinate-through-toolkit-db-session-advisory-locks-under-a-named-roster)
   - [D-63 (H) Authorization is delegated to the platform PDP through the shared PolicyEnforcer adapter](#d-63-h-authorization-is-delegated-to-the-platform-pdp-through-the-shared-policyenforcer-adapter)
   - [D-64 (M) Refusal reasons follow the platform ContractError contract](#d-64-m-refusal-reasons-follow-the-platform-contracterror-contract)
+- [M. The flow as a platform definition (ADR-0011…0013) and the slice operations](#m-the-flow-as-a-platform-definition-adr-00110013-and-the-slice-operations)
+  - [D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime](#d-65-h-the-order-process-flow-is-a-versioned-platform-workflow-definition-executed-by-serverless-runtime)
+  - [D-66 (H) References, not payloads, cross the engine boundary](#d-66-h-references-not-payloads-cross-the-engine-boundary)
+  - [D-67 (H) Protected steps are fenced by six validation rules and by run-time guards](#d-67-h-protected-steps-are-fenced-by-six-validation-rules-and-by-run-time-guards)
+  - [D-68 (H) Instances are pinned to their definition version; the platform operator publishes](#d-68-h-instances-are-pinned-to-their-definition-version-the-platform-operator-publishes)
+  - [D-69 (H) The step operation is the unit of work, behind one internal step surface](#d-69-h-the-step-operation-is-the-unit-of-work-behind-one-internal-step-surface)
+  - [D-70 (H) Timers, waits and task retry policy are the platform's](#d-70-h-timers-waits-and-task-retry-policy-are-the-platforms)
+  - [D-71 (M) The worker roster is three workers, and the sweep selects every due intent](#d-71-m-the-worker-roster-is-three-workers-and-the-sweep-selects-every-due-intent)
+  - [D-72 (M) Inbound dead letters are the platform trigger path's; `owf_dead_letter_record` is retired](#d-72-m-inbound-dead-letters-are-the-platform-trigger-paths-owf_dead_letter_record-is-retired)
+  - [D-73 (H) Start is the platform event trigger; the REST start route is removed](#d-73-h-start-is-the-platform-event-trigger-the-rest-start-route-is-removed)
+  - [D-74 (M) The idempotency key families gain the trigger family and two round components](#d-74-m-the-idempotency-key-families-gain-the-trigger-family-and-two-round-components)
+  - [D-75 (M) Supersession is unwind-then-start, and admission waits for the prior instance](#d-75-m-supersession-is-unwind-then-start-and-admission-waits-for-the-prior-instance)
+  - [D-76 (M) The seller axis is resolved inside Orders and carried from admission to start](#d-76-m-the-seller-axis-is-resolved-inside-orders-and-carried-from-admission-to-start)
+  - [D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-two](#d-77-m-twelve-reasons-are-registered-for-the-step-operations-the-catalogue-holds-forty-two)
+  - [D-78 (M) The barrier and the park are definition patterns over Orders guards](#d-78-m-the-barrier-and-the-park-are-definition-patterns-over-orders-guards)
+  - [D-79 (M) Each wave is one `call` carrying the line set as references](#d-79-m-each-wave-is-one-call-carrying-the-line-set-as-references)
+  - [D-80 (M) Competing-fork arms only listen or wait; one shared return, and a hold pauses only the approval stage](#d-80-m-competing-fork-arms-only-listen-or-wait-one-shared-return-and-a-hold-pauses-only-the-approval-stage)
+  - [D-81 (M) One shared unwind path: fence, compensate, report, terminate](#d-81-m-one-shared-unwind-path-fence-compensate-report-terminate)
+  - [D-82 (M) A lifetime-ceiling park is allowed from `suspended`; a parked instance unwinds only through the fence](#d-82-m-a-lifetime-ceiling-park-is-allowed-from-suspended-a-parked-instance-unwinds-only-through-the-fence)
+  - [D-83 (H) `compensate-order` is one operation over the Orders-owned ordinal, resumable by pass](#d-83-h-compensate-order-is-one-operation-over-the-orders-owned-ordinal-resumable-by-pass)
+  - [D-84 (M) The apply-time cancel re-check runs once, and withdrawn authority becomes a task](#d-84-m-the-apply-time-cancel-re-check-runs-once-and-withdrawn-authority-becomes-a-task)
+  - [D-85 (M) The cancel request is a slice-09 table; task requests are slice 07's](#d-85-m-the-cancel-request-is-a-slice-09-table-task-requests-are-slice-07s)
+  - [D-86 (M) An operator re-drive keeps the invocation, or the instance is unwound and re-submitted](#d-86-m-an-operator-re-drive-keeps-the-invocation-or-the-instance-is-unwound-and-re-submitted)
+  - [D-87 (M) One outage threshold governs the park clock, and the gate-open outage pause is a probe arm](#d-87-m-one-outage-threshold-governs-the-park-clock-and-the-gate-open-outage-pause-is-a-probe-arm)
+  - [D-88 (L) The approval routing plan is saved at the first `open-gates`](#d-88-l-the-approval-routing-plan-is-saved-at-the-first-open-gates)
+  - [D-89 (M) Lifecycle is the sole evaluator of tolerate-failure](#d-89-m-lifecycle-is-the-sole-evaluator-of-tolerate-failure)
+  - [D-90 (M) Payments is read on request, polled by a definition wait](#d-90-m-payments-is-read-on-request-polled-by-a-definition-wait)
+  - [D-91 (M) The overlap and market re-check is advisory at construction and authoritative before wave 2](#d-91-m-the-overlap-and-market-re-check-is-advisory-at-construction-and-authoritative-before-wave-2)
+  - [D-92 (M) A plan-level failure never leaves `approved` by itself](#d-92-m-a-plan-level-failure-never-leaves-approved-by-itself)
+  - [D-93 (L) Sizes: SLA population N ≤ 40 lines, a 200-line cap, 30-day authorization validity](#d-93-l-sizes-sla-population-n--40-lines-a-200-line-cap-30-day-authorization-validity)
+  - [D-94 (M) Remediation exhaustion is the one automatic path that compensates activated lines](#d-94-m-remediation-exhaustion-is-the-one-automatic-path-that-compensates-activated-lines)
+  - [D-95 (M) An operator retry returns a failed line to its pre-wave state](#d-95-m-an-operator-retry-returns-a-failed-line-to-its-pre-wave-state)
+  - [D-96 (M) An admission deferral is a settled success, over a slice-05 admission table](#d-96-m-an-admission-deferral-is-a-settled-success-over-a-slice-05-admission-table)
+  - [D-97 (M) Intent statuses, the confirmation arm and the Subscriptions tuple](#d-97-m-intent-statuses-the-confirmation-arm-and-the-subscriptions-tuple)
+  - [D-98 (M) The manual-task reason enum is a catalogue subset, and SLA classes are 4 h and 24 h](#d-98-m-the-manual-task-reason-enum-is-a-catalogue-subset-and-sla-classes-are-4-h-and-24-h)
+  - [D-99 (M) The remediation hold is a flag; cancelling the last open forward task exhausts remediation](#d-99-m-the-remediation-hold-is-a-flag-cancelling-the-last-open-forward-task-exhausts-remediation)
+  - [D-100 (M) Task actions record a request and signal; every mutating route requires a key](#d-100-m-task-actions-record-a-request-and-signal-every-mutating-route-requires-a-key)
+  - [D-101 (L) The task queue sorts on the immutable `(created_at, task_id)` key](#d-101-l-the-task-queue-sorts-on-the-immutable-created_at-task_id-key)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -92,6 +130,10 @@
   - [Q-07: Tension between asynchronous outbox publication and the PRD's p95 < 30 s process-event delivery target](#q-07-tension-between-asynchronous-outbox-publication-and-the-prds-p95--30-s-process-event-delivery-target)
   - [Q-08: SUB-O5 (overlap-scope-key presence read) is unagreed, leaving the pre-activation overlap check unevaluable; SUB-O1 (compensation cancellation reason) is critical and unagreed, leaving the activated-cancel reason unspecifiable from this side](#q-08-sub-o5-overlap-scope-key-presence-read-is-unagreed-leaving-the-pre-activation-overlap-check-unevaluable-sub-o1-compensation-cancellation-reason-is-critical-and-unagreed-leaving-the-activated-cancel-reason-unspecifiable-from-this-side)
   - [Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?](#q-09-do-the-orders-gears-and-pricing-converge-on-toolkit-db-session-advisory-locks-or-on-the-gearsbsslibscoord-fenced-lease-for-worker-coordination)
+  - [Q-10: May a seller-scoped role publish definition fragments, or tenants author Functions, in phase 1?](#q-10-may-a-seller-scoped-role-publish-definition-fragments-or-tenants-author-functions-in-phase-1)
+  - [Q-11: Does the platform's DSL express the hold pattern and the other constructs the definition needs, or do they need Functions?](#q-11-does-the-platforms-dsl-express-the-hold-pattern-and-the-other-constructs-the-definition-needs-or-do-they-need-functions)
+  - [Q-12: Engine-history isolation, retention and residency — the pending half of Q-01](#q-12-engine-history-isolation-retention-and-residency--the-pending-half-of-q-01)
+  - [Q-13: Which caller-facing route or event sends `reauthorize-requested` and `unpark-requested`?](#q-13-which-caller-facing-route-or-event-sends-reauthorize-requested-and-unpark-requested)
 - [What This Design Set Does Not Claim](#what-this-design-set-does-not-claim)
 - [Traceability](#traceability)
 
@@ -108,8 +150,8 @@ behaviour rather than silently becoming the platform answer.
 
 This is the whole register for the gear, in one file. It covers every slice — the process engine
 (01), triggers and start (02), approval execution (03), the fulfillment plan (04), provisioning
-intents (05), saga and compensation (06), manual tasks (07), hold and cancel (08), and read and
-authorization (09) — together with the commercial-policy decisions owned elsewhere, the
+intents (05), saga and compensation (06), manual tasks (07), hold and cancel (08), read and
+authorization (09) and the process definition (10) — together with the commercial-policy decisions owned elsewhere, the
 tuning-value working baselines, the cross-cutting decisions, and the open-questions register.
 Numbering starts at `D-01`, runs in one continuous sequence, and is never split across parts.
 Reopening a decision means flipping its status and recording why; no existing identifier is ever
@@ -129,6 +171,8 @@ document relies on `cfs toc`, `cfs validate-toc`, and `cfs check-language` inste
 
 ### D-01: Engine execution history is not the process-audit source of record
 
+**Amended by D-65 (2026-09-24).** The substrate is now selected (D-65, ADR-0011): the platform's Temporal plugin, not this gear, owns retries and timers, and its history is still never the audit trail. The ADR line below is superseded: ADR-0001 is rewritten and Q-01 is answered in two parts.
+
 **Decision**: `owf_step_log` (and any durable-execution substrate run history) exists solely for
 recovery and replay. `owf_audit_entry` is the sole audit source of record, append-only, with no
 UPDATE or DELETE path. A durable-execution substrate is used for retries and durable timers, but
@@ -145,6 +189,8 @@ to an infrastructure choice made via a separate ADR.
 execution history is not the audit source of record`
 
 ### D-02: Four distinct bounds govern execution, not three
+
+**Amended by D-70 (2026-09-24).** The bounds are now **five, with two owners** (`01 §4.2`): the per-operation deadline is the operation's; the retry budget, task timeout, overdue window and lifetime ceiling are the definition's. `owf_retry_state` and `owf_durable_timer` are retired; the structural separation is kept by the definition's distinct `wait` arms and by validation rule 4.
 
 **Decision**: retry budget (governs submission failures only), per-attempt timeout, and step
 deadline are tracked together in `owf_retry_state`. The process deadline (the overdue window) is
@@ -177,6 +223,8 @@ idempotency registry's non-success outcomes are exhaustive`
 
 ### D-04: The dead-letter record and the manual-task record are two separate objects; a failed step never grows a second inspectable object
 
+**Amended by D-72 (2026-09-24).** `owf_dead_letter_record` is retired: an inbound delivery past its cap is the platform event-trigger path's dead letter. The separation this entry states stands — the manual task is still the one inspectable object for a step failure — and `dead-lettered` is no longer an outcome of the step surface.
+
 **Decision**: `owf_dead_letter_record` records **delivery** exhaustion, never step exhaustion. It
 is written only when an inbound Lifecycle trigger, or a Subscriptions / Payments /
 Generic-Approval callback, exhausts its finite delivery-count cap; it is written by the step
@@ -204,6 +252,8 @@ dead-letter record is never an order state`
 ## B. Triggers and start (slice 02)
 
 ### D-05: Trigger intake is a closed, exhaustive vocabulary, admission-checked before any instance spawns
+
+**Amended by D-72 and D-73 (2026-09-24).** Trigger intake is now `admit-trigger`, called first on every trigger arm of the definition; the closed vocabulary is validation rule 3 of ADR-0012, the start triggers are the platform event triggers on `OrderSubmitted` and `OrderAmended`, and the delivery cap is the platform trigger path's.
 
 **Decision**: Trigger Intake subscribes to the Orders Lifecycle state-event stream (event
 subscription, not a command surface Lifecycle calls into) and recognizes a closed trigger
@@ -280,6 +330,8 @@ Idempotency keys must not reuse the process correlation id`
 
 ### D-10: Escalation-timer ownership sits in this gear, undivided across the service boundary
 
+**Amended by D-70 (2026-09-24).** The escalation timer is a definition `wait` executed by the plugin's durable timers; the Escalation Timer Owner component is retired. What stays in this gear, undivided, is the record of the window (`owf_approval_gate.window_remaining_ms`) and the escalation operation `escalate-gate`; Generic Approval still stores no timer state.
+
 **Decision**: the Escalation Timer Owner component is the sole scheduler, persister, and firer of
 every approval gate's escalation timer. The Generic Approval service supplies configuration only
 (window, escalation path) and never stores timer state.
@@ -292,6 +344,8 @@ ownership undivided in this gear removes that ambiguity.
 ownership never splits across a service boundary`
 
 ### D-11: Escalation-timer pause preserves accrued elapsed time on hold and on a Generic Approval outage, and never resets the window
+
+**Amended by D-70 and D-87 (2026-09-24).** The pause is the `pause_causes` of `owf_approval_gate` written through slice 03's gate-window port, and the remainder `window_remaining_ms` is the only remainder authority; `apply-hold`/`apply-resume` return it and the definition re-arms exactly that remainder. The Generic Approval outage pause is a probe arm over `escalate-gate` in `probe` mode (D-87). `owf_timer_pause` is retired.
 
 **Decision**: hold and a Generic Approval service outage on an already-open gate use the same
 pause mechanism owned by the Escalation Timer Owner (D-10). On resume, the timer's previously
@@ -307,6 +361,8 @@ the opposite of the escalation window's purpose.
 Escalation timer fire and approval-service outage pause`
 
 ### D-12: Verdict-source unavailability parks the process fail-closed in `submitted`, and the park never suspends the Lifecycle `submitted` TTL
+
+**Amended by D-78 (2026-09-24).** The park is a definition arm (`park`, a park loop armed by `arm-park-escalation`, exit by `unpark` or the fence); the fail-closed rule and the TTL rule are unchanged, and the park clock is governed by the one outage threshold of D-87.
 
 **Decision**: every verdict-source or approval-service unavailability path parks or pauses the
 process rather than assuming success; the order remains in Lifecycle's `submitted` state. This
@@ -390,6 +446,8 @@ Dependency Ownership Stays With Catalog`, § `2.2 Bundle Lines Are Never Expande
 Construction and Freeze`
 
 ### D-17: Pending and failed payment authorization are two distinct, never-collapsed process outcomes
+
+**Amended by D-90 (2026-09-24).** Payments is read on request inside `evaluate-payment-auth-eligibility`, polled by a definition `wait`; pending and failed stay distinct, and Lifecycle is the sole evaluator of tolerate-failure (D-89).
 
 **Decision**: payment-authorization pending and payment-authorization failed are kept as two
 distinct begin-fulfillment guard outcomes, never collapsed into one. Tolerate-failure and
@@ -496,6 +554,8 @@ already observes toward order state.
 
 ### D-23: A pre-activation draft re-read immediately before every activation intent is the sole detection mechanism for an auto-voided wave-1 draft
 
+**Amended by D-78 (2026-09-24).** The re-read is the operation `reread-draft-liveness`, ordered by the definition immediately before `dispatch-wave2-activate`; the rule that it is the sole detection mechanism stands.
+
 **Decision**: the Draft-Liveness Re-reader re-reads the wave-1 draft's liveness immediately before
 every activation intent, and this re-read is the only detection mechanism this design relies on
 for an auto-voided draft, regardless of cause (hold, platform TTL, or otherwise). No design path
@@ -510,6 +570,8 @@ matter.
 `2.1 Detection by Re-read, Never by Absence of Notification`
 
 ### D-24: A voided wave-1 draft is rebuilt by re-running wave 1 against the same frozen orderId and orderVersion, never by resuming into wave 2
+
+**Amended by D-78 and D-95 (2026-09-24).** The rebuild is the operation `rebuild-wave1`; a lapsed draft routes rebuild → wave 1 in the definition, and `draft_created → pending` (reason `draft-voided`) is driven only by it.
 
 **Decision**: when the pre-activation re-read finds a voided draft, the Wave-1 Rebuilder issues a
 fresh draft-create intent with a fresh idempotency key, against the same frozen `orderId` and
@@ -701,6 +763,8 @@ the only safe deadline mechanism available to this gear.
 
 ### D-35: A hold suspends this gear's own dispatch and timers only; it never pauses, reads, or owns the Subscriptions draft auto-void TTL, and a paused timer resumes with its remaining window, never the full window
 
+**Amended by D-80 (2026-09-24).** A hold is the Lifecycle `OrderHeld` event consumed by a `listen` arm that calls `apply-hold`; it pauses only the approval-escalation `wait`, in the approval stage, and dispatch operations refuse new intents while suspended. The Subscriptions draft TTL rule stands.
+
 **Decision**: `OrderHeld` suspends this gear's own dispatch and timers only. It never pauses,
 reads, or assumes the state of the Subscriptions draft auto-void TTL, which is a foreign
 aggregate's clock and keeps running through a hold; already-accepted provisioning intents run to
@@ -723,6 +787,8 @@ must preserve.
 
 ### D-36: Dependency-retry resilience and the Generic Approval fail-closed park are structurally distinct mechanisms, never one code path branching on dependency name
 
+**Amended by D-70 (2026-09-24).** The retry half is now the definition's task retry policy over `retryable-failure` outcomes; the Dependency Retry Governor is retired. The two mechanisms stay structurally distinct: the park is a separate definition arm.
+
 **Decision**: retry-then-manual-task applies only to Lifecycle/Subscriptions/Payments transient
 unavailability, uses the calling step's existing retry budget, and escalates to a manual task on
 exhaustion. Generic Approval unavailability (once that service exists) is exclusively slice 03's
@@ -743,6 +809,8 @@ condition indefinitely or parking on a merely transient outage that resilience s
 ## J. Read projection and authorization (slice 09)
 
 ### D-37: Every system-actor grant requires a verified service principal — `subject_type` plus `token_scopes` naming the calling gear on REST, the broker's produce grant on the event transport; actor class alone is never sufficient
+
+**Amended by D-69 (2026-09-24).** The event-transport half no longer has a consumer in this gear: the platform consumes the events and every event reaches Orders as a step call from the serverless-runtime service principal under `process_step × execute`. The REST-surface half stands and is the step route's principal check.
 
 **Amended by D-63 (2026-09-24).** The original wording required "a gateway-asserted service
 principal carrying a scope claim naming the calling gear" and, on the event transport, a signed
@@ -798,6 +866,8 @@ values remain unset and routed, per Q-02.
 
 ### D-39: The retry backoff curve is exponential with base 1 s, coefficient 2.0, a 30 s cap and full jitter, over a maximum of 5 submission attempts
 
+**Amended by D-70 (2026-09-24).** The curve is the definition's `use.retries.transient` (exponential from 1 s, jitter 0–30 s, 5 attempts), applied by the platform to operations registered `retryable-on: transient`; the value stands as a working baseline.
+
 **Decision**: the delay before attempt *n* is drawn uniformly from `[0, min(30 s, 1 s * 2^n)]`,
 with a maximum of 5 attempts against intent-submission failures only.
 
@@ -812,6 +882,8 @@ with it.
 
 ### D-40: The per-attempt timeout is 10 s, set from the downstream's service objective rather than from caller patience
 
+**Amended by D-70 (2026-09-24).** The 10 s per-attempt timeout is the per-operation `deadline` of a dispatch operation inside the envelope (`01 §4.2`); record-only operations take 5 s.
+
 **Decision**: a single attempt is cut at 10 s.
 
 **Rationale**: the standard is 3-10x the downstream's p99, not a figure chosen for caller comfort.
@@ -824,6 +896,8 @@ the whole step.
 
 ### D-41: The step deadline is 5 minutes per wave step, derived from the fulfillment service objective rather than chosen
 
+**Amended by D-70 (2026-09-24).** The step deadline is the definition's task timeout: 3 min for wave-2 tasks, 10 min for wave-1 tasks (`01 §4.2`).
+
 **Decision**: each wave step is bounded at 5 minutes, inclusive of all attempts and backoff.
 
 **Rationale**: this is a derivation, not a preference. The PRD's p95 <= 15 minutes for a standard
@@ -835,6 +909,8 @@ unsatisfiable by construction; a smaller one would fail healthy slow provisionin
 
 ### D-42: The nesting invariant over the four bounds is asserted at configuration load, and a violating configuration is refused at startup
 
+**Amended by D-67 and D-70 (2026-09-24).** The nesting invariant is validation rule 4 of ADR-0012, refused before publish and in CI; the gear additionally refuses readiness when an operation's `deadline_ms` breaks it against a bound version.
+
 **Decision**: per-attempt timeout **<** step deadline **<** process deadline must hold, and a
 configuration violating that ordering is refused at startup rather than accepted.
 
@@ -845,6 +921,8 @@ as documentation is what makes the four-bound model in D-02 enforceable instead 
 **Propagates to**: `design/01-foundation.md` §4.2 (the nesting invariant is normative)
 
 ### D-43: A gear-wide retry budget caps retries at 10% of request volume with adaptive throttling, in addition to the per-request attempt cap
+
+**Amended by D-70 (2026-09-24).** The gear-wide retry share is asked of the platform as a property of its task retry policy (`…-upreq-serverless-runtime-readiness-gate`); remaining-budget propagation is the ask `…-upreq-serverless-runtime-attempt-and-deadline-propagation`.
 
 **Decision**: the retry/backoff controller enforces a gear-wide retry share, working baseline 10%
 of request volume over a sliding window, with adaptive client-side throttling beyond it. The
@@ -861,6 +939,8 @@ clean up.
 **Propagates to**: `design/01-foundation.md` §4.5 (a retry budget bounds the gear, not just the request)
 
 ### D-44: Per-order line parallelism is 8; the cross-process aggregate limit is sized by Little's Law from measured capacity and preferably adaptive; the dead-letter delivery cap is 5
+
+**Amended by D-72 and D-96 (2026-09-24).** The parallelism and aggregate caps are admission controls inside the dispatch operations over `owf_dispatch_admission` (slice 05); the dead-letter delivery cap is the platform trigger path's.
 
 **Decision**: 8 parallel lines per order; the aggregate in-flight-intent limit carries the working
 baseline **256 concurrent intents gear-wide**, to be replaced by the `L = lambda * W` derivation
@@ -883,6 +963,8 @@ without parking a payload a brief blip would have cleared.
 
 ### D-45: The reconciliation-sweep ladder is 30 s to 1 h with jitter and a bounded page size, and must resolve every intent inside the overdue window
 
+**Amended by D-71 (2026-09-24).** The ladder drives `owf_provisioning_intent.next_sweep_at`, and the `reconciliation-sweep` worker selects every due intent; the definition's poll arm is an early read.
+
 **Decision**: escalating re-reads at 30 s, 1 min, 2 min, 5 min, 15 min, 1 h, capped hourly, each
 wake-up jittered, each pass bounded by page size; the ladder must reach a terminal outcome or the
 dead-letter floor within the 24 h overdue window.
@@ -900,6 +982,8 @@ recovery for. The schedule stated above is retained for every intent outside tha
 **Propagates to**: `design/05-provisioning-intents.md` §4.2 (reconciliation-sweep schedule)
 
 ### D-46: Generic Approval outage detection is fixed with a circuit breaker, while the escalation threshold remains deliberately unset
+
+**Amended by D-87 (2026-09-24).** The circuit breaker stays in the envelope (`circuit-breaker-open`); the relational threshold governs both the park clock and the gate-open outage probe arm.
 
 **Decision**: the verdict gateway detects unavailability through a circuit breaker opening at a
 50% failure rate over a sliding window of 20 calls, held open 60 s, then probed half-open. The
@@ -936,6 +1020,8 @@ retained so a later reader can argue with the value rather than guess at where i
 
 ### D-47: Idempotency keys form four tenant-prefixed families, and `gateId` is derived rather than minted
 
+**Amended by D-74 (2026-09-24).** A fifth family is added — the event-scoped trigger family `{tenant}:{eventId}:admit-trigger[:listen]` — plus an instance-scoped family for record-only operations; `begin-fulfillment`'s key ends in the eligibility round and `compensate-order`'s in the pass.
+
 **Decision**: every idempotency key in this gear is prefixed with `resource_tenant_id`, so key
 spaces are tenant-namespaced and two tenants can never collide. Four families exist and no fifth is
 invented:
@@ -969,6 +1055,8 @@ composition, including this family set.
 
 ### D-48: Three tenant axes, and every gear-owned table carries at least the resource axis
 
+**Amended by D-69 (2026-09-24).** `owf_step_operation` is load-only configuration and carries no tenant column — the one stated exemption to this entry.
+
 **Decision**: this gear adopts the sibling Orders Lifecycle set's three tenant axes by name —
 `resource_tenant_id` (resource recipient), `payer_tenant_id` (billing party), `seller_tenant_id`
 (selling party). Every one of the gear's `owf_*` tables carries **at least** `resource_tenant_id`,
@@ -989,6 +1077,8 @@ inventing new ones keeps cross-gear joins and operator tooling consistent.
 tables), and the §3.7 of every slice that declares a table; `DESIGN.md` §3.7 (table registry)
 
 ### D-49: Optimistic concurrency is a row version surfaced as an ETag, and one active instance per order is a partial unique index
+
+**Amended by D-75 (2026-09-24).** The partial unique index now also arbitrates supersession: the new version's `admit-trigger` answers `prior-instance-active` until the prior instance is terminal, replacing the atomic terminate-then-start step.
 
 **Decision**: `owf_process_instance` and `owf_manual_task` each carry
 `row_version bigint NOT NULL DEFAULT 0`, incremented on every write, surfaced to callers as an
@@ -1078,6 +1168,8 @@ the sweep the load spike it exists to recover from.
 
 ### D-53: A non-pausable `max_process_lifetime` of 90 days bounds every process, independently of order state
 
+**Amended by D-70 and D-82 (2026-09-24).** The lifetime ceiling is a top-level definition `wait` arm, never cancelled by a hold; on expiry it calls `raise-overdue-escalation` and `park`, and the park is allowed from `suspended`.
+
 **Accepted.**
 
 **Decision**: an unconditional, non-pausable `max_process_lifetime = 90 days` is armed at process
@@ -1099,6 +1191,8 @@ resume), `gears/bss/orders-workflow/docs/design/01-foundation.md` §4.2 (bounds)
 interim backstop recorded under Q-03
 
 ### D-54: A partial wave-2 failure holds the order; already-activated lines are not rolled back
+
+**Amended by D-94 (2026-09-24).** D-55 remediation exhaustion is the one automatic route to order-level compensation of activated lines; an operator-initiated cancel is the other route.
 
 **Accepted.**
 
@@ -1348,6 +1442,8 @@ model; `design/01-foundation.md` §3.1, §3.7 (`actor`), §4.17 *Verifier*; `UPS
 
 ### D-62 (M) Workflow-owned workers coordinate through toolkit-db session advisory locks under a named roster
 
+**Amended by D-71 (2026-09-24).** The roster is three workers — `reconciliation-sweep`, `retention-purge`, `audit/<audit-tenant UUID>`; `timer-wakeup` and `dead-lease-scan` are removed with the timers.
+
 **Accepted.** *(mirrors Lifecycle D-92's coordination clarification)*
 
 **Decision**: the previously unnamed "coordination lease library" is replaced by
@@ -1431,6 +1527,8 @@ withdrawn), §2.8 (new), §3, §5; D-37 (amended).
 
 ### D-64 (M) Refusal reasons follow the platform ContractError contract
 
+**Amended by D-77 (2026-09-24).** The catalogue now holds forty-two reasons — ten engine families (adding `definition-not-bound`) and thirty-two slice values.
+
 **Accepted.** *(mirrors Lifecycle `01 §4.7` *Refusal reasons are derived GTS error types*)*
 
 **Decision**: every reason in the catalogue of `01 §4.9` is a derived GTS error type under the
@@ -1464,17 +1562,722 @@ shared client. Closes review finding OW-108 (code half).
 `DESIGN.md` §3.3 *Error envelope*; `design/03-approval-execution.md` §3.2, §3.3;
 `design/09-read-and-authz.md` §2.2, §3.3, §4.4.
 
+## M. The flow as a platform definition (ADR-0011…0013) and the slice operations
+
+The decisions in this section were taken when the order process flow moved from Rust code in this
+gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
+each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
+three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
+restructurings recorded. Each names the entries it amends; the amended entries carry a dated
+**Amended by** note. All were taken on 2026-09-24.
+
+### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
+
+**Accepted.** *(carries `ADR/0011`; answers Q-01 part 1)*
+
+**Decision**: the order process flow — step order, branches, waits, the two-wave barrier release,
+event listening, the hold/resume/cancel signal arms and the structure of compensation — is a
+Serverless Workflow v1.0.0 definition registered in the platform gear `serverless-runtime` as a
+`gts.cf.core.sless.workflow.v1~` callable and executed by its Temporal plugin. The definition uses
+`call`, `listen`, `wait`, `switch`, `fork`, `try`/`catch`/`raise` and `set`; it uses no `run`, no
+`emit` and no `for`. This gear provides **step operations** and **the process record**. Adjusting
+the flow is publishing a definition version; changing what a step does is an Orders release. The
+durable-execution substrate is therefore **selected** — not the OSS Workflow Engine and not a
+BSS-local mechanism — and ADR-0001 is rewritten to say so. The platform has no code today; the
+canonical definitions are documentation until the readiness gate of `01 §3.8` passes, and if the
+platform slips only sequencing falls back to code (`definition_source = code`) — the **fallback
+property**, stated as a property of the decomposition and not as a plan.
+
+**Rationale**: it is the only option under which the flow is adjustable without an Orders release
+and no second orchestration engine is built; the code-defined flow, policy points and an
+Orders-local interpreter each keep a timer service, a retry engine and scheduling workers this
+gear would own alone. The record PRD §6.1 requires is unchanged in ownership, transaction shape and
+audit grade.
+
+**ADR**: ADR-0011 (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`); ADR-0001 as rewritten.
+
+**Propagated**: `design/10-process-definition.md` (new); `design/01-foundation.md` §1.1, §3.2, §3.3;
+`DESIGN.md` §1, §2.1, §3.2, §3.5, §4.9; `design/README.md`; Q-01, Q-12.
+
+### D-66 (H) References, not payloads, cross the engine boundary
+
+**Accepted.** *(carries `ADR/0013`)*
+
+**Decision**: a task input or output carries only `correlationId`, `orderId`, `orderVersion`,
+`resource_tenant_id`, the platform `invocation_id`/`attempt_id`, an opaque
+`stepRef`/`taskRef`/`gateRef`/`lineRef`, small closed enums the operations return, and a duration
+or instant a `wait` needs. It never carries a resolved total or price field, catalog or product
+references, line items, approver identities or any `subject_id`, a tenant axis beyond
+`resource_tenant_id`, payment, subscription or transition-request identifiers, the frozen plan,
+approval context, the saga log, or free text. Every operation declares its `input` and `output` as
+GTS reference schemas built from that list, and every operation reads commercial data inside this
+gear under the PDP.
+
+**Rationale**: whatever crosses is persisted in Temporal history this gear neither owns nor
+retains; references answer PRD §15's "which commercial data would sit in engine history" with
+"none" and keep D-61's erasure and ADR-0010's `assigned_principal` constraint enforceable in one
+store. The residual — identifiers in engine history — is bounded by the residency ask and Q-12.
+
+**ADR**: ADR-0013 (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`).
+
+**Propagated**: `design/01-foundation.md` §2.1, §3.3, §4.14; `design/10-process-definition.md`
+§2.1, §2.2 rule 5; every slice §3.3; `DESIGN.md` §2.1, §4.2, §4.3; `UPSTREAM_REQS.md` §2.3, §2.9.
+
+### D-67 (H) Protected steps are fenced by six validation rules and by run-time guards
+
+**Accepted.** *(carries `ADR/0012`, fence half)*
+
+**Decision**: 35 step operations are registered: **22 `protected`** — `start-instance`,
+`settle-from-lookup` (sweep-only), `terminate-instance`, `admit-trigger`,
+`terminate-on-terminal-event`, `obtain-verdict`, `reflect-verdict`, `record-decision`,
+`construct-and-freeze-plan`, `evaluate-payment-auth-eligibility`, `re-check-pre-activation`,
+`begin-fulfillment`, `dispatch-wave1-create`, `dispatch-wave2-activate`, `report-spawn-signal`,
+`run-cancellation-fence`, `compensate-order`, `report-outcome`, `create-manual-task`,
+`apply-hold`, `apply-resume`, `authorize-cancel` — and **13 `composable`**. A protected operation
+may be ordered by a definition, never omitted or replaced. A version is publishable only if it
+passes six rules over the whole definition: protected operations present in their order
+constraints; every `call` to a registered operation (a Function only for a composable one); every
+`listen` inside the closed set; bounds nest (per-operation deadline < retry budget < task timeout
+< overdue window < lifetime ceiling); no payload field crosses; no protected operation inside a
+`catch` that continues the forward path. `design/10` §2.2 states the same rules as eight numbered
+checks, adding the grammar subset and the fork-routing convention. The rules run in a pre-publish
+validation hook (an upstream ask) and in a CI test over the canonical definitions; independently,
+every protected operation re-checks its own precondition in Orders' record and refuses with a
+catalogue reason, so a definition that bypasses the static fence fails closed at the first
+protected operation it misorders.
+
+**Rationale**: the PRD's `p1` invariants are properties of the path, not of one task, so only a
+whole-definition check fences them; human review cannot check a nesting inequality or a schema;
+and the run-time guard makes the fence hold even for a publish outside the pipeline.
+
+**ADR**: ADR-0012 (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`).
+
+**Propagated**: `design/10-process-definition.md` §2.2, §4.1, §4.2, §4.6; each slice §3.3
+`protection`; `design/09-read-and-authz.md` §3.1; `DESIGN.md` §2.2, §4.2.
+
+### D-68 (H) Instances are pinned to their definition version; the platform operator publishes
+
+**Accepted.** *(carries `ADR/0012`, versioning half)*
+
+**Decision**: `start-instance` writes `owf_definition_binding` (`correlation_id`, `definition_id`,
+`definition_version`, `definition_source` ∈ `platform | code`, `pinned_at`, `published_by`,
+`resource_tenant_id`) in the instance-creating transaction; `owf_process_instance.definition_version`
+references it; the instance runs to termination on that version; there is no migration (PRD §5.2).
+A version is never archived or deleted while a binding names it (an upstream ask on the platform
+lifecycle). The publish role is the platform operator, authorized by the platform on its registry;
+a seller-scoped fragment role is Q-10 and is not granted. Every publish must be attributable; until
+the platform audits publishes, the CI run, the registry's version listing and
+`owf_definition_binding.published_by` are the evidence.
+
+**Rationale**: PRD §6.1 requires the version recorded on the instance and in the audit trail, and
+§5.2 excludes migration; the platform pins an invocation to its callable version (serverless-runtime
+DESIGN.md line 614), and Orders must hold the same pin on its side.
+
+**ADR**: ADR-0012.
+
+**Propagated**: `design/01-foundation.md` §3.3 *start-instance*, §3.7; `design/10-process-definition.md`
+§2.2 *Versioning, pinning, publish*, §4.3; `DESIGN.md` §3.6 *Publish a definition version and pin
+an instance*; `UPSTREAM_REQS.md` §2.9; Q-10.
+
+### D-69 (H) The step operation is the unit of work, behind one internal step surface
+
+**Accepted.**
+
+**Decision**: every step the definition can order is an Orders operation on
+`POST /bss-orders-workflow/v1/steps/{operation}`, one route per registered operation, callable only
+by the serverless-runtime service principal (`subject_type` service, `token_scopes` naming this
+gear) and authorized as `gts.cf.bss.orders_workflow.process_step.v1~` × `execute` with the
+operation name as a resource property; 34 values are granted, `settle-from-lookup` to none. Each
+operation is declared once in its slice §3.3 with `name`, `protection`, `input`, `output`,
+`idempotency_key`, `declared_event`, `compensation`, `reasons`, `audit_kind`, `retry_class`,
+`deadline`, mirrored into `owf_step_operation`, which is load-only, audited on load and carries
+**no tenant column** — the one stated exemption to D-48, because it is configuration, not a
+process record. Every operation runs inside the envelope: registry resolution before the effect,
+record, audit, declared event and settlement in one transaction after it, answer only after
+commit. Orders subscribes to no topic: the event-handler rows of `09` are removed and every event
+reaches Orders as a step call.
+
+**Rationale**: an HTTP route with a declared reference schema is the only boundary the platform's
+`call` task can reach and the only one this gear can authorize, audit and replay-proof uniformly;
+declaring each operation once keeps the definition, the PDP catalogue and the registry in lockstep
+by a startup assertion in both directions.
+
+**ADR**: ADR-0011; ADR-0010 as amended.
+
+**Propagated**: `design/01-foundation.md` §3.2, §3.3, §3.7; `design/09-read-and-authz.md` §3.1,
+§3.3, §4.1; `DESIGN.md` §3.3, §4.2; D-37, D-48.
+
+### D-70 (H) Timers, waits and task retry policy are the platform's
+
+**Accepted.** *(amends D-02, D-10, D-11, D-39…D-46, D-49, D-53)*
+
+**Decision**: every timer — escalation window, park escalation, expected-fulfillment wait,
+barrier poll, overdue window, lifetime ceiling, SLA clock — is a definition `wait` executed by the
+plugin's durable timers; the task retry policy (`use.retries.transient`: exponential from 1 s,
+jitter to 30 s, 5 attempts, on `$error.status` ∈ {429, 503, 504, 409}) re-issues only operations
+registered `retryable-on: transient`, under the same idempotency key. `owf_durable_timer`,
+`owf_retry_state` and slice 08's `owf_timer_pause` are **retired**; Orders records the platform
+`attempt_id` and its own attempt number on every `owf_step_log` row. There are **five bounds, two
+owners** (`01 §4.2`): the per-operation deadline is the operation's; the retry budget, task
+timeout, overdue window and lifetime ceiling are the definition's, and their nesting is validation
+rule 4. The per-dependency retry budgets of the former Dependency Retry Governor are superseded by
+the definition's per-task retry policy, which **MAY** be tighter per task and **MUST** nest inside
+the task timeout. The only remainder authority for a paused escalation window is
+`owf_approval_gate.window_remaining_ms` with `pause_causes`, written through slice 03's gate-window
+port.
+
+**Rationale**: a durable timer service and a retry controller in a business gear are the
+duplication ADR-0005 of serverless-runtime refuses; the plugin already owns them. What PRD §6.1
+requires Orders to hold of them is evidence — the attempt per step record and the remaining window
+— not the scheduling.
+
+**ADR**: ADR-0011; ADR-0006 and ADR-0007 as amended.
+
+**Propagated**: `design/01-foundation.md` §3.7 *Retired tables*, §4.2, §4.4; `design/03-approval-execution.md`
+§3.7; `design/08-hold-and-cancel.md` §3.2, §3.7; `design/10-process-definition.md` §2.2;
+`DESIGN.md` §3.7, §4.8.
+
+### D-71 (M) The worker roster is three workers, and the sweep selects every due intent
+
+**Accepted.** *(amends D-62)*
+
+**Decision**: the advisory-locked roster of `01 §3.8` is `reconciliation-sweep`,
+`retention-purge` and `audit/<audit-tenant UUID>`. `timer-wakeup` and `dead-lease-scan` are
+removed: timers are the platform's, and a dead lease on a dispatching step key is found by
+`reconcile-intent`'s read on the sweep's schedule and settled by `settle-from-lookup`. The sweep's
+candidate set is `next_sweep_at <= now()` over **every non-terminal intent**, one bounded page per
+pass, whether or not the owning instance has a live invocation; it reads invocation status only to
+report intents whose instance has no live invocation. The definition's poll and confirmation arms
+are early reads of the same rows, never a reason to skip one. `retention-purge` additionally purges
+`owf_compensation_record`, `owf_cancellation_fence` and `owf_task_resolution_request` at ≥ 400 days
+and stale `owf_dispatch_admission` seller rows, and holds no grant on `owf_definition_binding`.
+
+**Rationale**: a sweep that selected only dead-invocation rows would leave a live instance's lost
+confirmation to the definition alone; selecting by `next_sweep_at` makes the sweep correct
+whether or not the platform is healthy.
+
+**Propagated**: `design/01-foundation.md` §3.8; `design/05-provisioning-intents.md` §3.8;
+`DESIGN.md` §3.8; Q-09.
+
+### D-72 (M) Inbound dead letters are the platform trigger path's; `owf_dead_letter_record` is retired
+
+**Accepted.** *(amends D-04, D-05, D-44)*
+
+**Decision**: an inbound delivery that exhausts its cap — a Lifecycle trigger, the approval
+decision or a Subscriptions outcome the platform could not deliver to an invocation — is the
+platform event-trigger path's dead letter (serverless-runtime DESIGN.md line 976). Orders writes no
+dead-letter row: `owf_dead_letter_record` is retired, and the registry's `delivery_count` with it.
+`owf_dead_letter_triage` and the three dead-letter routes of `09 §4.1` are **pending** the
+platform's answer on operator visibility (`…-upreq-serverless-runtime-dead-letter-operator-visibility`);
+if it is declined they are retired rather than rebuilt on an Orders copy. The manual task remains
+the one inspectable object for a step-level failure, and `dead-lettered` is not an outcome of the
+step surface.
+
+**Rationale**: once the platform consumes the events, the delivery cap is the platform's; an
+Orders copy of the platform's dead letter would be the second inspectable object ADR-0009 exists to
+prevent.
+
+**ADR**: ADR-0009 as amended.
+
+**Propagated**: `design/01-foundation.md` §3.3, §3.7 *Retired tables*, §4.8; `design/07-manual-tasks.md`
+§3.7; `design/09-read-and-authz.md` §3.1, §4.1; `DESIGN.md` §3.7, §4.4, §4.5; `UPSTREAM_REQS.md` §2.9.
+
+### D-73 (H) Start is the platform event trigger; the REST start route is removed
+
+**Accepted.**
+
+**Decision**: PRD §9.1 *Start workflow* is realised by two serverless-runtime event triggers on the
+`order_process` callable — `OrderSubmitted` (filtered to `category = new_sale`) and `OrderAmended`
+— whose invocation's first calls are `admit-trigger` (`role: start`) and `start-instance`. The
+start-trigger set is `{OrderSubmitted, OrderAmended}`, because Lifecycle publishes no
+`OrderSubmitted` after an amendment. `POST /bss-orders-workflow/v1/workflows` is removed, the
+`process_instance × start` action is retired, and no Orders route calls
+`POST /api/serverless-runtime/v1/invocations`.
+
+**Rationale**: a REST start would be a second entry into the process the definition does not see;
+the trigger is the platform's own mechanism for event-driven invocation, and the admission guard is
+the same protected operation on every path.
+
+**Propagated**: `design/02-triggers-and-start.md` §2.2, §3.3; `design/10-process-definition.md`
+§2.2 rule 7, §3.3; `design/09-read-and-authz.md` §3.1, §3.3, §4.1; `DESIGN.md` §3.3;
+`UPSTREAM_REQS.md` §2.8 item 4, §4 item 8.
+
+### D-74 (M) The idempotency key families gain the trigger family and two round components
+
+**Accepted.** *(amends D-47; ADR-0006 as amended)*
+
+**Decision**: a fifth family is added for event-scoped admission, `trigger`:
+`{tenant}:{eventId}:admit-trigger[:listen]`, carried in `owf_step_operation.key_family`; an
+instance-scoped family `{tenant}:{correlationId}:{name}[:{subject}][:{attempt}]` covers the
+record-only operations. Two instance-bound keys carry a round component: `begin-fulfillment`'s
+lifecycle-transition key ends in the eligibility round (`…:begin-fulfillment:{eligibilitySeq}`), so
+a re-evaluated eligibility is a new transition attempt and a replay of the committed round is
+absorbed by both gears; and `compensate-order`'s step key ends in the pass
+(`…:compensate-order:{pass}`). The platform's same-key re-invocation is absorbed by every family.
+
+**Rationale**: an admission happens before an instance exists, so no instance-bound key can name
+it; and a begin-fulfillment or a compensation pass that legitimately repeats must not be absorbed
+as a duplicate of the previous round.
+
+**ADR**: ADR-0006 as amended.
+
+**Propagated**: `design/01-foundation.md` §3.3 *The step-operation contract*;
+`design/02-triggers-and-start.md` §2.1; `design/04-fulfillment-plan.md` §3.3, §4.1;
+`design/06-saga-and-compensation.md` §3.3.
+
+### D-75 (M) Supersession is unwind-then-start, and admission waits for the prior instance
+
+**Accepted.** *(replaces the atomic terminate-then-start step; D-06 and D-07 stand; amends D-49's use of the one-active-instance index)*
+
+**Decision**: when an `OrderAmended` supersedes a version whose instance is still running, the
+prior invocation's `listen` arm runs the shared unwind path (fence, compensate, report
+`superseded`, terminate) while the new version's invocation, started by the trigger, holds its
+admission `open`: `admit-trigger` answers `prior-instance-active` (409) until the prior instance is
+terminal, under a dedicated `supersession` retry policy (constant 5 min, up to 24 h). The partial
+unique index `UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates the race; it is never
+bypassed.
+
+**Rationale**: two invocations cannot share one atomic transaction; the ordering the atomic step
+gave is kept by the index and the held admission, and a longer, constant retry fits an unwind that
+may wait on Subscriptions for hours.
+
+**Propagated**: `design/02-triggers-and-start.md` §4.3, §4.7; `design/10-process-definition.md`
+§3.6 (a), (f).
+
+### D-76 (M) The seller axis is resolved inside Orders and carried from admission to start
+
+**Accepted.**
+
+**Decision**: `start-instance` reads `seller_tenant_id` (and `payer_tenant_id`) from the settled
+result of `admit-trigger`, which resolved them from Lifecycle inside Orders, never from the task
+input; the definition never carries a seller or payer axis.
+
+**Rationale**: ADR-0013 keeps every tenant axis beyond `resource_tenant_id` out of engine history,
+and `start-instance` needs the seller axis for every seller-scoped row it writes.
+
+**Propagated**: `design/01-foundation.md` §3.3 *start-instance*; `design/02-triggers-and-start.md` §3.3.
+
+### D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-two
+
+**Accepted.** *(amends D-64's counts)*
+
+**Decision**: `01 §4.9` registers `trigger-applicability-unverified` (503) and
+`prior-instance-active` (409) for slice 02; `identity-party-unavailable` for slice 04;
+`activation-precondition-unmet` (409) and `intent-unresolved` (400) for slice 05;
+`fence-not-claimed` and `outcome-not-reportable` for slice 06; `order-fenced`,
+`action-not-offered`, `override-unverified`, `lifetime-ceiling-reached` and
+`approval-reflection-refused` for slice 07. The engine contributes ten families (adding
+`definition-not-bound`); the catalogue is **42** reasons — ten engine, thirty-two slice.
+
+**Rationale**: a reason a slice raises but the catalogue does not register does not compile
+(D-64); registering them once with their categories stops two slices choosing different statuses.
+
+**Propagated**: `design/01-foundation.md` §3.3 *Error surface*, §4.9; slices 02, 04, 05, 06, 07 §3.3;
+`DESIGN.md` §3.3 *Error envelope*.
+
+### D-78 (M) The barrier and the park are definition patterns over Orders guards
+
+**Accepted.** *(amends D-12, D-23, D-24; ADR-0004 and ADR-0007 as amended)*
+
+**Decision**: the two-wave barrier is a definition pattern — the expected-fulfillment `wait` over
+the instant `construct-and-freeze-plan` returns, and the eligibility re-evaluation — whose
+all-creates half and conjunction are `evaluate-activation-eligibility`, and whose run-time guard is
+`dispatch-wave2-activate`'s refusal (`activation-precondition-unmet`) unless every task of the
+frozen plan is `draft_created` and the instant has passed by database time. The pre-activation
+draft re-read (D-23) is `reread-draft-liveness`, and the wave-1 rebuild (D-24) is `rebuild-wave1`,
+both ordered by the definition before wave 2; a lapsed draft routes rebuild → wave 1. The
+fail-closed park (D-12) is a definition arm — `park`, then a park loop whose escalation `wait` is
+armed by `arm-park-escalation` — and exits only through `unpark` or the fence; it never suspends
+the Lifecycle `submitted` TTL.
+
+**Rationale**: timing and ordering are the definition's under D-65; the invariants those
+mechanisms protect stay Orders' guards so a publish cannot weaken them.
+
+**ADR**: ADR-0004, ADR-0007 as amended.
+
+**Propagated**: `design/03-approval-execution.md` §3.3, §4.2; `design/04-fulfillment-plan.md`
+§3.3; `design/05-provisioning-intents.md` §3.3; `design/10-process-definition.md` §3.6 (a), (b).
+
+### D-79 (M) Each wave is one `call` carrying the line set as references
+
+**Accepted.**
+
+**Decision**: `dispatch-wave1-create` and `dispatch-wave2-activate` are each **one** `call` per wave
+carrying the wave's line set as references; the per-order parallel-line cap and every other
+admission control run inside the operation. There is no per-line `fork`.
+
+**Rationale**: the DSL's `for` iterates sequentially and `fork` takes a static branch list, so it
+has no dynamic per-line fan-out (Q-11 (iii)); putting the fan-out inside the operation also keeps
+the concurrency bound where the admission state is.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.3, §4.3; `design/10-process-definition.md`
+§2.2; ADR-0004 and ADR-0012 rule 1.
+
+### D-80 (M) Competing-fork arms only listen or wait; one shared return, and a hold pauses only the approval stage
+
+**Accepted.**
+
+**Decision**: every branch of a competing `fork` only `listen`s or `wait`s and then `set`s `arm`;
+no step operation runs inside a competing branch, so a losing branch is never cancelled halfway
+through an operation, and the sibling `switch` routes the winner to the path that calls the
+operation. Every stage loop records its name in `$context.stageLoop`; the shared paths that return
+to the stage an arm left end in `returnToStage`. A hold enters the resume wait (pausing the
+escalation `wait` with the remainder Orders returns) **only in the approval stage**; elsewhere the
+hold is recorded by `apply-hold` and the stage loop continues, because the barrier, the
+expected-fulfillment and overdue `wait`s and the lifetime ceiling do not pause.
+
+**Rationale**: an operation cancelled mid-flight by a competing arm would leave an `open` key and a
+half-recorded effect; routing after the switch keeps every operation whole. Pausing only where PRD
+§6.3 requires a pause keeps the other clocks honest.
+
+**Propagated**: `design/10-process-definition.md` §3.6, §4.5; `design/08-hold-and-cancel.md` §3.3.
+
+### D-81 (M) One shared unwind path: fence, compensate, report, terminate
+
+**Accepted.**
+
+**Decision**: every failure, cancel, supersession and terminal-event arm routes to the same unwind
+path — `run-cancellation-fence` → `compensate-order` (repeated by pass until `complete`) →
+`report-outcome` → `terminate-instance`. No path reaches `report-outcome` with `failed`,
+`cancelled` or `superseded` except through `compensate-order`, and none reaches it with `completed`
+except through `dispatch-wave2-activate`.
+
+**Rationale**: one path is one fence rule to validate and one set of run-time guards; four paths
+would be four chances to report before compensating.
+
+**ADR**: ADR-0005, ADR-0012.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (c), (d), (f), §4.1; `design/06-saga-and-compensation.md` §3.3.
+
+### D-82 (M) A lifetime-ceiling park is allowed from `suspended`; a parked instance unwinds only through the fence
+
+**Accepted.**
+
+**Decision**: `01 §3.7` gains `suspended → parked` for `parkReason = lifetime-ceiling`, leaving
+the open suspension open because the hold is still Lifecycle's fact; a parked instance —
+including one parked at the lifetime ceiling — reaches an unwind only by passing the cancellation
+fence (`parked → compensating`). No `suspended → terminated` edge is added: every unwind from hold
+passes `compensating`.
+
+**Rationale**: the lifetime ceiling is non-pausable (D-53) and must bound a held order; parking it
+without closing the suspension keeps the two facts separate.
+
+**Propagated**: `design/01-foundation.md` §3.7 *phase*; `design/08-hold-and-cancel.md` §2.1, §4.8.
+
+### D-83 (H) `compensate-order` is one operation over the Orders-owned ordinal, resumable by pass
+
+**Accepted.** *(ADR-0005 as amended)*
+
+**Decision**: the whole reverse compensation walk is one protected operation, `compensate-order`,
+because the ordinal (`owf_compensation_record.compensation_sequence`) is Orders' record and a
+definition cannot see it. Each call is one bounded **pass** under the key
+`…:compensate-order:{pass}` with a per-pass deadline, and returns `complete`, `in-progress` or
+`pending-escalation`; the definition repeats it while `in-progress`. Each leg carries a
+`submission_failure_count` with a bound of **5**; a leg reaching the bound or the sweep floor
+becomes `failed-pending-escalation` and a manual task is created in that unit of work, under
+either partial-failure policy — compensation failure always escalates to a manual task. The walk
+continues past an escalated leg.
+
+**Rationale**: a definition that expressed the walk as per-line tasks could only order by wave,
+the formulation ADR-0005 refuses; a pass-scoped key makes a long walk resumable without absorbing
+the next pass as a duplicate.
+
+**ADR**: ADR-0005 as amended.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.2, §3.3, §3.7; `design/10-process-definition.md`
+§3.6 (c).
+
+### D-84 (M) The apply-time cancel re-check runs once, and withdrawn authority becomes a task
+
+**Accepted.**
+
+**Decision**: the apply-time re-check of an authorized cancel runs once, in `authorize-cancel`,
+before `run-cancellation-fence`; `report-outcome` does not repeat it. `compensate-order`
+(`pre-compensation`) and `report-outcome` (`pre-submission`) call slice 08's cancel-authority port
+on a cancel run, and on `withdrawn` set `owf_cancellation_fence.reauthorization_required_at`: no
+further leg is submitted and no Lifecycle submission is made until a newly authorized cancel is
+absorbed against the run. Withdrawn authority — and `authorize-cancel` exhausting its retry budget
+— creates an `authority-withdrawn` manual task; the recorded phase does not change.
+
+**Rationale**: repeating the re-check at every step would let a later PDP outage strand a fence
+half-way; marking the fence rather than failing it keeps the record honest about why it paused.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.2, §3.7; `design/08-hold-and-cancel.md`
+§3.3, §4.3; `design/10-process-definition.md` §3.6 (d).
+
+### D-85 (M) The cancel request is a slice-09 table; task requests are slice 07's
+
+**Accepted.**
+
+**Decision**: an accepted Seller Operator cancel is recorded in `owf_cancel_request` (slice 09),
+carrying the authorization snapshot, before its `cancel-requested` signal is delivered; the
+signal carries only the reference tuple and `requestRef`. A `retry`, `override` or task `cancel`
+is slice 07's `owf_task_resolution_request`, which the step-retry route also writes.
+
+**Rationale**: every signal must be recorded in Orders before delivery (`10 §4.4`), and the
+operator's identity must stay out of engine history (D-66); the record that names the request is
+the one the consuming operation reads.
+
+**Propagated**: `design/09-read-and-authz.md` §3.1, §3.7; `design/08-hold-and-cancel.md` §3.3;
+`design/07-manual-tasks.md` §3.7; `DESIGN.md` §3.7.
+
+### D-86 (M) An operator re-drive keeps the invocation, or the instance is unwound and re-submitted
+
+**Accepted.** *(orchestrator ruling)*
+
+**Decision**: an operator re-drive of an invocation the platform reports `failed` or
+`dead_lettered` is the platform's `…:control` `retry` **keeping `invocation_id`**, once the
+platform confirms that property (`…-upreq-serverless-runtime-signals`); `owf_process_instance.invocation_id`
+is never re-bound to a second invocation, and `start-instance` answers an existing binding to a
+second invocation, which then ends itself. Until the platform confirms it, a dead invocation's
+instance is unwound through the fence and the order re-submitted.
+
+**Rationale**: re-binding would let two invocations believe they drive one instance; the platform's
+own retry of the same invocation preserves the one-to-one binding the record depends on.
+
+**Propagated**: `design/09-read-and-authz.md` §3.3; `design/01-foundation.md` §3.3;
+`UPSTREAM_REQS.md` §2.9; `DESIGN.md` §4.5.
+
+### D-87 (M) One outage threshold governs the park clock, and the gate-open outage pause is a probe arm
+
+**Accepted.** *(amends D-11, D-46)*
+
+**Decision**: the Generic-Approval outage escalation threshold `min(30 min, 0.25 ×
+lifecycle_submitted_ttl)` governs both clocks: the park escalates at `escalation_due_at = min(parked_at + threshold,
+submitted_at + lifecycle_submitted_ttl − escalation_lead_time)`, settling the ADR-0007 text against the old slice text. A gate-open outage is a
+definition probe arm calling `escalate-gate` in `probe` mode, which answers `available` with the
+remainder or the outage state; it replaces the Orders probe loop and the `owf_timer_pause`
+`approval-outage` row. The routing plan's remainder is `owf_approval_gate.window_remaining_ms`
+through the gate-window port (D-70), and resume-ahead rows of `owf_process_suspension` reconcile
+out-of-order hold/resume delivery.
+
+**Rationale**: one threshold, measured from first-observed unavailability, is one number to sign
+off (Q-02); a probe arm keeps the pause decision in the definition and the evidence in Orders.
+
+**Propagated**: `design/03-approval-execution.md` §4.1, §4.2; `design/08-hold-and-cancel.md` §3.7;
+`design/10-process-definition.md` §3.6 (a).
+
+### D-88 (L) The approval routing plan is saved at the first `open-gates`
+
+**Accepted.**
+
+**Decision**: the full routing plan is persisted at the first `open-gates` of an order version, every
+gate beyond the first in a new `planned` state; the definition opens the next gate by calling
+`open-gates` with the `nextPosition` `record-decision` returns.
+
+**Rationale**: the definition carries positions, not the plan (D-66); the plan must be fixed once
+so a replay cannot re-route.
+
+**Propagated**: `design/03-approval-execution.md` §3.7, §4.3.
+
+### D-89 (M) Lifecycle is the sole evaluator of tolerate-failure
+
+**Accepted.**
+
+**Decision**: `evaluate-payment-auth-eligibility` reports a conclusive `failed` rather than
+deciding it; `begin-fulfillment` carries it to Lifecycle, which applies the seller's
+tolerate-failure policy, and a Lifecycle refusal is recorded as `withheld`. PRD §6.3 *Payment
+Authorization Precondition* is amended to say begin-fulfillment is not **committed** rather than
+not called.
+
+**Rationale**: evaluating the policy on both sides of the seam is a second author of one rule (R2).
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.2, §3.3; `UPSTREAM_REQS.md` §4 item 9.
+
+### D-90 (M) Payments is read on request, polled by a definition wait
+
+**Accepted.** *(amends D-17's mechanism)*
+
+**Decision**: the Payments coupling is an outbound read-by-request inside
+`evaluate-payment-auth-eligibility`, re-evaluated on `OrderAcceptanceRecorded`, on
+`reauthorize-requested` and on a definition poll `wait`; the inbound Payments reporting arm and the
+`payment-auth-wait` timer are withdrawn. Pending and failed stay distinct.
+
+**Rationale**: Payments has no specification (Q-06) and no event this gear could `listen` for; a
+read keeps the coupling one-directional.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.4, §3.6; `design/10-process-definition.md` §3.6 (b);
+`design/09-read-and-authz.md` §4.1.
+
+### D-91 (M) The overlap and market re-check is advisory at construction and authoritative before wave 2
+
+**Accepted.** *(amends D-15's evaluation point)*
+
+**Decision**: `construct-and-freeze-plan` records the overlap/market observation only;
+`re-check-pre-activation` is authoritative before wave 2. An unevaluable re-check follows
+Lifecycle's `defer` ladder, 3 attempts within 60 s, then aborts with `overlap-read-unevaluable`; an
+unavailable identity port is `identity-party-unavailable`.
+
+**Rationale**: a construction-time answer can be stale by activation; an abort must rest on the read
+nearest the resource-affecting step, and an honest reason distinguishes an outage from a collision.
+
+**Propagated**: `design/04-fulfillment-plan.md` §4.2; `design/01-foundation.md` §4.9; Q-08.
+
+### D-92 (M) A plan-level failure never leaves `approved` by itself
+
+**Accepted.**
+
+**Decision**: plan-level failures take no Lifecycle transition from `approved`; `topology-unavailable`
+is a plan-level manual task under either policy; a plan-level failure that must report
+`fulfillment_failed` passes `begin-fulfillment` first.
+
+**Rationale**: Lifecycle's `fulfillment_failed` is reachable only from `in_fulfillment`; a plan that
+never began cannot fail fulfillment.
+
+**Propagated**: `design/04-fulfillment-plan.md` §4.3; `design/07-manual-tasks.md` §3.7.
+
+### D-93 (L) Sizes: SLA population N ≤ 40 lines, a 200-line cap, 30-day authorization validity
+
+**Accepted.**
+
+**Decision**: the 15-minute SLA population is orders of at most 40 lines; the plan-size admission
+bound is 200 lines; `payment_auth_validity` is 30 days. These replace the non-existent "D-5" the
+previous revision of slice 04 cited.
+
+**Rationale**: the numbers were stated without a register entry; a citation to a decision that
+does not exist is a defect.
+
+**Propagated**: `design/04-fulfillment-plan.md` §4.6; `DESIGN.md` §4.1.
+
+### D-94 (M) Remediation exhaustion is the one automatic path that compensates activated lines
+
+**Accepted.** *(amends D-54)*
+
+**Decision**: D-54's "only an operator-initiated cancel" rolls back activated lines is amended: D-55
+remediation exhaustion is the one **automatic** route to order-level compensation of activated
+lines, as `PRD.md:339` states.
+
+**Rationale**: without it, an order whose remediation is exhausted would stay held with live
+subscriptions and no path out but an operator.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.6; `design/07-manual-tasks.md` §4.3; D-54, D-55.
+
+### D-95 (M) An operator retry returns a failed line to its pre-wave state
+
+**Accepted.**
+
+**Decision**: a retry returns a failed line to the state before the failed wave — `pending` for wave 1,
+`draft_created` for wave 2 — and slice 07's `retry` is defined per wave. `draft_created → pending`
+with reason `draft-voided` is a machine transition driven only by `rebuild-wave1`.
+
+**Rationale**: re-entering at the failed wave keeps the barrier's all-creates half true for a
+wave-2 retry and forces a new draft for a wave-1 retry.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.7; `design/05-provisioning-intents.md` §3.3;
+`design/07-manual-tasks.md` §3.3.
+
+### D-96 (M) An admission deferral is a settled success, over a slice-05 admission table
+
+**Accepted.** *(amends `01 §4.12`'s first rule; D-44)*
+
+**Decision**: a line the admission controls cannot admit is deferred, and the dispatch operation
+settles as success carrying `deferred[]` and `retryAfterMs`, never as `retryable-failure`, so the
+definition's deferral arm waits and calls again without consuming the task retry budget. The
+admission state is `owf_dispatch_admission` (slice 05), serialized by row locks, not an in-memory
+controller; in-flight counts are computed.
+
+**Rationale**: PRD §6.3 requires a throttle not to consume the retry budget; a settled deferral is
+the only outcome the platform's retry policy will not count.
+
+**Propagated**: `design/01-foundation.md` §4.12; `design/05-provisioning-intents.md` §2.1, §3.7, §4.3;
+`DESIGN.md` §3.7.
+
+### D-97 (M) Intent statuses, the confirmation arm and the Subscriptions tuple
+
+**Accepted.**
+
+**Decision**: the intent status `dead_lettered` is renamed `unresolved` and a status `lapsed` is
+added; until the platform can store only a consumed event's exported members, the confirmation arm
+targets a reference-only Subscriptions notification (a further Subscriptions ask) or is dropped in
+favour of the poll arm; the confirmation arm calls `reconcile-intent` first. `SUB-O13` asks for the
+full lookup tuple (with `intentKind` and `wave_attempt`), and `SUB-O16` for the union of field
+lists.
+
+**Rationale**: `dead_lettered` now names a platform status; the published Subscriptions outcome
+carries `subscriptionId`, which D-66 keeps out of engine history.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.7, §4.1; `UPSTREAM_REQS.md` §2.1, §2.9.
+
+### D-98 (M) The manual-task reason enum is a catalogue subset, and SLA classes are 4 h and 24 h
+
+**Accepted.**
+
+**Decision**: `owf_manual_task.reason` is the catalogue subset covering line, plan, order-level and
+lifetime-ceiling subjects, including `trigger-applicability-unverified`; `overlap-collision` and
+`market-divergence` are dropped as task reasons. The SLA classes are **4 h** for a resource-affecting
+subject and **24 h** otherwise, replacing a stale "D-6" citation; stale "D-3" citations mean D-55.
+
+**Rationale**: a task reason outside the catalogue is free text in disguise; the 4 h window sits
+inside the 24 h overdue window so an SLA breach is visible before the order-level escalation.
+
+**Propagated**: `design/07-manual-tasks.md` §3.7, §4.1, §4.7.
+
+### D-99 (M) The remediation hold is a flag; cancelling the last open forward task exhausts remediation
+
+**Accepted.**
+
+**Decision**: the remediation hold is an open forward task under `remediate`, projected as a derived
+flag, not a sixth `assignment_state`. A Seller Operator's `cancel` of the last open forward task of a
+line or plan subject that is still failed under a live order returns `exhausted`, which declares
+remediation exhausted for that subject.
+
+**Rationale**: an assignment state would conflate the operator's progress with the order's dispatch
+state; cancelling the last task is the Seller Operator's judgement that remediation is moot.
+
+**Propagated**: `design/07-manual-tasks.md` §3.3, §4.3.
+
+### D-100 (M) Task actions record a request and signal; every mutating route requires a key
+
+**Accepted.**
+
+**Decision**: the task routes are per action; `retry`, `override` and task `cancel` record
+`owf_task_resolution_request` and signal `task-resolution-requested`, consumed by
+`resolve-manual-task` (and `verify-override`); `assign` and `escalate` apply in-process and signal
+nothing; `escalate` is not a closing action. Every mutating task route requires `Idempotency-Key`
+`{tenant}:{taskId}:{action}:{rowVersion}`, the decision route
+`{tenant}:{gateId}:decision:{subject_id}`. The generic `…/tasks/{taskId}/resolve` route is retired
+and the step-retry route is an alias of the task's `retry`.
+
+**Rationale**: the definition must apply what changes the process path; actions that change only the
+task record need no round trip through the platform.
+
+**Propagated**: `design/07-manual-tasks.md` §3.3; `design/09-read-and-authz.md` §3.3, §4.1;
+`DESIGN.md` §3.3.
+
+### D-101 (L) The task queue sorts on the immutable `(created_at, task_id)` key
+
+**Accepted.** *(orchestrator decision, commit `d71fcbaaf`)*
+
+**Decision**: the operator task queue pages on the immutable key `(created_at, task_id)`, as slice
+09's paging rule requires; `sla_deadline` is mutable on reopen and is therefore not a sort key.
+
+**Rationale**: a keyset cursor over a mutable column skips or repeats rows when the column changes
+between pages.
+
+**Propagated**: `design/07-manual-tasks.md` §3.3; `design/09-read-and-authz.md` §2.2.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
 
-**Blocked**: no slice's saga-step, durable-timer, or engine-history-isolation implementation can
-be finalized until the substrate is chosen; evaluation must include which commercial data would
-sit in engine-side history, isolation and retention of that history, BSS/OSS boundary
-compatibility, and the requirement that gear-owned process audit stays independent of engine
-purge. Target date 2026-09-30 per `gears/bss/orders-workflow/docs/PRD.md` § `15. Open Questions`.
+**Answered in two parts (2026-09-24).**
+
+1. **The substrate choice is made** — D-65, `ADR/0011`: the serverless-runtime Temporal plugin
+   executing a versioned platform definition; neither the OSS Workflow Engine of
+   `PRD-workflow-engine-202501051430` nor a BSS-local mechanism. ADR-0001 is rewritten and no
+   longer selects nothing.
+2. **The PRD §15 evaluation is pending on the platform asks** — moved to **Q-12**. Of the four
+   evaluation criteria, *which commercial data would sit in engine history* is answered "none" by
+   D-66 (`ADR/0013`); *BSS/OSS boundary compatibility* is answered by the engine being a platform
+   gear holding no commercial document; *gear-owned audit independent of engine purge* is answered
+   by the record being complete without the history. *Isolation and retention of that history* —
+   with its residency — cannot be asserted from the platform's documents and is Q-12.
+
+*Superseded statement, retained for history:* no slice's saga-step, durable-timer, or
+engine-history-isolation implementation could be finalized until the substrate was chosen; target
+date 2026-09-30 per `gears/bss/orders-workflow/docs/PRD.md` § `15. Open Questions`.
 
 ### Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset
 
@@ -1595,17 +2398,107 @@ inside its writing transaction, which the advisory lock cannot. Neither Orders g
 alone: the answer is one contract for all three, decided with the Pricing owner, and until it
 lands this gear's roster runs on `Db::lock` with its rechecks intact.
 
+### Q-10: May a seller-scoped role publish definition fragments, or tenants author Functions, in phase 1?
+
+**Owner**: Architecture, with Product.
+
+**Open; recommendation: no.** ADR-0012 grants publish to the platform operator only. A
+seller-scoped role that publishes a fragment of the definition — a seller's own escalation arms,
+waits or SLA branches — and tenant-authored Functions called from the definition would let the
+adjustability contract reach the people who own the commercial policy, but each is a new
+authorship surface over a `p1` order-taking process: the validation hook would have to fence a
+fragment in the context of a definition it did not publish, a Function could only target
+`composable` operations and would run tenant code inside the platform's invocation, and the
+platform's publishing governance and publish audit are themselves unaddressed
+(serverless-runtime `NEXT_ADR_SCOPE.md` lines 26 and 48). The recommendation is that phase 1 grants
+neither, and that the question be reopened only after the pre-publish validation hook and publish
+audit asks of `UPSTREAM_REQS.md` §2.9 land. The PRD §15 row asking the same question is a
+registered PRD amendment (`UPSTREAM_REQS.md` §4 item 7).
+
+**Review trigger**: the definition-versioning and validation-hook ask agreed by serverless-runtime.
+
+### Q-11: Does the platform's DSL express the hold pattern and the other constructs the definition needs, or do they need Functions?
+
+**Owner**: Architecture (joint with the serverless-runtime owners).
+
+**Open.** The canonical definition of `design/10` relies on five things the Serverless Workflow
+DSL 1.0.0 may or may not provide as the platform's plugin implements it
+(`design/10-process-definition.md` §4.5):
+
+1. **(i)** a runtime expression as a `wait` duration, so the remaining escalation window, the
+   expected-fulfillment instant, the SLA remainder and a deferral's `retryAfterMs` can be armed
+   without a Function;
+2. **(ii)** the Problem body's `error_code` visible on `$error`, so a `catch` can tell
+   `idempotency-key-conflict` from `still-processing` before the retry budget is spent;
+3. **(iii)** a dynamic parallel construct, so a wave could fan out per line inside the definition;
+4. **(iv)** a `listen` inside a competing `fork` that is cancellable without losing an event
+   delivered during cancellation;
+5. **(v)** **the hold pattern** as a whole — a hold arm that wins a competing `fork` and cancels
+   the escalation `wait`, a resume wait, and a re-armed `wait` of the remainder Orders returns —
+   natively, without a Function.
+
+**Fallbacks in force until answered**: (i) and (v) a registered Function that sleeps the
+remainder, called only from a `composable` position; (ii) bounded by the retry budget; (iii)
+settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) covered by the poll arms and the
+re-entry of every stage loop (D-80).
+
+**Review trigger**: the platform readiness gate (`…-upreq-serverless-runtime-readiness-gate`).
+
+### Q-12: Engine-history isolation, retention and residency — the pending half of Q-01
+
+**Owner**: Architecture (with the serverless-runtime owners and the residency owner).
+
+**Open.** ADR-0013 bounds engine history to references, but `correlationId`, `orderId` and
+`orderVersion` with their timestamps still sit in a Temporal persistence backend whose location and
+retention the platform sets (serverless-runtime ADR-0004 line 100; `TenantRuntimePolicy`,
+serverless-runtime DESIGN.md line 739), and the platform has no data-classification model for
+execution history (`NEXT_ADR_SCOPE.md` line 23). PRD §15 requires the isolation, retention and
+residency of that history to be assessed. It cannot be, from this side, until the platform states
+them: the upstream ask is `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-history-residency-retention`.
+Until it closes, the platform path is not ready for a residency-bound tenant (`DESIGN.md` §2.2),
+and the "commercial data in engine history" threat is *bounded, not closed* (`DESIGN.md` §4.2).
+
+**Review trigger**: the platform readiness gate; Q-01 closes fully when this question does.
+
+### Q-13: Which caller-facing route or event sends `reauthorize-requested` and `unpark-requested`?
+
+**Owner**: Architecture, with Product.
+
+**Open.** The canonical definition has arms for two operator signals that no route in this design
+set can send: `reauthorize-requested` (a payment re-authorisation, slice 04) and `unpark-requested`
+(an operator's release of an instance parked at the lifetime ceiling). `design/09-read-and-authz.md`
+§2.1 forbids delivering a signal from anywhere but an authorized control operation, so today
+neither arm can fire. The question is which caller-facing route — with its catalogue pair, scope,
+idempotency key and request record — or which event sends each; this register does not invent
+them. **If neither has an origin by the platform readiness gate, both arms are removed from the
+canonical definition** and the corresponding cases fall back to the paths that exist (the
+`OrderAcceptanceRecorded` and poll arms for re-authorisation; the unwind path for a lifetime-ceiling
+park).
+
+**Review trigger**: the platform readiness gate.
+
 ## What This Design Set Does Not Claim
 
 Following the sibling Orders Lifecycle design set's own precedent: the coherence of this design
-set — that its nine `design/` slices and this `DECISIONS.md` register agree with each other and
-with the PRD — is asserted here by reviewer-checkable statements, not enforced by CI. This is
+set — that its ten `design/` documents (the foundation, eight capability slices and the process
+definition) and this `DECISIONS.md` register agree with each other and with the PRD — is asserted
+here by reviewer-checkable statements, not enforced by CI. This is
 because `.cf-studio/config/artifacts.toml` excludes `docs/design/*.md` and `DECISIONS.md` from
 `cfs` autodetect, and `cfs` hardcodes its artifact-kind set, so a `DESIGN_SLICE` kind cannot be
 registered for either document type. Only `DESIGN.md`, `ADR/*.md`, and `UPSTREAM_REQS.md` are
 gate-enforced by `cfs validate --artifact` for this gear. Nothing in this register should be read
 as CI-verified; every propagation address above was checked by hand against the heading it names,
 and that hand-check is the only guarantee this document offers.
+
+Two further non-claims follow from D-65. **The canonical definitions are documentation until the
+platform readiness gate passes**: serverless-runtime has no host, SDK or Temporal plugin in this
+repository, so nothing in `design/10-process-definition.md` has been parsed by the platform,
+published to a registry or executed, and the YAML fragments are asserted against the Serverless
+Workflow v1.0.0 specification by reading, not by a tool. **No claim is made that the platform
+validation hook exists**: the ADR-0012 fence at publish time is the CI conformance test this design
+specifies (also not yet implemented) plus the platform-operator publish role; the consumer-registered
+pre-publish hook is an upstream ask (`UPSTREAM_REQS.md` §2.9), and every platform capability this
+register relies on is cited to a serverless-runtime file and line or registered as such an ask.
 
 
 ## Traceability
@@ -1646,6 +2539,43 @@ and that hand-check is the only guarantee this document offers.
 | D-62 | L Cross-cutting (worker coordination) | `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15, `DESIGN.md` §1.3, §2.2, §3.4, §3.8, §4.1, §4.2, §4.5, Q-09 |
 | D-63 | L Cross-cutting (authorization) | `ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md`, `design/09-read-and-authz.md` §2, §3, §4.1, §4.2, §4.4, `DESIGN.md` §2.2, §3.4, §3.5, §3.7, §4.2, §4.8, `design/03-approval-execution.md` §3.2, §3.3, `design/07-manual-tasks.md` §3.2, §3.3, `UPSTREAM_REQS.md` §2.8, D-37 |
 | D-64 | L Cross-cutting (error contract) | `design/01-foundation.md` §3.2, §3.3, §4.9, `DESIGN.md` §3.3, `design/03-approval-execution.md` §3.3, `design/09-read-and-authz.md` §3.3, §4.4 |
+| D-65 | M Platform definition (ADR-0011) | `ADR/0011`, `ADR/0001`, `design/10-process-definition.md`, `design/01-foundation.md` §1.1, §3.2, §3.3, `DESIGN.md` §1, §2.1, §3.2, §3.5, §4.9, `design/README.md`, Q-01, Q-12 |
+| D-66 | M References, not payloads (ADR-0013) | `ADR/0013`, `design/01-foundation.md` §2.1, §3.3, §4.14, `design/10-process-definition.md` §2.1, §2.2, every slice §3.3, `DESIGN.md` §2.1, §4.2, §4.3, `UPSTREAM_REQS.md` §2.3, §2.9 |
+| D-67 | M Protected-step fence (ADR-0012) | `ADR/0012`, `design/10-process-definition.md` §2.2, §4.1, §4.2, §4.6, every slice §3.3, `design/09-read-and-authz.md` §3.1, `DESIGN.md` §2.2, §4.2 |
+| D-68 | M Pinning and publish roles (ADR-0012) | `ADR/0012`, `design/01-foundation.md` §3.3, §3.7, `design/10-process-definition.md` §2.2, §4.3, `DESIGN.md` §3.6, `UPSTREAM_REQS.md` §2.9, Q-10 |
+| D-69 | M Step operations and the step surface | `design/01-foundation.md` §3.2, §3.3, §3.7, `design/09-read-and-authz.md` §3.1, §3.3, §4.1, `DESIGN.md` §3.3, §4.2, D-37, D-48 |
+| D-70 | M Timers and retry policy to the platform | `design/01-foundation.md` §3.7, §4.2, §4.4, `design/03-approval-execution.md` §3.7, `design/08-hold-and-cancel.md` §3.2, §3.7, `design/10-process-definition.md` §2.2, `DESIGN.md` §3.7, §4.8; D-02, D-10, D-11, D-39–D-46, D-49, D-53 |
+| D-71 | M Three-worker roster | `design/01-foundation.md` §3.8, `design/05-provisioning-intents.md` §3.8, `DESIGN.md` §3.8, D-62, Q-09 |
+| D-72 | M Inbound dead letters to the platform | `ADR/0009`, `design/01-foundation.md` §3.3, §3.7, §4.8, `design/07-manual-tasks.md` §3.7, `design/09-read-and-authz.md` §3.1, §4.1, `DESIGN.md` §3.7, §4.4, §4.5, `UPSTREAM_REQS.md` §2.9; D-04, D-05, D-44 |
+| D-73 | M Start via the platform event trigger | `design/02-triggers-and-start.md` §2.2, §3.3, `design/10-process-definition.md` §2.2, §3.3, `design/09-read-and-authz.md` §3.1, §3.3, §4.1, `DESIGN.md` §3.3, `UPSTREAM_REQS.md` §2.8, §4 |
+| D-74 | M Key families | `ADR/0006`, `design/01-foundation.md` §3.3, `design/02-triggers-and-start.md` §2.1, `design/04-fulfillment-plan.md` §3.3, §4.1, `design/06-saga-and-compensation.md` §3.3; D-47 |
+| D-75 | M Supersession | `design/02-triggers-and-start.md` §4.3, §4.7, `design/10-process-definition.md` §3.6; D-06, D-07, D-49 |
+| D-76 | M Seller axis at start | `design/01-foundation.md` §3.3, `design/02-triggers-and-start.md` §3.3 |
+| D-77 | M Reason catalogue | `design/01-foundation.md` §3.3, §4.9, slices 02, 04, 05, 06, 07 §3.3, `DESIGN.md` §3.3; D-64 |
+| D-78 | M Barrier and park patterns | `ADR/0004`, `ADR/0007`, `design/03-approval-execution.md` §3.3, §4.2, `design/04-fulfillment-plan.md` §3.3, `design/05-provisioning-intents.md` §3.3, `design/10-process-definition.md` §3.6; D-12, D-23, D-24 |
+| D-79 | M One call per wave | `design/05-provisioning-intents.md` §3.3, §4.3, `design/10-process-definition.md` §2.2 |
+| D-80 | M Definition routing conventions | `design/10-process-definition.md` §3.6, §4.5, `design/08-hold-and-cancel.md` §3.3; D-35 |
+| D-81 | M Shared unwind path | `design/10-process-definition.md` §3.6, §4.1, `design/06-saga-and-compensation.md` §3.3 |
+| D-82 | M Lifetime-ceiling park from hold | `design/01-foundation.md` §3.7, `design/08-hold-and-cancel.md` §2.1, §4.8; D-53 |
+| D-83 | M compensate-order | `ADR/0005`, `design/06-saga-and-compensation.md` §3.2, §3.3, §3.7, `design/10-process-definition.md` §3.6 |
+| D-84 | M Cancel re-check and withdrawn authority | `design/06-saga-and-compensation.md` §3.2, §3.7, `design/08-hold-and-cancel.md` §3.3, §4.3, `design/10-process-definition.md` §3.6 |
+| D-85 | M Cancel request record | `design/09-read-and-authz.md` §3.1, §3.7, `design/08-hold-and-cancel.md` §3.3, `design/07-manual-tasks.md` §3.7, `DESIGN.md` §3.7 |
+| D-86 | M Operator re-drive | `design/09-read-and-authz.md` §3.3, `design/01-foundation.md` §3.3, `UPSTREAM_REQS.md` §2.9, `DESIGN.md` §4.5 |
+| D-87 | M Outage threshold and probe arm | `design/03-approval-execution.md` §4.1, §4.2, `design/08-hold-and-cancel.md` §3.7, `design/10-process-definition.md` §3.6; D-11, D-46 |
+| D-88 | M Routing plan | `design/03-approval-execution.md` §3.7, §4.3 |
+| D-89 | M Tolerate-failure evaluator | `design/04-fulfillment-plan.md` §3.2, §3.3, `UPSTREAM_REQS.md` §4 |
+| D-90 | M Payments coupling | `design/04-fulfillment-plan.md` §3.4, §3.6, `design/10-process-definition.md` §3.6, `design/09-read-and-authz.md` §4.1; D-17 |
+| D-91 | M Pre-activation re-check | `design/04-fulfillment-plan.md` §4.2, `design/01-foundation.md` §4.9, Q-08; D-15 |
+| D-92 | M Plan-level failures | `design/04-fulfillment-plan.md` §4.3, `design/07-manual-tasks.md` §3.7 |
+| D-93 | M Sizes | `design/04-fulfillment-plan.md` §4.6, `DESIGN.md` §4.1 |
+| D-94 | M Automatic compensation route | `design/04-fulfillment-plan.md` §3.6, `design/07-manual-tasks.md` §4.3; D-54, D-55 |
+| D-95 | M Operator retry state | `design/04-fulfillment-plan.md` §3.7, `design/05-provisioning-intents.md` §3.3, `design/07-manual-tasks.md` §3.3 |
+| D-96 | M Admission deferral | `design/01-foundation.md` §4.12, `design/05-provisioning-intents.md` §2.1, §3.7, §4.3, `DESIGN.md` §3.7; D-44 |
+| D-97 | M Intent statuses and Subscriptions tuple | `design/05-provisioning-intents.md` §3.7, §4.1, `UPSTREAM_REQS.md` §2.1, §2.9 |
+| D-98 | M Manual-task reasons and SLA classes | `design/07-manual-tasks.md` §3.7, §4.1, §4.7 |
+| D-99 | M Remediation hold and exhaustion | `design/07-manual-tasks.md` §3.3, §4.3 |
+| D-100 | M Task actions and keys | `design/07-manual-tasks.md` §3.3, `design/09-read-and-authz.md` §3.3, §4.1, `DESIGN.md` §3.3 |
+| D-101 | M Task-queue sort key | `design/07-manual-tasks.md` §3.3, `design/09-read-and-authz.md` §2.2 |
 
-Highest decision number used: **D-64**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-101**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
