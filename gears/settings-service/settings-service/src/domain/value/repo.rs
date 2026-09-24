@@ -103,7 +103,9 @@ pub trait ValueRepository: Send + Sync {
     ) -> Result<Option<StoredValue>, DomainError>;
 
     /// The rows flagged for review among `declaration_ids`, at any of
-    /// `tenant_ids` — the administrative needs-review listing.
+    /// `tenant_ids` — the administrative needs-review listing — in
+    /// (declaration, tenant) order and at most `limit + 1` of them, so the
+    /// caller can tell a full answer from one the bound cut.
     ///
     /// # Errors
     /// [`DomainError`] when the read fails.
@@ -113,6 +115,7 @@ pub trait ValueRepository: Send + Sync {
         scope: &AccessScope,
         declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
+        limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError>;
 
     /// Insert a row.

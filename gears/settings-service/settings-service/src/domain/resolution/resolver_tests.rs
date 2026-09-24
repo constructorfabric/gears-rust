@@ -584,7 +584,7 @@ async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_list
     tenants.push(t.root);
     let flagged = h
         .resolver
-        .flagged_overrides(&conn, &[d], &tenants)
+        .flagged_overrides(&conn, &[d], &tenants, 1_000)
         .await
         .expect("listing");
     assert_eq!(flagged.len(), 1);
@@ -618,7 +618,7 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
     assert!(!tenants.contains(&t.s), "the subtree stops at the seam");
     let flagged = h
         .resolver
-        .flagged_overrides(&conn, &[d], &tenants)
+        .flagged_overrides(&conn, &[d], &tenants, 1_000)
         .await
         .expect("listing");
     let listed: Vec<uuid::Uuid> = flagged.iter().map(|r| r.tenant_id).collect();
@@ -628,7 +628,7 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
     // directly, the standalone tenant's own listing reports it.
     let own = h
         .resolver
-        .flagged_overrides(&conn, &[d], &[t.s])
+        .flagged_overrides(&conn, &[d], &[t.s], 1_000)
         .await
         .expect("listing");
     assert_eq!(own.len(), 1);

@@ -56,3 +56,32 @@ async fn flagging_a_row_that_is_not_there_is_not_found_not_success() {
         Some("no longer validates")
     );
 }
+
+#[tokio::test]
+async fn the_flagged_listing_fetches_one_past_its_bound_and_no_more() {
+    // The needs-review listing spans a page of declarations across a subtree;
+    // unbounded, a broad migration makes it a million-row read. It fetches one
+    // row past the bound so the caller can tell a full answer from a cut one.
+    let h = ResolutionHarness::new().await;
+    let declaration = h.declare("flagged", scope_class::LOCAL, json!(1)).await;
+    let tenants = [h.tree.root, h.tree.a, h.tree.b, h.tree.c];
+    for tenant in tenants {
+        h.set_flagged(declaration, tenant, json!(2)).await;
+    }
+    let conn = h.db.conn().expect("connection");
+    let rows = ValueRepo
+        .list_flagged(
+            &conn,
+            &AccessScope::allow_all(),
+            &[declaration],
+            &tenants,
+            2,
+        )
+        .await
+        .expect("rows");
+    assert_eq!(
+        rows.len(),
+        3,
+        "the bound of two, plus the one that says there is more"
+    );
+}

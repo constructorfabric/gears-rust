@@ -29,6 +29,10 @@ use crate::gear::ConcreteResolver;
 use crate::log_text::LogSafe;
 
 const READ: &str = "read";
+/// The most flagged rows one needs-review page reads; past it the page is
+/// refused with the bound named, never cut.
+pub const REVIEW_ROW_LIMIT: usize = 1_000;
+
 /// The entitlement that unmasks `pii` values on the administrative surface.
 const READ_UNMASKED: &str = "read_unmasked";
 
@@ -368,10 +372,29 @@ pub async fn browse_settings(
         }
         tenants.push(target_tenant);
         let ids: Vec<Uuid> = page.items.iter().map(|d| d.id).collect();
-        let rows = resolver.flagged_overrides(&conn, &ids, &tenants).await?;
+        let rows = resolver
+            .flagged_overrides(&conn, &ids, &tenants, REVIEW_ROW_LIMIT)
+            .await?;
+        // A page cut short of its flagged rows would hide what needs review;
+        // refused with the bound named instead, for the caller to narrow.
+        if rows.len() > REVIEW_ROW_LIMIT {
+            return Err(DomainError::Validation {
+                field: "limit".to_owned(),
+                code: field::REVIEW_TOO_MANY_ROWS,
+                message: format!(
+                    "more than {REVIEW_ROW_LIMIT} flagged rows on this page; lower `limit`, or \
+                     narrow `tenant` or the categories"
+                ),
+            }
+            .into());
+        }
+        // The page's declarations by id, built once: each row finds its own in
+        // constant time rather than by a scan of the page.
+        let by_id: std::collections::HashMap<Uuid, &crate::domain::declaration::Declaration> =
+            page.items.iter().map(|d| (d.id, d)).collect();
         rows.iter()
             .filter_map(|row| {
-                let declaration = page.items.iter().find(|d| d.id == row.declaration_id)?;
+                let declaration = by_id.get(&row.declaration_id)?;
                 Some(
                     SettingItemDto::flagged(render_flagged(&declaration.key, row, root, pii))
                         .with_mode(&declaration.mode),

@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -206,6 +206,7 @@ impl ValueRepository for ValueRepo {
         scope: &AccessScope,
         declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
+        limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError> {
         if declaration_ids.is_empty() || tenant_ids.is_empty() {
             return Ok(Vec::new());
@@ -215,6 +216,10 @@ impl ValueRepository for ValueRepo {
             .filter(setting_value::Column::DeclarationId.is_in(declaration_ids.iter().copied()))
             .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
             .filter(subjectless())
+            .order_by_asc(setting_value::Column::DeclarationId)
+            .order_by_asc(setting_value::Column::TenantId)
+            // One past the bound: the caller tells a full answer from a cut one.
+            .limit(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
             .secure()
             .scope_with(scope)
             .all(conn)

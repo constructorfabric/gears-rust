@@ -78,6 +78,9 @@ pub const SUBTREE_TOO_LARGE: &str = "subtree_too_large";
 /// A search page's matching overrides exceed the bound a page fetches.
 pub const SEARCH_TOO_MANY_HITS: &str = "search_too_many_hits";
 
+/// A needs-review page's flagged rows exceed the bound a page fetches.
+pub const REVIEW_TOO_MANY_ROWS: &str = "review_too_many_rows";
+
 /// A trait-checked value holds more string leaves than the leaf cap.
 pub const VALUE_TOO_MANY_LEAVES: &str = "value_too_many_leaves";
 

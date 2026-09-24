@@ -579,9 +579,16 @@ where
         conn: &C,
         declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
+        limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError> {
         self.values
-            .list_flagged(conn, &AccessScope::allow_all(), declaration_ids, tenant_ids)
+            .list_flagged(
+                conn,
+                &AccessScope::allow_all(),
+                declaration_ids,
+                tenant_ids,
+                limit,
+            )
             .await
     }
 
