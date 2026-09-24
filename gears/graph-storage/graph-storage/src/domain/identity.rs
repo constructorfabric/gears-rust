@@ -77,8 +77,9 @@ pub fn reference_key_complaint(node_key: &str, payload: Option<&Value>) -> Optio
     })
 }
 
-/// Recursively sort object keys so two semantically identical JSON values
-/// hash identically regardless of member order.
+/// Recursively sort object keys and normalize numeric spelling so two
+/// semantically identical JSON values hash identically regardless of member
+/// order or of how a producer's serializer happened to render its numbers.
 fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -89,8 +90,47 @@ fn canonicalize(value: &Value) -> Value {
             Value::Object(sorted.into_iter().collect())
         }
         Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+        Value::Number(number) => Value::Number(canonical_number(number)),
         other => other.clone(),
     }
+}
+
+/// The largest magnitude an `f64` represents without gaps between consecutive
+/// integers. Above it, a float's integral look says nothing about the integer
+/// a producer meant, so the number is left exactly as it was parsed.
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// One spelling per value.
+///
+/// `serde_json` keeps the variant it parsed — `1`, `1.0` and `1e0` arrive as
+/// `PosInt(1)`, `Float(1.0)` and `Float(1.0)` — and `Display` renders the
+/// variant, not the value. Since the hash is taken over the rendered text,
+/// two retries of the same logical request hash differently whenever the
+/// producer's serializer changes how it writes a whole number, which is the
+/// one thing an idempotency key exists to survive. An integral float within
+/// the exactly-representable range therefore folds onto its integer form;
+/// everything else keeps its parsed spelling, which `ryu` already renders
+/// canonically for a given `f64`.
+///
+/// This deliberately makes request identity coarser than payload equality:
+/// `{"n": 1}` and `{"n": 1.0}` are one request, while the stored payloads
+/// would not compare equal. That is the intended direction — a replay answers
+/// with the original outcome and never applies the second body — but it means
+/// the first spelling to arrive is the one that persists.
+fn canonical_number(number: &serde_json::Number) -> serde_json::Number {
+    if number.is_f64()
+        && let Some(float) = number.as_f64()
+        && float.fract() == 0.0
+        && float.abs() < EXACT_INTEGER_LIMIT
+    {
+        // `fract() == 0.0` already excludes NaN and both infinities.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the magnitude bound above is exactly the range this cast is lossless over"
+        )]
+        return serde_json::Number::from(float as i64);
+    }
+    number.clone()
 }
 
 fn node_value(node: &graph_storage_sdk::models::NodeSpec) -> Value {
@@ -249,6 +289,67 @@ mod tests {
         let one = make(serde_json::json!({"a": 1, "b": 2}));
         let two = make(serde_json::json!({"b": 2, "a": 1}));
         assert_eq!(ingest_request_hash(&one), ingest_request_hash(&two));
+    }
+
+    /// A retry the mechanism exists to survive: the same logical request from
+    /// a client library that renders whole numbers differently.
+    #[test]
+    fn the_request_hash_ignores_how_a_whole_number_is_written() {
+        let make = |payload: serde_json::Value| IngestRequest {
+            nodes: vec![NodeSpec {
+                node_key: "k".into(),
+                type_id: "t".into(),
+                payload: Some(payload),
+                ..NodeSpec::default()
+            }],
+            ..IngestRequest::default()
+        };
+        for (left, right) in [
+            (r#"{"count": 1}"#, r#"{"count": 1.0}"#),
+            (r#"{"n": 100}"#, r#"{"n": 1e2}"#),
+            (r#"{"n": -7}"#, r#"{"n": -7.0}"#),
+            (r#"{"deep": [{"n": 2}]}"#, r#"{"deep": [{"n": 2.0}]}"#),
+        ] {
+            let parse = |text: &str| serde_json::from_str(text).expect("the fixture is JSON");
+            assert_eq!(
+                ingest_request_hash(&make(parse(left))),
+                ingest_request_hash(&make(parse(right))),
+                "`{left}` and `{right}` are one request"
+            );
+        }
+    }
+
+    /// The normalization folds spellings together, not values. Two integers
+    /// too large for an `f64` to separate keep their own hashes.
+    #[test]
+    fn the_request_hash_still_separates_numbers_that_differ() {
+        let make = |payload: serde_json::Value| IngestRequest {
+            nodes: vec![NodeSpec {
+                node_key: "k".into(),
+                type_id: "t".into(),
+                payload: Some(payload),
+                ..NodeSpec::default()
+            }],
+            ..IngestRequest::default()
+        };
+        for (left, right) in [
+            (r#"{"n": 1}"#, r#"{"n": 2}"#),
+            (r#"{"n": 1.5}"#, r#"{"n": 1.25}"#),
+            // Both land on the same `f64`; neither may be folded onto it.
+            (
+                r#"{"n": 10000000000000000001}"#,
+                r#"{"n": 10000000000000000002}"#,
+            ),
+            // A number is not its own decimal spelling.
+            (r#"{"n": 1}"#, r#"{"n": "1"}"#),
+        ] {
+            let parse = |text: &str| serde_json::from_str(text).expect("the fixture is JSON");
+            assert_ne!(
+                ingest_request_hash(&make(parse(left))),
+                ingest_request_hash(&make(parse(right))),
+                "`{left}` and `{right}` are different requests"
+            );
+        }
     }
 
     #[test]

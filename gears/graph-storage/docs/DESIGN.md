@@ -1697,6 +1697,18 @@ request is safely retryable at all; the canonical request hash is computed over
 the body. Everything else is body, including scope replacement and its
 generation:
 
+The hash is taken over a canonical rendering of that body, not over the bytes
+as they arrived. Object members are sorted, and a whole number is folded onto
+one spelling, so a producer whose serializer writes `1.0` or `1e2` where an
+earlier attempt wrote `1` or `100` still retries the same request rather than
+colliding with its own key. A number too large for an `f64` to separate from
+its neighbour is left exactly as it was parsed. This makes request identity
+deliberately coarser than payload equality — `{"n": 1}` and `{"n": 1.0}` are
+one request, while the two stored payloads would not compare equal — which is
+the intended direction: a replay answers with the first attempt's recorded
+outcome and never applies the second body, so the first spelling to arrive is
+the one that persists.
+
 ```http
 POST /api/graph-storage/v1/ingest
 Authorization: Bearer <token>
