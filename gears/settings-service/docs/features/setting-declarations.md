@@ -254,7 +254,7 @@ The hardest constraint here is not any single field but the rule connecting them
 - Unsupported OData filter or ordering expression
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/declarations/{id} or GET /settings-service/v1/declarations with optional OData `$filter`, `$orderby`, and a pagination cursor; `$select` is not taken and is refused with `400` rather than ignored - `inst-decl-read-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/declarations/{id} or GET /settings-service/v1/declarations with optional OData `$filter`, `$orderby` over `key`, `category_id`, `mode` or `status`, and a pagination cursor; `$orderby` over `domain_affinity` or `owner_module` is refused `400 odata_unsortable_field` because either may be empty and a page cursor cannot carry an empty value, and `$select` is not taken and is refused with `400` rather than ignored - `inst-decl-read-1`
 2. [x] - `p1` - Authorize `read` on `gts.cf.core.settings.declaration.v1~` and obtain the `AccessScope` constraints - `inst-decl-read-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-read-3`
 4. [ ] - `p1` - Derive the combined visibility and domain-affinity predicate from the `AccessScope` constraints; the licence predicate joins it in R2, when the License Resolver exists to answer it - `inst-decl-read-4`

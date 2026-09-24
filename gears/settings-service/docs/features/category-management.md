@@ -202,7 +202,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Malformed or expired pagination cursor
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/categories with optional OData `$filter`, `$orderby`, `$select`, and a pagination cursor - `inst-cat-list-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/categories with optional OData `$filter`, `$orderby` over `key` or `name`, and a pagination cursor; `$orderby` over `domain_affinity` is refused `400 odata_unsortable_field` because it may be empty and a page cursor cannot carry an empty value, and `$select` is refused `400` rather than ignored - `inst-cat-list-1`
 2. [x] - `p1` - Authorize `read` on `gts.cf.core.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-list-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-list-3`
 4. [x] - `p1` - Parse the OData expressions against the category field mapping - `inst-cat-list-4`

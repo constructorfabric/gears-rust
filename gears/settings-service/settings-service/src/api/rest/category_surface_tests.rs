@@ -195,6 +195,42 @@ async fn the_listing_refuses_the_odata_option_it_does_not_implement() {
 }
 
 #[tokio::test]
+async fn the_listing_refuses_to_order_by_a_column_that_may_be_empty() {
+    // `domain_affinity` is optional, and a page cursor has no spelling for an
+    // empty sort value: the second page would be refused. It is not offered
+    // for ordering; the name and the key are.
+    let h = RestHarness::new().await;
+    let answer = h
+        .send(
+            "GET",
+            &format!("{CATEGORIES}?$orderby=domain_affinity%20asc"),
+            None,
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(
+        answer.body["context"]["field_violations"][0]["reason"],
+        json!(crate::field::ODATA_UNSORTABLE_FIELD),
+        "{}",
+        answer.body
+    );
+    for field in ["name", "key"] {
+        let answer = h
+            .send(
+                "GET",
+                &format!("{CATEGORIES}?$orderby={field}%20asc"),
+                None,
+                None,
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{field}: {}", answer.body);
+    }
+}
+
+#[tokio::test]
 async fn the_listing_carries_the_categories_that_exist() {
     let h = RestHarness::new().await;
     create(&h, "billing", "Invoices").await;

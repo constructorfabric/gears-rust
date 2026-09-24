@@ -47,9 +47,10 @@ pub fn register_routes(
         .summary("List settings categories")
         .description(
             "List categories visible to the caller, ordered by sort order then name. \
-             Supports OData `$filter` and `$orderby` over `key`, `name` and \
-             `domain_affinity`, with cursor pagination. `$select` is not supported and \
-             is rejected rather than ignored.",
+             Supports OData `$filter` over `key`, `name` and `domain_affinity`, and \
+             `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over \
+             `domain_affinity` is refused: it may be empty, and a page cursor cannot carry \
+             an empty value. `$select` is not supported and is rejected rather than ignored.",
         )
         .tag(TAG)
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
@@ -69,7 +70,7 @@ pub fn register_routes(
         // The declared surface is the rejection rule made visible: a field
         // absent from `x-odata-filter` is refused with 400, never ignored.
         .with_odata_filter::<CategoryFilterField>()
-        .with_odata_orderby::<CategoryFilterField>()
+        .with_odata_orderby::<crate::domain::odata::CategoryOrderField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

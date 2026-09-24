@@ -143,6 +143,10 @@ impl<R: DeclarationRepository> DeclarationService<R> {
         query: &ODataQuery,
     ) -> Result<Page<RenderedDeclaration>, DomainError> {
         crate::domain::odata::reject_unsupported_options(query, "declarations")?;
+        crate::domain::odata::reject_unsortable::<crate::domain::odata::DeclarationOrderField>(
+            query,
+            "declarations",
+        )?;
         let visible = visibility::domain_visibility(scope);
         // The declaration surface is the platform administrator's; no tenant
         // restriction hides a declaration from it, only the domain visibility.

@@ -483,10 +483,7 @@ fn slugs(body: &Value) -> Vec<String> {
 #[tokio::test]
 async fn a_declaration_page_continues_from_its_cursor_without_a_gap_or_a_repeat() {
     // The cursor is minted from the last row served, by the field the page is
-    // ordered on — the key, unique, so the boundary is exact. (Ordering by a
-    // nullable column and paging past a NULL is refused by the shared
-    // pagination library, whose cursor cannot carry a null; that is its
-    // follow-up, not this surface's, and is not exercised here.)
+    // ordered on — the key, unique, so the boundary is exact.
     let h = RestHarness::new().await;
     for name in ["alpha", "beta", "gamma"] {
         create(&h, name).await;
@@ -519,4 +516,49 @@ async fn a_declaration_page_continues_from_its_cursor_without_a_gap_or_a_repeat(
         second["page_info"]["next_cursor"].is_null(),
         "nothing after the remainder: {second}"
     );
+}
+
+#[tokio::test]
+async fn ordering_by_a_column_that_may_be_empty_is_refused_before_any_page() {
+    // A page cursor carries the sort value of the last row served, and it has
+    // no spelling for an empty one: a listing ordered on a column that may be
+    // empty would serve its first page and then refuse its own cursor. Such a
+    // column is not offered for ordering, and asking for it is refused up
+    // front, naming it.
+    let h = RestHarness::new().await;
+    for name in ["alpha", "beta", "gamma"] {
+        create(&h, name).await;
+    }
+    for field in ["domain_affinity", "owner_module"] {
+        let (status, body) = h
+            .get(
+                &format!("{DECLARATIONS}?limit=2&$orderby={field}%20asc"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 400, "{field}: {body}");
+        let violation = &body["context"]["field_violations"][0];
+        assert_eq!(violation["field"], json!("$orderby"), "{body}");
+        assert_eq!(
+            violation["reason"],
+            json!(crate::field::ODATA_UNSORTABLE_FIELD),
+            "{body}"
+        );
+        assert!(
+            violation["description"]
+                .as_str()
+                .is_some_and(|d| d.contains(field)),
+            "the refusal names the field: {body}"
+        );
+    }
+
+    // A column that is never empty still orders the listing.
+    let (status, body) = h
+        .get(
+            &format!("{DECLARATIONS}?limit=2&$orderby=key%20desc"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(slugs(&body), vec!["gamma", "beta"]);
 }

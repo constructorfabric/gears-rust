@@ -1247,7 +1247,7 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 | Method | Endpoint | Description | Idempotency |
 |--------|----------|-------------|-------------|
 | `POST` | `/settings-service/v1/declarations` | Create an admin-authored declaration, evolve the active declaration on the same version-stripped path, or revive its exact retired `v1` key when no active declaration exists. Evolve and revive require credential step-up | No — lost-response retry disambiguated by re-read (§4.3 DNA) |
-| `GET` | `/settings-service/v1/declarations` | List declarations — OData `$filter` (e.g. `category_id`, `domain_affinity`), `$orderby`/`$select` (§4.3 DNA); visibility/licence gated | Yes |
+| `GET` | `/settings-service/v1/declarations` | List declarations — OData `$filter` (e.g. `category_id`, `domain_affinity`), `$orderby` over the fields that are never empty (`key`, `category_id`, `mode`, `status`; a page cursor cannot carry an empty sort value), `$select` refused (§4.3 DNA); visibility/licence gated | Yes |
 | `GET` | `/settings-service/v1/declarations/{id}` | Get a declaration (incl. `value_type_id` + resolved `traits`) | Yes |
 | `PATCH` | `/settings-service/v1/declarations/{id}` | Update declaration metadata — **immediate** (admin-authored only) | Yes |
 | `DELETE` | `/settings-service/v1/declarations/{id}` | **Immediately** retire a declaration — `status=retired`, values retained but excluded from resolution (**`200`** with the retired body — soft-delete tombstone; admin-authored only) — **step-up gated** (§4.2 *Declaration Management*) | Yes |
@@ -2296,7 +2296,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Partial active-declaration index | Mix `active`/`retired` | Index filters retired from active reads |
 | Tenant isolation | Seed tenant A values; query as tenant B | Empty result set (real WHERE generation) |
 | Pagination | Seed N declarations | Cursor traversal: all items, no duplicates, stable order |
-| OData list query | `GET /settings-service/v1/declarations?$filter=…&$orderby=…&$select=…` | Allowed fields filter/sort/project (`toolkit_odata`); disallowed field → `UNSUPPORTED_FILTER_FIELD`/`UNSUPPORTED_ORDERBY_FIELD`; cursor locks `$filter`/`$orderby`/`$select` (guideline §4.4) |
+| OData list query | `GET /settings-service/v1/declarations?$filter=…&$orderby=…&$select=…` | Allowed fields filter/sort/project (`toolkit_odata`); disallowed field → `UNSUPPORTED_FILTER_FIELD`/`UNSUPPORTED_ORDERBY_FIELD`; a field that may be empty filters but is refused for `$orderby` (`odata_unsortable_field`), since a page cursor cannot carry an empty sort value; cursor locks `$filter`/`$orderby`/`$select` (guideline §4.4) |
 | Search trigram | Seed varied keys/descriptions | `pg_trgm` GIN returns expected substring matches |
 | Migration idempotency | Run migrations twice | Second run is a no-op |
 

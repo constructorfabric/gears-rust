@@ -169,6 +169,10 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         query: &toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<Category>, DomainError> {
         crate::domain::odata::reject_unsupported_options(query, "categories")?;
+        crate::domain::odata::reject_unsortable::<crate::domain::odata::CategoryOrderField>(
+            query,
+            "categories",
+        )?;
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-6
         let visible = visibility::domain_visibility(scope);
         // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-6

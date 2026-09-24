@@ -78,10 +78,12 @@ pub fn register_routes(
         .operation_id("settings_service.list_declarations")
         .summary("List setting declarations")
         .description(
-            "List declarations visible to the caller. Supports OData `$filter` and \
-             `$orderby` over `key`, `category_id`, `domain_affinity`, `mode`, `status` \
-             and `owner_module`, with cursor pagination. `$select` is not supported and \
-             is rejected rather than ignored. Each declaration carries its \
+            "List declarations visible to the caller. Supports OData `$filter` over \
+             `key`, `category_id`, `domain_affinity`, `mode`, `status` and \
+             `owner_module`, and `$orderby` over `key`, `category_id`, `mode` and \
+             `status`, with cursor pagination. `$orderby` over the two that may be \
+             empty is refused, since a page cursor cannot carry an empty value. `$select` is not \
+             supported and is rejected rather than ignored. Each declaration carries its \
              `value_type_id` and the value type's resolved traits.",
         )
         .tag(TAG)
@@ -100,7 +102,7 @@ pub fn register_routes(
             "A page of declarations with its pagination cursors",
         )
         .with_odata_filter::<DeclarationFilterField>()
-        .with_odata_orderby::<DeclarationFilterField>()
+        .with_odata_orderby::<crate::domain::odata::DeclarationOrderField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

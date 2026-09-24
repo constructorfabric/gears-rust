@@ -43,6 +43,10 @@ pub const ODATA_QUERY: &str = "odata_query";
 /// A request used an `OData` option this resource does not implement.
 pub const ODATA_UNSUPPORTED_OPTION: &str = "odata_unsupported_option";
 
+/// `$orderby` named a field this listing does not order by — one that may be
+/// empty, which a page cursor cannot carry, or one that is not a field here.
+pub const ODATA_UNSORTABLE_FIELD: &str = "odata_unsortable_field";
+
 /// The named value type is not registered in the types registry.
 pub const VALUE_TYPE_UNKNOWN: &str = "value_type_unknown";
 

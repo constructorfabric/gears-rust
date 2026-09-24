@@ -53505,7 +53505,7 @@
     },
     "/settings-service/v1/categories": {
       "get": {
-        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` and `$orderby` over `key`, `name` and `domain_affinity`, with cursor pagination. `$select` is not supported and is rejected rather than ignored.",
+        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
         "operationId": "settings_service.list_categories",
         "parameters": [
           {
@@ -53536,7 +53536,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc\n- domain_affinity asc\n- domain_affinity desc",
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -53649,9 +53649,7 @@
             "key asc",
             "key desc",
             "name asc",
-            "name desc",
-            "domain_affinity asc",
-            "domain_affinity desc"
+            "name desc"
           ]
         }
       },
@@ -54136,7 +54134,7 @@
     },
     "/settings-service/v1/declarations": {
       "get": {
-        "description": "List declarations visible to the caller. Supports OData `$filter` and `$orderby` over `key`, `category_id`, `domain_affinity`, `mode`, `status` and `owner_module`, with cursor pagination. `$select` is not supported and is rejected rather than ignored. Each declaration carries its `value_type_id` and the value type's resolved traits.",
+        "description": "List declarations visible to the caller. Supports OData `$filter` over `key`, `category_id`, `domain_affinity`, `mode`, `status` and `owner_module`, and `$orderby` over `key`, `category_id`, `mode` and `status`, with cursor pagination. `$orderby` over the two that may be empty is refused, since a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored. Each declaration carries its `value_type_id` and the value type's resolved traits.",
         "operationId": "settings_service.list_declarations",
         "parameters": [
           {
@@ -54167,7 +54165,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc\n- domain_affinity asc\n- domain_affinity desc\n- mode asc\n- mode desc\n- status asc\n- status desc\n- owner_module asc\n- owner_module desc",
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc\n- mode asc\n- mode desc\n- status asc\n- status desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -54302,14 +54300,10 @@
             "key desc",
             "category_id asc",
             "category_id desc",
-            "domain_affinity asc",
-            "domain_affinity desc",
             "mode asc",
             "mode desc",
             "status asc",
-            "status desc",
-            "owner_module asc",
-            "owner_module desc"
+            "status desc"
           ]
         }
       },
