@@ -1020,7 +1020,7 @@ terminal_event_emitted_seq, created_at; `line_ref` UNIQUE; `failed_wave` NOT NUL
 | From | Permitted to | Driven by |
 |------|--------------|-----------|
 | `pending` | `draft_created`, `failed` | Wave-1 draft-create confirmation / failure (slice 05). `pending -> failed` sets `failed_wave = 1`. |
-| `draft_created` | `activated`, `failed` | Wave-2 activation confirmation / failure (slice 05). `draft_created -> failed` sets `failed_wave = 2`. |
+| `draft_created` | `activated`, `failed`, `pending` | Wave-2 activation confirmation / failure (slice 05). `draft_created -> failed` sets `failed_wave = 2`. `draft_created -> pending` is the **machine** transition with reason `draft-voided`, driven only by `rebuild-wave1` (slice 05) when the line's draft is recorded `lapsed`; the line's next wave-1 create is a new intent under a new `wave_attempt` ([`05 §3.6` *Wave-1 Rebuild*](./05-provisioning-intents.md#36-interactions--sequences)). |
 | `failed` (`failed_wave = 1`) | `pending` | **Operator-driven only** — `resolve-manual-task` `retry` (slice 07): the line returns to the state before the failed wave, and slice 05 re-dispatches its create under the new `attempt`; the later `pending -> draft_created` is machine-driven as usual. |
 | `failed` (`failed_wave = 2`) | `draft_created`, `activated` | **Operator-driven only** — `retry` returns the line to `draft_created` (slice 05 re-reads the draft's liveness and rebuilds it if it lapsed) so the next barrier pass may activate it; a verified `override` (`verify-override`, slice 07) lands `activated` with the verified `subscription_id`. |
 
@@ -1029,7 +1029,8 @@ Every exit from `failed` requires `last_transition_actor`; a machine-driven exit
 (slice 06), which records its own outcome and does not rewrite `state`. (decision recorded by
 commit D as D-6x: an operator retry returns a failed line to the state before the failed wave —
 `pending` for wave 1, `draft_created` for wave 2 — and slice 07's `retry` is defined per wave
-accordingly.)
+accordingly; `draft_created → pending`, reason `draft-voided`, is a machine transition driven
+only by `rebuild-wave1`.)
 
 **Additional info**: **Ownership**: rows inserted only by `construct-and-freeze-plan`; `state`
 and the evidence columns written only by the Progress Tracker's in-process transition, inside the

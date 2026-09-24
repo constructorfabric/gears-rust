@@ -73,17 +73,24 @@ rather than one task, fails closed before a definition can be executed, and stil
   1. every `protected` operation of the path appears exactly where its order constraints require:
      `admit-trigger` precedes every other operation on a trigger arm; `obtain-verdict` precedes
      `reflect-verdict`; `record-decision` precedes any activation of the approval outcome;
-     `construct-and-freeze-plan` precedes `evaluate-payment-auth-eligibility`, which precedes
-     `re-check-pre-activation` and `begin-fulfillment`; `dispatch-wave1-create` for every task
-     precedes `dispatch-wave2-activate` for any task, and `dispatch-wave2-activate` follows both
-     the wave-1 join and the expected-fulfillment `wait` (the ADR-0004 conjunction);
+     `evaluate-payment-auth-eligibility` precedes `construct-and-freeze-plan`, which precedes
+     `begin-fulfillment` (a settled `eligible` of the same round and a settled `frozen`, as
+     `design/10-process-definition.md` §4.1 and `design/04-fulfillment-plan.md` §4.8 order them);
+     `begin-fulfillment` precedes `dispatch-wave1-create`, which precedes
+     `re-check-pre-activation`, `report-spawn-signal` and `dispatch-wave2-activate` in that order;
+     each wave is one `call` carrying `lineRefs[]`, and `dispatch-wave2-activate` follows both an
+     `evaluate-activation-eligibility` that answered `released` and the expected-fulfillment
+     `wait` (the ADR-0004 conjunction);
      `run-cancellation-fence` precedes `compensate-order`, which precedes `report-outcome`;
      `terminate-instance` is the last operation on every terminal path; `start-instance` is the
      first operation of every instance;
   2. every `call` targets an operation registered in `owf_step_operation`, and a `call` to a
      registered Function targets only a `composable` operation;
   3. every `listen` target is within the closed set: the nine Lifecycle triggers, the approval
-     decision, the Subscriptions confirmation and failure events;
+     decision, the Subscriptions confirmation and failure events, Orders' own two terminal process
+     events (the overdue arm only) and the operator signals of `design/10-process-definition.md`
+     §3.3 (`cancel-requested`, `reauthorize-requested`, `task-resolution-requested`,
+     `unpark-requested`);
   4. bounds nest: per-task timeout < task retry budget < the enclosing `wait`/deadline < the
      overdue window < the lifetime ceiling (D-02, D-53), and every `wait` has a bound;
   5. no payload field crosses: every task input and output conforms to the reference schema the
@@ -102,8 +109,12 @@ rather than one task, fails closed before a definition can be executed, and stil
   `composable`: `retry-step` (operator), `park`, `unpark`, `open-gates`, `arm-park-escalation`,
   `escalate-gate`, `evaluate-activation-eligibility`, `reread-draft-liveness`, `rebuild-wave1`,
   `reconcile-intent` (sweep), `resolve-manual-task`, `verify-override`,
-  `raise-overdue-escalation`. A `protected` operation may be ordered by a definition; it may never
-  be omitted or replaced.
+  `raise-overdue-escalation`. The list is **22 `protected` and 13 `composable`** operations,
+  35 in all, and matches the `protection` field each slice's §3.3 declares (slice 03: only
+  `obtain-verdict`, `reflect-verdict` and `record-decision` protected; slice 05: `reread-draft-liveness`,
+  `rebuild-wave1` and `reconcile-intent` composable; slice 07: only `create-manual-task`
+  protected). A `protected` operation may be ordered by a definition; it may never be omitted or
+  replaced.
 * **Two enforcement points, one rule set.** The rules run (a) in a validation hook the platform
   registry calls before a definition version is published — a consumer-registered pre-publish
   hook is not in the platform surface today (only the plugin's registration-validation hook is,

@@ -691,7 +691,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | orders-workflow (slice 04, Fulfillment Plan) | `cpt-cf-bss-orders-workflow-component-progress-tracker` — transition rule, in-process | The only writer of `owf_fulfillment_task.state`; this slice applies it on every outcome |
 | orders-workflow (slice 04, Fulfillment Plan) | `re-check-pre-activation` settlement, read | `report-spawn-signal`'s precondition |
 | orders-workflow (slice 06, Saga) | `compensate-order` → Intent Dispatcher, in-process | Compensating intents are built and submitted here, recorded in `owf_provisioning_intent` |
-| orders-workflow (slice 08, Hold/Cancel) | `owf_process_suspension`, read | An open suspension defers every dispatch (`deferReason = held`) |
+| orders-workflow (slice 08, Hold/Cancel) | `owf_process_instance.suspended` (the hold predicate `apply-hold` sets and `apply-resume` clears, `01 §3.7`), read; deferred-outcome columns on `owf_provisioning_intent`, applied by `apply-resume` | A suspended instance defers every dispatch (`deferReason = held`); a failure observed while suspended is recorded as deferred, not applied ([`08 §2.2`](./08-hold-and-cancel.md#22-constraints)) |
 | orders-workflow (slice 10, Process Definition) | Fragment (b) of `10 §3.6` | Sequences the operations; holds only their references |
 
 **Dependency Rules** (per project conventions):
@@ -785,7 +785,7 @@ draft-create acceptance.
 1. [ ] - `p1` - Resolve `planRef` and each `lineRef` to the frozen plan and its `FulfillmentTask` rows under the instance's `resource_tenant_id`; a line not on the plan is refused `not-found`; a terminal instance is `version-mismatch` - `inst-pi-resolve`
 2. [ ] - `p1` - **IF** `dispatch-wave2-activate`: **IF** the record does not show every plan task at `draft_created` or beyond, **OR** `expectedFulfillmentAt` is after database time, **OR** no `report-spawn-signal` settlement exists for this order version, refuse the whole call `activation-precondition-unmet` (409, retryable) - `inst-pi-wave2-guard`
 3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt`, unless that row carries `not_found_at`; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe) - `inst-pi-skip-existing`
-4. [ ] - `p1` - **IF** an open `owf_process_suspension` row exists for the instance, defer every remaining line with `deferReason = held` - `inst-pi-held`
+4. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true for the instance (read under the instance row lock; not `owf_process_suspension`, whose rows are slice 08's record), defer every remaining line with `deferReason = held`; a same-key re-issue of a call already settled is absorbed as usual while suspended - `inst-pi-held`
 5. [ ] - `p1` - For each remaining line, ask Dispatch Admission Control (§4.3); a line not admitted joins `deferred[]` with the hint - `inst-pi-admit`
 6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed`, send nothing for the line and add it to `lapsed[]`; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
 7. [ ] - `p1` - Per admitted line, commit the pre-dispatch unit of work: one `owf_provisioning_intent` row at `status = submitted`, `transition_request_id` null, with intent key, envelope, `attempt_id`, `step_idempotency_key` and the ladder of §4.2 initialised; a line whose existing row carries `not_found_at` (§4.4) reuses that row and clears the marker - `inst-pi-pre-dispatch`
@@ -882,7 +882,7 @@ requirement.
 
 1. [ ] - `p1` - Lock the intent row; **IF** terminal, return its state (absorbed) - `inst-ri-lock`
 2. [ ] - `p1` - Read status through `SUB-O13` by `transition_request_id`, or by the lookup tuple of §4.4 when it is null; a timeout, 503 or authorization failure leaves every column unchanged except the rung, and is never read as an outcome - `inst-ri-read`
-3. [ ] - `p1` - **IF** terminal confirmation (`draft_created`, `activated`) or failure: write the status and `subscription_id`, apply 04's transition, mirror `subscription_id` onto the task, enqueue `OrderFulfillmentStepCompleted` where the task becomes terminal - `inst-ri-terminal`
+3. [ ] - `p1` - **IF** terminal confirmation (`draft_created`, `activated`) or failure: write the status and `subscription_id`, apply 04's transition, mirror `subscription_id` onto the task, enqueue `OrderFulfillmentStepCompleted` where the task becomes terminal; **EXCEPT** that a **failure** read while `owf_process_instance.suspended` is true is recorded on the intent as deferred (`deferred_failure_reason`, `deferred_observed_at`) and **MUST NOT** advance the task to `failed`, appear in `failed[]` or create a manual task — `apply-resume` applies it in observation order ([`08 §2.2`](./08-hold-and-cancel.md#22-constraints)) - `inst-ri-terminal`
 4. [ ] - `p1` - **IF** compensating outcome (`voided`, `cancelled`, or its failure): write it on the compensating row; 06's `compensate-order` reads it on its next pass - `inst-ri-compensating`
 5. [ ] - `p1` - **IF** not found: apply the never-dispatched branch of §4.4 - `inst-ri-not-found`
 6. [ ] - `p1` - **IF** still non-terminal: advance `sweep_tier`, `sweep_reads`, `next_sweep_at` on the ladder of §4.2; at the floor set `status = unresolved`, `next_sweep_at` null, and report the line in `unresolved[]` - `inst-ri-ladder`
@@ -946,6 +946,8 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `next_sweep_at` | timestamptz nullable | Next scheduled read — **the sweep's schedule**; null once terminal or `unresolved`. |
 | `key_expires_at` | timestamptz | `created_at` + 30 days; after it the sweep is read-only for this intent. |
 | `not_found_at` | timestamptz nullable | Set by `reconcile-intent` when the status read answers "no such transition request" inside the key lifetime; tells the next dispatch round to send this never-sent row under its unchanged key (§4.4); cleared by that send. |
+| `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Applied and cleared by `apply-resume` (slice 08) in its settlement transaction. |
+| `deferred_observed_at` | timestamptz nullable | Database time the deferred failure was read; `apply-resume` applies deferred failures in this order. NOT NULL exactly when `deferred_failure_reason` is. |
 | `created_at` | timestamptz | Row creation; the partition key. |
 
 **PK**: `intent_id`

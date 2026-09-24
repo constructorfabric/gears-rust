@@ -56,18 +56,23 @@ Chosen option: **two-wave barrier**, because it is the only option under which m
 
 > **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
 > the barrier is now a **definition pattern**, not a timer this gear arms. In the platform
-> definition, wave 1 is a `fork` of `dispatch-wave1-create` per fulfillment task whose join
-> completes when every task's Subscriptions confirmation has been received (`listen`); the
+> definition, each wave is **one `call`** — `dispatch-wave1-create`, later
+> `dispatch-wave2-activate` — **carrying the line set as `lineRefs[]`**, because the DSL has no
+> dynamic parallel branch and per-line parallelism is an admission control inside the operation
+> (`design/10-process-definition.md` §2.2, Q-11 (iii)); the all-creates half of the barrier is
+> `evaluate-activation-eligibility` reading this gear's record, re-invoked on every Subscriptions
+> confirmation `listen` and on a poll interval, never a count the definition holds; the
 > expected-fulfillment instant is a `wait` armed from the value `construct-and-freeze-plan`
 > returns; `dispatch-wave2-activate` follows both. `owf_durable_timer` and the activation-barrier
 > timer are removed; the plugin's native timers execute the wait (serverless-runtime DESIGN.md
 > line 632). The **conjunction rule** — no activation intent until every line is `draft_created`
 > **and** the timer has elapsed — becomes ADR-0012 validation rule 1: a definition in which
-> `dispatch-wave2-activate` does not follow both the wave-1 join and the expected-fulfillment
+> `dispatch-wave2-activate` does not follow both a `released` evaluation and the expected-fulfillment
 > `wait` is not publishable, and `dispatch-wave2-activate` (`protected`) additionally refuses at
 > run time unless this gear's record shows every task at `draft_created` and the wait's instant
-> passed. The rebuild path is unchanged: a voided draft found by `reread-draft-liveness` routes to
-> `rebuild-wave1`, after which the join must complete again before wave 2 (D-23, D-24). The
+> passed. The rebuild path is unchanged: a voided draft — reported in `dispatch-wave2-activate`'s
+> `lapsed[]`, whose draft-liveness re-read is inside the operation — routes to `rebuild-wave1`,
+> after which wave 1 and the barrier run again for that line before wave 2 (D-23, D-24). The
 > "hold suspension" clause of the second consequence is superseded by ADR-0011's signal pattern:
 > the barrier wait is at the top level of the definition and does **not** pause on hold (D-35,
 > D-53); only approval-escalation waits do.
