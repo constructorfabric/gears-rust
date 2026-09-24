@@ -434,6 +434,18 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// The edge half, here for the same reason: whether or not the window opens,
+/// both stores must revive a deleted edge rather than refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_edge_is_revived_by_the_next_upsert() {
+    conformance::a_deleted_edge_is_revived_by_the_next_upsert(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Spawned and multi-threaded like the case it shares, but the race it
 /// describes cannot happen here: this store takes one lock for the whole of
 /// `ingest` and holds it across the body, with no `.await` inside, so the

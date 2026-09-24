@@ -3959,6 +3959,147 @@ pub async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone(
     }
 }
 
+/// The edge half of the delete-versus-upsert race, and it answers the
+/// opposite way on purpose.
+///
+/// A tombstoned node key is not reusable before purge, so `upsert_node`
+/// refuses it and its write filters on `deleted_at IS NULL`. An edge is the
+/// other decision: re-asserting a relationship that was deleted brings it
+/// back, and `upsert_edge` clears `deleted_at` as part of the update. The two
+/// paths look alike enough that the node's filter is the obvious thing to
+/// copy across, and copying it would turn every legitimate re-assertion of a
+/// deleted edge into a conflict -- silently, since a tombstoned edge reads as
+/// absent and the producer would see only a refusal it could never clear.
+///
+/// So this case pins the difference rather than the similarity. The
+/// sequential half states the contract outright; the raced half puts the
+/// delete and the upsert in the same window the node case uses and requires
+/// that no ordering of them produces a tombstone refusal.
+pub async fn a_deleted_edge_is_revived_by_the_next_upsert(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // A payload, so a re-assertion is an update rather than the convergent
+    // no-op an identical body would be.
+    let linking = |note: &str| EdgeSpec {
+        payload: Some(serde_json::json!({ "note": note })),
+        ..edge("link-a", "link-b")
+    };
+
+    ingest_batch(
+        store.as_ref(),
+        &reader,
+        batch(
+            vec![node("link-a", "a"), node("link-b", "b")],
+            vec![linking("first")],
+        ),
+    )
+    .await
+    .expect("the edge is created");
+
+    let key = store
+        .get_node(&reader, &"link-a".to_owned(), 10)
+        .await
+        .expect("the endpoint reads")
+        .adjacency
+        .first()
+        .expect("the edge is adjacent")
+        .edge_key
+        .clone();
+
+    store
+        .soft_delete(&reader, DeleteRequest::Edge(key.clone()))
+        .await
+        .expect("the edge is tombstoned");
+    assert!(
+        store.get_edge(&reader, &key).await.is_err(),
+        "a tombstoned edge reads as absent"
+    );
+
+    ingest_batch(
+        store.as_ref(),
+        &reader,
+        batch(Vec::new(), vec![linking("again")]),
+    )
+    .await
+    .expect("re-asserting a deleted relationship revives it, it is not a conflict");
+    assert!(
+        store.get_edge(&reader, &key).await.is_ok(),
+        "the revived edge reads live again"
+    );
+
+    // And the same thing with the two in one window. Sixteen rounds for the
+    // reason the node case gives: one round mostly lands the two orderings
+    // that were never in question.
+    for round in 0..16 {
+        store
+            .soft_delete(&reader, DeleteRequest::Edge(key.clone()))
+            .await
+            .expect("the edge is tombstoned again");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let writer = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let spec = linking(&format!("round-{round}"));
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                ingest_batch(store.as_ref(), &ctx, batch(Vec::new(), vec![spec])).await
+            })
+        };
+        let deleter = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let key = key.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                store.soft_delete(&ctx, DeleteRequest::Edge(key)).await
+            })
+        };
+        // Both spawned before either is awaited: awaiting the first leaves it
+        // at a barrier nobody else has reached.
+        let upserted = writer.await.expect("the writer task does not panic");
+        deleter
+            .await
+            .expect("the deleter task does not panic")
+            .expect("the delete succeeds whichever order it lands in");
+
+        match upserted {
+            Ok(_) => {}
+            Err(GraphStoreError::Conflict { ref reason }) => assert!(
+                !reason.contains("tombstone"),
+                "an edge is revived rather than refused, got: {reason}"
+            ),
+            Err(other) => panic!("unexpected refusal in round {round}: {other}"),
+        }
+
+        // Whichever way the round went, the key is still usable: the store
+        // converges on the next assertion rather than needing a purge first.
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(Vec::new(), vec![linking("settled")]),
+        )
+        .await
+        .expect("the edge is assertable after the race");
+        assert!(
+            store.get_edge(&reader, &key).await.is_ok(),
+            "round {round} left the edge unreachable"
+        );
+    }
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a

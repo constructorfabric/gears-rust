@@ -1274,7 +1274,7 @@ async fn upsert_edge(
                 Expr::value(Some(value.to_owned())),
             );
     }
-    update
+    let written = update
         .col_expr(edge::Column::Payload, Expr::value(payload))
         .col_expr(edge::Column::UpdatedAt, Expr::value(now))
         .col_expr(
@@ -1303,6 +1303,26 @@ async fn upsert_edge(
         .exec(tx)
         .await
         .map_err(map_scope_err)?;
+
+    // Zero rows means the row this write was prepared against is gone, and
+    // answering `Updated` would tell the caller its payload landed when
+    // nothing holds it. A scope replacement removes an edge it no longer
+    // declares with a hard delete, not a tombstone, so under read-committed
+    // the row can disappear between the read above and this statement.
+    //
+    // Unlike a node, an edge has no tombstone conflict to report here: a
+    // tombstoned edge is deliberately revived by this very statement, which
+    // clears `deleted_at`. What is left is the one case, and it is retryable
+    // -- the key is free, so a re-ingest inserts rather than updates.
+    if written.rows_affected == 0 {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "edge `{edge_key}` was removed while this write was being prepared; \
+                 re-ingest it"
+            ),
+        });
+    }
+
     Ok(ItemOutcome::Updated)
 }
 
