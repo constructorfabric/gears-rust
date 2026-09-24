@@ -213,6 +213,13 @@ pub trait WriteMetrics: Send + Sync {
     fn step_up(&self, operation: &'static str, result: &'static str);
 }
 
+/// The gauge the lifecycle refreshes from the store.
+pub trait ReviewMetrics: Send + Sync {
+    /// `settings_needs_review_total` for one declaration source: the overrides
+    /// flagged `needs_review` and awaiting an administrator's fix.
+    fn needs_review(&self, source: &'static str, count: u64);
+}
+
 /// Counts nothing; the test binding.
 pub struct NoMetrics;
 

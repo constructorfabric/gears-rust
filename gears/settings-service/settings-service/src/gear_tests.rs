@@ -672,3 +672,80 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
         "past its horizon, it leaves"
     );
 }
+
+/// Records what the review pass publishes, in order.
+#[derive(Default)]
+struct RecordingReviewMetrics(std::sync::Mutex<Vec<(&'static str, u64)>>);
+
+impl crate::domain::ports::ReviewMetrics for RecordingReviewMetrics {
+    fn needs_review(&self, source: &'static str, count: u64) {
+        self.0.lock().expect("lock").push((source, count));
+    }
+}
+
+#[tokio::test]
+async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_where_none() {
+    // The pass the lifecycle runs once a minute. Every source is published
+    // each time, zero included: a gauge that skipped a source with nothing
+    // flagged would keep showing its last count after the fix.
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let d = h
+        .declare("proxy", "cascading", serde_json::json!(true))
+        .await;
+    h.set_flagged(d, h.tree.a, serde_json::json!("aggressive"))
+        .await;
+    h.set_flagged(d, h.tree.b, serde_json::json!("gentle"))
+        .await;
+    h.set(d, h.tree.root, serde_json::json!(false)).await;
+
+    let metrics = RecordingReviewMetrics::default();
+    SettingsService::review_once(&h.db, &metrics).await;
+    assert_eq!(
+        *metrics.0.lock().expect("lock"),
+        vec![("admin_authored", 0), ("module_contributed", 2)],
+        "the harness declares as a module; the unflagged row is not counted"
+    );
+
+    // An administrator's declaration with one flagged row is counted under
+    // its own source, and the module's count is unchanged.
+    let admin = {
+        use crate::domain::declaration::{DeclarationDraft, DeclarationRepository as _};
+        let conn = h.db.conn().expect("connection");
+        crate::infra::storage::declaration_repo::DeclarationRepo
+            .insert(
+                &conn,
+                &toolkit_security::AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.retry.v1~"
+                        .to_owned(),
+                    leaf_slug: "retry".to_owned(),
+                    value_type_id: crate::test_support::BOOL.to_owned(),
+                    category_id: h.category_id(),
+                    default_value: serde_json::json!(false),
+                    scope_class: "cascading".to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: false,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "admin_authored".to_owned(),
+                    owner_module: None,
+                    licence_feature: None,
+                    description: None,
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("an admin declaration")
+            .id
+    };
+    h.set_flagged(admin, h.tree.a, serde_json::json!("often"))
+        .await;
+    let metrics = RecordingReviewMetrics::default();
+    SettingsService::review_once(&h.db, &metrics).await;
+    assert_eq!(
+        *metrics.0.lock().expect("lock"),
+        vec![("admin_authored", 1), ("module_contributed", 2)]
+    );
+}

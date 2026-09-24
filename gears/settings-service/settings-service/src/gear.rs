@@ -123,9 +123,14 @@ fn ticking(period: Duration) -> tokio::time::Interval {
 /// nothing and keeps the pass cheap.
 const RETENTION_TICK: Duration = Duration::from_hours(24);
 
+/// How often the managed lifecycle refreshes the needs-review gauge: two
+/// indexed counts, cheap enough for a minute's resolution on a dashboard.
+const REVIEW_TICK: Duration = Duration::from_mins(1);
+
 impl SettingsService {
-    /// The managed lifecycle: the pending-secret sweep once a minute and the
-    /// audit retention pass once a day, until cancelled. The only long-running
+    /// The managed lifecycle: the pending-secret sweep and the needs-review
+    /// gauge once a minute, and the audit retention pass once a day, until
+    /// cancelled. The only long-running
     /// work this gear owns; everything else is request-driven.
     #[allow(
         clippy::redundant_pub_crate,
@@ -144,28 +149,76 @@ impl SettingsService {
             tick_secs = SWEEP_TICK.as_secs(),
             "pending-secret sweep and audit retention started"
         );
-        Self::tick_until_cancelled(&writes, &db, retention, &cancel).await;
+        let review = crate::infra::review_metrics::OtelReviewMetrics::new();
+        Self::tick_until_cancelled(&writes, &db, retention, &review, &cancel).await;
         info!("pending-secret sweep and audit retention stopped");
         Ok(())
     }
 
-    /// The two periodic passes, until the lifecycle is cancelled.
+    /// The periodic passes, until the lifecycle is cancelled.
     async fn tick_until_cancelled(
         writes: &crate::infra::value_writes::WriteCoordinator,
         db: &DBProvider<DbError>,
         retention: Duration,
+        review: &dyn crate::domain::ports::ReviewMetrics,
         cancel: &CancellationToken,
     ) {
         let mut interval = ticking(SWEEP_TICK);
         let mut retention_interval = ticking(RETENTION_TICK);
+        let mut review_interval = ticking(REVIEW_TICK);
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
                 _ = interval.tick() => Self::sweep_once(writes).await,
                 _ = retention_interval.tick() => Self::retention_tick(db, retention).await,
+                _ = review_interval.tick() => Self::review_once(db, review).await,
             }
         }
+    }
+
+    /// One refresh of the needs-review gauge, logged and never fatal. Every
+    /// source is published, zero included, so a fixed backlog reads zero
+    /// rather than its last count; a failed pass leaves the gauge as it was
+    /// until the next tick.
+    async fn review_once(
+        db: &DBProvider<DbError>,
+        review: &dyn crate::domain::ports::ReviewMetrics,
+    ) {
+        match Self::count_needs_review(db).await {
+            Ok(counts) => {
+                for (source, count) in counts {
+                    review.needs_review(source, count);
+                }
+            }
+            Err(err) => tracing::warn!(
+                err = %LogSafe(&err),
+                "needs-review gauge refresh failed; retried next tick"
+            ),
+        }
+    }
+
+    /// The flagged overrides per declaration source, across every tenant.
+    async fn count_needs_review(
+        db: &DBProvider<DbError>,
+    ) -> Result<Vec<(&'static str, u64)>, crate::domain::error::DomainError> {
+        use crate::domain::value::ValueRepository as _;
+        let conn = db.conn().map_err(|err| {
+            crate::domain::error::DomainError::dependency_unavailable(
+                "database",
+                "open a connection",
+                err,
+            )
+        })?;
+        let scope = toolkit_security::AccessScope::allow_all();
+        let mut counts = Vec::with_capacity(crate::domain::declaration::SOURCES.len());
+        for source in crate::domain::declaration::SOURCES {
+            let count = crate::infra::storage::value_repo::ValueRepo
+                .count_flagged(&conn, &scope, source)
+                .await?;
+            counts.push((source, count));
+        }
+        Ok(counts)
     }
 
     /// The daily tick: one retention pass against the clock now.

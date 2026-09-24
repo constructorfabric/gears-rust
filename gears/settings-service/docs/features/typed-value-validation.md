@@ -31,6 +31,7 @@
   - [SettingValue Entity and Schema](#settingvalue-entity-and-schema)
   - [Value Scope and Uniqueness Invariants](#value-scope-and-uniqueness-invariants)
   - [Needs-Review Flag](#needs-review-flag)
+  - [Needs-Review Gauge](#needs-review-gauge)
   - [Classification Denormalization](#classification-denormalization)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
@@ -262,6 +263,19 @@ The system **MUST** carry a non-null `needs_review` boolean with an optional hum
 - DB Table: `setting_values`
 - Entities: `SettingValue`
 
+### Needs-Review Gauge
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review-gauge`
+
+The system **MUST** publish `settings_needs_review_total`, the count of overrides flagged `needs_review`, by declaration source (`admin_authored`, `module_contributed`), refreshed from the store by the gear's lifecycle once a minute. Every source **MUST** be published on every refresh, zero included, so a backlog that has been fixed reads zero rather than its last count, and a failed refresh **MUST** leave the gauge as it was until the next one. A flagged override falls through on read without an error; this gauge is the signal an operator alerts on, and the needs-review listing shows which settings and scopes are affected.
+
+**Implements**:
+- `cpt-cf-settings-service-state-typed-value-validation-review`
+
+**Touches**:
+- DB Table: `setting_values`, `setting_declarations`
+- Entities: `SettingValue`
+
 ### Classification Denormalization
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-classification`
@@ -306,3 +320,4 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [x] Deleting a declaration cascades to its value rows
 - [x] Changing a declaration's classification re-syncs every value row in the same transaction, leaving no window where the two disagree
 - [x] A value flagged `needs_review` carries a detail string, and clearing the flag clears the detail
+- [x] The needs-review gauge counts flagged overrides per declaration source and publishes zero for a source with none

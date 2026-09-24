@@ -94,9 +94,10 @@ AuthN resolver, the tenant resolver and the Credential Store are fetched from
 gear that reads settings during *its* init names `settings-service` in its own
 `deps` and cannot close a cycle through this one.
 
-Capabilities are `db`, `rest` and `stateful`; the managed lifecycle runs two
-passes: the minute sweep that releases staged secrets nobody claimed, and a
-daily audit retention pass that prunes records past their horizon.
+Capabilities are `db`, `rest` and `stateful`; the managed lifecycle runs three
+passes: the minute sweep that releases staged secrets nobody claimed, the
+minute refresh of the `settings_needs_review_total` gauge, and a daily audit
+retention pass that prunes records past their horizon.
 
 ## REST surface
 

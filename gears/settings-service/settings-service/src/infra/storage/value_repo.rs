@@ -200,6 +200,29 @@ impl ValueRepository for ValueRepo {
         Ok(row.map(to_domain))
     }
 
+    async fn count_flagged<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        source: &str,
+    ) -> Result<u64, DomainError> {
+        use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
+        let of_source = sea_orm::sea_query::Query::select()
+            .column(declaration::Column::Id)
+            .from(DeclarationEntity)
+            .and_where(declaration::Column::Source.eq(source))
+            .to_owned();
+        ValueEntity::find()
+            .filter(setting_value::Column::NeedsReview.eq(true))
+            .filter(subjectless())
+            .filter(setting_value::Column::DeclarationId.in_subquery(of_source))
+            .secure()
+            .scope_with(scope)
+            .count(conn)
+            .await
+            .map_err(db_error)
+    }
+
     async fn list_flagged<C: DBRunner>(
         &self,
         conn: &C,

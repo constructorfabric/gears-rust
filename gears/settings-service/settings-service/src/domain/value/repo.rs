@@ -102,6 +102,18 @@ pub trait ValueRepository: Send + Sync {
         tenant_id: Uuid,
     ) -> Result<Option<StoredValue>, DomainError>;
 
+    /// How many rows are flagged for review under declarations from `source`,
+    /// across every tenant — what the needs-review gauge reports.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn count_flagged<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        source: &str,
+    ) -> Result<u64, DomainError>;
+
     /// The rows flagged for review among `declaration_ids`, at any of
     /// `tenant_ids` — the administrative needs-review listing — in
     /// (declaration, tenant) order and at most `limit + 1` of them, so the
