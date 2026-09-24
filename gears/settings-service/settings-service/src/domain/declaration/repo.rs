@@ -277,18 +277,18 @@ pub trait DeclarationRepository: Send + Sync {
         id: Uuid,
     ) -> Result<(), DomainError>;
 
-    /// Adopt a re-declaration's value type and Schema Default — the definition
-    /// arm of the effective recency — stamping `last_change_at` and
-    /// `updated_at`.
+    /// Adopt a re-declaration's Schema Default — the definition arm of the
+    /// effective recency — stamping `last_change_at` and `updated_at`.
     ///
     /// Only a revive calls this: an active declaration's definition never
-    /// changes in place, it rides a new major.
-    async fn set_definition<C: DBRunner>(
+    /// changes in place, it rides a new major. The value type is not here to
+    /// change: the setting's own GTS type is registered with it, and the
+    /// registry does not replace a registered type.
+    async fn set_default<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        value_type_id: &str,
         default_value: &serde_json::Value,
     ) -> Result<(), DomainError>;
 

@@ -192,7 +192,7 @@ The hardest constraint here is not any single field but the rule connecting them
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
 **Success Scenarios**:
-- A retired declaration is revived by re-declaring its key — with the same value type or a different one — and its retained values, re-validated against that type, resume participating in resolution
+- A retired declaration is revived by re-declaring its key with the value type it was declared with, and its retained values, re-validated against that type, resume participating in resolution
 
 **Error Scenarios**:
 - Credential step-up absent or invalid
@@ -208,10 +208,12 @@ The hardest constraint here is not any single field but the rule connecting them
 6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key - `inst-decl-react-6`
 7. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
 8. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-9. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared `value_type_id`, Schema Default and metadata WHERE key = {key}; re-validate every retained value against that value type, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-10. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
-11. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
-12. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+9. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
+10. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
+11. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
+12. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+13. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
+14. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
 
 ### Declare Dependency Group
 
@@ -424,7 +426,7 @@ The system **MUST** partition declaration changes into descriptive metadata appl
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
 
-Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; the re-declaration **MAY** name a different value type, in which case the row adopts it and every retained value is re-validated against it, and it **MUST** be refused when it flips the secret trait or changes the Scope Class. Neither action goes through the value write path, and neither deletes values.
+Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; every retained value **MUST** be re-validated against the value type before it goes live, and the re-declaration **MUST** be refused when it flips the secret trait, changes the Scope Class or names a different value type — the setting's own GTS type is registered with its value type, and the Types Registry does not replace a registered type. Neither action goes through the value write path, and neither deletes values.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-retire`
@@ -528,7 +530,7 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Retiring a declaration invalidates the cache for the affected scopes in the same transaction that flips the status
 - [x] A retired declaration still blocks deletion of its category
 - [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
-- [x] Re-declaring a retired key with a different value type revives it under that type: a retained value that validates goes live, one that does not is flagged `needs_review` with its detail
+- [x] Re-declaring a retired key with a different value type is refused `409 value_type_changed` with nothing written; a revive under the same type re-validates every retained value, one that validates goes live and one that does not is flagged `needs_review` with its detail
 - [x] Re-declaring a retired key with a type that flips the secret trait, or with a different scope class, returns `409` and leaves the row retired and its values untouched
 - [x] Re-declaring a key that is already `active` returns `409`
 - [ ] A Dependency Group naming a key that resolves to no active declaration returns `400`

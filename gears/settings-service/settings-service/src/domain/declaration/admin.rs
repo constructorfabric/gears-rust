@@ -46,6 +46,9 @@ pub mod conflict {
     pub const SECRETNESS_CHANGED: &str = "secretness_changed";
     /// A revive changes the scope class; where a value may exist is not revived.
     pub const SCOPE_CLASS_CHANGED: &str = "scope_class_changed";
+    /// A revive names another value type; the setting's own GTS type stays
+    /// registered with the one it was declared with.
+    pub const VALUE_TYPE_CHANGED: &str = "value_type_changed";
 }
 
 /// What an administrator supplies to declare a setting.
@@ -480,8 +483,10 @@ where
             )),
             // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
             Some(retired) => {
-                self.revive(conn, scope, retired, &request, derived, metadata, actor)
-                    .await
+                self.revive(
+                    conn, scope, &key, retired, &request, derived, metadata, actor,
+                )
+                .await
             }
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
             None => {
@@ -577,6 +582,7 @@ where
         &self,
         conn: &C,
         scope: &AccessScope,
+        key: &SettingKey,
         retired: Declaration,
         request: &CreateDeclaration,
         derived: DerivedClassification,
@@ -590,11 +596,14 @@ where
         self.verify_step_up(actor).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
-        // What a revive may not change, because it would move values rather
-        // than re-interpret them: the secret boundary (a secret's values live
-        // by reference, everything else inline) and the scope class. The value
-        // type itself may change — that is how a setting is retyped — and every
-        // retained value is re-validated against it below.
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
+        // What a revive may not change: the secret boundary (a secret's values
+        // live by reference, everything else inline) and the scope class, which
+        // would move values rather than re-interpret them; and the value type,
+        // which the setting's own GTS type is registered with — the registry
+        // does not replace a registered type, so a retyped row would disagree
+        // with it for good. The secret boundary is checked first: crossing it is always a retype too, and the more
+        // specific refusal says why.
         if retired.has_secret_trait != derived.has_secret_trait {
             return Err(conflict(
                 conflict::SECRETNESS_CHANGED,
@@ -615,26 +624,33 @@ where
                 ),
             ));
         }
+        if retired.value_type_id != request.value_type_id {
+            return Err(conflict(
+                conflict::VALUE_TYPE_CHANGED,
+                format!(
+                    "`{}` is declared with `{}` and its setting type is registered with it; \
+                     a revive keeps that value type and cannot adopt `{}`",
+                    retired.key, retired.value_type_id, request.value_type_id
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-14
+        // The type the row goes live under is the registered one, confirmed
+        // before anything is written — as a create registers before it inserts.
+        self.registrar
+            .register_setting_type(key, &retired.value_type_id)
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-14
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-9
         // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-3
         let classification_changed = retired.data_classification != metadata.data_classification;
         let new_classification = metadata.data_classification.clone();
-        if retired.value_type_id != request.value_type_id
-            || retired.default_value != request.default_value
-        {
+        if retired.default_value != request.default_value {
             // Adopted as declared: the Schema Default was validated against the
-            // (possibly new) type on the way in. The setting's own GTS type,
-            // registered at create with its payload narrowed to the old value
-            // type, stays as registered — the registry answers a second
-            // registration with already-exists.
+            // type on the way in.
             self.declarations
-                .set_definition(
-                    conn,
-                    scope,
-                    retired.id,
-                    &request.value_type_id,
-                    &request.default_value,
-                )
+                .set_default(conn, scope, retired.id, &request.default_value)
                 .await?;
         }
         let redefines = metadata.redefines(&retired);
@@ -642,12 +658,12 @@ where
             .update_metadata(conn, scope, retired.id, metadata, None, redefines)
             .await?;
         // Every retained value is re-validated against the type it goes live
-        // under — the new one, or the old one that may have gained a revision
-        // while the setting sat retired. What fails is flagged with its detail
+        // under, which may have gained a compatible revision while the setting
+        // sat retired. What fails is flagged with its detail
         // and falls through on read rather than being served or discarded;
         // what validates again has its flag cleared.
         for row in self.values.find_all(conn, scope, retired.id).await? {
-            let detail = self.revalidate(&request.value_type_id, &row).await?;
+            let detail = self.revalidate(&retired.value_type_id, &row).await?;
             if detail.is_some() != row.needs_review {
                 self.values.flag(conn, scope, row.id, detail).await?;
             }

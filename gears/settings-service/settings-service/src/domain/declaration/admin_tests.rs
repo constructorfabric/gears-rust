@@ -708,8 +708,14 @@ async fn re_declaring_a_retired_key_revives_it_with_its_values() {
             .expect("lookup")
             .is_some()
     );
-    // No second type registration: the key is the one already registered.
-    assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
+    // The revive confirms the setting's own type under the value type it goes
+    // live with, before anything is written; the registry answers an
+    // identical second registration as the one it already holds.
+    let key = revived.declaration.key.clone();
+    assert_eq!(
+        *h.registrar.registered.lock().expect("lock"),
+        vec![(key.clone(), BOOL.to_owned()), (key, BOOL.to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -771,7 +777,54 @@ async fn a_revive_may_not_flip_the_secret_boundary_or_the_scope_class() {
 }
 
 #[tokio::test]
-async fn a_revive_may_retype_the_setting_and_re_validates_every_retained_value() {
+async fn a_revive_may_not_retype_the_setting_because_its_registered_type_cannot_follow() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tenant = h.base.tree.a;
+    h.base.set(id, tenant, json!(true)).await;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+
+    // The setting's own GTS type is registered with its payload narrowed to
+    // the boolean, and the registry does not replace a registered type: a
+    // revive as text would leave the two disagreeing, so it is refused.
+    let mut retyped = h.request("retry_policy");
+    retyped.value_type_id = TEXT.to_owned();
+    retyped.default_value = json!("gentle");
+    let err = h.create(retyped, &admin_actor()).await.expect_err("retype");
+    match err {
+        DomainError::Conflict { detail } => assert!(
+            detail.starts_with(super::conflict::VALUE_TYPE_CHANGED),
+            "{detail}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // Nothing was reactivated, retyped or re-registered, and the retained
+    // value is as it was.
+    let row = h.load(id).await;
+    assert_eq!(row.status, "retired");
+    assert_eq!(row.value_type_id, BOOL);
+    assert_eq!(row.default_value, json!(false));
+    assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
+    let conn = h.base.db.conn().expect("connection");
+    let value = ValueRepo
+        .find_one(&conn, &AccessScope::allow_all(), id, tenant)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(value.value, Some(json!(true)));
+    assert!(!value.needs_review);
+}
+
+#[tokio::test]
+async fn a_revive_re_validates_every_retained_value_against_its_type() {
     let h = Harness::verified().await;
     let created = h
         .create(h.request("retry_policy"), &admin_actor())
@@ -779,24 +832,22 @@ async fn a_revive_may_retype_the_setting_and_re_validates_every_retained_value()
         .expect("created");
     let id = created.declaration.id;
     let (a, b) = (h.base.tree.a, h.base.tree.b);
-    // A boolean that will not read as text, and a text flagged while the
-    // setting was boolean: the retype swaps which of the two is live.
-    h.base.set(id, a, json!(true)).await;
-    h.base.set_flagged(id, b, json!("aggressive")).await;
+    // A text that never read as a boolean, and a boolean flagged while the
+    // setting sat retired: the revive re-validates both, keeping the first
+    // flagged and clearing the second.
+    h.base.set_flagged(id, a, json!("aggressive")).await;
+    h.base.set_flagged(id, b, json!(true)).await;
     let tag = etag_of(&created.declaration);
     h.retire(id, Some(tag.as_str()), &admin_actor())
         .await
         .expect("retired");
 
-    let mut retyped = h.request("retry_policy");
-    retyped.value_type_id = TEXT.to_owned();
-    retyped.default_value = json!("gentle");
-    let revived = h.create(retyped, &admin_actor()).await.expect("revived");
+    let revived = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("revived");
     assert!(revived.reactivated);
-    assert_eq!(revived.declaration.id, id, "the row keeps its identity");
-    assert_eq!(revived.declaration.value_type_id, TEXT);
-    assert_eq!(revived.declaration.default_value, json!("gentle"));
-    assert_eq!(revived.declaration.status, "active");
+    assert_eq!(revived.declaration.value_type_id, BOOL);
 
     let conn = h.base.db.conn().expect("connection");
     let scope = AccessScope::allow_all();
@@ -805,19 +856,20 @@ async fn a_revive_may_retype_the_setting_and_re_validates_every_retained_value()
         .await
         .expect("lookup")
         .expect("row");
-    assert!(flagged.needs_review, "`true` is not text");
+    assert!(flagged.needs_review, "text is not a boolean");
     assert!(flagged.needs_review_detail.is_some(), "the flag says why");
-    assert_eq!(flagged.value, Some(json!(true)), "flagged, not discarded");
+    assert_eq!(
+        flagged.value,
+        Some(json!("aggressive")),
+        "flagged, not discarded"
+    );
     let cleared = ValueRepo
         .find_one(&conn, &scope, id, b)
         .await
         .expect("lookup")
         .expect("row");
-    assert!(!cleared.needs_review, "text validates under the new type");
+    assert!(!cleared.needs_review, "a boolean validates again");
     assert_eq!(cleared.needs_review_detail, None);
-    // The setting's own type was registered at create; a revive mints no
-    // second one.
-    assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
 }
 
 #[tokio::test]

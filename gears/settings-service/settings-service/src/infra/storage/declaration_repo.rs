@@ -340,20 +340,15 @@ impl DeclarationRepository for DeclarationRepo {
         Ok(())
     }
 
-    async fn set_definition<C: DBRunner>(
+    async fn set_default<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        value_type_id: &str,
         default_value: &serde_json::Value,
     ) -> Result<(), DomainError> {
         let at = now();
         DeclarationEntity::update_many()
-            .col_expr(
-                declaration::Column::ValueTypeId,
-                Expr::value(value_type_id.to_owned()),
-            )
             .col_expr(
                 declaration::Column::DefaultValue,
                 Expr::value(default_value.clone()),
