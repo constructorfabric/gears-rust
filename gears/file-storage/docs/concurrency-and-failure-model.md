@@ -86,7 +86,8 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
                                                                             ▼
                                                        CompleteMultipartUpload + 8 KiB MIME sniff
                                                                             │
-                                                       finalize tx (available + bind CAS) ── on error: release-lease CAS ──► IN_PROGRESS
+                                                       finalize+bind+finish tx (available + bind CAS + session completed,
+                                                       one transaction) ── on error: release-lease CAS ──► IN_PROGRESS
                                                                             ▼
                                                        COMPLETED(complete_result JSON)   [ABORTED via client abort / cleanup sweep]
 ```
@@ -97,8 +98,8 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
 | M2 | part upload | none by the sidecar; the **control plane** upserts the part row on the token-authenticated report callback (`MultipartStore::upsert_multipart_part` — single upsert) | Sidecar streams the part (`upload_part` / S3 `UploadPart`), enforcing the token's **exact** `size` claim, hashing on the fly | The part's `PUT` connection; report callback bounded like finalize (10 s / 3 attempts). Part URL `exp` bounds *starting* an upload; the session `expires_at` bounds the whole endeavour (two-clock model, DESIGN §4.7 Phase C) |
 | M3 | acquire lease | **Single CAS**: `state='completing', lease_until=now+K, lease_owner=:me WHERE upload_id=:id AND (state='in_progress' OR (state='completing' AND lease_until < now))` — `MultipartRepo::acquire_complete_lease`. One statement covers fresh acquire **and** dead-owner takeover | none | Read-only pre-flight (missing-parts diff, size, policy) runs **before** the CAS, so a deterministic rejection never occupies the lease. `K = multipart_complete_lease_secs` (default 120 s) |
 | M4 | assembly | none | Winner's **detached task** (`tokio::spawn` in `complete_multipart_upload`; the HTTP handler awaits its `JoinHandle`, but a dropped request future cannot cancel the work): S3 `CompleteMultipartUpload` (manifest + root folded from reported part rows — **no re-read**, ADR-0006), then one ~8 KiB ranged `get_range` for MIME sniffing. Takeover recovery: if the backend handle was already consumed but the assembled object exists, `(manifest, root)` are rebuilt locally from the part rows (`assemble_and_finish_inner`) | The client's `complete` request is open but expendable (F5-safe). The lease clock bounds how long the state stays `completing` unobserved |
-| M5 | finalize (+bind) | **One tx**: version `pending → available` + hash/manifest row + audit + (`session.auto_bind`) the bind CAS against the `content_id` validated by the endpoint's `If-Match` + bind audit + event (`Store::finalize_version`) | none | — |
-| M6 | finish | **One tx**: CAS `completing → completed` + persist `complete_result` JSON (`StoredCompleteResult`) + audit — `MultipartRepo::finish_complete`. On a failed assembly instead: release-lease CAS `completing → in_progress WHERE lease_owner = :me` (`release_complete_lease`), so the next `complete` retries immediately | none | — |
+| M5 | finalize + bind + finish (first-attempt path) | **One tx** (crash-consistency fix — this used to be two independent transactions with a gap between them): version `pending → available` + hash/manifest row + audit; (`session.auto_bind`) the bind CAS against the `content_id` validated by the endpoint's `If-Match` + bind audit + event; then, in the SAME transaction, the session's own `completing → completed` CAS (fenced only by `state = 'completing'`, not by lease ownership) + persisted `complete_result` JSON + audit — `Store::finalize_multipart_version` | none | — |
+| M6 | finish (recovery/converge path only) | Reached only when this caller's OWN finalize CAS above was lost (someone else already finalized the version — a stale lease-owner racing a takeover) but the version is confirmed `available`: replays the persisted result, then, in its own **one tx**, CAS `completing → completed` + persist `complete_result` JSON + audit for this caller's session state — `MultipartRepo::finish_complete` via `finish_session`. On a failed assembly (a genuine error, not this convergence): release-lease CAS `completing → in_progress WHERE lease_owner = :me` (`release_complete_lease`), so the next `complete` retries immediately | none | — |
 
 ### 2.3 Clock & timeout inventory
 
@@ -142,10 +143,11 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
    (`state='completing' AND lease_until < now`) makes takeover the *same* operation as acquisition — no
    separate recovery protocol. The taker distrusts the dead owner's progress and re-derives it from
    durable state: version row status, backend object existence, part rows (§2.2 M4). A slow-but-alive
-   original owner that finishes assembly after losing its lease cannot corrupt anything: its
-   `finish_complete` CAS (`WHERE state='completing'`) still succeeds only if no one else finished first,
-   and `VersionRepo::finalize`'s own `status='pending'` CAS makes the version flip once-only; a lost
-   finish converges via `replay_completed` (`finish_session`'s not-finished branch).
+   original owner that finishes assembly after losing its lease cannot corrupt anything: the version's
+   `status='pending'` CAS (inside the M5 finalize+bind+finish transaction) makes the version flip
+   once-only, so of the two racing owners at most one actually finalizes it; the other's own finalize CAS
+   is lost, re-reads the version as already `available`, and converges by replaying the persisted result
+   and running only its own session's `completing → completed` transition (M6) instead of erroring.
 3. **PUT replay on the same token** (until `exp`). Unpublished path: lands as an ordinary write.
    Published path: `publish_exclusive` refuses (**bytes never mutate in place**); finalize still runs
    with the replay's digest and either converges (same bytes) or is rejected by the stored-hash /

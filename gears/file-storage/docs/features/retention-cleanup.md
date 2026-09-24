@@ -41,7 +41,7 @@ Updated:  2026-07-08 by Constructor Tech
 
 ### 1.1 Overview
 
-Two related P2 capabilities sharing one background engine (`CleanupEngine::run_sweep`, `src/domain/cleanup.rs`):
+Two related P2 capabilities sharing one background engine (the cleanup engine's periodic sweep):
 (1) **retention policies** (`cpt-cf-file-storage-fr-retention-policies`) — tenant/user/file-scoped rules that
 auto-expire files by age, inactivity, or a custom-metadata match; and (2) **orphan reconciliation**
 (`cpt-cf-file-storage-fr-orphan-reconciliation`) — reclaiming `pending` version rows (and, transitively, permanently
@@ -231,17 +231,20 @@ retention_expired_deleted, idempotency_keys_deleted }`
 6. [x] - `p1` - RETURN the accumulated `SweepResult`; the gear also exports these five tallies as metrics counters
    at the point they are logged - `inst-sweep-return`
 
-> **Batching note.** Only two phases of this cycle are batched: the retention-expiry scan (keyset-paginated,
-> `RETENTION_SWEEP_BATCH` = 500 files per page — [Sweep Retention-Policy Expiry](#sweep-retention-policy-expiry)) and the
-> versionless-files list (`inst-sweep-versionless-list`, "in batches" — [Sweep Versionless
-> Files](#sweep-versionless-files-abandoned-multipart-create-orphans)). The other four queries in this cycle —
-> the abandoned-pending-versions list (step 1's first phase), the expired-multipart-sessions list (step 2), the all-retention-
-> rules load (step 3), and the expired-idempotency-keys delete (step 4) — run as a single unbounded query/statement,
-> with no limit or offset. That is acceptable today because each of those sets is bounded by the number of
-> currently-abandoned or currently-expired sessions/keys, or by the number of configured retention rules, not by
-> the size of the `files` table — none of them scales with total file count. If any of these sets grows large
-> enough to matter, batching will need to be introduced for it too, the same way it already has been for the other
-> two phases.
+> **Batching note.** All five sweep queries are bounded per pass by a named `..._SWEEP_BATCH` constant (500 rows
+> each: `RETENTION_SWEEP_BATCH`, `ABANDONED_PENDING_SWEEP_BATCH`, `VERSIONLESS_SWEEP_BATCH`,
+> `EXPIRED_MULTIPART_SWEEP_BATCH`, `EXPIRED_IDEMPOTENCY_SWEEP_BATCH`) — none of them is a literal unbounded
+> query/statement with no `LIMIT`. Only the retention-expiry scan actually loops across multiple pages within a
+> single sweep pass (keyset-paginated by `file_id`, continuing until a short page comes back —
+> [Sweep Retention-Policy Expiry](#sweep-retention-policy-expiry)), because it is the one query whose candidate set
+> scales with total file count. The other four — the abandoned-pending-versions list (step 1's first phase), the
+> versionless-files list (step 1's second phase — [Sweep Versionless
+> Files](#sweep-versionless-files-abandoned-multipart-create-orphans)), the expired-multipart-sessions list (step 2),
+> and the expired-idempotency-keys delete (step 4) — each take exactly one bounded batch of up to 500 rows per sweep
+> pass, with no further pagination inside that call: any remainder is left for the next scheduled
+> `sweep_interval_secs` tick rather than looped over immediately. That is acceptable because each of those sets is
+> bounded by the number of currently-abandoned or currently-expired sessions/keys, not by the size of the `files`
+> table — none of them scales with total file count the way the retention scan does.
 
 ### Sweep Abandoned Pending Versions (Orphan Reconciliation)
 
@@ -252,11 +255,11 @@ retention_expired_deleted, idempotency_keys_deleted }`
 **Output**: `(pending_versions_deleted, orphan_files_deleted)`
 
 **Steps**:
-1. [x] - `p1` - DB: list `pending` version rows with `created_at < grace_cutoff`, **excluding** any version that is still the backing version of a live `in_progress` multipart session (`multipart_uploads.expires_at > now`) — see [Live-Multipart-Session Guard](#live-multipart-session-guard) - `inst-sweep-pending-list`
-2. [x] - `p1` - FOR EACH candidate: write an `orphan_reconcile` audit row, then delete the version row **status-guarded** (`status = pending` only) -- the same CAS pattern step 2 below uses, so a version a racing `finalize_upload` already flipped to `available` between the list query and this delete is left completely untouched (row, blob, and debit alike) - `inst-sweep-pending-audit-delete`
+1. [x] - `p1` - DB: list `pending` version rows with `created_at < grace_cutoff`, **excluding** any version that is still the backing version of a live `in_progress` multipart session (`multipart_uploads.expires_at > now`) **or** of any `completing` session regardless of its lease — see [Live-Multipart-Session Guard](#live-multipart-session-guard) - `inst-sweep-pending-list`
+2. [x] - `p1` - FOR EACH candidate (having already resolved every candidate's parent file in ONE batched round-trip up front — a single "list files by ids" call, not one lookup per candidate — purely to attribute the right `tenant_id` on each audit row): write an `orphan_reconcile` audit row, then delete the version row **status-guarded** (`status = pending` only) -- the same CAS pattern step 2 below uses, so a version a racing `finalize_upload` already flipped to `available` between the list query and this delete is left completely untouched (row, blob, and debit alike) - `inst-sweep-pending-audit-delete`
 3. [x] - `p1` - **IF** deleted: debit the reclaimed bytes via the usage reporter (fire-and-forget; `bytes_delta = -size`, `file_count_delta = 0` — `size` is structurally `0` in practice since a version is only ever assigned a nonzero size by `finalize_version`, which a reclaimed-here version never reached) - `inst-sweep-pending-usage`
 4. [x] - `p1` - Best-effort: delete the backend blob at the version's `(backend_id, backend_path)` — a failure leaves an unreachable orphan blob, acceptable in P2 - `inst-sweep-pending-blob`
-5. [x] - `p1` - **IF** the parent file now has zero versions **AND** `content_id IS NULL` **AND** no `in_progress`, unexpired multipart session still references it (the same guard as step 1, re-checked because a session that has not yet expired could still legitimately have its backing version reclaimed by an unrelated grace-window aging in the *same* sweep pass): delete the `files` row too — the multipart-session check just described is pre-transactional (see [Live-Multipart-Session Guard](#live-multipart-session-guard)); the transactional delete itself (`Store::delete_orphan_file_with_event`) re-verifies only the other two conditions, zero versions and `content_id IS NULL`, fresh inside the same transaction, so a version inserted in the gap is never lost — write a `file.deleted` event and debit `file_count_delta = -1`, `bytes_delta = 0` - `inst-sweep-pending-orphan-file`
+5. [x] - `p1` - **IF** the parent file now has zero versions **AND** `content_id IS NULL` **AND** no `in_progress`, unexpired multipart session, nor any `completing` session, still references it (the same guard as step 1, re-checked because a session that has not yet expired could still legitimately have its backing version reclaimed by an unrelated grace-window aging in the *same* sweep pass): delete the `files` row too — the multipart-session check just described is pre-transactional (see [Live-Multipart-Session Guard](#live-multipart-session-guard)); the transactional delete itself (`Store::delete_orphan_file_with_event`) re-verifies only the other two conditions, zero versions and `content_id IS NULL`, fresh inside the same transaction, so a version inserted in the gap is never lost — write a `file.deleted` event and debit `file_count_delta = -1`, `bytes_delta = 0` - `inst-sweep-pending-orphan-file`
 6. [x] - `p1` - RETURN the two counts - `inst-sweep-pending-return`
 
 ### Sweep Versionless Files (Abandoned Multipart-Create Orphans)
@@ -282,7 +285,9 @@ while `orphan_grace_secs` is measured in hours.
 
 **Steps**:
 1. [x] - `p1` - DB: list `files` rows with `content_id IS NULL` and zero rows in `file_versions`, `created_at <
-   grace_cutoff`, in batches - `inst-sweep-versionless-list`
+   grace_cutoff`, in batches — this list query already returns the full `File` row for each candidate, so (unlike
+   the abandoned-pending and expired-multipart phases) no separate per-candidate or batched file lookup is needed
+   here to attribute the audit row's `tenant_id` - `inst-sweep-versionless-list`
 2. [x] - `p1` - FOR EACH candidate: reuse `maybe_delete_orphaned_file` — the same guarded primitive [Sweep Abandoned
    Pending Versions](#sweep-abandoned-pending-versions-orphan-reconciliation) step 5 uses for its own zero-version
    case, so the [Live-Multipart-Session Guard](#live-multipart-session-guard) (`has_blocking_multipart_session`) and
@@ -303,12 +308,13 @@ while `orphan_grace_secs` is measured in hours.
 
 **Steps**:
 1. [x] - `p1` - DB: list multipart sessions with `expires_at < now` that are either still `in_progress` or left `completing` by a dead completer whose lease has also expired (`MultipartRepo::list_expired`; a live lease is never reaped mid-assembly) - `inst-sweep-multipart-list`
-2. [x] - `p1` - FOR EACH: CAS the session `in_progress -> aborted` **first**, via the same `Store::abort_multipart_upload` the user-driven abort path uses — that call also deletes the session's `multipart_upload_parts` rows in the same transaction as the state flip, so a concurrent `complete_multipart_upload` racing on the same session row can win instead (`in_progress -> completed`); only one side wins - `inst-sweep-multipart-cas`
-3. [x] - `p1` - **IF** the sweep won the CAS: best-effort abort the backend upload handle, then delete the pending version row **status-guarded** (`status = pending` only) — a version a racing complete already flipped to `available` via `finalize_version` (ahead of its own session CAS) is left untouched; the DELETE simply matches zero rows - `inst-sweep-multipart-cleanup`
+2. [x] - `p1` - Resolve every listed session's parent file in ONE batched round-trip up front (a single "list files by ids" call, not one lookup per session), same as step 1's abandoned-pending phase — used only to attribute the right `tenant_id` on each session's audit row - `inst-sweep-multipart-audit-batch`
+3. [x] - `p1` - FOR EACH: CAS the session `in_progress -> aborted` **first**, via the same `Store::abort_multipart_upload` the user-driven abort path uses — that call also deletes the session's `multipart_upload_parts` rows in the same transaction as the state flip, so a concurrent `complete_multipart_upload` racing on the same session row can win instead (`in_progress -> completed`); only one side wins - `inst-sweep-multipart-cas`
+4. [x] - `p1` - **IF** the sweep won the CAS: best-effort abort the backend upload handle, then delete the pending version row **status-guarded** (`status = pending` only) — a version a racing complete already flipped to `available` via `finalize_version` (ahead of its own session CAS) is left untouched; the DELETE simply matches zero rows - `inst-sweep-multipart-cleanup`
 
    The backend abort is best-effort and **not** retried: once the CAS has moved the session to `aborted`, no later pass lists it again (step 1 selects only `in_progress` and lease-expired `completing` sessions). A failed abort therefore leaves an incomplete multipart upload on the backend that FileStorage will never touch again — configure an `AbortIncompleteMultipartUpload` bucket lifecycle rule as the backstop reaper (see `concurrency-and-failure-model.md` §5).
-4. [x] - `p1` - **IF** the sweep lost the CAS (session already transitioned): skip version cleanup entirely and log — if the winner was `complete`, the version is now `Available` and bound; touching it would be data loss - `inst-sweep-multipart-skip`
-5. [x] - `p1` - RETURN the count of sessions the sweep itself won and aborted - `inst-sweep-multipart-return`
+5. [x] - `p1` - **IF** the sweep lost the CAS (session already transitioned): skip version cleanup entirely and log — if the winner was `complete`, the version is now `Available` and bound; touching it would be data loss - `inst-sweep-multipart-skip`
+6. [x] - `p1` - RETURN the count of sessions the sweep itself won and aborted - `inst-sweep-multipart-return`
 
 ### Sweep Retention-Policy Expiry
 
@@ -322,7 +328,7 @@ while `orphan_grace_secs` is measured in hours.
 1. [x] - `p1` - DB: list all retention rules across all tenants and scopes; **IF** empty, skip the file scan entirely - `inst-sweep-retention-rules`
 2. [x] - `p1` - Scan all files in keyset-paginated batches of 500 (by `file_id`, `after`-cursor), so the sweep never materializes every file across every tenant in memory regardless of deployment size - `inst-sweep-retention-scan`
 3. [x] - `p1` - FOR EACH file in a batch: gather rules applicable by scope (`Tenant` → always; `User` → `rule.scope_target_id == file.owner_id`; `File` → `rule.scope_target_id == file.file_id`), restricted to the file's own tenant - `inst-sweep-retention-applicable`
-4. [x] - `p1` - **IF** any applicable rule: fetch the file's custom metadata (needed for a metadata-criterion rule); a fetch failure skips the file (logged) rather than treating it as "no metadata, no match" - `inst-sweep-retention-metadata`
+4. [x] - `p1` - **IF** any applicable rule: fetch the custom metadata of every file on the current page that needs it, in ONE batched "list metadata for files" call per page (not one query per file) — a page with no metadata-criterion rules issues zero metadata queries; a fetch failure skips every file on that page that needed metadata (logged) rather than treating it as "no metadata, no match" - `inst-sweep-retention-metadata`
 5. [x] - `p1` - Evaluate OR semantics across the file's applicable rules — the first matching criterion (age: `now - created_at > max_age_days`; inactivity: `now - last_modified_at > inactivity_days`, **not** reset by downloads, only by writes; metadata: an exact key/value match) triggers expiry - `inst-sweep-retention-match`
 6. [x] - `p1` - **IF** expiring: write a `retention_delete` audit row and a `file.deleted` event on the same transactional-outbox path user-initiated deletes use, delete the file (all versions + the `files` row), debit total bytes and `file_count_delta = -1` via the usage reporter, then best-effort delete each version's backend blob - `inst-sweep-retention-delete`
 7. [x] - `p1` - RETURN the total deleted across all pages - `inst-sweep-retention-return`
@@ -369,15 +375,11 @@ eliminate the redundant work (not the small risk of incorrectness, since there i
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-retention-rule-endpoints`
 
 `RetentionScope` (`Tenant`/`User`/`File`) and `RetentionRuleBody` (`age`/`inactivity`/`metadata`, OR
-semantics — any one matching criterion triggers expiry) are defined in `src/domain/policy.rs`; `GET/POST /retention-rules` and
-`DELETE /retention-rules/{rule_id}` (`src/api/rest/routes.rs:388-440`, `handlers::list_retention_rules`/
-`create_retention_rule`/`delete_retention_rule`) are backed by `PolicyService::list_retention_rules`/
-`create_retention_rule`/`delete_retention_rule` (`src/domain/policy_service.rs`). Scope-aware authorization (`Tenant`
+semantics — any one matching criterion triggers expiry) back `GET/POST /retention-rules` and
+`DELETE /retention-rules/{rule_id}`. Scope-aware authorization (`Tenant`
 = `ADMIN_POLICY` outright, no `WRITE` fallback; `User` = `ADMIN_POLICY`-first with `WRITE`-plus-target-match fallback; `File` = resolve-then-
-per-file-`WRITE`) is covered by `tests/policy_authz_test.rs`
-(`create_retention_rule_file_scope_target_not_writable_is_denied`,
-`create_retention_rule_file_scope_target_writable_is_allowed`, `delete_retention_rule_foreign_owner_is_denied`,
-`delete_missing_retention_rule_returns_retention_not_found`).
+per-file-`WRITE`) is covered by dedicated authorization tests for each scope, including a foreign-owner denial and a
+not-found case for deleting a missing rule.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-retention-list`
@@ -393,12 +395,10 @@ per-file-`WRITE`) is covered by `tests/policy_authz_test.rs`
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-cleanup-engine`
 
-`CleanupEngine::run_sweep` (`src/domain/cleanup.rs`) implements all four steps in [Run Sweep
-Cycle](#run-sweep-cycle). `gear.rs` spawns a `tokio::spawn` loop on `cfg.sweep_interval_secs`, gated by
-`cfg.enable_background_sweep` (default enabled; test/dev harnesses that need deterministic behavior set it `false`
-and call `run_sweep()` directly), and exports the `SweepResult` tallies as metrics counters
-(`sweep_metrics.record_sweep_result`) at the point they are logged. Covered end-to-end by `tests/cleanup_test.rs`
-(25 tests spanning all four steps, backend migration interaction, and idempotency/outbox housekeeping).
+The cleanup engine's sweep entry point implements all four steps in [Run Sweep
+Cycle](#run-sweep-cycle). The gear spawns a background loop on `sweep_interval_secs`, gated by
+`enable_background_sweep` (default enabled; test/dev harnesses that need deterministic behavior set it `false`
+and call the sweep directly), and exports the tallied results as metrics counters at the point they are logged.
 
 **Implements**:
 - `cpt-cf-file-storage-algo-run-sweep`
@@ -408,7 +408,7 @@ and call `run_sweep()` directly), and exports the `SweepResult` tallies as metri
 - `cpt-cf-file-storage-algo-sweep-retention-expiry`
 
 **Touches**:
-- Gears: `src/domain/cleanup.rs`, `src/gear.rs`
+- Gears: the cleanup engine module and gear startup wiring
 - DB Table: `file_versions`, `files`, `multipart_uploads`, `multipart_upload_parts`, `idempotency_keys`
 
 > **Usage-reporting caveat, mirroring multipart-coordinator.md's own note.** `CleanupEngine::report_usage` is a real,
@@ -424,18 +424,23 @@ and call `run_sweep()` directly), and exports the `SweepResult` tallies as metri
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-cleanup-live-multipart-guard`
 
 `VersionRepo::list_pending_older_than`
-(`src/infra/storage/repo/version_repo.rs:373-403`) — the query backing [Sweep Abandoned Pending
+— the query backing [Sweep Abandoned Pending
 Versions](#sweep-abandoned-pending-versions-orphan-reconciliation) — filters out any `pending` version row whose
-`version_id` appears in a live multipart session: `SELECT version_id FROM multipart_uploads WHERE state =
-'in_progress' AND expires_at > now`. **Invariant**: a pending version backing a still-`in_progress`, unexpired
-multipart session is **never** selected for reclamation by step 1, regardless of how old its `created_at` is — a
+`version_id` appears in an active multipart session: `SELECT version_id FROM multipart_uploads WHERE (state =
+'in_progress' AND expires_at > now) OR state = 'completing'`. **Invariant**: a pending version backing a
+still-`in_progress`, unexpired multipart session, **or** backing **any** `completing` session (regardless of
+`lease_until`), is **never** selected for reclamation by step 1, regardless of how old its `created_at` is — a
 long-running upload (large file, generous URL TTL) can legitimately keep its backing version `pending` for longer
 than `orphan_grace_secs`, and without this guard the sweep would delete the version out from under the in-progress
-upload. A session whose `expires_at` has **already passed** is deliberately **not** excluded by this guard — that
-version becomes reclaimable, but only after [Sweep Expired Multipart
-Sessions](#sweep-expired-multipart-sessions) (step 2, running in the same cycle) has transitioned the session out of
-`in_progress`; step 1 and step 2 run in a fixed order within one `run_sweep` call, so a session that expires exactly
-between them is reclaimed on the *next* cycle, not silently missed. The same live-session check is repeated,
+upload or the completer currently assembling it. A session whose `expires_at` has **already passed** is deliberately
+**not** excluded by this guard while it is still `in_progress` — that version becomes reclaimable, but only after
+[Sweep Expired Multipart Sessions](#sweep-expired-multipart-sessions) (step 2, running in the same cycle) has
+transitioned the session out of `in_progress`; step 1 and step 2 run in a fixed order within one `run_sweep` call, so
+a session that expires exactly between them is reclaimed on the *next* cycle, not silently missed. A `completing`
+session, by contrast, is excluded unconditionally — independent of `expires_at`, and regardless of whether its own
+completion lease (`lease_until`) has itself lapsed — since reaping its backing version would risk destroying content
+a completer is (or was) actively assembling; only step 2's takeover/abort path, once it moves a lease-expired
+`completing` session out of that state, makes the version reclaimable again. The same live-session check is repeated,
 independently, by `CleanupEngine::has_blocking_multipart_session` before deleting a permanently-orphaned zero-version
 `files` row (§3, step 5's `inst-sweep-pending-orphan-file`), for the same reason at the file-deletion granularity: a
 `files` row's `ON DELETE CASCADE` would otherwise take a still-`in_progress` `multipart_uploads` row down with it.
@@ -453,7 +458,7 @@ against a version reclaimed earlier in the very same sweep pass, before this fil
 guard, even though its candidates never had a pending version for the version-query-level check to apply to in the
 first place.
 
-Directly exercised by `tests/cleanup_test.rs::sweep_skips_pending_version_of_active_multipart_session` (a backdated-
+Directly exercised by a dedicated test (a backdated-
 `created_at`, still-live session's version survives the sweep untouched) and its companion
 `sweep_reclaims_version_after_session_expires` (once `expires_at` also passes, the session is aborted by step 2 and
 its version is reclaimed by step 1 on the same `run_sweep()` call).
@@ -462,30 +467,26 @@ its version is reclaimed by step 1 on the same `run_sweep()` call).
 - `cpt-cf-file-storage-algo-sweep-abandoned-pending`
 
 **Touches**:
-- Gears: `src/infra/storage/repo/version_repo.rs`, `src/domain/cleanup.rs`
+- Gears: the version repository and the cleanup engine module
 - DB Table: `file_versions`, `multipart_uploads`
 
 ### Semantic Validation on Write
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-retention-semantic-validation`
 
-`PolicyService::validate_retention_rule` rejects an all-criteria-absent body, a zero-day age/inactivity
-criterion, and a `User`/`File`-scope rule with no target, at `POST /retention-rules` write time. Covered by
-`tests/policy_authz_test.rs`'s `create_retention_rule_zero_max_age_is_rejected`,
-`create_retention_rule_all_criteria_none_is_rejected`, `create_retention_rule_user_scope_without_target_is_rejected`.
-`tests/cleanup_test.rs::sweep_does_not_run_zero_age_rule` additionally proves the guard is a real, load-bearing
-gate rather than a redundant safety net: it attempts to create a zero-`max_age_days` rule through
-`PolicyService::create_retention_rule` itself (rejected as `DomainError::Validation`, no row written), then confirms
-a file that *would* have matched such a rule survives a subsequent sweep untouched. The companion
-`retention_expired_file_is_deleted_by_sweep` test takes the opposite approach — inserting a zero-day rule directly
-through the store, bypassing this write-time guard on purpose — specifically to exercise the sweep's own matcher
-mechanics in isolation from the guard.
+The policy service's retention-rule validation rejects an all-criteria-absent body, a zero-day age/inactivity
+criterion, and a `User`/`File`-scope rule with no target, at `POST /retention-rules` write time. This write-time
+guard is verified to be a real, load-bearing gate rather than a redundant safety net: attempting to create a
+zero-`max_age_days` rule is rejected outright (no row written), and a file that *would* have matched such a rule
+survives a subsequent sweep untouched. A companion case inserts a zero-day rule directly at the storage layer,
+bypassing this write-time guard on purpose, specifically to exercise the sweep's own matcher mechanics in isolation
+from the guard.
 
 **Implements**:
 - `cpt-cf-file-storage-algo-validate-retention-rule`
 
 **Touches**:
-- Gears: `src/domain/policy_service.rs`
+- Gears: the policy service module
 
 ## 6. Acceptance Criteria
 
@@ -509,12 +510,15 @@ mechanics in isolation from the guard.
   been reclaimed first
 - [x] A file that still has another (bound) version is never deleted by the zero-version-orphan check, even while
   one of its other versions is independently reclaimed as abandoned-pending
-- [x] A `pending` version still backing a **live** (`in_progress`, unexpired) multipart session is **never** selected
-  for orphan reclamation regardless of its age — this invariant is enforced both at the
-  version-query level (`list_pending_older_than`'s `NOT IN` subquery against live sessions) and, independently, at
-  the zero-version-orphan-file check (`has_blocking_multipart_session`)
-- [x] Once that same session's `expires_at` has also passed, the session is aborted by the sweep's own step 2 and
-  its previously-protected version becomes reclaimable by step 1 on a subsequent cycle
+- [x] A `pending` version still backing a **live** (`in_progress`, unexpired) multipart session, **or** backing
+  **any** `completing` session regardless of its lease, is **never** selected for orphan reclamation regardless of
+  its age — this invariant is enforced both at the version-query level (`list_pending_older_than`'s `NOT IN`
+  subquery against active sessions) and, independently, at the zero-version-orphan-file check
+  (`has_blocking_multipart_session`)
+- [x] Once an `in_progress` session's `expires_at` has also passed, the session is aborted by the sweep's own step 2
+  and its previously-protected version becomes reclaimable by step 1 on a subsequent cycle; a `completing` session's
+  version instead becomes reclaimable only once step 2's takeover/abort path moves it out of `completing`,
+  independent of `expires_at`
 - [x] An expired multipart session is aborted via a CAS (`in_progress -> aborted`) that a concurrent
   `complete_multipart_upload` can win instead; the loser leaves the version completely untouched either way (no
   double-delete, no deleting a since-bound version)
@@ -532,6 +536,11 @@ mechanics in isolation from the guard.
   `RetentionRuleBody` today; deferred to P3 pending a versioning-policy schema (see `lifecycle.rs`'s module doc
   comment)
 - [ ] Sweep-driven usage reports (bytes/file-count debits on reclaim/expiry) are wired end-to-end in code but are a
-  no-op in every real deployment today, since `gear.rs` wires no `UsageReporter` (`cpt-cf-file-storage-fr-usage-
+  no-op in every real deployment today, since no `UsageReporter` is configured (`cpt-cf-file-storage-fr-usage-
   reporting` is a separate, not-yet-connected requirement — see the caveat under [Cleanup Engine and Background
   Sweep Scheduling](#cleanup-engine-and-background-sweep-scheduling))
+- [ ] Retention-rule pagination is **not implemented**: the retention-expiry sweep loads every stored retention rule
+  across every tenant and scope in one unpaginated read before scanning files (only the file scan itself is
+  keyset-paginated, step 2 above). Safe today because the rule set is small relative to the number of files, but
+  it is an unbounded read that would need its own pagination if the number of tenants/rules grows large enough to
+  matter; deferred until that is observed in practice.

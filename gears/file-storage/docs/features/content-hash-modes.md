@@ -191,8 +191,8 @@ feature and remains owned by `cpt-cf-file-storage-feature-multipart-coordinator`
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-content-hash-modes-groundwork`
 
-The system **MUST** introduce `HashMode`, `ManifestEntry`, and `Manifest` types (`src/infra/content/hash_mode.rs`,
-alongside the existing `hash.rs`), with `Manifest::to_wire_string()`/`from_wire_string()` implementing the canonical
+The system **MUST** introduce `HashMode`, `ManifestEntry`, and `Manifest` types, alongside the existing hashing
+module, with `Manifest::to_wire_string()`/`from_wire_string()` implementing the canonical
 grammar in §3 (below) exactly, plus round-trip and cross-implementation-stability unit tests confirming
 `to_wire_string()` output matches a hand-computed expected string and `sha256(to_wire_string(...))` matches an
 independently-computed reference `root`.
@@ -201,19 +201,24 @@ independently-computed reference `root`.
 - `cpt-cf-file-storage-algo-content-hash-modes-build-manifest`
 
 **Touches**:
-- Gears: `src/infra/content/hash_mode.rs` (new)
+- Gears: the content-hash mode types and manifest codec module (new)
 
 ### Schema Migration — hash_mode, part_count, version_hash_manifest
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-content-hash-modes-schema`
 
 The system **MUST** add `hash_mode` (`'whole-sha256'` | `'multipart-composite-sha256'`, default `'whole-sha256'`) and
-`part_count` (`NOT NULL`, and `>= 2`, only for the multipart mode — a one-part multipart plan degenerates to
-`whole-sha256` instead, so a composite row never carries fewer than 2 parts) to `file_versions`, plus a new
+`part_count` (`NOT NULL`, only for the multipart mode — a one-part multipart plan degenerates to `whole-sha256`
+instead, so the application itself never *writes* a composite row with fewer than 2 parts) to `file_versions`, plus
+a new
 `version_hash_manifest` table
 (`version_id` PK/FK into `file_versions`, `manifest text NOT NULL`, `created_at`). Existing rows backfill to
 `hash_mode = 'whole-sha256'`, `part_count = NULL`, no `version_hash_manifest` row — correct, since every extant row
-is a P1 single-part SHA-256 upload requiring no re-hash. The existing `hash_algorithm` CHECK
+is a P1 single-part SHA-256 upload requiring no re-hash. The shipped `part_count` CHECK is **presence-only**
+(`(hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)`) — it deliberately does **not** enforce a
+`>= 2` floor at the DB level, because versions finalized before the single-part amendment shipped legitimately carry
+`part_count = 1`; adding that floor now would reject those legacy rows (see `DECOMPOSITION.md`'s deferred
+`part_count >= 2` floor item for the expand/contract plan). The existing `hash_algorithm` CHECK
 (`= 'SHA-256'`) is left untouched — never widened, since both modes use SHA-256 as their only underlying primitive.
 `VersionRepo::finalize`/`Store::finalize_version` gain `hash_mode`/`part_count` parameters, set at **finalize** time
 (mirroring the existing gap where `hash_algorithm` is fixed at pending-insert time but a pending row cannot yet know
@@ -320,67 +325,43 @@ an accepted, explicitly documented consequence (§11), not an oversight.
 
 ### 1. Current state
 
-**Hashing.** `src/infra/content/hash.rs` is the gear's single SHA-256 call
-site (Dylint `DE0708` allow-list entry). `ALGORITHM = "SHA-256"` is a
-constant; `sha256`, `sha256_parts`, the incremental `Hasher`, and
-`digest_to_array` (panics if the digest isn't 32 bytes) are all SHA-256-only.
-Both hash modes use this one primitive, so `hash.rs` stays the gear's only
-hash-primitive call site — no second dependency, Cargo feature gate, or FIPS
-carve-out beyond what already exists.
+**Hashing.** The gear has a single SHA-256 call site shared by both hash modes: a fixed `"SHA-256"` algorithm
+constant, flat and incremental (streaming) hashing helpers, and a digest-to-fixed-length-array conversion that
+panics if a digest isn't 32 bytes. No second hash dependency, Cargo feature gate, or FIPS carve-out exists beyond
+what this one primitive already provides.
 
-**`StorageBackend` trait** (`src/infra/backend/mod.rs`):
-- `upload_part` returns `(backend_etag, part_hash)` where `part_hash =
-  hash::sha256(&data)` — a flat SHA-256 of that part's bytes — and also
-  threads the part's byte offset through so `complete_multipart` can record
-  it in the manifest.
-- `complete_multipart` takes the ordered `(part_number, offset, part_hash,
-  backend_etag)` tuples the caller already collected during upload and
-  returns `(Manifest, [u8; 32])` — the manifest and its `root`, built by the
-  shared `build_manifest_and_root` helper (`src/infra/backend/mod.rs`).
-  Neither multipart-capable backend re-reads the assembled object to compute
-  this:
-  - `S3Backend::complete_multipart` (`src/infra/backend/s3.rs`) POSTs
-    `CompleteMultipartUpload` using the parts' backend `ETag`s, then builds
-    the manifest/root from the already-collected `(offset, part_hash)` pairs
-    — no `GetObject` re-read.
-  - `InMemoryBackend::complete_multipart` (`src/infra/backend/in_memory.rs`)
-    assembles the parts into the blob store (so `get` still returns the
-    whole object) but likewise derives the stored hash from the
-    already-collected per-part digests, not by re-hashing the assembled
-    bytes.
-  - `LocalFsBackend` has **no multipart support at all** — it inherits the
-    trait's default `Err(multipart_not_supported)` for `initiate_multipart`/
-    `upload_part`/`complete_multipart`/`abort_multipart`.
-- `report_part` / `MultipartStore::upsert_multipart_part` persist each part's
-  `part_hash` into `multipart_upload_parts.part_hash` (`bytea`, **no length
-  CHECK** — `src/infra/storage/entity/multipart_upload_part.rs`).
-  `complete_multipart_upload` reads these rows back (`list_multipart_parts`)
-  and threads each part's offset and digest into `complete_multipart` — the
-  per-part hash is not write-only.
+**Backend trait surface**:
+- Per-part upload returns a per-part SHA-256 digest (a flat hash of that part's bytes) alongside the backend's own
+  per-part ETag, and threads the part's byte offset through so the multipart-complete step can record it in the
+  manifest.
+- Multipart-complete takes the ordered `(part_number, offset, part_hash, backend_etag)` tuples the caller already
+  collected during upload and returns the manifest and its `root`, built by a shared helper. Neither
+  multipart-capable backend re-reads the assembled object to compute this:
+  - The S3 backend completes the native multipart upload using the parts' backend ETags, then builds the
+    manifest/root from the already-collected `(offset, part_hash)` pairs — no re-read of the assembled object.
+  - The in-memory backend assembles the parts into its blob store (so a subsequent read still returns the whole
+    object) but likewise derives the stored hash from the already-collected per-part digests, not by re-hashing the
+    assembled bytes.
+  - The local-filesystem backend has **no multipart support at all** — it inherits the trait's default
+    "unsupported" error for every multipart operation.
+- The report-part callback persists each part's hash into its own table column (no length constraint on that
+  column at the schema level). The complete step reads these rows back and threads each part's offset and digest
+  into the backend's multipart-complete call — the per-part hash is not write-only.
 
-**Multipart control flow**
-(`src/domain/multipart_service.rs::complete_multipart_upload`): loads
-`parts` from the store, builds `backend_parts: Vec<(u32, u64, [u8; 32],
-String)>` carrying every part's number, offset, SHA-256 digest, and backend
-`ETag`; calls `backend.complete_multipart(...)`; and persists the returned
-manifest root as `hash_value` plus the manifest text (in
-`version_hash_manifest`) via `store.finalize_version(...)`.
+**Multipart control flow**: the complete operation loads the reported parts from the store, builds an ordered
+list carrying every part's number, offset, SHA-256 digest, and backend ETag; calls the backend's multipart-complete
+operation; and persists the returned manifest root as the version's stored hash plus the manifest text (in the
+manifest table) as part of finalizing the version.
 
-**Single-part finalize** (`src/domain/service/write.rs::finalize_upload` /
-`finalize_upload_by_token`): both stream the blob back from the backend via
-`get_stream`, recompute SHA-256 incrementally with `hash::Hasher`, and
-`hash_mismatch` on any divergence from the client-claimed digest. Never
-trusts the caller. This read-back is retained for mode 1 -- only the
-multipart (mode 2) path avoids re-reading the assembled object.
+**Single-part finalize**: both finalize paths (token-authenticated and legacy) stream the blob back from the
+backend, recompute SHA-256 incrementally, and reject on any divergence from the client-claimed digest — the control
+plane never trusts the caller's claim. This read-back is retained for mode 1 -- only the multipart (mode 2) path
+avoids re-reading the assembled object.
 
-**`migrate_backend`** (`src/domain/service/backend.rs`): reads the whole blob
-from the source backend, then calls `Store::verify_content_hash(&bytes,
-hash_mode, &version.hash_value, manifest)` -- mode-aware: for `whole-sha256`
-it hashes the blob directly and compares; for `multipart-composite-sha256`
-it fetches the version's `version_hash_manifest` row, splits the blob at the
-manifest's recorded offsets, rebuilds the manifest from the recomputed
-per-part digests, and compares its hash to `hash_value` -- before writing to
-the destination.
+**Backend migration**: reads the whole blob from the source backend, then verifies it mode-aware: for
+`whole-sha256` it hashes the blob directly and compares; for `multipart-composite-sha256` it fetches the version's
+manifest row, splits the blob at the manifest's recorded offsets, rebuilds the manifest from the recomputed per-part
+digests, and compares its hash to the stored value -- before writing to the destination.
 
 **Schema** (`m20260624_000001_p1_initial.rs`):
 ```sql
@@ -463,7 +444,7 @@ the root.)
 #### Mode 2 — multipart, SHA-256 offset-manifest composite
 
 - **Per-part computation**: flat `sha256(part_bytes)` — exactly what
-  `upload_part` already computes (`s3.rs:803`, `in_memory.rs:190`). No
+  `upload_part` already computes (both the S3 and in-memory backends). No
   change needed to the per-part hash itself, only to what is retained
   (the byte offset, alongside the digest) and what happens with it at
   `complete`.
@@ -710,13 +691,17 @@ part count; **`hash_algorithm`'s CHECK is unchanged** — it stays locked to
 ALTER TABLE file_versions
     ADD COLUMN hash_mode  text NOT NULL DEFAULT 'whole-sha256'
         CHECK (hash_mode IN ('whole-sha256', 'multipart-composite-sha256')),
-    ADD COLUMN part_count integer,  -- NOT NULL, and >= 2, only for hash_mode = 'multipart-composite-sha256'
+    ADD COLUMN part_count integer,  -- set only for hash_mode = 'multipart-composite-sha256'
     ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
-               AND (part_count IS NULL OR part_count >= 2));
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
     -- hash_algorithm CHECK (hash_algorithm = 'SHA-256') is NOT touched — both
     -- modes use SHA-256 as the only underlying primitive; there is nothing
-    -- to widen.
+    -- to widen. The CHECK above is presence-only, deliberately NOT a
+    -- `part_count >= 2` floor: the application never writes part_count = 1
+    -- (a one-part plan degenerates to whole-sha256), but versions finalized
+    -- before that amendment shipped legitimately persisted part_count = 1,
+    -- and a floor would reject those legacy rows outright (deferred, see
+    -- DECOMPOSITION.md).
 ```
 
 Plus the new manifest table from §4:
@@ -744,8 +729,8 @@ widening, no `part_size` column (offsets are self-describing inside the
 manifest, so there is no uniform-part-size invariant to record or enforce),
 one new small table instead of a wider `file_versions` row.
 
-**`VersionRepo::finalize`** (`repo/version_repo.rs:144-` and its caller
-`Store::finalize_version`, `store/versions.rs:133-167`) must gain
+**`VersionRepo::finalize`** and its caller
+`Store::finalize_version` must gain
 `hash_mode: &str, part_count: Option<i32>` parameters (no `hash_algorithm`
 parameter needed — it never varies) and write them at finalize time, plus
 (for `multipart-composite-sha256`) insert the `version_hash_manifest` row in
@@ -769,10 +754,10 @@ existing session-scoped lifecycle.
 | Single-part `finalize_upload[_by_token]` (`write.rs`) | re-read whole object, `hash::sha256`, compare | unchanged | N/A (multipart only) |
 | Multipart `complete_multipart_upload` (`multipart_service.rs`) | `backend.complete_multipart` re-reads + flat SHA-256 | N/A | build manifest from already-collected `(offset, part_hash)` pairs, `root = sha256(manifest)` — **no re-read** |
 | Client-side re-verification | N/A (no multipart mode existed with an independent client check) | re-read/re-fetch the object, `sha256`, compare to `hash_value` — always possible from object bytes alone | **retain the composite root (wire field `content_hash` on the `POST .../complete` response) and `manifest`** (retaining them is the cheapest path; the manifest is also re-fetchable later, since `VersionDto` carries a `manifest` field re-served on composite versions by `GET /files/{id}/versions`), split the object at the manifest's recorded offsets, `sha256` each part, rebuild the manifest string per §3, `sha256(manifest) == root` — self-contained given object bytes + the retained manifest; not possible from object bytes alone |
-| `migrate_backend` (`backend.rs:35-170`) | `Store::verify_content_hash` = hard-coded `hash::sha256(blob)` | unchanged: re-read + whole-object SHA-256 rehash, compare to `hash_value` | fetch the `version_hash_manifest` row alongside the version; re-read the (already necessarily re-read, since this is a backend copy) object bytes; split at the manifest's offsets, `sha256` each part, rebuild the manifest, compare `sha256(manifest)` to `hash_value` — **fully self-contained from object bytes + the stored manifest row, no dependency on `multipart_upload_parts` surviving** |
+| `migrate_backend` | `Store::verify_content_hash` = hard-coded `hash::sha256(blob)` | unchanged: re-read + whole-object SHA-256 rehash, compare to `hash_value` | fetch the `version_hash_manifest` row alongside the version; re-read the (already necessarily re-read, since this is a backend copy) object bytes; split at the manifest's offsets, `sha256` each part, rebuild the manifest, compare `sha256(manifest)` to `hash_value` — **fully self-contained from object bytes + the stored manifest row, no dependency on `multipart_upload_parts` surviving** |
 | Any future generic "re-verify a version's integrity" tool | implicit, whole-object | dispatch by `hash_mode`, whole-object rehash | dispatch by `hash_mode`; fetch the manifest row, re-derive per the migrate_backend path above |
 
-`Store::verify_content_hash` (`store/mod.rs:154`) is mode-aware:
+`Store::verify_content_hash` is mode-aware:
 `fn verify_content_hash(blob, hash_mode, hash_value, manifest: Option<&str>)
 -> Result<(), DomainError>`. For `whole-sha256`, `manifest` is always `None`
 and the function's behavior is unchanged. For `multipart-composite-sha256`,

@@ -117,7 +117,18 @@ Notes:
   alone, for the same reason `POST /files` checks it that way (see above): `user` and `app` are disjoint owner
   spaces, so a caller could otherwise pass their own id under the *other* `owner_kind` and have the self-service
   check pass while actually listing the other owner space's files. Each returned item's `custom_metadata` is real,
-  batch-fetched per page (one `IN (...)` query), not an always-empty placeholder.
+  batch-fetched per page (one `IN (...)` query), not an always-empty placeholder. Results are ordered
+  `created_at DESC` with `file_id DESC` as a deterministic tie-breaker — `created_at` has only millisecond
+  resolution, so rows can share an instant, and without the tie-breaker an offset-paginated page could skip or
+  repeat a row at that boundary.
+- Both listing endpoints (`GET /files`, `GET /files/{id}/versions`) page via `?limit`/`?offset`. The effective
+  limit on every request is `min(requested-or-default, configured max_page_size)`: `default_page_size` (50 by
+  default) is used when `?limit` is omitted, and `max_page_size` (1000 by default) is a **hard ceiling** —
+  `MAX_PAGE_SIZE_CEILING` = 1000 — that a configured `max_page_size` can never exceed regardless of what an
+  operator sets, enforced at config-validation time (gear init fails if `max_page_size` is configured above it),
+  independent of and in addition to the ordinary `default_page_size ≤ max_page_size` sanity check. A caller can
+  therefore never receive more than the configured `max_page_size` items in one page, and that configured value
+  itself can never exceed 1000.
 - `POST /files` and `POST /files/{id}/versions` return `{ file_id, version_id, upload_url }` (the control plane
   creates a `pending` `file_versions` row for `version_id` before returning the URL). The client `PUT`s the bytes to
   `upload_url` on the sidecar; the sidecar streams them to the backend, measuring size + SHA-256, then calls the
@@ -137,7 +148,8 @@ Notes:
   exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
-- `GET /files/{id}/versions` returns a JSON array of version objects. Each carries
+- `GET /files/{id}/versions` returns a JSON array of version objects, ordered `created_at DESC` with `version_id
+  DESC` as a deterministic tie-breaker — same reasoning as `GET /files` above. Each carries
   `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, manifest?, status, is_current, created_at }`
   (ADR-0006). `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is `"whole-sha256"` (then
   `hash` = `sha256(object bytes)` and `part_count`/`manifest` are omitted) or `"multipart-composite-sha256"` (then
@@ -187,6 +199,11 @@ actual read (full or ranged) reaches the backend, the read is refused **before t
 than served against a length that no longer matches: `503 Service Unavailable` with `Retry-After: 1` and a short text
 body (`"object changed during read, retry"`). This is a transient-race signal, not a fault — logged at `warn`, not
 `error` — and the recovery is a plain retry. Any other backend read failure is a genuine I/O fault and stays `500`.
+This length check is enforced identically across backends and does not depend on the upstream response carrying a
+usable length up front: the local-fs backend re-stats the file before streaming and rejects a mismatch the same
+way, and the S3 backend wraps every stream (ranged or whole-object) in a length guard that still catches a
+truncated or overlong object even when the upstream response has no `Content-Length` at all (a chunked-transfer
+response) — the same guard S3's own `Content-Length`-present fast path uses when that header happens to be there.
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate

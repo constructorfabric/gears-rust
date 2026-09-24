@@ -31,7 +31,7 @@ date: 2026-07-07
 ## Context and Problem Statement
 
 Tier 1 item 1.7 of the P2 remediation plan ("No durable/distributed storage backend (S3) despite doc claims")
-requires an `S3Backend` implementing the `StorageBackend` trait (`src/infra/backend/mod.rs`), the seam every backend
+requires an `S3Backend` implementing the `StorageBackend` trait, the seam every backend
 type must satisfy. Before this ADR, the crate shipped two backend types: `LocalFsBackend` (sets `durable: true` —
 writes survive a process restart on a single machine — but has no native multipart support) and `InMemoryBackend`
 (sets `multipart_native: true`, but is explicitly non-durable — content is lost on restart). Neither, on its own,
@@ -81,7 +81,7 @@ This ADR chooses which S3 client crate backs `S3Backend`.
   four multipart operations, without hand-rolled request construction
 * **Maintenance / community health** — release cadence, maintainer count, issue responsiveness; this becomes the
   gear's exposure if the crate stalls
-* **Security-review burden for an external SDK** — `src/infra/backend/mod.rs:11` already flags that "S3/GCS/etc. are
+* **Security-review burden for an external SDK** — the backend trait's own documentation already flags that "S3/GCS/etc. are
   deferred (they require an external SDK + security review)"; ADR-0003 establishes the same posture (external
   dependencies that touch the data plane get reviewed, not rubber-stamped)
 * **FIPS posture** — consistency with the rustls / `aws-lc-rs` posture the rest of the gear is converging on (see
@@ -151,7 +151,7 @@ rather than a rejected option.
   `rusty-s3` (request construction as well as response parsing) for comparatively little additional size saving
   (+5.6% vs. `rusty-s3`'s +11.7%).
 
-**Security-review gate.** Per `src/infra/backend/mod.rs:11` ("S3/GCS/etc. are deferred (they require an external SDK
+**Security-review gate.** Per the backend trait's own documented posture ("S3/GCS/etc. are deferred (they require an external SDK
 + security review)") and the external-dependency review posture ADR-0003 establishes for data-plane-adjacent code,
 whichever client is ultimately vendored — `rusty-s3` (+ `quick-xml`) per this decision, or `object_store` if the team
 later invokes the documented fallback — **must clear a team security review before being merged as a real
@@ -205,7 +205,7 @@ off.
   duplication, not a hidden one, and it is a real, ongoing maintenance item (including tracking `quick-xml`'s own
   CVEs, as the pinned-version note above already reflects).
 * This is still a **new external dependency pair** regardless of which of the five options is chosen; it does not
-  skip the security-review gate flagged in `src/infra/backend/mod.rs:11`, and this ADR cannot itself close that gate.
+  skip the security-review gate flagged in the backend trait's own documentation, and this ADR cannot itself close that gate.
 * **FIPS posture.** Executing `rusty-s3`'s presigned requests over our existing `reqwest`/rustls/`aws-lc-rs` chain
   means no *second* crypto/TLS backend is introduced — consistent with the FIPS-posture direction ADR-0004 sets for
   the rest of the gear (route through a single, swappable, eventually FIPS-validatable module rather than accumulate
@@ -286,7 +286,7 @@ off.
   gap for a caller that needs manual page-by-page control, though **not one this gear has**, since
   `StorageBackend`'s own enumeration contract already returns a flat, fully-drained list
 * Bad, because it is still a new external dependency requiring the security review flagged in
-  `src/infra/backend/mod.rs:11` — fallback status is not a review exemption
+  the backend trait's own documented posture — fallback status is not a review exemption
 
 ### `aws-sdk-s3` (+ `aws-config`)
 
@@ -375,7 +375,7 @@ turns on.
 | Raw HTTP (`aws-sigv4` + `quick-xml`) | 3,720,608 bytes | +198,704 B (+5.6%) | +49 (187) |
 
 These are the measured numbers underlying the Decision Outcome above. The ADR's `status` remains `proposed` not
-because sizes are unmeasured, but because the security review required by `src/infra/backend/mod.rs:11` / ADR-0003
+because sizes are unmeasured, but because the security review required by the backend trait's own documented posture / ADR-0003
 has not yet run against the chosen `rusty-s3` + `quick-xml` pair (see [Confirmation](#confirmation)).
 
 ## Traceability

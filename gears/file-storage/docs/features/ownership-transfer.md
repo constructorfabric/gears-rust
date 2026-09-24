@@ -57,8 +57,7 @@ owner changed but no audit trail exists for it, or vice versa.
 
 > **Caveat: target-owner validation is partial.** `transfer_ownership`
 > rejects `new_owner_id` only when it is the **nil UUID** — an obviously
-> malformed sentinel value, checked with `Uuid::is_nil()`
-> (`src/domain/service/write.rs::transfer_ownership`). It does **not** verify
+> malformed sentinel value. It does **not** verify
 > that `new_owner_id` names a real, existing principal, nor that the principal
 > is actually a member of the caller's tenant. `cf-gears-file-storage` has no
 > account-management SDK wired in and no principal directory of its own, so it
@@ -137,7 +136,7 @@ owner changed but no audit trail exists for it, or vice versa.
 - File not found, or `transfer_ownership_atomic`'s scoped `UPDATE` matches
   zero rows (e.g. concurrent delete) — `404` (`FileNotFound`); **no** audit
   row and **no** file event are written in this case (proven by
-  `tests/ownership_test.rs::transfer_ownership_no_row_means_no_audit_and_no_event`)
+  proven by a dedicated regression test)
 - Caller lacks `WRITE` authorization on the file — `403`
 
 **Steps**:
@@ -235,7 +234,7 @@ nil-UUID guard.
 
 ## 6. Acceptance Criteria
 
-- [x] `POST /files/{id}/transfer` updates `owner_kind`/`owner_id` on the file row (`tests/ownership_test.rs::transfer_ownership_updates_owner_fields`)
+- [x] `POST /files/{id}/transfer` updates `owner_kind`/`owner_id` on the file row
 - [x] A `TransferOwnership` audit row is written in the same transaction as the owner update (`::transfer_ownership_leaves_audit_row`)
 - [x] A `file.owner_transferred` event is enqueued in `events_outbox` in the same transaction (`::transfer_ownership_enqueues_file_event`)
 - [x] Transferring a non-existent file returns `FileNotFound` (`::transfer_ownership_non_existent_file_returns_not_found`)

@@ -26,15 +26,21 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **nine**
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **fifteen**
 invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
-enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required); one absolute
-ceiling (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days — see that field below); four
-cross-field ordering invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs.
-`max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`; `multipart_session_ttl_secs` vs.
-`default_url_ttl_secs`); and one per-entry format check (each `previous_signing_public_keys` entry must be a
-validly-formed, 32-byte Ed25519 public key — see that field below) — noted inline below. Function names (rather
-than line numbers) are used as source pointers throughout this table since line numbers drift with every edit.
+enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required); seven absolute
+ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
+`MAX_PAGE_SIZE_CEILING`, 1000; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
+above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
+`MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `orphan_grace_secs` above `MAX_ORPHAN_GRACE_SECS`, 30 days;
+`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days — see those fields below); four cross-field ordering invariants (`default_url_ttl_secs`
+vs. `max_url_ttl_secs`; `default_page_size` vs. `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`;
+`multipart_session_ttl_secs` vs. `default_url_ttl_secs`); and one per-entry format check (each
+`previous_signing_public_keys` entry must be a validly-formed, 32-byte Ed25519 public key — see that field below) —
+noted inline below. A separate check (`max_url_ttl_secs` vs. `orphan_grace_secs`) only logs a `warn` rather than
+rejecting, since the recommended defaults (7 days vs. 1 hour) would otherwise fail on every default deployment — see
+`orphan_grace_secs` below. Function names (rather than line numbers) are used as source pointers throughout this
+table since line numbers drift with every edit.
 
 Config for this gear (like every gear on this platform) is loaded from its own platform YAML configuration section —
 there is no standalone TOML/JSON file of its own.
@@ -82,7 +88,8 @@ leave at the 7-day default or lower for stricter environments; do not raise with
 sharing use case (a separate FileShare gear, not yet built, is the intended mechanism for that — not a raised ceiling
 here). **Misconfiguration risk**: raising it widens the window during which a leaked URL is exploitable, with no
 revocation mechanism to claw it back. Lowering it below `default_url_ttl_secs` is rejected by
-`FileStorageConfig::validate()` at startup rather than silently clamping every default-TTL mint.
+`FileStorageConfig::validate()` at startup rather than silently clamping every default-TTL mint, and so is raising it
+above `MAX_URL_TTL_CEILING` (`2592000` s = 30 days).
 
 ### `finalize_token_grace_secs`
 How far past its `exp` (seconds, default `3600` = 1 hour) the signed upload token is still accepted **on the
@@ -116,7 +123,9 @@ session lifetime would let a part URL outlive the session it belongs to and have
 expiry check reject an upload whose URLs were still technically valid. **Production recommendation**: size it to the
 slowest legitimate upload you intend to support. **Misconfiguration risk**: too short → long uploads are aborted
 mid-flight by the sweep; too long → abandoned sessions (and their backend multipart handles) linger before the
-reaper touches them.
+reaper touches them. Capped at `MAX_MULTIPART_SESSION_TTL_SECS` (`2592000` s = 30 days): `validate()` fails gear
+init above it, because the value is added to the current time when a session is created and an oversized one would
+otherwise overflow that timestamp.
 
 ### `multipart_complete_lease_secs`
 How long (seconds, default `120`) one caller may hold the `completing` lease on a multipart session before another
@@ -125,7 +134,8 @@ caller is allowed to take it over. `complete` moves the session `in_progress →
 assembly I/O; a second caller arriving while the lease is live is answered `202 completing` and polls. **Production
 recommendation**: size it to the backend's assembly time for your largest objects. **Misconfiguration risk**: too
 short → a slow-but-healthy assembly has its lease stolen and the work is redone by a second caller; too long → a
-session whose completer really did crash stays unavailable for takeover for the whole lease window.
+session whose completer really did crash stays unavailable for takeover for the whole lease window. Capped at
+`MAX_MULTIPART_COMPLETE_LEASE_SECS` (`86400` s = 1 day); `validate()` fails gear init above it.
 
 ### `sidecar_base_url`
 The externally-reachable base URL of the data-plane sidecar that every signed URL points at (default assumes a
@@ -141,6 +151,9 @@ Pagination defaults/ceiling for `GET /files` (and similar list endpoints) — `5
 have a proven need for larger pages and the DB/latency budget supports it. **Misconfiguration risk**: a very large
 `max_page_size` lets a caller force an expensive, unbounded-feeling listing query; a `default_page_size` larger than
 `max_page_size` would be self-contradictory — `FileStorageConfig::validate()` rejects this combination at startup.
+`max_page_size` also has its own absolute ceiling, `MAX_PAGE_SIZE_CEILING` (`1000`, the same value as the shipped
+default): `validate()` rejects any configured `max_page_size` above it, independent of the `default_page_size`
+check, since it is otherwise the only bound on a single listing request's row count and response size.
 
 ### `storage_root`
 Local filesystem root for the default `local-fs` backend (default `./.file-storage-data`, i.e. **relative to the
@@ -243,7 +256,8 @@ are reclaimed by the cleanup sweep's step 4 (see below). **Production recommenda
 realistic client retry window (default is generous for most HTTP retry policies). **Misconfiguration risk**: too
 short → a legitimately delayed retry (e.g. after a long client-side backoff) creates a duplicate file instead of
 being deduplicated; too long → more rows accumulate between sweep passes (bounded by `sweep_interval_secs`, not a
-correctness issue, just storage/index bloat).
+correctness issue, just storage/index bloat). Capped at `MAX_IDEMPOTENCY_TTL_SECS` (`2592000` s = 30 days);
+`validate()` fails gear init above it, since the value is added to the current time for every idempotency record.
 
 ### `orphan_grace_secs`
 Grace period (seconds, default `3600` = 1h) a `pending` version or an expired multipart session must age past
@@ -255,6 +269,7 @@ Because that first failure mode is a direct self-contradiction — a signed `PUT
 reclaims the version behind it — `FileStorageConfig::validate()` **rejects** a configuration where
 `default_url_ttl_secs` exceeds `orphan_grace_secs`. There is no session row to guard a single-part upload the way
 the live-multipart-session guard protects a multipart one, so this config check is the only thing enforcing it.
+Capped at `MAX_ORPHAN_GRACE_SECS` (`2592000` s = 30 days); `validate()` fails gear init above it.
 
 ### `sweep_interval_secs`
 How often (seconds, default `3600` = 1h) the background cleanup sweep fires, when `enable_background_sweep` is
@@ -421,7 +436,7 @@ The sweep runs **four** steps, in this order:
    - **(a)** Deletes `file_versions` rows still `pending` (pre-registered but never finalized) older than
      `orphan_grace_secs`, best-effort deletes their backend blobs, and additionally deletes the parent `files` row
      too if reclaiming its last pending version leaves it a permanent zero-version orphan (no versions left **and**
-     `content_id IS NULL`, and no blocking in-progress multipart session for that file).
+     `content_id IS NULL`, and no blocking in-progress/completing multipart session for that file).
    - **(b)** Separately sweeps `files` rows that never had a version in the first place. The list query's predicate
      is exactly three conditions — `content_id IS NULL`, no rows in `file_versions`, and `created_at` older than the
      same `grace_cutoff` (`orphan_grace_secs`) — and runs batched; each candidate is then re-verified and deleted
