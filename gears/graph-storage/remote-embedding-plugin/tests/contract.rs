@@ -327,6 +327,88 @@ async fn a_transient_refusal_is_retried_within_the_budget() {
     assert_eq!(response.vectors.len(), 2);
 }
 
+/// A timeout is not one condition, and the two it can be want opposite
+/// answers.
+///
+/// The per-attempt timeout is `min(caller's remaining budget, our configured
+/// timeout)`. When ours is the smaller one -- the ordinary case, since the
+/// default is a minute and an ingest batch is given far more -- a timeout
+/// says the endpoint is slow, not that the caller is out of time, and the
+/// caller may still have minutes of budget to retry into. Treating it as the
+/// caller's deadline abandoned the whole batch on the first slow response,
+/// which is the quiet loss of recall the retry loop was added to prevent.
+#[tokio::test]
+async fn a_slow_endpoint_is_retried_while_the_caller_still_has_budget() {
+    let server = MockServer::start().await;
+    // Answers correctly, but later than our own timeout allows.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_millis(400)),
+        )
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(HashingEndpoint {
+            drop_last: false,
+            force_width: None,
+        })
+        .mount(&server)
+        .await;
+
+    // Ours binds: 50ms against the request helper's 30-second budget.
+    let provider = provider_for(&server, |config| {
+        config.timeout = Duration::from_millis(50);
+    });
+    let response = provider
+        .embed(request(&["a"]))
+        .await
+        .expect("a slow endpoint is transient, and the third attempt is quick");
+    assert_eq!(response.vectors.len(), 1);
+    assert_eq!(
+        server.received_requests().await.map(|r| r.len()),
+        Some(3),
+        "the two slow attempts must have been retried, not given up on"
+    );
+}
+
+/// The other half of the same rule: once the caller's budget is what ran out,
+/// there is nothing to retry into and the answer is its deadline.
+#[tokio::test]
+async fn a_timeout_on_the_callers_own_budget_is_a_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    // The caller's budget binds: 150ms against a ten-second configuration.
+    let provider = provider_for(&server, |config| {
+        config.timeout = Duration::from_secs(10);
+    });
+    let error = provider
+        .embed(EmbedRequest {
+            inputs: vec!["a".to_owned()],
+            budget: RemainingBudget::starting_now(Duration::from_millis(150)),
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .err()
+        .expect("the caller's deadline is not something a retry can fix");
+    assert!(matches!(error, EmbeddingProviderError::Deadline), "{error}");
+    assert_eq!(
+        server.received_requests().await.map(|r| r.len()),
+        Some(1),
+        "an exhausted caller budget must not be retried into"
+    );
+}
+
 /// Retries are bounded, and a refusal that outlives them is reported.
 #[tokio::test]
 async fn a_persistent_refusal_gives_up_and_says_so() {

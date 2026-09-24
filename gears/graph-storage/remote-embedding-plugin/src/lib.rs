@@ -362,11 +362,47 @@ impl EmbeddingProviderV1 for RemoteEmbeddingProvider {
     async fn health(&self) -> Result<(), EmbeddingProviderError> {
         self.embed_chunk(
             &["health".to_owned()],
-            self.config.timeout.min(Duration::from_secs(10)),
+            // No caller is waiting on a budget here, so a timeout is this
+            // provider's own and says the endpoint is unreachable.
+            AttemptWindow::provider_bound(self.config.timeout.min(Duration::from_secs(10))),
         )
         .await
         .map(drop)
         .map_err(|refusal| refusal.error)
+    }
+}
+
+/// How long one attempt may take, and which clock said so.
+///
+/// The per-attempt timeout is the smaller of the caller's remaining budget
+/// and this provider's own configured one, and a timeout means opposite
+/// things depending on which of the two bound it. When the caller's budget
+/// ran out there is nothing left to retry into and the answer is `Deadline`.
+/// When the provider's own cap fired first the caller may still have minutes
+/// of budget left, and a slow-but-healthy endpoint is exactly the transient
+/// condition the retry loop exists for — classifying that as the caller's
+/// deadline abandons the batch on the first slow response. `min` alone does
+/// not remember which argument won, so the answer is carried alongside it.
+#[derive(Clone, Copy)]
+struct AttemptWindow {
+    timeout: Duration,
+    caller_bound: bool,
+}
+
+impl AttemptWindow {
+    fn for_attempt(remaining: Duration, configured: Duration) -> Self {
+        Self {
+            timeout: remaining.min(configured),
+            caller_bound: remaining <= configured,
+        }
+    }
+
+    /// An attempt no caller is waiting on, so its timeout can only be ours.
+    fn provider_bound(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            caller_bound: false,
+        }
     }
 }
 
@@ -392,7 +428,7 @@ impl RemoteEmbeddingProvider {
             if remaining.is_zero() {
                 return Err(EmbeddingProviderError::Deadline);
             }
-            let call = self.embed_chunk(chunk, remaining.min(self.config.timeout));
+            let call = self.embed_chunk(chunk, AttemptWindow::for_attempt(remaining, self.config.timeout));
             let outcome = tokio::select! {
                 () = req.cancel.cancelled() => return Err(EmbeddingProviderError::Cancelled),
                 result = call => result,
@@ -436,7 +472,7 @@ impl RemoteEmbeddingProvider {
     async fn embed_chunk(
         &self,
         inputs: &[String],
-        timeout: Duration,
+        window: AttemptWindow,
     ) -> Result<Vec<Vec<f32>>, Refusal> {
         let body = EmbeddingsRequest {
             model: self.config.model.trim(),
@@ -459,15 +495,16 @@ impl RemoteEmbeddingProvider {
         let mut request = self
             .http
             .post(self.endpoint.clone())
-            .timeout(timeout)
+            .timeout(window.timeout)
             .json(&body);
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key.expose_secret());
         }
 
         let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                // The caller's deadline, not the endpoint's refusal.
+            if error.is_timeout() && window.caller_bound {
+                // The caller's deadline, not the endpoint's refusal: nothing
+                // is left to retry into.
                 Refusal::permanent(EmbeddingProviderError::Deadline)
             } else {
                 Refusal::transient(EmbeddingProviderError::Unavailable {
