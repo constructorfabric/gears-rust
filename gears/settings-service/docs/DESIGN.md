@@ -1812,7 +1812,7 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 
 **Indexes:** `idx_audit_scoped` (`declaration_key`, `tenant_id`, `occurred_at DESC`) — serves the per-(setting, scope) history read directly, which is what makes its p95 a local index lookup rather than a cross-service call (§7); `idx_audit_retention` (`retain_until`) `WHERE retain_until IS NOT NULL`, for pruning.
 
-**Invariants:** append-only in the mutation's own transaction — the record and the change it audits share one commit and cannot diverge (§4.2 *Audit Emitter*) — and append-only at the store: a trigger carried by the gear's migration refuses every `UPDATE`, and on PostgreSQL a `DELETE` while an explicit `retain_until` hold is in force; retention pruning of expired rows is the one delete the table sees. Rows are written through the same `AccessScope`-scoped path as every other write, so an audit row is never visible outside its tenant.
+**Invariants:** append-only in the mutation's own transaction — the record and the change it audits share one commit and cannot diverge (§4.2 *Audit Emitter*) — and append-only at the store: a trigger carried by the gear's migration refuses every `UPDATE`, and on PostgreSQL a `DELETE` while an explicit `retain_until` hold is in force or while the record is younger than the platform minimum of twelve months — a guard against a mistake in code, not against a privileged database writer, which is for database roles and R2's off-box copy; retention pruning of expired rows is the one delete the table sees. Rows are written through the same `AccessScope`-scoped path as every other write, so an audit row is never visible outside its tenant.
 
 #### GTS Type & Schema Identifiers
 

@@ -22,6 +22,7 @@ mod m20260907_000002_tenant_permissions;
 mod m20260915_000001_pending_secrets;
 mod m20260917_000001_value_type_namespace;
 mod m20260924_000001_audit_records_append_only;
+mod m20260924_000002_audit_records_retention_floor;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260915_000001_pending_secrets::Migration),
             Box::new(m20260917_000001_value_type_namespace::Migration),
             Box::new(m20260924_000001_audit_records_append_only::Migration),
+            Box::new(m20260924_000002_audit_records_retention_floor::Migration),
         ]
     }
 }
